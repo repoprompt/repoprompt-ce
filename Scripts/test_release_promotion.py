@@ -318,6 +318,7 @@ class ReleasePromotionTests(unittest.TestCase):
             fake_bin,
             "curl",
             """\
+            args="$*"
             output=""
             url=""
             write_status=false
@@ -331,7 +332,9 @@ class ReleasePromotionTests(unittest.TestCase):
             done
             case "$url" in
                 https://api.github.com/repos/repoprompt/repoprompt-ce-updates/releases/latest)
-                    if [[ -n "$FAKE_LATEST_BUILD" && ! -f "$FAKE_PROMOTION_PUBLISHED" ]]; then
+                    if [[ "$args" != *"Authorization: Bearer update-token"* ]]; then
+                        $write_status && printf '403'
+                    elif [[ -n "$FAKE_LATEST_BUILD" && ! -f "$FAKE_PROMOTION_PUBLISHED" ]]; then
                         printf '{"tag_name":"v0.9.0"}\\n' > "$output"
                         $write_status && printf '200'
                     elif grep -q 'release edit v1.0.0 --repo repoprompt/repoprompt-ce-updates' "$FAKE_GH_CAPTURE" 2>/dev/null; then
@@ -345,8 +348,11 @@ class ReleasePromotionTests(unittest.TestCase):
                         $write_status && printf '%s' "$FAKE_LATEST_HTTP_STATUS"
                     fi
                     ;;
-                https://api.github.com/repos/repoprompt/repoprompt-ce/releases/latest)
-                    printf '{"tag_name":"v1.0.0"}\\n'
+                https://github.com/repoprompt/repoprompt-ce-updates/releases/latest)
+                    $write_status && printf 'https://github.com/repoprompt/repoprompt-ce-updates/releases/tag/v1.0.0'
+                    ;;
+                https://github.com/repoprompt/repoprompt-ce/releases/latest)
+                    $write_status && printf 'https://github.com/repoprompt/repoprompt-ce/releases/tag/v1.0.0'
                     ;;
                 */v0.9.0/appcast.xml) cp "$FAKE_ASSET_DIR/previous-appcast.xml" "$output" ;;
                 */appcast.xml) cp "$FAKE_ASSET_DIR/appcast.xml" "$output" ;;

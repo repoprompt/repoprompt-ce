@@ -327,6 +327,8 @@ verify_strictly_newer_build() {
         --location \
         --silent \
         --show-error \
+        --header "Authorization: Bearer $PUBLIC_UPDATE_GH_TOKEN" \
+        --header "Accept: application/vnd.github+json" \
         --output "$latest_json_file" \
         --write-out '%{http_code}' \
         "https://api.github.com/repos/$PUBLIC_UPDATE_REPOSITORY/releases/latest")"; then
@@ -477,17 +479,19 @@ verify_anonymous_publish() {
     cmp "$APPCAST" "$published_source_appcast"
     cmp "$CHECKSUMS" "$published_source_checksums"
 
-    local update_latest source_latest
-    update_latest="$(curl_anonymous \
-        "https://api.github.com/repos/$PUBLIC_UPDATE_REPOSITORY/releases/latest" |
-        jq -r .tag_name)"
-    source_latest="$(curl_anonymous \
-        "https://api.github.com/repos/$SOURCE_GITHUB_REPOSITORY/releases/latest" |
-        jq -r .tag_name)"
-    [[ "$update_latest" == "$RELEASE_TAG" ]] ||
-        fail "Public updater latest tag mismatch: expected $RELEASE_TAG, got $update_latest"
-    [[ "$source_latest" == "$RELEASE_TAG" ]] ||
-        fail "Source latest tag mismatch: expected $RELEASE_TAG, got $source_latest"
+    local update_latest_url source_latest_url
+    update_latest_url="$(curl_anonymous \
+        --output /dev/null \
+        --write-out '%{url_effective}' \
+        "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/latest")"
+    source_latest_url="$(curl_anonymous \
+        --output /dev/null \
+        --write-out '%{url_effective}' \
+        "https://github.com/$SOURCE_GITHUB_REPOSITORY/releases/latest")"
+    [[ "$update_latest_url" == "https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/tag/$RELEASE_TAG" ]] ||
+        fail "Public updater latest redirect mismatch: $update_latest_url"
+    [[ "$source_latest_url" == "https://github.com/$SOURCE_GITHUB_REPOSITORY/releases/tag/$RELEASE_TAG" ]] ||
+        fail "Source latest redirect mismatch: $source_latest_url"
 
     printf 'OK: anonymous release smoke passed for %s.\n' "$RELEASE_TAG"
 }
