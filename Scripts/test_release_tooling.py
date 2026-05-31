@@ -17,6 +17,19 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_publish_staged_validates_before_creating_dist(self) -> None:
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+        publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]
+
+        self.assertLess(
+            publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"'),
+            publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"'),
+        )
+        self.assertLess(
+            publish_staged.index('"$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"'),
+            publish_staged.index("prepare_dist"),
+        )
+
     def test_modern_sparkle_key_seed_derives_public_key(self) -> None:
         descriptor, key_path = tempfile.mkstemp()
         os.close(descriptor)

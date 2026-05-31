@@ -204,7 +204,6 @@ publish_staged_release() {
     require_command xcrun
     verify_publish_inputs
     require_env REPOPROMPT_APPROVED_SOURCE_ROOT
-    prepare_dist
     TMP_DIR="$(mktemp -d)"
 
     [[ -d "$APP_BUNDLE" ]] || fail "Missing secret-free staged app bundle: $APP_BUNDLE"
@@ -212,6 +211,7 @@ publish_staged_release() {
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/sign_staged_release.sh"
+    prepare_dist
     validate_packaged_legal "$APP_BUNDLE"
 
     local notary_zip="$TMP_DIR/$ARCHIVE_BASENAME-notarization.zip"
