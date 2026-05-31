@@ -4,6 +4,17 @@ This is a Swift Package macOS app for RepoPrompt CE.
 
 Prefer the coordinated developer daemon (`make dev-*`, see "Developer daemon / coordinated validation" below) for builds, runs, and tests. It runs every job through a lane-serialized queue so concurrent agents do not build, launch, or test over each other, and it returns a ticket for each job so long builds can be detached and checked on later instead of blocking. The plain `make` / `swift` / `./Scripts` commands shown below are the uncoordinated fallback for when the daemon is unavailable.
 
+## Contribution preflight
+
+Before every commit or push, read and run the repository-local `$rpce-contribution-check` skill:
+
+```bash
+.agents/skills/rpce-contribution-check/scripts/preflight.sh commit
+.agents/skills/rpce-contribution-check/scripts/preflight.sh push
+```
+
+Stage only the intended changes, then use `commit` mode before creating a commit; rerun it after any staging change, including partial-staging updates. Use `push` mode after committing but before pushing the intended current branch. The skill enforces redacted staged-index and outgoing-range secret scanning, repository guardrails, clean push boundaries, and the applicable coordinated validation lanes. Obtain explicit user approval immediately before any force-push, history rewrite, branch deletion, fork deletion, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or stopping a visible app.
+
 ## Run
 
 ```bash
