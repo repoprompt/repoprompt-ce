@@ -1,5 +1,6 @@
 # RepoPrompt CE
 
+[![CI](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/repoprompt/repoprompt-ce/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![Platform: macOS 26+](https://img.shields.io/badge/platform-macOS%2026%2B-black)
 
