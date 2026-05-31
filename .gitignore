@@ -12,6 +12,9 @@ build/
 
 # Packaged app / archives / symbols
 *.app/
+# Sparkle ships this helper app inside its vendored release framework.
+!Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Updater.app/
+!Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework/Versions/B/Updater.app/**
 *.dSYM/
 *.dSYM.zip
 *.ipa

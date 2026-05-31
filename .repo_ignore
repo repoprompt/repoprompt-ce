@@ -1,0 +1,3 @@
+# Vendored release payloads are maintainer-managed and should stay out of
+# ordinary contributor and agent context.
+Vendor/Sparkle/
