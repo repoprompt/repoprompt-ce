@@ -167,7 +167,22 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertEqual(list(install_dir.glob(".RepoPrompt CE.app.backup.*")), [])
         self.assertEqual(list(install_dir.glob(".RepoPrompt CE.app.installing.*")), [])
 
-    def run_installer(self, *, fail_final_install_move: bool) -> tuple[subprocess.CompletedProcess[str], Path]:
+    def test_certificate_minting_omits_legacy_when_openssl_does_not_support_it(self) -> None:
+        result, _ = self.run_installer(
+            fail_final_install_move=False,
+            existing_identity=False,
+            openssl_rejects_legacy=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def run_installer(
+        self,
+        *,
+        fail_final_install_move: bool,
+        existing_identity: bool = True,
+        openssl_rejects_legacy: bool = False,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
         root = temp_dir / "repo"
@@ -214,7 +229,12 @@ class LocalProductionInstallerTests(unittest.TestCase):
             """\
             case "$1" in
                 default-keychain) printf '    "%s"\\n' "$FAKE_KEYCHAIN" ;;
-                find-identity) printf '  1) ABCDEF "%s"\\n' "$PINNED_CERTIFICATE_NAME" ;;
+                find-identity)
+                    if [[ "$FAKE_EXISTING_IDENTITY" == "1" || -f "$FAKE_IMPORTED_IDENTITY" ]]; then
+                        printf '  1) ABCDEF "%s"\\n' "$PINNED_CERTIFICATE_NAME"
+                    fi
+                    ;;
+                import) : > "$FAKE_IMPORTED_IDENTITY" ;;
                 *) exit 0 ;;
             esac
             """,
@@ -230,7 +250,22 @@ class LocalProductionInstallerTests(unittest.TestCase):
             """,
         )
         self.write_stub(bin_dir, "codesign", "exit 0\n")
-        self.write_stub(bin_dir, "openssl", "exit 0\n")
+        self.write_stub(
+            bin_dir,
+            "openssl",
+            """\
+            if [[ "$1" == "rand" ]]; then
+                printf '0123456789abcdef0123456789abcdef0123456789abcdef\\n'
+            elif [[ "$1" == "pkcs12" && "${2:-}" == "-help" ]]; then
+                printf 'usage: pkcs12\\n'
+            elif [[ "$1" == "pkcs12" && "$OPENSSL_REJECTS_LEGACY" == "1" ]]; then
+                for argument in "$@"; do
+                    [[ "$argument" != "-legacy" ]] || exit 64
+                done
+            fi
+            exit 0
+            """,
+        )
         self.write_stub(bin_dir, "pgrep", "exit 1\n")
         self.write_stub(bin_dir, "ditto", 'cp -R "$1" "$2"\n')
         self.write_stub(
@@ -253,6 +288,9 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 "LOCAL_SELF_SIGNED_CERTIFICATE_NAME": "divergent override",
                 "FAKE_BUILD_DIR": str(build_dir),
                 "FAKE_KEYCHAIN": str(keychain),
+                "FAKE_EXISTING_IDENTITY": "1" if existing_identity else "0",
+                "FAKE_IMPORTED_IDENTITY": str(temp_dir / "imported-identity"),
+                "OPENSSL_REJECTS_LEGACY": "1" if openssl_rejects_legacy else "0",
                 "PINNED_CERTIFICATE_NAME": PINNED_CERTIFICATE_NAME,
                 "FAIL_FINAL_INSTALL_MOVE": "1" if fail_final_install_move else "0",
             }

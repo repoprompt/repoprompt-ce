@@ -95,7 +95,11 @@ EOF
         -config "$TMP_DIR/openssl.cnf" \
         -out "$CERTIFICATE_PEM" \
         -keyout "$TMP_DIR/repoprompt-ce-local-signing-key.pem"
-    openssl pkcs12 -export -legacy \
+    local -a pkcs12_args=(-export)
+    if { openssl pkcs12 -help 2>&1 || true; } | grep -q -- '-legacy'; then
+        pkcs12_args+=(-legacy)
+    fi
+    openssl pkcs12 "${pkcs12_args[@]}" \
         -out "$TMP_DIR/repoprompt-ce-local-signing.p12" \
         -inkey "$TMP_DIR/repoprompt-ce-local-signing-key.pem" \
         -in "$CERTIFICATE_PEM" \

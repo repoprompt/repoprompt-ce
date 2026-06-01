@@ -46,7 +46,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         // Initialize Sparkle updater
         let updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
+            startingUpdater: false,
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
@@ -99,6 +99,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         }
 
         #if DEBUG
+            sparkleManager.startUpdater()
             if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
                 Task {
                     // Ensure the user-space CLI symlink is available for external tools
@@ -129,7 +130,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
                     return
                 }
 
-                // Only proceed with security monitoring after verification succeeds
+                // Only activate updates and proceed with security monitoring after verification succeeds
+                sparkleManager.startUpdater()
 
                 // 1) Security checks
                 ApplicationSecurity.startMonitoring()

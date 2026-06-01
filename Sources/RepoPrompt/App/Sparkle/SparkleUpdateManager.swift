@@ -80,6 +80,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     private let updaterController: SPUStandardUpdaterController
     private var cancellables = Set<AnyCancellable>()
+    private var updaterStarted = false
     private var periodicCheckTimer: Timer?
     private var appcastCheckTask: Task<AppcastUpdateInfo?, Never>?
     private var userInitiatedSparkleCheckInProgress = false
@@ -144,21 +145,25 @@ final class SparkleUpdaterManager: ObservableObject {
 
         if !sparkleConfigurationValid {
             disableUpdatesForIntegrityFailure()
-            return
         }
+    }
 
-        // Setup observers for update status
+    func startUpdater() {
+        guard sparkleConfigurationValid, !updaterStarted else { return }
+
+        // Install observers before activation so no Sparkle event can race registration.
         setupObservers()
-
-        // Initialize with current state
+        updaterController.startUpdater()
+        updaterStarted = true
+        forceSparkleAutomaticChecksOff()
         canCheckForUpdates = updaterController.updater.canCheckForUpdates
 
-        // Schedule a background check after a short delay
+        // Schedule a background check after a short delay.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             self?.performInitialUpdateCheck()
         }
 
-        // Setup periodic passive update checking if enabled
+        // Setup periodic passive update checking if enabled.
         setupPeriodicUpdateCheck()
     }
 
@@ -177,7 +182,7 @@ final class SparkleUpdaterManager: ObservableObject {
 
     /// Performs initial passive update check using appcast parsing only.
     private func performInitialUpdateCheck() {
-        guard sparkleConfigurationValid, automaticallyChecksForUpdates else { return }
+        guard updaterStarted, sparkleConfigurationValid, automaticallyChecksForUpdates else { return }
         Task {
             await performPassiveAppcastCheck()
         }
@@ -187,7 +192,7 @@ final class SparkleUpdaterManager: ObservableObject {
     private func setupPeriodicUpdateCheck() {
         periodicCheckTimer?.invalidate()
         periodicCheckTimer = nil
-        guard sparkleConfigurationValid, automaticallyChecksForUpdates else { return }
+        guard updaterStarted, sparkleConfigurationValid, automaticallyChecksForUpdates else { return }
         forceSparkleAutomaticChecksOff()
         // Check if we need to do an immediate check based on last check time
         let lastCheck = UserDefaults.standard.double(forKey: Self.lastCheckKey)
@@ -233,7 +238,7 @@ final class SparkleUpdaterManager: ObservableObject {
     /// Returns true only when the appcast fetch and parse produced update info.
     @discardableResult
     func checkAppcastDirectly() async -> Bool {
-        guard sparkleConfigurationValid else { return false }
+        guard updaterStarted, sparkleConfigurationValid else { return false }
         guard let feedURL = Bundle.main.infoDictionary?["SUFeedURL"] as? String,
               let url = URL(string: feedURL)
         else {
@@ -445,7 +450,7 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     func checkForUpdates(silent: Bool = false) {
-        guard sparkleConfigurationValid else { return }
+        guard updaterStarted, sparkleConfigurationValid else { return }
         if silent {
             // Passive checks are appcast-only by design; Sparkle UI remains user-initiated.
             guard automaticallyChecksForUpdates else { return }
@@ -458,7 +463,7 @@ final class SparkleUpdaterManager: ObservableObject {
     }
 
     func installUpdate() {
-        guard sparkleConfigurationValid else { return }
+        guard updaterStarted, sparkleConfigurationValid else { return }
         beginUserInitiatedSparkleCheck()
     }
 
@@ -578,6 +583,7 @@ final class SparkleUpdaterManager: ObservableObject {
         func debugPublishedSnapshot() -> [String: Any] {
             var snapshot: [String: Any] = [
                 "sparkle_configuration_valid": sparkleConfigurationValid,
+                "updater_started": updaterStarted,
                 "updates_disabled_message": updatesDisabledMessage ?? NSNull(),
                 "can_check_for_updates": canCheckForUpdates,
                 "sparkle_can_check_for_updates": updaterController.updater.canCheckForUpdates,

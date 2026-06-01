@@ -27,7 +27,9 @@ The intended process is:
 1. A contributor opens a release PR that updates `version.env`, release notes,
    and any relevant changelog entry.
 2. CI runs ordinary validation plus the secret-free release-candidate lane.
-3. Contributors and maintainers test the ad-hoc release-candidate artifact.
+3. Contributors and maintainers inspect the ad-hoc release-candidate artifact
+   for packaging correctness. Runnable release-mode local testing uses the
+   self-signed local production installer.
 4. A maintainer merges the PR and creates a new immutable tag for that exact
    commit.
 5. A maintainer dispatches **Publish Release**. CI imports the
@@ -57,7 +59,9 @@ path on `main` and on manual dispatch, then uploads the archive as a workflow
 artifact.
 
 Contributors should not upload this artifact to GitHub Releases. It is useful
-for packaging review and local testing only.
+for packaging inspection only; its ad-hoc signature intentionally does not pass
+the official release runtime integrity check. For runnable release-mode local
+testing, use the self-signed local production installer below.
 
 ## Install a local self-signed production build
 

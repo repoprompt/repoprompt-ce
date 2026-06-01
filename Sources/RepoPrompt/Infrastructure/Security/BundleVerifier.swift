@@ -12,10 +12,15 @@ import Security
 class BundleVerifier {
     private static let expectedBundleIdentifier = SecurityObfuscation.decode(SecurityObfuscation.expectedBundleIdentifierEncoded)
     private static let expectedTeamIdentifier = SecurityObfuscation.decode(SecurityObfuscation.expectedTeamIdentifierEncoded)
-    #if REPOPROMPT_LOCAL_SELF_SIGNED_BUILD
-        private static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
-        private static let localSelfSignedSigningMode = "local-self-signed"
-    #endif
+    private static let localSelfSignedCertificateName = "RepoPrompt CE Local Self-Signed Code Signing"
+    private static let localSelfSignedSigningMode = "local-self-signed"
+    static let developerIDApplicationCertificateExtension = "1.2.840.113635.100.6.1.13"
+
+    enum SigningIdentityRequirementMode {
+        case localSelfSigned
+        case debugAppleDevelopment
+        case officialDeveloperID
+    }
 
     /// Error types that can occur during bundle verification
     enum VerificationError: Error, CustomStringConvertible {
@@ -79,19 +84,31 @@ class BundleVerifier {
 
     // MARK: - Identity Requirements
 
+    static func signingIdentityRequirementString(for mode: SigningIdentityRequirementMode) -> String {
+        switch mode {
+        case .localSelfSigned:
+            "anchor trusted and identifier \"\(expectedBundleIdentifier)\" and certificate leaf[subject.CN] = \"\(localSelfSignedCertificateName)\""
+        case .debugAppleDevelopment:
+            "anchor apple generic and certificate leaf[subject.OU] = \"\(expectedTeamIdentifier)\""
+        case .officialDeveloperID:
+            "anchor apple generic and identifier \"\(expectedBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(expectedTeamIdentifier)\" and certificate leaf[field.\(developerIDApplicationCertificateExtension)] exists"
+        }
+    }
+
     private static func verifySigningIdentity(for code: SecStaticCode, bundle: Bundle) throws {
-        // In debug builds, verify team ID only (bundle ID differs between debug/release)
-        // In release builds, verify both bundle ID and team ID
+        // In debug builds, verify team ID only (bundle ID differs between debug/release).
+        // Official release builds also require the Developer ID Application certificate class.
         #if REPOPROMPT_LOCAL_SELF_SIGNED_BUILD
             guard bundle.object(forInfoDictionaryKey: "RepoPromptSigningMode") as? String == localSelfSignedSigningMode else {
                 throw VerificationError.signingModeInvalid
             }
-            let requirementString = "anchor trusted and identifier \"\(expectedBundleIdentifier)\" and certificate leaf[subject.CN] = \"\(localSelfSignedCertificateName)\""
+            let requirementMode = SigningIdentityRequirementMode.localSelfSigned
         #elseif DEBUG
-            let requirementString = "anchor apple generic and certificate leaf[subject.OU] = \"\(expectedTeamIdentifier)\""
+            let requirementMode = SigningIdentityRequirementMode.debugAppleDevelopment
         #else
-            let requirementString = "anchor apple generic and identifier \"\(expectedBundleIdentifier)\" and certificate leaf[subject.OU] = \"\(expectedTeamIdentifier)\""
+            let requirementMode = SigningIdentityRequirementMode.officialDeveloperID
         #endif
+        let requirementString = signingIdentityRequirementString(for: requirementMode)
 
         var requirement: SecRequirement?
         let requirementStatus = SecRequirementCreateWithString(requirementString as CFString, [], &requirement)

@@ -17,6 +17,32 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 class ReleaseToolingTests(unittest.TestCase):
+    def test_sparkle_start_is_deferred_until_release_bundle_verification(self) -> None:
+        app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
+            encoding="utf-8"
+        )
+        sparkle_manager = (
+            SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "Sparkle" / "SparkleUpdateManager.swift"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("startingUpdater: false", app_delegate)
+        verification = app_delegate.index("let isValid = try await verificationService.verify()")
+        release_activation = app_delegate.index("sparkleManager.startUpdater()", verification)
+        self.assertLess(verification, release_activation)
+        manager_init = sparkle_manager.split("init(updaterController: SPUStandardUpdaterController) {", 1)[1].split(
+            "\n    func startUpdater()", 1
+        )[0]
+        self.assertNotIn("updaterController.startUpdater()", manager_init)
+        self.assertIn("guard sparkleConfigurationValid, !updaterStarted else { return }", sparkle_manager)
+        self.assertIn("guard updaterStarted, sparkleConfigurationValid else { return false }", sparkle_manager)
+
+    def test_ci_secret_scan_covers_introduced_commit_range_and_checked_out_tree(self) -> None:
+        workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+
+        self.assertIn("fetch-depth: 0", workflow)
+        self.assertIn('gitleaks git --redact --log-opts="$range" .', workflow)
+        self.assertIn("gitleaks dir --redact .", workflow)
+
     def test_publish_staged_validates_before_creating_dist(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
         publish_staged = release_script.split("publish_staged_release() {", 1)[1].split("\n}", 1)[0]

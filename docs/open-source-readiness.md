@@ -1,6 +1,6 @@
 # Open-Source and Release Readiness Notes
 
-Current as of 2026-05-31. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice or a substitute for legal review.
+Current as of 2026-06-01. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice or a substitute for legal review.
 
 ## Release metadata and signing
 
@@ -81,46 +81,27 @@ guardrail keeps the resolved SwiftPM inventory aligned with `Package.resolved`
 and verifies the copied notice checksums, including the complete curated
 Tree-sitter bundle.
 
-## Remaining public-release blockers
+## Public release readiness status
 
-Completed setup on 2026-05-31:
+Completed setup through 2026-06-01:
 
 - Registered the explicit Apple Developer App ID `com.pvncher.repoprompt.ce`.
 - Created and validated the `RepoPromptCEDeveloperID` Developer ID provisioning profile for `648A27MST5.com.pvncher.repoprompt.ce`.
 - Enabled App Store Connect API access, created a least-privilege `Developer` team key for notarization, and verified its credentials with a read-only `notarytool history` request.
 - Created the GitHub `release` environment, stored its Developer ID PKCS#12, export password, ephemeral CI keychain password, CE provisioning profile, CE Sparkle private key, and `NOTARYTOOL_*` secrets, and set the `SIGN_IDENTITY` environment variable.
+- Enabled required-reviewer protection for the `release` environment and restricted deployment branches to protected `main`.
+- Added an immutable `v*` release-tag ruleset that permits new tags while preventing updates and deletion after creation.
+- Enabled GitHub Release immutability for both `repoprompt/repoprompt-ce` and `repoprompt/repoprompt-ce-updates`.
+- Added the fine-grained `PUBLIC_UPDATE_REPOSITORY_TOKEN` secret scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission.
+- Published the source repository, reran CI, and exercised the protected **Publish Release** draft and **Promote Release** flow through public publication.
 - Kept the opted-in contributor cohort in the tracked `.github/APPROVED_CONTRIBUTORS` file so changes remain public and reviewable. The issue and pull-request gates read that default-branch file directly.
 - Curated copied license and notice files for every remote dependency in the resolved root SwiftPM graph and added machine guardrails for inventory drift and copied-file checksums.
 - Added the environment-scoped **Promote Release** workflow. It uses trusted tooling pinned to a validated `main` SHA, requires the requested tag to be reachable from protected `main`, verifies reviewed source-draft assets and ZIP/DMG contents, validates packaged legal files and the protected CE Sparkle private key, mirrors update assets into `repoprompt-ce-updates`, enforces monotonically increasing stable builds, resumes matching partial states, publishes without rebuilding, explicitly selects the latest release, and runs anonymous post-publish checks.
 
-Pre-public validation limitation:
-
-- The source repository is currently private, and newly queued GitHub Actions
-  jobs fail before runner startup with GitHub's billing-or-spending-limit
-  annotation. This is not expected to block the public workflow:
-  [GitHub documents](https://docs.github.com/en/billing/concepts/product-billing/github-actions)
-  that standard GitHub-hosted runners are free in public repositories, and CE's
-  workflows use the standard `macos-26` label rather than a larger-runner label.
-  After switching the source repository public, rerun CI and **Publish Release**
-  before relying on the release path.
-
-Remaining blockers:
-
-- Enable a GitHub configuration that exposes required-reviewer protection for
-  the `release` environment and restrict its deployment branches to protected
-  `main`. The current private-repository settings do not expose a
-  required-reviewer control.
-- Add an immutable `v*` release-tag ruleset that allows new tag creation but
-  prevents updates and deletion after creation.
-- Enable GitHub Release immutability for both the source repository and
-  `repoprompt-ce-updates` before the first stable publish.
-- Add the `PUBLIC_UPDATE_REPOSITORY_TOKEN` secret to the protected `release`
-  environment before production promotion. Use a fine-grained GitHub token
-  scoped only to `repoprompt/repoprompt-ce-updates` with repository contents
-  read/write permission.
-- After switching the source repository public, rerun CI, create and test the
-  first **Publish Release** draft, dispatch **Promote Release**, and confirm an
-  installed app updates through the public channel.
+The previously tracked external GitHub configuration gates are complete and are
+no longer public-release blockers. Continue to verify an installed app update
+through the public channel for each release candidate before relying on a new
+stable update.
 
 ## Contributor validation touchpoints
 
