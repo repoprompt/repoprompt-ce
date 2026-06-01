@@ -8,12 +8,15 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: ["waiting_for_user_input"]))
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
+        let waitingStatus = "Codex reports it is waiting for user input…"
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(.assistantDelta("progress"), session: session)
 
-        try await waitUntil { controller.readSnapshotCountSync() > 0 }
+        try await waitUntil {
+            controller.readSnapshotCountSync() > 0 && session.runningStatusText == waitingStatus
+        }
 
-        XCTAssertEqual(session.runningStatusText, "Codex reports it is waiting for user input…")
+        XCTAssertEqual(session.runningStatusText, waitingStatus)
         XCTAssertFalse(session.items.contains { item in
             item.kind == .error && item.text.contains("Repo Prompt thinks Codex has stalled")
         })
