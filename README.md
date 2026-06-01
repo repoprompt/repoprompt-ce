@@ -27,6 +27,10 @@ For development and quick evaluation, double-click
 The launcher builds RepoPrompt CE from source, opens the debug app, and keeps a
 small terminal window available for rebuild, status, and stop controls.
 
+> **Note:** If you use the debug app to modify RepoPrompt CE itself, validation
+> will rebuild and relaunch the app. Expect the debug app to restart while those
+> checks run.
+
 | Key | Action                                      |
 | --- | ------------------------------------------- |
 | `r` | Rebuild and relaunch                        |
