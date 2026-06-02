@@ -1,6 +1,6 @@
 # Open-Source and Release Readiness Notes
 
-Current as of 2026-06-01. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice or a substitute for legal review.
+Current as of 2026-06-02. This is a contributor/maintainer inventory for RepoPrompt CE's public-readiness work. It documents the current state and follow-ups; it is not legal advice or a substitute for legal review.
 
 ## Release metadata and signing
 
@@ -41,6 +41,25 @@ repository. This keeps the appcast and signed updater ZIP anonymously
 downloadable while the source repository remains private during validation.
 The organization currently disables GitHub Pages creation, so the feed uses
 public GitHub Release assets in that repository rather than Pages.
+
+Release validation semantically couples Sparkle installer-launcher configuration
+to the app's entitlement sandbox state. RepoPrompt CE is currently
+non-sandboxed, so `SUEnableInstallerLauncherService` and other Sparkle
+sandbox-service keys must remain absent or `false` unless maintainers migrate
+the app to sandboxed entitlements in the same release configuration change. A
+future sandbox migration should update the Info.plist template and all release
+entitlement profiles together so static validation can prove the update channel
+configuration is coherent.
+
+Known update-channel limitation: v1.0.0 shipped with
+`SUEnableInstallerLauncherService=true` even though the CE app was
+non-sandboxed. An installed v1.0.0 app may detect v1.0.2 or later but fail while
+connecting to Sparkle's installer. Because the already-running v1.0.0 updater
+configuration controls that attempted self-update, later source fixes cannot
+repair v1.0.0 before replacement; manual installation of the latest release is
+the official workaround. Continue to verify future candidates with static
+release validation and, when available, a dedicated self-update smoke from a
+known-good previous release.
 
 ## Dependency pins
 

@@ -102,6 +102,7 @@ for path in root.rglob("*"):
 PYTHON
 
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"
+"$SCRIPT_DIR/validate_sparkle_helper_layout.sh" "$APP_BUNDLE" "Staged app Sparkle helper layout"
 
 [[ "$(cat "$ROOT_DIR/RELEASE_COMMIT")" == "$RELEASE_COMMIT" ]] ||
     fail "Staged release commit does not match approved commit"
@@ -135,5 +136,10 @@ for key, value in {
 if plistlib.loads(text.encode("utf-8")) != plistlib.loads(Path(actual).read_bytes()):
     raise SystemExit("ERROR: staged Info.plist does not match the approved release candidate")
 PYTHON
+
+python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py" \
+    "$APP_BUNDLE/Contents/Info.plist" \
+    "$APPROVED_SOURCE_ROOT/AppBundle/RepoPrompt.entitlements.template" \
+    "$APPROVED_SOURCE_ROOT/AppBundle/RepoPrompt.local-self-signed.entitlements.template"
 
 printf 'OK: staged release payload matches approved source and confined path policy.\n'

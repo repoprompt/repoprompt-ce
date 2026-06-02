@@ -50,6 +50,10 @@ validate_embedded_mcp_helper_layout() {
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$@"
 }
 
+validate_sparkle_helper_layout() {
+    "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh" "$@"
+}
+
 require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
 }
@@ -154,6 +158,7 @@ validate_app_bundle() {
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
+    validate_sparkle_helper_layout "$app_bundle" "Reviewed ZIP Sparkle helper layout"
 }
 
 validate_dmg_matches_zip_app() {
@@ -166,6 +171,7 @@ validate_dmg_matches_zip_app() {
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
+    validate_sparkle_helper_layout "$dmg_app" "Mounted DMG Sparkle helper layout"
 
     hdiutil detach "$DMG_MOUNT_POINT" >/dev/null
     DMG_MOUNT_POINT=""
@@ -243,6 +249,7 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"

@@ -94,6 +94,9 @@ jobs:
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
             extracted/RepoPrompt.app \
             "Reviewed ZIP MCP helper layout"
+          ./trusted-control-plane/Scripts/validate_sparkle_helper_layout.sh \
+            extracted/RepoPrompt.app \
+            "Reviewed ZIP Sparkle helper layout"
 
       - name: Execute reviewed helper without inherited secrets
         run: |

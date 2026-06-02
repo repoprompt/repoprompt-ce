@@ -37,6 +37,8 @@ trap cleanup EXIT
 [[ -x "$GENERATE_APPCAST" ]] || fail "Missing Sparkle generate_appcast tool: $GENERATE_APPCAST"
 [[ -x "$ROOT_DIR/Scripts/validate_embedded_mcp_helper_layout.sh" ]] ||
     fail "Missing embedded MCP helper layout validator"
+[[ -x "$ROOT_DIR/Scripts/validate_sparkle_helper_layout.sh" ]] ||
+    fail "Missing Sparkle helper layout validator"
 
 for command in codesign curl ditto gh plutil shasum xcrun; do
     require_command "$command"
@@ -69,6 +71,7 @@ printf '%s\n' "$signature_details" | grep -q '^Authority=Developer ID Applicatio
     fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team_identifier:-<missing>}"
 xcrun stapler validate "$APP_BUNDLE"
 "$ROOT_DIR/Scripts/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Public updater ZIP MCP helper layout"
+"$ROOT_DIR/Scripts/validate_sparkle_helper_layout.sh" "$APP_BUNDLE" "Public updater ZIP Sparkle helper layout"
 
 bundle_identifier="$(plutil -extract CFBundleIdentifier raw "$APP_BUNDLE/Contents/Info.plist")"
 marketing_version="$(plutil -extract CFBundleShortVersionString raw "$APP_BUNDLE/Contents/Info.plist")"

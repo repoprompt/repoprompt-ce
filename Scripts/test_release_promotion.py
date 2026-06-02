@@ -151,11 +151,13 @@ class ReleasePromotionTests(unittest.TestCase):
             scripts / "validate_embedded_mcp_helper_layout.sh",
         )
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
+        shutil.copy2(SCRIPT_DIR / "validate_sparkle_helper_layout.sh", scripts / "validate_sparkle_helper_layout.sh")
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "promote_release.sh").chmod(0o755)
         (scripts / "validate_embedded_mcp_helper_layout.sh").chmod(0o755)
         (scripts / "validate_packaged_legal.sh").chmod(0o755)
+        (scripts / "validate_sparkle_helper_layout.sh").chmod(0o755)
         self.write_stub(scripts, "verify_remote_release_commit.sh", "printf 'OK: fixture remote tag remains bound.\\n'\n")
         self.write_stub(scripts, "verify_sparkle_vendor.sh", "printf 'OK: fixture Sparkle payload matches.\\n'\n")
         (root / "version.env").write_text(
@@ -179,6 +181,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
         (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        self.write_sparkle_helper_layout(app)
         self.write_legal_tree(root, app)
         shutil.copytree(app, dmg_app, symlinks=True)
         if mismatched_dmg_app:
@@ -415,6 +418,33 @@ class ReleasePromotionTests(unittest.TestCase):
         if mode == "promote" and result.returncode == 0:
             (temp_dir / "promotion-published").touch()
         return result, capture, tool_capture
+
+    @staticmethod
+    def write_sparkle_helper_layout(app: Path) -> None:
+        framework = app / "Contents" / "Frameworks" / "Sparkle.framework"
+        version_b = framework / "Versions" / "B"
+        for directory in (
+            version_b / "Headers",
+            version_b / "Modules",
+            version_b / "PrivateHeaders",
+            version_b / "Resources",
+            version_b / "Updater.app" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        for executable in (
+            version_b / "Autoupdate",
+            version_b / "Sparkle",
+            version_b / "Updater.app" / "Contents" / "MacOS" / "Updater",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS" / "Installer",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS" / "Downloader",
+        ):
+            executable.write_text(f"{executable.name}\n", encoding="utf-8")
+            executable.chmod(0o755)
+        (framework / "Versions" / "Current").symlink_to("B")
+        for name in ("Autoupdate", "Headers", "Modules", "PrivateHeaders", "Resources", "Sparkle", "Updater.app", "XPCServices"):
+            (framework / name).symlink_to(f"Versions/Current/{name}")
 
     @staticmethod
     def write_legal_tree(root: Path, app: Path) -> None:

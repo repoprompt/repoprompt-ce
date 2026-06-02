@@ -58,6 +58,19 @@ Apple Development signing path.
 | `x` | Stop the app                                |
 | `q` | Close the launcher without stopping the app |
 
+### Updating from v1.0.0
+
+If RepoPrompt CE v1.0.0 detects v1.0.2 or later but fails with:
+
+```text
+Update Error! An error occurred while connecting to the installer. Please try again later.
+```
+
+manually download and install the latest RepoPrompt CE release. v1.0.0's running
+Sparkle updater configuration controls that attempted self-update, so a later
+release cannot repair the already-running v1.0.0 installer path before the app is
+replaced. After the manual install, normal in-app updates should resume.
+
 ### Install a local production build
 
 For a release-mode app under `/Applications`, install Python 3 and double-click
