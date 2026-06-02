@@ -12,6 +12,25 @@ struct WorkspaceReadableFileService {
         self.homeDirectoryURL = homeDirectoryURL
     }
 
+    static func exactAbsoluteCatalogHitInput(_ rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        return expanded
+    }
+
+    func resolveExactAbsoluteWorkspaceCatalogHit(
+        _ rawPath: String,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceFileRecord? {
+        guard let absolutePath = Self.exactAbsoluteCatalogHitInput(rawPath) else { return nil }
+        guard case let .matched(file) = await store.lookupCatalogFileForExplicitRequest(absolutePath, rootScope: rootScope) else {
+            return nil
+        }
+        return file
+    }
+
     func resolveReadableFile(
         _ userPath: String,
         profile: PathLocateProfile = .mcpRead,

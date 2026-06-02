@@ -2919,7 +2919,7 @@ final class MCPServerViewModel: ObservableObject {
     ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
-        let (roots, readableFile) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
+        let (roots, readableFile): ([WorkspaceRootRef], WorkspaceReadableFileHandle?) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
             let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)
             let exactPathIssue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope)
             EditFlowPerf.end(
@@ -2934,6 +2934,10 @@ final class MCPServerViewModel: ObservableObject {
             let rootRefsLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.rootRefsLookup)
             let roots = await store.rootRefs(scope: lookupRootScope)
             EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
+
+            if let exactAbsoluteCatalogHit = await readableService.resolveExactAbsoluteWorkspaceCatalogHit(path, rootScope: lookupRootScope) {
+                return (roots, WorkspaceReadableFileHandle.workspace(exactAbsoluteCatalogHit))
+            }
 
             let folderResolutionStage = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolution)
             let folderResolution = await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)
