@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -108,6 +109,12 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Appcast enclosure URL mismatch", result.stderr)
 
+    def test_verify_rejects_reviewed_zip_with_incompatible_sparkle_configuration(self) -> None:
+        result, _capture, _tools = self.run_promotion("verify", installer_launcher_enabled=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-sandboxed apps must not enable Sparkle sandbox services", result.stderr)
+
     def test_verify_rejects_tag_that_disagrees_with_release_metadata(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", release_tag="v1.0.1")
 
@@ -132,6 +139,7 @@ class ReleasePromotionTests(unittest.TestCase):
         latest_http_status: str = "404",
         reviewed_checksums_sha256: str = "",
         release_tag: str = "v1.0.0",
+        installer_launcher_enabled: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -152,6 +160,10 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
         shutil.copy2(SCRIPT_DIR / "validate_sparkle_helper_layout.sh", scripts / "validate_sparkle_helper_layout.sh")
+        shutil.copy2(
+            SCRIPT_DIR / "validate_sparkle_update_configuration.py",
+            scripts / "validate_sparkle_update_configuration.py",
+        )
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "promote_release.sh").chmod(0o755)
@@ -173,7 +185,16 @@ class ReleasePromotionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (app / "Contents" / "Info.plist").write_text("fixture plist\n", encoding="utf-8")
+        info_plist = {
+            "CFBundleIdentifier": "com.pvncher.repoprompt.ce",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": "1",
+            "SUFeedURL": "https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml",
+            "SUPublicEDKey": "fixture-public-key",
+        }
+        if installer_launcher_enabled:
+            info_plist["SUEnableInstallerLauncherService"] = True
+        self.write_plist(app / "Contents" / "Info.plist", info_plist)
         self.write_stub(
             app / "Contents" / "MacOS",
             "repoprompt-mcp",
@@ -302,6 +323,12 @@ class ReleasePromotionTests(unittest.TestCase):
             """\
             if [[ "$1" == "-dv" ]]; then
                 printf 'Authority=Developer ID Application: Fixture (648A27MST5)\\nTeamIdentifier=648A27MST5\\n' >&2
+            elif [[ "$1" == "-d" && "$2" == "--entitlements" ]]; then
+                cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict/></plist>
+PLIST
             fi
             """,
         )
@@ -457,6 +484,11 @@ class ReleasePromotionTests(unittest.TestCase):
         shutil.copy2(root / "LICENSE", legal / "LICENSE")
         shutil.copy2(root / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")
         shutil.copytree(root / "ThirdPartyLicenses", legal / "ThirdPartyLicenses")
+
+    @staticmethod
+    def write_plist(path: Path, value: dict[str, object]) -> Path:
+        path.write_bytes(plistlib.dumps(value))
+        return path
 
     @staticmethod
     def sha256(path: Path) -> str:

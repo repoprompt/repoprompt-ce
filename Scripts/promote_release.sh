@@ -54,6 +54,17 @@ validate_sparkle_helper_layout() {
     "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh" "$@"
 }
 
+validate_sparkle_update_configuration() {
+    local app_bundle="$1"
+    local label="$2"
+    local entitlements_plist="$TMP_DIR/${label//[^A-Za-z0-9_.-]/-}-entitlements.plist"
+    codesign -d --entitlements :- "$app_bundle" > "$entitlements_plist" 2>/dev/null ||
+        fail "Unable to extract signed entitlements for $label"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py" \
+        "$app_bundle/Contents/Info.plist" \
+        "$entitlements_plist"
+}
+
 require_env() {
     [[ -n "${!1:-}" ]] || fail "Missing required environment variable: $1"
 }
@@ -159,6 +170,7 @@ validate_app_bundle() {
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
     validate_sparkle_helper_layout "$app_bundle" "Reviewed ZIP Sparkle helper layout"
+    validate_sparkle_update_configuration "$app_bundle" "Reviewed ZIP Sparkle update configuration"
 }
 
 validate_dmg_matches_zip_app() {
@@ -250,6 +262,7 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"

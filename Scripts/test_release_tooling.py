@@ -62,7 +62,14 @@ class ReleaseToolingTests(unittest.TestCase):
                 {"SUEnableInstallerLauncherService": True},
                 [non_sandboxed],
                 1,
-                "non-sandboxed apps must not enable SUEnableInstallerLauncherService",
+                "non-sandboxed apps must not enable Sparkle sandbox services",
+            ),
+            (
+                "non-sandboxed downloader true",
+                {"SUEnableDownloaderService": True},
+                [non_sandboxed],
+                1,
+                "non-sandboxed apps must not enable Sparkle sandbox services",
             ),
             (
                 "sandboxed missing launcher",
@@ -149,6 +156,8 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', release_script)
         self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', release_script)
         self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', package_script)
+        self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', promote_script)
+        self.assertIn('python3 "$ROOT_DIR/Scripts/validate_sparkle_update_configuration.py"', public_update_script)
         self.assertIn('python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py"', staged_signing_script)
         staged_validator = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
         self.assertIn('python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py"', staged_validator)

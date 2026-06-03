@@ -10,7 +10,12 @@ from pathlib import Path
 from typing import Any
 
 SANDBOX_ENTITLEMENT_KEY = "com.apple.security.app-sandbox"
-SPARKLE_SANDBOX_SERVICE_KEYS = ("SUEnableInstallerLauncherService",)
+SPARKLE_SANDBOX_SERVICE_KEYS = (
+    "SUEnableInstallerLauncherService",
+    "SUEnableDownloaderService",
+    "SUEnableInstallerConnectionService",
+    "SUEnableInstallerStatusService",
+)
 
 
 def fail(message: str) -> None:
@@ -59,12 +64,18 @@ def validate(info_plist_path: Path, entitlement_paths: list[Path]) -> None:
         fail(f"entitlement profiles disagree on sandbox state: {details}")
 
     is_sandboxed = next(iter(derived_states))
+    enabled_sandbox_services = [
+        key for key in SPARKLE_SANDBOX_SERVICE_KEYS if info_plist.get(key) is True
+    ]
     installer_launcher_enabled = info_plist.get("SUEnableInstallerLauncherService") is True
 
     if is_sandboxed and not installer_launcher_enabled:
         fail("sandboxed apps must set SUEnableInstallerLauncherService to true for Sparkle installer-launcher support")
-    if not is_sandboxed and installer_launcher_enabled:
-        fail("non-sandboxed apps must not enable SUEnableInstallerLauncherService")
+    if not is_sandboxed and enabled_sandbox_services:
+        fail(
+            "non-sandboxed apps must not enable Sparkle sandbox services: "
+            + ", ".join(enabled_sandbox_services)
+        )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
