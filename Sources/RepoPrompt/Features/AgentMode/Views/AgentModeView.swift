@@ -36,6 +36,8 @@ struct AgentModeView: View {
         _rootsSidebarStore = StateObject(wrappedValue: AgentWorkspaceRootsSidebarStore(
             rootProjections: { windowState.workspaceFilesViewModel.visibleRootShellProjections },
             rootChanges: windowState.workspaceFilesViewModel.objectWillChange.map { _ in () }.eraseToAnyPublisher(),
+            gitContextLookup: { promptManager.gitViewModel.gitWorktreeContext(forStandardizedRootPath: $0) },
+            gitContextChanges: promptManager.gitViewModel.gitWorktreeContextChanges,
             workspaceManager: windowState.workspaceManager,
             windowID: windowState.windowID
         ))

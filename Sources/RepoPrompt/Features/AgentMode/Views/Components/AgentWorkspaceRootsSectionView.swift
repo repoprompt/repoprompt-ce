@@ -148,8 +148,7 @@ struct AgentWorkspaceRootsSectionView: View {
         if let direct = worktreeIndicatorsByLogicalRootPath[row.fullPath] {
             return direct
         }
-        let standardized = URL(fileURLWithPath: row.fullPath).standardizedFileURL.path
-        return worktreeIndicatorsByLogicalRootPath[standardized]
+        return worktreeIndicatorsByLogicalRootPath[row.standardizedFullPath]
     }
 
     /// Resolves the active worktree merge attention for `row`, if any.
@@ -157,8 +156,7 @@ struct AgentWorkspaceRootsSectionView: View {
         if let direct = worktreeMergeAttentionsByLogicalRootPath[row.fullPath] {
             return direct
         }
-        let standardized = URL(fileURLWithPath: row.fullPath).standardizedFileURL.path
-        return worktreeMergeAttentionsByLogicalRootPath[standardized]
+        return worktreeMergeAttentionsByLogicalRootPath[row.standardizedFullPath]
     }
 
     private var estimatedFolderListHeight: CGFloat {
@@ -354,6 +352,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .layoutPriority(1)
 
             if row.isPrimary {
                 Text("PRIMARY")
@@ -365,6 +364,11 @@ struct AgentWorkspaceRootsSectionView: View {
                         Capsule()
                             .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75)
                     )
+            }
+
+            if let gitContext = row.gitContext {
+                gitContextCapsule(gitContext)
+                    .layoutPriority(-1)
             }
 
             if let worktree = row.worktree {
@@ -428,6 +432,31 @@ struct AgentWorkspaceRootsSectionView: View {
             hoveredRootID = hovered ? row.id : nil
         }
         .hoverTooltip(row.fullPath, .top)
+    }
+
+    // MARK: - Git Context Capsule
+
+    private func gitContextCapsule(_ context: GitWorktreeContextSummary) -> some View {
+        HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
+            Image(systemName: "point.topleft.down.curvedto.point.bottomright.up")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
+            Text(context.breadcrumbText)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .frame(maxWidth: fontPreset.scaledClamped(118, min: 72, max: 150), alignment: .leading)
+        }
+        .foregroundColor(.secondary)
+        .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
+        .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
+        .background(
+            Capsule().fill(Color.secondary.opacity(0.10))
+        )
+        .overlay(
+            Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75)
+        )
+        .hoverTooltip(context.tooltipText, .top)
+        .accessibilityLabel(context.accessibilityText)
     }
 
     // MARK: - Worktree Capsule

@@ -17,7 +17,9 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows.map(\.isPrimary), [true, false, false])
         XCTAssertEqual(rows.map(\.canMoveUp), [false, true, true])
         XCTAssertEqual(rows.map(\.canMoveDown), [true, true, false])
+        XCTAssertEqual(rows.map(\.standardizedFullPath), [rootA.standardizedFullPath, rootB.standardizedFullPath, rootC.standardizedFullPath])
         XCTAssertEqual(rows.map(\.worktree), [nil, nil, nil])
+        XCTAssertEqual(rows.map(\.gitContext), [nil, nil, nil])
     }
 
     func testRowsDoNotMarkSingleRootAsPrimaryOrMovable() {
@@ -30,11 +32,28 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 id: root.id,
                 name: "Only",
                 fullPath: "/tmp/Only",
+                standardizedFullPath: root.standardizedFullPath,
                 isPrimary: false,
                 canMoveUp: false,
                 canMoveDown: false
             )
         ])
+    }
+
+    func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
+        let rootA = makeProjection(name: "A", path: "/tmp/A")
+        let rootB = makeProjection(name: "B", path: "/tmp/B")
+        let contextB = makeGitContext(repository: "Repo", worktree: "B", branch: "feature/b")
+
+        let rows = AgentWorkspaceRootsSidebarStore.rows(from: [rootA, rootB]) { path in
+            path == rootB.standardizedFullPath ? contextB : nil
+        }
+
+        XCTAssertEqual(rows.map(\.id), [rootA.id, rootB.id])
+        XCTAssertEqual(rows.map(\.isPrimary), [true, false])
+        XCTAssertNil(rows[0].gitContext)
+        XCTAssertEqual(rows[1].gitContext, contextB)
+        XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
     }
 
     // MARK: - Worktree indicators (Item 10)
@@ -57,9 +76,30 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(enriched.id, base.id)
         XCTAssertEqual(enriched.name, base.name)
         XCTAssertEqual(enriched.fullPath, base.fullPath)
+        XCTAssertEqual(enriched.standardizedFullPath, base.standardizedFullPath)
         XCTAssertEqual(enriched.isPrimary, base.isPrimary)
         XCTAssertEqual(enriched.canMoveUp, base.canMoveUp)
         XCTAssertEqual(enriched.canMoveDown, base.canMoveDown)
+        XCTAssertEqual(enriched.gitContext, base.gitContext)
+    }
+
+    func testWithWorktreePreservesGitContext() {
+        let context = makeGitContext(repository: "Repo", worktree: "repo", branch: "main")
+        let base = AgentWorkspaceRootRow(
+            id: UUID(),
+            name: "Repo",
+            fullPath: "/tmp/Repo",
+            isPrimary: true,
+            canMoveUp: false,
+            canMoveDown: true,
+            gitContext: context
+        )
+        let indicator = makeIndicator()
+
+        let enriched = base.withWorktree(indicator)
+
+        XCTAssertEqual(enriched.gitContext, context)
+        XCTAssertEqual(enriched.worktree, indicator)
     }
 
     func testIndicatorMakePrefersBindingColorAndLabel() {
@@ -166,6 +206,24 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             visualLabel: visualLabel,
             visualColorHex: visualColorHex,
             boundAt: Date()
+        )
+    }
+
+    private func makeGitContext(
+        repository: String,
+        worktree: String,
+        branch: String?
+    ) -> GitWorktreeContextSummary {
+        GitWorktreeContextSummary(
+            repositoryID: "gitrepo-test",
+            repoKey: "repo-test",
+            repositoryDisplayName: repository,
+            worktreeID: "wt-test",
+            worktreePath: "/tmp/\(worktree)",
+            worktreeName: worktree,
+            branch: branch,
+            head: "1234567890abcdef",
+            isDetached: false
         )
     }
 

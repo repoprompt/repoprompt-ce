@@ -5,42 +5,45 @@ struct AgentWorkspaceRootRow: Identifiable, Equatable {
     let id: UUID
     let name: String
     let fullPath: String
+    let standardizedFullPath: String
     let isPrimary: Bool
     let canMoveUp: Bool
     let canMoveDown: Bool
-    /// Bound-worktree visual identity for the active Agent session, when this
-    /// logical root is bound (Item 10). Populated by the roots section view,
-    /// not by `rows(from:)` — the store stays session-agnostic.
+    let gitContext: GitWorktreeContextSummary?
     let worktree: AgentWorktreeIndicator?
 
     init(
         id: UUID,
         name: String,
         fullPath: String,
+        standardizedFullPath: String? = nil,
         isPrimary: Bool,
         canMoveUp: Bool,
         canMoveDown: Bool,
+        gitContext: GitWorktreeContextSummary? = nil,
         worktree: AgentWorktreeIndicator? = nil
     ) {
         self.id = id
         self.name = name
         self.fullPath = fullPath
+        self.standardizedFullPath = standardizedFullPath ?? StandardizedPath.absolute(fullPath)
         self.isPrimary = isPrimary
         self.canMoveUp = canMoveUp
         self.canMoveDown = canMoveDown
+        self.gitContext = gitContext
         self.worktree = worktree
     }
 
-    /// Returns a copy of this row carrying `worktree` as its bound-worktree
-    /// identity. Used to enrich store-derived rows with active-session state.
     func withWorktree(_ worktree: AgentWorktreeIndicator?) -> AgentWorkspaceRootRow {
         AgentWorkspaceRootRow(
             id: id,
             name: name,
             fullPath: fullPath,
+            standardizedFullPath: standardizedFullPath,
             isPrimary: isPrimary,
             canMoveUp: canMoveUp,
             canMoveDown: canMoveDown,
+            gitContext: gitContext,
             worktree: worktree
         )
     }
@@ -54,6 +57,8 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
 
     private let rootProjections: @MainActor () -> [WorkspaceRootShellProjection]
     private let rootChanges: AnyPublisher<Void, Never>
+    private let gitContextLookup: @MainActor (String) -> GitWorktreeContextSummary?
+    private let gitContextChanges: AnyPublisher<Void, Never>
     private let workspaceManager: WorkspaceManagerViewModel
     let windowID: Int
 
@@ -67,11 +72,15 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     init(
         rootProjections: @escaping @MainActor () -> [WorkspaceRootShellProjection],
         rootChanges: AnyPublisher<Void, Never>,
+        gitContextLookup: @escaping @MainActor (String) -> GitWorktreeContextSummary? = { _ in nil },
+        gitContextChanges: AnyPublisher<Void, Never> = Empty<Void, Never>().eraseToAnyPublisher(),
         workspaceManager: WorkspaceManagerViewModel,
         windowID: Int
     ) {
         self.rootProjections = rootProjections
         self.rootChanges = rootChanges
+        self.gitContextLookup = gitContextLookup
+        self.gitContextChanges = gitContextChanges
         self.workspaceManager = workspaceManager
         self.windowID = windowID
 
@@ -83,16 +92,21 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
         resnapshotTask?.cancel()
     }
 
-    static func rows(from projections: [WorkspaceRootShellProjection]) -> [AgentWorkspaceRootRow] {
+    static func rows(
+        from projections: [WorkspaceRootShellProjection],
+        gitContextLookup: (String) -> GitWorktreeContextSummary? = { _ in nil }
+    ) -> [AgentWorkspaceRootRow] {
         let rootCount = projections.count
         return projections.enumerated().map { index, projection in
             AgentWorkspaceRootRow(
                 id: projection.id,
                 name: projection.name,
                 fullPath: projection.fullPath,
+                standardizedFullPath: projection.standardizedFullPath,
                 isPrimary: rootCount > 1 && index == 0,
                 canMoveUp: rootCount > 1 && index > 0,
-                canMoveDown: rootCount > 1 && index < rootCount - 1
+                canMoveDown: rootCount > 1 && index < rootCount - 1,
+                gitContext: gitContextLookup(projection.standardizedFullPath)
             )
         }
     }
@@ -149,6 +163,14 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
             }
             .store(in: &cancellables)
 
+        gitContextChanges
+            .sink { [weak self] in
+                Task { @MainActor in
+                    self?.scheduleResnapshot()
+                }
+            }
+            .store(in: &cancellables)
+
         workspaceManager.objectWillChange
             .sink { [weak self] _ in
                 Task { @MainActor in
@@ -170,7 +192,10 @@ final class AgentWorkspaceRootsSidebarStore: ObservableObject {
     }
 
     private func resnapshot() {
-        let nextRootRows = Self.rows(from: rootProjections())
+        let nextRootRows = Self.rows(
+            from: rootProjections(),
+            gitContextLookup: gitContextLookup
+        )
         let nextWorkspaceLabel = Self.workspaceLabel(for: workspaceManager.activeWorkspace)
         let nextIsExitDisabled = workspaceManager.activeWorkspace?.isSystemWorkspace ?? true
 

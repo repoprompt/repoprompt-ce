@@ -74,6 +74,110 @@ public struct GitWorktreeDescriptor: Sendable, Equatable, Hashable {
     }
 }
 
+public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
+    public let repositoryID: String
+    public let repoKey: String
+    public let repositoryDisplayName: String
+    public let worktreeID: String?
+    public let worktreePath: String
+    public let worktreeName: String
+    public let branch: String?
+    public let head: String?
+    public let isDetached: Bool
+
+    public init(
+        repositoryID: String,
+        repoKey: String,
+        repositoryDisplayName: String,
+        worktreeID: String?,
+        worktreePath: String,
+        worktreeName: String,
+        branch: String?,
+        head: String?,
+        isDetached: Bool
+    ) {
+        self.repositoryID = repositoryID
+        self.repoKey = repoKey
+        self.repositoryDisplayName = repositoryDisplayName
+        self.worktreeID = worktreeID
+        self.worktreePath = worktreePath
+        self.worktreeName = worktreeName
+        self.branch = Self.normalizedOptional(branch)
+        self.head = Self.normalizedOptional(head)
+        self.isDetached = isDetached
+    }
+
+    public init(descriptor: GitWorktreeDescriptor) {
+        self.init(
+            repositoryID: descriptor.repository.repositoryID,
+            repoKey: descriptor.repository.repoKey,
+            repositoryDisplayName: descriptor.repository.displayName,
+            worktreeID: descriptor.worktreeID,
+            worktreePath: descriptor.path,
+            worktreeName: descriptor.name ?? Self.fallbackWorktreeName(from: descriptor.path),
+            branch: descriptor.branch,
+            head: descriptor.head,
+            isDetached: descriptor.isDetached
+        )
+    }
+
+    public var branchDisplayText: String? {
+        if let branch {
+            return branch
+        }
+        if isDetached, let short = shortHead {
+            return "detached @ \(short)"
+        }
+        if let short = shortHead {
+            return "HEAD @ \(short)"
+        }
+        return nil
+    }
+
+    public var breadcrumbText: String {
+        [repositoryDisplayName, worktreeName, branchDisplayText]
+            .compactMap(\.self)
+            .filter { !$0.isEmpty }
+            .joined(separator: " / ")
+    }
+
+    public var tooltipText: String {
+        let branchText = branchDisplayText ?? "unknown branch"
+        var parts = [
+            "Repository: \(repositoryDisplayName)",
+            "Worktree: \(worktreeName)",
+            "Branch: \(branchText)",
+            "Path: \(worktreePath)"
+        ]
+        if let head {
+            parts.insert("HEAD: \(head)", at: 3)
+        }
+        return parts.joined(separator: "\n")
+    }
+
+    public var accessibilityText: String {
+        let branchText = branchDisplayText ?? "unknown branch"
+        return "Git repository \(repositoryDisplayName), worktree \(worktreeName), branch \(branchText)"
+    }
+
+    private var shortHead: String? {
+        guard let head else { return nil }
+        return String(head.prefix(7))
+    }
+
+    private static func normalizedOptional(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        return trimmed
+    }
+
+    private static func fallbackWorktreeName(from path: String) -> String {
+        let last = URL(fileURLWithPath: path).lastPathComponent
+        return last.isEmpty ? "worktree" : last
+    }
+}
+
 public struct GitWorktreeCreateRequest: Sendable, Equatable {
     public let path: URL
     public let branch: String?

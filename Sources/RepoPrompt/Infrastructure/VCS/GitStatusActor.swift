@@ -19,6 +19,7 @@ actor GitStatusActor {
         let rootPath: String
         let isGitRepo: Bool // Kept for compatibility; true for any VCS (git or jj)
         let backendKind: VCSBackendKind?
+        let gitWorktreeContext: GitWorktreeContextSummary?
     }
 
     struct GitStatusSnapshot {
@@ -32,6 +33,7 @@ actor GitStatusActor {
         let availableBranches: [VCSBranch]
         let availableRemoteBranches: [VCSBranch]
         let availableTags: [VCSTag]
+        let gitWorktreeContext: GitWorktreeContextSummary?
 
         let totalAdditions: Int
         let totalDeletions: Int
@@ -55,6 +57,18 @@ actor GitStatusActor {
         let isRepo: Bool
         let repoRootPath: String?
         let backendKind: VCSBackendKind?
+        let resolvedRepo: VCSResolvedRepo?
+        let gitWorktreeContext: GitWorktreeContextSummary?
+    }
+
+    private struct RootContextRequest {
+        let rootPath: String
+        let resolved: VCSResolvedRepo
+    }
+
+    private struct RootContextResult {
+        let rootPath: String
+        let context: GitWorktreeContextSummary?
     }
 
     /// rootPath -> repo info
@@ -113,15 +127,12 @@ actor GitStatusActor {
         let removedRoots = previousRoots.subtracting(currentRoots)
         workspaceRoots = roots
 
-        // Drop stale detections for removed roots
         rootInfos = rootInfos.filter { key, _ in currentRoots.contains(key) }
 
-        // Avoid clearing the shared VCS cache on every root publication; only invalidate removed roots.
         for root in removedRoots {
             await vcsService.invalidateCache(for: URL(fileURLWithPath: root))
         }
 
-        // Run detection in parallel for added/missing roots only.
         let rootsToDetect = roots.filter { rootInfos[$0] == nil }
         await withTaskGroup(of: (String, RootInfo).self) { group in
             for root in rootsToDetect {
@@ -131,10 +142,18 @@ actor GitStatusActor {
                         return (root, RootInfo(
                             isRepo: true,
                             repoRootPath: resolved.rootURL.path,
-                            backendKind: resolved.backendKind
+                            backendKind: resolved.backendKind,
+                            resolvedRepo: resolved,
+                            gitWorktreeContext: nil
                         ))
                     } else {
-                        return (root, RootInfo(isRepo: false, repoRootPath: nil, backendKind: nil))
+                        return (root, RootInfo(
+                            isRepo: false,
+                            repoRootPath: nil,
+                            backendKind: nil,
+                            resolvedRepo: nil,
+                            gitWorktreeContext: nil
+                        ))
                     }
                 }
             }
@@ -144,13 +163,64 @@ actor GitStatusActor {
             }
         }
 
+        await refreshGitWorktreeContexts(for: roots)
+
         return roots.map { root in
             let info = rootInfos[root]
             return RepoDetection(
                 rootPath: root,
                 isGitRepo: info?.isRepo ?? false,
-                backendKind: info?.backendKind
+                backendKind: info?.backendKind,
+                gitWorktreeContext: info?.gitWorktreeContext
             )
+        }
+    }
+
+    private func refreshGitWorktreeContexts(for roots: [String]) async {
+        let requests = roots.compactMap { root -> RootContextRequest? in
+            guard let info = rootInfos[root],
+                  info.backendKind == .git,
+                  let resolved = info.resolvedRepo
+            else { return nil }
+            return RootContextRequest(rootPath: root, resolved: resolved)
+        }
+        guard !requests.isEmpty else { return }
+
+        let grouped = Dictionary(grouping: requests) { request in
+            StandardizedPath.absolute(request.resolved.rootURL.path)
+        }
+
+        await withTaskGroup(of: [RootContextResult].self) { group in
+            for groupRequests in grouped.values {
+                group.addTask { [vcsService] in
+                    guard let resolved = groupRequests.first?.resolved else { return [] }
+                    let worktrees = try? await vcsService.listGitWorktrees(for: resolved)
+                    var results: [RootContextResult] = []
+                    results.reserveCapacity(groupRequests.count)
+                    for request in groupRequests {
+                        let context = await vcsService.gitWorktreeContext(
+                            for: URL(fileURLWithPath: request.rootPath),
+                            resolved: request.resolved,
+                            worktrees: worktrees
+                        )
+                        results.append(RootContextResult(rootPath: request.rootPath, context: context))
+                    }
+                    return results
+                }
+            }
+
+            for await results in group {
+                for result in results {
+                    guard let current = rootInfos[result.rootPath] else { continue }
+                    rootInfos[result.rootPath] = RootInfo(
+                        isRepo: current.isRepo,
+                        repoRootPath: current.repoRootPath,
+                        backendKind: current.backendKind,
+                        resolvedRepo: current.resolvedRepo,
+                        gitWorktreeContext: result.context
+                    )
+                }
+            }
         }
     }
 
@@ -235,6 +305,7 @@ actor GitStatusActor {
                 availableBranches: [],
                 availableRemoteBranches: [],
                 availableTags: [],
+                gitWorktreeContext: nil,
                 totalAdditions: 0,
                 totalDeletions: 0,
                 commitDelta: nil,
@@ -270,6 +341,7 @@ actor GitStatusActor {
                 availableBranches: [],
                 availableRemoteBranches: [],
                 availableTags: [],
+                gitWorktreeContext: nil,
                 totalAdditions: 0,
                 totalDeletions: 0,
                 commitDelta: nil,
@@ -314,12 +386,14 @@ actor GitStatusActor {
         async let branchesTask = (try? backend.getLocalBranches(at: repoURL, limit: 50))
         async let remoteBranchesTask = (try? backend.getRemoteBranches(at: repoURL, limit: 10))
         async let tagsTask = (try? backend.getTags(at: repoURL, limit: 50))
+        async let gitWorktreeContextTask = vcsService.gitWorktreeContext(for: URL(fileURLWithPath: rootPath))
 
         var files: [VCSUncommittedFile] = []
         var currentBranch: String?
         var branches: [VCSBranch] = []
         var remoteBranches: [VCSBranch] = []
         var tags: [VCSTag] = []
+        var gitWorktreeContext: GitWorktreeContextSummary?
         var errorMsg: String?
         var delta: (ahead: Int, behind: Int)?
 
@@ -332,6 +406,14 @@ actor GitStatusActor {
         branches = await branchesTask ?? []
         remoteBranches = await remoteBranchesTask ?? []
         tags = await tagsTask ?? []
+        gitWorktreeContext = await gitWorktreeContextTask ?? rootInfo?.gitWorktreeContext
+        rootInfos[rootPath] = RootInfo(
+            isRepo: true,
+            repoRootPath: gitRoot,
+            backendKind: backendKind,
+            resolvedRepo: backendKind.map { VCSResolvedRepo(rootURL: repoURL, backendKind: $0) },
+            gitWorktreeContext: gitWorktreeContext
+        )
 
         // Ahead/behind for non-tag branches (only when comparing to a branch, not HEAD)
         if selectedDiffBranch != "HEAD" {
@@ -389,6 +471,7 @@ actor GitStatusActor {
             availableBranches: cappedBranches,
             availableRemoteBranches: cappedRemoteBranches,
             availableTags: tags,
+            gitWorktreeContext: gitWorktreeContext,
             totalAdditions: totalAdd,
             totalDeletions: totalDel,
             commitDelta: delta,
