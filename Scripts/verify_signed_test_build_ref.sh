@@ -35,13 +35,11 @@ fetch_args=(
 )
 server_url="${GITHUB_SERVER_URL:-https://github.com}"
 server_url="${server_url%/}/"
-if [[ -n "${GITHUB_TOKEN:-}" ]]; then
+token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+if [[ -n "$token" ]]; then
+    auth_header="$(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')"
     fetch_args+=(
-        -c "http.$server_url.extraheader=AUTHORIZATION: bearer $GITHUB_TOKEN"
-    )
-elif [[ -n "${GH_TOKEN:-}" ]]; then
-    fetch_args+=(
-        -c "http.$server_url.extraheader=AUTHORIZATION: bearer $GH_TOKEN"
+        -c "http.$server_url.extraheader=AUTHORIZATION: basic $auth_header"
     )
 fi
 fetch_args+=(
