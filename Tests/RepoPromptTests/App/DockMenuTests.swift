@@ -4,24 +4,14 @@ import XCTest
 
 @MainActor
 final class DockMenuTests: XCTestCase {
-    func testDockNewWindowMenuItemReflectsOpenerAvailability() throws {
-        defer { AppWindowOpener.shared.resetForTesting() }
-
+    func testDockNewWindowMenuItemIsAlwaysEnabled() throws {
         let delegate = AppDelegate()
 
-        AppWindowOpener.shared.resetForTesting()
-        let unavailableItem = try newWindowDockMenuItem(from: delegate)
-        XCTAssertEqual(unavailableItem.title, "New Window")
-        XCTAssertTrue(unavailableItem.target === delegate)
-        XCTAssertNotNil(unavailableItem.action)
-        XCTAssertFalse(unavailableItem.isEnabled)
-
-        AppWindowOpener.shared.installForTesting {}
-        let availableItem = try newWindowDockMenuItem(from: delegate)
-        XCTAssertEqual(availableItem.title, "New Window")
-        XCTAssertTrue(availableItem.target === delegate)
-        XCTAssertNotNil(availableItem.action)
-        XCTAssertTrue(availableItem.isEnabled)
+        let item = try newWindowDockMenuItem(from: delegate)
+        XCTAssertEqual(item.title, "New Window")
+        XCTAssertTrue(item.target === delegate)
+        XCTAssertNotNil(item.action)
+        XCTAssertTrue(item.isEnabled)
     }
 
     private func newWindowDockMenuItem(from delegate: AppDelegate) throws -> NSMenuItem {

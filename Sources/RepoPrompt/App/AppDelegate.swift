@@ -129,7 +129,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             keyEquivalent: ""
         )
         newWindowItem.target = self
-        newWindowItem.isEnabled = AppWindowOpener.shared.isAvailable
         menu.addItem(newWindowItem)
         return menu
     }
