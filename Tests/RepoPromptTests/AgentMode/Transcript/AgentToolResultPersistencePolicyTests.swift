@@ -127,6 +127,63 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
     }
 
+    func testWebSearchPersistsBoundedSummaryOnlySuccessPresentation() throws {
+        let bulkySnippet = String(repeating: "full page body ", count: 80)
+        let raw = jsonString([
+            "status": "completed",
+            "query": "native web search cards",
+            "results": [[
+                "title": "Native Web Search Cards",
+                "url": "https://example.com/search-cards",
+                "snippet": bulkySnippet
+            ]],
+            "sources": [["title": "Plan", "url": "https://example.com/plan"]]
+        ])
+        let args = jsonString(["query": "native web search cards"])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "search", rawResultJSON: raw, argsJSON: args))
+        let object = try decodedObject(summary.resultJSON)
+        let renderSummary = try XCTUnwrap(object["render_summary"] as? [String: Any])
+        let restored = try XCTUnwrap(StoredToolCardPresentation.fromSummaryOnly(raw: summary.resultJSON))
+
+        XCTAssertTrue(summary.summaryOnly)
+        XCTAssertEqual(object["summary_only"] as? Bool, true)
+        XCTAssertEqual(renderSummary["tool_name"] as? String, "search")
+        XCTAssertEqual(renderSummary["title"] as? String, "Web Search")
+        XCTAssertEqual(renderSummary["status"] as? String, "success")
+        XCTAssertTrue((renderSummary["subtitle"] as? String)?.contains("native web search cards") == true)
+        XCTAssertTrue((renderSummary["subtitle"] as? String)?.contains("1 result") == true)
+        XCTAssertTrue((renderSummary["subtitle"] as? String)?.contains("1 source") == true)
+        XCTAssertEqual(restored.title, "Web Search")
+        XCTAssertEqual(restored.status, .success)
+        XCTAssertFalse(summary.resultJSON.contains(bulkySnippet))
+        XCTAssertNil(object["results"])
+        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+    }
+
+    func testWebSearchPersistsBoundedSummaryOnlyErrorPresentation() throws {
+        let raw = jsonString([
+            "status": "failed",
+            "query": "native web search cards",
+            "error": ["message": "web search unavailable"]
+        ])
+        let args = jsonString(["query": "native web search cards"])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "web_search", rawResultJSON: raw, argsJSON: args))
+        let object = try decodedObject(summary.resultJSON)
+        let renderSummary = try XCTUnwrap(object["render_summary"] as? [String: Any])
+        let restored = try XCTUnwrap(StoredToolCardPresentation.fromSummaryOnly(raw: summary.resultJSON))
+
+        XCTAssertTrue(summary.summaryOnly)
+        XCTAssertEqual(renderSummary["tool_name"] as? String, "search")
+        XCTAssertEqual(renderSummary["title"] as? String, "Web Search")
+        XCTAssertEqual(renderSummary["status"] as? String, "failure")
+        XCTAssertTrue((renderSummary["detail_text"] as? String)?.contains("web search unavailable") == true)
+        XCTAssertEqual(restored.title, "Web Search")
+        XCTAssertEqual(restored.status, .failure)
+        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+    }
+
     func testSummaryOnlyFalseOnlyForPromptExportStructuredMetadata() throws {
         let promptRaw = jsonString([
             "op": "export",
@@ -148,20 +205,21 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertNil(promptObject["summary_only"])
     }
 
-    private func persistedSummary(toolName: String, rawResultJSON: String) -> AgentPersistedToolResultSummary? {
+    private func persistedSummary(toolName: String, rawResultJSON: String, argsJSON: String? = nil) -> AgentPersistedToolResultSummary? {
         let invocationID = UUID()
         let item = AgentChatItem(
             kind: .toolResult,
             text: rawResultJSON,
             toolName: toolName,
             toolInvocationID: invocationID,
+            toolArgsJSON: argsJSON,
             toolResultJSON: rawResultJSON
         )
         let execution = AgentTranscriptToolExecution(
             stableExecutionID: invocationID.uuidString,
             toolName: toolName,
             invocationID: invocationID,
-            argsJSON: nil,
+            argsJSON: argsJSON,
             resultJSON: rawResultJSON,
             toolIsError: nil,
             status: .unknown

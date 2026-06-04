@@ -114,8 +114,10 @@ enum AgentTranscriptToolVisibilityPolicy {
             "read_file"
         case "read_file_tool", "read_file_contents":
             "read_file"
-        case "file_search", "filesearch", "grep", "search":
+        case "file_search", "filesearch", "grep":
             "file_search"
+        case "search", "web_search", "web_search_request", "google_web_search", "search_web":
+            "search"
         case "bash", "shell", "local_shell", "unified_exec", "exec", "exec_command", "run_shell_command", "command":
             "bash"
         case "filechange", "file_change":

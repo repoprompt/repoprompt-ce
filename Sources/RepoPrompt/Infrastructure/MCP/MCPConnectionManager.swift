@@ -344,6 +344,14 @@ actor ServerNetworkManager {
         toolName == "manage_workspaces" || toolName == "bind_context" || toolName == "context_builder" || isAppWideTool(toolName)
     }
 
+    nonisolated static func shouldSkipPerCallRunScopedTabRebindFallback(
+        toolName: String,
+        purpose: MCPRunPurpose
+    ) -> Bool {
+        guard purpose == .agentModeRun else { return false }
+        return toolName == "read_file" || toolName == "file_search"
+    }
+
     nonisolated static func shouldBypassWindowRouting(for toolName: String) -> Bool {
         isAppWideTool(toolName)
     }
@@ -477,7 +485,75 @@ actor ServerNetworkManager {
     private var lastBootstrapHealthCheckAt: Date = .distantPast
     private let bootstrapHealthCheckInterval: TimeInterval = 5.0
 
+    private func resolvedBootstrapSocketURL() -> URL {
+        #if DEBUG
+            if let testBootstrapSocketURLOverride {
+                return testBootstrapSocketURLOverride
+            }
+        #endif
+        return MCPFilesystemConstants.bootstrapSocketURL()
+    }
+
     #if DEBUG
+        enum DebugBootstrapSocketURLOverrideError: Error, Equatable {
+            case managerNotFullyStopped
+            case overrideAlreadyInstalled
+            case overrideNotInstalled
+            case overrideMismatch
+            case productionSocketURLRejected
+        }
+
+        private var testBootstrapSocketURLOverride: URL?
+
+        func debugInstallBootstrapSocketURLOverride(_ socketURL: URL) throws {
+            try debugRequireFullyStoppedForBootstrapSocketURLOverride()
+            let standardizedSocketURL = socketURL.standardizedFileURL
+            guard standardizedSocketURL != MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL else {
+                throw DebugBootstrapSocketURLOverrideError.productionSocketURLRejected
+            }
+            guard testBootstrapSocketURLOverride == nil else {
+                throw DebugBootstrapSocketURLOverrideError.overrideAlreadyInstalled
+            }
+            testBootstrapSocketURLOverride = standardizedSocketURL
+        }
+
+        func debugRestoreBootstrapSocketURLOverride(expected socketURL: URL) throws {
+            try debugRequireFullyStoppedForBootstrapSocketURLOverride()
+            guard let testBootstrapSocketURLOverride else {
+                throw DebugBootstrapSocketURLOverrideError.overrideNotInstalled
+            }
+            guard testBootstrapSocketURLOverride == socketURL.standardizedFileURL else {
+                throw DebugBootstrapSocketURLOverrideError.overrideMismatch
+            }
+            self.testBootstrapSocketURLOverride = nil
+        }
+
+        func debugResolvedBootstrapSocketURL() -> URL {
+            resolvedBootstrapSocketURL()
+        }
+
+        func debugIsEnabledForBootstrapSocketURLOverride() -> Bool {
+            isEnabledState
+        }
+
+        private func debugRequireFullyStoppedForBootstrapSocketURLOverride() throws {
+            guard !isRunningState,
+                  bootstrapSocketServer == nil,
+                  bootstrapSocketTask == nil,
+                  maintenanceTask == nil,
+                  !bootstrapStartInProgress,
+                  !bootstrapRestartInProgress,
+                  bootstrapRestartToken == nil,
+                  connections.isEmpty,
+                  connectionTasks.isEmpty,
+                  pendingConnections.isEmpty,
+                  bootstrapReservations.isEmpty,
+                  connectionWaiters.isEmpty
+            else {
+                throw DebugBootstrapSocketURLOverrideError.managerNotFullyStopped
+            }
+        }
+
         private struct DebugConnectionEvent {
             let seq: UInt64
             let timestamp: Date
@@ -645,6 +721,9 @@ actor ServerNetworkManager {
     private var lastWindowByClientSession: [String: [String: Int]] = [:]
     /// Same-process live run reconnect affinity keyed by (clientID, sessionKey).
     private var liveRunAffinityByClientSession: [String: [String: LiveRunAffinity]] = [:]
+    #if DEBUG
+        private var debugExactRoutingSessionRestorePoints: [UUID: DebugExactRoutingSessionFixtureRestorePoint] = [:]
+    #endif
     /// TTL for routing records (24 hours)
     private let routingRecordTTL: TimeInterval = 24 * 60 * 60
 
@@ -2197,7 +2276,7 @@ actor ServerNetworkManager {
         }
         lastBootstrapHealthCheckAt = now
 
-        let socketPath = MCPFilesystemConstants.bootstrapSocketURL().path
+        let socketPath = resolvedBootstrapSocketURL().path
         let exists = FileManager.default.fileExists(atPath: socketPath)
 
         if !exists {
@@ -2287,7 +2366,7 @@ actor ServerNetworkManager {
             return
         }
 
-        let socketPath = MCPFilesystemConstants.bootstrapSocketURL().path
+        let socketPath = resolvedBootstrapSocketURL().path
         connectionLog("Restarting bootstrap socket server (reason=\(reason), socket=\(socketPath), failures=\(bootstrapStartFailures))")
         await stopBootstrapSocketServer()
         await startBootstrapSocketServer()
@@ -2305,12 +2384,13 @@ actor ServerNetworkManager {
 
         connectionLog("Starting bootstrap socket server...")
 
-        let server = BootstrapSocketServer(logger: log)
+        let socketURL = resolvedBootstrapSocketURL()
+        let server = BootstrapSocketServer(socketURL: socketURL, logger: log)
         bootstrapSocketServer = server
 
         do {
             #if DEBUG
-                print("[MCPStartup] calling BootstrapSocketServer.start socket=\(MCPFilesystemConstants.bootstrapSocketURL().path)")
+                print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path)")
             #endif
             try await server.start { [weak self] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
                 guard let self else {
@@ -2324,7 +2404,7 @@ actor ServerNetworkManager {
                 )
             }
             #if DEBUG
-                print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(MCPFilesystemConstants.bootstrapSocketURL().path)")
+                print("[MCPStartup] BootstrapSocketServer.start succeeded socket=\(socketURL.path)")
             #endif
             bootstrapStartFailures = 0
             bootstrapRestartToken = nil
@@ -3344,7 +3424,7 @@ actor ServerNetworkManager {
     /// 3. The caller didn't explicitly provide `window_id`
     /// Pure function - doesn't access actor state.
     private nonisolated func injectWindowIDIfNeeded(
-        schema: JSONSchema,
+        schemaDeclaresWindowID: Bool,
         routingWindowID: Int?,
         args: [String: Value]
     ) -> [String: Value] {
@@ -3353,7 +3433,7 @@ actor ServerNetworkManager {
 
         // Priority 2: _windowID routing + schema has window_id -> inject
         guard let windowID = routingWindowID,
-              schemaDeclaresWindowID(schema: schema)
+              schemaDeclaresWindowID
         else {
             return args
         }
@@ -4442,6 +4522,534 @@ actor ServerNetworkManager {
                 ]
             }
 
+            struct DebugExactRoutingSessionFixtureSession {
+                let sessionFingerprint: String
+                let expectedLastConnectionID: UUID
+                let rawSessionToken: String
+            }
+
+            struct DebugExactRoutingSessionFixture {
+                let restoreID: UUID
+                let sessionA: DebugExactRoutingSessionFixtureSession
+                let sessionB: DebugExactRoutingSessionFixtureSession
+                let reboundConnectionID: UUID
+            }
+
+            struct DebugExactRoutingSessionFixtureState: Equatable {
+                let persistedRecordCountByFingerprint: [String: Int]
+                let lastWindowEntryCountByFingerprint: [String: Int]
+                let liveRunAffinityEntryCountByFingerprint: [String: Int]
+            }
+
+            private struct DebugExactRoutingSessionFixtureRestorePoint {
+                let routingState: MCPRoutingState
+                let lastWindowByClientSession: [String: [String: Int]]
+                let liveRunAffinityByClientSession: [String: [String: LiveRunAffinity]]
+                let pendingConnections: [UUID: String]
+                let activeConnectionsByClient: [String: Set<UUID>]
+                let clientIDByConnection: [UUID: String]
+                let capabilityTokenByConnection: [UUID: String]
+                let connectionIDBySessionToken: [String: UUID]
+            }
+
+            func debugClearPersistedRoutingSessionPayload(
+                sessionFingerprint: String,
+                expectedLastConnectionID: UUID
+            ) -> [String: Any] {
+                guard !debugHasActiveOrPendingRuntimeResidue(for: expectedLastConnectionID) else {
+                    return debugExactRoutingSessionCleanupError(
+                        sessionFingerprint: sessionFingerprint,
+                        expectedLastConnectionID: expectedLastConnectionID,
+                        code: "target_connection_active_or_pending",
+                        message: "expected_last_connection_id remains active or pending."
+                    )
+                }
+
+                var matchingRawSessionKeys = Set<String>()
+                for records in routingState.records.values {
+                    for record in records {
+                        guard let sessionKey = record.sessionKey, !sessionKey.isEmpty else { continue }
+                        if debugSessionFingerprint(forToken: sessionKey) == sessionFingerprint {
+                            matchingRawSessionKeys.insert(sessionKey)
+                        }
+                    }
+                }
+                for sessionMap in lastWindowByClientSession.values {
+                    for sessionKey in sessionMap.keys where !sessionKey.isEmpty {
+                        if debugSessionFingerprint(forToken: sessionKey) == sessionFingerprint {
+                            matchingRawSessionKeys.insert(sessionKey)
+                        }
+                    }
+                }
+                for sessionMap in liveRunAffinityByClientSession.values {
+                    for sessionKey in sessionMap.keys where !sessionKey.isEmpty {
+                        if debugSessionFingerprint(forToken: sessionKey) == sessionFingerprint {
+                            matchingRawSessionKeys.insert(sessionKey)
+                        }
+                    }
+                }
+
+                guard !matchingRawSessionKeys.isEmpty else {
+                    return debugExactRoutingSessionCleanupSuccess(
+                        sessionFingerprint: sessionFingerprint,
+                        expectedLastConnectionID: expectedLastConnectionID,
+                        alreadyAbsent: true,
+                        removedPersistedRecordCount: 0,
+                        removedLastWindowEntryCount: 0,
+                        removedLiveRunAffinityEntryCount: 0
+                    )
+                }
+                guard matchingRawSessionKeys.count == 1, let rawSessionKey = matchingRawSessionKeys.first else {
+                    return debugExactRoutingSessionCleanupError(
+                        sessionFingerprint: sessionFingerprint,
+                        expectedLastConnectionID: expectedLastConnectionID,
+                        code: "ambiguous_session_fingerprint",
+                        message: "session_fingerprint resolves to multiple persisted routing sessions."
+                    )
+                }
+
+                let matchedRecords = routingState.records.flatMap { clientID, records in
+                    records.compactMap { record -> (clientID: String, record: MCPRoutingState.ClientRecord)? in
+                        record.sessionKey == rawSessionKey ? (clientID, record) : nil
+                    }
+                }
+                guard !matchedRecords.isEmpty else {
+                    return debugExactRoutingSessionCleanupError(
+                        sessionFingerprint: sessionFingerprint,
+                        expectedLastConnectionID: expectedLastConnectionID,
+                        code: "unexpected_routing_state_shape",
+                        message: "session_fingerprint resolved only to map residue without a persisted record."
+                    )
+                }
+                for matchedRecord in matchedRecords {
+                    guard matchedRecord.record.sessionKey == rawSessionKey,
+                          !rawSessionKey.isEmpty,
+                          matchedRecord.record.clientID == matchedRecord.clientID
+                    else {
+                        return debugExactRoutingSessionCleanupError(
+                            sessionFingerprint: sessionFingerprint,
+                            expectedLastConnectionID: expectedLastConnectionID,
+                            code: "unexpected_routing_state_shape",
+                            message: "Persisted routing record shape is inconsistent."
+                        )
+                    }
+                    guard let lastConnectionUUID = matchedRecord.record.lastConnectionUUID else {
+                        return debugExactRoutingSessionCleanupError(
+                            sessionFingerprint: sessionFingerprint,
+                            expectedLastConnectionID: expectedLastConnectionID,
+                            code: "unexpected_routing_state_shape",
+                            message: "Persisted routing record is missing last_connection_id corroboration."
+                        )
+                    }
+                    guard lastConnectionUUID == expectedLastConnectionID else {
+                        return debugExactRoutingSessionCleanupError(
+                            sessionFingerprint: sessionFingerprint,
+                            expectedLastConnectionID: expectedLastConnectionID,
+                            code: "last_connection_id_mismatch",
+                            message: "Persisted routing record does not match expected_last_connection_id."
+                        )
+                    }
+                }
+
+                let reverseConnectionID = connectionIDBySessionToken[rawSessionKey]
+                let forwardConnectionIDs = Set(capabilityTokenByConnection.compactMap { connectionID, sessionKey in
+                    sessionKey == rawSessionKey ? connectionID : nil
+                })
+                let activeConnectionTokenIDs = Set(connections.compactMap { connectionID, connection in
+                    connection.capabilityToken == rawSessionKey ? connectionID : nil
+                })
+                if reverseConnectionID != nil || !forwardConnectionIDs.isEmpty || !activeConnectionTokenIDs.isEmpty {
+                    guard let reverseConnectionID,
+                          forwardConnectionIDs == Set([reverseConnectionID]),
+                          activeConnectionTokenIDs.isEmpty || activeConnectionTokenIDs == Set([reverseConnectionID])
+                    else {
+                        return debugExactRoutingSessionCleanupError(
+                            sessionFingerprint: sessionFingerprint,
+                            expectedLastConnectionID: expectedLastConnectionID,
+                            code: "unexpected_routing_state_shape",
+                            message: "Session token caches are stale or inconsistent."
+                        )
+                    }
+                    guard debugHasActiveOrPendingRuntimeResidue(for: reverseConnectionID) else {
+                        return debugExactRoutingSessionCleanupError(
+                            sessionFingerprint: sessionFingerprint,
+                            expectedLastConnectionID: expectedLastConnectionID,
+                            code: "unexpected_routing_state_shape",
+                            message: "Session token caches reference a non-live connection."
+                        )
+                    }
+                    return debugExactRoutingSessionCleanupError(
+                        sessionFingerprint: sessionFingerprint,
+                        expectedLastConnectionID: expectedLastConnectionID,
+                        code: "session_rebound_active",
+                        message: "Persisted routing session is rebound to a live connection."
+                    )
+                }
+
+                var nextRecords = routingState.records
+                var removedPersistedRecordCount = 0
+                for clientID in Array(nextRecords.keys) {
+                    guard let records = nextRecords[clientID] else { continue }
+                    let retainedRecords = records.filter { $0.sessionKey != rawSessionKey }
+                    removedPersistedRecordCount += records.count - retainedRecords.count
+                    if retainedRecords.isEmpty {
+                        nextRecords.removeValue(forKey: clientID)
+                    } else {
+                        nextRecords[clientID] = retainedRecords
+                    }
+                }
+
+                var nextLastWindowByClientSession = lastWindowByClientSession
+                var removedLastWindowEntryCount = 0
+                for clientID in Array(nextLastWindowByClientSession.keys) {
+                    guard var sessionMap = nextLastWindowByClientSession[clientID] else { continue }
+                    if sessionMap.removeValue(forKey: rawSessionKey) != nil {
+                        removedLastWindowEntryCount += 1
+                    }
+                    if sessionMap.isEmpty {
+                        nextLastWindowByClientSession.removeValue(forKey: clientID)
+                    } else {
+                        nextLastWindowByClientSession[clientID] = sessionMap
+                    }
+                }
+
+                var nextLiveRunAffinityByClientSession = liveRunAffinityByClientSession
+                var removedLiveRunAffinityEntryCount = 0
+                for clientID in Array(nextLiveRunAffinityByClientSession.keys) {
+                    guard var sessionMap = nextLiveRunAffinityByClientSession[clientID] else { continue }
+                    if sessionMap.removeValue(forKey: rawSessionKey) != nil {
+                        removedLiveRunAffinityEntryCount += 1
+                    }
+                    if sessionMap.isEmpty {
+                        nextLiveRunAffinityByClientSession.removeValue(forKey: clientID)
+                    } else {
+                        nextLiveRunAffinityByClientSession[clientID] = sessionMap
+                    }
+                }
+
+                routingState.records = nextRecords
+                lastWindowByClientSession = nextLastWindowByClientSession
+                liveRunAffinityByClientSession = nextLiveRunAffinityByClientSession
+                if removedPersistedRecordCount > 0 {
+                    saveRoutingState()
+                }
+                return debugExactRoutingSessionCleanupSuccess(
+                    sessionFingerprint: sessionFingerprint,
+                    expectedLastConnectionID: expectedLastConnectionID,
+                    alreadyAbsent: false,
+                    removedPersistedRecordCount: removedPersistedRecordCount,
+                    removedLastWindowEntryCount: removedLastWindowEntryCount,
+                    removedLiveRunAffinityEntryCount: removedLiveRunAffinityEntryCount
+                )
+            }
+
+            private func debugHasActiveOrPendingRuntimeResidue(for connectionID: UUID) -> Bool {
+                connections[connectionID] != nil
+                    || connectionTasks[connectionID] != nil
+                    || pendingConnections[connectionID] != nil
+                    || bootstrapReservations[connectionID] != nil
+                    || clientIDByConnection[connectionID] != nil
+                    || activeConnectionsByClient.values.contains { $0.contains(connectionID) }
+                    || callLimiters[connectionID] != nil
+            }
+
+            private func debugExactRoutingSessionCleanupSuccess(
+                sessionFingerprint: String,
+                expectedLastConnectionID: UUID,
+                alreadyAbsent: Bool,
+                removedPersistedRecordCount: Int,
+                removedLastWindowEntryCount: Int,
+                removedLiveRunAffinityEntryCount: Int
+            ) -> [String: Any] {
+                let removedTotalCount = removedPersistedRecordCount
+                    + removedLastWindowEntryCount
+                    + removedLiveRunAffinityEntryCount
+                return [
+                    "ok": true,
+                    "op": "clear_persisted_routing_session",
+                    "session_fingerprint": sessionFingerprint,
+                    "expected_last_connection_id": expectedLastConnectionID.uuidString,
+                    "already_absent": alreadyAbsent,
+                    "changed": removedTotalCount > 0,
+                    "removed_persisted_record_count": removedPersistedRecordCount,
+                    "removed_last_window_entry_count": removedLastWindowEntryCount,
+                    "removed_live_run_affinity_entry_count": removedLiveRunAffinityEntryCount,
+                    "removed_total_count": removedTotalCount
+                ]
+            }
+
+            private func debugExactRoutingSessionCleanupError(
+                sessionFingerprint: String,
+                expectedLastConnectionID: UUID,
+                code: String,
+                message: String
+            ) -> [String: Any] {
+                [
+                    "ok": false,
+                    "op": "clear_persisted_routing_session",
+                    "session_fingerprint": sessionFingerprint,
+                    "expected_last_connection_id": expectedLastConnectionID.uuidString,
+                    "code": code,
+                    "error": message
+                ]
+            }
+
+            func debugSeedExactRoutingSessionFixture() -> DebugExactRoutingSessionFixture {
+                let clientID = AgentProviderKind.codexMCPClientID
+                let sessionAToken = "debug-exact-routing-session-a"
+                let sessionBToken = "debug-exact-routing-session-b"
+                let sessionAConnectionID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+                let sessionBConnectionID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
+                let reboundConnectionID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
+                let restoreID = UUID()
+                debugExactRoutingSessionRestorePoints[restoreID] = DebugExactRoutingSessionFixtureRestorePoint(
+                    routingState: routingState,
+                    lastWindowByClientSession: lastWindowByClientSession,
+                    liveRunAffinityByClientSession: liveRunAffinityByClientSession,
+                    pendingConnections: pendingConnections,
+                    activeConnectionsByClient: activeConnectionsByClient,
+                    clientIDByConnection: clientIDByConnection,
+                    capabilityTokenByConnection: capabilityTokenByConnection,
+                    connectionIDBySessionToken: connectionIDBySessionToken
+                )
+
+                debugRemoveExactRoutingSessionFixtureToken(sessionAToken)
+                debugRemoveExactRoutingSessionFixtureToken(sessionBToken)
+                debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: sessionAConnectionID)
+                debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: sessionBConnectionID)
+                debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: reboundConnectionID)
+
+                routingState.records[clientID, default: []].append(contentsOf: [
+                    MCPRoutingState.ClientRecord(
+                        clientID: clientID,
+                        lastTransport: .network,
+                        sessionKey: sessionAToken,
+                        lastWindowID: 9101,
+                        lastWorkspaceID: nil,
+                        lastWorkspaceInstanceNumber: nil,
+                        lastConnectionUUID: sessionAConnectionID,
+                        lastSeenAt: Date(timeIntervalSince1970: 1_700_000_001)
+                    ),
+                    MCPRoutingState.ClientRecord(
+                        clientID: clientID,
+                        lastTransport: .network,
+                        sessionKey: sessionBToken,
+                        lastWindowID: 9102,
+                        lastWorkspaceID: nil,
+                        lastWorkspaceInstanceNumber: nil,
+                        lastConnectionUUID: sessionBConnectionID,
+                        lastSeenAt: Date(timeIntervalSince1970: 1_700_000_002)
+                    )
+                ])
+                lastWindowByClientSession[clientID, default: [:]][sessionAToken] = 9101
+                lastWindowByClientSession[clientID, default: [:]][sessionBToken] = 9102
+                liveRunAffinityByClientSession[clientID, default: [:]][sessionAToken] = LiveRunAffinity(
+                    windowID: 9101,
+                    runID: UUID(uuidString: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA")!,
+                    purpose: .agentModeRun,
+                    lastSeenAt: Date(timeIntervalSince1970: 1_700_000_001)
+                )
+                liveRunAffinityByClientSession[clientID, default: [:]][sessionBToken] = LiveRunAffinity(
+                    windowID: 9102,
+                    runID: UUID(uuidString: "BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB")!,
+                    purpose: .agentModeRun,
+                    lastSeenAt: Date(timeIntervalSince1970: 1_700_000_002)
+                )
+                saveRoutingState()
+
+                return DebugExactRoutingSessionFixture(
+                    restoreID: restoreID,
+                    sessionA: DebugExactRoutingSessionFixtureSession(
+                        sessionFingerprint: debugSessionFingerprint(forToken: sessionAToken)!,
+                        expectedLastConnectionID: sessionAConnectionID,
+                        rawSessionToken: sessionAToken
+                    ),
+                    sessionB: DebugExactRoutingSessionFixtureSession(
+                        sessionFingerprint: debugSessionFingerprint(forToken: sessionBToken)!,
+                        expectedLastConnectionID: sessionBConnectionID,
+                        rawSessionToken: sessionBToken
+                    ),
+                    reboundConnectionID: reboundConnectionID
+                )
+            }
+
+            func debugSetExactRoutingSessionFixtureTargetActive(
+                _ session: DebugExactRoutingSessionFixtureSession,
+                active: Bool
+            ) {
+                let clientID = AgentProviderKind.codexMCPClientID
+                if active {
+                    clientIDByConnection[session.expectedLastConnectionID] = clientID
+                    activeConnectionsByClient[clientID, default: []].insert(session.expectedLastConnectionID)
+                } else {
+                    debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: session.expectedLastConnectionID)
+                }
+            }
+
+            func debugSetExactRoutingSessionFixtureTargetPending(
+                _ session: DebugExactRoutingSessionFixtureSession,
+                pending: Bool
+            ) {
+                if pending {
+                    pendingConnections[session.expectedLastConnectionID] = AgentProviderKind.codexMCPClientID
+                } else {
+                    pendingConnections.removeValue(forKey: session.expectedLastConnectionID)
+                }
+            }
+
+            func debugSetExactRoutingSessionFixtureReboundActive(
+                _ fixture: DebugExactRoutingSessionFixture,
+                active: Bool
+            ) {
+                let clientID = AgentProviderKind.codexMCPClientID
+                let reboundConnectionID = fixture.reboundConnectionID
+                if active {
+                    debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: reboundConnectionID)
+                    debugRemoveExactRoutingSessionFixtureTokenBindings(fixture.sessionA.rawSessionToken)
+                    clientIDByConnection[reboundConnectionID] = clientID
+                    activeConnectionsByClient[clientID, default: []].insert(reboundConnectionID)
+                    capabilityTokenByConnection[reboundConnectionID] = fixture.sessionA.rawSessionToken
+                    connectionIDBySessionToken[fixture.sessionA.rawSessionToken] = reboundConnectionID
+                } else {
+                    debugRemoveExactRoutingSessionFixtureRuntimeResidue(for: reboundConnectionID)
+                    debugRemoveExactRoutingSessionFixtureTokenBindings(fixture.sessionA.rawSessionToken)
+                }
+            }
+
+            func debugExactRoutingSessionFixtureState() -> DebugExactRoutingSessionFixtureState {
+                var persistedRecordCountByFingerprint: [String: Int] = [:]
+                var lastWindowEntryCountByFingerprint: [String: Int] = [:]
+                var liveRunAffinityEntryCountByFingerprint: [String: Int] = [:]
+                func increment(_ sessionToken: String?, counts: inout [String: Int]) {
+                    guard let sessionToken,
+                          !sessionToken.isEmpty,
+                          let fingerprint = debugSessionFingerprint(forToken: sessionToken)
+                    else { return }
+                    counts[fingerprint, default: 0] += 1
+                }
+                for records in routingState.records.values {
+                    for record in records {
+                        increment(record.sessionKey, counts: &persistedRecordCountByFingerprint)
+                    }
+                }
+                for sessionMap in lastWindowByClientSession.values {
+                    for sessionToken in sessionMap.keys {
+                        increment(sessionToken, counts: &lastWindowEntryCountByFingerprint)
+                    }
+                }
+                for sessionMap in liveRunAffinityByClientSession.values {
+                    for sessionToken in sessionMap.keys {
+                        increment(sessionToken, counts: &liveRunAffinityEntryCountByFingerprint)
+                    }
+                }
+                return DebugExactRoutingSessionFixtureState(
+                    persistedRecordCountByFingerprint: persistedRecordCountByFingerprint,
+                    lastWindowEntryCountByFingerprint: lastWindowEntryCountByFingerprint,
+                    liveRunAffinityEntryCountByFingerprint: liveRunAffinityEntryCountByFingerprint
+                )
+            }
+
+            func debugRestoreExactRoutingSessionFixture(_ fixture: DebugExactRoutingSessionFixture) -> Bool {
+                guard let restorePoint = debugExactRoutingSessionRestorePoints.removeValue(forKey: fixture.restoreID) else {
+                    return false
+                }
+                routingState = restorePoint.routingState
+                lastWindowByClientSession = restorePoint.lastWindowByClientSession
+                liveRunAffinityByClientSession = restorePoint.liveRunAffinityByClientSession
+                pendingConnections = restorePoint.pendingConnections
+                activeConnectionsByClient = restorePoint.activeConnectionsByClient
+                clientIDByConnection = restorePoint.clientIDByConnection
+                capabilityTokenByConnection = restorePoint.capabilityTokenByConnection
+                connectionIDBySessionToken = restorePoint.connectionIDBySessionToken
+                saveRoutingState()
+                return debugEncodedRoutingState(routingState) == debugEncodedRoutingState(restorePoint.routingState)
+                    && lastWindowByClientSession == restorePoint.lastWindowByClientSession
+                    && debugLiveRunAffinitiesEqual(liveRunAffinityByClientSession, restorePoint.liveRunAffinityByClientSession)
+                    && pendingConnections == restorePoint.pendingConnections
+                    && activeConnectionsByClient == restorePoint.activeConnectionsByClient
+                    && clientIDByConnection == restorePoint.clientIDByConnection
+                    && capabilityTokenByConnection == restorePoint.capabilityTokenByConnection
+                    && connectionIDBySessionToken == restorePoint.connectionIDBySessionToken
+            }
+
+            private func debugRemoveExactRoutingSessionFixtureToken(_ sessionToken: String) {
+                for clientID in Array(routingState.records.keys) {
+                    guard let records = routingState.records[clientID] else { continue }
+                    let retainedRecords = records.filter { $0.sessionKey != sessionToken }
+                    if retainedRecords.isEmpty {
+                        routingState.records.removeValue(forKey: clientID)
+                    } else {
+                        routingState.records[clientID] = retainedRecords
+                    }
+                }
+                for clientID in Array(lastWindowByClientSession.keys) {
+                    lastWindowByClientSession[clientID]?.removeValue(forKey: sessionToken)
+                    if lastWindowByClientSession[clientID]?.isEmpty == true {
+                        lastWindowByClientSession.removeValue(forKey: clientID)
+                    }
+                }
+                for clientID in Array(liveRunAffinityByClientSession.keys) {
+                    liveRunAffinityByClientSession[clientID]?.removeValue(forKey: sessionToken)
+                    if liveRunAffinityByClientSession[clientID]?.isEmpty == true {
+                        liveRunAffinityByClientSession.removeValue(forKey: clientID)
+                    }
+                }
+                debugRemoveExactRoutingSessionFixtureTokenBindings(sessionToken)
+            }
+
+            private func debugRemoveExactRoutingSessionFixtureTokenBindings(_ sessionToken: String) {
+                connectionIDBySessionToken.removeValue(forKey: sessionToken)
+                for connectionID in capabilityTokenByConnection.compactMap({ connectionID, token in
+                    token == sessionToken ? connectionID : nil
+                }) {
+                    capabilityTokenByConnection.removeValue(forKey: connectionID)
+                }
+            }
+
+            private func debugRemoveExactRoutingSessionFixtureRuntimeResidue(for connectionID: UUID) {
+                pendingConnections.removeValue(forKey: connectionID)
+                clientIDByConnection.removeValue(forKey: connectionID)
+                capabilityTokenByConnection.removeValue(forKey: connectionID)
+                for sessionToken in connectionIDBySessionToken.compactMap({ sessionToken, mappedConnectionID in
+                    mappedConnectionID == connectionID ? sessionToken : nil
+                }) {
+                    connectionIDBySessionToken.removeValue(forKey: sessionToken)
+                }
+                for clientID in Array(activeConnectionsByClient.keys) {
+                    activeConnectionsByClient[clientID]?.remove(connectionID)
+                    if activeConnectionsByClient[clientID]?.isEmpty == true {
+                        activeConnectionsByClient.removeValue(forKey: clientID)
+                    }
+                }
+            }
+
+            private func debugEncodedRoutingState(_ state: MCPRoutingState) -> Data? {
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                encoder.dateEncodingStrategy = .iso8601
+                return try? encoder.encode(state)
+            }
+
+            private func debugLiveRunAffinitiesEqual(
+                _ lhs: [String: [String: LiveRunAffinity]],
+                _ rhs: [String: [String: LiveRunAffinity]]
+            ) -> Bool {
+                guard Set(lhs.keys) == Set(rhs.keys) else { return false }
+                for clientID in lhs.keys {
+                    guard let leftSessions = lhs[clientID], let rightSessions = rhs[clientID] else { return false }
+                    guard Set(leftSessions.keys) == Set(rightSessions.keys) else { return false }
+                    for sessionToken in leftSessions.keys {
+                        guard let left = leftSessions[sessionToken], let right = rightSessions[sessionToken] else { return false }
+                        guard left.windowID == right.windowID,
+                              left.runID == right.runID,
+                              left.purpose == right.purpose,
+                              left.lastSeenAt == right.lastSeenAt
+                        else { return false }
+                    }
+                }
+                return true
+            }
+
             func debugSeedRoutingAffinityPayload(connectionID: UUID, windowID: Int) async -> [String: Any] {
                 let exists = await MainActor.run { WindowStatesManager.shared.hasWindow(id: windowID) }
                 guard exists else {
@@ -4514,7 +5122,7 @@ actor ServerNetworkManager {
                     "mode": mode,
                     "delay_ms": delayMS,
                     "down_ms": downMS,
-                    "socket_path": MCPFilesystemConstants.bootstrapSocketURL().path,
+                    "socket_path": resolvedBootstrapSocketURL().path,
                     "scheduled_at_ms": debugDateMilliseconds(Date())
                 ]
             }
@@ -5398,6 +6006,17 @@ actor ServerNetworkManager {
                 EditFlowPerf.Dimensions(toolName: toolName)
             )
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.total, totalState) }
+            let preLimiterEnvelopeState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.MCPToolCall.preLimiterEnvelope,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            )
+            var didEndPreLimiterEnvelope = false
+            func endPreLimiterEnvelopeIfNeeded() {
+                guard !didEndPreLimiterEnvelope else { return }
+                didEndPreLimiterEnvelope = true
+                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.preLimiterEnvelope, preLimiterEnvelopeState)
+            }
+            defer { endPreLimiterEnvelopeIfNeeded() }
 
             // Normalize arguments using shared module
             connectionLog("tools/call \(toolName): normalizing args")
@@ -5537,7 +6156,12 @@ actor ServerNetworkManager {
             }
 
             connectionLog("tools/call \(toolName): computing effective policy")
-            let policy = await effectivePolicyState(for: connectionID)
+            let policy = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.MCPToolCall.effectivePolicySnapshot,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            ) {
+                await self.effectivePolicyState(for: connectionID)
+            }
             connectionLog("tools/call \(toolName): policy ready")
             do {
                 let policyState = EditFlowPerf.begin(
@@ -5578,494 +6202,643 @@ actor ServerNetworkManager {
             // mutable cross-connection service state.
             let bypassWindowRoutingForSnapshot = Self.shouldBypassWindowRouting(for: toolName)
             connectionLog("tools/call \(toolName): reading MainActor routing state")
-            let routingSnapshot: (Int, [any Service], Bool) = await MainActor.run {
-                let services = ServiceRegistry.services
-                guard !bypassWindowRoutingForSnapshot else {
-                    return (0, services, false)
+            let routingSnapshot: (Int, [any Service], Bool) = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.MCPToolCall.routingSnapshot,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            ) {
+                await MainActor.run {
+                    let services = ServiceRegistry.services
+                    guard !bypassWindowRoutingForSnapshot else {
+                        return (0, services, false)
+                    }
+                    let windows = WindowStatesManager.shared.allWindows
+                    let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
+                    return (windows.count, services, effectiveMode)
                 }
-                let windows = WindowStatesManager.shared.allWindows
-                let effectiveMode = WindowStatesManager.shared.isMultiWindowModeEffectivelyActive
-                return (windows.count, services, effectiveMode)
             }
             connectionLog("tools/call \(toolName): routing state windowCount=\(routingSnapshot.0) services=\(routingSnapshot.1.count) multi=\(routingSnapshot.2)")
 
             // Per-connection concurrency limiter with safe release pattern
             connectionLog("tools/call \(toolName): acquiring limiter")
-            let limiter = await limiter(for: connectionID)
+            let limiter = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.MCPToolCall.limiterResolution,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            ) {
+                await self.limiter(for: connectionID)
+            }
+            endPreLimiterEnvelopeIfNeeded()
             connectionLog("tools/call \(toolName): entering limiter")
-            return await limiter.withPermit {
-                // Wrap entire call so inner services can query current routing hints.
-                await Self.$currentConnectionID.withValue(connectionID) {
-                    await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
-
-                        // Global enable flag
-                        guard await self.isEnabledState else {
-                            log.notice("Tool call rejected: RepoPrompt MCP is disabled")
-                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "RepoPrompt MCP is currently disabled.")
-                        }
-
-                        // ────────────────────────────────────────────────────────
-                        // Window-selection with explicit override support
-                        // ────────────────────────────────────────────────────────
-                        // Hidden params like `_windowID` can explicitly redirect a call even
-                        // when the connection already has a preferred window binding.
-
-                        let bypassWindowRouting = Self.shouldBypassWindowRouting(for: toolName)
-                        let existingMapping = bypassWindowRouting ? nil : await self.connectionWindowMap[connectionID]
-                        var chosenID: Int? = bypassWindowRouting ? nil : capturedPreResolvedWindowID
-                        let preassigned = await self.preassignedConnections.contains(connectionID)
-                        if let cid = existingMapping {
-                            mcpRoutingLog("Tool=\(toolName) conn=\(connectionID) has existingWindow=\(cid) preassigned=\(preassigned)")
-                        }
-                        let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
-
-                        // ═══════════════════════════════════════════════════════════════
-                        // PRIORITY 0: _windowID is a strong per-call override
-                        // ═══════════════════════════════════════════════════════════════
-                        // When provided, _windowID always takes precedence, even over
-                        // existing connection mappings. This enables explicit window targeting.
-                        if !bypassWindowRouting, let requestedWindowID = capturedWindowID {
-                            let windowValid = await WindowStatesManager.shared.hasWindowWithMCPEnabled(requestedWindowID)
-                            guard windowValid else {
-                                return Self.toolErrorResult(
-                                    rawJSON: capturedRawJSON,
-                                    message: Self.invalidWindowSelectionGuidance(
-                                        windowID: requestedWindowID,
-                                        purpose: policy.purpose,
-                                        restrictedTools: policy.restricted
-                                    )
+            return await EditFlowPerf.measure(
+                EditFlowPerf.Stage.MCPToolCall.limiterEnvelope,
+                EditFlowPerf.Dimensions(toolName: toolName)
+            ) {
+                let limiterWaitState = EditFlowPerf.begin(
+                    EditFlowPerf.Stage.MCPToolCall.limiterWait,
+                    EditFlowPerf.Dimensions(toolName: toolName)
+                )
+                return await limiter.withPermit {
+                    EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState)
+                    return await EditFlowPerf.measure(
+                        EditFlowPerf.Stage.MCPToolCall.permitBodyEnvelope,
+                        EditFlowPerf.Dimensions(toolName: toolName)
+                    ) {
+                        // Wrap entire call so inner services can query current routing hints.
+                        await Self.$currentConnectionID.withValue(connectionID) {
+                            await Self.$currentTabContextHint.withValue(capturedTabContextHint) {
+                                let permitPreDispatchEnvelopeState = EditFlowPerf.begin(
+                                    EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
                                 )
-                            }
-
-                            chosenID = requestedWindowID
-                            if existingMapping == nil {
-                                await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
-                                connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
-                            } else if let prev = existingMapping, prev != requestedWindowID {
-                                connectionLog("Tool call: applying per-call _windowID override \(prev) → \(requestedWindowID) for connection \(connectionID) (default binding unchanged)")
-                            } else {
-                                connectionLog("Tool call: routed connection \(connectionID) to window \(requestedWindowID) via _windowID")
-                            }
-                        }
-
-                        // ═══════════════════════════════════════════════════════════════
-                        // PRIORITY 1: Use existing connection mapping (no override requested)
-                        // ═══════════════════════════════════════════════════════════════
-                        if !bypassWindowRouting, chosenID == nil, let mapped = existingMapping {
-                            chosenID = mapped
-                            mcpRoutingLog("Tool=\(toolName) using existing mapping conn=\(connectionID) window=\(mapped)")
-                        }
-
-                        // PRIORITY 2: Use clientName to find existing window assignment (for same client, new connection)
-                        if !bypassWindowRouting,
-                           chosenID == nil,
-                           let clientName = await self.clientIdentifier(forConnection: connectionID),
-                           let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
-                        {
-                            chosenID = windowID
-                            await self.setConnectionWindowMapping(connectionID, windowID: windowID)
-                            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(windowID) via clientName '\(clientName)' reuse")
-                        }
-
-                        // PRIORITY 2b: Same-process live run affinity, then persisted window affinity.
-                        if !bypassWindowRouting,
-                           chosenID == nil,
-                           let clientName = await self.clientIdentifier(forConnection: connectionID)
-                        {
-                            let managerToken = await self.connections[connectionID]?.capabilityToken
-                            let cachedToken = await self.capabilityTokenByConnection[connectionID]
-                            let sessionKey = managerToken ?? cachedToken
-                            mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
-                            if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
-                                chosenID = liveAffinity.windowID
-                                await self.setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
-                                _ = await self.mapConnectionToRunID(
-                                    connectionID,
-                                    runID: liveAffinity.runID,
-                                    windowID: liveAffinity.windowID
-                                )
-                                connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
-                            } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
-                                chosenID = preferredWindowID
-                                await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
-                                connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
-                            }
-                        }
-
-                        // PRIORITY 3: Auto-route to active window when:
-                        // - Currently in single-window mode, OR
-                        // - Connection was established during single-window mode (stays bound even when more windows open)
-                        let connectedDuringSingleWindow: Bool
-                        if let recordedWindowCount = await self.windowCountAtConnectionTime[connectionID] {
-                            connectedDuringSingleWindow = recordedWindowCount == 1
-                        } else if multiWindowModeEffective {
-                            mcpRoutingLog("Auto-routing conn=\(connectionID): connect-time window count unavailable; treating as multi-window")
-                            connectedDuringSingleWindow = false
-                        } else {
-                            connectedDuringSingleWindow = windowCount == 1
-                        }
-                        if !bypassWindowRouting && chosenID == nil && (!multiWindowModeEffective || connectedDuringSingleWindow) {
-                            // Find the window with active MCP tools
-                            let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
-                            if let activeID = activeWindowID {
-                                let reason = connectedDuringSingleWindow && multiWindowModeEffective
-                                    ? "single-window-at-connect"
-                                    : "no policy"
-                                mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
-                                chosenID = activeID
-                                // Store the mapping for this connection
-                                await self.setConnectionWindowMapping(connectionID, windowID: activeID)
-                            }
-                        }
-
-                        // Only require explicit window selection when multi-window mode is effectively active.
-                        // bind_context is exempt because it is the public routing/binding entry point.
-                        if !bypassWindowRouting,
-                           multiWindowModeEffective,
-                           chosenID == nil,
-                           !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
-                        {
-                            return Self.toolErrorResult(
-                                rawJSON: capturedRawJSON,
-                                message: Self.multiWindowSelectionGuidance(
-                                    purpose: policy.purpose,
-                                    restrictedTools: policy.restricted
-                                )
-                            )
-                        }
-
-                        // Log the call - one notice for the call, debug for the end
-                        let windowStr = chosenID.map(String.init) ?? "-"
-                        let logName = (originalName == toolName) ? toolName : "\(originalName)→\(toolName)"
-                        connectionLog("Tool call: \(logName) [conn=\(connectionID) window=\(windowStr)]")
-
-                        // Notify tool call observers using the connection's resolved run mapping.
-                        // Coordination/app-wide routing tools run before a stable window/run context may
-                        // exist, so avoid re-entering MainActor run lookup on that hot path.
-                        let observerRunIDForCallbacksFinal = Self.shouldBypassWindowRouting(for: toolName)
-                            ? nil
-                            : await self.runIDForConnection(connectionID)
-                        let invocationID = UUID()
-                        if let runID = observerRunIDForCallbacksFinal {
-                            let observerState = EditFlowPerf.begin(
-                                EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
-                                EditFlowPerf.Dimensions(toolName: toolName)
-                            )
-                            let legacyObserverCount = await self.fireToolCallObservers(runID: runID, toolName: toolName)
-                            let eventObserverCount = await self.fireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments)
-                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.observerCallbacks, observerState)
-                            #if DEBUG
-                                if toolName == "agent_run" {
-                                    print("[ACPAgentRunToolTracking] MCP observer call tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) legacyObservers=\(legacyObserverCount) eventObservers=\(eventObserverCount)")
+                                var didEndPermitPreDispatchEnvelope = false
+                                func endPermitPreDispatchEnvelopeIfNeeded() {
+                                    guard !didEndPermitPreDispatchEnvelope else { return }
+                                    didEndPermitPreDispatchEnvelope = true
+                                    EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPreDispatchEnvelope, permitPreDispatchEnvelopeState)
                                 }
-                            #endif
-                        } else {
-                            if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName) {
-                                mcpToolTrackingDiagnostic(
-                                    "MCP observer call skipped no runID conn=\(connectionID.uuidString) " +
-                                        "tool=\(toolName) invocation=\(invocationID.uuidString)"
-                                )
-                            }
-                            #if DEBUG
-                                if toolName == "agent_run" {
-                                    print("[ACPAgentRunToolTracking] MCP observer call skipped no-run tool=\(toolName) conn=\(connectionID.uuidString)")
+                                defer { endPermitPreDispatchEnvelopeIfNeeded() }
+
+                                // Global enable flag
+                                let isEnabled = await EditFlowPerf.measure(
+                                    EditFlowPerf.Stage.MCPToolCall.enabledStateSnapshot,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                ) {
+                                    await self.isEnabledState
                                 }
-                            #endif
-                        }
-
-                        let shouldTrackToolOwnership = await self.runPurpose(for: connectionID) != .agentModeRun
-
-                        // Record value signal for admission fairness and history
-                        await self.recordToolCall(for: connectionID, toolName: toolName)
-                        defer { connectionLog("CALL end   conn=\(connectionID) tool=\(toolName) window=\(windowStr)") }
-
-                        // ────────────────────────────────────────────────────────
-                        // Run-scoped tab rebind fallback on reconnect handovers
-                        // ────────────────────────────────────────────────────────
-                        if capturedTabID == nil,
-                           let runID = observerRunIDForCallbacksFinal,
-                           let windowID = chosenID
-                        {
-                            let clientName = await self.clientIdentifier(forConnection: connectionID)
-                            _ = await self.ensureTabBoundForRunIfPossible(
-                                connectionID: connectionID,
-                                clientName: clientName,
-                                runID: runID,
-                                windowID: windowID
-                            )
-                        }
-
-                        // ────────────────────────────────────────────────────────
-                        // Legacy compatibility: sticky tab binding via hidden _tabID for unmigrated tools only
-                        // ────────────────────────────────────────────────────────
-                        if let tabID = capturedTabID, !Self.shouldSkipGenericTabBinding(for: toolName) {
-                            // Guard: _tabID requires a resolved window
-                            guard let windowID = chosenID else {
-                                let msg = ToolOutputFormatter.operationFailed(
-                                    title: "Tab Binding Failed",
-                                    issue: "Cannot bind to tab \(tabID.uuidString.prefix(8))... - no window is selected.",
-                                    troubleshooting: Self.tabBindingTroubleshooting(
-                                        purpose: policy.purpose,
-                                        restrictedTools: policy.restricted
-                                    )
-                                )
-                                return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
-                            }
-
-                            let clientName = await self.clientIdentifier(forConnection: connectionID)
-
-                            do {
-                                try await MainActor.run {
-                                    guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
-                                        throw MCPError.invalidParams("Window \(windowID) not found")
-                                    }
-                                    let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
-                                        ?? windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID)?.workspaceID
-                                        ?? windowState.workspaceManager.activeWorkspace?.id
-                                    guard let workspaceID = resolvedWorkspaceID else {
-                                        throw MCPError.invalidParams("No workspace containing tab \(tabID) is available in window \(windowID). Use bind_context op='list' to verify context_id/window routing.")
-                                    }
-                                    try windowState.mcpServer.bindTabForConnection(
-                                        connectionID: connectionID,
-                                        clientName: clientName,
-                                        tabID: tabID,
-                                        workspaceID: workspaceID,
-                                        windowID: windowID
-                                    )
+                                guard isEnabled else {
+                                    log.notice("Tool call rejected: RepoPrompt MCP is disabled")
+                                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "RepoPrompt MCP is currently disabled.")
                                 }
-                                await self.setConnectionWindowMapping(connectionID, windowID: windowID)
-                                connectionLog("Tab binding: bound connection \(connectionID) to tab \(tabID) in window \(windowID)")
-                            } catch {
-                                // Tab binding failed - provide detailed error with window context
-                                let shortTabID = tabID.uuidString.prefix(8)
-                                let issue = "Tab \(shortTabID)... not found in window \(windowID)."
-                                let msg = ToolOutputFormatter.operationFailed(
-                                    title: "Tab Binding Failed",
-                                    issue: issue,
-                                    troubleshooting: Self.tabBindingTroubleshooting(
-                                        purpose: policy.purpose,
-                                        restrictedTools: policy.restricted,
-                                        windowID: windowID
-                                    )
-                                )
-                                return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
-                            }
-                        }
 
-                        // ────────────────────────────────────────────────────────
-                        // Tool dispatch with window filtering
-                        // ────────────────────────────────────────────────────────
-                        for service in allServices {
-                            // App-wide coordination tools have a single owning service. Avoid probing
-                            // unrelated window-scoped services for their tool lists during startup,
-                            // because some of those lists hop through UI/window state.
-                            if toolName == "bind_context", !(service is WindowRoutingService) { continue }
-                            if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
+                                // ────────────────────────────────────────────────────────
+                                // Window-selection with explicit override support
+                                // ────────────────────────────────────────────────────────
+                                // Hidden params like `_windowID` can explicitly redirect a call even
+                                // when the connection already has a preferred window binding.
 
-                            let wsSvc = service as? WindowScopedService
-
-                            // Skip window-scoped services that don't match this connection
-                            if let wsSvc, windowCount > 1 {
-                                guard let wID = chosenID, wID == wsSvc.windowID else { continue }
-                            }
-
-                            // Get the tool definition (need schema for window_id injection)
-                            connectionLog("tools/call \(toolName): inspecting service \(String(describing: type(of: service)))")
-                            let serviceTools = await service.tools
-                            connectionLog("tools/call \(toolName): service \(String(describing: type(of: service))) exposes \(serviceTools.count) tools")
-                            guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else { continue }
-                            connectionLog("tools/call \(toolName): dispatching via service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
-
-                            // Inject window_id from routing if tool schema declares it and caller didn't provide it.
-                            // bind_context manages its own window_id semantics and must not be auto-injected.
-                            let effectiveArgs: [String: Value]
-                            let effectiveArgsForFormatter: [String: Value]
-                            if Self.shouldAutoInjectPublicWindowID(for: toolName) {
-                                let routingWindowID: Int? = {
-                                    if let wsSvc {
-                                        return capturedWindowID ?? chosenID ?? wsSvc.windowID
-                                    }
-                                    return capturedWindowID ?? chosenID
-                                }()
-                                effectiveArgs = self.injectWindowIDIfNeeded(
-                                    schema: toolDef.inputSchema,
-                                    routingWindowID: routingWindowID,
-                                    args: capturedArguments
-                                )
-                                effectiveArgsForFormatter = self.injectWindowIDIfNeeded(
-                                    schema: toolDef.inputSchema,
-                                    routingWindowID: routingWindowID,
-                                    args: capturedArgsForFormatter
-                                )
-                            } else {
-                                effectiveArgs = capturedArguments
-                                effectiveArgsForFormatter = capturedArgsForFormatter
-                            }
-
-                            // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
-                            if let wsSvc, shouldTrackToolOwnership {
-                                let ownershipWindowID = chosenID ?? wsSvc.windowID
+                                let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
+                                var chosenID: Int?
+                                let windowStr: String
+                                let observerRunIDForCallbacksFinal: UUID?
                                 do {
-                                    return try await self.withWindowToolOwnership(
-                                        windowID: ownershipWindowID,
-                                        connectionID: connectionID,
-                                        toolName: toolName
-                                    ) {
-                                        let value = try await EditFlowPerf.measure(
-                                            EditFlowPerf.Stage.MCPToolCall.dispatch,
-                                            EditFlowPerf.Dimensions(toolName: toolName)
-                                        ) {
-                                            try await service.call(
-                                                tool: toolName,
-                                                with: effectiveArgs
-                                            )
-                                        }
-                                        guard let value else {
-                                            // Shouldn't happen after the pre-check, but guard anyway.
-                                            if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped nil-result") {
-                                                let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
-                                                let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
-                                                #if DEBUG
-                                                    if toolName == "agent_run" {
-                                                        print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
-                                                    }
-                                                #endif
-                                            }
-                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
-                                        }
-
-                                        // Build well‑structured, human‑readable content blocks for the result
-                                        let contentBlocks = EditFlowPerf.measure(
-                                            EditFlowPerf.Stage.MCPToolCall.formatResult,
-                                            EditFlowPerf.Dimensions(toolName: toolName)
-                                        ) {
-                                            Self.formatToolResult(
-                                                toolName: toolName,
-                                                args: effectiveArgsForFormatter,
-                                                value: value
-                                            )
-                                        }
-
-                                        // Fire completion observer with result for detailed UI rendering
-                                        if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped success") {
-                                            let resultJSON = ToolOutputFormatter.rawJSONString(value)
-                                            let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
-                                            #if DEBUG
-                                                if toolName == "agent_run" {
-                                                    print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
-                                                }
-                                            #endif
-                                        }
-
-                                        // Note: context_builder caller termination is NOT done here.
-                                        // The spawned agent connection is terminated by ContextBuilderAgentViewModel
-                                        // when the run completes. This prevents killing the host MCP client
-                                        // (e.g., Claude Desktop) that invoked context_builder.
-
-                                        return CallTool.Result(content: contentBlocks, isError: false)
-                                    }
-                                } catch {
-                                    log.error("Error executing tool \(toolName): \(error.localizedDescription)")
-                                    if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped error") {
-                                        let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
-                                        let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
-                                        #if DEBUG
-                                            if toolName == "agent_run" {
-                                                print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
-                                            }
-                                        #endif
-                                    }
-                                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
-                                }
-                            } else {
-                                // Not window-scoped → no ownership tracking needed
-                                do {
-                                    let value = try await EditFlowPerf.measure(
-                                        EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                    let windowRunResolutionState = EditFlowPerf.begin(
+                                        EditFlowPerf.Stage.MCPToolCall.windowRunResolution,
                                         EditFlowPerf.Dimensions(toolName: toolName)
-                                    ) {
-                                        try await service.call(
-                                            tool: toolName,
-                                            with: effectiveArgs
+                                    )
+                                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.windowRunResolution, windowRunResolutionState) }
+
+                                    let bypassWindowRouting = Self.shouldBypassWindowRouting(for: toolName)
+                                    let existingMapping = bypassWindowRouting ? nil : await self.connectionWindowMap[connectionID]
+                                    chosenID = bypassWindowRouting ? nil : capturedPreResolvedWindowID
+                                    let preassigned = await self.preassignedConnections.contains(connectionID)
+                                    if let cid = existingMapping {
+                                        mcpRoutingLog("Tool=\(toolName) conn=\(connectionID) has existingWindow=\(cid) preassigned=\(preassigned)")
+                                    }
+
+                                    // ═══════════════════════════════════════════════════════════════
+                                    // PRIORITY 0: _windowID is a strong per-call override
+                                    // ═══════════════════════════════════════════════════════════════
+                                    // When provided, _windowID always takes precedence, even over
+                                    // existing connection mappings. This enables explicit window targeting.
+                                    if !bypassWindowRouting, let requestedWindowID = capturedWindowID {
+                                        let windowValid = await WindowStatesManager.shared.hasWindowWithMCPEnabled(requestedWindowID)
+                                        guard windowValid else {
+                                            return Self.toolErrorResult(
+                                                rawJSON: capturedRawJSON,
+                                                message: Self.invalidWindowSelectionGuidance(
+                                                    windowID: requestedWindowID,
+                                                    purpose: policy.purpose,
+                                                    restrictedTools: policy.restricted
+                                                )
+                                            )
+                                        }
+
+                                        chosenID = requestedWindowID
+                                        if existingMapping == nil {
+                                            await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
+                                            connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                        } else if let prev = existingMapping, prev != requestedWindowID {
+                                            connectionLog("Tool call: applying per-call _windowID override \(prev) → \(requestedWindowID) for connection \(connectionID) (default binding unchanged)")
+                                        } else {
+                                            connectionLog("Tool call: routed connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                        }
+                                    }
+
+                                    // ═══════════════════════════════════════════════════════════════
+                                    // PRIORITY 1: Use existing connection mapping (no override requested)
+                                    // ═══════════════════════════════════════════════════════════════
+                                    if !bypassWindowRouting, chosenID == nil, let mapped = existingMapping {
+                                        chosenID = mapped
+                                        mcpRoutingLog("Tool=\(toolName) using existing mapping conn=\(connectionID) window=\(mapped)")
+                                    }
+
+                                    // PRIORITY 2: Use clientName to find existing window assignment (for same client, new connection)
+                                    if !bypassWindowRouting,
+                                       chosenID == nil,
+                                       let clientName = await self.clientIdentifier(forConnection: connectionID),
+                                       let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
+                                    {
+                                        chosenID = windowID
+                                        await self.setConnectionWindowMapping(connectionID, windowID: windowID)
+                                        connectionLog("Tool call: auto-routed connection \(connectionID) to window \(windowID) via clientName '\(clientName)' reuse")
+                                    }
+
+                                    // PRIORITY 2b: Same-process live run affinity, then persisted window affinity.
+                                    if !bypassWindowRouting,
+                                       chosenID == nil,
+                                       let clientName = await self.clientIdentifier(forConnection: connectionID)
+                                    {
+                                        let managerToken = await self.connections[connectionID]?.capabilityToken
+                                        let cachedToken = await self.capabilityTokenByConnection[connectionID]
+                                        let sessionKey = managerToken ?? cachedToken
+                                        mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
+                                        if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
+                                            chosenID = liveAffinity.windowID
+                                            await self.setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
+                                            _ = await self.mapConnectionToRunID(
+                                                connectionID,
+                                                runID: liveAffinity.runID,
+                                                windowID: liveAffinity.windowID
+                                            )
+                                            connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
+                                        } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
+                                            chosenID = preferredWindowID
+                                            await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
+                                            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+                                        }
+                                    }
+
+                                    // PRIORITY 3: Auto-route to active window when:
+                                    // - Currently in single-window mode, OR
+                                    // - Connection was established during single-window mode (stays bound even when more windows open)
+                                    let connectedDuringSingleWindow: Bool
+                                    if let recordedWindowCount = await self.windowCountAtConnectionTime[connectionID] {
+                                        connectedDuringSingleWindow = recordedWindowCount == 1
+                                    } else if multiWindowModeEffective {
+                                        mcpRoutingLog("Auto-routing conn=\(connectionID): connect-time window count unavailable; treating as multi-window")
+                                        connectedDuringSingleWindow = false
+                                    } else {
+                                        connectedDuringSingleWindow = windowCount == 1
+                                    }
+                                    if !bypassWindowRouting && chosenID == nil && (!multiWindowModeEffective || connectedDuringSingleWindow) {
+                                        // Find the window with active MCP tools
+                                        let activeWindowID = await WindowStatesManager.shared.firstMCPEnabledWindow()?.windowID
+                                        if let activeID = activeWindowID {
+                                            let reason = connectedDuringSingleWindow && multiWindowModeEffective
+                                                ? "single-window-at-connect"
+                                                : "no policy"
+                                            mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
+                                            chosenID = activeID
+                                            // Store the mapping for this connection
+                                            await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                        }
+                                    }
+
+                                    // Only require explicit window selection when multi-window mode is effectively active.
+                                    // bind_context is exempt because it is the public routing/binding entry point.
+                                    if !bypassWindowRouting,
+                                       multiWindowModeEffective,
+                                       chosenID == nil,
+                                       !Self.isWindowSelectionExempt(toolName: toolName, args: capturedArguments)
+                                    {
+                                        return Self.toolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            message: Self.multiWindowSelectionGuidance(
+                                                purpose: policy.purpose,
+                                                restrictedTools: policy.restricted
+                                            )
                                         )
                                     }
-                                    guard let value else {
-                                        if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global nil-result") {
-                                            let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
-                                            let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
-                                            #if DEBUG
-                                                if toolName == "agent_run" {
-                                                    print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
-                                                }
-                                            #endif
-                                        }
-                                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
-                                    }
 
-                                    // Build well‑structured, human‑readable content blocks for the result
-                                    let contentBlocks = EditFlowPerf.measure(
-                                        EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                    // Log the call - one notice for the call, debug for the end
+                                    windowStr = chosenID.map(String.init) ?? "-"
+                                    let logName = (originalName == toolName) ? toolName : "\(originalName)→\(toolName)"
+                                    connectionLog("Tool call: \(logName) [conn=\(connectionID) window=\(windowStr)]")
+
+                                    // Notify tool call observers using the connection's resolved run mapping.
+                                    // Coordination/app-wide routing tools run before a stable window/run context may
+                                    // exist, so avoid re-entering MainActor run lookup on that hot path.
+                                    observerRunIDForCallbacksFinal = Self.shouldBypassWindowRouting(for: toolName)
+                                        ? nil
+                                        : await self.runIDForConnection(connectionID)
+                                }
+                                let invocationID = UUID()
+                                if let runID = observerRunIDForCallbacksFinal {
+                                    let observerState = EditFlowPerf.begin(
+                                        EditFlowPerf.Stage.MCPToolCall.observerCallbacks,
                                         EditFlowPerf.Dimensions(toolName: toolName)
-                                    ) {
-                                        Self.formatToolResult(
+                                    )
+                                    let legacyObserverCount = await self.fireToolCallObservers(runID: runID, toolName: toolName)
+                                    let eventObserverCount = await self.fireToolCalledObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments)
+                                    EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.observerCallbacks, observerState)
+                                    #if DEBUG
+                                        if toolName == "agent_run" {
+                                            print("[ACPAgentRunToolTracking] MCP observer call tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) legacyObservers=\(legacyObserverCount) eventObservers=\(eventObserverCount)")
+                                        }
+                                    #endif
+                                } else {
+                                    if MCPIntegrationHelper.isRepoPromptToolNameAfterNormalization(toolName) {
+                                        mcpToolTrackingDiagnostic(
+                                            "MCP observer call skipped no runID conn=\(connectionID.uuidString) " +
+                                                "tool=\(toolName) invocation=\(invocationID.uuidString)"
+                                        )
+                                    }
+                                    #if DEBUG
+                                        if toolName == "agent_run" {
+                                            print("[ACPAgentRunToolTracking] MCP observer call skipped no-run tool=\(toolName) conn=\(connectionID.uuidString)")
+                                        }
+                                    #endif
+                                }
+
+                                let shouldTrackToolOwnership = await EditFlowPerf.measure(
+                                    EditFlowPerf.Stage.MCPToolCall.ownershipPurposeResolution,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                ) {
+                                    await self.runPurpose(for: connectionID) != .agentModeRun
+                                }
+
+                                // Record value signal for admission fairness and history
+                                await EditFlowPerf.measure(
+                                    EditFlowPerf.Stage.MCPToolCall.toolCallRecording,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                ) {
+                                    await self.recordToolCall(for: connectionID, toolName: toolName)
+                                }
+                                defer { connectionLog("CALL end   conn=\(connectionID) tool=\(toolName) window=\(windowStr)") }
+
+                                // ────────────────────────────────────────────────────────
+                                // Run-scoped tab rebind fallback on reconnect handovers
+                                // ────────────────────────────────────────────────────────
+                                let shouldAttemptRunScopedTabRebindFallback = capturedTabID == nil
+                                    && observerRunIDForCallbacksFinal != nil
+                                    && chosenID != nil
+                                    && !Self.shouldSkipPerCallRunScopedTabRebindFallback(
+                                        toolName: toolName,
+                                        purpose: policy.purpose
+                                    )
+                                do {
+                                    let runScopedTabRebindFallbackState = EditFlowPerf.begin(
+                                        EditFlowPerf.Stage.MCPToolCall.runScopedTabRebindFallback,
+                                        EditFlowPerf.Dimensions(
                                             toolName: toolName,
-                                            args: effectiveArgsForFormatter,
-                                            value: value
+                                            outcome: shouldAttemptRunScopedTabRebindFallback ? "attempted" : "skipped"
+                                        )
+                                    )
+                                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runScopedTabRebindFallback, runScopedTabRebindFallbackState) }
+                                    if shouldAttemptRunScopedTabRebindFallback,
+                                       let runID = observerRunIDForCallbacksFinal,
+                                       let windowID = chosenID
+                                    {
+                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
+                                        _ = await self.ensureTabBoundForRunIfPossible(
+                                            connectionID: connectionID,
+                                            clientName: clientName,
+                                            runID: runID,
+                                            windowID: windowID
                                         )
                                     }
-
-                                    // Fire completion observer with result for detailed UI rendering
-                                    if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global success") {
-                                        let resultJSON = ToolOutputFormatter.rawJSONString(value)
-                                        let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
-                                        #if DEBUG
-                                            if toolName == "agent_run" {
-                                                print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
-                                            }
-                                        #endif
-                                    }
-
-                                    // Note: context_builder caller termination is NOT done here.
-                                    // See comment in window-scoped branch above.
-
-                                    return CallTool.Result(content: contentBlocks, isError: false)
-                                } catch {
-                                    log.error("Error executing tool \(toolName): \(error.localizedDescription)")
-                                    if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global error") {
-                                        let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
-                                        let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
-                                        #if DEBUG
-                                            if toolName == "agent_run" {
-                                                print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
-                                            }
-                                        #endif
-                                    }
-                                    return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
                                 }
-                            }
-                        }
 
-                        let finalToolNotFoundErrorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
-                        if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "final tool-not-found fallthrough") {
-                            let eventObserverCount = await self.fireToolCompletedObservers(
-                                runID: runID,
-                                invocationID: invocationID,
-                                toolName: toolName,
-                                args: capturedArguments,
-                                resultJSON: finalToolNotFoundErrorJSON,
-                                isError: true
-                            )
-                            mcpToolTrackingDiagnostic(
-                                "MCP observer completion final tool-not-found fallthrough conn=\(connectionID.uuidString) " +
-                                    "runID=\(runID.uuidString) tool=\(toolName) invocation=\(invocationID.uuidString) " +
-                                    "eventObservers=\(eventObserverCount)"
-                            )
-                        }
-                        log.error("Tool not found: \(toolName)")
-                        return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
-                    } // TabContextHint TaskLocal wrapper
-                } // ConnectionID TaskLocal wrapper
-            } // withPermit wrapper
+                                // ────────────────────────────────────────────────────────
+                                // Legacy compatibility: sticky tab binding via hidden _tabID for unmigrated tools only
+                                // ────────────────────────────────────────────────────────
+                                let shouldAttemptLegacyTabBindingCompatibility = capturedTabID != nil
+                                    && !Self.shouldSkipGenericTabBinding(for: toolName)
+                                do {
+                                    let legacyTabBindingCompatibilityState = EditFlowPerf.begin(
+                                        EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility,
+                                        EditFlowPerf.Dimensions(
+                                            toolName: toolName,
+                                            outcome: shouldAttemptLegacyTabBindingCompatibility ? "attempted" : "skipped"
+                                        )
+                                    )
+                                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.legacyTabBindingCompatibility, legacyTabBindingCompatibilityState) }
+                                    if shouldAttemptLegacyTabBindingCompatibility, let tabID = capturedTabID {
+                                        // Guard: _tabID requires a resolved window
+                                        guard let windowID = chosenID else {
+                                            let msg = ToolOutputFormatter.operationFailed(
+                                                title: "Tab Binding Failed",
+                                                issue: "Cannot bind to tab \(tabID.uuidString.prefix(8))... - no window is selected.",
+                                                troubleshooting: Self.tabBindingTroubleshooting(
+                                                    purpose: policy.purpose,
+                                                    restrictedTools: policy.restricted
+                                                )
+                                            )
+                                            return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
+                                        }
+
+                                        let clientName = await self.clientIdentifier(forConnection: connectionID)
+
+                                        do {
+                                            try await MainActor.run {
+                                                guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
+                                                    throw MCPError.invalidParams("Window \(windowID) not found")
+                                                }
+                                                let resolvedWorkspaceID = capturedTabContextHint?.workspaceID
+                                                    ?? windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID)?.workspaceID
+                                                    ?? windowState.workspaceManager.activeWorkspace?.id
+                                                guard let workspaceID = resolvedWorkspaceID else {
+                                                    throw MCPError.invalidParams("No workspace containing tab \(tabID) is available in window \(windowID). Use bind_context op='list' to verify context_id/window routing.")
+                                                }
+                                                try windowState.mcpServer.bindTabForConnection(
+                                                    connectionID: connectionID,
+                                                    clientName: clientName,
+                                                    tabID: tabID,
+                                                    workspaceID: workspaceID,
+                                                    windowID: windowID
+                                                )
+                                            }
+                                            await self.setConnectionWindowMapping(connectionID, windowID: windowID)
+                                            connectionLog("Tab binding: bound connection \(connectionID) to tab \(tabID) in window \(windowID)")
+                                        } catch {
+                                            // Tab binding failed - provide detailed error with window context
+                                            let shortTabID = tabID.uuidString.prefix(8)
+                                            let issue = "Tab \(shortTabID)... not found in window \(windowID)."
+                                            let msg = ToolOutputFormatter.operationFailed(
+                                                title: "Tab Binding Failed",
+                                                issue: issue,
+                                                troubleshooting: Self.tabBindingTroubleshooting(
+                                                    purpose: policy.purpose,
+                                                    restrictedTools: policy.restricted,
+                                                    windowID: windowID
+                                                )
+                                            )
+                                            return CallTool.Result(content: [.text(text: msg, annotations: nil, _meta: nil)], isError: true)
+                                        }
+                                    }
+                                }
+
+                                // ────────────────────────────────────────────────────────
+                                // Tool dispatch with window filtering
+                                // ────────────────────────────────────────────────────────
+                                let serviceToolLookupState = EditFlowPerf.begin(
+                                    EditFlowPerf.Stage.MCPToolCall.serviceToolLookup,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                )
+                                for service in allServices {
+                                    // App-wide coordination tools have a single owning service. Avoid probing
+                                    // unrelated window-scoped services for their tool lists during startup,
+                                    // because some of those lists hop through UI/window state.
+                                    if toolName == "bind_context", !(service is WindowRoutingService) { continue }
+                                    if toolName == AppSettingsMCPService.toolName, !(service is AppSettingsMCPService) { continue }
+
+                                    let wsSvc = service as? WindowScopedService
+
+                                    // Skip window-scoped services that don't match this connection
+                                    if let wsSvc, windowCount > 1 {
+                                        guard let wID = chosenID, wID == wsSvc.windowID else { continue }
+                                    }
+
+                                    // Get the tool definition (need schema for window_id injection)
+                                    connectionLog("tools/call \(toolName): inspecting service \(String(describing: type(of: service)))")
+                                    #if DEBUG || EDIT_FLOW_PERF
+                                        let serviceToolsAwaitState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait)
+                                    #endif
+                                    let serviceTools = await service.tools
+                                    #if DEBUG || EDIT_FLOW_PERF
+                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupServiceToolsAwait, serviceToolsAwaitState)
+                                    #endif
+                                    connectionLog("tools/call \(toolName): service \(String(describing: type(of: service))) exposes \(serviceTools.count) tools")
+                                    #if DEBUG || EDIT_FLOW_PERF
+                                        let toolDefinitionScanState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan)
+                                    #endif
+                                    guard let toolDef = serviceTools.first(where: { $0.name == toolName }) else {
+                                        #if DEBUG || EDIT_FLOW_PERF
+                                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
+                                        #endif
+                                        continue
+                                    }
+                                    #if DEBUG || EDIT_FLOW_PERF
+                                        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupToolDefinitionScan, toolDefinitionScanState)
+                                    #endif
+                                    connectionLog("tools/call \(toolName): dispatching via service \(String(describing: type(of: service))) windowScoped=\(wsSvc != nil)")
+
+                                    // Inject window_id from routing if tool schema declares it and caller didn't provide it.
+                                    // bind_context manages its own window_id semantics and must not be auto-injected.
+                                    let effectiveArgs: [String: Value]
+                                    let effectiveArgsForFormatter: [String: Value]
+                                    if Self.shouldAutoInjectPublicWindowID(for: toolName) {
+                                        #if DEBUG || EDIT_FLOW_PERF
+                                            let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)
+                                        #endif
+                                        let routingWindowID: Int? = {
+                                            if let wsSvc {
+                                                return capturedWindowID ?? chosenID ?? wsSvc.windowID
+                                            }
+                                            return capturedWindowID ?? chosenID
+                                        }()
+                                        let selectedSchemaDeclaresWindowID = routingWindowID != nil
+                                            && (
+                                                capturedArguments["window_id"] == nil
+                                                    || capturedArgsForFormatter["window_id"] == nil
+                                            )
+                                            && self.schemaDeclaresWindowID(schema: toolDef.inputSchema)
+                                        effectiveArgs = self.injectWindowIDIfNeeded(
+                                            schemaDeclaresWindowID: selectedSchemaDeclaresWindowID,
+                                            routingWindowID: routingWindowID,
+                                            args: capturedArguments
+                                        )
+                                        effectiveArgsForFormatter = self.injectWindowIDIfNeeded(
+                                            schemaDeclaresWindowID: selectedSchemaDeclaresWindowID,
+                                            routingWindowID: routingWindowID,
+                                            args: capturedArgsForFormatter
+                                        )
+                                        #if DEBUG || EDIT_FLOW_PERF
+                                            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection, publicWindowIDInjectionState)
+                                        #endif
+                                    } else {
+                                        effectiveArgs = capturedArguments
+                                        effectiveArgsForFormatter = capturedArgsForFormatter
+                                    }
+                                    EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
+                                    endPermitPreDispatchEnvelopeIfNeeded()
+
+                                    // Now dispatch. If window-scoped, wrap in ownership scope (fallback to service window).
+                                    if let wsSvc, shouldTrackToolOwnership {
+                                        let ownershipWindowID = chosenID ?? wsSvc.windowID
+                                        do {
+                                            return try await self.withWindowToolOwnership(
+                                                windowID: ownershipWindowID,
+                                                connectionID: connectionID,
+                                                toolName: toolName
+                                            ) {
+                                                let value = try await EditFlowPerf.measure(
+                                                    EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                                ) {
+                                                    try await toolDef.callAsFunction(effectiveArgs)
+                                                }
+                                                let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
+                                                    EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
+                                                    EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
+                                                )
+                                                defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
+
+                                                // Build well‑structured, human‑readable content blocks for the result
+                                                let contentBlocks = EditFlowPerf.measure(
+                                                    EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                                ) {
+                                                    Self.formatToolResult(
+                                                        toolName: toolName,
+                                                        args: effectiveArgsForFormatter,
+                                                        value: value
+                                                    )
+                                                }
+
+                                                // Fire completion observer with result for detailed UI rendering
+                                                await EditFlowPerf.measure(
+                                                    EditFlowPerf.Stage.MCPToolCall.completionObservers,
+                                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                                ) {
+                                                    if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped success") {
+                                                        let resultJSON = ToolOutputFormatter.rawJSONString(value)
+                                                        let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                        #if DEBUG
+                                                            if toolName == "agent_run" {
+                                                                print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
+                                                            }
+                                                        #endif
+                                                    }
+                                                }
+
+                                                // Note: context_builder caller termination is NOT done here.
+                                                // The spawned agent connection is terminated by ContextBuilderAgentViewModel
+                                                // when the run completes. This prevents killing the host MCP client
+                                                // (e.g., Claude Desktop) that invoked context_builder.
+
+                                                return CallTool.Result(content: contentBlocks, isError: false)
+                                            }
+                                        } catch {
+                                            let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
+                                                EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
+                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: "dispatchError")
+                                            )
+                                            defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
+                                            log.error("Error executing tool \(toolName): \(error.localizedDescription)")
+                                            await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.completionObservers,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "window-scoped error") {
+                                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    #if DEBUG
+                                                        if toolName == "agent_run" {
+                                                            print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
+                                                        }
+                                                    #endif
+                                                }
+                                            }
+                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
+                                        }
+                                    } else {
+                                        // Not window-scoped → no ownership tracking needed
+                                        do {
+                                            let value = try await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                try await toolDef.callAsFunction(effectiveArgs)
+                                            }
+                                            let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
+                                                EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
+                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
+                                            )
+                                            defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
+
+                                            // Build well‑structured, human‑readable content blocks for the result
+                                            let contentBlocks = EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.formatResult,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                Self.formatToolResult(
+                                                    toolName: toolName,
+                                                    args: effectiveArgsForFormatter,
+                                                    value: value
+                                                )
+                                            }
+
+                                            // Fire completion observer with result for detailed UI rendering
+                                            await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.completionObservers,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global success") {
+                                                    let resultJSON = ToolOutputFormatter.rawJSONString(value)
+                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: resultJSON, isError: false)
+                                                    #if DEBUG
+                                                        if toolName == "agent_run" {
+                                                            print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=false resultChars=\(resultJSON.count)")
+                                                        }
+                                                    #endif
+                                                }
+                                            }
+
+                                            // Note: context_builder caller termination is NOT done here.
+                                            // See comment in window-scoped branch above.
+
+                                            return CallTool.Result(content: contentBlocks, isError: false)
+                                        } catch {
+                                            let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
+                                                EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
+                                                EditFlowPerf.Dimensions(toolName: toolName, outcome: "dispatchError")
+                                            )
+                                            defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
+                                            log.error("Error executing tool \(toolName): \(error.localizedDescription)")
+                                            await EditFlowPerf.measure(
+                                                EditFlowPerf.Stage.MCPToolCall.completionObservers,
+                                                EditFlowPerf.Dimensions(toolName: toolName)
+                                            ) {
+                                                if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "global error") {
+                                                    let errorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string(error.localizedDescription), "tool": .string(toolName)]))
+                                                    let eventObserverCount = await self.fireToolCompletedObservers(runID: runID, invocationID: invocationID, toolName: toolName, args: capturedArguments, resultJSON: errorJSON, isError: true)
+                                                    #if DEBUG
+                                                        if toolName == "agent_run" {
+                                                            print("[ACPAgentRunToolTracking] MCP observer completion tool=\(toolName) conn=\(connectionID.uuidString) runID=\(runID.uuidString) invocation=\(invocationID.uuidString) eventObservers=\(eventObserverCount) isError=true resultChars=\(errorJSON.count)")
+                                                        }
+                                                    #endif
+                                                }
+                                            }
+                                            return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Error: \(error)")
+                                        }
+                                    }
+                                }
+
+                                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
+                                endPermitPreDispatchEnvelopeIfNeeded()
+                                let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
+                                    EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
+                                    EditFlowPerf.Dimensions(toolName: toolName, outcome: "toolNotFound")
+                                )
+                                defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
+                                await EditFlowPerf.measure(
+                                    EditFlowPerf.Stage.MCPToolCall.completionObservers,
+                                    EditFlowPerf.Dimensions(toolName: toolName)
+                                ) {
+                                    let finalToolNotFoundErrorJSON = ToolOutputFormatter.rawJSONString(.object(["error": .string("Tool not found: \(toolName)"), "tool": .string(toolName)]))
+                                    if let runID = await self.toolTrackingRunIDForCompletion(callTimeRunID: observerRunIDForCallbacksFinal, connectionID: connectionID, toolName: toolName, invocationID: invocationID, context: "final tool-not-found fallthrough") {
+                                        let eventObserverCount = await self.fireToolCompletedObservers(
+                                            runID: runID,
+                                            invocationID: invocationID,
+                                            toolName: toolName,
+                                            args: capturedArguments,
+                                            resultJSON: finalToolNotFoundErrorJSON,
+                                            isError: true
+                                        )
+                                        mcpToolTrackingDiagnostic(
+                                            "MCP observer completion final tool-not-found fallthrough conn=\(connectionID.uuidString) " +
+                                                "runID=\(runID.uuidString) tool=\(toolName) invocation=\(invocationID.uuidString) " +
+                                                "eventObservers=\(eventObserverCount)"
+                                        )
+                                    }
+                                }
+                                log.error("Tool not found: \(toolName)")
+                                return Self.toolErrorResult(rawJSON: capturedRawJSON, message: "Tool not found: \(toolName)")
+                            } // TabContextHint TaskLocal wrapper
+                        } // ConnectionID TaskLocal wrapper
+                    } // PermitBodyEnvelope wrapper
+                } // withPermit wrapper
+            } // LimiterEnvelope wrapper
         }
     }
 

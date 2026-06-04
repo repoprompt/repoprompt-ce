@@ -281,7 +281,11 @@ private actor ToolsCache {
     }
 
     func get() -> [Tool] {
-        tools
+        #if DEBUG || EDIT_FLOW_PERF
+            let actorBodyState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupWindowRoutingToolsCacheActorBody)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupWindowRoutingToolsCacheActorBody, actorBodyState) }
+        #endif
+        return tools
     }
 }
 

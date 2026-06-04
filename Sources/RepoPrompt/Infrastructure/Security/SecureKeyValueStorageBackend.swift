@@ -32,12 +32,46 @@ enum SecureKeyValueStorageFactory {
                 return EphemeralSecureKeyValueStore.shared
             }
         #else
-            return KeychainService.shared
+            switch PersistentKeychainRuntimePolicy.backendKind() {
+            case .localSelfSigned:
+                return KeychainService.localSelfSignedShared
+            case .canonical:
+                return KeychainService.shared
+            }
         #endif
     }()
 
     static func defaultBackend() -> SecureKeyValueStorageBackend {
         cachedBackend
+    }
+}
+
+enum PersistentKeychainBackendKind: Equatable {
+    case localSelfSigned
+    case canonical
+}
+
+enum PersistentKeychainRuntimePolicy {
+    private static let localSelfSignedMarker = "local-self-signed"
+    private static let signingModePlistKey = "RepoPromptSigningMode"
+
+    static func backendKind() -> PersistentKeychainBackendKind {
+        backendKind(signingModeMarker: Bundle.main.object(forInfoDictionaryKey: signingModePlistKey) as? String)
+    }
+
+    static func backendKind(signingModeMarker: String?) -> PersistentKeychainBackendKind {
+        switch normalizedString(signingModeMarker) {
+        case localSelfSignedMarker:
+            .localSelfSigned
+        default:
+            .canonical
+        }
+    }
+
+    private static func normalizedString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.isEmpty ? nil : trimmed
     }
 }
 

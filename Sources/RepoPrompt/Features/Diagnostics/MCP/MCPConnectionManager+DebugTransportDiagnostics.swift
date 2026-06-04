@@ -188,6 +188,40 @@ import MCP
             return debugDiagnosticsResult(payload, isError: (payload["ok"] as? Bool) == false)
         }
 
+        func debugClearPersistedRoutingSessionToolPayload(op: String, arguments: [String: Value]) -> CallTool.Result {
+            let allowedKeys: Set = [
+                "op",
+                "allow_destructive",
+                "session_fingerprint",
+                "expected_last_connection_id"
+            ]
+            guard Set(arguments.keys).isSubset(of: allowedKeys) else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "clear_persisted_routing_session received an unexpected argument.")
+            }
+            guard case .bool(true)? = arguments["allow_destructive"] else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "clear_persisted_routing_session requires allow_destructive=true.")
+            }
+            guard let sessionFingerprint = debugString(arguments, "session_fingerprint") else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "session_fingerprint must match ^sha256:[0-9a-f]{16}$ exactly.")
+            }
+            let fullFingerprintRange = sessionFingerprint.startIndex ..< sessionFingerprint.endIndex
+            guard let matchRange = sessionFingerprint.range(of: #"^sha256:[0-9a-f]{16}$"#, options: .regularExpression),
+                  matchRange == fullFingerprintRange
+            else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "session_fingerprint must match ^sha256:[0-9a-f]{16}$ exactly.")
+            }
+            guard let expectedLastConnectionIDString = debugString(arguments, "expected_last_connection_id"),
+                  let expectedLastConnectionID = UUID(uuidString: expectedLastConnectionIDString)
+            else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "expected_last_connection_id must be a UUID string.")
+            }
+            let payload = debugClearPersistedRoutingSessionPayload(
+                sessionFingerprint: sessionFingerprint,
+                expectedLastConnectionID: expectedLastConnectionID
+            )
+            return debugDiagnosticsResult(payload, isError: (payload["ok"] as? Bool) == false)
+        }
+
         func debugSeedRoutingAffinityToolPayload(op: String, connectionID: UUID, arguments: [String: Value]) async -> CallTool.Result {
             guard debugBool(arguments, "allow_destructive") == true else {
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "seed_routing_affinity requires allow_destructive=true.")

@@ -139,6 +139,110 @@ struct FileSearchResultCard: View {
     }
 }
 
+struct WebSearchResultCard: View {
+    let item: AgentChatItem
+    @State private var isExpanded = false
+
+    private var presentation: AgentToolCardRenderSummary? {
+        NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "search")
+    }
+
+    private var summary: String? {
+        presentation?.inlineSummaryText ?? storageStatusSubtitle(for: item)
+    }
+
+    private var status: ToolCardStatus {
+        if let presentation {
+            return ToolCardStatus.fromRenderStatus(presentation.status)
+        }
+        return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
+    }
+
+    var body: some View {
+        ToolCardContainer(
+            iconName: toolIcon(for: "search"),
+            iconColor: ToolCardAccentResolver.color(for: "search"),
+            title: "Web Search",
+            subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
+            status: status,
+            timestamp: item.timestamp,
+            isExpandable: toolResultHasPayload(item),
+            isExpanded: $isExpanded
+        ) {
+            ToolMarkdownExpandedContent(item: item)
+        }
+    }
+}
+
+struct NativeToolResultCard: View {
+    let item: AgentChatItem
+    let normalizedToolName: String?
+    @State private var isExpanded = false
+
+    private var presentation: AgentToolCardRenderSummary? {
+        NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
+    }
+
+    var body: some View {
+        ToolCardContainer(
+            iconName: toolIcon(for: normalizedToolName ?? item.toolName),
+            iconColor: ToolCardAccentResolver.color(for: normalizedToolName ?? item.toolName),
+            title: presentation?.title ?? toolDisplayName(for: normalizedToolName ?? item.toolName),
+            subtitle: nonEmptyToolCardSummary(presentation?.inlineSummaryText, fallbackStatusFor: item),
+            status: presentation.map { ToolCardStatus.fromRenderStatus($0.status) }
+                ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral),
+            timestamp: item.timestamp,
+            isExpandable: toolResultHasPayload(item),
+            isExpanded: $isExpanded
+        ) {
+            ToolMarkdownExpandedContent(item: item)
+        }
+    }
+}
+
+enum NativeToolCardPresentationBuilder {
+    static func build(item: AgentChatItem, normalizedToolName: String?) -> AgentToolCardRenderSummary? {
+        let normalizedToolName = normalizedToolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if let summaryObject = ToolRawJSON.object(from: item.toolResultJSON),
+           let renderSummary = AgentToolCardRenderSummary(summaryOnlyObject: summaryObject)
+        {
+            guard canTrustStoredSummary(renderSummary, normalizedToolName: normalizedToolName) else { return nil }
+            return renderSummary
+        }
+        let rawObject = ToolRawJSON.object(from: item.toolResultJSON)
+        let argsObject = ToolRawJSON.object(from: item.toolArgsJSON)
+        let statusWord = statusWord(for: item)
+        return AgentToolCardRenderSummaryBuilder.build(
+            normalizedToolName: normalizedToolName,
+            statusWord: statusWord,
+            rawObject: rawObject,
+            argsObject: argsObject,
+            allowExistingSummaryOnly: true
+        )
+    }
+
+    private static func canTrustStoredSummary(
+        _ renderSummary: AgentToolCardRenderSummary,
+        normalizedToolName: String?
+    ) -> Bool {
+        guard let normalizedToolName, renderSummary.toolName == normalizedToolName else { return false }
+        if normalizedToolName == "search" { return true }
+        return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(normalizedToolName)
+    }
+
+    private static func statusWord(for item: AgentChatItem) -> String {
+        if item.toolIsError == true { return "failed" }
+        if item.toolIsError == false { return "success" }
+        guard let object = ToolRawJSON.object(from: item.toolResultJSON) else { return "unknown" }
+        for key in ["status", "state", "outcome", "result"] {
+            if let value = ToolRawJSON.string(object, key: key)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return "unknown"
+    }
+}
+
 struct FileActionResultCard: View {
     let item: AgentChatItem
     @State private var isExpanded = false

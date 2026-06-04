@@ -278,37 +278,61 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
-        guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("missing path") }
-        let startLineFromInteger = args["start_line"]?.intValue
-        let offsetFromInteger = args["offset"]?.intValue
-        let startLineFromString = args["start_line"]?.stringValue.flatMap(Int.init)
-        let offsetFromString = args["offset"]?.stringValue.flatMap(Int.init)
-        let startLine1Based = startLineFromInteger ?? offsetFromInteger ?? startLineFromString ?? offsetFromString
-        let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
-        let metadata = await dependencies.captureRequestMetadata()
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-        let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-        let resolvedPath = lookupContext.translateInputPath(path)
-        var readResult = try await dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)
-        let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
-            lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
+        let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.providerTotal, providerTotalState) }
+
+        let (path, startLine1Based, limit) = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerArgumentParsing) {
+            guard let path = args["path"]?.stringValue else { throw MCPError.invalidParams("missing path") }
+            let startLineFromInteger = args["start_line"]?.intValue
+            let offsetFromInteger = args["offset"]?.intValue
+            let startLineFromString = args["start_line"]?.stringValue.flatMap(Int.init)
+            let offsetFromString = args["offset"]?.stringValue.flatMap(Int.init)
+            let startLine1Based = startLineFromInteger ?? offsetFromInteger ?? startLineFromString ?? offsetFromString
+            let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
+            return (path, startLine1Based, limit)
         }
-        readResult = (
-            ToolResultDTOs.ReadFileReply(
-                content: readResult.reply.content,
-                totalLines: readResult.reply.totalLines,
-                firstLine: readResult.reply.firstLine,
-                lastLine: readResult.reply.lastLine,
-                message: readResult.reply.message,
-                displayPath: projectedDisplayPath,
-                worktreeScope: worktreeScope
-            ),
-            readResult.shouldAutoSelect
-        )
-        if readResult.shouldAutoSelect {
-            await dependencies.maybeAutoSelectReadFileSelection(readResult.reply, path)
+        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
+            await dependencies.captureRequestMetadata()
         }
-        return try Value(readResult.reply)
+        let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
+            await dependencies.resolveFileToolLookupContext(metadata)
+        }
+        let (worktreeScope, resolvedPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
+            let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
+            let resolvedPath = lookupContext.translateInputPath(path)
+            return (worktreeScope, resolvedPath)
+        }
+        var readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
+            try await dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)
+        }
+        readResult = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
+            let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
+                lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
+            }
+            return (
+                ToolResultDTOs.ReadFileReply(
+                    content: readResult.reply.content,
+                    totalLines: readResult.reply.totalLines,
+                    firstLine: readResult.reply.firstLine,
+                    lastLine: readResult.reply.lastLine,
+                    message: readResult.reply.message,
+                    displayPath: projectedDisplayPath,
+                    worktreeScope: worktreeScope
+                ),
+                readResult.shouldAutoSelect
+            )
+        }
+        await EditFlowPerf.measure(
+            EditFlowPerf.Stage.ReadFile.providerAutoSelect,
+            EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
+        ) {
+            if readResult.shouldAutoSelect {
+                await dependencies.maybeAutoSelectReadFileSelection(readResult.reply, path)
+            }
+        }
+        return try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
+            try Value(readResult.reply)
+        }
     }
 
     private func fileSearchTool() -> Tool {

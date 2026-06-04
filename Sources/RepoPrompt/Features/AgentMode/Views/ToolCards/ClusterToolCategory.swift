@@ -218,10 +218,10 @@ enum ClusterToolCategory {
     // MARK: - Tool categories
 
     private static let navigationTools: Set<String> = [
-        "get_file_tree", "read_file", "read", "file_search", "get_code_structure"
+        "get_file_tree", "read_file", "read", "file_search", "search", "get_code_structure"
     ]
     private static let summaryTitleNavigationTools: Set<String> = [
-        "get_file_tree", "read_file", "read", "file_search", "get_code_structure"
+        "get_file_tree", "read_file", "read", "file_search", "search", "get_code_structure"
     ]
     private static let editTools: Set<String> = [
         "apply_edits", "apply_patch", "edit", "file_actions"

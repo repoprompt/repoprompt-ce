@@ -81,7 +81,13 @@ actor MCPToolCatalogReadiness {
 
         // Actually await the catalog service tools to force cache build.
         // This will hop to MainActor internally since MCPServerViewModel is @MainActor.
+        #if DEBUG || EDIT_FLOW_PERF
+            let readinessWarmAccessState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess)
+        #endif
         _ = await mcpServer.windowMCPTools
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.readinessWarmAccess, readinessWarmAccessState)
+        #endif
         mcpToolCatalogReadinessLog("Tool cache warmed for window \(windowID)")
     }
 

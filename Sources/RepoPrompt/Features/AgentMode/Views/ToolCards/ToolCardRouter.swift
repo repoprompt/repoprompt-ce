@@ -123,6 +123,7 @@ enum ToolCardRouter {
         "apply_patch",
         "edit",
         "file_search",
+        "search",
         "get_file_tree",
         "get_code_structure",
         "file_actions",
@@ -190,6 +191,8 @@ enum ToolCardRouter {
             return AnyView(CursorNativeEditResultCard(item: item, isMostRecentEdit: isMostRecentEditBubble))
         case "file_search":
             return AnyView(FileSearchResultCard(item: item))
+        case "search":
+            return AnyView(WebSearchResultCard(item: item))
         case "get_file_tree":
             return AnyView(FileTreeResultCard(item: item))
         case "get_code_structure":
@@ -234,6 +237,9 @@ enum ToolCardRouter {
         case "app_settings":
             return AnyView(AppSettingsResultCard(item: item))
         default:
+            if NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: key) != nil {
+                return AnyView(NativeToolResultCard(item: item, normalizedToolName: key))
+            }
             return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
         }
     }
@@ -448,7 +454,7 @@ private enum ToolCardSubtitleBuilder {
             {
                 return command
             }
-        case "search", "web_search", "web_search_request", "google_web_search":
+        case "search", "web_search", "web_search_request", "google_web_search", "search_web":
             if let query = stringArgument(from: argsJSON, keys: ["query", "q", "search_query", "searchQuery", "text", "value"]),
                !query.isEmpty
             {

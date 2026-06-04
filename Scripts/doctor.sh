@@ -64,9 +64,24 @@ phase "macOS SDK"
 SDK_PATH="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null || true)"
 [[ -n "$SDK_PATH" ]] || fail "No macOS SDK found via xcrun. Try xcode-select --install or select a valid Xcode with xcode-select."
 log "$SDK_PATH"
-base="$(basename "$SDK_PATH")"
-if [[ ! "$base" =~ MacOSX([0-9]+) ]]; then fail "Unable to determine macOS SDK version from $SDK_PATH"; fi
-if (( ${BASH_REMATCH[1]} < 26 )); then fail "macOS 26 SDK or newer required. Current SDK: $SDK_PATH"; fi
+SDK_VERSION="$(xcrun --sdk macosx --show-sdk-version 2>/dev/null || true)"
+SDK_MAJOR=""
+if [[ "$SDK_VERSION" =~ ^([0-9]+)(\.|$) ]]; then
+    SDK_MAJOR="${BASH_REMATCH[1]}"
+else
+    SDK_REAL_PATH="$(cd "$SDK_PATH" 2>/dev/null && pwd -P || true)"
+    while IFS= read -r base; do
+        if [[ "$base" =~ MacOSX([0-9]+) ]]; then
+            SDK_MAJOR="${BASH_REMATCH[1]}"
+            break
+        fi
+    done <<EOF
+$(basename "$SDK_PATH")
+$(basename "${SDK_REAL_PATH:-$SDK_PATH}")
+EOF
+fi
+[[ -n "$SDK_MAJOR" ]] || fail "Unable to determine macOS SDK version from xcrun output '${SDK_VERSION:-<empty>}' or path $SDK_PATH"
+if (( SDK_MAJOR < 26 )); then fail "macOS 26 SDK or newer required. Current SDK: ${SDK_VERSION:-$SDK_PATH}"; fi
 phase "Signing diagnostics"
 DEFAULT_KEYCHAIN="$(security default-keychain 2>/dev/null | tr -d '"' || true)"
 log "Default keychain: ${DEFAULT_KEYCHAIN:-<unknown>}"

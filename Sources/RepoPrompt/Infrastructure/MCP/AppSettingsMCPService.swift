@@ -22,7 +22,13 @@ final class AppSettingsMCPService: Service {
     }
 
     var tools: [Tool] {
-        get async { makeTools() }
+        get async {
+            #if DEBUG || EDIT_FLOW_PERF
+                let appSettingsToolsBuildState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupAppSettingsToolsBuild)
+                defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupAppSettingsToolsBuild, appSettingsToolsBuildState) }
+            #endif
+            return makeTools()
+        }
     }
 
     private func makeTools() -> [Tool] {

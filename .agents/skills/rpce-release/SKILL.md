@@ -52,6 +52,8 @@ profiles, certificate exports, tokens, or passwords into logs or chat.
 
 RepoPrompt CE starts its independent release history at `1.0.0 (1)`.
 Increment `BUILD_NUMBER` monotonically for every later public update.
+After changing `version.env`, run `make release-sync-cli-version` and commit the
+synchronized MCP CLI version before creating the release tag.
 
 For an explicit private-source updater smoke test, use the maintainer-only
 `Scripts/publish_public_update_test.sh` helper documented in

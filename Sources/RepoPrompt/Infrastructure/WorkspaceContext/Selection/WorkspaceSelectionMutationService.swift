@@ -328,6 +328,7 @@ struct WorkspaceSelectionMutationService {
         if codemapOnly, codemapsGloballyDisabled {
             return WorkspaceAddSelectionResult(selection: existing, invalidPaths: [codemapsGloballyDisabledMessage], resolvedMap: [:], mutated: false, codemapUnavailable: [])
         }
+        let candidateResolutionTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.candidateResolutionTotal)
         let resolution: (files: [WorkspaceFileRecord], invalid: [String], resolvedMap: [String: String], unavailable: [String])
         if codemapOnly {
             let value = await resolveCodemapOnlyCandidates(paths: paths, rawPaths: rawPaths, expandFolders: true, rootScope: rootScope)
@@ -336,7 +337,9 @@ struct WorkspaceSelectionMutationService {
             let value = await resolveSelectionCandidates(paths: paths, rawPaths: rawPaths, expandFolders: true, rootScope: rootScope)
             resolution = (value.candidates, value.invalidPaths, value.resolvedMap, [])
         }
+        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.candidateResolutionTotal, candidateResolutionTotal)
 
+        let structuralMerge = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.structuralMerge)
         var selectedPaths = existing.selectedPaths
         var codemapPaths = existing.autoCodemapPaths
         var slices = existing.slices
@@ -378,8 +381,21 @@ struct WorkspaceSelectionMutationService {
             slices: slices,
             codemapAutoEnabled: codemapOnly ? false : existing.codemapAutoEnabled
         )
+        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.structuralMerge, structuralMerge)
+        let autoCodemapRecomputeTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal)
         if selection.codemapAutoEnabled {
             selection = await recomputeAutoCodemaps(selection, rootScope: rootScope)
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal,
+                autoCodemapRecomputeTotal,
+                EditFlowPerf.Dimensions(outcome: "attempted")
+            )
+        } else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.autoCodemapRecomputeTotal,
+                autoCodemapRecomputeTotal,
+                EditFlowPerf.Dimensions(outcome: "skipped")
+            )
         }
         return WorkspaceAddSelectionResult(selection: selection, invalidPaths: resolution.invalid, resolvedMap: resolution.resolvedMap, mutated: mutated, codemapUnavailable: resolution.unavailable)
     }
@@ -639,16 +655,26 @@ struct WorkspaceSelectionMutationService {
         guard !codemapsGloballyDisabled else {
             return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
         }
+        let selectedFileLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.selectedFileLookup)
         let resolved = await store.lookupFiles(atPaths: base.selectedPaths, rootScope: rootScope)
+        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.selectedFileLookup, selectedFileLookup)
         let selected = base.selectedPaths.compactMap { resolved[$0] }
         guard !selected.isEmpty else {
             return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
         }
-        let allAPIs = await store.allCodemapFileAPIs()
-        guard !allAPIs.isEmpty else {
+        let codemapAPILoad = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad)
+        let aggregate = await store.codemapFileAPIAggregate()
+        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad, codemapAPILoad)
+        guard !aggregate.orderedFileAPIs.isEmpty else {
             return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
         }
-        let referenced = CodeMapExtractor.resolveReferencedFilePaths(from: selected, among: allAPIs)
+        let referencedPathResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.referencedPathResolution)
+        let referenced = CodeMapExtractor.resolveReferencedFilePaths(
+            from: selected,
+            among: aggregate.orderedFileAPIs,
+            firstFileAPIByStandardizedNestedPath: aggregate.firstFileAPIByStandardizedNestedPath
+        )
+        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.referencedPathResolution, referencedPathResolution)
         return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: referenced, slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
     }
 

@@ -4182,7 +4182,7 @@ final class CodexNativeSessionController {
                 "id", "itemId", "item_id", "callId", "call_id", "invocationId", "invocation_id", "toolCallId", "tool_call_id"
             ])
             let invocationID = invocationID(from: itemID)
-            let argsJSON = toolArgsJSON(from: candidate)
+            let argsJSON = toolArgsJSON(from: candidate, toolName: toolName)
 
             if isStarted {
                 let dedupKey = toolDedupKey(
@@ -4194,7 +4194,7 @@ final class CodexNativeSessionController {
                 return .call(name: toolName, invocationID: invocationID, argsJSON: argsJSON, dedupKey: dedupKey)
             }
 
-            let resultJSON = toolResultJSON(from: candidate)
+            let resultJSON = toolResultJSON(from: candidate, toolName: toolName)
             let isError = toolIsError(from: candidate)
             let isCommandLike = toolName == "bash"
                 || typeRaw.contains("command")
@@ -6176,11 +6176,14 @@ final class CodexNativeSessionController {
         return nil
     }
 
-    private func toolArgsJSON(from candidate: [String: Any]) -> String? {
+    private func toolArgsJSON(from candidate: [String: Any], toolName: String? = nil) -> String? {
         for key in ["arguments", "args", "input", "parameters", "params"] {
             if let value = candidate[key], let json = jsonString(from: value), !json.isEmpty {
                 return json
             }
+        }
+        if toolName == "search", let query = searchQueryValue(from: candidate), !query.isEmpty {
+            return jsonString(from: ["query": query])
         }
         if let command = stringValue(from: candidate, keys: ["command", "cmd"]), !command.isEmpty {
             var payload: [String: Any] = ["command": command]
@@ -6200,7 +6203,10 @@ final class CodexNativeSessionController {
         return nil
     }
 
-    private func toolResultJSON(from candidate: [String: Any]) -> String? {
+    private func toolResultJSON(from candidate: [String: Any], toolName: String? = nil) -> String? {
+        if toolName == "search", let searchJSON = webSearchToolResultJSON(from: candidate) {
+            return searchJSON
+        }
         for key in ["result", "output", "response", "content"] {
             if let value = candidate[key], let json = jsonString(from: value), !json.isEmpty {
                 return json
@@ -6213,6 +6219,112 @@ final class CodexNativeSessionController {
             return json
         }
         return nil
+    }
+
+    private func webSearchToolResultJSON(from candidate: [String: Any]) -> String? {
+        var object: [String: Any] = [:]
+        copySearchMetadata(from: candidate, into: &object)
+
+        for key in ["result", "output", "response", "content"] {
+            guard let value = candidate[key] else { continue }
+            if let array = value as? [Any] {
+                if !array.isEmpty { object[searchArrayKey(forWrapper: key)] = array }
+                copySearchPayloadFields(from: candidate, into: &object)
+                normalizeSearchContentArrays(in: &object)
+                return jsonString(from: object)
+            }
+            if let wrapped = value as? [String: Any] {
+                var merged = wrapped
+                copySearchMetadata(from: candidate, into: &merged)
+                copySearchPayloadFields(from: candidate, into: &merged)
+                normalizeSearchContentArrays(in: &merged)
+                return jsonString(from: merged)
+            }
+            if let text = value as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                object[searchTextKey(forWrapper: key)] = text
+                copySearchPayloadFields(from: candidate, into: &object)
+                return jsonString(from: object)
+            }
+            if let json = jsonString(from: value), !json.isEmpty {
+                object[searchTextKey(forWrapper: key)] = json
+                copySearchPayloadFields(from: candidate, into: &object)
+                return jsonString(from: object)
+            }
+        }
+
+        copySearchPayloadFields(from: candidate, into: &object)
+        normalizeSearchContentArrays(in: &object)
+        return object.isEmpty ? nil : jsonString(from: object)
+    }
+
+    private func copySearchMetadata(from candidate: [String: Any], into object: inout [String: Any]) {
+        for key in ["status", "query", "q", "searchQuery", "search_query", "isError", "is_error"] {
+            if object[key] == nil, let value = candidate[key] {
+                object[key] = value
+            }
+        }
+        if object["query"] == nil,
+           let query = searchQueryValue(from: candidate),
+           !query.isEmpty
+        {
+            object["query"] = query
+        }
+        if object["error"] == nil, let error = candidate["error"] {
+            object["error"] = error
+        }
+    }
+
+    private func searchQueryValue(from candidate: [String: Any]) -> String? {
+        if let query = stringValue(from: candidate, keys: ["query", "q", "searchQuery", "search_query", "search_text", "searchText"]),
+           !query.isEmpty
+        {
+            return query
+        }
+        for key in ["action", "search", "request", "parameters", "params"] {
+            guard let nested = candidate[key] as? [String: Any] else { continue }
+            if let query = searchQueryValue(from: nested), !query.isEmpty {
+                return query
+            }
+        }
+        return nil
+    }
+
+    private func copySearchPayloadFields(from candidate: [String: Any], into object: inout [String: Any]) {
+        for key in ["results", "items", "web_results", "webResults", "search_results", "searchResults", "sources", "citations", "result_count", "resultCount", "total_results", "totalResults", "count", "source_count", "sourceCount", "total_sources", "totalSources", "citation_count", "citationCount", "total_citations", "totalCitations", "summary", "answer", "snippet", "text", "message", "error", "errors", "error_message", "errorMessage"] {
+            guard object[key] == nil, let value = candidate[key] else { continue }
+            object[key] = value
+        }
+    }
+
+    private func normalizeSearchContentArrays(in object: inout [String: Any]) {
+        if object["results"] == nil, let content = object["content"] as? [Any], !content.isEmpty {
+            object["results"] = content
+            object.removeValue(forKey: "content")
+        }
+        if object["results"] == nil, let result = object["result"] as? [Any], !result.isEmpty {
+            object["results"] = result
+            object.removeValue(forKey: "result")
+        }
+    }
+
+    private func searchArrayKey(forWrapper key: String) -> String {
+        switch key {
+        case "content", "result", "output", "response":
+            "results"
+        default:
+            "results"
+        }
+    }
+
+    private func searchTextKey(forWrapper key: String) -> String {
+        switch key {
+        case "response":
+            "answer"
+        case "output", "content", "result":
+            "text"
+        default:
+            "text"
+        }
     }
 
     private func toolIsError(from candidate: [String: Any]) -> Bool? {
@@ -6254,10 +6366,45 @@ final class CodexNativeSessionController {
                 return false
             }
         }
+        if hasNonEmptyErrorSignal(in: candidate) {
+            Self.logCodexDebug("[CodexNativeController] toolIsError tool=\(debugToolName) decision=true reason=error-payload status=\(debugStatus)")
+            return true
+        }
         if typeRaw.contains("command") || debugToolName == "bash" || debugToolName == "exec_command" {
             Self.logCodexDebug("[CodexNativeController] toolIsError tool=\(debugToolName) decision=nil reason=insufficient-signals status=\(debugStatus)")
         }
         return nil
+    }
+
+    private func hasNonEmptyErrorSignal(in candidate: [String: Any]) -> Bool {
+        for key in ["error", "errors", "error_message", "errorMessage"] {
+            guard let value = candidate[key] else { continue }
+            if hasNonEmptyErrorValue(value) { return true }
+        }
+        return false
+    }
+
+    private func hasNonEmptyErrorValue(_ value: Any) -> Bool {
+        if let text = value as? String {
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if let array = value as? [Any] {
+            return array.contains { hasNonEmptyErrorValue($0) }
+        }
+        if let object = value as? [String: Any] {
+            if object.isEmpty { return false }
+            for key in ["message", "detail", "description", "code", "error", "error_message", "errorMessage"] {
+                guard let nested = object[key] else { continue }
+                if hasNonEmptyErrorValue(nested) { return true }
+            }
+            return object.values.contains { value in
+                if value is [String: Any] || value is [Any] {
+                    return hasNonEmptyErrorValue(value)
+                }
+                return false
+            }
+        }
+        return false
     }
 
     private func stringValue(from candidate: [String: Any], keys: [String]) -> String? {

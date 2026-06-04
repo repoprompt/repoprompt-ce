@@ -1,4 +1,6 @@
 import CryptoKit
+import Darwin
+import Foundation
 import MCP
 import Ontology
 @testable import RepoPrompt
@@ -35,20 +37,30 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertEqual(signatures, Self.expectedSignatures)
     }
 
-    func testProductionRegistrationUsesCatalogServiceNotViewModel() async {
-        let window = Self.makeWindowWithoutAutoStart()
-        let catalogService = window.mcpServer.windowMCPToolCatalogService
+    func testProductionRegistrationUsesCatalogServiceNotViewModel() async throws {
+        #if DEBUG
+            let window = Self.makeWindowWithoutAutoStart()
+            let catalogService = window.mcpServer.windowMCPToolCatalogService
 
-        await window.mcpServer.ensureServerReadyForAgentBootstrap()
-        XCTAssertTrue(ServiceRegistry.services.contains { service in
-            (service as AnyObject) === (catalogService as AnyObject)
-        })
-        XCTAssertFalse(ServiceRegistry.services.contains { service in
-            (service as AnyObject) === (window.mcpServer as AnyObject)
-        })
+            try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
+                await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                XCTAssertTrue(ServiceRegistry.services.contains { service in
+                    (service as AnyObject) === (catalogService as AnyObject)
+                })
+                XCTAssertFalse(ServiceRegistry.services.contains { service in
+                    (service as AnyObject) === (window.mcpServer as AnyObject)
+                })
 
-        await window.mcpServer.stopServer()
-        ServiceRegistry.unregister(catalogService)
+                let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+                XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
+
+                await Self.assertBootstrapSocketOverrideError(.managerNotFullyStopped) {
+                    try await ServerNetworkManager.shared.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
+                }
+            }
+        #else
+            throw XCTSkip("Bootstrap socket URL override seam is DEBUG-only")
+        #endif
     }
 
     func testWorktreePublicAPISchemaFieldsRemainAdvertised() async throws {
@@ -118,6 +130,127 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         return window
     }
+
+    #if DEBUG
+        private struct BootstrapSocketNamespaceFixture {
+            let directoryURL: URL
+            let socketURL: URL
+
+            static func make() throws -> Self {
+                let directoryURL = URL(
+                    fileURLWithPath: "/tmp/rpce-xctest-bs-\(getpid())-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+                let socketURL = directoryURL.appendingPathComponent("bootstrap.sock")
+                XCTAssertLessThan(socketURL.path.utf8CString.count, MemoryLayout<sockaddr_un>.size)
+                XCTAssertNotEqual(socketURL.standardizedFileURL, MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL)
+                try FileManager.default.createDirectory(
+                    at: directoryURL,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                return .init(directoryURL: directoryURL, socketURL: socketURL)
+            }
+
+            func removeOwnedDirectory() {
+                try? FileManager.default.removeItem(at: directoryURL)
+            }
+        }
+
+        private static func withIsolatedBootstrapSocketNamespace(
+            window: WindowState,
+            catalogService: MCPWindowToolCatalogService,
+            operation: (URL) async throws -> Void
+        ) async throws {
+            let fixture = try BootstrapSocketNamespaceFixture.make()
+            let manager = ServerNetworkManager.shared
+            let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
+            let defaultSocketURL = await manager.debugResolvedBootstrapSocketURL()
+            XCTAssertEqual(defaultSocketURL, productionSocketURL)
+            let previousEnabledState = await manager.debugIsEnabledForBootstrapSocketURLOverride()
+
+            await assertBootstrapSocketOverrideError(.productionSocketURLRejected) {
+                try await manager.debugInstallBootstrapSocketURLOverride(productionSocketURL)
+            }
+
+            do {
+                try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
+            } catch {
+                fixture.removeOwnedDirectory()
+                throw error
+            }
+
+            await assertBootstrapSocketOverrideError(.overrideAlreadyInstalled) {
+                try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
+            }
+
+            do {
+                try await operation(fixture.socketURL)
+            } catch {
+                do {
+                    try await cleanupIsolatedBootstrapSocketNamespace(
+                        window: window,
+                        catalogService: catalogService,
+                        fixture: fixture,
+                        previousEnabledState: previousEnabledState
+                    )
+                } catch {
+                    XCTFail("Failed to clean isolated bootstrap socket namespace: \(error)")
+                }
+                throw error
+            }
+
+            try await cleanupIsolatedBootstrapSocketNamespace(
+                window: window,
+                catalogService: catalogService,
+                fixture: fixture,
+                previousEnabledState: previousEnabledState
+            )
+        }
+
+        private static func cleanupIsolatedBootstrapSocketNamespace(
+            window: WindowState,
+            catalogService: MCPWindowToolCatalogService,
+            fixture: BootstrapSocketNamespaceFixture,
+            previousEnabledState: Bool
+        ) async throws {
+            await window.mcpServer.stopServer()
+            ServiceRegistry.unregister(catalogService)
+            await window.mcpServer.shutdownListener()
+
+            let manager = ServerNetworkManager.shared
+            let runningAfterShutdown = await manager.isRunning()
+            XCTAssertFalse(runningAfterShutdown)
+            let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
+            let resolvedSocketURL = await manager.debugResolvedBootstrapSocketURL()
+            XCTAssertEqual(resolvedSocketURL, fixture.socketURL.standardizedFileURL)
+            try await manager.debugRestoreBootstrapSocketURLOverride(expected: fixture.socketURL)
+            let restoredSocketURL = await manager.debugResolvedBootstrapSocketURL()
+            XCTAssertEqual(restoredSocketURL, productionSocketURL)
+            await manager.setEnabled(previousEnabledState)
+            let restoredEnabledState = await manager.debugIsEnabledForBootstrapSocketURLOverride()
+            XCTAssertEqual(restoredEnabledState, previousEnabledState)
+            let runningAfterEnabledRestore = await manager.isRunning()
+            XCTAssertFalse(runningAfterEnabledRestore)
+            let resolvedSocketURLAfterEnabledRestore = await manager.debugResolvedBootstrapSocketURL()
+            XCTAssertEqual(resolvedSocketURLAfterEnabledRestore, productionSocketURL)
+            fixture.removeOwnedDirectory()
+        }
+
+        private static func assertBootstrapSocketOverrideError(
+            _ expectedError: ServerNetworkManager.DebugBootstrapSocketURLOverrideError,
+            operation: () async throws -> Void
+        ) async {
+            do {
+                try await operation()
+                XCTFail("Expected bootstrap socket URL override error: \(expectedError)")
+            } catch let error as ServerNetworkManager.DebugBootstrapSocketURLOverrideError {
+                XCTAssertEqual(error, expectedError)
+            } catch {
+                XCTFail("Unexpected bootstrap socket URL override error: \(error)")
+            }
+        }
+    #endif
 
     private static func schemaProperties(for tool: RepoPrompt.Tool) throws -> [String: Value] {
         let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue)

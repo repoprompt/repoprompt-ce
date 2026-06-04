@@ -231,6 +231,35 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertTrue(ServerNetworkManager.shouldRehydrateLegacyTabID(for: "context_builder"))
     }
 
+    func testConnectionManagerSkipsRoutinePerCallRunScopedTabRebindFallbackOnlyForCanonicalAgentModeLookups() {
+        for toolName in ["read_file", "file_search"] {
+            XCTAssertTrue(ServerNetworkManager.shouldSkipPerCallRunScopedTabRebindFallback(
+                toolName: toolName,
+                purpose: .agentModeRun
+            ))
+        }
+
+        for toolName in ["workspace_context", "agent_run"] {
+            XCTAssertFalse(ServerNetworkManager.shouldSkipPerCallRunScopedTabRebindFallback(
+                toolName: toolName,
+                purpose: .agentModeRun
+            ))
+        }
+
+        for purpose in [MCPRunPurpose.discoverRun, .unknown] {
+            for toolName in ["read_file", "file_search", "workspace_context", "agent_run"] {
+                XCTAssertFalse(ServerNetworkManager.shouldSkipPerCallRunScopedTabRebindFallback(
+                    toolName: toolName,
+                    purpose: purpose
+                ))
+            }
+        }
+
+        XCTAssertTrue(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "legacy_tool"))
+        XCTAssertTrue(ServerNetworkManager.shouldInjectLegacyTabIDForCompatibility(for: "context_builder"))
+        XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "workspace_context"))
+    }
+
     func testBindContextParticipatesInHiddenWindowRoutingWithoutImplicitPublicInjection() {
         XCTAssertFalse(ServerNetworkManager.shouldBypassWindowRouting(for: "bind_context"))
         XCTAssertFalse(ServerNetworkManager.shouldAutoInjectPublicWindowID(for: "bind_context"))

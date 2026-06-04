@@ -474,7 +474,15 @@ final class MCPServerViewModel: ObservableObject {
         didSet {
             updateDashboardSubscriptionIfNeeded()
             recomputeCloseSafetyState()
-            Task { await updateToolRegistration() }
+            #if DEBUG || EDIT_FLOW_PERF
+                Task {
+                    let registrationUpdateWindowToolsEnabledDidSetState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet)
+                    defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateWindowToolsEnabledDidSet, registrationUpdateWindowToolsEnabledDidSetState) }
+                    await updateToolRegistration()
+                }
+            #else
+                Task { await updateToolRegistration() }
+            #endif
         }
     }
 
@@ -1537,7 +1545,13 @@ final class MCPServerViewModel: ObservableObject {
         ToolAvailabilityStore.shared.$toolSummaries
             .dropFirst()
             .sink { [weak self] _ in
+                #if DEBUG || EDIT_FLOW_PERF
+                    let invalidationToolSummariesChangeState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange)
+                #endif
                 self?.invalidateToolsCache()
+                #if DEBUG || EDIT_FLOW_PERF
+                    EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange, invalidationToolSummariesChangeState)
+                #endif
             }
             .store(in: &cancellables)
 
@@ -1672,10 +1686,20 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Ensures tools are enabled and the window is joined before agent bootstrap continues.
     func ensureServerReadyForAgentBootstrap() async {
+        let invalidateCatalogBeforeUpdate = !windowToolsEnabled
+            || !ServiceRegistry.services.contains { service in
+                (service as AnyObject) === (windowToolCatalogService as AnyObject)
+            }
         if !windowToolsEnabled {
             windowToolsEnabled = true
         }
-        await updateToolRegistration()
+        #if DEBUG || EDIT_FLOW_PERF
+            let registrationUpdateAgentBootstrapState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap)
+        #endif
+        await updateToolRegistration(invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate)
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap, registrationUpdateAgentBootstrapState)
+        #endif
     }
 
     /// Disables tools for this window.
@@ -1700,8 +1724,16 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Updates tool registration based on windowToolsEnabled state
     @MainActor
-    private func updateToolRegistration() async {
-        invalidateToolsCache()
+    private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {
+        if invalidateCatalogBeforeUpdate {
+            #if DEBUG || EDIT_FLOW_PERF
+                let invalidationToolRegistrationUpdateState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate)
+            #endif
+            invalidateToolsCache()
+            #if DEBUG || EDIT_FLOW_PERF
+                EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate, invalidationToolRegistrationUpdateState)
+            #endif
+        }
 
         if windowToolsEnabled {
             ServiceRegistry.register(windowToolCatalogService) // idempotent
@@ -1980,6 +2012,11 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
+        let runToolSetupState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.MCPToolCall.runToolSetup,
+            EditFlowPerf.Dimensions(toolName: name)
+        )
+
         // Eagerly attempt to bind any queued tab context for this connection
         // This ensures non-tab-scoped tools (like get_file_tree, file_search) can
         // trigger context binding, preventing "live mode" drift in parallel runs
@@ -2000,7 +2037,12 @@ final class MCPServerViewModel: ObservableObject {
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
         let capturedConnectionID = metadata.connectionID
+        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
 
+        let runToolRegistrationState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.MCPToolCall.runToolRegistration,
+            EditFlowPerf.Dimensions(toolName: name)
+        )
         if shouldTrackActiveTool {
             await MainActor.run {
                 self.activeToolToken = toolToken
@@ -2014,7 +2056,10 @@ final class MCPServerViewModel: ObservableObject {
         // Propagate TaskLocal connectionID so tools can resolve tab context
         let task = Task {
             try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
-                try await EditFlowPerf.measure(EditFlowPerf.Stage.MCPToolCall.providerExecution) {
+                try await EditFlowPerf.measure(
+                    EditFlowPerf.Stage.MCPToolCall.providerExecution,
+                    EditFlowPerf.Dimensions(toolName: name)
+                ) {
                     try await body()
                 }
             }
@@ -2038,36 +2083,58 @@ final class MCPServerViewModel: ObservableObject {
                 )
             }
         }
+        EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolRegistration, runToolRegistrationState)
 
         do {
             // Timeout wrapper to prevent stuck tools
-            let result = try await withThrowingTaskGroup(of: T.self) { group in
-                group.addTask { try await task.value }
-                group.addTask {
-                    try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * UInt64(1_000_000_000))
-                    throw MCPError.internalError("tool '\(name)' timed out after \(timeoutSeconds)s")
+            let timeoutEnvelopeState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope,
+                EditFlowPerf.Dimensions(toolName: name)
+            )
+            let result: T
+            do {
+                result = try await withThrowingTaskGroup(of: T.self) { group in
+                    group.addTask { try await task.value }
+                    group.addTask {
+                        try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * UInt64(1_000_000_000))
+                        throw MCPError.internalError("tool '\(name)' timed out after \(timeoutSeconds)s")
+                    }
+                    let value = try await group.next()!
+                    group.cancelAll()
+                    return value
                 }
-                let value = try await group.next()!
-                group.cancelAll()
-                return value
+                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, timeoutEnvelopeState)
+            } catch {
+                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, timeoutEnvelopeState)
+                throw error
             }
             // Clean up after successful completion (only if this tool execution is still current)
+            let cleanupState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,
+                EditFlowPerf.Dimensions(toolName: name)
+            )
             await MainActor.run {
                 self.unregisterToolExecution(executionID: toolToken)
                 if shouldTrackActiveTool, self.activeToolToken == toolToken {
                     self.clearActiveToolSlot()
                 }
             }
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup, cleanupState)
             return result
         } catch let err {
             task.cancel() // ensure no leak
             // Clean up after error (only if this tool execution is still current)
+            let cleanupState = EditFlowPerf.begin(
+                EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,
+                EditFlowPerf.Dimensions(toolName: name)
+            )
             await MainActor.run {
                 self.unregisterToolExecution(executionID: toolToken)
                 if shouldTrackActiveTool, self.activeToolToken == toolToken {
                     self.clearActiveToolSlot()
                 }
             }
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup, cleanupState)
             if err is CancellationError {
                 throw MCPError.internalError("tool cancelled by user")
             }
@@ -2509,12 +2576,26 @@ final class MCPServerViewModel: ObservableObject {
 
     private func applyAutoSelectedSlices(_ entries: [AutoSliceSelection.SliceEntry]) async {
         guard !entries.isEmpty else { return }
+        #if DEBUG || EDIT_FLOW_PERF
+            let sliceFlowTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal)
+            var sliceFlowOutcome = "error"
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.ReadFile.AutoSelect.sliceFlowTotal,
+                    sliceFlowTotal,
+                    EditFlowPerf.Dimensions(outcome: sliceFlowOutcome)
+                )
+            }
+        #endif
         let sliceInputs = entries.map { entry in
             WorkspaceSelectionSliceInput(path: entry.path, ranges: entry.ranges)
         }
 
         do {
             _ = try await applySelectionSlices(entries: sliceInputs, mode: .add)
+            #if DEBUG || EDIT_FLOW_PERF
+                sliceFlowOutcome = "attempted"
+            #endif
         } catch {
             mcpServerViewModelDebugLog("Auto slice selection skipped due to slice apply error: \(error.localizedDescription)")
         }
@@ -2525,40 +2606,85 @@ final class MCPServerViewModel: ObservableObject {
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         guard !normalizedPaths.isEmpty else { return }
+        #if DEBUG || EDIT_FLOW_PERF
+            let fullFlowTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.fullFlowTotal)
+            var fullFlowOutcome = "error"
+            defer {
+                EditFlowPerf.end(
+                    EditFlowPerf.Stage.ReadFile.AutoSelect.fullFlowTotal,
+                    fullFlowTotal,
+                    EditFlowPerf.Dimensions(outcome: fullFlowOutcome)
+                )
+            }
+        #endif
 
         do {
-            let metadata = await captureRequestMetadata()
-            let lookupContext = await resolveFileToolLookupContext(from: metadata)
+            let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullRequestMetadata) {
+                await captureRequestMetadata()
+            }
+            let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullLookupContext) {
+                await resolveFileToolLookupContext(from: metadata)
+            }
             let lookupRootScope = lookupContext.rootScope
-            var resolvedContext = try resolveTabContextSnapshot(
-                from: metadata,
-                toolName: "autoSelectReadFile",
-                policy: .allowLegacyImplicitRouting
-            )
+            var resolvedContext = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullSnapshotResolution) {
+                try resolveTabContextSnapshot(
+                    from: metadata,
+                    toolName: "autoSelectReadFile",
+                    policy: .allowLegacyImplicitRouting
+                )
+            }
             let ctx = resolvedContext.snapshot
-            let addResult = await addStoredSelectionPaths(
-                existing: ctx.selection,
-                paths: normalizedPaths,
-                rawPaths: normalizedPaths,
-                mode: "full",
-                lookupRootScope: lookupRootScope
-            )
+            let addResult = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.structuralAddTotal) {
+                await addStoredSelectionPaths(
+                    existing: ctx.selection,
+                    paths: normalizedPaths,
+                    rawPaths: normalizedPaths,
+                    mode: "full",
+                    lookupRootScope: lookupRootScope
+                )
+            }
             let sliceRemovalInputs = normalizedPaths.map {
                 WorkspaceSelectionSliceInput(path: $0, ranges: [])
             }
-            let clearedSelection: StoredSelection = if sliceRemovalInputs.isEmpty {
-                addResult.selection
-            } else {
-                await computeSelectionSlicesVirtual(
-                    base: addResult.selection,
-                    entries: sliceRemovalInputs,
-                    mode: .remove,
-                    lookupRootScope: lookupRootScope
-                ).selection
+            let clearedSelection: StoredSelection = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.fullSliceClearing) {
+                if sliceRemovalInputs.isEmpty {
+                    addResult.selection
+                } else {
+                    await computeSelectionSlicesVirtual(
+                        base: addResult.selection,
+                        entries: sliceRemovalInputs,
+                        mode: .remove,
+                        lookupRootScope: lookupRootScope
+                    ).selection
+                }
             }
-            guard clearedSelection != ctx.selection else { return }
+            let finalSelectionEquality = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.finalSelectionEquality)
+            let shouldPersist = clearedSelection != ctx.selection
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.finalSelectionEquality,
+                finalSelectionEquality,
+                EditFlowPerf.Dimensions(outcome: shouldPersist ? "changed" : "unchanged")
+            )
+            guard shouldPersist else {
+                #if DEBUG || EDIT_FLOW_PERF
+                    EditFlowPerf.measure(
+                        EditFlowPerf.Stage.ReadFile.AutoSelect.persistence,
+                        EditFlowPerf.Dimensions(outcome: "skipped")
+                    ) {}
+                    fullFlowOutcome = "unchanged"
+                #endif
+                return
+            }
             resolvedContext.snapshot.selection = clearedSelection
-            await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            await EditFlowPerf.measure(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.persistence,
+                EditFlowPerf.Dimensions(outcome: "attempted")
+            ) {
+                await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: true)
+            }
+            #if DEBUG || EDIT_FLOW_PERF
+                fullFlowOutcome = "changed"
+            #endif
         } catch {
             mcpServerViewModelDebugLog("Auto full-file selection skipped due to selection apply error: \(error.localizedDescription)")
         }
@@ -2568,8 +2694,27 @@ final class MCPServerViewModel: ObservableObject {
         reply: ToolResultDTOs.ReadFileReply,
         requestedPath: String
     ) async {
-        guard await shouldAutoSelectAgentSlices() else { return }
-        guard let baseSelection = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: requestedPath) else { return }
+        #if DEBUG || EDIT_FLOW_PERF
+            let autoSelectTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.total)
+            defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.total, autoSelectTotal) }
+        #endif
+        let eligibilityResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.eligibilityResolution)
+        let shouldApply = await shouldAutoSelectAgentSlices()
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.AutoSelect.eligibilityResolution,
+            eligibilityResolution,
+            EditFlowPerf.Dimensions(outcome: shouldApply ? "eligible" : "ineligible")
+        )
+        guard shouldApply else { return }
+        let selectionProjection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.selectionProjection)
+        guard let baseSelection = AutoSliceSelection.readFileSelection(from: reply, fallbackPath: requestedPath) else {
+            EditFlowPerf.end(
+                EditFlowPerf.Stage.ReadFile.AutoSelect.selectionProjection,
+                selectionProjection,
+                EditFlowPerf.Dimensions(outcome: "missing")
+            )
+            return
+        }
         let selection: AutoSliceSelection.ReadFileSelection
         switch baseSelection {
         case .full:
@@ -2581,6 +2726,16 @@ final class MCPServerViewModel: ObservableObject {
                 existingFullPaths: existingFullPaths
             )
         }
+        EditFlowPerf.end(
+            EditFlowPerf.Stage.ReadFile.AutoSelect.selectionProjection,
+            selectionProjection,
+            EditFlowPerf.Dimensions(outcome: {
+                switch selection {
+                case .full: "full"
+                case .slice: "slice"
+                }
+            }())
+        )
         switch selection {
         case let .full(path):
             await applyAutoSelectedFullFiles([path])

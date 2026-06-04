@@ -77,8 +77,8 @@ actor BootstrapSocketServer {
     /// Returns: Admission decision with optional postAccept hook for MCP startup
     private var onNewConnection: ((Int32, String, Int, String?) async -> Admission)?
 
-    init(logger: Logger? = nil) {
-        socketURL = MCPFilesystemConstants.bootstrapSocketURL()
+    init(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(), logger: Logger? = nil) {
+        self.socketURL = socketURL
         self.logger = {
             var l = logger ?? Logger(label: "com.repoprompt.mcp.bootstrap") {
                 _ in SwiftLogNoOpLogHandler()

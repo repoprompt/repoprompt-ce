@@ -58,7 +58,10 @@ struct SystemSecItemClient: SecItemClient {
 /// Secure storage service using the canonical CE macOS Keychain service.
 final class KeychainService: SecureKeyValueStorageBackend {
     static let canonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
+    static let localSelfSignedServiceName = "com.pvncher.repoprompt.ce.local-self-signed.keychain"
+
     static let shared = KeychainService()
+    static let localSelfSignedShared = KeychainService(serviceName: localSelfSignedServiceName)
 
     private let serviceName: String
     private let secItemClient: SecItemClient

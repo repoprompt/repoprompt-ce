@@ -293,11 +293,51 @@ enum EditFlowPerf {
             static let normalizeArgs: StaticString = "EditFlow.MCPToolCall.NormalizeArgs"
             static let logicalContextResolution: StaticString = "EditFlow.MCPToolCall.LogicalContextResolution"
             static let policyGating: StaticString = "EditFlow.MCPToolCall.PolicyGating"
+            static let effectivePolicySnapshot: StaticString = "EditFlow.MCPToolCall.EffectivePolicySnapshot"
+            static let routingSnapshot: StaticString = "EditFlow.MCPToolCall.RoutingSnapshot"
+            static let preLimiterEnvelope: StaticString = "EditFlow.MCPToolCall.PreLimiterEnvelope"
+            static let limiterResolution: StaticString = "EditFlow.MCPToolCall.LimiterResolution"
+            static let limiterEnvelope: StaticString = "EditFlow.MCPToolCall.LimiterEnvelope"
+            static let limiterWait: StaticString = "EditFlow.MCPToolCall.LimiterWait"
+            static let permitBodyEnvelope: StaticString = "EditFlow.MCPToolCall.PermitBodyEnvelope"
+            static let permitPreDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPreDispatchEnvelope"
+            static let enabledStateSnapshot: StaticString = "EditFlow.MCPToolCall.EnabledStateSnapshot"
+            static let windowRunResolution: StaticString = "EditFlow.MCPToolCall.WindowRunResolution"
             static let observerCallbacks: StaticString = "EditFlow.MCPToolCall.ObserverCallbacks"
+            static let ownershipPurposeResolution: StaticString = "EditFlow.MCPToolCall.OwnershipPurposeResolution"
+            static let toolCallRecording: StaticString = "EditFlow.MCPToolCall.ToolCallRecording"
+            static let runScopedTabRebindFallback: StaticString = "EditFlow.MCPToolCall.RunScopedTabRebindFallback"
+            static let legacyTabBindingCompatibility: StaticString = "EditFlow.MCPToolCall.LegacyTabBindingCompatibility"
+            static let serviceToolLookup: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup"
+            static let serviceToolLookupServiceToolsAwait: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ServiceToolsAwait"
+            static let serviceToolLookupToolDefinitionScan: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.ToolDefinitionScan"
+            static let serviceToolLookupPublicWindowIDInjection: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.PublicWindowIDInjection"
+            static let serviceToolLookupAppSettingsToolsBuild: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.AppSettingsToolsBuild"
+            static let serviceToolLookupWindowRoutingToolsCacheActorBody: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowRoutingToolsCacheActorBody"
+            static let serviceToolLookupWindowCatalogToolsActorBodyTotal: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsActorBodyTotal"
+            static let serviceToolLookupWindowCatalogToolsMaterialization: StaticString = "EditFlow.MCPToolCall.ServiceToolLookup.WindowCatalogToolsMaterialization"
             static let dispatch: StaticString = "EditFlow.MCPToolCall.Dispatch"
+            static let permitPostDispatchEnvelope: StaticString = "EditFlow.MCPToolCall.PermitPostDispatchEnvelope"
+            static let completionObservers: StaticString = "EditFlow.MCPToolCall.CompletionObservers"
             static let preToolFilesystemFlush: StaticString = "EditFlow.MCPToolCall.PreToolFilesystemFlush"
+            static let runToolSetup: StaticString = "EditFlow.MCPToolCall.RunToolSetup"
+            static let runToolRegistration: StaticString = "EditFlow.MCPToolCall.RunToolRegistration"
             static let providerExecution: StaticString = "EditFlow.MCPToolCall.ProviderExecution"
+            static let runToolTimeoutEnvelope: StaticString = "EditFlow.MCPToolCall.RunToolTimeoutEnvelope"
+            static let runToolCompletionCleanup: StaticString = "EditFlow.MCPToolCall.RunToolCompletionCleanup"
             static let formatResult: StaticString = "EditFlow.MCPToolCall.FormatResult"
+        }
+
+        enum MCPWindowToolCatalog {
+            static let construction: StaticString = "EditFlow.MCPWindowToolCatalog.Construction"
+            static let invalidateToolsCache: StaticString = "EditFlow.MCPWindowToolCatalog.InvalidateToolsCache"
+            static let invalidationToolSummariesChange: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolSummariesChange"
+            static let invalidationToolRegistrationUpdate: StaticString = "EditFlow.MCPWindowToolCatalog.Invalidation.ToolRegistrationUpdate"
+            static let registrationUpdateWindowToolsEnabledDidSet: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.WindowToolsEnabledDidSet"
+            static let registrationUpdateAgentBootstrap: StaticString = "EditFlow.MCPWindowToolCatalog.RegistrationUpdate.AgentBootstrap"
+            static let readinessWarmAccess: StaticString = "EditFlow.MCPWindowToolCatalog.ReadinessWarmAccess"
+            static let serviceRegistryToolsPublication: StaticString = "EditFlow.MCPWindowToolCatalog.ServiceRegistryToolsPublication"
+            static let codexTurnMCPServerEnable: StaticString = "EditFlow.MCPWindowToolCatalog.CodexTurnMCPServerEnable"
         }
 
         enum ApplyEdits {
@@ -339,6 +379,15 @@ enum EditFlowPerf {
         }
 
         enum ReadFile {
+            static let providerTotal: StaticString = "EditFlow.ReadFile.ProviderTotal"
+            static let providerArgumentParsing: StaticString = "EditFlow.ReadFile.ProviderArgumentParsing"
+            static let providerRequestMetadata: StaticString = "EditFlow.ReadFile.ProviderRequestMetadata"
+            static let providerLookupContextResolution: StaticString = "EditFlow.ReadFile.ProviderLookupContextResolution"
+            static let providerPathTranslation: StaticString = "EditFlow.ReadFile.ProviderPathTranslation"
+            static let providerReadEnvelope: StaticString = "EditFlow.ReadFile.ProviderReadEnvelope"
+            static let providerReplyProjection: StaticString = "EditFlow.ReadFile.ProviderReplyProjection"
+            static let providerAutoSelect: StaticString = "EditFlow.ReadFile.ProviderAutoSelect"
+            static let providerValueEncoding: StaticString = "EditFlow.ReadFile.ProviderValueEncoding"
             static let resolveReadableFile: StaticString = "EditFlow.ReadFile.ResolveReadableFile"
             static let exactPathIssueDetection: StaticString = "EditFlow.ReadFile.ExactPathIssueDetection"
             static let rootRefsLookup: StaticString = "EditFlow.ReadFile.RootRefsLookup"
@@ -353,6 +402,42 @@ enum EditFlowPerf {
             static let workspaceContentLoad: StaticString = "EditFlow.ReadFile.WorkspaceContentLoad"
             static let splitPreservingLineEndings: StaticString = "EditFlow.ReadFile.SplitPreservingLineEndings"
             static let buildSlice: StaticString = "EditFlow.ReadFile.BuildSlice"
+
+            enum AutoSelect {
+                static let total: StaticString = "EditFlow.ReadFile.AutoSelect.Total"
+                static let eligibilityResolution: StaticString = "EditFlow.ReadFile.AutoSelect.EligibilityResolution"
+                static let selectionProjection: StaticString = "EditFlow.ReadFile.AutoSelect.SelectionProjection"
+                static let fullFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.FullFlowTotal"
+                static let fullRequestMetadata: StaticString = "EditFlow.ReadFile.AutoSelect.FullRequestMetadata"
+                static let fullLookupContext: StaticString = "EditFlow.ReadFile.AutoSelect.FullLookupContext"
+                static let fullSnapshotResolution: StaticString = "EditFlow.ReadFile.AutoSelect.FullSnapshotResolution"
+                static let structuralAddTotal: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralAddTotal"
+                static let candidateResolutionTotal: StaticString = "EditFlow.ReadFile.AutoSelect.CandidateResolutionTotal"
+                static let structuralMerge: StaticString = "EditFlow.ReadFile.AutoSelect.StructuralMerge"
+                static let autoCodemapRecomputeTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AutoCodemapRecomputeTotal"
+                static let selectedFileLookup: StaticString = "EditFlow.ReadFile.AutoSelect.SelectedFileLookup"
+                static let codemapAPILoad: StaticString = "EditFlow.ReadFile.AutoSelect.CodemapAPILoad"
+
+                enum AllCodemapFileAPIs {
+                    static let actorBodyTotal: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.ActorBodyTotal"
+                    static let stateSnapshot: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.StateSnapshot"
+                    static let materialization: StaticString = "EditFlow.ReadFile.AutoSelect.AllCodemapFileAPIs.Materialization"
+                }
+
+                static let referencedPathResolution: StaticString = "EditFlow.ReadFile.AutoSelect.ReferencedPathResolution"
+                static let acceptedFileAPIFilter: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter"
+
+                enum AcceptedFileAPIFilter {
+                    static let pathGrouping: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.PathGrouping"
+                    static let selectedRecordProjection: StaticString = "EditFlow.ReadFile.AutoSelect.AcceptedFileAPIFilter.SelectedRecordProjection"
+                }
+
+                static let autoReferencedAPIComputation: StaticString = "EditFlow.ReadFile.AutoSelect.AutoReferencedAPIComputation"
+                static let fullSliceClearing: StaticString = "EditFlow.ReadFile.AutoSelect.FullSliceClearing"
+                static let finalSelectionEquality: StaticString = "EditFlow.ReadFile.AutoSelect.FinalSelectionEquality"
+                static let persistence: StaticString = "EditFlow.ReadFile.AutoSelect.Persistence"
+                static let sliceFlowTotal: StaticString = "EditFlow.ReadFile.AutoSelect.SliceFlowTotal"
+            }
         }
 
         enum FileSystem {

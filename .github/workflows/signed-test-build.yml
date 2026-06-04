@@ -1,0 +1,393 @@
+name: Signed Test Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Upstream branch, tag, or upstream-reachable SHA to build and sign
+        required: true
+        default: main
+        type: string
+
+concurrency:
+  group: signed-test-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  validate-ref:
+    name: Validate Test Build Ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    outputs:
+      commit: ${{ steps.source-ref.outputs.commit }}
+      reachable_refs: ${{ steps.source-ref.outputs.reachable_refs }}
+      tooling-commit: ${{ steps.tooling-ref.outputs.commit }}
+    steps:
+      - name: Require trusted workflow dispatch
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SOURCE_REF" ]] || { echo "source_ref is required" >&2; exit 1; }
+          [[ "$SOURCE_REF" != -* ]] || { echo "source_ref must not start with '-'" >&2; exit 1; }
+          [[ "$SOURCE_REF" != *$'\n'* && "$SOURCE_REF" != *$'\r'* ]] || { echo "source_ref must be a single line" >&2; exit 1; }
+          [[ "$SOURCE_REF" != *:* ]] || { echo "Signed test builds must use canonical upstream refs, not fork shorthand refs." >&2; exit 1; }
+          case "$SOURCE_REF" in
+            refs/pull/*|pull/*|refs/remotes/*/pull/*)
+              echo "Signed test builds must use an upstream branch, tag, or upstream-reachable SHA, not a pull-request ref." >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: main
+          path: trusted-control-plane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve trusted tooling commit
+        id: tooling-ref
+        run: echo "commit=$(git -C trusted-control-plane rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out requested source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ inputs.source_ref }}
+          path: requested-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify source commit is reachable from upstream refs
+        id: source-ref
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: ./trusted-control-plane/Scripts/verify_signed_test_build_ref.sh "$SOURCE_REF" requested-source
+
+  stage:
+    name: Build Requested Source Without Secrets
+    needs: validate-ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out requested source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.commit }}
+          path: release-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Build and stage requested source
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+        run: ./trusted-control-plane/Scripts/release.sh stage-test-build
+
+      - name: Upload staged signed test build source
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-staged-signed-test-build
+          path: |
+            release-source/dist/*-stage.zip
+            release-source/dist/*-stage.zip.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  sign:
+    name: Sign and Notarize Test Build
+    needs:
+      - validate-ref
+      - stage
+    if: github.ref == 'refs/heads/main'
+    environment: release
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download staged signed test build source
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: RepoPrompt-CE-staged-signed-test-build
+          path: staged-release
+
+      - name: Check out approved source as data
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.commit }}
+          path: approved-source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Revalidate source ref after release approval
+        id: sign-source-ref
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_SERVER_URL: ${{ github.server_url }}
+        run: ./trusted-control-plane/Scripts/verify_signed_test_build_ref.sh "$SOURCE_REF" approved-source
+
+      - name: Require sign-time source ref to match validated commit
+        env:
+          EXPECTED_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          ACTUAL_COMMIT: ${{ steps.sign-source-ref.outputs.commit }}
+        run: |
+          set -euo pipefail
+          [[ "$ACTUAL_COMMIT" == "$EXPECTED_COMMIT" ]] || {
+            echo "source_ref resolved differently after release approval: expected $EXPECTED_COMMIT, got $ACTUAL_COMMIT" >&2
+            exit 1
+          }
+
+      - name: Verify and expand staged signed test build source
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+        run: |
+          set -euo pipefail
+          cd staged-release
+          shopt -s nullglob
+          archives=(./*-stage.zip)
+          checksum_files=(./*-stage.zip.sha256)
+          [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one staged ZIP" >&2; exit 1; }
+          [[ "${#checksum_files[@]}" == "1" ]] || { echo "Expected exactly one staged ZIP checksum" >&2; exit 1; }
+          archive="${archives[0]}"
+          [[ "${checksum_files[0]}" == "$archive.sha256" ]] || { echo "Staged ZIP checksum name mismatch" >&2; exit 1; }
+          shasum -a 256 -c "${checksum_files[0]}"
+          staged_sha256="$(awk '{ print $1 }' "${checksum_files[0]}")"
+          echo "SIGNED_TEST_STAGED_ARCHIVE_NAME=$(basename "$archive")" >> "$GITHUB_ENV"
+          echo "SIGNED_TEST_STAGED_ARCHIVE_SHA256=$staged_sha256" >> "$GITHUB_ENV"
+          ../trusted-control-plane/Scripts/extract_staged_release.py "$archive" ../release-source RepoPrompt
+          REPOPROMPT_RELEASE_SOURCE_ROOT=../release-source \
+            REPOPROMPT_APPROVED_SOURCE_ROOT=../approved-source \
+            ../trusted-control-plane/Scripts/validate_staged_release.sh
+
+      - name: Import Developer ID certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+          CI_KEYCHAIN_PASSWORD: ${{ secrets.CI_KEYCHAIN_PASSWORD }}
+          CONFIGURED_SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-release.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"
+          keychain_created=0
+          cleanup_certificate_and_failed_keychain() {
+            status=$?
+            rm -f "$CERTIFICATE_PATH"
+            if (( status != 0 )) && (( keychain_created )); then
+              security delete-keychain "$KEYCHAIN_PATH" || true
+            fi
+          }
+          trap cleanup_certificate_and_failed_keychain EXIT
+          printf '%s' "$CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          keychain_created=1
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$CERTIFICATE_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=${CONFIGURED_SIGN_IDENTITY:-Developer ID Application: Eric Provencher (648A27MST5)}" >> "$GITHUB_ENV"
+
+      - name: Prepare provisioning profile and notarization key
+        env:
+          PROVISIONING_PROFILE_BASE64: ${{ secrets.REPOPROMPT_CE_PROVISIONING_PROFILE_BASE64 }}
+          NOTARYTOOL_PRIVATE_KEY_BASE64: ${{ secrets.NOTARYTOOL_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          SECRETS_DIR="$RUNNER_TEMP/repoprompt-release-secrets"
+          mkdir -p "$SECRETS_DIR"
+          printf '%s' "$PROVISIONING_PROFILE_BASE64" | base64 --decode > "$SECRETS_DIR/repoprompt-ce.provisionprofile"
+          printf '%s' "$NOTARYTOOL_PRIVATE_KEY_BASE64" | base64 --decode > "$SECRETS_DIR/notarytool-private-key.p8"
+          echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
+          echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
+
+      - name: Sign, notarize, and package test build
+        env:
+          RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_GIT_ROOT: ${{ github.workspace }}/trusted-control-plane
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          REPOPROMPT_APPROVED_SOURCE_ROOT: ${{ github.workspace }}/approved-source
+          REPOPROMPT_REQUIRE_HEAD_MATCH: 0
+          SIGNED_TEST_SOURCE_REF: ${{ inputs.source_ref }}
+          SIGNED_TEST_REACHABLE_REFS: ${{ steps.sign-source-ref.outputs.reachable_refs }}
+          SIGNED_TEST_TOOLING_COMMIT: ${{ needs.validate-ref.outputs.tooling-commit }}
+          SIGNED_TEST_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
+          NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+        run: ./trusted-control-plane/Scripts/release.sh publish-test-build
+
+      - name: Remove ephemeral keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/repoprompt-release.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"
+          security delete-keychain "$KEYCHAIN_PATH" || true
+          rm -f "$CERTIFICATE_PATH"
+          rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"
+
+      - name: Upload signed test build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RepoPrompt-CE-signed-test-build
+          path: |
+            release-source/dist/*.zip
+            release-source/dist/*.dmg
+            release-source/dist/SHA256SUMS
+            release-source/dist/*-signed-test-provenance.json
+          if-no-files-found: error
+          retention-days: 7
+
+  smoke-signed-helper:
+    name: Smoke Signed Helper Without Release Secrets
+    needs:
+      - validate-ref
+      - sign
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-26
+    permissions:
+      contents: read
+    steps:
+      - name: Check out trusted release tooling
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          ref: ${{ needs.validate-ref.outputs.tooling-commit }}
+          path: trusted-control-plane
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download signed test build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: RepoPrompt-CE-signed-test-build
+          path: signed-test-build
+
+      - name: Extract and statically validate signed helper layout
+        env:
+          EXPECTED_REQUESTED_REF: ${{ inputs.source_ref }}
+          EXPECTED_SOURCE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
+          EXPECTED_TOOLING_COMMIT: ${{ needs.validate-ref.outputs.tooling-commit }}
+          EXPECTED_WORKFLOW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(signed-test-build/*.zip)
+          dmgs=(signed-test-build/*.dmg)
+          manifests=(signed-test-build/*SHA256SUMS)
+          provenances=(signed-test-build/*-signed-test-provenance.json)
+          [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP" >&2; exit 1; }
+          [[ "${#dmgs[@]}" == "1" ]] || { echo "Expected exactly one signed DMG" >&2; exit 1; }
+          [[ "${#manifests[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP checksum manifest" >&2; exit 1; }
+          [[ "${#provenances[@]}" == "1" ]] || { echo "Expected exactly one signed test provenance file" >&2; exit 1; }
+          python3 - "${archives[0]}" "${dmgs[0]}" "${manifests[0]}" "${provenances[0]}" <<'PY'
+          import hashlib
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          zip_path, dmg_path, checksums_path, provenance_path = map(Path, sys.argv[1:])
+          provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+          required = {
+              "requested_ref",
+              "resolved_source_commit",
+              "trusted_tooling_commit",
+              "workflow_run_url",
+              "signing_mode",
+              "source_reachable_refs",
+              "artifacts",
+          }
+          missing = sorted(required - provenance.keys())
+          if missing:
+              raise SystemExit(f"Missing provenance fields: {', '.join(missing)}")
+          if provenance.get("schema_version") != 1:
+              raise SystemExit("Unexpected signed test build provenance schema version")
+          if provenance.get("hash_algorithm") != "SHA-256":
+              raise SystemExit("Unexpected signed test build provenance hash algorithm")
+          if provenance["requested_ref"] != os.environ["EXPECTED_REQUESTED_REF"]:
+              raise SystemExit("Provenance requested ref mismatch")
+          if provenance["resolved_source_commit"] != os.environ["EXPECTED_SOURCE_COMMIT"]:
+              raise SystemExit("Provenance source commit mismatch")
+          if provenance["trusted_tooling_commit"] != os.environ["EXPECTED_TOOLING_COMMIT"]:
+              raise SystemExit("Provenance tooling commit mismatch")
+          if provenance["workflow_run_url"] != os.environ["EXPECTED_WORKFLOW_RUN_URL"]:
+              raise SystemExit("Provenance workflow run URL mismatch")
+          if provenance["signing_mode"] != "developer-id-signed-test-build":
+              raise SystemExit("Unexpected signed test build signing mode")
+          if not isinstance(provenance["source_reachable_refs"], list) or not provenance["source_reachable_refs"]:
+              raise SystemExit("Provenance reachable refs must be a non-empty list")
+
+          def sha256(path: Path) -> str:
+              digest = hashlib.sha256()
+              with path.open("rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          expected = {
+              "zip": zip_path,
+              "dmg": dmg_path,
+              "checksums": checksums_path,
+          }
+          artifacts = provenance["artifacts"]
+          for key, path in expected.items():
+              entry = artifacts.get(key)
+              if not isinstance(entry, dict):
+                  raise SystemExit(f"Missing provenance artifact entry: {key}")
+              if entry.get("file") != path.name:
+                  raise SystemExit(f"Provenance {key} file mismatch")
+              if entry.get("sha256") != sha256(path):
+                  raise SystemExit(f"Provenance {key} hash mismatch")
+          PY
+          archive="${archives[0]}"
+          archive_name="$(basename "$archive")"
+          archive_checksum_entry="$RUNNER_TEMP/signed-test-build-zip.sha256"
+          awk -v archive_name="$archive_name" '$2 == archive_name { print }' "${manifests[0]}" > "$archive_checksum_entry"
+          [[ "$(wc -l < "$archive_checksum_entry" | tr -d ' ')" == "1" ]] || { echo "Expected exactly one signed ZIP checksum entry" >&2; exit 1; }
+          (cd signed-test-build && shasum -a 256 -c "$archive_checksum_entry")
+          mkdir extracted
+          ditto -x -k "$archive" extracted
+          ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
+            extracted/RepoPrompt.app \
+            "Signed test build MCP helper layout"
+
+      - name: Execute signed helper without inherited secrets
+        run: |
+          env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME="$HOME" \
+            TMPDIR="$RUNNER_TEMP" \
+            ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
+            extracted/RepoPrompt.app \
+            "Signed test build MCP helper"

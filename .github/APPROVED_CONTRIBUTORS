@@ -1,6 +1,6 @@
 # GitHub handles approved to bypass contribution auto-close
-# The listed people opted in to publishing their GitHub handles.
-# Maintainers may update this list through reviewed changes or issue approvals.
+# Initial import: matched RepoPrompt customer claim-form submissions
+# Refresh: ./Scripts/refresh_contributor_allowlist.sh
 # Format: <username> <capability>
 # capability:
 #   issue  issues stay open
@@ -10,6 +10,7 @@
 0NotApplicable0 pr
 0xNino pr
 1WorldCapture pr
+2021opt pr
 24601 pr
 2lim5lim pr
 9erson pr
@@ -20,10 +21,12 @@ abhishekbhakat pr
 abhshkt pr
 achiu3q pr
 aconcepcion pr
+adamhelfgott pr
 adamkmccarthy pr
 adampearse pr
 adityadaniel pr
 AdrianAlonsoDev pr
+afadlallah pr
 agamrp pr
 agentdouble0zero pr
 ahafonof pr
@@ -102,6 +105,8 @@ brandonskane pr
 brasazza pr
 brianhays pr
 brichase pr
+brytoncooper pr
+BullThistle pr
 bz8768 pr
 c-p-b pr
 cababa pr
@@ -122,6 +127,7 @@ chebizarro pr
 chesterhartin pr
 cheuk-cheng pr
 chevyphillip pr
+chidev pr
 chingchok pr
 chingyeowp pr
 choguun pr
@@ -130,6 +136,7 @@ christopherbeers pr
 christophersrizzo pr
 christophersutton pr
 christophsturm pr
+chucky23 pr
 chufucious pr
 ci pr
 cipradu pr
@@ -142,6 +149,7 @@ clssck pr
 cmgramse pr
 CMiller-cli pr
 cmujie pr
+CodeCultivar pr
 CodeWithBehnam pr
 cogwheel0 pr
 colindotfun pr
@@ -174,6 +182,7 @@ davidarce pr
 davidgovea pr
 davidmansaray pr
 DavidSchargel pr
+DavidWells pr
 dayvough pr
 dbader pr
 dbryson pr
@@ -219,6 +228,7 @@ erodriguezh pr
 ethan-wickstrom pr
 eugenepyvovarov pr
 everjose pr
+FalconEdi pr
 falksinke pr
 fant0zzi pr
 fatehwaharp pr
@@ -245,6 +255,7 @@ gapurov pr
 gavinmclelland pr
 gcavanaugh pr
 gchahal1982 pr
+GenAIAddict pr
 german-muzquiz pr
 gerred pr
 ggaabe pr
@@ -274,6 +285,7 @@ hazmyr pr
 hbruss pr
 helpimfalling pr
 HendrikReh pr
+henrycarrero pr
 heomin86 pr
 hierosir1984 pr
 highlandhodl pr
@@ -282,6 +294,7 @@ HomunculusLabs pr
 hosmelq pr
 hovr pr
 hstove pr
+hugo-sss pr
 HunterHillegas pr
 hutchutchutch pr
 i1r0 pr
@@ -306,6 +319,7 @@ jackberger03 pr
 jackwimbish pr
 jakekinchen pr
 jakio pr
+jamesblackwell pr
 jamesjlundin pr
 jasenlew pr
 jayashan10 pr
@@ -326,8 +340,10 @@ jim380 pr
 jinstrel pr
 jmaartenson pr
 jmdfm pr
+Jmeg8r pr
 jmslagle pr
 joedevon pr
+JoelHarlander pr
 JohanM-er pr
 johnjhughes pr
 johnshaughnessy pr
@@ -354,6 +370,7 @@ kbimplis pr
 keiranhaax pr
 keltokhy pr
 kennyfrc pr
+kennyroh pr
 kevkmr pr
 kevyyar pr
 kierandotai pr
@@ -368,6 +385,7 @@ kulshekhar pr
 kushthakker pr
 kverma pr
 kzheart pr
+l0kki pr
 Lauricio pr
 leegmoore pr
 legalwinner pr
@@ -436,6 +454,7 @@ nafizh pr
 najibninaba pr
 narner pr
 nbbaier pr
+ndcollins pr
 nealerickson pr
 NebojsaKrtolica pr
 neo-cheung pr
@@ -469,6 +488,8 @@ pauloelias pr
 pavelklymenko pr
 peak-flow pr
 Peddle pr
+pedrini210 pr
+peerapatjk pr
 Pent pr
 PerimeterViktor pr
 PeterHa-UoH pr
@@ -514,6 +535,7 @@ rshagiev pr
 rwblackburn pr
 ryan-castner pr
 ryan6416 pr
+ryanmosz pr
 ryanodum pr
 safoinme pr
 Sailfishc pr
@@ -521,6 +543,7 @@ sammyjoyce pr
 samuelcombey pr
 samuelcouch pr
 SanCognition pr
+sandman187154 pr
 sankara0717 pr
 sanky369 pr
 saqbach pr
@@ -530,6 +553,7 @@ seamasmc pr
 seantimm pr
 seth-mc pr
 seyeint pr
+shamardy pr
 shankys pr
 shauntrennery pr
 shawnharmsen pr
@@ -562,11 +586,13 @@ SuperManfred pr
 suvash pr
 Swader pr
 Swarzox pr
+sykopatrick pr
 syntaxsurge pr
 sysrex pr
 Taik pr
 tapestreamer pr
 techguysimon pr
+thameera pr
 TheAlexYao pr
 TheAndrewJackson pr
 thejudge22 pr
@@ -578,8 +604,10 @@ thompson-h pr
 ThomsenDrake pr
 ThunderMullet pr
 tiagoefreitas pr
+tiarnann pr
 timigod pr
 timpulver pr
+tjc-dev pr
 TJennerjahn pr
 tjrivera pr
 tmik105 pr
@@ -632,11 +660,13 @@ xcyyyy19 pr
 xeryspace pr
 xHeaven pr
 xsdc pr
+xtchall pr
 xuanvinhvu pr
 xyin-anl pr
 yaananth pr
 yaarix pr
 yayasoumah pr
+yazinsai pr
 ybbuc pr
 ybugrara pr
 yerffejytnac pr

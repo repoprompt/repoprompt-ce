@@ -187,6 +187,7 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
         switch toolName {
         case "git": "Git"
         case "file_search": "Search"
+        case "search": "Web Search"
         case "manage_selection": "Selection"
         case "read_file": "Read File"
         case "workspace_context": "Context"
@@ -213,6 +214,9 @@ enum AgentToolCardRenderSummaryBuilder {
     private static let safeGitDiffOnelinerRegex = try! NSRegularExpression(
         pattern: #"^(?:[0-9]+ repos?: )?[0-9]+ files? \(\+[0-9]+ -[0-9]+\)$"#
     )
+    private static let safeNativeToolNameRegex = try! NSRegularExpression(
+        pattern: #"^[a-z][a-z0-9_]{1,48}$"#
+    )
 
     static func build(
         normalizedToolName: String?,
@@ -230,6 +234,8 @@ enum AgentToolCardRenderSummaryBuilder {
             return readFileSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "file_search":
             return fileSearchSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
+        case "search":
+            return webSearchSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "manage_selection":
             return manageSelectionSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "workspace_context":
@@ -241,7 +247,7 @@ enum AgentToolCardRenderSummaryBuilder {
         case "git":
             return gitSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         default:
-            return nil
+            return safeNativeToolSummary(normalizedToolName: normalizedToolName, statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         }
     }
 
@@ -290,6 +296,14 @@ enum AgentToolCardRenderSummaryBuilder {
         guard let object else { return nil }
         for key in keys {
             if let value = object[key] as? [Any] { return value }
+        }
+        return nil
+    }
+
+    static func objectValue(_ object: [String: Any]?, keys: [String]) -> [String: Any]? {
+        guard let object else { return nil }
+        for key in keys {
+            if let value = object[key] as? [String: Any] { return value }
         }
         return nil
     }
@@ -354,6 +368,68 @@ enum AgentToolCardRenderSummaryBuilder {
             detailText: nil,
             status: renderStatus,
             op: "file_search"
+        )
+    }
+
+    private static func webSearchSummary(statusWord: String, rawObject: [String: Any]?, argsObject: [String: Any]?) -> AgentToolCardRenderSummary? {
+        guard rawObject != nil || argsObject != nil else { return nil }
+        let query = trimmed(stringValue(argsObject, keys: ["query", "q", "search_query", "searchQuery", "text", "value"]))
+            ?? trimmed(stringValue(rawObject, keys: ["query", "q", "search_query", "searchQuery", "text", "value"]))
+        let resultCount = firstSearchResultCount(rawObject)
+        let sourceCount = firstSearchSourceCount(rawObject)
+        let errorDetail = webSearchErrorDetail(rawObject)
+        let countSummary: String? = {
+            var parts: [String] = []
+            if let resultCount { parts.append("\(resultCount) result\(resultCount == 1 ? "" : "s")") }
+            if let sourceCount { parts.append("\(sourceCount) source\(sourceCount == 1 ? "" : "s")") }
+            return parts.isEmpty ? nil : parts.joined(separator: " • ")
+        }()
+        let subtitle = [query.map { "\"\($0)\"" }, countSummary]
+            .compactMap(\.self)
+            .joined(separator: " • ")
+        let baseStatus = status(from: stringValue(rawObject, keys: ["status", "state", "outcome"]) ?? statusWord, defaultStatus: .neutral)
+        let resultDetail = webSearchDetailText(rawObject)
+        let renderStatus: AgentToolCardRenderStatus = {
+            if errorDetail != nil, baseStatus != .success { return .failure }
+            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running { return baseStatus }
+            if (resultCount ?? 0) > 0 || (sourceCount ?? 0) > 0 { return .success }
+            if resultDetail != nil { return .success }
+            return baseStatus
+        }()
+        let detailText = baseStatus == .success ? (resultDetail ?? errorDetail) : (errorDetail ?? resultDetail)
+        return AgentToolCardRenderSummary(
+            toolName: "search",
+            title: "Web Search",
+            subtitle: subtitle.isEmpty ? nil : subtitle,
+            detailText: detailText,
+            status: renderStatus,
+            op: "search"
+        )
+    }
+
+    private static func safeNativeToolSummary(
+        normalizedToolName: String,
+        statusWord: String,
+        rawObject: [String: Any]?,
+        argsObject: [String: Any]?
+    ) -> AgentToolCardRenderSummary? {
+        guard isSafeNativeToolName(normalizedToolName), rawObject != nil || argsObject != nil else { return nil }
+        let subtitle = nativeScalarSummary(
+            object: argsObject,
+            preferredKeys: ["query", "q", "prompt", "text", "value", "name", "id", "operation", "op"]
+        )
+        let detailText = nativeScalarSummary(
+            object: rawObject,
+            preferredKeys: ["summary", "answer", "message", "text", "title", "status", "state", "outcome"]
+        )
+        guard subtitle != nil || detailText != nil else { return nil }
+        return AgentToolCardRenderSummary(
+            toolName: normalizedToolName,
+            title: nativeToolTitle(from: normalizedToolName),
+            subtitle: subtitle,
+            detailText: detailText,
+            status: status(from: stringValue(rawObject, keys: ["status", "state", "outcome"]) ?? statusWord, defaultStatus: .neutral),
+            op: normalizedToolName
         )
     }
 
@@ -567,6 +643,171 @@ enum AgentToolCardRenderSummaryBuilder {
             status: renderStatus,
             op: op.lowercased()
         )
+    }
+
+    private static func webSearchDetailText(_ object: [String: Any]?) -> String? {
+        if let direct = trimmed(stringValue(object, keys: ["summary", "answer", "snippet", "message", "text"])) {
+            return safeCollapsedText(direct)
+        }
+        for arrayKey in ["results", "items", "web_results", "webResults", "search_results", "searchResults"] {
+            guard let first = arrayValue(object, keys: [arrayKey])?.first else { continue }
+            if let text = webSearchDetailText(fromResult: first) { return text }
+        }
+        if let nested = objectValue(object, keys: ["result", "output", "response", "content", "data", "payload"]),
+           let text = webSearchDetailText(nested)
+        {
+            return text
+        }
+        for arrayKey in ["sources", "citations"] {
+            guard let first = arrayValue(object, keys: [arrayKey])?.first else { continue }
+            if let text = webSearchDetailText(fromResult: first) { return text }
+        }
+        return nil
+    }
+
+    private static func webSearchDetailText(fromResult value: Any) -> String? {
+        if let text = value as? String { return safeCollapsedText(text) }
+        guard let object = value as? [String: Any] else { return nil }
+        let title = safeCollapsedText(stringValue(object, keys: ["title", "name", "source", "url"]))
+        let snippet = safeCollapsedText(stringValue(object, keys: ["snippet", "summary", "text", "description", "content"]))
+        return join(title, snippet)
+    }
+
+    private static func webSearchErrorDetail(_ object: [String: Any]?) -> String? {
+        guard let object else { return nil }
+        if let error = object["error"] as? String { return safeCollapsedText(error) }
+        if let errorMessage = trimmed(stringValue(object, keys: ["error_message", "errorMessage"])) {
+            return safeCollapsedText(errorMessage)
+        }
+        if let error = object["error"] as? [String: Any] {
+            return safeCollapsedText(stringValue(error, keys: ["message", "detail", "description", "code"]))
+        }
+        if let errors = object["errors"] as? [Any], let first = errors.first {
+            if let text = first as? String { return safeCollapsedText(text) }
+            if let error = first as? [String: Any] {
+                return safeCollapsedText(stringValue(error, keys: ["message", "detail", "description", "code"]))
+            }
+        }
+        return nil
+    }
+
+    private static func firstSearchResultCount(_ object: [String: Any]?) -> Int? {
+        firstArrayCount(object, keys: ["results", "items", "web_results", "webResults", "search_results", "searchResults"])
+            ?? intValue(object, keys: ["result_count", "resultCount", "total_results", "totalResults", "count"])
+            ?? firstNestedSearchResultCount(object)
+    }
+
+    private static func firstNestedSearchResultCount(_ object: [String: Any]?) -> Int? {
+        for key in ["result", "output", "response", "content", "data", "payload"] {
+            guard let nested = objectValue(object, keys: [key]) else { continue }
+            if let count = firstSearchResultCount(nested) { return count }
+        }
+        return nil
+    }
+
+    private static func firstSearchSourceCount(_ object: [String: Any]?) -> Int? {
+        firstArrayCount(object, keys: ["sources", "citations"])
+            ?? intValue(object, keys: [
+                "source_count", "sourceCount", "total_sources", "totalSources",
+                "citation_count", "citationCount", "total_citations", "totalCitations"
+            ])
+            ?? firstNestedSearchSourceCount(object)
+    }
+
+    private static func firstNestedSearchSourceCount(_ object: [String: Any]?) -> Int? {
+        for key in ["result", "output", "response", "content", "data", "payload"] {
+            guard let nested = objectValue(object, keys: [key]) else { continue }
+            if let count = firstSearchSourceCount(nested) { return count }
+        }
+        return nil
+    }
+
+    private static func firstArrayCount(_ object: [String: Any]?, keys: [String]) -> Int? {
+        for key in keys {
+            if let count = arrayValue(object, keys: [key])?.count { return count }
+        }
+        return nil
+    }
+
+    private static func safeCollapsedText(_ value: String?) -> String? {
+        guard let value = trimmed(value) else { return nil }
+        guard !value.contains("\n"), !value.contains("\r") else {
+            let oneline = value
+                .components(separatedBy: .newlines)
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+            return smallSummaryString(oneline)
+        }
+        let lowered = value.lowercased()
+        guard !(value.hasPrefix("{") || value.hasPrefix("[")),
+              !lowered.contains("\"results\""),
+              !lowered.contains("\"content\"")
+        else { return nil }
+        return smallSummaryString(value)
+    }
+
+    private static func smallSummaryString(_ value: String?) -> String? {
+        guard let value = trimmed(value) else { return nil }
+        if value.count <= 240 { return value }
+        let prefix = value.prefix(237).trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.isEmpty ? nil : prefix + "…"
+    }
+
+    private static func nativeScalarSummary(object: [String: Any]?, preferredKeys: [String]) -> String? {
+        guard let object else { return nil }
+        for key in preferredKeys {
+            if let value = safeNativeScalar(object[key]) { return value }
+        }
+        return nil
+    }
+
+    private static func safeNativeScalar(_ value: Any?) -> String? {
+        switch value {
+        case let string as String:
+            safeCollapsedText(string)
+        case let number as NSNumber:
+            number.stringValue
+        default:
+            nil
+        }
+    }
+
+    static func isSafeNativeFallbackToolName(_ name: String?) -> Bool {
+        guard let name else { return false }
+        return isSafeNativeToolName(name)
+    }
+
+    private static func isSafeNativeToolName(_ name: String) -> Bool {
+        let normalized = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard normalized == name,
+              normalized != "tool",
+              normalized != "other",
+              !normalized.hasPrefix("mcp__"),
+              !normalized.contains("."),
+              !normalized.contains("/")
+        else { return false }
+        switch normalized {
+        case "read", "read_file", "file_search", "grep", "bash", "shell", "apply_edits", "apply_patch", "edit",
+             "get_file_tree", "get_code_structure", "file_actions", "manage_selection", "workspace_context", "prompt",
+             "ask_oracle", "oracle_send", "oracle_utils", "oracle_chat_log", "chat_send", "chats", "list_models",
+             "bind_context", "manage_workspaces", "git", "manage_worktree", "context_builder", "request_user_input",
+             "ask_user", "ask_user_question", "agent_explore", "agent_run", "agent_manage", "app_settings":
+            return false
+        default:
+            break
+        }
+        let range = NSRange(normalized.startIndex ..< normalized.endIndex, in: normalized)
+        return safeNativeToolNameRegex.firstMatch(in: normalized, range: range) != nil
+    }
+
+    private static func nativeToolTitle(from name: String) -> String {
+        name.split(separator: "_")
+            .map { part in
+                guard let first = part.first else { return "" }
+                return String(first).uppercased() + part.dropFirst().lowercased()
+            }
+            .joined(separator: " ")
     }
 
     private static func status(from rawStatus: String, defaultStatus: AgentToolCardRenderStatus) -> AgentToolCardRenderStatus {

@@ -468,7 +468,7 @@ func toolIcon(for toolName: String?) -> String {
         return "doc.text"
     case "bash", "shell", "local_shell", "unified_exec", "exec_command", "run_shell_command":
         return "terminal"
-    case "search", "web_search", "web_search_request", "google_web_search":
+    case "search", "web_search", "web_search_request", "google_web_search", "search_web":
         return "globe"
     case "apply_edits", "mcp__RepoPrompt__apply_edits":
         return "pencil"
@@ -536,7 +536,7 @@ func toolDisplayName(for toolName: String?) -> String {
         return "Question"
     case "bash", "shell", "local_shell", "unified_exec", "exec_command", "run_shell_command":
         return "Bash"
-    case "search", "web_search", "web_search_request", "google_web_search":
+    case "search", "web_search", "web_search_request", "google_web_search", "search_web":
         return "Web Search"
     case "read", "Read":
         return "Read"

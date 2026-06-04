@@ -25,7 +25,14 @@ enum ServiceRegistry {
         _services.append(service)
         // Inform the availability store so the Settings UI can list them
         Task {
-            await ToolAvailabilityStore.shared.registerTools(service.tools)
+            #if DEBUG || EDIT_FLOW_PERF
+                let serviceTools = await EditFlowPerf.measure(EditFlowPerf.Stage.MCPWindowToolCatalog.serviceRegistryToolsPublication) {
+                    await service.tools
+                }
+                await ToolAvailabilityStore.shared.registerTools(serviceTools)
+            #else
+                await ToolAvailabilityStore.shared.registerTools(service.tools)
+            #endif
             // Tools list has effectively changed; notify connected clients
             await ServerNetworkManager.shared.broadcastToolListChanged()
         }

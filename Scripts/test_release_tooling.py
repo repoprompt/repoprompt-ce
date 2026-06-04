@@ -123,6 +123,10 @@ class ReleaseToolingTests(unittest.TestCase):
         promote_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release-promote.yml").read_text(
             encoding="utf-8"
         )
+        signed_test_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "signed-test-build.yml").read_text(
+            encoding="utf-8"
+        )
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
 
         publish_job = release_workflow.split("\n  publish:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
         publish_staged = "        run: ./trusted-control-plane/Scripts/release.sh publish-staged"
@@ -175,6 +179,72 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn('CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"', final_cleanup)
         self.assertIn('rm -f "$CERTIFICATE_PATH"', final_cleanup)
         self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"', final_cleanup)
+
+        self.assertIn("group: signed-test-build", signed_test_workflow)
+        self.assertIn("verify_signed_test_build_ref.sh", signed_test_workflow)
+        self.assertIn("reachable_refs: ${{ steps.source-ref.outputs.reachable_refs }}", signed_test_workflow)
+        self.assertIn("upstream-reachable SHA", signed_test_workflow)
+        self.assertIn("source_ref must not start with '-'", signed_test_workflow)
+        self.assertIn("source_ref must be a single line", signed_test_workflow)
+        self.assertIn("GITHUB_SERVER_URL", signed_test_workflow)
+        self.assertNotIn("branch, tag, or SHA to build and sign", signed_test_workflow)
+
+        signed_test_stage = signed_test_workflow.split("\n  stage:", 1)[1].split("\n  sign:", 1)[0]
+        self.assertNotIn("environment: release", signed_test_stage)
+        self.assertIn("persist-credentials: false", signed_test_stage)
+        self.assertIn("release.sh stage-test-build", signed_test_stage)
+        self.assertIn("RepoPrompt-CE-staged-signed-test-build", signed_test_stage)
+
+        signed_test_sign = signed_test_workflow.split("\n  sign:", 1)[1].split("\n  smoke-signed-helper:", 1)[0]
+        self.assertIn("environment: release", signed_test_sign)
+        self.assertIn("- stage", signed_test_sign)
+        self.assertIn("RepoPrompt-CE-staged-signed-test-build", signed_test_sign)
+        self.assertIn("release.sh publish-test-build", signed_test_sign)
+        self.assertIn("release-source/dist/*.zip", signed_test_sign)
+        self.assertIn("release-source/dist/*.dmg", signed_test_sign)
+        self.assertIn("release-source/dist/*-signed-test-provenance.json", signed_test_sign)
+        self.assertIn("Revalidate source ref after release approval", signed_test_sign)
+        self.assertIn("id: sign-source-ref", signed_test_sign)
+        self.assertIn("Require sign-time source ref to match validated commit", signed_test_sign)
+        self.assertLess(signed_test_sign.index("Revalidate source ref after release approval"), signed_test_sign.index("Import Developer ID certificate"))
+        self.assertIn("SIGNED_TEST_SOURCE_REF", signed_test_sign)
+        self.assertIn("SIGNED_TEST_REACHABLE_REFS: ${{ steps.sign-source-ref.outputs.reachable_refs }}", signed_test_sign)
+        self.assertNotIn("SIGNED_TEST_REACHABLE_REFS: ${{ needs.validate-ref.outputs.reachable_refs }}", signed_test_sign)
+        self.assertIn("SIGNED_TEST_TOOLING_COMMIT", signed_test_sign)
+        self.assertIn("SIGNED_TEST_WORKFLOW_RUN_URL", signed_test_sign)
+        self.assertNotIn("gh release create", signed_test_sign)
+        self.assertNotIn("SPARKLE_PRIVATE_KEY", signed_test_sign)
+
+        signed_test_smoke = signed_test_workflow.split("\n  smoke-signed-helper:", 1)[1]
+        self.assertNotIn("environment: release", signed_test_smoke)
+        self.assertIn("RepoPrompt-CE-signed-test-build", signed_test_smoke)
+        self.assertIn("provenances=(signed-test-build/*-signed-test-provenance.json)", signed_test_smoke)
+        self.assertIn("Expected exactly one signed test provenance file", signed_test_smoke)
+        self.assertIn("EXPECTED_REQUESTED_REF: ${{ inputs.source_ref }}", signed_test_smoke)
+        self.assertIn('os.environ["EXPECTED_REQUESTED_REF"]', signed_test_smoke)
+        self.assertNotIn('provenance["requested_ref"] != "${{ inputs.source_ref }}"', signed_test_smoke)
+        self.assertIn("Provenance requested ref mismatch", signed_test_smoke)
+        self.assertIn("Provenance source commit mismatch", signed_test_smoke)
+        self.assertIn("Provenance workflow run URL mismatch", signed_test_smoke)
+        self.assertIn("Provenance reachable refs must be a non-empty list", signed_test_smoke)
+        self.assertIn("developer-id-signed-test-build", signed_test_smoke)
+        self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_test_smoke)
+        self.assertIn("env -i", signed_test_smoke)
+
+        stage_test = release_script.split("stage_signed_test_build() {", 1)[1].split("\n}", 1)[0]
+        self.assertIn("unset GH_TOKEN GITHUB_TOKEN SOURCE_GH_TOKEN", stage_test)
+        self.assertIn("RELEASE_ALLOW_ADHOC_SIGNING=1", stage_test)
+        self.assertIn('SIGNED_TEST_PROVENANCE="$DIST_DIR/$ARCHIVE_BASENAME-signed-test-provenance.json"', release_script)
+        self.assertIn("write_signed_test_build_provenance", release_script)
+        self.assertIn("SIGNED_TEST_SOURCE_REF", release_script)
+        self.assertIn("SIGNED_TEST_REACHABLE_REFS", release_script)
+        self.assertIn("SIGNED_TEST_STAGED_ARCHIVE_SHA256", release_script)
+        self.assertIn("developer-id-signed-test-build", release_script)
+        self.assertIn('"staged_source_archive"', release_script)
+        publish_test = release_script.split("publish_signed_test_build() {", 1)[1].split("\n}", 1)[0]
+        self.assertNotIn("gh release create", publish_test)
+        self.assertNotIn("SPARKLE_PRIVATE_KEY", publish_test)
+        self.assertIn('shasum -a 256', publish_test)
 
     def test_staged_release_extractor_rejects_alternate_in_app_cli_target(self) -> None:
         for relative, alternate_target in (
@@ -527,6 +597,32 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertFalse(marker.exists())
 
+    def test_mcp_cli_version_sync_updates_source_and_check_detects_drift(self) -> None:
+        root = self.make_metadata_root()
+        source = root / "Sources" / "RepoPromptMCP" / "main.swift"
+        source.parent.mkdir(parents=True)
+        source.write_text('let CLI_VERSION = "9.9.9"\n', encoding="utf-8")
+        env = os.environ.copy()
+        env["REPOPROMPT_RELEASE_SOURCE_ROOT"] = str(root)
+        helper = SCRIPT_DIR / "sync_mcp_cli_version.sh"
+
+        rejected = subprocess.run([str(helper), "--check"], env=env, text=True, capture_output=True)
+        synced = subprocess.run([str(helper)], env=env, text=True, capture_output=True)
+        accepted = subprocess.run([str(helper), "--check"], env=env, text=True, capture_output=True)
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("Run ./Scripts/release.sh sync-cli-version", rejected.stderr)
+        self.assertEqual(synced.returncode, 0, synced.stderr)
+        self.assertEqual(source.read_text(encoding="utf-8"), 'let CLI_VERSION = "1.0.0"\n')
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_release_preflight_requires_synchronized_mcp_cli_version(self) -> None:
+        release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
+
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"', release_script)
+        self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh" --check', release_script)
+        self.assertIn("sync-cli-version) sync_mcp_cli_version", release_script)
+
     def test_remote_release_commit_helper_rejects_moved_tag(self) -> None:
         remote, work = self.make_git_remote()
         first = self.commit_file(work, "first")
@@ -584,6 +680,91 @@ class ReleaseToolingTests(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("canonical", result.stderr)
+
+
+    def test_signed_test_build_ref_helper_requires_exact_ref_and_upstream_reachability(self) -> None:
+        remote, work = self.make_git_remote()
+        first = self.commit_file(work, "first")
+        self.git(work, "tag", "v1.0.0")
+        self.git(work, "tag", "-a", "v1.0.0-annotated", "-m", "annotated")
+        self.git(work, "push", "origin", "main", "v1.0.0", "v1.0.0-annotated")
+
+        for source_ref in ("main", "refs/heads/main", "v1.0.0", "refs/tags/v1.0.0", "v1.0.0-annotated", first):
+            with self.subTest(source_ref=source_ref):
+                self.git(work, "checkout", source_ref)
+                accepted = self.run_signed_test_ref_verify(work, source_ref)
+                self.assertEqual(accepted.returncode, 0, accepted.stderr)
+                self.assertEqual(accepted.stdout.strip(), first)
+
+        self.git(work, "checkout", "main")
+        self.commit_file(work, "unreachable")
+        unreachable = self.git(work, "rev-parse", "HEAD").stdout.strip()
+        rejected = self.run_signed_test_ref_verify(work, unreachable)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("not reachable from any upstream branch or tag", rejected.stderr)
+
+    def test_signed_test_build_ref_helper_rejects_commitish_and_mismatched_inputs(self) -> None:
+        remote, work = self.make_git_remote()
+        first = self.commit_file(work, "first")
+        self.git(work, "push", "origin", "main")
+        second = self.commit_file(work, "second")
+        self.git(work, "push", "origin", "main")
+
+        for source_ref in ("main~1", "main^", "main..HEAD", first[:12], "refs/remotes/origin/main"):
+            with self.subTest(source_ref=source_ref):
+                self.git(work, "checkout", first)
+                result = self.run_signed_test_ref_verify(work, source_ref)
+                self.assertNotEqual(result.returncode, 0)
+
+        self.git(work, "checkout", first)
+        mismatched = self.run_signed_test_ref_verify(work, "main")
+        self.assertNotEqual(mismatched.returncode, 0)
+        self.assertIn("checkout HEAD", mismatched.stderr)
+
+    def test_signed_test_build_ref_helper_rejects_ambiguous_branch_tag_names(self) -> None:
+        remote, work = self.make_git_remote()
+        self.commit_file(work, "first")
+        self.git(work, "push", "origin", "main")
+        self.git(work, "checkout", "-b", "ambiguous")
+        self.commit_file(work, "branch")
+        self.git(work, "push", "origin", "ambiguous")
+        self.git(work, "checkout", "main")
+        self.git(work, "tag", "ambiguous")
+        self.git(work, "push", "origin", "refs/tags/ambiguous")
+
+        self.git(work, "checkout", "refs/heads/ambiguous")
+        rejected = self.run_signed_test_ref_verify(work, "ambiguous")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("ambiguous", rejected.stderr)
+
+    def test_signed_test_build_ref_helper_rejects_pr_and_fork_refs(self) -> None:
+        remote, work = self.make_git_remote()
+        self.commit_file(work, "first")
+        self.git(work, "push", "origin", "main")
+
+        for source_ref, expected in (
+            ("refs/pull/123/head", "pull-request"),
+            ("pull/123/head", "pull-request"),
+            ("someuser:branch", "fork shorthand refs"),
+        ):
+            with self.subTest(source_ref=source_ref):
+                result = self.run_signed_test_ref_verify(work, source_ref)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected, result.stderr)
+
+    def test_signed_test_build_docs_describe_reachability_and_provenance(self) -> None:
+        docs = (SCRIPT_DIR.parent / "docs" / "releasing.md").read_text(encoding="utf-8")
+
+        self.assertIn("full 40-character commit SHA", docs)
+        self.assertIn("unreachable", docs)
+        self.assertIn("revspecs", docs)
+        self.assertIn("`sign` job", docs)
+        self.assertIn("signed-test-provenance.json", docs)
+        self.assertIn("source commit", docs)
+        self.assertIn("trusted tooling commit", docs)
+        self.assertIn("workflow run URL", docs)
+        self.assertIn("ZIP, DMG, checksum manifest", docs)
+        self.assertIn("archive hashes", docs)
 
     def make_embedded_helper_layout(self) -> Path:
         temp_dir = Path(tempfile.mkdtemp())
@@ -726,6 +907,15 @@ SIGNING_TEAM_ID=648A27MST5
         self.git(work, "add", "value.txt")
         self.git(work, "commit", "-m", content)
         return self.git(work, "rev-parse", "HEAD").stdout.strip()
+
+    def run_signed_test_ref_verify(self, work: Path, source_ref: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT_DIR / "verify_signed_test_build_ref.sh"), source_ref, str(work)],
+            cwd=work,
+            env={"PATH": os.environ["PATH"]},
+            text=True,
+            capture_output=True,
+        )
 
     def run_remote_verify(self, work: Path, expected: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(

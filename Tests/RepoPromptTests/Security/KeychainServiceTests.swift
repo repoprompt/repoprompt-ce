@@ -121,6 +121,14 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(addQuery.boolValue(for: kSecAttrSynchronizable), false)
     }
 
+    func testPersistentBackendPolicySeparatesSigningModes() {
+        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: "developer-id"), .canonical)
+        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: " LOCAL-SELF-SIGNED "), .localSelfSigned)
+        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: "release-candidate-adhoc"), .canonical)
+        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: nil), .canonical)
+        XCTAssertNotEqual(KeychainService.canonicalServiceName, KeychainService.localSelfSignedServiceName)
+    }
+
     private func makeService(
         serviceName: String = "test.canonical.service",
         secItemClient: SecItemClient

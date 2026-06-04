@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import MCP
 @testable import RepoPrompt
@@ -185,7 +186,6 @@ final class AgentRunWorktreeStartTests: XCTestCase {
     func testManualFirstSendCanCreateAndBindNewWorktree() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -195,20 +195,35 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         viewModel.selectInitialStartLocation(.newWorktree, for: sourceTabID)
         let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession))
 
-        let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(text: "start in a worktree", target: target)
+        try await withIsolatedBootstrapSocketNamespace(window: window) { namespace in
+            let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(
+                text: "start in a worktree",
+                target: target,
+                createAndActivateSessionTab: {
+                    let destinationTabID = await viewModel.createAndActivateSessionTab()
+                    if let destinationTabID {
+                        namespace.track(tabID: destinationTabID, session: viewModel.session(for: destinationTabID))
+                    }
+                    return destinationTabID
+                }
+            )
 
-        XCTAssertEqual(result, .submitted)
-        let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        XCTAssertNotEqual(destinationTabID, sourceTabID)
-        let destinationSession = viewModel.session(for: destinationTabID)
-        let binding = try XCTUnwrap(destinationSession.worktreeBindings.first)
-        XCTAssertEqual(binding.source, "agent_ui.initial_send")
-        XCTAssertEqual(binding.logicalRootPath, fixture.repo.path)
-        XCTAssertTrue(binding.worktreeRootPath.contains(".repoprompt-worktrees"), binding.worktreeRootPath)
-        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: destinationSession), binding.worktreeRootPath)
-        XCTAssertNil(viewModel.initialStartLocationProps(tabID: destinationTabID))
-        XCTAssertEqual(viewModel.executionLocationProps(tabID: destinationTabID)?.indicator?.worktreeID, binding.worktreeID)
-        XCTAssertEqual(destinationSession.items.first(where: { $0.kind == .user })?.text, "start in a worktree")
+            XCTAssertEqual(result, .submitted)
+            if result == .submitted {
+                try await namespace.acceptedSubmitAndAwaitOwnedSocket()
+            }
+            let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+            XCTAssertNotEqual(destinationTabID, sourceTabID)
+            let destinationSession = viewModel.session(for: destinationTabID)
+            let binding = try XCTUnwrap(destinationSession.worktreeBindings.first)
+            XCTAssertEqual(binding.source, "agent_ui.initial_send")
+            XCTAssertEqual(binding.logicalRootPath, fixture.repo.path)
+            XCTAssertTrue(binding.worktreeRootPath.contains(".repoprompt-worktrees"), binding.worktreeRootPath)
+            XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: destinationSession), binding.worktreeRootPath)
+            XCTAssertNil(viewModel.initialStartLocationProps(tabID: destinationTabID))
+            XCTAssertEqual(viewModel.executionLocationProps(tabID: destinationTabID)?.indicator?.worktreeID, binding.worktreeID)
+            XCTAssertEqual(destinationSession.items.first(where: { $0.kind == .user })?.text, "start in a worktree")
+        }
     }
 
     func testManualNewWorktreeFirstSendBlocksForNonGitPrimaryRootWithoutBinding() async throws {
@@ -238,7 +253,6 @@ final class AgentRunWorktreeStartTests: XCTestCase {
     func testFreshLinkedManualFirstSendCanCreateAndBindNewWorktreeInPlace() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let createdTabID = await viewModel.createAndActivateSessionTab()
@@ -250,25 +264,31 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: linkedTabID, session: linkedSession))
         XCTAssertEqual(target.route, .existingAgentSession)
 
-        let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(
-            text: "start linked thread in a worktree",
-            target: target,
-            createAndActivateSessionTab: {
-                XCTFail("Linked first send must not create another destination tab")
-                return nil
-            }
-        )
+        try await withIsolatedBootstrapSocketNamespace(window: window) { namespace in
+            namespace.track(tabID: linkedTabID, session: linkedSession)
+            let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(
+                text: "start linked thread in a worktree",
+                target: target,
+                createAndActivateSessionTab: {
+                    XCTFail("Linked first send must not create another destination tab")
+                    return nil
+                }
+            )
 
-        XCTAssertEqual(result, .submitted)
-        XCTAssertEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, linkedTabID)
-        let binding = try XCTUnwrap(linkedSession.worktreeBindings.first)
-        XCTAssertEqual(binding.source, "agent_ui.initial_send")
-        XCTAssertEqual(binding.logicalRootPath, fixture.repo.path)
-        XCTAssertTrue(binding.worktreeRootPath.contains(".repoprompt-worktrees"), binding.worktreeRootPath)
-        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: linkedSession), binding.worktreeRootPath)
-        XCTAssertNil(viewModel.initialStartLocationProps(tabID: linkedTabID))
-        XCTAssertEqual(viewModel.executionLocationProps(tabID: linkedTabID)?.indicator?.worktreeID, binding.worktreeID)
-        XCTAssertEqual(linkedSession.items.first(where: { $0.kind == .user })?.text, "start linked thread in a worktree")
+            XCTAssertEqual(result, .submitted)
+            if result == .submitted {
+                try await namespace.acceptedSubmitAndAwaitOwnedSocket()
+            }
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, linkedTabID)
+            let binding = try XCTUnwrap(linkedSession.worktreeBindings.first)
+            XCTAssertEqual(binding.source, "agent_ui.initial_send")
+            XCTAssertEqual(binding.logicalRootPath, fixture.repo.path)
+            XCTAssertTrue(binding.worktreeRootPath.contains(".repoprompt-worktrees"), binding.worktreeRootPath)
+            XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: linkedSession), binding.worktreeRootPath)
+            XCTAssertNil(viewModel.initialStartLocationProps(tabID: linkedTabID))
+            XCTAssertEqual(viewModel.executionLocationProps(tabID: linkedTabID)?.indicator?.worktreeID, binding.worktreeID)
+            XCTAssertEqual(linkedSession.items.first(where: { $0.kind == .user })?.text, "start linked thread in a worktree")
+        }
     }
 
     func testFreshLinkedManualNewWorktreeFirstSendBlocksForNonGitPrimaryRootInPlace() async throws {
@@ -311,7 +331,6 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let sibling = fixture.sandbox.appendingPathComponent("existing-ui-worktree", isDirectory: true)
         try runGit(["worktree", "add", "-b", "feature/existing-ui-\(fixture.suffix)", sibling.path, "HEAD"], cwd: fixture.repo)
         let window = try await makeWindow(root: fixture.repo)
-        defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let viewModel = window.agentModeViewModel
         window.apiSettingsViewModel.isCodexConnected = true
         let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
@@ -326,16 +345,31 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         XCTAssertEqual(selectionResult, .applied)
         let target = try XCTUnwrap(viewModel.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession))
 
-        let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(text: "start in existing", target: target)
+        try await withIsolatedBootstrapSocketNamespace(window: window) { namespace in
+            let result = await viewModel.submitUserTurnCreatingSessionIfNeeded(
+                text: "start in existing",
+                target: target,
+                createAndActivateSessionTab: {
+                    let destinationTabID = await viewModel.createAndActivateSessionTab()
+                    if let destinationTabID {
+                        namespace.track(tabID: destinationTabID, session: viewModel.session(for: destinationTabID))
+                    }
+                    return destinationTabID
+                }
+            )
 
-        XCTAssertEqual(result, .submitted)
-        let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
-        let destination = viewModel.session(for: destinationTabID)
-        let binding = try XCTUnwrap(destination.worktreeBindings.first)
-        XCTAssertEqual(binding.worktreeID, existing.worktreeID)
-        XCTAssertEqual(binding.worktreeRootPath, sibling.standardizedFileURL.path)
-        XCTAssertEqual(binding.source, "agent_ui.initial_send_existing")
-        XCTAssertEqual(viewModel.executionLocationProps(tabID: destinationTabID)?.indicator?.worktreeID, existing.worktreeID)
+            XCTAssertEqual(result, .submitted)
+            if result == .submitted {
+                try await namespace.acceptedSubmitAndAwaitOwnedSocket()
+            }
+            let destinationTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+            let destination = viewModel.session(for: destinationTabID)
+            let binding = try XCTUnwrap(destination.worktreeBindings.first)
+            XCTAssertEqual(binding.worktreeID, existing.worktreeID)
+            XCTAssertEqual(binding.worktreeRootPath, sibling.standardizedFileURL.path)
+            XCTAssertEqual(binding.source, "agent_ui.initial_send_existing")
+            XCTAssertEqual(viewModel.executionLocationProps(tabID: destinationTabID)?.indicator?.worktreeID, existing.worktreeID)
+        }
     }
 
     func testIdleStartedThreadRequiresRestartConfirmationBeforeReturningLocalAndClearsOldCWDProviderIdentity() async throws {
@@ -615,6 +649,221 @@ final class AgentRunWorktreeStartTests: XCTestCase {
             XCTAssertEqual(child.worktreeBindings.first?.worktreeID, explicitDescriptor.worktreeID)
             XCTAssertEqual(child.worktreeBindings.first?.worktreeRootPath, explicitDescriptor.path)
         }
+    }
+
+    #if DEBUG
+        @MainActor
+        private final class BootstrapSocketNamespaceFixture {
+            enum FixtureError: Error {
+                case defaultSocketURLWasNotProduction
+                case installedSocketURLDidNotResolve
+                case trackedSessionMissing
+                case ownedPathWasNotSocket
+                case ownedSocketDidNotAppear
+                case retainedAgentTaskDidNotFinish
+                case trackedAgentTaskWasNotCleared
+                case managerWasNotStopped
+                case previousEnabledStateMissing
+                case enabledStateWasNotRestored
+                case resolvedSocketURLChangedBeforeRestore
+                case productionSocketURLWasNotRestored
+            }
+
+            let productionSocketURL: URL
+            let directoryURL: URL
+            let socketURL: URL
+            private(set) var trackedTabID: UUID?
+            private(set) var trackedSession: AgentModeViewModel.TabSession?
+            private(set) var firstObservedAgentTask: Task<Void, Never>?
+            private(set) var acceptedSubmit = false
+            private(set) var ownedSocketObserved = false
+            private(set) var cleanupStarted = false
+            private(set) var overrideInstalled = false
+            private var previousEnabledState: Bool?
+            private var retainedAgentTaskFinished = false
+
+            static func make() throws -> BootstrapSocketNamespaceFixture {
+                let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
+                let directoryURL = URL(
+                    fileURLWithPath: "/tmp/rpce-xctest-bs-\(getpid())-\(UUID().uuidString)",
+                    isDirectory: true
+                )
+                let socketURL = directoryURL.appendingPathComponent("bootstrap.sock").standardizedFileURL
+                let address = sockaddr_un()
+                XCTAssertLessThanOrEqual(socketURL.path.utf8CString.count, MemoryLayout.size(ofValue: address.sun_path))
+                XCTAssertNotEqual(socketURL, productionSocketURL)
+                try FileManager.default.createDirectory(
+                    at: directoryURL,
+                    withIntermediateDirectories: false,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                return .init(productionSocketURL: productionSocketURL, directoryURL: directoryURL, socketURL: socketURL)
+            }
+
+            init(productionSocketURL: URL, directoryURL: URL, socketURL: URL) {
+                self.productionSocketURL = productionSocketURL
+                self.directoryURL = directoryURL
+                self.socketURL = socketURL
+            }
+
+            func install() async throws {
+                let manager = ServerNetworkManager.shared
+                guard await manager.debugResolvedBootstrapSocketURL() == productionSocketURL else {
+                    throw FixtureError.defaultSocketURLWasNotProduction
+                }
+                previousEnabledState = await manager.debugIsEnabledForBootstrapSocketURLOverride()
+                try await manager.debugInstallBootstrapSocketURLOverride(socketURL)
+                overrideInstalled = true
+                guard await manager.debugResolvedBootstrapSocketURL() == socketURL else {
+                    throw FixtureError.installedSocketURLDidNotResolve
+                }
+            }
+
+            func track(tabID: UUID, session: AgentModeViewModel.TabSession) {
+                if let trackedTabID, let trackedSession {
+                    XCTAssertEqual(trackedTabID, tabID)
+                    XCTAssertTrue(trackedSession === session)
+                    return
+                }
+                trackedTabID = tabID
+                trackedSession = session
+            }
+
+            func acceptedSubmitAndAwaitOwnedSocket() async throws {
+                acceptedSubmit = true
+                guard trackedSession != nil else {
+                    throw FixtureError.trackedSessionMissing
+                }
+                let deadline = ContinuousClock.now + .seconds(5)
+                while ContinuousClock.now < deadline {
+                    observeFirstAgentTaskIfNeeded()
+                    if FileManager.default.fileExists(atPath: socketURL.path) {
+                        let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
+                        guard attributes[.type] as? FileAttributeType == .typeSocket else {
+                            throw FixtureError.ownedPathWasNotSocket
+                        }
+                        ownedSocketObserved = true
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                throw FixtureError.ownedSocketDidNotAppear
+            }
+
+            func cleanup(window: WindowState) async throws {
+                guard !cleanupStarted else { return }
+                cleanupStarted = true
+
+                if acceptedSubmit {
+                    guard let trackedTabID, let trackedSession else {
+                        throw FixtureError.trackedSessionMissing
+                    }
+                    observeFirstAgentTaskIfNeeded()
+                    await window.agentModeViewModel.cancelAgentRun(tabID: trackedTabID, waitForCleanup: true)
+                    if let firstObservedAgentTask {
+                        firstObservedAgentTask.cancel()
+                        try await boundedAwaitRetainedAgentTask(firstObservedAgentTask)
+                    }
+                    guard trackedSession.agentTask == nil else {
+                        throw FixtureError.trackedAgentTaskWasNotCleared
+                    }
+                }
+
+                await window.mcpServer.stopServer()
+                ServiceRegistry.unregister(window.mcpServer.windowMCPToolCatalogService)
+                await window.mcpServer.shutdownListener()
+
+                let manager = ServerNetworkManager.shared
+                guard await !(manager.isRunning()) else {
+                    throw FixtureError.managerWasNotStopped
+                }
+                guard await manager.debugResolvedBootstrapSocketURL() == socketURL else {
+                    throw FixtureError.resolvedSocketURLChangedBeforeRestore
+                }
+                try await manager.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
+                guard await manager.debugResolvedBootstrapSocketURL() == productionSocketURL else {
+                    throw FixtureError.productionSocketURLWasNotRestored
+                }
+                guard let previousEnabledState else {
+                    throw FixtureError.previousEnabledStateMissing
+                }
+                await manager.setEnabled(previousEnabledState)
+                guard await manager.debugIsEnabledForBootstrapSocketURLOverride() == previousEnabledState else {
+                    throw FixtureError.enabledStateWasNotRestored
+                }
+                guard await !(manager.isRunning()) else {
+                    throw FixtureError.managerWasNotStopped
+                }
+                guard await manager.debugResolvedBootstrapSocketURL() == productionSocketURL else {
+                    throw FixtureError.productionSocketURLWasNotRestored
+                }
+                overrideInstalled = false
+                removeOwnedDirectory()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+
+            func removeOwnedDirectory() {
+                try? FileManager.default.removeItem(at: directoryURL)
+            }
+
+            private func observeFirstAgentTaskIfNeeded() {
+                if firstObservedAgentTask == nil {
+                    firstObservedAgentTask = trackedSession?.agentTask
+                }
+            }
+
+            private func boundedAwaitRetainedAgentTask(_ task: Task<Void, Never>) async throws {
+                retainedAgentTaskFinished = false
+                let observer = Task { @MainActor [weak self] in
+                    await task.value
+                    self?.retainedAgentTaskFinished = true
+                }
+                let deadline = ContinuousClock.now + .seconds(5)
+                while !retainedAgentTaskFinished, ContinuousClock.now < deadline {
+                    try await Task.sleep(for: .milliseconds(10))
+                }
+                guard retainedAgentTaskFinished else {
+                    observer.cancel()
+                    throw FixtureError.retainedAgentTaskDidNotFinish
+                }
+            }
+        }
+    #endif
+
+    private func withIsolatedBootstrapSocketNamespace(
+        window: WindowState,
+        operation: (BootstrapSocketNamespaceFixture) async throws -> Void
+    ) async throws {
+        #if DEBUG
+            let namespace: BootstrapSocketNamespaceFixture
+            do {
+                namespace = try BootstrapSocketNamespaceFixture.make()
+            } catch {
+                WindowStatesManager.shared.unregisterWindowState(window)
+                throw error
+            }
+
+            do {
+                try await namespace.install()
+                try await operation(namespace)
+                try await namespace.cleanup(window: window)
+            } catch {
+                if namespace.overrideInstalled, !namespace.cleanupStarted {
+                    do {
+                        try await namespace.cleanup(window: window)
+                    } catch {
+                        XCTFail("Failed to contain isolated Agent Run bootstrap socket namespace: \(error)")
+                        throw error
+                    }
+                } else if !namespace.overrideInstalled {
+                    namespace.removeOwnedDirectory()
+                    WindowStatesManager.shared.unregisterWindowState(window)
+                }
+                throw error
+            }
+        #else
+            throw XCTSkip("Bootstrap socket URL override seam is DEBUG-only")
+        #endif
     }
 
     private func makeAgentRunStartService(window: WindowState, sourceTabID: UUID?) -> AgentRunMCPToolService {

@@ -67,6 +67,11 @@ struct WorkspaceObservedCodemapResult: @unchecked Sendable {
     }
 }
 
+struct WorkspaceCodemapFileAPIAggregate {
+    let orderedFileAPIs: [FileAPI]
+    let firstFileAPIByStandardizedNestedPath: [String: FileAPI]
+}
+
 enum WorkspaceFileCatalogMaterializationResult: Equatable {
     case materialized(WorkspaceFileRecord)
     case ineligible(CatalogRegularFileIneligibilityReason)
@@ -183,6 +188,7 @@ actor WorkspaceFileContextStore {
     )
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
+    private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?
     private var codemapUpdateContinuations: [UUID: AsyncStream<WorkspaceCodemapUpdateEvent>.Continuation] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
@@ -617,7 +623,47 @@ actor WorkspaceFileContextStore {
     }
 
     func allCodemapFileAPIs() -> [FileAPI] {
-        allCodemapSnapshots().compactMap(\.fileAPI)
+        codemapFileAPIAggregate().orderedFileAPIs
+    }
+
+    func codemapFileAPIAggregate() -> WorkspaceCodemapFileAPIAggregate {
+        let actorBodyTotal = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal, actorBodyTotal) }
+
+        if let cachedCodemapFileAPIAggregate {
+            return cachedCodemapFileAPIAggregate
+        }
+
+        #if DEBUG || EDIT_FLOW_PERF
+            let stateSnapshot = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot)
+            let discoverableSnapshots = codemapSnapshotsByFileID.values
+                .filter { isDiscoverableFileID($0.fileID) }
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot, stateSnapshot)
+
+            let materialization = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization)
+            let APIs = discoverableSnapshots
+                .sorted { $0.fullPath < $1.fullPath }
+                .compactMap(\.fileAPI)
+        #else
+            let APIs = allCodemapSnapshots().compactMap(\.fileAPI)
+        #endif
+        var firstFileAPIByStandardizedNestedPath: [String: FileAPI] = [:]
+        firstFileAPIByStandardizedNestedPath.reserveCapacity(APIs.count)
+        for api in APIs {
+            let standardizedNestedPath = StandardizedPath.absolute(api.filePath)
+            if firstFileAPIByStandardizedNestedPath[standardizedNestedPath] == nil {
+                firstFileAPIByStandardizedNestedPath[standardizedNestedPath] = api
+            }
+        }
+        let aggregate = WorkspaceCodemapFileAPIAggregate(
+            orderedFileAPIs: APIs,
+            firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath
+        )
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)
+        #endif
+        cachedCodemapFileAPIAggregate = aggregate
+        return aggregate
     }
 
     func codemapSnapshotDictionary() -> [UUID: WorkspaceCodemapSnapshot] {
@@ -668,6 +714,9 @@ actor WorkspaceFileContextStore {
             codemapSnapshotsByFileID[file.id] = snapshot
             codemapFileIDsByRootID[file.rootID, default: []].insert(file.id)
             snapshotsByRootID[file.rootID, default: []].append(snapshot)
+        }
+        if !snapshotsByRootID.isEmpty {
+            invalidateAllCodemapFileAPIsCache()
         }
 
         for (rootID, snapshots) in snapshotsByRootID {
@@ -2873,7 +2922,9 @@ actor WorkspaceFileContextStore {
         rootStatesByID[root.id] = state
         if let file = file(rootID: root.id, relativePath: relativePath) {
             if managedOnly {
-                managedOnlyFileIDs.insert(file.id)
+                if managedOnlyFileIDs.insert(file.id).inserted {
+                    invalidateAllCodemapFileAPIsCache()
+                }
                 for folder in newlyIndexedParentFolders(for: relativePath, rootID: root.id, existingFolderPaths: existingFolderPaths) {
                     managedOnlyFolderIDs.insert(folder.id)
                 }
@@ -2978,6 +3029,7 @@ actor WorkspaceFileContextStore {
               codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil
         else { return }
         codemapFileIDsByRootID[rootID]?.remove(fileID)
+        invalidateAllCodemapFileAPIsCache()
         yieldCodemapRemoval(root: state.root, removedFileIDs: [fileID], isRootUnload: false)
     }
 
@@ -2989,7 +3041,9 @@ actor WorkspaceFileContextStore {
         else { return nil }
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
         managedOnlyFileIDs.remove(fileID)
-        codemapSnapshotsByFileID.removeValue(forKey: fileID)
+        if codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil {
+            invalidateAllCodemapFileAPIsCache()
+        }
         codemapFileIDsByRootID[file.rootID]?.remove(fileID)
         if let parentID = file.parentFolderID {
             state.childFileIDsByFolderID[parentID]?.removeAll { $0 == fileID }
@@ -3051,6 +3105,10 @@ actor WorkspaceFileContextStore {
         return (removedFileIDs, removedFolderIDs, removedFilePaths, removedFolderPaths)
     }
 
+    private func invalidateAllCodemapFileAPIsCache() {
+        cachedCodemapFileAPIAggregate = nil
+    }
+
     private func isDiscoverableFileID(_ fileID: UUID) -> Bool {
         !managedOnlyFileIDs.contains(fileID)
     }
@@ -3060,7 +3118,9 @@ actor WorkspaceFileContextStore {
     }
 
     private func promoteToDiscoverable(_ file: WorkspaceFileRecord) {
-        managedOnlyFileIDs.remove(file.id)
+        if managedOnlyFileIDs.remove(file.id) != nil {
+            invalidateAllCodemapFileAPIsCache()
+        }
         if let folderID = file.parentFolderID, let folder = foldersByID[folderID] {
             promoteFolderToDiscoverable(folder)
         }
@@ -3108,6 +3168,9 @@ actor WorkspaceFileContextStore {
             codemapFileIDsByRootID[file.rootID, default: []].insert(result.fileID)
             snapshotsByRootID[file.rootID, default: []].append(snapshot)
         }
+        if !snapshotsByRootID.isEmpty {
+            invalidateAllCodemapFileAPIsCache()
+        }
 
         for (rootID, snapshots) in snapshotsByRootID {
             guard let root = rootStatesByID[rootID]?.root else { continue }
@@ -3124,6 +3187,7 @@ actor WorkspaceFileContextStore {
         guard !fileIDsByRootID.isEmpty else { return }
         codemapSnapshotsByFileID.removeAll(keepingCapacity: false)
         codemapFileIDsByRootID.removeAll(keepingCapacity: false)
+        invalidateAllCodemapFileAPIsCache()
         for (rootID, fileIDs) in fileIDsByRootID {
             guard let root = rootStatesByID[rootID]?.root else { continue }
             yieldCodemapRemoval(root: root, removedFileIDs: Array(fileIDs), isRootUnload: false)
@@ -3133,8 +3197,12 @@ actor WorkspaceFileContextStore {
     @discardableResult
     private func removeCodemapSnapshots(forRootID rootID: UUID) -> [UUID] {
         guard let fileIDs = codemapFileIDsByRootID.removeValue(forKey: rootID) else { return [] }
+        var removedSnapshot = false
         for fileID in fileIDs {
-            codemapSnapshotsByFileID.removeValue(forKey: fileID)
+            removedSnapshot = codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil || removedSnapshot
+        }
+        if removedSnapshot {
+            invalidateAllCodemapFileAPIsCache()
         }
         return Array(fileIDs)
     }

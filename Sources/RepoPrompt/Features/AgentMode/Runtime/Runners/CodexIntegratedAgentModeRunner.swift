@@ -30,7 +30,13 @@ final class CodexIntegratedAgentModeRunner {
                 return .cancelled
             }
             defer { session.agentTask = nil }
+            #if DEBUG || EDIT_FLOW_PERF
+                let codexTurnMCPServerEnableState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable)
+            #endif
             await mcpServerEnabler()
+            #if DEBUG || EDIT_FLOW_PERF
+                EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.codexTurnMCPServerEnable, codexTurnMCPServerEnableState)
+            #endif
 
             let outcome = await codexCoordinator.sendCodexNativeMessage(
                 session: session,
