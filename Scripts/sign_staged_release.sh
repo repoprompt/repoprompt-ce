@@ -61,6 +61,9 @@ PYTHON
 plutil -lint "$app_entitlements"
 plutil -replace RepoPromptDebugSecureStorageBackend -string keychain "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace RepoPromptSigningMode -string developer-id "$APP_BUNDLE/Contents/Info.plist"
+python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py" \
+    "$APP_BUNDLE/Contents/Info.plist" \
+    "$app_entitlements"
 
 sign_path() {
     local path="$1"
@@ -88,6 +91,7 @@ plutil -convert xml1 -o "$canonical_signed_entitlements" "$signed_entitlements"
 cmp "$canonical_app_entitlements" "$canonical_signed_entitlements" ||
     fail "Signed app entitlements do not match trusted release policy"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Developer ID staged app MCP helper layout"
+"$SCRIPT_DIR/validate_sparkle_helper_layout.sh" "$APP_BUNDLE" "Developer ID staged app Sparkle helper layout"
 
 signature_details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1)"
 identifier="$(printf '%s\n' "$signature_details" | awk -F= '/^Identifier=/{print $2; exit}')"

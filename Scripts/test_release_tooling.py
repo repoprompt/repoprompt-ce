@@ -21,7 +21,6 @@ class ReleaseToolingTests(unittest.TestCase):
     def test_custom_packaging_resigns_sparkle_helpers_without_recursive_entitlement_propagation(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         staged_signing_script = (SCRIPT_DIR / "sign_staged_release.sh").read_text(encoding="utf-8")
-        info_plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_bytes())
 
         for script in (package_script, staged_signing_script):
             self.assertIn('sign_path "$framework/Versions/B/XPCServices/Installer.xpc"', script)
@@ -36,9 +35,100 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn('APP_SIGN_ARGS=()', package_script)
         self.assertNotIn('APP_SIGN_ARGS=(--deep)', package_script)
         self.assertNotIn('sign_path "$APP_BUNDLE" --deep', staged_signing_script)
-        self.assertNotIn("SUEnableInstallerLauncherService", info_plist)
         self.assertIn("trap 'finish $?' EXIT", package_script)
         self.assertIn('local status="$1" now total', package_script)
+
+    def test_sparkle_update_configuration_validator_accepts_current_source(self) -> None:
+        result = self.run_sparkle_validator(
+            SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template",
+            [
+                SCRIPT_DIR.parent / "AppBundle" / "RepoPrompt.entitlements.template",
+                SCRIPT_DIR.parent / "AppBundle" / "RepoPrompt.local-self-signed.entitlements.template",
+            ],
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Sparkle update configuration is compatible", result.stdout)
+
+    def test_sparkle_update_configuration_validator_enforces_sandbox_semantics(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        non_sandboxed = self.write_plist(temp_dir / "non-sandboxed.entitlements", {})
+        sandboxed = self.write_plist(temp_dir / "sandboxed.entitlements", {"com.apple.security.app-sandbox": True})
+
+        cases = (
+            (
+                "non-sandboxed launcher true",
+                {"SUEnableInstallerLauncherService": True},
+                [non_sandboxed],
+                1,
+                "non-sandboxed apps must not enable Sparkle sandbox services",
+            ),
+            (
+                "non-sandboxed downloader true",
+                {"SUEnableDownloaderService": True},
+                [non_sandboxed],
+                1,
+                "non-sandboxed apps must not enable Sparkle sandbox services",
+            ),
+            (
+                "sandboxed missing launcher",
+                {},
+                [sandboxed],
+                1,
+                "sandboxed apps must set SUEnableInstallerLauncherService to true",
+            ),
+            (
+                "sandboxed launcher false",
+                {"SUEnableInstallerLauncherService": False},
+                [sandboxed],
+                1,
+                "sandboxed apps must set SUEnableInstallerLauncherService to true",
+            ),
+            (
+                "sandboxed launcher true",
+                {"SUEnableInstallerLauncherService": True},
+                [sandboxed],
+                0,
+                "Sparkle update configuration is compatible",
+            ),
+            (
+                "mixed entitlement sandbox states",
+                {"SUEnableInstallerLauncherService": True},
+                [non_sandboxed, sandboxed],
+                1,
+                "entitlement profiles disagree on sandbox state",
+            ),
+        )
+
+        for label, info, entitlements, expected_returncode, expected_message in cases:
+            with self.subTest(label=label):
+                info_path = self.write_plist(temp_dir / f"{label}.Info.plist", info)
+                result = self.run_sparkle_validator(info_path, entitlements)
+                self.assertEqual(result.returncode, expected_returncode, result.stderr)
+                self.assertIn(expected_message, result.stdout + result.stderr)
+
+    def test_sparkle_update_configuration_validator_rejects_non_boolean_values(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        non_sandboxed = self.write_plist(temp_dir / "non-sandboxed.entitlements", {})
+
+        non_boolean_info = self.write_plist(
+            temp_dir / "non-boolean-info.plist",
+            {"SUEnableInstallerLauncherService": "true"},
+        )
+        rejected_info = self.run_sparkle_validator(non_boolean_info, [non_sandboxed])
+        self.assertNotEqual(rejected_info.returncode, 0)
+        self.assertIn("SUEnableInstallerLauncherService must be a Boolean", rejected_info.stderr)
+
+        empty_info = self.write_plist(temp_dir / "empty-info.plist", {})
+        non_boolean_entitlements = self.write_plist(
+            temp_dir / "non-boolean.entitlements",
+            {"com.apple.security.app-sandbox": "true"},
+        )
+        rejected_entitlements = self.run_sparkle_validator(empty_info, [non_boolean_entitlements])
+        self.assertNotEqual(rejected_entitlements.returncode, 0)
+        self.assertIn("com.apple.security.app-sandbox must be a Boolean", rejected_entitlements.stderr)
 
     def test_release_paths_use_static_validation_in_privileged_contexts_and_token_stripped_local_smoke(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
@@ -49,16 +139,29 @@ class ReleaseToolingTests(unittest.TestCase):
 
         package_outer_sign = package_script.index('sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"')
         package_layout = package_script.index('"$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"')
+        package_sparkle_layout = package_script.index('"$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh"')
         package_smoke = package_script.index(
             '"$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"'
         )
         self.assertLess(package_outer_sign, package_layout)
-        self.assertLess(package_layout, package_smoke)
+        self.assertLess(package_layout, package_sparkle_layout)
+        self.assertLess(package_sparkle_layout, package_smoke)
 
         for privileged_script in (staged_signing_script, promote_script, public_update_script):
             self.assertIn("validate_embedded_mcp_helper_layout.sh", privileged_script)
+            self.assertIn("validate_sparkle_helper_layout.sh", privileged_script)
             self.assertNotIn("smoke_embedded_mcp_helper.sh", privileged_script)
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', release_script)
+        self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', release_script)
+        self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', package_script)
+        self.assertIn('python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"', promote_script)
+        self.assertIn('python3 "$ROOT_DIR/Scripts/validate_sparkle_update_configuration.py"', public_update_script)
+        self.assertIn('python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py"', staged_signing_script)
+        staged_validator = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
+        self.assertIn('python3 "$SCRIPT_DIR/validate_sparkle_update_configuration.py"', staged_validator)
+        self.assertIn('"$SCRIPT_DIR/validate_sparkle_helper_layout.sh"', staged_validator)
 
     def test_embedded_mcp_helper_smoke_rejects_exit_137(self) -> None:
         temp_dir = Path(tempfile.mkdtemp())
@@ -118,6 +221,56 @@ class ReleaseToolingTests(unittest.TestCase):
                 result = self.run_layout_validation(app)
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_sparkle_helper_layout_validator_accepts_canonical_layout(self) -> None:
+        app = self.make_sparkle_helper_layout()
+
+        result = self.run_sparkle_helper_validation(app)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("matches the Sparkle helper layout policy", result.stdout)
+
+    def test_sparkle_helper_layout_validator_rejects_invalid_metadata(self) -> None:
+        def escaping_current_symlink(app: Path) -> None:
+            current = app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "Current"
+            current.unlink()
+            current.symlink_to("../../../../MacOS")
+
+        def missing_autoupdate(app: Path) -> None:
+            (app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Autoupdate").unlink()
+
+        def escaping_extra_symlink(app: Path) -> None:
+            extra = app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Resources" / "escape"
+            extra.symlink_to("/tmp")
+
+        def non_executable_downloader(app: Path) -> None:
+            downloader = (
+                app
+                / "Contents"
+                / "Frameworks"
+                / "Sparkle.framework"
+                / "Versions"
+                / "B"
+                / "XPCServices"
+                / "Downloader.xpc"
+                / "Contents"
+                / "MacOS"
+                / "Downloader"
+            )
+            downloader.chmod(0o644)
+
+        for label, mutate, expected_message in (
+            ("broken current symlink", escaping_current_symlink, "broken Sparkle framework symlink"),
+            ("missing Autoupdate", missing_autoupdate, "broken Sparkle framework symlink"),
+            ("escaping extra symlink", escaping_extra_symlink, "escaping Sparkle framework symlink"),
+            ("non-executable Downloader", non_executable_downloader, "must be executable"),
+        ):
+            with self.subTest(label=label):
+                app = self.make_sparkle_helper_layout()
+                mutate(app)
+                result = self.run_sparkle_helper_validation(app)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_message, result.stderr)
+
     def test_release_workflows_isolate_executable_helper_smoke_and_harden_p12_cleanup(self) -> None:
         release_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         promote_workflow = (SCRIPT_DIR.parent / ".github" / "workflows" / "release-promote.yml").read_text(
@@ -147,6 +300,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("shasum -a 256 -c", signed_smoke)
         self.assertLess(signed_smoke.index("shasum -a 256 -c"), signed_smoke.index("ditto -x -k"))
         self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_smoke)
+        self.assertIn("validate_sparkle_helper_layout.sh", signed_smoke)
         self.assertIn("env -i", signed_smoke)
         self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", signed_smoke)
         self.assertIn('HOME="$HOME"', signed_smoke)
@@ -158,6 +312,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("GH_TOKEN: ${{ github.token }}", reviewed_smoke)
         self.assertIn("reviewed_checksums_sha256", reviewed_smoke)
         self.assertIn("validate_embedded_mcp_helper_layout.sh", reviewed_smoke)
+        self.assertIn("validate_sparkle_helper_layout.sh", reviewed_smoke)
         self.assertIn("env -i", reviewed_smoke)
         promote_job = promote_workflow.split("\n  promote:", 1)[1]
         self.assertIn("- smoke-reviewed-helper", promote_job)
@@ -286,6 +441,44 @@ class ReleaseToolingTests(unittest.TestCase):
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unexpected or escaping staged symlink", result.stderr)
+
+    def test_staged_release_validator_rejects_invalid_sparkle_helper_layout(self) -> None:
+        cases = (
+            (
+                "missing Installer",
+                lambda app: (
+                    app
+                    / "Contents"
+                    / "Frameworks"
+                    / "Sparkle.framework"
+                    / "Versions"
+                    / "B"
+                    / "XPCServices"
+                    / "Installer.xpc"
+                    / "Contents"
+                    / "MacOS"
+                    / "Installer"
+                ).unlink(),
+                "missing Sparkle helper executable",
+            ),
+            (
+                "non-executable Autoupdate",
+                lambda app: (
+                    app / "Contents" / "Frameworks" / "Sparkle.framework" / "Versions" / "B" / "Autoupdate"
+                ).chmod(0o644),
+                "must be executable",
+            ),
+        )
+        for label, mutate, expected_message in cases:
+            with self.subTest(label=label):
+                approved, staged, scripts = self.make_staged_release_fixture()
+                app = staged / ".build" / "release" / "RepoPrompt.app"
+                mutate(app)
+
+                result = self.run_staged_validation(approved, staged, scripts)
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(expected_message, result.stderr)
 
     def test_runtime_bundle_verifier_is_removed_without_changing_sparkle_or_anti_debug_startup(self) -> None:
         app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
@@ -782,10 +975,70 @@ class ReleaseToolingTests(unittest.TestCase):
         (resources_bin / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
         return app
 
+    def make_sparkle_helper_layout(self) -> Path:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        app = temp_dir / "RepoPrompt.app"
+        self.add_sparkle_helper_layout(app)
+        return app
+
+    @staticmethod
+    def add_sparkle_helper_layout(app: Path) -> None:
+        framework = app / "Contents" / "Frameworks" / "Sparkle.framework"
+        version_b = framework / "Versions" / "B"
+        for directory in (
+            version_b / "Headers",
+            version_b / "Modules",
+            version_b / "PrivateHeaders",
+            version_b / "Resources",
+            version_b / "Updater.app" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        for executable in (
+            version_b / "Autoupdate",
+            version_b / "Sparkle",
+            version_b / "Updater.app" / "Contents" / "MacOS" / "Updater",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS" / "Installer",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS" / "Downloader",
+        ):
+            executable.write_text(f"{executable.name}\n", encoding="utf-8")
+            executable.chmod(0o755)
+        (framework / "Versions" / "Current").symlink_to("B")
+        for name in ("Autoupdate", "Headers", "Modules", "PrivateHeaders", "Resources", "Sparkle", "Updater.app", "XPCServices"):
+            (framework / name).symlink_to(f"Versions/Current/{name}")
+
     @staticmethod
     def run_layout_validation(app: Path) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(SCRIPT_DIR / "validate_embedded_mcp_helper_layout.sh"), str(app), "Fixture helper layout"],
+            text=True,
+            capture_output=True,
+        )
+
+    @staticmethod
+    def run_sparkle_helper_validation(app: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT_DIR / "validate_sparkle_helper_layout.sh"), str(app), "Fixture Sparkle helper layout"],
+            text=True,
+            capture_output=True,
+        )
+
+    @staticmethod
+    def write_plist(path: Path, value: dict[str, object]) -> Path:
+        path.write_bytes(plistlib.dumps(value))
+        return path
+
+    @staticmethod
+    def run_sparkle_validator(info_plist: Path, entitlements: list[Path]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "python3",
+                str(SCRIPT_DIR / "validate_sparkle_update_configuration.py"),
+                str(info_plist),
+                *[str(path) for path in entitlements],
+            ],
             text=True,
             capture_output=True,
         )
@@ -827,7 +1080,9 @@ SIGNING_TEAM_ID=648A27MST5
         for name in (
             "load_release_metadata.sh",
             "validate_embedded_mcp_helper_layout.sh",
+            "validate_sparkle_helper_layout.sh",
             "validate_packaged_legal.sh",
+            "validate_sparkle_update_configuration.py",
             "validate_staged_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
@@ -845,8 +1100,11 @@ SIGNING_TEAM_ID=648A27MST5
             (root / "LICENSE").write_text("license\n", encoding="utf-8")
             (root / "THIRD_PARTY_NOTICES.md").write_text("notices\n", encoding="utf-8")
             (root / "ThirdPartyLicenses" / "fixture" / "LICENSE").write_text("fixture\n", encoding="utf-8")
-        template = (SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_text(encoding="utf-8")
+        app_bundle_source = SCRIPT_DIR.parent / "AppBundle"
+        template = (app_bundle_source / "Info.plist.template").read_text(encoding="utf-8")
         (approved / "AppBundle" / "Info.plist.template").write_text(template, encoding="utf-8")
+        for name in ("RepoPrompt.entitlements.template", "RepoPrompt.local-self-signed.entitlements.template"):
+            shutil.copy2(app_bundle_source / name, approved / "AppBundle" / name)
         for key, value in {
             "__APP_NAME__": "RepoPrompt",
             "__DISPLAY_NAME__": "RepoPrompt CE",
@@ -863,6 +1121,7 @@ SIGNING_TEAM_ID=648A27MST5
         (app / "Contents" / "MacOS" / "repoprompt-mcp").chmod(0o755)
         (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
         (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        self.add_sparkle_helper_layout(app)
         legal = app / "Contents" / "Resources" / "Legal"
         shutil.copy2(staged / "LICENSE", legal / "LICENSE")
         shutil.copy2(staged / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")

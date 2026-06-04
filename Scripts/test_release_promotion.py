@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import plistlib
 import shutil
 import subprocess
 import tempfile
@@ -108,6 +109,12 @@ class ReleasePromotionTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Appcast enclosure URL mismatch", result.stderr)
 
+    def test_verify_rejects_reviewed_zip_with_incompatible_sparkle_configuration(self) -> None:
+        result, _capture, _tools = self.run_promotion("verify", installer_launcher_enabled=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("non-sandboxed apps must not enable Sparkle sandbox services", result.stderr)
+
     def test_verify_rejects_tag_that_disagrees_with_release_metadata(self) -> None:
         result, _capture, _tools = self.run_promotion("verify", release_tag="v1.0.1")
 
@@ -132,6 +139,7 @@ class ReleasePromotionTests(unittest.TestCase):
         latest_http_status: str = "404",
         reviewed_checksums_sha256: str = "",
         release_tag: str = "v1.0.0",
+        installer_launcher_enabled: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -151,11 +159,17 @@ class ReleasePromotionTests(unittest.TestCase):
             scripts / "validate_embedded_mcp_helper_layout.sh",
         )
         shutil.copy2(SCRIPT_DIR / "validate_packaged_legal.sh", scripts / "validate_packaged_legal.sh")
+        shutil.copy2(SCRIPT_DIR / "validate_sparkle_helper_layout.sh", scripts / "validate_sparkle_helper_layout.sh")
+        shutil.copy2(
+            SCRIPT_DIR / "validate_sparkle_update_configuration.py",
+            scripts / "validate_sparkle_update_configuration.py",
+        )
         shutil.copy2(SCRIPT_DIR / "load_release_metadata.sh", scripts / "load_release_metadata.sh")
         shutil.copy2(SCRIPT_DIR / "verify_sparkle_signature.swift", scripts / "verify_sparkle_signature.swift")
         (scripts / "promote_release.sh").chmod(0o755)
         (scripts / "validate_embedded_mcp_helper_layout.sh").chmod(0o755)
         (scripts / "validate_packaged_legal.sh").chmod(0o755)
+        (scripts / "validate_sparkle_helper_layout.sh").chmod(0o755)
         self.write_stub(scripts, "verify_remote_release_commit.sh", "printf 'OK: fixture remote tag remains bound.\\n'\n")
         self.write_stub(scripts, "verify_sparkle_vendor.sh", "printf 'OK: fixture Sparkle payload matches.\\n'\n")
         (root / "version.env").write_text(
@@ -171,7 +185,16 @@ class ReleasePromotionTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        (app / "Contents" / "Info.plist").write_text("fixture plist\n", encoding="utf-8")
+        info_plist = {
+            "CFBundleIdentifier": "com.pvncher.repoprompt.ce",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion": "1",
+            "SUFeedURL": "https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml",
+            "SUPublicEDKey": "fixture-public-key",
+        }
+        if installer_launcher_enabled:
+            info_plist["SUEnableInstallerLauncherService"] = True
+        self.write_plist(app / "Contents" / "Info.plist", info_plist)
         self.write_stub(
             app / "Contents" / "MacOS",
             "repoprompt-mcp",
@@ -179,6 +202,7 @@ class ReleasePromotionTests(unittest.TestCase):
         )
         (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
         (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        self.write_sparkle_helper_layout(app)
         self.write_legal_tree(root, app)
         shutil.copytree(app, dmg_app, symlinks=True)
         if mismatched_dmg_app:
@@ -299,6 +323,12 @@ class ReleasePromotionTests(unittest.TestCase):
             """\
             if [[ "$1" == "-dv" ]]; then
                 printf 'Authority=Developer ID Application: Fixture (648A27MST5)\\nTeamIdentifier=648A27MST5\\n' >&2
+            elif [[ "$1" == "-d" && "$2" == "--entitlements" ]]; then
+                cat <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict/></plist>
+PLIST
             fi
             """,
         )
@@ -417,6 +447,33 @@ class ReleasePromotionTests(unittest.TestCase):
         return result, capture, tool_capture
 
     @staticmethod
+    def write_sparkle_helper_layout(app: Path) -> None:
+        framework = app / "Contents" / "Frameworks" / "Sparkle.framework"
+        version_b = framework / "Versions" / "B"
+        for directory in (
+            version_b / "Headers",
+            version_b / "Modules",
+            version_b / "PrivateHeaders",
+            version_b / "Resources",
+            version_b / "Updater.app" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS",
+        ):
+            directory.mkdir(parents=True, exist_ok=True)
+        for executable in (
+            version_b / "Autoupdate",
+            version_b / "Sparkle",
+            version_b / "Updater.app" / "Contents" / "MacOS" / "Updater",
+            version_b / "XPCServices" / "Installer.xpc" / "Contents" / "MacOS" / "Installer",
+            version_b / "XPCServices" / "Downloader.xpc" / "Contents" / "MacOS" / "Downloader",
+        ):
+            executable.write_text(f"{executable.name}\n", encoding="utf-8")
+            executable.chmod(0o755)
+        (framework / "Versions" / "Current").symlink_to("B")
+        for name in ("Autoupdate", "Headers", "Modules", "PrivateHeaders", "Resources", "Sparkle", "Updater.app", "XPCServices"):
+            (framework / name).symlink_to(f"Versions/Current/{name}")
+
+    @staticmethod
     def write_legal_tree(root: Path, app: Path) -> None:
         (root / "ThirdPartyLicenses" / "fixture").mkdir(parents=True)
         (root / "LICENSE").write_text("root license\n", encoding="utf-8")
@@ -427,6 +484,11 @@ class ReleasePromotionTests(unittest.TestCase):
         shutil.copy2(root / "LICENSE", legal / "LICENSE")
         shutil.copy2(root / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")
         shutil.copytree(root / "ThirdPartyLicenses", legal / "ThirdPartyLicenses")
+
+    @staticmethod
+    def write_plist(path: Path, value: dict[str, object]) -> Path:
+        path.write_bytes(plistlib.dumps(value))
+        return path
 
     @staticmethod
     def sha256(path: Path) -> str:

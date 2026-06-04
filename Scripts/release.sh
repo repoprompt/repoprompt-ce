@@ -65,6 +65,7 @@ prepare_dist() {
 
 run_preflight() {
     require_command plutil
+    require_command python3
     require_command shasum
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/swiftpm_notice_guardrails.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh"
@@ -78,12 +79,14 @@ run_preflight() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/extract_staged_release.py"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_staged_release.sh"
     require_file "$RUN_WITHOUT_GITHUB_TOKENS"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_signed_test_build_ref.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py"
     require_file "$TRUSTED_ROOT/Vendor/Sparkle/INSTALLED_MANIFEST.tsv"
     require_file "$TRUSTED_ROOT/Vendor/Sparkle/bin/generate_appcast"
     require_file "$SPARKLE_FRAMEWORK_INFO"
@@ -93,6 +96,10 @@ run_preflight() {
     feed_url="$(plutil -extract SUFeedURL raw "$ROOT_DIR/AppBundle/Info.plist.template")"
     [[ "$sparkle_version" == "2.9.2" ]] || fail "Expected vendored Sparkle 2.9.2, got $sparkle_version"
     [[ "$feed_url" == "$EXPECTED_FEED_URL" ]] || fail "Expected CE Sparkle feed $EXPECTED_FEED_URL, got $feed_url"
+    python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py" \
+        "$ROOT_DIR/AppBundle/Info.plist.template" \
+        "$ROOT_DIR/AppBundle/RepoPrompt.entitlements.template" \
+        "$ROOT_DIR/AppBundle/RepoPrompt.local-self-signed.entitlements.template"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \

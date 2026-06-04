@@ -205,6 +205,22 @@ Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 
+validate_sparkle_update_configuration(){
+    (( IS_RELEASE )) || return 0
+    phase "Validating Sparkle update configuration"
+    [[ -f "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py" ]] || fail "Missing Sparkle update configuration validator"
+    if [[ -n "$APP_ENTITLEMENTS" && -f "$APP_ENTITLEMENTS" ]]; then
+        run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py" \
+            "$APP_BUNDLE/Contents/Info.plist" \
+            "$APP_ENTITLEMENTS"
+    else
+        run python3 "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_update_configuration.py" \
+            "$APP_BUNDLE/Contents/Info.plist" \
+            "$APP_ENTITLEMENTS_TEMPLATE" \
+            "$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE"
+    fi
+}
+
 if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     phase "Rendering local self-signed entitlements"
     [[ -f "$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE" ]] || fail "Missing local self-signed entitlements template: $LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE"
@@ -235,6 +251,8 @@ Path('$APP_ENTITLEMENTS').write_text(s)
 PY
     run plutil -lint "$APP_ENTITLEMENTS"
 fi
+
+validate_sparkle_update_configuration
 
 phase "Copying dynamic frameworks"
 printf 'Framework destination: %s\n' "$APP_BUNDLE/Contents/Frameworks"
@@ -308,6 +326,7 @@ fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_sparkle_helper_layout.sh" "$APP_BUNDLE" "Packaged app Sparkle helper layout"
 run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
 if [[ "$(python3 - <<PY
 from pathlib import Path

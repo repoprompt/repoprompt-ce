@@ -247,6 +247,15 @@ The current app enables Sparkle's required update-archive verification through
 `SURequireSignedFeed` mode, so do not describe the XML feed itself as
 cryptographically required.
 
+Release validation must also preserve the semantic relationship between Sparkle
+installer-launcher settings and the app's sandbox state. The CE app is currently
+non-sandboxed, so Sparkle sandbox-service keys such as
+`SUEnableInstallerLauncherService` must remain absent or `false`. Release
+preflight, release package rendering, staged artifact validation, and trusted
+signing validation are expected to reject an incompatible Sparkle
+installer-launcher/sandbox-entitlement combination before a public update is
+promoted.
+
 ## GitHub-hosted Sparkle feed
 
 The appcast URL committed in the app is:
@@ -298,6 +307,21 @@ The helper reads the CE Sparkle private key from the local Sparkle Keychain
 account `repoprompt-ce`. It refuses to overwrite an existing public test tag
 and publishes that tag with `--latest=false`, so a private-source smoke run
 cannot replace the stable feed selected by `latest/download/appcast.xml`.
+
+### Follow-up: self-update smoke
+
+The current release checks validate static configuration, generated assets,
+appcast metadata, signatures, notarization, packaged legal files, and embedded
+helper layout. They do not install a previous public app and drive Sparkle
+through an actual app replacement to the candidate build.
+
+Before treating a release as fully exercised through the update channel,
+maintainers should run or plan a disposable macOS GUI-machine smoke that installs
+the previous public release, points it at the candidate/public test feed, accepts
+the Sparkle update, and confirms the replacement app launches. This heavier E2E
+lane may require signed and notarized artifacts, a writable installation
+location, a GUI session, and controlled public or private appcast hosting; do not
+block the static release gates on that future automation.
 
 ## Promote and verify
 
@@ -376,6 +400,20 @@ when the existing updater assets match the reviewed source assets exactly. For
 a public regression, withdraw the bad release if policy allows it and publish a
 new hotfix tag with a higher `BUILD_NUMBER`; explicitly promote the hotfix as
 latest.
+
+### v1.0.0 updater caveat
+
+RepoPrompt CE v1.0.0 may detect v1.0.2 or later but fail the in-app install with
+an installer-connection error. Because v1.0.0's running Sparkle configuration
+controls that attempted self-update, a fixed v1.0.2+ release cannot repair the
+already-running v1.0.0 installer path before installation. The official recovery
+path for affected users is to manually download and install the latest release;
+normal updates should resume after that replacement.
+
+Do not treat repeated in-app retries from an installed v1.0.0 app as a release
+candidate validation signal. Validate new candidates with the static release
+checks above and, when available, a self-update smoke from a known-good previous
+release.
 
 ## References
 
