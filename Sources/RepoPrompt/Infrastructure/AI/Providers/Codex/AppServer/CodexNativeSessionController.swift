@@ -6345,12 +6345,8 @@ final class CodexNativeSessionController {
         {
             return "bash"
         }
-        if lowered == "web_search"
-            || lowered == "web_search_request"
-            || lowered == "google_web_search"
-            || lowered == "search_web"
-        {
-            return "search"
+        if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
+            return webCanonical
         }
         if !raw.isEmpty {
             if isRepoPromptToolCandidate(candidate, toolName: raw) {
@@ -6378,8 +6374,17 @@ final class CodexNativeSessionController {
                 return json
             }
         }
+        if toolName == "search", var payload = compactWebActionScalars(from: candidate) {
+            if payload["query"] == nil, let query = searchQueryValue(from: candidate), !query.isEmpty {
+                payload["query"] = query
+            }
+            return jsonString(from: payload)
+        }
         if toolName == "search", let query = searchQueryValue(from: candidate), !query.isEmpty {
             return jsonString(from: ["query": query])
+        }
+        if toolName == "web_read", let payload = compactWebActionScalars(from: candidate) {
+            return jsonString(from: payload)
         }
         if let command = stringValue(from: candidate, keys: ["command", "cmd"]), !command.isEmpty {
             var payload: [String: Any] = ["command": command]
@@ -6403,6 +6408,9 @@ final class CodexNativeSessionController {
         if toolName == "search", let searchJSON = webSearchToolResultJSON(from: candidate) {
             return searchJSON
         }
+        if toolName == "web_read", let readJSON = webReadToolResultJSON(from: candidate) {
+            return readJSON
+        }
         for key in ["result", "output", "response", "content"] {
             if let value = candidate[key], let json = jsonString(from: value), !json.isEmpty {
                 return json
@@ -6417,9 +6425,20 @@ final class CodexNativeSessionController {
         return nil
     }
 
+    private func webReadToolResultJSON(from candidate: [String: Any]) -> String? {
+        var object: [String: Any] = [:]
+        copyWebActionScalars(from: candidate, into: &object)
+        copyWebReadResultFields(from: candidate, into: &object)
+        return object.isEmpty ? nil : jsonString(from: object)
+    }
+
     private func webSearchToolResultJSON(from candidate: [String: Any]) -> String? {
         var object: [String: Any] = [:]
         copySearchMetadata(from: candidate, into: &object)
+        if isSearchWebReadOrFindPayload(object) {
+            copyWebReadResultFields(from: candidate, into: &object)
+            return jsonString(from: object)
+        }
 
         for key in ["result", "output", "response", "content"] {
             guard let value = candidate[key] else { continue }
@@ -6454,6 +6473,7 @@ final class CodexNativeSessionController {
     }
 
     private func copySearchMetadata(from candidate: [String: Any], into object: inout [String: Any]) {
+        copyWebActionScalars(from: candidate, into: &object)
         for key in ["status", "query", "q", "searchQuery", "search_query", "isError", "is_error"] {
             if object[key] == nil, let value = candidate[key] {
                 object[key] = value
@@ -6470,8 +6490,55 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func copyWebReadResultFields(from candidate: [String: Any], into object: inout [String: Any]) {
+        for key in AgentWebToolPayloadKeys.readResultMetadataKeys {
+            guard object[key] == nil, let value = candidate[key] else { continue }
+            object[key] = value
+        }
+        if object["error"] == nil, let error = candidate["error"] {
+            object["error"] = error
+        }
+        if object["errorMessage"] == nil, let errorMessage = candidate["errorMessage"] ?? candidate["error_message"] {
+            object["errorMessage"] = errorMessage
+        }
+        if object["match_count"] == nil, object["matchCount"] == nil,
+           let matches = candidate["matches"] as? [Any], !matches.isEmpty
+        {
+            object["match_count"] = matches.count
+        }
+    }
+
+    private func isSearchWebReadOrFindPayload(_ object: [String: Any]) -> Bool {
+        let action = stringValue(from: object, keys: AgentWebToolPayloadKeys.operationKeys)?.lowercased()
+        if ["open", "read", "fetch", "find"].contains(action ?? "") { return true }
+        let hasTarget = stringValue(from: object, keys: AgentWebToolPayloadKeys.urlTargetKeys + AgentWebToolPayloadKeys.refTargetKeys) != nil
+        let hasFind = stringValue(from: object, keys: AgentWebToolPayloadKeys.findKeys) != nil
+        return hasTarget && hasFind
+    }
+
+    private func compactWebActionScalars(from candidate: [String: Any]) -> [String: Any]? {
+        var object: [String: Any] = [:]
+        copyWebActionScalars(from: candidate, into: &object)
+        return object.isEmpty ? nil : object
+    }
+
+    private func copyWebActionScalars(from candidate: [String: Any], into object: inout [String: Any]) {
+        for key in AgentWebToolPayloadKeys.compactScalarKeys {
+            guard object[key] == nil, let value = candidate[key], isCompactWebActionScalar(value) else { continue }
+            object[key] = value
+        }
+    }
+
+    private func isCompactWebActionScalar(_ value: Any) -> Bool {
+        if let text = value as? String {
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && text.count <= 500
+        }
+        if value is NSNumber { return true }
+        return false
+    }
+
     private func searchQueryValue(from candidate: [String: Any]) -> String? {
-        if let query = stringValue(from: candidate, keys: ["query", "q", "searchQuery", "search_query", "search_text", "searchText"]),
+        if let query = stringValue(from: candidate, keys: AgentWebToolPayloadKeys.queryKeys),
            !query.isEmpty
         {
             return query
@@ -6486,6 +6553,7 @@ final class CodexNativeSessionController {
     }
 
     private func copySearchPayloadFields(from candidate: [String: Any], into object: inout [String: Any]) {
+        copyWebActionScalars(from: candidate, into: &object)
         for key in ["results", "items", "web_results", "webResults", "search_results", "searchResults", "sources", "citations", "result_count", "resultCount", "total_results", "totalResults", "count", "source_count", "sourceCount", "total_sources", "totalSources", "citation_count", "citationCount", "total_citations", "totalCitations", "summary", "answer", "snippet", "text", "message", "error", "errors", "error_message", "errorMessage"] {
             guard object[key] == nil, let value = candidate[key] else { continue }
             object[key] = value

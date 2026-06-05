@@ -4646,14 +4646,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private static func normalizedExternalToolName(_ raw: String?) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
         let lowered = raw.lowercased()
+        if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
+            return webCanonical
+        }
         let suffix = lowered.split(separator: ".").last.map(String.init) ?? lowered
         switch suffix {
         case "local_shell", "shell", "unified_exec", "exec_command", "run_shell_command":
             return "bash"
-        case "web_search", "web_search_request", "google_web_search", "search_web":
-            return "search"
         default:
-            return suffix
+            return AgentWebToolCanonicalNames.canonicalToolCardName(suffix) ?? suffix
         }
     }
 

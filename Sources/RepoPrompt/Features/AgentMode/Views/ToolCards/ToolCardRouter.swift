@@ -7,13 +7,16 @@ func normalizedToolCardName(_ name: String?) -> String? {
     let canonical = MCPIntegrationHelper.canonicalRepoPromptToolName(raw) ?? raw
     // External tools can be namespaced (for example, "functions.bash").
     // Route by suffix so tool cards stay consistent.
+    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(canonical.lowercased()) {
+        return webCanonical
+    }
     let suffix = canonical.split(separator: ".").last.map(String.init) ?? canonical
     let lowered = suffix.lowercased()
     if lowered == "local_shell" || lowered == "shell" || lowered == "unified_exec" || lowered == "exec_command" || lowered == "run_shell_command" {
         return "bash"
     }
-    if lowered == "web_search" || lowered == "web_search_request" || lowered == "google_web_search" || lowered == "search_web" {
-        return "search"
+    if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
+        return webCanonical
     }
     if lowered == "filechange" || lowered == "file_change" {
         return "apply_patch"
@@ -125,6 +128,7 @@ enum ToolCardRouter {
         "edit",
         "file_search",
         "search",
+        "web_read",
         "get_file_tree",
         "get_code_structure",
         "file_actions",
@@ -155,11 +159,12 @@ enum ToolCardRouter {
     ) -> AnyView {
         let normalized = normalizedToolCardName(item.toolName)
         let key = normalized?.lowercased()
-        let subtitle = callSubtitle(for: key, argsJSON: item.toolArgsJSON)
+        let presentation = callPresentation(for: item)
+        let subtitle = presentation?.subtitle ?? callSubtitle(for: key, argsJSON: item.toolArgsJSON)
         return AnyView(
             ToolCallCard(
                 item: item,
-                title: toolDisplayName(for: normalized ?? item.toolName),
+                title: presentation?.title ?? toolDisplayName(for: normalized ?? item.toolName),
                 subtitle: subtitle,
                 oracleOpenContext: oracleOpenContext,
                 showRunScopedToolCancel: showRunScopedToolCancel,
@@ -193,7 +198,9 @@ enum ToolCardRouter {
         case "file_search":
             return AnyView(FileSearchResultCard(item: item))
         case "search":
-            return AnyView(WebSearchResultCard(item: item))
+            return AnyView(WebSearchResultCard(item: item, normalizedToolName: "search"))
+        case "web_read":
+            return AnyView(WebSearchResultCard(item: item, normalizedToolName: "web_read"))
         case "get_file_tree":
             return AnyView(FileTreeResultCard(item: item))
         case "get_code_structure":
@@ -243,6 +250,22 @@ enum ToolCardRouter {
             }
             return AnyView(UnknownToolResultCard(item: item, title: toolDisplayName(for: normalized ?? item.toolName)))
         }
+    }
+
+    struct ToolCallPresentation: Equatable {
+        let title: String
+        let subtitle: String?
+    }
+
+    static func callPresentation(for item: AgentChatItem) -> ToolCallPresentation? {
+        let normalized = normalizedToolCardName(item.toolName)?.lowercased()
+        guard let webPresentation = AgentWebToolActionPresentation.classify(
+            rawToolName: item.toolName,
+            normalizedToolName: normalized,
+            argsJSON: item.toolArgsJSON,
+            resultJSON: nil
+        ) else { return nil }
+        return ToolCallPresentation(title: webPresentation.title, subtitle: webPresentation.subtitle)
     }
 
     static func callSubtitle(for toolName: String?, argsJSON: String?) -> String? {
@@ -455,8 +478,8 @@ private enum ToolCardSubtitleBuilder {
             {
                 return command
             }
-        case "search", "web_search", "web_search_request", "google_web_search", "search_web":
-            if let query = stringArgument(from: argsJSON, keys: ["query", "q", "search_query", "searchQuery", "text", "value"]),
+        case "search":
+            if let query = stringArgument(from: argsJSON, keys: AgentWebToolPayloadKeys.legacySearchQueryKeys),
                !query.isEmpty
             {
                 return "\"\(query)\""

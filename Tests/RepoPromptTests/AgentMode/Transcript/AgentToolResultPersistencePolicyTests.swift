@@ -161,6 +161,42 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
     }
 
+    func testWebReadAndFindPersistActionAwareSummaryOnlyPresentations() throws {
+        let readRaw = jsonString([
+            "status": "completed",
+            "title": "RepoPrompt docs",
+            "content": String(repeating: "full page body ", count: 80)
+        ])
+        let readArgs = jsonString(["url": "https://docs.example.com/a/b/c"])
+        let readSummary = try XCTUnwrap(persistedSummary(toolName: "webfetch", rawResultJSON: readRaw, argsJSON: readArgs))
+        let readObject = try decodedObject(readSummary.resultJSON)
+        let readRenderSummary = try XCTUnwrap(readObject["render_summary"] as? [String: Any])
+        XCTAssertEqual(readRenderSummary["tool_name"] as? String, "web_read")
+        XCTAssertEqual(readRenderSummary["title"] as? String, "Read Web Page")
+        XCTAssertEqual(readRenderSummary["subtitle"] as? String, "docs.example.com/…/c")
+        XCTAssertEqual(readRenderSummary["detail_text"] as? String, "RepoPrompt docs")
+        XCTAssertFalse(readSummary.resultJSON.contains("full page body"))
+
+        let bodySummaryRaw = jsonString([
+            "status": "completed",
+            "summary": String(repeating: "page body ", count: 80)
+        ])
+        let bodySummary = try XCTUnwrap(persistedSummary(toolName: "webfetch", rawResultJSON: bodySummaryRaw, argsJSON: readArgs))
+        XCTAssertFalse(bodySummary.resultJSON.contains("page body"))
+
+        let findRaw = jsonString(["status": "completed", "match_count": 3])
+        let findArgs = jsonString(["url": "https://example.com/docs", "pattern": "needle"])
+        let findSummary = try XCTUnwrap(persistedSummary(toolName: "search", rawResultJSON: findRaw, argsJSON: findArgs))
+        let findObject = try decodedObject(findSummary.resultJSON)
+        let findRenderSummary = try XCTUnwrap(findObject["render_summary"] as? [String: Any])
+        XCTAssertEqual(findRenderSummary["tool_name"] as? String, "search")
+        XCTAssertEqual(findRenderSummary["title"] as? String, "Find In Page")
+        XCTAssertEqual(findRenderSummary["op"] as? String, "find_in_page")
+        XCTAssertEqual(findRenderSummary["detail_text"] as? String, "3 matches")
+        let restored = try XCTUnwrap(StoredToolCardPresentation.fromSummaryOnly(raw: findSummary.resultJSON))
+        XCTAssertEqual(restored.title, "Find In Page")
+    }
+
     func testWebSearchPersistsBoundedSummaryOnlyErrorPresentation() throws {
         let raw = jsonString([
             "status": "failed",
