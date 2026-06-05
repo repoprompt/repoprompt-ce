@@ -2003,11 +2003,17 @@
             ] {
                 XCTAssertTrue(bootstrap.contains(hook), "Missing bootstrap attribution hook: \(hook)")
             }
+            XCTAssertTrue(bootstrap.contains("""
+            defer {
+                        handshakeSocket.rollback()
+                        inFlightHandshakeSockets.removeValue(forKey: handshakeID)
+            """))
             assertSourceOrder(
                 in: bootstrap,
                 hooks: [
                     "EditFlowPerf.Lifecycle.Bootstrap.acceptedResponseSent",
-                    "handshakeSocket.transferOwnershipIfOpen(",
+                    "guard handshakeSocket.transfer(",
+                    "publish: publishTransferredTransport",
                     "EditFlowPerf.Lifecycle.Bootstrap.ownershipTransferred",
                     "await postAccept()"
                 ]
