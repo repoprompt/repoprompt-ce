@@ -65,6 +65,7 @@ test:
 guardrails:
 	./Scripts/source_layout_guardrails.sh
 	bash ./Scripts/core_boundary_guardrails.sh
+	python3 ./Scripts/test_shared_runtime_phase1_boundaries.py
 	./Scripts/contributor_allowlist_guardrails.sh
 	./Scripts/swiftpm_notice_guardrails.sh
 

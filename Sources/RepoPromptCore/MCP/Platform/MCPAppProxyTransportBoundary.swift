@@ -35,14 +35,44 @@ package struct MCPPeerIdentity: Equatable {
     }
 }
 
-/// Descriptor-bearing handoff from the macOS app-proxy listener into MCP admission.
-/// Raw socket operations remain adapter-owned; policy consumes the normalized identity.
-package struct MCPAppProxyInboundConnection: Equatable {
-    package let connectedFileDescriptor: Int32
+package enum MCPAppProxyAcceptedTransportLeaseState: Equatable {
+    case listenerOwned
+    case admissionReserved
+    case transferred
+    case closed
+}
+
+/// Opaque accepted transport published synchronously into the host lifecycle ledger.
+/// Native descriptors and socket operations remain adapter-owned.
+package protocol MCPAppProxyAcceptedTransport: AnyObject, Sendable {
+    func close()
+}
+
+/// Ownership lease for one accepted app-proxy transport.
+///
+/// Admission reserves the lease before returning acceptance. After the accepted response is
+/// written, the listener transfers the opaque transport into lifecycle-visible storage. Any
+/// failed path rolls the lease back and closes the native transport exactly once.
+package protocol MCPAppProxyAcceptedTransportLease: AnyObject, Sendable {
+    var state: MCPAppProxyAcceptedTransportLeaseState { get }
+
+    func reserveForAdmission() -> Bool
+    func transfer(
+        publish: @Sendable (any MCPAppProxyAcceptedTransport) -> Bool
+    ) -> Bool
+    func rollback()
+}
+
+/// Opaque handoff from the app-proxy listener into reusable admission policy.
+package struct MCPAppProxyInboundConnection {
+    package let transportLease: any MCPAppProxyAcceptedTransportLease
     package let peerIdentity: MCPPeerIdentity
 
-    package init(connectedFileDescriptor: Int32, peerIdentity: MCPPeerIdentity) {
-        self.connectedFileDescriptor = connectedFileDescriptor
+    package init(
+        transportLease: any MCPAppProxyAcceptedTransportLease,
+        peerIdentity: MCPPeerIdentity
+    ) {
+        self.transportLease = transportLease
         self.peerIdentity = peerIdentity
     }
 }

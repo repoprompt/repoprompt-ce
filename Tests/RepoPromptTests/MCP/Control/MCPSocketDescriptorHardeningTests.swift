@@ -1,11 +1,12 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 import XCTest
 
 final class MCPSocketDescriptorHardeningTests: XCTestCase {
-    func testSharedHelperSetsAndPreservesDescriptorFlags() throws {
+    func testPOSIXSupportHelperSetsAndPreservesDescriptorFlags() throws {
         var descriptors = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(Darwin.pipe(&descriptors), 0)
         defer {
@@ -47,7 +48,12 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let acceptedFlag = OptionalBoolRecorder()
 
             try await server.start { inboundConnection, _, _ in
-                await acceptedFlag.record(Self.hasCloseOnExec(inboundConnection.connectedFileDescriptor))
+                let transportLease = try? XCTUnwrap(
+                    inboundConnection.transportLease as? MacOSBootstrapAcceptedTransportLease
+                )
+                await acceptedFlag.record(
+                    transportLease.map { Self.hasCloseOnExec($0.fileDescriptor) } ?? false
+                )
                 return .reject()
             }
             do {
@@ -287,13 +293,11 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         let gate = SuspendedAdmissionGate()
         let postAcceptCount = AsyncCounter()
         let abortCount = AsyncCounter()
-        let transferredFDs = SynchronousFDRecorder()
-        defer { transferredFDs.closeAll() }
 
         try await server.start { _, _, _ in
             await gate.suspendUntilReleased()
             return .accept(
-                publishTransferredFD: { transferredFDs.record($0) },
+                publishTransferredTransport: { _ in true },
                 postAccept: { await postAcceptCount.increment() },
                 onAcceptAborted: { await abortCount.increment() }
             )
@@ -538,7 +542,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
-    func testNonImportableCLISourcesUseSharedDescriptorHardening() throws {
+    func testNonImportableCLISourcesUsePOSIXSupportDescriptorHardening() throws {
         let root = try RepoRoot.url()
         let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
         let interactive = try Self.sourceText(
@@ -549,6 +553,10 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
             relativeTo: root
         )
+
+        XCTAssertTrue(main.contains("import RepoPromptPOSIXSupport"))
+        XCTAssertTrue(interactive.contains("import RepoPromptPOSIXSupport"))
+        XCTAssertTrue(transport.contains("import RepoPromptPOSIXSupport"))
 
         XCTAssertGreaterThanOrEqual(
             main.occurrenceCount(of: "POSIXDescriptorSupport.setCloseOnExec"),

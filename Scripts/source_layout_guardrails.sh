@@ -28,6 +28,7 @@ required_dirs=(
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
   "Sources/RepoPromptCore"
   "Sources/RepoPromptCoreMacOS"
+  "Sources/RepoPromptPOSIXSupport/Descriptors"
   "Sources/RepoPromptHeadless"
   "Sources/RepoPromptSyntaxCBridge/include"
   "Sources/RepoPromptShared/MCP"
@@ -47,6 +48,9 @@ if [[ ! -f "Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift" ]]; then
 fi
 if [[ ! -f "Sources/RepoPromptShared/MCP/MCPBootstrapEndpoint.swift" ]]; then
   fail "required shared MCP bootstrap endpoint file missing"
+fi
+if [[ ! -f "Sources/RepoPromptPOSIXSupport/Descriptors/POSIXDescriptorSupport.swift" ]]; then
+  fail "required package-internal POSIX descriptor support file missing"
 fi
 
 if [[ ! -f "docs/architecture/headless-core.md" ]]; then
@@ -116,6 +120,7 @@ assert_single_source_file() {
 
 assert_single_source_file "FileSystemWatching.swift" "Sources/RepoPromptCore/Platform/FileSystemWatching.swift"
 assert_single_source_file "ProcessLaunching.swift" "Sources/RepoPromptCore/Platform/ProcessLaunching.swift"
+assert_single_source_file "POSIXDescriptorSupport.swift" "Sources/RepoPromptPOSIXSupport/Descriptors/POSIXDescriptorSupport.swift"
 assert_single_source_file "RepoPromptCorePlatformDependencies.swift" "Sources/RepoPromptCore/Platform/RepoPromptCorePlatformDependencies.swift"
 assert_single_source_file "SecureKeyValueStorageBackend.swift" "Sources/RepoPromptCore/Platform/SecureKeyValueStorageBackend.swift"
 assert_single_source_file "BundledHelperPeerVerifying.swift" "Sources/RepoPromptCore/MCP/Platform/BundledHelperPeerVerifying.swift"
@@ -247,6 +252,8 @@ package = json.loads(subprocess.check_output(["swift", "package", "dump-package"
 targets = {target["name"]: target for target in package["targets"]}
 repo_prompt = targets.get("RepoPrompt", {})
 repo_prompt_dependencies = repo_prompt.get("dependencies", [])
+repo_prompt_mcp = targets.get("RepoPromptMCP", {})
+repo_prompt_mcp_dependencies = repo_prompt_mcp.get("dependencies", [])
 core = targets.get("RepoPromptCore", {})
 core_dependencies = core.get("dependencies", [])
 macos = targets.get("RepoPromptCoreMacOS", {})
@@ -309,16 +316,34 @@ if syntax_bridge_by_name_dependencies != ["TreeSitterScannerSupport"]:
     errors.append("RepoPromptSyntaxCBridge must directly depend only on TreeSitterScannerSupport plus the curated grammar products")
 if has_by_name(repo_prompt_dependencies, "TreeSitterScannerSupport"):
     errors.append("RepoPrompt must not directly depend on TreeSitterScannerSupport")
-if not has_by_name(core_dependencies, "RepoPromptSyntaxCBridge"):
-    errors.append("RepoPromptCore must directly depend on RepoPromptSyntaxCBridge")
-if not has_by_name(core_dependencies, "RepoPromptC") or not has_by_name(core_dependencies, "CSwiftPCRE2"):
-    errors.append("RepoPromptCore must directly depend on RepoPromptC and CSwiftPCRE2")
+unexpected_core_native_dependencies = sorted(
+    dependency["byName"][0]
+    for dependency in core_dependencies
+    if "byName" in dependency
+    and dependency["byName"][0] in {"RepoPromptShared", "RepoPromptPOSIXSupport", "RepoPromptC", "CSwiftPCRE2", "RepoPromptSyntaxCBridge"}
+)
+if unexpected_core_native_dependencies:
+    errors.append(f"RepoPromptCore has premature dependency edges: {unexpected_core_native_dependencies}")
 if not has_by_name(repo_prompt_dependencies, "RepoPromptCore") or not has_by_name(repo_prompt_dependencies, "RepoPromptCoreMacOS"):
     errors.append("RepoPrompt must directly depend on RepoPromptCore and RepoPromptCoreMacOS")
 if not has_by_name(repo_prompt_dependencies, "RepoPromptSyntaxCBridge"):
     errors.append("RepoPrompt must directly depend on RepoPromptSyntaxCBridge while SyntaxManager remains app-owned")
+if not has_by_name(repo_prompt_dependencies, "RepoPromptC") or not has_by_name(repo_prompt_dependencies, "CSwiftPCRE2"):
+    errors.append("RepoPrompt must retain direct native dependencies while current app sources import them")
+if not has_by_name(repo_prompt_dependencies, "RepoPromptPOSIXSupport"):
+    errors.append("RepoPrompt must directly depend on RepoPromptPOSIXSupport while app socket sources import it")
+if not has_by_name(repo_prompt_mcp_dependencies, "RepoPromptPOSIXSupport"):
+    errors.append("RepoPromptMCP must directly depend on RepoPromptPOSIXSupport")
 if not has_by_name(macos_dependencies, "RepoPromptCore"):
     errors.append("RepoPromptCoreMacOS must directly depend on RepoPromptCore")
+if not has_by_name(macos_dependencies, "RepoPromptPOSIXSupport"):
+    errors.append("RepoPromptCoreMacOS must directly depend on RepoPromptPOSIXSupport")
+if has_by_name(macos_dependencies, "RepoPromptShared"):
+    errors.append("RepoPromptCoreMacOS must not depend on RepoPromptShared")
+
+product_names = [product["name"] for product in package["products"]]
+if product_names != ["RepoPrompt", "repoprompt-mcp", "repoprompt-headless"]:
+    errors.append(f"SwiftPM products must expose exactly the three executables, found: {product_names}")
 
 if errors:
     raise SystemExit("\n".join(errors))
@@ -474,6 +499,7 @@ allowed_tracked_docs=(
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
   "docs/characterization/shared-runtime-phase0-2026-06-05.md"
+  "docs/characterization/shared-runtime-phase1-2026-06-05.md"
   "docs/open-source-readiness.md"
   "docs/releasing.md"
   "docs/worktrees.md"

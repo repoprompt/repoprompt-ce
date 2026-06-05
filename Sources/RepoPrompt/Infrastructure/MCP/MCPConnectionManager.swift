@@ -10,6 +10,7 @@ import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 import SwiftUI
 
@@ -206,13 +207,13 @@ struct IdentityContextSnapshot {
 // MCPServerConnection implementation is BootstrapSocketConnectionManager (in a separate file).
 // No replacement code is needed; we now go directly to ServerNetworkManager.
 
-/// Lock-protected ownership ledger for accepted bootstrap descriptors after handshake
+/// Lock-protected ownership ledger for accepted bootstrap transports after handshake
 /// ownership transfer but before actor-processed deferred registration. Full shutdown
-/// invalidates one lifecycle and drains its descriptors synchronously.
+/// invalidates one lifecycle and drains its transports synchronously.
 private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
     private struct Entry {
         let lifecycleGeneration: UInt64
-        let fd: Int32
+        let transport: any MCPAppProxyAcceptedTransport
     }
 
     private let lock = NSLock()
@@ -225,13 +226,20 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
         lock.unlock()
     }
 
-    func publish(connectionID: UUID, lifecycleGeneration: UInt64, fd: Int32) -> Bool {
+    func publish(
+        connectionID: UUID,
+        lifecycleGeneration: UInt64,
+        transport: any MCPAppProxyAcceptedTransport
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard activeLifecycleGeneration == lifecycleGeneration,
               entriesByConnectionID[connectionID] == nil
         else { return false }
-        entriesByConnectionID[connectionID] = Entry(lifecycleGeneration: lifecycleGeneration, fd: fd)
+        entriesByConnectionID[connectionID] = Entry(
+            lifecycleGeneration: lifecycleGeneration,
+            transport: transport
+        )
         return true
     }
 
@@ -244,7 +252,10 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
         return entry.lifecycleGeneration == lifecycleGeneration
     }
 
-    func claim(connectionID: UUID, lifecycleGeneration: UInt64) -> Int32? {
+    func claim(
+        connectionID: UUID,
+        lifecycleGeneration: UInt64
+    ) -> (any MCPAppProxyAcceptedTransport)? {
         lock.lock()
         defer { lock.unlock() }
         guard activeLifecycleGeneration == lifecycleGeneration,
@@ -252,20 +263,25 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
               entry.lifecycleGeneration == lifecycleGeneration
         else { return nil }
         entriesByConnectionID.removeValue(forKey: connectionID)
-        return entry.fd
+        return entry.transport
     }
 
-    func remove(connectionID: UUID, lifecycleGeneration: UInt64) -> Int32? {
+    func remove(
+        connectionID: UUID,
+        lifecycleGeneration: UInt64
+    ) -> (any MCPAppProxyAcceptedTransport)? {
         lock.lock()
         defer { lock.unlock() }
         guard let entry = entriesByConnectionID[connectionID],
               entry.lifecycleGeneration == lifecycleGeneration
         else { return nil }
         entriesByConnectionID.removeValue(forKey: connectionID)
-        return entry.fd
+        return entry.transport
     }
 
-    func invalidateAndDrain(lifecycleGeneration: UInt64) -> [Int32] {
+    func invalidateAndDrain(
+        lifecycleGeneration: UInt64
+    ) -> [any MCPAppProxyAcceptedTransport] {
         lock.lock()
         defer { lock.unlock() }
         guard activeLifecycleGeneration == lifecycleGeneration else { return [] }
@@ -274,7 +290,7 @@ private final class BootstrapTransferredSocketLedger: @unchecked Sendable {
         for connectionID in matchingEntries.keys {
             entriesByConnectionID.removeValue(forKey: connectionID)
         }
-        return matchingEntries.values.map(\.fd)
+        return matchingEntries.values.map(\.transport)
     }
 
     var isEmptyAndInactive: Bool {
@@ -1081,11 +1097,11 @@ actor ServerNetworkManager {
     }
 
     private func closeTransferredBootstrapSocket(connectionID: UUID, lifecycleGeneration: UInt64) {
-        guard let fd = transferredBootstrapSockets.remove(
+        guard let transport = transferredBootstrapSockets.remove(
             connectionID: connectionID,
             lifecycleGeneration: lifecycleGeneration
         ) else { return }
-        closeUnregisteredBootstrapFD(fd)
+        transport.close()
     }
 
     private func closeUnregisteredBootstrapFD(_ fd: Int32) {
@@ -2845,7 +2861,7 @@ actor ServerNetworkManager {
         sessionToken: String,
         clientName: String?
     ) async -> BootstrapSocketServer.Admission {
-        let clientFD = inboundConnection.connectedFileDescriptor
+        let transportLease = inboundConnection.transportLease
         let peerIdentity = inboundConnection.peerIdentity
         let connectionID = UUID()
         connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (trustedPid=\(peerIdentity.trustedPID.map(String.init) ?? "unavailable"), claimedPid=\(peerIdentity.handshakeClaimedPID), provenance=\(String(describing: peerIdentity.provenance)), session=\(sessionToken.prefix(8))...)")
@@ -2917,7 +2933,8 @@ actor ServerNetworkManager {
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
             peerIdentity: peerIdentity,
-            clientName: clientName
+            clientName: clientName,
+            transportLease: transportLease
         )
     }
 
@@ -2935,8 +2952,13 @@ actor ServerNetworkManager {
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
         peerIdentity: MCPPeerIdentity,
-        clientName: String?
+        clientName: String?,
+        transportLease: any MCPAppProxyAcceptedTransportLease
     ) -> BootstrapSocketServer.Admission {
+        guard transportLease.reserveForAdmission() else {
+            connectionLog("Rejecting bootstrap connection \(connectionID) - transport lease unavailable")
+            return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
+        }
         reserveBootstrapSlot(
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration
@@ -2946,11 +2968,11 @@ actor ServerNetworkManager {
         // NOTE: Using strong capture [self] to ensure reservation cleanup always reaches
         // the owning manager. These closures are short-lived and not stored long-term.
         return .accept(
-            publishTransferredFD: { [transferredBootstrapSockets] clientFD in
+            publishTransferredTransport: { [transferredBootstrapSockets] transport in
                 transferredBootstrapSockets.publish(
                     connectionID: connectionID,
                     lifecycleGeneration: admissionLifecycleGeneration,
-                    fd: clientFD
+                    transport: transport
                 )
             },
             postAccept: { [self] in
@@ -2963,6 +2985,7 @@ actor ServerNetworkManager {
                 )
             },
             onAcceptAborted: { [self] in
+                transportLease.rollback()
                 await rollbackBootstrapReservation(
                     connectionID: connectionID,
                     lifecycleGeneration: admissionLifecycleGeneration,
@@ -3021,7 +3044,7 @@ actor ServerNetworkManager {
             return
         }
 
-        guard let committedFD = transferredBootstrapSockets.claim(
+        guard let committedTransport = transferredBootstrapSockets.claim(
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration
         ) else {
@@ -3030,6 +3053,15 @@ actor ServerNetworkManager {
                 lifecycleGeneration: admissionLifecycleGeneration,
                 reason: "transferred fd missing before registration"
             )
+            return
+        }
+
+        guard let acceptedTransport = committedTransport as? MacOSBootstrapAcceptedTransportLease,
+              let committedFD = acceptedTransport.claimConnectedFileDescriptor()
+        else {
+            committedTransport.close()
+            bootstrapReservations.removeValue(forKey: connectionID)
+            connectionLog("Abandoned pending bootstrap commit \(connectionID) (opaque transport could not be adopted)")
             return
         }
         bootstrapReservations.removeValue(forKey: connectionID)
@@ -3073,14 +3105,18 @@ actor ServerNetworkManager {
             clientFD: Int32
         ) -> BootstrapSocketServer.Admission? {
             guard isRunningState else { return nil }
+            let transportLease = MacOSBootstrapAcceptedTransportLease(fileDescriptor: clientFD)
             let admission = makeAcceptedBootstrapAdmission(
                 connectionID: connectionID,
                 lifecycleGeneration: lifecycleGeneration,
                 sessionToken: sessionToken,
                 peerIdentity: MCPPeerIdentity(socketObservedPID: clientPid, handshakeClaimedPID: clientPid),
-                clientName: clientName
+                clientName: clientName,
+                transportLease: transportLease
             )
-            guard admission.publishTransferredFD?(clientFD) == true else {
+            guard let publish = admission.publishTransferredTransport,
+                  transportLease.transfer(publish: publish)
+            else {
                 rollbackBootstrapReservation(
                     connectionID: connectionID,
                     lifecycleGeneration: lifecycleGeneration,
@@ -3485,11 +3521,11 @@ actor ServerNetworkManager {
         // Invalidate synchronous transfer publication and close transferred-but-unregistered
         // sockets before awaiting listener teardown. This prevents old-lifecycle commits
         // from surviving a full stop followed by restart.
-        let transferredBootstrapFDs = transferredBootstrapSockets.invalidateAndDrain(
+        let transferredBootstrapTransports = transferredBootstrapSockets.invalidateAndDrain(
             lifecycleGeneration: stoppedLifecycleGeneration
         )
-        for fd in transferredBootstrapFDs {
-            closeUnregisteredBootstrapFD(fd)
+        for transport in transferredBootstrapTransports {
+            transport.close()
         }
         bootstrapReservations.removeAll()
         let waiterIDsToResume = connectionWaiters.compactMap { waiterID, waiter in

@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptShared
 
 /// Platform-neutral description of a spawned child process.
 package struct SpawnedProcess: @unchecked Sendable {
@@ -20,7 +19,7 @@ package struct SpawnedProcess: @unchecked Sendable {
 
 package enum ProcessLauncherError: Error {
     case pipeCreationFailed(String)
-    case descriptorConfigurationFailed(label: String, fd: Int32, underlying: POSIXDescriptorConfigurationError)
+    case descriptorConfigurationFailed(operation: String, label: String, fd: Int32, errno: Int32)
     case spawnFileActionsFailed(operation: String, errno: Int32)
     case changeDirectoryFailed(path: String, errno: Int32)
     case spawnAttributesFailed(operation: String, errno: Int32)

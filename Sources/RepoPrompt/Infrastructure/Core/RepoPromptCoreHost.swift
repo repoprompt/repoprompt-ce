@@ -1,17 +1,9 @@
 import Foundation
 import RepoPromptCore
 
-struct RepoPromptSessionID: Hashable {
-    let rawValue: UUID
-
-    init(rawValue: UUID = UUID()) {
-        self.rawValue = rawValue
-    }
-}
-
-struct MCPRoutingSessionID: Hashable {
-    let rawValue: Int
-}
+// Phase 1 compatibility aliases. Remove when the host/session implementation moves to Core.
+typealias RepoPromptSessionID = RepoPromptCore.RepoPromptSessionID
+typealias MCPRoutingSessionID = RepoPromptCore.MCPRoutingSessionID
 
 enum RepoPromptCoreSessionLifecycle: String {
     case created

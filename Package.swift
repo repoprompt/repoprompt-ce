@@ -5,9 +5,6 @@ let package = Package(
     name: "RepoPromptCE",
     platforms: [.macOS(.v14)],
     products: [
-        .library(name: "RepoPromptCore", targets: ["RepoPromptCore"]),
-        .library(name: "RepoPromptCoreMacOS", targets: ["RepoPromptCoreMacOS"]),
-        .library(name: "RepoPromptSyntaxCBridge", targets: ["RepoPromptSyntaxCBridge"]),
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
         .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
         .executable(name: "repoprompt-headless", targets: ["RepoPromptHeadless"])
@@ -47,7 +44,7 @@ let package = Package(
         .executableTarget(
             name: "RepoPrompt",
             dependencies: [
-                "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS", "RepoPromptSyntaxCBridge",
+                "RepoPromptShared", "RepoPromptPOSIXSupport", "RepoPromptCore", "RepoPromptCoreMacOS", "RepoPromptSyntaxCBridge",
                 "RepoPromptC", "CSwiftPCRE2",
                 "Sparkle",
                 .product(name: "Logging", package: "swift-log"),
@@ -74,7 +71,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptShared", "RepoPromptPOSIXSupport", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
@@ -90,14 +87,14 @@ let package = Package(
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
         .target(name: "RepoPromptShared", path: "Sources/RepoPromptShared"),
+        .target(name: "RepoPromptPOSIXSupport", path: "Sources/RepoPromptPOSIXSupport"),
         .target(
             name: "RepoPromptCore",
-            dependencies: ["RepoPromptShared", "RepoPromptC", "CSwiftPCRE2", "RepoPromptSyntaxCBridge"],
             path: "Sources/RepoPromptCore"
         ),
         .target(
             name: "RepoPromptCoreMacOS",
-            dependencies: ["RepoPromptCore", "RepoPromptShared"],
+            dependencies: ["RepoPromptCore", "RepoPromptPOSIXSupport"],
             path: "Sources/RepoPromptCoreMacOS"
         ),
         .target(name: "CSwiftPCRE2", path: "Sources/CSwiftPCRE2", exclude: ["deps/sljit/sljit_src/sljitNativeARM_64.c", "deps/sljit/sljit_src/sljitSerialize.c", "deps/sljit/sljit_src/sljitUtils.c", "deps/sljit/sljit_src/sljitNativeX86_common.c", "deps/sljit/sljit_src/sljitNativeX86_64.c", "deps/sljit/sljit_src/sljitNativeX86_32.c", "deps/sljit/sljit_src/allocator_src/sljitWXExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitProtExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorCore.c", "deps/sljit/sljit_src/allocator_src/sljitExecAllocatorApple.c"], publicHeadersPath: "include", cSettings: [.headerSearchPath("include"), .headerSearchPath("src"), .define("PCRE2_CODE_UNIT_WIDTH", to: "8"), .define("HAVE_CONFIG_H")]),
@@ -129,7 +126,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPrompt", "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS"],
+            dependencies: ["RepoPrompt", "RepoPromptShared", "RepoPromptPOSIXSupport", "RepoPromptCore", "RepoPromptCoreMacOS"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),
@@ -140,6 +137,16 @@ let package = Package(
             name: "RepoPromptHeadlessTests",
             dependencies: ["RepoPromptHeadless"],
             path: "Tests/RepoPromptHeadlessTests"
+        ),
+        .testTarget(
+            name: "RepoPromptCoreTests",
+            dependencies: ["RepoPromptCore"],
+            path: "Tests/RepoPromptCoreTests"
+        ),
+        .testTarget(
+            name: "RepoPromptPOSIXSupportTests",
+            dependencies: ["RepoPromptPOSIXSupport"],
+            path: "Tests/RepoPromptPOSIXSupportTests"
         )
     ],
     swiftLanguageModes: [.v5]

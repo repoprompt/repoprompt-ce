@@ -12,6 +12,7 @@ import Darwin
 import Dispatch
 import Foundation
 import Logging
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 
 #if DEBUG
@@ -28,134 +29,6 @@ import RepoPromptShared
 // RepoPromptShared/MCP/MCPBootstrapMessages.swift for sharing with the CLI.
 
 // MARK: - Bootstrap Socket Server
-
-/// Lock-protected ownership wrapper for accepted sockets that are still in the
-/// bootstrap handshake. Blocking handshake reads run outside actor isolation,
-/// while stop() must be able to invalidate and close these sockets immediately.
-private final class BootstrapHandshakeSocket: @unchecked Sendable {
-    private enum Ownership: Equatable {
-        case serverOwnedOpen
-        case serverOwnedClosing
-        case transferred
-        case closed
-    }
-
-    let fd: Int32
-
-    private let lock = NSLock()
-    private var ownership: Ownership = .serverOwnedOpen
-    private var activeIOLeases = 0
-    private var shutdownInProgress = false
-    #if DEBUG
-        private let debugBeforeInitiatingShutdown: (() -> Void)?
-    #endif
-
-    init(fd: Int32) {
-        self.fd = fd
-        #if DEBUG
-            debugBeforeInitiatingShutdown = nil
-        #endif
-    }
-
-    #if DEBUG
-        init(fd: Int32, debugBeforeInitiatingShutdown: @escaping () -> Void) {
-            self.fd = fd
-            self.debugBeforeInitiatingShutdown = debugBeforeInitiatingShutdown
-        }
-    #endif
-
-    func isServerOwnedOpen() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        guard case .serverOwnedOpen = ownership else { return false }
-        return true
-    }
-
-    /// Runs one blocking syscall while preventing the numeric FD from being closed
-    /// and reused underneath it. stop() still calls shutdown immediately to wake I/O;
-    /// final close occurs when the last lease exits.
-    func withServerOwnedIOLease<T>(_ body: (Int32) -> T) -> T? {
-        lock.lock()
-        guard case .serverOwnedOpen = ownership else {
-            lock.unlock()
-            return nil
-        }
-        activeIOLeases += 1
-        lock.unlock()
-
-        let result = body(fd)
-        releaseIOLease()
-        return result
-    }
-
-    func shutdownAndCloseIfServerOwned() {
-        lock.lock()
-        guard case .serverOwnedOpen = ownership else {
-            lock.unlock()
-            return
-        }
-        ownership = .serverOwnedClosing
-        // A lease release must not close and recycle the numeric FD before this
-        // initiating shutdown call has used it.
-        shutdownInProgress = true
-        lock.unlock()
-
-        #if DEBUG
-            debugBeforeInitiatingShutdown?()
-        #endif
-        POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
-
-        lock.lock()
-        shutdownInProgress = false
-        let shouldClose = activeIOLeases == 0 && ownership == .serverOwnedClosing
-        if shouldClose {
-            ownership = .closed
-        }
-        lock.unlock()
-
-        if shouldClose {
-            Darwin.close(fd)
-        }
-    }
-
-    /// Atomically leaves handshake ownership and publishes the transferred descriptor
-    /// into the manager's synchronous full-shutdown ledger. If the receiving lifecycle
-    /// is already invalid, this method closes the descriptor itself.
-    func transferOwnershipIfOpen(
-        publishTransferredFD: (Int32) -> Bool
-    ) -> Bool {
-        lock.lock()
-        guard case .serverOwnedOpen = ownership, activeIOLeases == 0 else {
-            lock.unlock()
-            return false
-        }
-        ownership = .transferred
-        let wasPublished = publishTransferredFD(fd)
-        lock.unlock()
-
-        if !wasPublished {
-            POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
-            Darwin.close(fd)
-        }
-        return wasPublished
-    }
-
-    private func releaseIOLease() {
-        lock.lock()
-        activeIOLeases -= 1
-        let shouldClose = activeIOLeases == 0
-            && ownership == .serverOwnedClosing
-            && !shutdownInProgress
-        if shouldClose {
-            ownership = .closed
-        }
-        lock.unlock()
-
-        if shouldClose {
-            Darwin.close(fd)
-        }
-    }
-}
 
 /// Actor that manages the single bootstrap UNIX socket.
 /// Accepts CLI connections and hands them off to ServerNetworkManager.
@@ -178,7 +51,7 @@ actor BootstrapSocketServer {
     /// Prevents FD exhaustion during connection storms.
     private let maxInFlightHandshakes: Int = 32
     private var listenerGeneration: UInt64 = 0
-    private var inFlightHandshakeSockets: [UUID: BootstrapHandshakeSocket] = [:]
+    private var inFlightHandshakeSockets: [UUID: MacOSBootstrapAcceptedTransportLease] = [:]
     private var acceptSuspendedForBackpressure: Bool = false
     private var drainInProgress: Bool = false
     private var drainRequestedWhileBusy: Bool = false
@@ -187,8 +60,8 @@ actor BootstrapSocketServer {
     struct Admission {
         let accepted: Bool
         /// Called synchronously while handshake ownership is transferred. The receiver
-        /// must publish the descriptor into storage visible to full shutdown.
-        let publishTransferredFD: (@Sendable (Int32) -> Bool)?
+        /// must publish the opaque transport into storage visible to full shutdown.
+        let publishTransferredTransport: (@Sendable (any MCPAppProxyAcceptedTransport) -> Bool)?
         /// Called after the bootstrap server successfully sends the accepted response
         /// and synchronously publishes transferred descriptor ownership.
         /// This is where MCP server startup should be scheduled.
@@ -200,13 +73,13 @@ actor BootstrapSocketServer {
         let rejection: MCPBootstrapResponse?
 
         static func accept(
-            publishTransferredFD: @escaping @Sendable (Int32) -> Bool,
+            publishTransferredTransport: @escaping @Sendable (any MCPAppProxyAcceptedTransport) -> Bool,
             postAccept: @escaping @Sendable () async -> Void,
             onAcceptAborted: (@Sendable () async -> Void)? = nil
         ) -> Self {
             .init(
                 accepted: true,
-                publishTransferredFD: publishTransferredFD,
+                publishTransferredTransport: publishTransferredTransport,
                 postAccept: postAccept,
                 onAcceptAborted: onAcceptAborted,
                 rejection: nil
@@ -214,7 +87,7 @@ actor BootstrapSocketServer {
         }
 
         static func reject(_ response: MCPBootstrapResponse? = nil) -> Self {
-            .init(accepted: false, publishTransferredFD: nil, postAccept: nil, onAcceptAborted: nil, rejection: response)
+            .init(accepted: false, publishTransferredTransport: nil, postAccept: nil, onAcceptAborted: nil, rejection: response)
         }
     }
 
@@ -381,8 +254,8 @@ actor BootstrapSocketServer {
                 }
             }
 
-            let handshakeSocket = BootstrapHandshakeSocket(
-                fd: descriptors[0],
+            let handshakeSocket = MacOSBootstrapAcceptedTransportLease(
+                fileDescriptor: descriptors[0],
                 debugBeforeInitiatingShutdown: {
                     initiatingShutdown.signal()
                     continueShutdown.wait()
@@ -391,7 +264,7 @@ actor BootstrapSocketServer {
             workerGroup.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { workerGroup.leave() }
-                _ = handshakeSocket.withServerOwnedIOLease { _ in
+                _ = handshakeSocket.withListenerOwnedIOLease { _ in
                     leaseStarted.signal()
                     releaseLease.wait()
                 }
@@ -402,7 +275,7 @@ actor BootstrapSocketServer {
             workerGroup.enter()
             DispatchQueue.global(qos: .userInitiated).async {
                 defer { workerGroup.leave() }
-                handshakeSocket.shutdownAndCloseIfServerOwned()
+                handshakeSocket.rollback()
                 shutdownFinished.signal()
             }
             try debugWait(initiatingShutdown, phase: "shutdown initiation")
@@ -465,7 +338,7 @@ actor BootstrapSocketServer {
         }
 
         for socket in inFlightHandshakeSockets.values {
-            socket.shutdownAndCloseIfServerOwned()
+            socket.rollback()
         }
         inFlightHandshakeSockets.removeAll()
 
@@ -567,7 +440,7 @@ actor BootstrapSocketServer {
             }
 
             let handshakeID = UUID()
-            let handshakeSocket = BootstrapHandshakeSocket(fd: clientFD)
+            let handshakeSocket = MacOSBootstrapAcceptedTransportLease(fileDescriptor: clientFD)
             let generation = listenerGeneration
             inFlightHandshakeSockets[handshakeID] = handshakeSocket
             let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
@@ -655,12 +528,12 @@ actor BootstrapSocketServer {
 
     private func handleNewConnectionWithBackpressure(
         handshakeID: UUID,
-        handshakeSocket: BootstrapHandshakeSocket,
+        handshakeSocket: MacOSBootstrapAcceptedTransportLease,
         generation: UInt64,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async {
         defer {
-            handshakeSocket.shutdownAndCloseIfServerOwned()
+            handshakeSocket.rollback()
             inFlightHandshakeSockets.removeValue(forKey: handshakeID)
             // If we were paused and now have room, resume accepting.
             if inFlightHandshakeSockets.count < maxInFlightHandshakes {
@@ -686,8 +559,8 @@ actor BootstrapSocketServer {
         }
     }
 
-    private func isActiveHandshake(_ handshakeSocket: BootstrapHandshakeSocket, generation: UInt64) -> Bool {
-        isRunning && listenerGeneration == generation && handshakeSocket.isServerOwnedOpen()
+    private func isActiveHandshake(_ handshakeSocket: MacOSBootstrapAcceptedTransportLease, generation: UInt64) -> Bool {
+        isRunning && listenerGeneration == generation && handshakeSocket.isListenerOwnedOpen()
     }
 
     private func abortAcceptedAdmissionIfNeeded(_ admission: Admission) async {
@@ -698,11 +571,11 @@ actor BootstrapSocketServer {
     /// Handles a new client connection: read handshake, validate, callback.
     private func handleNewConnection(
         handshakeID: UUID,
-        handshakeSocket: BootstrapHandshakeSocket,
+        handshakeSocket: MacOSBootstrapAcceptedTransportLease,
         generation: UInt64,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async {
-        let clientFD = handshakeSocket.fd
+        let clientFD = handshakeSocket.fileDescriptor
         bootstrapSocketServerLog("BootstrapSocketServer: new connection on fd \(clientFD)")
         guard isActiveHandshake(handshakeSocket, generation: generation) else { return }
 
@@ -744,7 +617,7 @@ actor BootstrapSocketServer {
             bootstrapSocketServerLog("BootstrapSocketServer: clientPid mismatch (request=\(request.clientPid), peer=\(peerPID)); using peer pid")
         }
         let inboundConnection = MCPAppProxyInboundConnection(
-            connectedFileDescriptor: clientFD,
+            transportLease: handshakeSocket,
             peerIdentity: peerIdentity
         )
 
@@ -799,7 +672,7 @@ actor BootstrapSocketServer {
         }
 
         if admission.accepted {
-            guard let publishTransferredFD = admission.publishTransferredFD,
+            guard let publishTransferredTransport = admission.publishTransferredTransport,
                   let postAccept = admission.postAccept
             else {
                 logger.error("BootstrapSocketServer: accepted admission missing ownership-transfer hooks for fd \(clientFD)")
@@ -825,8 +698,8 @@ actor BootstrapSocketServer {
             // NOW it's safe to transfer ownership and start the MCP server. The CLI
             // has received "accepted". Handshake ownership and full-shutdown-visible
             // manager publication move together under the handshake socket lock.
-            guard handshakeSocket.transferOwnershipIfOpen(
-                publishTransferredFD: publishTransferredFD
+            guard handshakeSocket.transfer(
+                publish: publishTransferredTransport
             ) else {
                 await abortAcceptedAdmissionIfNeeded(admission)
                 return
@@ -853,7 +726,7 @@ actor BootstrapSocketServer {
     /// Reads the handshake request from the client socket.
     /// Format: newline-delimited JSON (same as MCP protocol)
     private func readHandshakeRequestAsync(
-        from handshakeSocket: BootstrapHandshakeSocket,
+        from handshakeSocket: MacOSBootstrapAcceptedTransportLease,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async -> MCPBootstrapRequest? {
         EditFlowPerf.lifecycleEvent(
@@ -894,7 +767,7 @@ actor BootstrapSocketServer {
         return request
     }
 
-    private nonisolated static func readHandshakeRequestBlocking(from handshakeSocket: BootstrapHandshakeSocket) -> MCPBootstrapRequest? {
+    private nonisolated static func readHandshakeRequestBlocking(from handshakeSocket: MacOSBootstrapAcceptedTransportLease) -> MCPBootstrapRequest? {
         var buffer = Data()
         var byte: UInt8 = 0
 
@@ -904,7 +777,7 @@ actor BootstrapSocketServer {
 
         while Date() < deadline {
             let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
-            guard let pollResult = handshakeSocket.withServerOwnedIOLease({ leasedFD in
+            guard let pollResult = handshakeSocket.withListenerOwnedIOLease({ leasedFD in
                 var pfd = pollfd(fd: leasedFD, events: Int16(POLLIN), revents: 0)
                 return poll(&pfd, 1, max(0, remaining))
             }) else {
@@ -918,7 +791,7 @@ actor BootstrapSocketServer {
                 continue
             }
 
-            guard let bytesRead = handshakeSocket.withServerOwnedIOLease({ leasedFD in
+            guard let bytesRead = handshakeSocket.withListenerOwnedIOLease({ leasedFD in
                 Darwin.read(leasedFD, &byte, 1)
             }) else {
                 return nil
@@ -955,9 +828,9 @@ actor BootstrapSocketServer {
     /// Returns true if the full response was written successfully.
     /// Uses SO_SNDTIMEO for bounded writes - if the client isn't reading, we fail fast.
     @discardableResult
-    private func sendResponseAsync(_ response: MCPBootstrapResponse, to handshakeSocket: BootstrapHandshakeSocket) async -> Bool {
-        let fd = handshakeSocket.fd
-        guard handshakeSocket.isServerOwnedOpen() else { return false }
+    private func sendResponseAsync(_ response: MCPBootstrapResponse, to handshakeSocket: MacOSBootstrapAcceptedTransportLease) async -> Bool {
+        let fd = handshakeSocket.fileDescriptor
+        guard handshakeSocket.isListenerOwnedOpen() else { return false }
         guard let jsonData = try? JSONEncoder().encode(response) else {
             logger.error("BootstrapSocketServer: failed to encode response")
             return false
@@ -975,7 +848,7 @@ actor BootstrapSocketServer {
         var totalWritten = 0
 
         while totalWritten < bytes.count {
-            if Task.isCancelled || !handshakeSocket.isServerOwnedOpen() {
+            if Task.isCancelled || !handshakeSocket.isListenerOwnedOpen() {
                 POSIXDescriptorSupport.shutdownSocketReadWrite(fd)
                 return false
             }

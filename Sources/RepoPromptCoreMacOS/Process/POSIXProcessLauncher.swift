@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 import RepoPromptCore
-import RepoPromptShared
+import RepoPromptPOSIXSupport
 
 package enum ProcessLauncher {
     package static func spawn(
@@ -79,7 +79,12 @@ package enum ProcessLauncher {
                 do {
                     try POSIXDescriptorSupport.setCloseOnExec(fd)
                 } catch let error as POSIXDescriptorConfigurationError {
-                    throw ProcessLauncherError.descriptorConfigurationFailed(label: label, fd: fd, underlying: error)
+                    throw ProcessLauncherError.descriptorConfigurationFailed(
+                        operation: "setCloseOnExec",
+                        label: label,
+                        fd: fd,
+                        errno: error.errnoValue
+                    )
                 }
             }
         }

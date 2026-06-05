@@ -1,6 +1,6 @@
 # Source Layout Ownership Map
 
-Current as of 2026-06-05 after the bounded core/platform split and the frozen packaging (`2b35091`), app/MCP (`042a500`), and headless (`487cd71`) sibling baselines. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-06-05 after shared-runtime Phase 1 from checkpoint `48a335e`. The app, proxy, and headless implementations still retain their Phase 0 production owners; Phase 1 establishes package boundaries and future Core contracts only.
 
 ## Current source tree shape
 
@@ -42,11 +42,12 @@ Sources/
       VCS/                       # git/VCS substrate
       WorkspaceContext/          # context store, indexing, path lookup, slices, search, token accounting
     ThirdParty/                  # vendored SwiftPCRE2 wrapper
-  RepoPromptCore/               # enforced UI-independent contracts, workspace policy helpers, and narrow MCP transport values
+  RepoPromptCore/               # Foundation-only neutral contracts and existing workspace policy helpers
   RepoPromptCoreMacOS/          # enforced macOS FSEvents, POSIX process, Keychain/signing, and peer-verification adapters
+  RepoPromptPOSIXSupport/       # package-internal shared descriptor/socket helpers for MCP and CoreMacOS
   RepoPromptSyntaxCBridge/      # narrow Tree-sitter declaration/linkage shim; owns grammar/scanner dependencies
   RepoPromptShared/
-    MCP/                         # shared app/CLI MCP bootstrap/control contracts; POSIX descriptor support is still present pending convergence
+    MCP/                         # Foundation-only app/CLI MCP bootstrap/control wire contracts
   RepoPromptHeadless/            # independent direct-stdio host, v1 profile/configuration, workspace runtime, and safe tool implementations
   RepoPromptMCP/                 # app-proxy MCP CLI implementation
   RepoPromptC/                   # C support target
@@ -66,11 +67,12 @@ Tests/
 Sources/
   RepoPromptCore/                # UI-independent contracts, workspace policy helpers, and narrow MCP transport values
   RepoPromptCoreMacOS/           # Apple/Darwin adapter implementations
+  RepoPromptPOSIXSupport/        # shared POSIX descriptor/socket implementation support
   RepoPromptSyntaxCBridge/       # narrow Tree-sitter declaration shim
   RepoPromptHeadless/            # landed independent direct-stdio runtime; not yet a shared-Core consumer
 ```
 
-`RepoPromptCore`, `RepoPromptCoreMacOS`, and `RepoPromptSyntaxCBridge` are currently SwiftPM library products/targets; removing their public products is a later convergence phase. `RepoPromptHeadless` is an executable target with a separate v1 workspace/tool stack. `Scripts/core_boundary_guardrails.sh` now fails on forbidden imports, embedded-app policy references, missing roots, and accidental standalone packaging references. The app-wide Objective-C bridging-header flags are removed; the syntax shim owns grammar and scanner-support linkage.
+SwiftPM advertises only the `RepoPrompt`, `repoprompt-mcp`, and `repoprompt-headless` executable products. `RepoPromptCore`, `RepoPromptCoreMacOS`, `RepoPromptPOSIXSupport`, and `RepoPromptSyntaxCBridge` are package-internal targets. `RepoPromptHeadless` still has a separate v1 workspace/tool stack. Guardrails enforce Foundation-only Shared/Core contracts, single-source POSIX support, importer-backed native dependencies, and executable-only products.
 
 The bounded split intentionally leaves the embedded session host and its workspace-context runtime closure under `Sources/RepoPrompt` for now. Moving `RepoPromptCoreHost` requires the deferred filesystem publication conversion from Combine to bounded async streams, neutral diagnostics instead of `os`/`UserDefaults`, explicit state-directory injection for code-map/partition caches, and app-model decoupling in `WorkspaceRepository` and `WorkspaceSessionController`. Do not bypass those blockers by moving app policy into `RepoPromptCore`.
 
@@ -101,6 +103,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - Keep Tree-sitter C declarations in the narrow `Sources/RepoPromptSyntaxCBridge` shim. Do not restore target-wide app bridging-header flags.
 - Put new reusable platform contracts and workspace policy helpers in `Sources/RepoPromptCore`; keep embedded-app policy and mixed runtime closures app-owned until they satisfy the enforced core guardrail.
 - Put Apple/Darwin adapter implementations in `Sources/RepoPromptCoreMacOS`; core must never import that module.
+- Put descriptor/socket helpers shared by the app proxy, proxy CLI, and CoreMacOS in `Sources/RepoPromptPOSIXSupport`; never place them in `RepoPromptShared` or expose them from Core contracts.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
@@ -111,7 +114,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app-proxy CLI-only implementation code goes under `Sources/RepoPromptMCP`.
 - New standalone direct-stdio/profile adapter code goes under `Sources/RepoPromptHeadless`; do not add a second implementation of canonical workspace/search/codemap/selection/prompt behavior while convergence is in progress.
 - New test doubles, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under the matching test target. Cross-target convergence fixtures belong under `Tests/SharedRuntimeConvergenceFixtures`, never under production sources.
-- Intentionally promoted durable characterization records belong under `docs/characterization`. Each tracked record must remain individually named in the source-layout guardrail allowlist; this directory is not a general home for agent working notes. The current promoted record is `docs/characterization/shared-runtime-phase0-2026-06-05.md`.
+- Intentionally promoted durable characterization records belong under `docs/characterization`. This directory is not a general home for agent working notes. Current records are the frozen Phase 0 baseline and `shared-runtime-phase1-2026-06-05.md`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
@@ -165,9 +168,9 @@ The source-layout guardrail verifies:
 - `MCPControlMessages.swift` exists only at `Sources/RepoPromptShared/MCP/MCPControlMessages.swift`;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - tracked contributor-facing documentation remains within the explicit file allowlist, including individually promoted durable characterization records;
-- each Item 5 moved contract/adapter file is single-sourced only under its narrow `RepoPromptCore` or `RepoPromptCoreMacOS` owner, so app-local compatibility copies cannot return;
+- each moved contract/adapter file is single-sourced under its narrow `RepoPromptCore`, `RepoPromptCoreMacOS`, or `RepoPromptPOSIXSupport` owner;
 - the narrow `RepoPromptSyntaxCBridge` target contains exactly its declaration header and anchor C file, exposes exactly the curated fourteen Tree-sitter declarations, owns the exact grammar/scanner linkage set, and replaces the retired app-wide bridging header;
-- the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired only through `RepoPromptSyntaxCBridge`, preserves the pinned grammar products in `Package.swift` and `Package.resolved`, keeps grammar products off the app target, requires the temporary core native-linkage umbrella, and keeps the retired local grammar directories absent;
+- the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired only through `RepoPromptSyntaxCBridge`, preserves the pinned grammar products in `Package.swift` and `Package.resolved`, keeps grammar products off the app target, and keeps the retired local grammar directories absent;
 - Agent/MCP runtime code does not depend on `WorkspaceFilesViewModel`, `FileViewModel`, or `FolderViewModel`;
 - removed native-tree/search artifact paths are not tracked again;
 - removed native-tree/search/eager-loading symbols such as `AgentFileTreeBottomPanelView`, `FileTreeViewWrapper`, `FileTreeViewController`, `NativeFileTree`, `SearchFileTreeViewModel`, `RootDescendantMaterialization`, `legacyMaterializedRootKeys`, `legacyMaterializeDescendantsRecursively`, and `legacyEager` are not referenced from app source;
@@ -177,8 +180,10 @@ The source-layout guardrail verifies:
 
 The enforced core-boundary guardrail rejects:
 
-- missing `Sources/RepoPromptCore`, `Sources/RepoPromptCoreMacOS`, or `Sources/RepoPromptSyntaxCBridge` roots;
+- missing `Sources/RepoPromptCore`, `Sources/RepoPromptCoreMacOS`, `Sources/RepoPromptPOSIXSupport`, `Sources/RepoPromptShared`, or `Sources/RepoPromptSyntaxCBridge` roots;
 - forbidden Apple UI/platform imports under `Sources/RepoPromptCore`;
+- non-Foundation imports or POSIX descriptor/socket ownership under `Sources/RepoPromptShared`;
+- Darwin/POSIX-backed types, raw accepted descriptors, or POSIX support imports in Core contracts;
 - app-owned runtime and embedded-app policy references under `Sources/RepoPromptCore`;
 - any accidental app-packaging reference to standalone `repoprompt-headless` / `rpce-headless` command names.
 

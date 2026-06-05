@@ -6,16 +6,10 @@ cd "$ROOT"
 
 CORE_ROOT="Sources/RepoPromptCore"
 MACOS_ROOT="Sources/RepoPromptCoreMacOS"
+POSIX_ROOT="Sources/RepoPromptPOSIXSupport"
+SHARED_ROOT="Sources/RepoPromptShared"
 SYNTAX_BRIDGE_ROOT="Sources/RepoPromptSyntaxCBridge"
 failures=0
-temporary_file=""
-
-cleanup() {
-  if [[ -n "$temporary_file" ]]; then
-    rm -f "$temporary_file"
-  fi
-}
-trap cleanup EXIT
 
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
@@ -43,36 +37,61 @@ report_matches() {
   fi
 }
 
-for required_root in "$CORE_ROOT" "$MACOS_ROOT" "$SYNTAX_BRIDGE_ROOT"; do
+swift_files_under() {
+  find "$1" -type f -name '*.swift' -print | sort
+}
+
+for required_root in "$CORE_ROOT" "$MACOS_ROOT" "$POSIX_ROOT" "$SHARED_ROOT" "$SYNTAX_BRIDGE_ROOT"; do
   if [[ ! -d "$required_root" ]]; then
-    fail "required Item 5 source root missing: $required_root"
+    fail "required boundary source root missing: $required_root"
   fi
 done
 
-if [[ -d "$CORE_ROOT" ]]; then
-  core_swift_files=()
-  temporary_file="$(mktemp "${TMPDIR:-/tmp}/repoprompt-core-boundary.XXXXXX")"
-  find "$CORE_ROOT" -type f -name '*.swift' -print0 > "$temporary_file"
-  while IFS= read -r -d '' file; do
-    core_swift_files+=("$file")
-  done < "$temporary_file"
-
-  if [[ "${#core_swift_files[@]}" -eq 0 ]]; then
-    fail "$CORE_ROOT contains no Swift files"
-  else
-    report_matches \
-      "forbidden Apple UI/platform import found under $CORE_ROOT" \
-      '^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import([[:space:]]+(class|struct|enum|protocol|func|var|let|typealias))?[[:space:]]+(AppKit|SwiftUI|Cocoa|Sparkle|KeyboardShortcuts|CoreServices|Security|Darwin|OSLog|os)([.]|[[:space:]]|$)' \
-      "${core_swift_files[@]}"
-    report_matches \
-      "app-owned runtime or embedded-policy reference found under $CORE_ROOT" \
-      '(^|[^[:alnum:]_])(WindowState|WindowStatesManager|NSApplication|NSWorkspace|SecureKeyValueStorageFactory|MacOSFSEventsWatcherFactory)([^[:alnum:]_]|$)|Bundle[.]main|UserDefaults[.]standard|applicationSupportDirectory' \
-      "${core_swift_files[@]}"
+shared_swift_files=()
+while IFS= read -r file; do
+  shared_swift_files+=("$file")
+done < <(swift_files_under "$SHARED_ROOT")
+if [[ "${#shared_swift_files[@]}" -eq 0 ]]; then
+  fail "$SHARED_ROOT contains no Swift files"
+else
+  shared_non_foundation_imports="$(grep -n -E '^[[:space:]]*import[[:space:]]+' "${shared_swift_files[@]}" | grep -v -E 'import[[:space:]]+Foundation$' || true)"
+  if [[ -n "$shared_non_foundation_imports" ]]; then
+    fail "$SHARED_ROOT must be Foundation-only"
+    printf '%s\n' "$shared_non_foundation_imports" >&2
   fi
+  report_matches \
+    "POSIX descriptor/socket ownership leaked back into $SHARED_ROOT" \
+    'POSIXDescriptor|fcntl|FD_CLOEXEC|SHUT_RDWR|sockaddr|Darwin|Glibc|SystemPackage' \
+    "${shared_swift_files[@]}"
+fi
+
+core_swift_files=()
+while IFS= read -r file; do
+  core_swift_files+=("$file")
+done < <(swift_files_under "$CORE_ROOT")
+if [[ "${#core_swift_files[@]}" -eq 0 ]]; then
+  fail "$CORE_ROOT contains no Swift files"
+else
+  report_matches \
+    "forbidden Apple UI/native import found under $CORE_ROOT" \
+    '^[[:space:]]*(@[[:alnum:]_]+[[:space:]]+)*import([[:space:]]+(class|struct|enum|protocol|func|var|let|typealias))?[[:space:]]+(AppKit|SwiftUI|Cocoa|Sparkle|KeyboardShortcuts|CoreServices|Security|Darwin|Glibc|SystemPackage|OSLog|os|RepoPromptShared|RepoPromptPOSIXSupport|RepoPromptCoreMacOS)([.]|[[:space:]]|$)' \
+    "${core_swift_files[@]}"
+  report_matches \
+    "app-owned runtime or embedded-policy reference found under $CORE_ROOT" \
+    '(^|[^[:alnum:]_])(WindowState|WindowStatesManager|NSApplication|NSWorkspace|SecureKeyValueStorageFactory|MacOSFSEventsWatcherFactory)([^[:alnum:]_]|$)|Bundle[.]main|UserDefaults[.]standard|applicationSupportDirectory' \
+    "${core_swift_files[@]}"
+  report_matches \
+    "Darwin-backed descriptor/socket type leaked into Core contracts" \
+    'POSIXDescriptorConfigurationError|connectedFileDescriptor|sockaddr|FileDescriptor|Darwin[.]|Glibc[.]' \
+    "${core_swift_files[@]}"
+fi
+
+if [[ ! -f "$POSIX_ROOT/Descriptors/POSIXDescriptorSupport.swift" ]]; then
+  fail "POSIX descriptor support must be single-sourced under $POSIX_ROOT/Descriptors"
 fi
 
 report_matches \
-  "app packaging mentions a standalone headless command; keep Items 6-7 independently packaged" \
+  "app packaging mentions a standalone headless command; keep headless independently packaged" \
   'repoprompt-headless|rpce-headless' \
   Scripts/package_app.sh
 
@@ -81,4 +100,4 @@ if [[ "$failures" -ne 0 ]]; then
   exit 1
 fi
 
-printf 'OK: enforced core boundary guardrails passed.\n'
+printf 'OK: enforced Core/Shared/POSIX boundary guardrails passed.\n'
