@@ -6,6 +6,8 @@ struct WindowStateComposition {
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    let workspaceObservation: WorkspaceSessionObservationBridge
+    let selectionForwarder: WorkspaceSessionSelectionForwarder
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
     let promptManager: PromptViewModel
@@ -59,15 +61,24 @@ enum WindowStateCompositionFactory {
             settingsManager: settingsManager
         )
 
-        // 7) Create the workspace manager
+        // 7) Create the workspace adapter over the authoritative Core session controller.
+        let workspaceObservation = WorkspaceSessionObservationBridge(
+            controller: coreSession.workspaceSessionController
+        )
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
-            workspaceRepository: coreContainer.workspaceRepository
+            workspaceRepository: coreContainer.workspaceRepository,
+            sessionController: coreSession.workspaceSessionController,
+            workspaceObservation: workspaceObservation
         )
-        coreSession.workspaceSessionController.attach(backing: workspaceManager)
         let selectionCoordinator = coreSession.selectionCoordinator
+        let selectionForwarder = WorkspaceSessionSelectionForwarder(
+            controller: coreSession.workspaceSessionController,
+            manager: workspaceManager
+        )
+        selectionCoordinator.attachWorkspaceManager(selectionForwarder)
         workspaceFilesViewModel.attachSelectionCoordinator(selectionCoordinator)
         workspaceManager.attachSelectionCoordinator(selectionCoordinator)
         promptManager.attachSelectionCoordinator(selectionCoordinator)
@@ -180,6 +191,8 @@ enum WindowStateCompositionFactory {
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
+                workspaceObservation: workspaceObservation,
+                selectionForwarder: selectionForwarder,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,
@@ -201,6 +214,8 @@ enum WindowStateCompositionFactory {
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
+                workspaceObservation: workspaceObservation,
+                selectionForwarder: selectionForwarder,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,

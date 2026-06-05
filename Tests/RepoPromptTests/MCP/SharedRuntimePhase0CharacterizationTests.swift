@@ -3,6 +3,7 @@ import Foundation
 import MCP
 import Ontology
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -25,7 +26,8 @@ final class SharedRuntimePhase0CharacterizationTests: XCTestCase {
         let routing = WindowRoutingService(
             windowStates: WindowStatesManager.shared,
             networkMgr: ServerNetworkManager.shared,
-            serviceRegistry: registry
+            serviceRegistry: registry,
+            workspaceRepository: RepoPromptAppCoreContainer.shared.workspaceRepository
         )
 
         do {
@@ -73,9 +75,16 @@ final class SharedRuntimePhase0CharacterizationTests: XCTestCase {
         let beforeWorkspace = try Data(contentsOf: workspaceURL)
         let beforeIndex = try Data(contentsOf: indexURL)
 
-        let repository = WorkspaceRepository(rootProvider: { temporaryRoot })
-        let workspaces = await repository.loadWorkspaceSnapshotFromDisk()
-        let workspace = try XCTUnwrap(workspaces.only)
+        let codec = EmbeddedWorkspaceCodecV1()
+        let writer = WorkspacePersistenceWriter(codec: codec)
+        let repository = WorkspaceRepository(
+            rootProvider: Phase0WorkspaceRootProvider(root: temporaryRoot),
+            codec: codec,
+            writer: writer,
+            migrationService: NoopWorkspaceLegacyMigrationService()
+        )
+        let inventory = await repository.loadInventory()
+        let workspace = try XCTUnwrap(inventory.workspaces.only)
         let tab = try XCTUnwrap(workspace.composeTabs.only)
 
         XCTAssertEqual(workspace.id.uuidString, "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA")
@@ -92,7 +101,7 @@ final class SharedRuntimePhase0CharacterizationTests: XCTestCase {
             LineRange(start: 2, end: 4, description: "phase zero slice")
         ])
         XCTAssertFalse(tab.selection.codemapAutoEnabled)
-        XCTAssertFalse(workspace.normalizationRequiresSave)
+        XCTAssertFalse(try XCTUnwrap(inventory.decodeResults[workspace.id]).requiresRewrite)
         XCTAssertEqual(try Data(contentsOf: workspaceURL), beforeWorkspace)
         XCTAssertEqual(try Data(contentsOf: indexURL), beforeIndex)
     }
@@ -249,6 +258,14 @@ final class SharedRuntimePhase0CharacterizationTests: XCTestCase {
     private static func optionalAny(_ value: (some Any)?) -> Any {
         if let value { return value }
         return NSNull()
+    }
+}
+
+private struct Phase0WorkspaceRootProvider: WorkspaceRepositoryRootProviding {
+    let root: URL
+
+    func repositoryRoot() async -> URL {
+        root
     }
 }
 

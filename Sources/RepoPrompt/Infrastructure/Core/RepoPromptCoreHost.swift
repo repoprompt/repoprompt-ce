@@ -44,6 +44,7 @@ final class RepoPromptCoreSession {
     let sessionID: RepoPromptSessionID
     let routingSessionID: MCPRoutingSessionID
     let workspaceRepository: WorkspaceRepository
+    let workspacePersistenceWriter: WorkspacePersistenceWriter
     let workspaceAccessPolicy: any WorkspaceAccessPolicy
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
@@ -63,22 +64,25 @@ final class RepoPromptCoreSession {
         sessionID: RepoPromptSessionID = RepoPromptSessionID(),
         routingSessionID: MCPRoutingSessionID,
         workspaceRepository: WorkspaceRepository,
+        workspacePersistenceWriter: WorkspacePersistenceWriter,
         workspaceAccessPolicy: any WorkspaceAccessPolicy,
         platformDependencies: RepoPromptCorePlatformDependencies
     ) {
         self.sessionID = sessionID
         self.routingSessionID = routingSessionID
         self.workspaceRepository = workspaceRepository
+        self.workspacePersistenceWriter = workspacePersistenceWriter
         self.workspaceAccessPolicy = workspaceAccessPolicy
         workspaceFileContextStore = WorkspaceFileContextStore(
             fileSystemWatcherFactory: platformDependencies.fileSystemWatcherFactory
         )
         workspaceSearchService = WorkspaceSearchService()
-        workspaceSessionController = WorkspaceSessionController(accessPolicy: workspaceAccessPolicy)
-        selectionCoordinator = WorkspaceSelectionCoordinator(
-            workspaceManager: workspaceSessionController,
-            store: workspaceFileContextStore
+        workspaceSessionController = WorkspaceSessionController(
+            repository: workspaceRepository,
+            persistenceWriter: workspacePersistenceWriter,
+            accessPolicy: workspaceAccessPolicy
         )
+        selectionCoordinator = WorkspaceSelectionCoordinator(store: workspaceFileContextStore)
     }
 }
 
@@ -93,6 +97,7 @@ final class RepoPromptCoreHost {
     }
 
     let workspaceRepository: WorkspaceRepository
+    let workspacePersistenceWriter: WorkspacePersistenceWriter
     let workspaceAccessPolicy: any WorkspaceAccessPolicy
     let runtimeSessionRegistry: MCPRuntimeSessionRegistry
     let platformDependencies: RepoPromptCorePlatformDependencies
@@ -101,11 +106,13 @@ final class RepoPromptCoreHost {
 
     init(
         workspaceRepository: WorkspaceRepository,
+        workspacePersistenceWriter: WorkspacePersistenceWriter,
         workspaceAccessPolicy: any WorkspaceAccessPolicy,
         runtimeSessionRegistry: MCPRuntimeSessionRegistry,
         platformDependencies: RepoPromptCorePlatformDependencies
     ) {
         self.workspaceRepository = workspaceRepository
+        self.workspacePersistenceWriter = workspacePersistenceWriter
         self.workspaceAccessPolicy = workspaceAccessPolicy
         self.runtimeSessionRegistry = runtimeSessionRegistry
         self.platformDependencies = platformDependencies
@@ -115,6 +122,7 @@ final class RepoPromptCoreHost {
         let session = RepoPromptCoreSession(
             routingSessionID: routingSessionID,
             workspaceRepository: workspaceRepository,
+            workspacePersistenceWriter: workspacePersistenceWriter,
             workspaceAccessPolicy: workspaceAccessPolicy,
             platformDependencies: platformDependencies
         )
@@ -156,7 +164,6 @@ final class RepoPromptCoreHost {
         )
         activeSessions.removeValue(forKey: session.sessionID)
         createdSessions.removeValue(forKey: session.sessionID)
-        session.workspaceSessionController.detach()
         session.lifecycle = .removed
     }
 

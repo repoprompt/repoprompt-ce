@@ -26,3 +26,15 @@ package protocol WorkspaceLegacyMigrationServicing: Sendable {
     func assess(_ request: WorkspaceLegacyMigrationRequest) async throws -> WorkspaceLegacyMigrationAssessment
     func migrate(_ request: WorkspaceLegacyMigrationRequest) async throws -> WorkspaceLegacyMigrationResult
 }
+
+package struct NoopWorkspaceLegacyMigrationService: WorkspaceLegacyMigrationServicing {
+    package init() {}
+
+    package func assess(_: WorkspaceLegacyMigrationRequest) async throws -> WorkspaceLegacyMigrationAssessment {
+        .notRequired
+    }
+
+    package func migrate(_: WorkspaceLegacyMigrationRequest) async throws -> WorkspaceLegacyMigrationResult {
+        .notRequired
+    }
+}

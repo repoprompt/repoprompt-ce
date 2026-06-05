@@ -1004,8 +1004,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             ServiceRegistry.unregister(contextA.catalogService)
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
-            contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
-            contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
+            contextB.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == contextB.workspaceID }
+            }
+            contextA.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == contextA.workspaceID }
+            }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
             if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
@@ -1058,7 +1062,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]
             configuredWorkspace.activeComposeTabID = tabID
-            window.workspaceManager.workspaces.append(configuredWorkspace)
+            window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.append(configuredWorkspace)
+            }
             let rootRecord = try await window.workspaceFileContextStore.loadRoot(path: rootURL.path)
             let exactHit = await WorkspaceReadableFileService(store: window.workspaceFileContextStore)
                 .resolveExactAbsoluteWorkspaceCatalogHit(fileURL.path, rootScope: .visibleWorkspace)
@@ -1084,7 +1090,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
                 return (existing, false)
             }
-            let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+            let service = WindowRoutingService(
+                windowStates: .shared,
+                networkMgr: .shared,
+                workspaceRepository: RepoPromptAppCoreContainer.shared.workspaceRepository
+            )
             for _ in 0 ..< 100 {
                 let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
                 let names = await service.tools.map(\.name)
@@ -1100,7 +1110,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private static func cleanupContext(_ context: ContextFixture) async {
             ServiceRegistry.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
-            context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
+            context.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == context.workspaceID }
+            }
             try? FileManager.default.removeItem(at: context.rootURL)
         }
     }

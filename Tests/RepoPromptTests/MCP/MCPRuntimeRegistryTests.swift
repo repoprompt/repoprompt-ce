@@ -8,17 +8,20 @@ import XCTest
 final class MCPRuntimeSessionRegistryTests: XCTestCase {
     func testPendingEnableInsertionOrderDrainingAndRetirement() {
         let registry = MCPRuntimeSessionRegistry()
-        let repository = WorkspaceRepository()
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
+        let repository = graph.repository
         let policy = UnrestrictedWorkspaceAccessPolicy()
         let first = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 1),
             workspaceRepository: repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
         let second = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 2),
             workspaceRepository: repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
@@ -50,17 +53,20 @@ final class MCPRuntimeSessionRegistryTests: XCTestCase {
 
     func testDuplicateRoutingIDCannotReplaceOrDrainOwningSession() {
         let registry = MCPRuntimeSessionRegistry()
-        let repository = WorkspaceRepository()
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
+        let repository = graph.repository
         let policy = UnrestrictedWorkspaceAccessPolicy()
         let owner = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 7),
             workspaceRepository: repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
         let duplicate = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 7),
             workspaceRepository: repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: policy,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )

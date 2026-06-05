@@ -1,117 +1,16 @@
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
-final class WorkspaceSelectionPersistenceTests: XCTestCase {
-    override func tearDown() async throws {
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
-        try await super.tearDown()
-    }
-
-    func testDiskWriterPreservesNewerSelectionRevisionAgainstLaterStalePayload() async throws {
+final class WorkspaceSelectionPersistenceAppDiagnosticsTests: XCTestCase {
+    func testCoreWriterDiagnosticsBridgePreservesDurabilityAttributionWithoutPaths() async throws {
         let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WorkspaceSelectionPersistenceTests-")
+            .appendingPathComponent("WorkspaceSelectionPersistenceAppDiagnosticsTests-")
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
         let url = tempDir.appendingPathComponent("workspace.json")
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
-
-        let workspaceID = UUID()
-        let tabID = UUID()
-        let correct = Self.workspace(
-            id: workspaceID,
-            tabID: tabID,
-            selection: Self.selection(count: 7),
-            dateModified: Date(timeIntervalSince1970: 100),
-            promptText: "correct"
-        )
-        let correctData = try JSONEncoder().encode(correct)
-        let correctMetadata = WorkspaceManagerViewModel.metadata(
-            for: correct,
-            source: "test.correctSelection",
-            activeSelectionRevision: 1
-        )
-
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(data: correctData, url: url, metadata: correctMetadata)
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
-
-        let stale = Self.workspace(
-            id: workspaceID,
-            tabID: tabID,
-            selection: Self.selection(count: 15, includeSlices: true),
-            dateModified: Date(timeIntervalSince1970: 200),
-            promptText: "stale-non-selection-field"
-        )
-        let staleData = try JSONEncoder().encode(stale)
-        let staleMetadata = WorkspaceManagerViewModel.metadata(
-            for: stale,
-            source: "test.staleSelection",
-            activeSelectionRevision: 0
-        )
-
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(data: staleData, url: url, metadata: staleMetadata)
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
-
-        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
-        let activeSelection = try XCTUnwrap(decoded.composeTabs.first(where: { $0.id == tabID })?.selection)
-        XCTAssertEqual(activeSelection, correct.composeTabs[0].selection)
-        XCTAssertEqual(decoded.composeTabs[0].promptText, "stale-non-selection-field")
-    }
-
-    func testDiskWriterMergesNewerSelectionIntoNewerDiskInsteadOfSkipping() async throws {
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WorkspaceSelectionPersistenceTests-")
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-        let url = tempDir.appendingPathComponent("workspace.json")
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
-
-        let workspaceID = UUID()
-        let tabID = UUID()
-        let staleDisk = Self.workspace(
-            id: workspaceID,
-            tabID: tabID,
-            selection: Self.selection(count: 15, includeSlices: true),
-            dateModified: Date(timeIntervalSince1970: 300),
-            promptText: "disk-field"
-        )
-        try JSONEncoder().encode(staleDisk).write(to: url, options: .atomic)
-
-        let incoming = Self.workspace(
-            id: workspaceID,
-            tabID: tabID,
-            selection: Self.selection(count: 7),
-            dateModified: Date(timeIntervalSince1970: 200),
-            promptText: "incoming-field"
-        )
-        let metadata = WorkspaceManagerViewModel.metadata(
-            for: incoming,
-            source: "test.newerSelectionOlderPayload",
-            activeSelectionRevision: 2
-        )
-
-        try await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(
-            data: JSONEncoder().encode(incoming),
-            url: url,
-            metadata: metadata
-        )
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
-
-        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
-        XCTAssertEqual(decoded.composeTabs[0].selection, incoming.composeTabs[0].selection)
-        XCTAssertEqual(decoded.composeTabs[0].promptText, "disk-field")
-    }
-
-    func testDiskWriterFlushAndAtomicWriteTelemetryCarryDurabilityAttributionWithoutPaths() async throws {
-        let tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WorkspaceSelectionPersistenceTests-")
-            .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDir) }
-        let url = tempDir.appendingPathComponent("workspace.json")
-        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
-        await writer.removeAllForTesting()
+        let writer = WorkspacePersistenceWriter(diagnostics: EmbeddedWorkspaceRepositoryDiagnosticsAdapter())
         defer { EditFlowPerf.resetDebugCaptureForTesting() }
 
         switch EditFlowPerf.beginDebugCapture(label: "workspace-durability", maxSamples: 100) {
@@ -128,16 +27,16 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
             await gate.markStartedAndWaitForRelease()
         }
 
-        await EditFlowPerf.$currentLifecycleCorrelation.withValue(firstCorrelation) {
+        _ = await EditFlowPerf.$currentLifecycleCorrelation.withValue(firstCorrelation) {
             await writer.enqueue(data: Data("first durable payload".utf8), url: url)
         }
         await gate.waitUntilStarted()
-        await EditFlowPerf.$currentLifecycleCorrelation.withValue(secondCorrelation) {
+        let secondReceipt = await EditFlowPerf.$currentLifecycleCorrelation.withValue(secondCorrelation) {
             await writer.enqueue(data: Data("second durable payload".utf8), url: url)
         }
         let flushTask = Task {
             await EditFlowPerf.$currentLifecycleCorrelation.withValue(secondCorrelation) {
-                await writer.flush(url: url)
+                _ = await writer.flush(secondReceipt)
             }
             await flushFinished.mark()
         }

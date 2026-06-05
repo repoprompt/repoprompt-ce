@@ -6,8 +6,10 @@ import XCTest
 final class RepoPromptCoreHostLifecycleTests: XCTestCase {
     func testSessionLifecycleActivatesDrainsAndRetiresRoutingID() {
         let registry = MCPRuntimeSessionRegistry()
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
         let host = RepoPromptCoreHost(
-            workspaceRepository: WorkspaceRepository(),
+            workspaceRepository: graph.repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
             runtimeSessionRegistry: registry,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
@@ -38,8 +40,10 @@ final class RepoPromptCoreHostLifecycleTests: XCTestCase {
 
     func testDuplicateRoutingIDActivationIsRejectedAndCannotTeardownOwner() {
         let registry = MCPRuntimeSessionRegistry()
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
         let host = RepoPromptCoreHost(
-            workspaceRepository: WorkspaceRepository(),
+            workspaceRepository: graph.repository,
+            workspacePersistenceWriter: graph.writer,
             workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
             runtimeSessionRegistry: registry,
             platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
@@ -68,7 +72,12 @@ final class RepoPromptCoreHostLifecycleTests: XCTestCase {
     }
 
     func testDetachedWorkspaceSessionControllerReturnsNoBindingCandidates() {
-        let controller = WorkspaceSessionController(accessPolicy: UnrestrictedWorkspaceAccessPolicy())
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
+        let controller = WorkspaceSessionController(
+            repository: graph.repository,
+            persistenceWriter: graph.writer,
+            accessPolicy: UnrestrictedWorkspaceAccessPolicy()
+        )
 
         XCTAssertNil(controller.activeWorkspace)
         XCTAssertNil(controller.bindingCandidate(forContextID: UUID()))

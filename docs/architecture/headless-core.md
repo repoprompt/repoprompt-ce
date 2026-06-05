@@ -1,6 +1,6 @@
 # Headless Core Architecture Lock
 
-Status: Phase 1 dependency boundaries implemented from frozen checkpoint `48a335e`, 2026-06-05. Shared is Foundation-only, POSIX helpers have an internal owner, Core exposes neutral future contracts and an opaque app-proxy lease, and internal targets are no longer public products. The mature app runtime has not moved into Core and headless still owns a parallel workspace/search/selection/codemap/prompt/safe-tool implementation. Shared-runtime convergence is incomplete.
+Status: Phase 2 Slice 1 implemented from frozen checkpoint `7e686cf`, 2026-06-05. Shared remains Foundation-only; Core now owns the canonical app workspace value graph, app-v1 codec/repository, process-shared persistence writer, and `@MainActor` session authority. The app is the only production constructor/consumer. Headless source/tests remain byte-identical to the checkpoint and still own their parallel v1 runtime. Shared-runtime convergence remains incomplete until Slices 2 and 3.
 
 ## Locked target graph
 
@@ -26,7 +26,7 @@ The current package graph contains bounded contract/adapter roots plus the stand
 
 | Reserved target or product | Reserved source root | Responsibility |
 | --- | --- | --- |
-| `RepoPromptCore` internal target | `Sources/RepoPromptCore` | Foundation-only platform/workspace/session/capability contracts and policy helpers; runtime-host promotion remains deferred below |
+| `RepoPromptCore` internal target | `Sources/RepoPromptCore` | Foundation-only platform/session/capability contracts plus canonical persisted workspace values, embedded app-v1 codec/repository, process-shared writer, and authoritative workspace session controller |
 | `RepoPromptCoreMacOS` internal target | `Sources/RepoPromptCoreMacOS` | FSEvents, POSIX process/descriptor-write, Keychain, code-signing inspection, peer verification, and macOS adapters |
 | `RepoPromptPOSIXSupport` internal target | `Sources/RepoPromptPOSIXSupport` | Shared close-on-exec and socket-shutdown helpers used by current POSIX importers |
 | `RepoPromptSyntaxCBridge` target | `Sources/RepoPromptSyntaxCBridge` | Narrow Tree-sitter declarations and grammar/scanner linkage without an app target-wide bridging header |
@@ -36,11 +36,21 @@ Existing app/proxy owners remain compatible during the bounded Item 5 split:
 
 | Existing target | Current responsibility retained during Item 0 |
 | --- | --- |
-| `RepoPrompt` | SwiftUI/AppKit shell plus deferred embedded runtime closure; imports `RepoPromptCore` and `RepoPromptCoreMacOS` explicitly |
+| `RepoPrompt` | SwiftUI/AppKit shell, sole constructor/consumer of the Slice 1 workspace runtime, and owner of observation, diagnostics, selection forwarding, file/context, MCP, and prompt adapters |
 | `RepoPromptMCP` / `repoprompt-mcp` | Existing app-bundled socket proxy, interactive client, and exec client |
 | `RepoPromptShared` | Foundation-only app/CLI MCP bootstrap and control wire contracts |
 
 Keep `platforms: [.macOS(.v14)]` during this migration. The first milestone is a standalone Swift-toolchain core boundary, not a Linux or Windows product claim.
+
+## Phase 2 Slice 1 workspace lock
+
+- `RepoPromptCore.WorkspaceSessionController` is the sole mutable owner of ordered workspaces, active workspace ID, index projection, dirty/save generations, selection revisions, and repository-path baselines.
+- `WorkspacePersistenceWriter` is one process-shared actor supplied by `RepoPromptAppCoreContainer` to every app session controller. It owns cross-window selection revision allocation and explicit-write serialization.
+- `EmbeddedWorkspaceCodecV1` preserves current app-v1 keys and normalization behavior. Decode/load is side-effect free; only explicit saves enter the writer. Canonical-v2 writes remain inactive.
+- `WorkspaceManagerViewModel` exposes read-only controller projections and routes every workspace/tab mutation through controller operations or bounded transactions.
+- Combine observation, UserDefaults/Application Support root policy, durability tracing, and the temporary Slice 1 selection forwarder remain app-owned adapters.
+- `Sources/RepoPromptHeadless/**` and `Tests/RepoPromptHeadlessTests/**` must remain byte-for-byte unchanged from `7e686cf`; headless does not construct the new runtime.
+- `Scripts/test_shared_runtime_phase2_slice1_boundaries.py` enforces the constructor, authority, no-read-rewrite, Core-import, frozen-fixture, and frozen-headless boundaries.
 
 ## Locked ownership rules
 

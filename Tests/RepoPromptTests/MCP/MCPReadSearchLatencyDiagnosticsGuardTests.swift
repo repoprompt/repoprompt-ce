@@ -1065,7 +1065,7 @@
             })
         }
 
-        func testReadFileAutoSelectionQueueAndDurabilityHooksRemainOwnedByCoordinatorAndDiskWriter() throws {
+        func testReadFileAutoSelectionQueueAndDurabilityHooksRemainOwnedByCoordinatorCoreWriterAndAppAdapter() throws {
             let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
             for hook in [
                 "responseEnqueue",
@@ -1081,11 +1081,23 @@
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
             XCTAssertTrue(viewModel.contains("Stage.ReadFile.AutoSelect.canonicalStoredCommit"))
 
-            let workspaceManager = try source("Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift")
-            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.flushWait"))
-            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.atomicWrite"))
+            let coreWriter = try source("Sources/RepoPromptCore/Workspaces/WorkspacePersistenceWriter.swift")
+            for event in [
+                "workspaceSave.flush.begin",
+                "workspaceSave.flush.end",
+                "workspaceSave.write.begin",
+                "workspaceSave.write.end"
+            ] {
+                XCTAssertTrue(coreWriter.contains(event), "Missing neutral Core durability event: \(event)")
+            }
+            let diagnosticsAdapter = try source(
+                "Sources/RepoPrompt/App/CoreAdapters/EmbeddedWorkspaceRepositoryDiagnosticsAdapter.swift"
+            )
+            XCTAssertTrue(diagnosticsAdapter.contains("Stage.WorkspaceDurability.flushWait"))
+            XCTAssertTrue(diagnosticsAdapter.contains("Stage.WorkspaceDurability.atomicWrite"))
             XCTAssertFalse(coordinator.contains("EditFlowPerf.Dimensions(path:"))
-            XCTAssertFalse(workspaceManager.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(coreWriter.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(diagnosticsAdapter.contains("EditFlowPerf.Dimensions(path:"))
         }
 
         func testReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle() throws {

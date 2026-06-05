@@ -156,7 +156,8 @@ final class WorkspaceRootSyncTests: XCTestCase {
         }
         """
 
-        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(payload.utf8))
+        let result = try EmbeddedWorkspaceCodecV1().decode(Data(payload.utf8))
+        let decoded = result.document
 
         XCTAssertEqual(decoded.composeTabs.count, 1)
         XCTAssertEqual(decoded.activeComposeTabID, decoded.composeTabs[0].id)
@@ -164,7 +165,7 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertEqual(decoded.composeTabs[0].expandedFolders, [])
         XCTAssertEqual(decoded.composeTabs[0].contextOverrides, ContextBuilderOverrides())
         XCTAssertEqual(decoded.composeTabs[0].contextBuilder.instructions, "")
-        XCTAssertTrue(decoded.normalizationRequiresSave)
+        XCTAssertTrue(result.requiresRewrite)
 
         let encoded = try String(data: JSONEncoder().encode(decoded), encoding: .utf8) ?? ""
         XCTAssertFalse(encoded.contains("workingFilePaths"), encoded)

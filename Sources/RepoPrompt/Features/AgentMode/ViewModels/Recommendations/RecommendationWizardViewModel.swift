@@ -240,7 +240,7 @@ final class RecommendationWizardViewModel: ObservableObject {
     /// Subscribe to changes that affect recommendations.
     private func setupSubscriptions() {
         // Subscribe to workspace changes - new workspace should start at intro
-        workspaceManager?.$activeWorkspaceID
+        workspaceManager?.workspaceObservation.$activeWorkspaceID
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.refresh(navigation: .resetToIntro)

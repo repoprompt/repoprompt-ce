@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptCore
 import SwiftUI
 
 #if DEBUG
@@ -340,7 +341,7 @@ final class WindowRoutingService: Service {
         windowStates: WindowStatesManager,
         networkMgr: ServerNetworkManager,
         serviceRegistry: MCPServiceRegistry? = nil,
-        workspaceRepository: WorkspaceRepository = WorkspaceRepository()
+        workspaceRepository: WorkspaceRepository
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr

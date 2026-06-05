@@ -28,13 +28,6 @@ extension CopyPresetKind: Codable {
     }
 }
 
-/// How to include git diff in the copy
-enum GitInclusion: String, Codable, CaseIterable {
-    case none
-    case selected
-    case complete
-}
-
 // MARK: - Copy Preset Model
 
 /// Copy preset describes behavior at a high level.

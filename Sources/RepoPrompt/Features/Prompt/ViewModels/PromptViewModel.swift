@@ -2,17 +2,6 @@ import Combine
 import Foundation
 import SwiftUI
 
-enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
-    case auto = "Auto"
-    case files = "Full"
-    case selected = "Selected"
-    case none = "None"
-
-    var id: String {
-        rawValue
-    }
-}
-
 /// Errors that can occur when publishing git diff artifacts
 enum GitArtifactPublishError: LocalizedError {
     case noActiveWorkspace
@@ -2327,17 +2316,17 @@ class PromptViewModel: ObservableObject {
         in manager: WorkspaceManagerViewModel,
         workspaceIndex index: Int
     ) {
-        guard
-            let activeID = manager.workspaces[index].activeComposeTabID,
-            let activeIdx = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == activeID })
-        else { return }
+        guard manager.workspaces.indices.contains(index) else { return }
+        let workspace = manager.workspaces[index]
+        guard let activeID = workspace.activeComposeTabID,
+              let activeTab = workspace.composeTabs.first(where: { $0.id == activeID }) else { return }
 
-        let currentName = manager.workspaces[index].composeTabs[activeIdx].name
-        let snapshot = manager.collectComposeTabSnapshot(
-            name: currentName,
-            base: manager.workspaces[index].composeTabs[activeIdx]
-        )
-        manager.workspaces[index].composeTabs[activeIdx] = snapshot
+        let snapshot = manager.collectComposeTabSnapshot(name: activeTab.name, base: activeTab)
+        manager.mutateComposeTab(
+            workspaceID: workspace.id,
+            tabID: activeID,
+            touchDateModified: false
+        ) { $0 = snapshot }
     }
 
     /// Flush pending editor state and snapshot the active tab before transitioning away.
@@ -2522,14 +2511,14 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        manager.workspaces[index].composeTabs.append(newTab)
-        manager.workspaces[index].activeComposeTabID = newTab.id
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, { workspace in
+            workspace.composeTabs.append(newTab)
+            workspace.activeComposeTabID = newTab.id
+        }) else { return }
         activeComposeTabID = newTab.id
         dirtyTabIDs.remove(newTab.id)
 
-        manager.markWorkspaceDirty()
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         await withComposeTabSwitching(targetTabID: newTab.id) {
             await manager.applyComposeTabState(newTab)
         }
@@ -2616,12 +2605,11 @@ class PromptViewModel: ObservableObject {
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
 
-        // Append but do NOT change activeComposeTabID
-        manager.workspaces[index].composeTabs.append(newTab)
-        // Keep existing active tab; just sync lists
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-
-        manager.markWorkspaceDirty()
+        // Append but do NOT change activeComposeTabID.
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.composeTabs.append(newTab)
+        }) else { return nil }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
         return newTab
     }
@@ -2639,11 +2627,12 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
-        manager.workspaces[index].activeComposeTabID = id
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.activeComposeTabID = id
+        }), let target = updatedWorkspace.composeTabs.first(where: { $0.id == id }) else { return }
         activeComposeTabID = id
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
 
         activeTabApplyTask?.cancel()
 
@@ -2663,14 +2652,13 @@ class PromptViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let manager = workspaceManager,
-              let workspace = manager.activeWorkspace,
-              let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-              let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == id }) else { return }
-        manager.workspaces[index].composeTabs[tabIndex].name = trimmed
-        manager.workspaces[index].composeTabs[tabIndex].lastModified = Date()
-        manager.markWorkspaceDirty()
+              let workspace = manager.activeWorkspace else { return }
+        guard manager.mutateComposeTab(workspaceID: workspace.id, tabID: id, {
+            $0.name = trimmed
+            $0.lastModified = Date()
+        }) != nil, let updatedWorkspace = manager.workspace(withID: workspace.id) else { return }
         manager.pollAndSaveState()
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
     }
 
     @MainActor
@@ -2715,16 +2703,12 @@ class PromptViewModel: ObservableObject {
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true
     ) async {
-        guard !ids.isEmpty else { return }
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard !ids.isEmpty,
+              let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace
         else { return }
+        let workspaceID = initialWorkspace.id
 
-        var tabs = manager.workspaces[index].composeTabs
-        let tabsBeforeClose = tabs
-        let originalCount = tabs.count
         var resolvedIDs = ids
         var stashedTabIDsToDelete: Set<UUID> = []
         if expandCascade, let composeTabCascadeResolver {
@@ -2735,8 +2719,9 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Identify which tabs will actually be removed
-        let tabsBeingClosed = resolvedIDs.intersection(Set(tabs.map(\.id)))
+        guard let workspaceBeforeClose = manager.workspace(withID: workspaceID) else { return }
+        let tabsBeforeClose = workspaceBeforeClose.composeTabs
+        let tabsBeingClosed = resolvedIDs.intersection(Set(tabsBeforeClose.map(\.id)))
         guard !tabsBeingClosed.isEmpty else {
             if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
                 await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
@@ -2744,13 +2729,6 @@ class PromptViewModel: ObservableObject {
             return
         }
 
-        let fallbackActiveID: UUID? = {
-            guard let previousActiveID = manager.workspaces[index].activeComposeTabID,
-                  tabsBeingClosed.contains(previousActiveID) else { return nil }
-            return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
-        }()
-
-        // Notify listeners BEFORE mutation so they can cancel running tasks
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
         #if DEBUG
@@ -2762,63 +2740,53 @@ class PromptViewModel: ObservableObject {
                 )
             }
         #endif
-
         if reason == .close {
             deleteGitDataForClosingTabs(tabIDs: tabsBeingClosed)
         }
 
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+        let refreshedTabs = refreshedWorkspace.composeTabs
+        let actualClosingIDs = resolvedIDs.intersection(Set(refreshedTabs.map(\.id)))
+        guard !actualClosingIDs.isEmpty else { return }
+        let previousActiveID = refreshedWorkspace.activeComposeTabID
+        let fallbackActiveID: UUID? = {
+            guard let previousActiveID, actualClosingIDs.contains(previousActiveID) else { return nil }
+            return adjacentTabID(
+                afterClosing: previousActiveID,
+                tabs: refreshedTabs,
+                closingIDs: actualClosingIDs
+            )
+        }()
+
+        var tabs = refreshedTabs.filter { !actualClosingIDs.contains($0.id) }
+        var stashedTabs = refreshedWorkspace.stashedTabs
         if reason == .stash {
-            let refreshedTabs = manager.workspaces[index].composeTabs
-            for tabID in tabsBeingClosed {
-                guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
-                let stashedTab = StashedTab(tab: refreshedTab)
-                if let existingIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
-                    manager.workspaces[index].stashedTabs[existingIndex] = stashedTab
+            for tab in refreshedTabs where actualClosingIDs.contains(tab.id) {
+                let stashed = StashedTab(tab: tab)
+                if let index = stashedTabs.firstIndex(where: { $0.tab.id == tab.id }) {
+                    stashedTabs[index] = stashed
                 } else {
-                    manager.workspaces[index].stashedTabs.append(stashedTab)
+                    stashedTabs.append(stashed)
                 }
             }
-            tabs = refreshedTabs
         }
-
-        tabs.removeAll { resolvedIDs.contains($0.id) }
-        guard tabs.count != originalCount else {
-            if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
-                await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
-            }
-            return
-        }
-
-        dirtyTabIDs.subtract(resolvedIDs)
-
-        let previousActiveID = manager.workspaces[index].activeComposeTabID
-        manager.workspaces[index].composeTabs = tabs
-
-        if tabs.isEmpty {
-            manager.workspaces[index].activeComposeTabID = nil
-            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
-            #if DEBUG
-                for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
-                        tabID: tabID,
-                        source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
-                        fields: ["reason": String(describing: reason)]
-                    )
-                }
-            #endif
-            manager.markWorkspaceDirty()
-            manager.pollAndSaveState()
-            if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
-                await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
-            }
-            return
-        }
+        dirtyTabIDs.subtract(actualClosingIDs)
 
         var newActiveID = previousActiveID
-        if let preferred = preferredActiveID, tabs.contains(where: { $0.id == preferred }) {
-            newActiveID = preferred
-        } else if let previousActiveID, resolvedIDs.contains(previousActiveID) {
+        if tabs.isEmpty {
+            guard let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                  let blankTab = makeComposeTab(
+                      for: .blank,
+                      explicitName: nil,
+                      workspaceIndex: workspaceIndex,
+                      manager: manager
+                  ) else { return }
+            tabs = [blankTab]
+            newActiveID = blankTab.id
+            dirtyTabIDs.remove(blankTab.id)
+        } else if let preferredActiveID, tabs.contains(where: { $0.id == preferredActiveID }) {
+            newActiveID = preferredActiveID
+        } else if let previousActiveID, actualClosingIDs.contains(previousActiveID) {
             if let fallbackActiveID, tabs.contains(where: { $0.id == fallbackActiveID }) {
                 newActiveID = fallbackActiveID
             } else {
@@ -2828,21 +2796,24 @@ class PromptViewModel: ObservableObject {
             newActiveID = tabs.first?.id
         }
 
-        manager.workspaces[index].activeComposeTabID = newActiveID
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.composeTabs = tabs
+            workspace.stashedTabs = stashedTabs
+            workspace.activeComposeTabID = newActiveID
+        }) else { return }
         activeComposeTabID = newActiveID
 
-        if newActiveID != previousActiveID,
-           let newActiveID,
+        if let newActiveID,
+           newActiveID != previousActiveID,
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
             await withComposeTabSwitching(targetTabID: newActiveID) {
                 await manager.applyComposeTabState(tab)
             }
         }
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         #if DEBUG
-            for tabID in tabsBeingClosed {
+            for tabID in actualClosingIDs {
                 AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
@@ -2850,7 +2821,6 @@ class PromptViewModel: ObservableObject {
                 )
             }
         #endif
-        manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
             await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
@@ -2885,27 +2855,6 @@ class PromptViewModel: ObservableObject {
         return nil
     }
 
-    @MainActor
-    private func appendReplacementBlankComposeTabIfNeeded(
-        manager: WorkspaceManagerViewModel,
-        workspaceIndex: Int
-    ) async {
-        guard manager.workspaces[workspaceIndex].composeTabs.isEmpty else { return }
-        guard let blankTab = makeComposeTab(
-            for: .blank,
-            explicitName: nil,
-            workspaceIndex: workspaceIndex,
-            manager: manager
-        ) else { return }
-        manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
-        activeComposeTabID = blankTab.id
-        dirtyTabIDs.remove(blankTab.id)
-        await withComposeTabSwitching(targetTabID: blankTab.id) {
-            await manager.applyComposeTabState(blankTab)
-        }
-    }
-
     /// Deletes git diff snapshots associated with closing tabs (fire-and-forget to avoid UI blocking).
     /// Uses a single batch scan instead of per-tab scans for efficiency.
     @MainActor
@@ -2937,9 +2886,10 @@ class PromptViewModel: ObservableObject {
         let clamped = max(0, min(destinationIndex, tabs.count - 1))
         let item = tabs.remove(at: sourceIndex)
         tabs.insert(item, at: clamped)
-        manager.workspaces[index].composeTabs = tabs
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.composeTabs = tabs
+        }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3096,48 +3046,41 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     func unstashTab(_ stashedTabID: UUID) async {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace,
+              initialWorkspace.stashedTabs.contains(where: { $0.id == stashedTabID }),
+              let initialIndex = manager.workspaces.firstIndex(where: { $0.id == initialWorkspace.id })
         else { return }
-
-        // Find the stashed tab
-        guard let stashIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.id == stashedTabID }) else { return }
+        let workspaceID = initialWorkspace.id
 
         guard await ensureCapacityForNewComposeTab(
             in: manager,
-            workspaceIndex: index,
+            workspaceIndex: initialIndex,
             policy: .uiInteractive,
-            excluding: manager.workspaces[index].activeComposeTabID
+            excluding: initialWorkspace.activeComposeTabID
         ) else { return }
+        guard let refreshedIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        flushAndSnapshotActiveTab(in: manager, workspaceIndex: refreshedIndex)
 
-        // Flush and snapshot current state before switching
-        flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
-
-        let stashedTab = manager.workspaces[index].stashedTabs[stashIndex]
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID),
+              let stashedTab = refreshedWorkspace.stashedTabs.first(where: { $0.id == stashedTabID })
+        else { return }
         var restoredTab = stashedTab.tab
-        guard !manager.workspaces[index].composeTabs.contains(where: { $0.id == restoredTab.id }) else {
-            return
-        }
+        guard !refreshedWorkspace.composeTabs.contains(where: { $0.id == restoredTab.id }) else { return }
         restoredTab.lastModified = Date()
 
-        // Remove from stashed tabs
-        manager.workspaces[index].stashedTabs.remove(at: stashIndex)
-
-        // Add to compose tabs
-        manager.workspaces[index].composeTabs.append(restoredTab)
-        manager.workspaces[index].activeComposeTabID = restoredTab.id
-        manager.workspaces[index].dateModified = Date()
-
-        // Reload state
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        currentStashedTabs = manager.workspaces[index].stashedTabs
-
-        // Switch to the restored tab
-        await switchComposeTab(restoredTab.id)
-
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.stashedTabs.removeAll { $0.id == stashedTabID }
+            workspace.composeTabs.append(restoredTab)
+            workspace.activeComposeTabID = restoredTab.id
+        }) else { return }
+        activeComposeTabID = restoredTab.id
+        dirtyTabIDs.remove(restoredTab.id)
+        loadComposeTabsFromWorkspace(updatedWorkspace)
+        currentStashedTabs = updatedWorkspace.stashedTabs
+        await withComposeTabSwitching(targetTabID: restoredTab.id) {
+            await manager.applyComposeTabState(restoredTab)
+        }
         manager.pollAndSaveState()
     }
 
@@ -3153,12 +3096,11 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     private func deleteStashedTabs(withIDs stashedTabIDs: Set<UUID>, expandCascade: Bool) async {
-        guard !stashedTabIDs.isEmpty else { return }
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard !stashedTabIDs.isEmpty,
+              let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace
         else { return }
+        let workspaceID = initialWorkspace.id
 
         var resolvedStashedTabIDs = stashedTabIDs
         var composeTabIDsToDelete: Set<UUID> = []
@@ -3167,71 +3109,80 @@ class PromptViewModel: ObservableObject {
             resolvedStashedTabIDs.formUnion(cascadePlan.stashedTabIDs)
             composeTabIDsToDelete.formUnion(cascadePlan.composeTabIDs)
         }
-        if !composeTabIDsToDelete.isEmpty {
-            let composeTabsBeforeDelete = manager.workspaces[index].composeTabs
-            let composeTabIDsBeingDeleted = composeTabIDsToDelete.intersection(Set(composeTabsBeforeDelete.map(\.id)))
+
+        if !composeTabIDsToDelete.isEmpty,
+           let workspaceBeforeDelete = manager.workspace(withID: workspaceID)
+        {
+            let tabsBeforeDelete = workspaceBeforeDelete.composeTabs
+            let composeTabIDsBeingDeleted = composeTabIDsToDelete.intersection(Set(tabsBeforeDelete.map(\.id)))
             if !composeTabIDsBeingDeleted.isEmpty {
-                let previousActiveID = manager.workspaces[index].activeComposeTabID
-                let fallbackActiveID: UUID? = {
-                    guard let previousActiveID,
-                          composeTabIDsBeingDeleted.contains(previousActiveID)
-                    else {
-                        return nil
-                    }
-                    return adjacentTabID(
-                        afterClosing: previousActiveID,
-                        tabs: composeTabsBeforeDelete,
-                        closingIDs: composeTabIDsBeingDeleted
-                    )
-                }()
                 await notifyComposeTabsWillClose(composeTabIDsBeingDeleted, reason: .close)
                 await cleanupMCPStateForClosingTabs(composeTabIDsBeingDeleted)
                 deleteGitDataForClosingTabs(tabIDs: composeTabIDsBeingDeleted)
-                var remainingComposeTabs = composeTabsBeforeDelete
-                remainingComposeTabs.removeAll { composeTabIDsBeingDeleted.contains($0.id) }
-                dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
-                manager.workspaces[index].composeTabs = remainingComposeTabs
-                if remainingComposeTabs.isEmpty {
-                    manager.workspaces[index].activeComposeTabID = nil
-                    await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-                } else {
-                    var newActiveID = previousActiveID
-                    if let previousActiveID,
-                       composeTabIDsBeingDeleted.contains(previousActiveID)
-                    {
-                        if let fallbackActiveID,
-                           remainingComposeTabs.contains(where: { $0.id == fallbackActiveID })
-                        {
-                            newActiveID = fallbackActiveID
-                        } else {
-                            newActiveID = remainingComposeTabs.last?.id ?? remainingComposeTabs.first?.id
-                        }
-                    } else if newActiveID == nil {
-                        newActiveID = remainingComposeTabs.first?.id
+
+                guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+                let actualIDs = composeTabIDsToDelete.intersection(Set(refreshedWorkspace.composeTabs.map(\.id)))
+                let previousActiveID = refreshedWorkspace.activeComposeTabID
+                let fallbackActiveID = previousActiveID.flatMap { activeID in
+                    actualIDs.contains(activeID)
+                        ? adjacentTabID(afterClosing: activeID, tabs: refreshedWorkspace.composeTabs, closingIDs: actualIDs)
+                        : nil
+                }
+                var remainingTabs = refreshedWorkspace.composeTabs.filter { !actualIDs.contains($0.id) }
+                dirtyTabIDs.subtract(actualIDs)
+                var newActiveID = previousActiveID
+                if remainingTabs.isEmpty {
+                    guard let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                          let blankTab = makeComposeTab(
+                              for: .blank,
+                              explicitName: nil,
+                              workspaceIndex: workspaceIndex,
+                              manager: manager
+                          ) else { return }
+                    remainingTabs = [blankTab]
+                    newActiveID = blankTab.id
+                    dirtyTabIDs.remove(blankTab.id)
+                } else if let previousActiveID, actualIDs.contains(previousActiveID) {
+                    if let fallbackActiveID, remainingTabs.contains(where: { $0.id == fallbackActiveID }) {
+                        newActiveID = fallbackActiveID
+                    } else {
+                        newActiveID = remainingTabs.last?.id ?? remainingTabs.first?.id
                     }
-                    manager.workspaces[index].activeComposeTabID = newActiveID
-                    activeComposeTabID = newActiveID
-                    if newActiveID != previousActiveID,
-                       let newActiveID,
-                       let tab = remainingComposeTabs.first(where: { $0.id == newActiveID })
-                    {
-                        await withComposeTabSwitching(targetTabID: newActiveID) {
-                            await manager.applyComposeTabState(tab)
-                        }
+                } else if newActiveID == nil {
+                    newActiveID = remainingTabs.first?.id
+                }
+                guard manager.mutateWorkspace(id: workspaceID, { workspace in
+                    workspace.composeTabs = remainingTabs
+                    workspace.activeComposeTabID = newActiveID
+                }) != nil else { return }
+                activeComposeTabID = newActiveID
+                if let newActiveID,
+                   newActiveID != previousActiveID,
+                   let tab = remainingTabs.first(where: { $0.id == newActiveID })
+                {
+                    await withComposeTabSwitching(targetTabID: newActiveID) {
+                        await manager.applyComposeTabState(tab)
                     }
                 }
             }
         }
 
-        let stashedTabsToDelete = manager.workspaces[index].stashedTabs.filter { resolvedStashedTabIDs.contains($0.id) }
-        guard !stashedTabsToDelete.isEmpty else { return }
-
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+        let stashedTabsToDelete = refreshedWorkspace.stashedTabs.filter { resolvedStashedTabIDs.contains($0.id) }
+        guard !stashedTabsToDelete.isEmpty else {
+            if let updatedWorkspace = manager.workspace(withID: workspaceID) {
+                loadComposeTabsFromWorkspace(updatedWorkspace)
+                manager.pollAndSaveState()
+            }
+            return
+        }
         let tabIDs = Set(stashedTabsToDelete.map(\.tab.id))
         await notifyComposeTabsWillClose(tabIDs, reason: .deleteStashed)
         deleteGitDataForClosingTabs(tabIDs: tabIDs)
-        manager.workspaces[index].stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
+        }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3265,17 +3216,14 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     func setComposeTabPinned(_ pinned: Bool, for tabID: UUID) {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-            let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == tabID })
-        else { return }
-        guard manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { return }
+        guard let manager = workspaceManager,
+              let workspace = manager.activeWorkspace,
+              workspace.composeTabs.first(where: { $0.id == tabID })?.isPinned != pinned else { return }
+        guard manager.mutateComposeTab(workspaceID: workspace.id, tabID: tabID, {
+            $0.isPinned = pinned
+        }) != nil, let updatedWorkspace = manager.workspace(withID: workspace.id) else { return }
 
-        manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3320,18 +3268,12 @@ class PromptViewModel: ObservableObject {
     func applyContextBuilderOverrides(_ overrides: ContextBuilderOverrides) async {
         guard let manager = workspaceManager,
               let workspace = manager.activeWorkspace,
-              let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
-        let activeTabID = manager.workspaces[workspaceIndex].activeComposeTabID ?? manager.workspaces[workspaceIndex].composeTabs.first?.id
-        guard
-            let tabID = activeTabID,
-            let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tabID })
+              let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id,
+              workspace.composeTabs.first(where: { $0.id == tabID })?.contextOverrides != overrides
         else { return }
-
-        guard manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides != overrides else { return }
-
-        manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides = overrides
-        manager.workspaces[workspaceIndex].dateModified = Date()
-        manager.markWorkspaceDirty()
+        manager.mutateComposeTab(workspaceID: workspace.id, tabID: tabID) {
+            $0.contextOverrides = overrides
+        }
     }
 
     @MainActor
@@ -3359,15 +3301,18 @@ class PromptViewModel: ObservableObject {
 
         await manager.createPreset(for: workspace, name: tab.name)
 
-        guard let presetIndex = manager.workspaces[index].presets.firstIndex(where: { $0.id == manager.workspaces[index].activePresetID }) else { return }
-        manager.workspaces[index].presets[presetIndex].capturesFileSelection = true
-        manager.workspaces[index].presets[presetIndex].capturesFileTreeExpansion = true
-        manager.workspaces[index].presets[presetIndex].capturesSelectedPrompts = true
-        manager.workspaces[index].presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
-        manager.workspaces[index].presets[presetIndex].expandedFolders = tab.expandedFolders
-        manager.workspaces[index].presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
-        manager.workspaces[index].presets[presetIndex].lastUpdated = Date()
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.workspace(withID: workspace.id),
+              let activePresetID = updatedWorkspace.activePresetID else { return }
+        manager.mutateWorkspace(id: workspace.id) { workspace in
+            guard let presetIndex = workspace.presets.firstIndex(where: { $0.id == activePresetID }) else { return }
+            workspace.presets[presetIndex].capturesFileSelection = true
+            workspace.presets[presetIndex].capturesFileTreeExpansion = true
+            workspace.presets[presetIndex].capturesSelectedPrompts = true
+            workspace.presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
+            workspace.presets[presetIndex].expandedFolders = tab.expandedFolders
+            workspace.presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
+            workspace.presets[presetIndex].lastUpdated = Date()
+        }
         manager.pollAndSaveState()
     }
 

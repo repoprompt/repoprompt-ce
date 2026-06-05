@@ -9,8 +9,6 @@ protocol WorkspaceSelectionHost: AnyObject {
     func updateComposeTabStoredOnly(_ tab: ComposeTabState)
 }
 
-extension WorkspaceManagerViewModel: WorkspaceSelectionHost {}
-
 /// Window-scoped coordinator that makes compose-tab `StoredSelection` the runtime
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
 @MainActor

@@ -673,14 +673,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     repoPaths: [rootURL.path],
                     ephemeral: true
                 )
-                let workspaceIndex = try XCTUnwrap(
-                    window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+                let configuredWorkspace = try XCTUnwrap(
+                    window.workspaceManager.mutateWorkspace(id: workspace.id) { workspace in
+                        workspace.composeTabs = [
+                            ComposeTabState(id: tabID, name: "Persistent Agent Mode MCP Read")
+                        ]
+                        workspace.activeComposeTabID = tabID
+                    }
                 )
-                window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                    ComposeTabState(id: tabID, name: "Persistent Agent Mode MCP Read")
-                ]
-                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
-                let configuredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
                 await window.workspaceManager.switchWorkspace(
                     to: configuredWorkspace,
                     saveState: false,
