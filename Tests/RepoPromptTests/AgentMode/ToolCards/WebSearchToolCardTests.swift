@@ -50,6 +50,70 @@ final class WebSearchToolCardTests: XCTestCase {
         XCTAssertEqual(webPresentation(toolName: "search", result: ["results": [["url": "https://example.com/result"]]])?.title, "Web Search")
     }
 
+    func testCodexSearchQueryGrammarRecognizesReadAndFindInPage() throws {
+        let read = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["query": "https://www.theguardian.com/europe"]
+        ))
+        XCTAssertEqual(read.title, "Read Web Page")
+        XCTAssertEqual(read.subtitle, "www.theguardian.com/europe")
+        XCTAssertEqual(read.op, "read_web_page")
+
+        let normalizedOnlyRead = try XCTUnwrap(AgentWebToolActionPresentation.classify(AgentWebToolActionInput(
+            rawToolName: "codex_web_search",
+            normalizedToolName: "search",
+            argsObject: ["query": "https://example.com/docs"],
+            resultObject: nil
+        )))
+        XCTAssertEqual(normalizedOnlyRead.title, "Read Web Page")
+        XCTAssertEqual(normalizedOnlyRead.subtitle, "example.com/docs")
+
+        let quotedFind = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["query": "'Netherlands' in https://www.theguardian.com/europe"]
+        ))
+        XCTAssertEqual(quotedFind.title, "Find In Page")
+        XCTAssertEqual(quotedFind.subtitle, "www.theguardian.com/europe • \"Netherlands\"")
+        XCTAssertEqual(quotedFind.op, "find_in_page")
+
+        let unquotedFind = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["query": "Netherlands in https://www.theguardian.com/europe"]
+        ))
+        XCTAssertEqual(unquotedFind.title, "Find In Page")
+        XCTAssertEqual(unquotedFind.subtitle, "www.theguardian.com/europe • \"Netherlands\"")
+
+        let curlyPossessiveFind = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["query": "teachers’ in https://example.com"]
+        ))
+        XCTAssertEqual(curlyPossessiveFind.title, "Find In Page")
+        XCTAssertEqual(curlyPossessiveFind.subtitle, "example.com • \"teachers’\"")
+
+        let straightPossessiveFind = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["query": "dogs' in https://example.com"]
+        ))
+        XCTAssertEqual(straightPossessiveFind.title, "Find In Page")
+        XCTAssertEqual(straightPossessiveFind.subtitle, "example.com • \"dogs'\"")
+    }
+
+    func testCodexSearchQueryGrammarKeepsOrdinaryURLMentionsAsWebSearchAndExcludesCodeSearch() throws {
+        for query in [
+            "Netherlands https://www.theguardian.com/europe",
+            "https://www.theguardian.com/europe Netherlands",
+            "site:https://www.theguardian.com/europe Netherlands",
+            "Netherlands in https://www.theguardian.com/europe latest news"
+        ] {
+            let presentation = try XCTUnwrap(webPresentation(toolName: "search", args: ["query": query]), query)
+            XCTAssertEqual(presentation.title, "Web Search", query)
+            XCTAssertEqual(presentation.op, "search", query)
+        }
+
+        XCTAssertNil(webPresentation(toolName: "file_search", args: ["query": "https://example.com/docs"]))
+        XCTAssertNil(webPresentation(toolName: "grep", args: ["query": "'needle' in https://example.com/docs"]))
+    }
+
     func testWebActionSubtitleFormatting() throws {
         XCTAssertEqual(webPresentation(toolName: "webfetch", args: ["url": "https://example.com"])?.subtitle, "example.com")
         XCTAssertEqual(webPresentation(toolName: "webfetch", args: ["url": "https://example.com/docs/api?token=secret#section"])?.subtitle, "example.com/docs/api")

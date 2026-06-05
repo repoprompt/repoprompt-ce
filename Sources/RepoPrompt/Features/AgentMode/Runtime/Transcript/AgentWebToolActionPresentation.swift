@@ -195,6 +195,9 @@ private enum AgentWebToolActionClassifier {
            argsSignals.findText == nil,
            !argsSignals.hasFindOperation
         {
+            if let codexQueryPresentation = codexSearchQueryPresentation(query: argsSignals.query) {
+                return codexQueryPresentation
+            }
             return webSearch(query: argsSignals.query)
         }
 
@@ -371,6 +374,53 @@ private enum AgentWebToolActionClassifier {
             subtitle: query.map { "\"\(compactText($0, maxLength: 80))\"" },
             op: "search"
         )
+    }
+
+    private static func codexSearchQueryPresentation(query: String?) -> AgentWebToolActionPresentation? {
+        guard let query else { return nil }
+        if let target = exactHTTPURLTarget(query) {
+            return readWebPage(target: target)
+        }
+        if let findQuery = codexFindInPageQuery(query) {
+            return findInPage(target: findQuery.target, findText: findQuery.findText)
+        }
+        return nil
+    }
+
+    private static func exactHTTPURLTarget(_ raw: String) -> Target? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.unicodeScalars.allSatisfy({ !compactTextSeparators.contains($0) }),
+              let subtitle = compactWebURLSubtitle(trimmed)
+        else { return nil }
+        return .url(trimmed, subtitle: subtitle)
+    }
+
+    private static func codexFindInPageQuery(_ raw: String) -> (findText: String, target: Target)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        for marker in [" in https://", " in http://"] {
+            guard let markerRange = trimmed.range(of: marker, options: [.caseInsensitive, .backwards]) else { continue }
+            let rawFindText = String(trimmed[..<markerRange.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let urlStart = trimmed.index(markerRange.lowerBound, offsetBy: 4)
+            let rawURL = String(trimmed[urlStart...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let target = exactHTTPURLTarget(rawURL),
+                  let findText = unquotedFindText(rawFindText)
+            else { continue }
+            return (findText, target)
+        }
+        return nil
+    }
+
+    private static func unquotedFindText(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let quotePairs: [(Character, Character)] = [("'", "'"), ("\"", "\""), ("“", "”"), ("‘", "’")]
+        for (opening, closing) in quotePairs where trimmed.first == opening && trimmed.last == closing && trimmed.count >= 2 {
+            let unquoted = String(trimmed.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+            return unquoted.isEmpty ? nil : unquoted
+        }
+        return trimmed
     }
 
     private static func readWebPage(target: Target?) -> AgentWebToolActionPresentation {
