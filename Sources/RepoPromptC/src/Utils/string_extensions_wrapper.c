@@ -16,6 +16,14 @@
 #include <errno.h>
 #include <limits.h>
 
+char* repo_strdup(const char *text) {
+	return text ? strdup(text) : NULL;
+}
+
+void repo_free(void *pointer) {
+	free(pointer);
+}
+
 /* MARK: - Levenshtein Distance */
 
 /**

@@ -8,7 +8,8 @@ final class RepoPromptCoreHostLifecycleTests: XCTestCase {
         let host = RepoPromptCoreHost(
             workspaceRepository: WorkspaceRepository(),
             workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
-            runtimeSessionRegistry: registry
+            runtimeSessionRegistry: registry,
+            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
         let handle = host.makeEmbeddedSession(routingSessionID: MCPRoutingSessionID(rawValue: 42))
 

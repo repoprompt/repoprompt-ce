@@ -52,7 +52,7 @@ final class SecureKeysService {
     ) async throws -> String? {
         do {
             return try secureStorage.get(for: identifier, accessMode: accessMode)
-        } catch KeychainService.KeychainError.itemNotFound {
+        } catch SecureStorageError.itemNotFound {
             return nil
         }
     }
@@ -80,7 +80,7 @@ final class SecureKeysService {
     ) throws -> String? {
         do {
             return try secureStorage.get(for: key, accessMode: accessMode)
-        } catch KeychainService.KeychainError.itemNotFound {
+        } catch SecureStorageError.itemNotFound {
             return nil
         }
     }

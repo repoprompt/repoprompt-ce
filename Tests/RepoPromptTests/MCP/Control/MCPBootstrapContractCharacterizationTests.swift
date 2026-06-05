@@ -68,6 +68,23 @@ final class MCPBootstrapContractCharacterizationTests: XCTestCase {
         XCTAssertEqual(MCPBootstrapErrorCode.clientCooldown.rawValue, "client_cooldown")
     }
 
+    func testHandshakeFallbackPIDRemainsDiagnosticOnly() {
+        let forgedPID = 4242
+        let identity = MCPPeerIdentity(socketObservedPID: nil, handshakeClaimedPID: forgedPID)
+
+        XCTAssertNil(identity.trustedPID)
+        XCTAssertEqual(identity.diagnosticPID, forgedPID)
+        XCTAssertEqual(identity.provenance, .handshakeFallback)
+    }
+
+    func testHandshakeClaimedPIDValidationRejectsOutOfRangeValues() {
+        XCTAssertFalse(MCPPeerIdentity.isValidHandshakeClaimedPID(0))
+        XCTAssertFalse(MCPPeerIdentity.isValidHandshakeClaimedPID(-1))
+        XCTAssertTrue(MCPPeerIdentity.isValidHandshakeClaimedPID(1))
+        XCTAssertTrue(MCPPeerIdentity.isValidHandshakeClaimedPID(Int(Int32.max)))
+        XCTAssertFalse(MCPPeerIdentity.isValidHandshakeClaimedPID(Int(Int32.max) + 1))
+    }
+
     func testBootstrapHandshakeDTOsAreSingleSourcedInRepoPromptShared() throws {
         let root = try RepoRoot.url()
         let sharedMessages = root.appendingPathComponent("Sources/RepoPromptShared/MCP/MCPBootstrapMessages.swift")

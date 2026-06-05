@@ -721,7 +721,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 let resolvedConnectionManager = try BootstrapSocketConnectionManager(
                     connectionID: connectionID,
                     sessionToken: sessionToken,
-                    clientPid: Int(getpid()),
+                    peerIdentity: MCPPeerIdentity(
+                        socketObservedPID: Int(getpid()),
+                        handshakeClaimedPID: Int(getpid())
+                    ),
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,

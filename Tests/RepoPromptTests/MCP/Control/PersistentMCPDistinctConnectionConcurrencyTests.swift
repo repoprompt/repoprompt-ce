@@ -1126,7 +1126,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let manager = try BootstrapSocketConnectionManager(
                 connectionID: connectionID,
                 sessionToken: sessionToken,
-                clientPid: Int(getpid()),
+                peerIdentity: MCPPeerIdentity(
+                    socketObservedPID: Int(getpid()),
+                    handshakeClaimedPID: Int(getpid())
+                ),
                 clientName: clientName,
                 purpose: .unknown,
                 codeMapsDisabled: false,

@@ -1,25 +1,6 @@
 import Foundation
 
-protocol SecureKeyValueStorageBackend: AnyObject {
-    var persistsValuesAcrossLaunches: Bool { get }
-
-    func save(
-        _ value: String,
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws
-
-    func get(
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws -> String
-
-    func delete(
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws
-}
-
+/// Embedded macOS app policy for selecting the secure-storage adapter.
 enum SecureKeyValueStorageFactory {
     private static let cachedBackend: SecureKeyValueStorageBackend = {
         #if DEBUG

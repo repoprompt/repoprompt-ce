@@ -299,17 +299,20 @@ actor ServerNetworkManager {
     nonisolated let runtimeSessionRegistry: MCPRuntimeSessionRegistry
     nonisolated let serviceRegistry: MCPServiceRegistry
     nonisolated let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
+    nonisolated let processAncestryInspector: any ProcessAncestryInspecting
     nonisolated let toolCatalogReadiness: MCPToolCatalogReadiness
     private static let repoCLIPrefix = "RepoPrompt CLI"
 
     init(
         runtimeSessionRegistry: MCPRuntimeSessionRegistry = MCPRuntimeSessionRegistry(),
         serviceRegistry: MCPServiceRegistry = MCPServiceRegistry(),
-        appSessionAdapters: RepoPromptAppSessionAdapterRegistry = .shared
+        appSessionAdapters: RepoPromptAppSessionAdapterRegistry = .shared,
+        processAncestryInspector: any ProcessAncestryInspecting = MacOSProcessAncestryInspector()
     ) {
         self.runtimeSessionRegistry = runtimeSessionRegistry
         self.serviceRegistry = serviceRegistry
         self.appSessionAdapters = appSessionAdapters
+        self.processAncestryInspector = processAncestryInspector
         toolCatalogReadiness = MCPToolCatalogReadiness(
             runtimeSessionRegistry: runtimeSessionRegistry,
             serviceRegistry: serviceRegistry,
@@ -2782,16 +2785,15 @@ actor ServerNetworkManager {
             #if DEBUG
                 print("[MCPStartup] calling BootstrapSocketServer.start socket=\(socketURL.path) generation=\(expectedLifecycleGeneration)")
             #endif
-            try await server.start { [weak self, weak server] clientFD, sessionToken, clientPid, clientName async -> BootstrapSocketServer.Admission in
+            try await server.start { [weak self, weak server] inboundConnection, sessionToken, clientName async -> BootstrapSocketServer.Admission in
                 guard let self, let server else {
                     return .reject(.rejected(reason: "Server unavailable", errorCode: "server_unavailable"))
                 }
                 return await handleBootstrapConnection(
                     sourceListener: server,
                     lifecycleGeneration: expectedLifecycleGeneration,
-                    clientFD: clientFD,
+                    inboundConnection: inboundConnection,
                     sessionToken: sessionToken,
-                    clientPid: clientPid,
                     clientName: clientName
                 )
             }
@@ -2836,14 +2838,20 @@ actor ServerNetworkManager {
     private func handleBootstrapConnection(
         sourceListener: BootstrapSocketServer,
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
-        clientFD: Int32,
+        inboundConnection: MCPAppProxyInboundConnection,
         sessionToken: String,
-        clientPid: Int,
         clientName: String?
     ) async -> BootstrapSocketServer.Admission {
+        let clientFD = inboundConnection.connectedFileDescriptor
+        let peerIdentity = inboundConnection.peerIdentity
         let connectionID = UUID()
-        connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (pid=\(clientPid), session=\(sessionToken.prefix(8))...)")
-        mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") pid=\(clientPid)")
+        connectionLog("Bootstrap socket connection: \(connectionID) from '\(clientName ?? "unknown")' (trustedPid=\(peerIdentity.trustedPID.map(String.init) ?? "unavailable"), claimedPid=\(peerIdentity.handshakeClaimedPID), provenance=\(String(describing: peerIdentity.provenance)), session=\(sessionToken.prefix(8))...)")
+        mcpACPLog("[MCP-ACP] bootstrap connection connection=\(connectionID) bootstrapClientName=\(clientName ?? "unknown") trustedPid=\(peerIdentity.trustedPID.map(String.init) ?? "unavailable") claimedPid=\(peerIdentity.handshakeClaimedPID) provenance=\(String(describing: peerIdentity.provenance))")
+
+        guard let clientPid = peerIdentity.trustedPID else {
+            log.warning("Rejecting bootstrap connection \(connectionID) - trusted socket peer pid unavailable")
+            return .reject(.rejected(reason: "Unable to verify peer process", errorCode: "peer_pid_unavailable"))
+        }
 
         guard isCurrentBootstrapListener(sourceListener, lifecycleGeneration: admissionLifecycleGeneration) else {
             return rejectBootstrapAdmissionBecauseStopped(connectionID: connectionID)
@@ -2905,7 +2913,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
-            clientPid: clientPid,
+            peerIdentity: peerIdentity,
             clientName: clientName
         )
     }
@@ -2923,7 +2931,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        peerIdentity: MCPPeerIdentity,
         clientName: String?
     ) -> BootstrapSocketServer.Admission {
         reserveBootstrapSlot(
@@ -2947,7 +2955,7 @@ actor ServerNetworkManager {
                     connectionID: connectionID,
                     lifecycleGeneration: admissionLifecycleGeneration,
                     sessionToken: sessionToken,
-                    clientPid: clientPid,
+                    peerIdentity: peerIdentity,
                     clientName: clientName
                 )
             },
@@ -2965,7 +2973,7 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration admissionLifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        peerIdentity: MCPPeerIdentity,
         clientName: String?
     ) async {
         guard let reservation = bootstrapReservations[connectionID],
@@ -3027,7 +3035,7 @@ actor ServerNetworkManager {
             connectionID: connectionID,
             lifecycleGeneration: admissionLifecycleGeneration,
             sessionToken: sessionToken,
-            clientPid: clientPid,
+            peerIdentity: peerIdentity,
             clientName: clientName,
             clientFD: committedFD
         )
@@ -3066,7 +3074,7 @@ actor ServerNetworkManager {
                 connectionID: connectionID,
                 lifecycleGeneration: lifecycleGeneration,
                 sessionToken: sessionToken,
-                clientPid: clientPid,
+                peerIdentity: MCPPeerIdentity(socketObservedPID: clientPid, handshakeClaimedPID: clientPid),
                 clientName: clientName
             )
             guard admission.publishTransferredFD?(clientFD) == true else {
@@ -3099,11 +3107,16 @@ actor ServerNetworkManager {
         connectionID: UUID,
         lifecycleGeneration: UInt64,
         sessionToken: String,
-        clientPid: Int,
+        peerIdentity: MCPPeerIdentity,
         clientName: String?,
         clientFD: Int32
     ) {
         guard isRunningState, self.lifecycleGeneration == lifecycleGeneration else {
+            closeUnregisteredBootstrapFD(clientFD)
+            return
+        }
+        guard let clientPid = peerIdentity.trustedPID else {
+            log.error("Refusing to register bootstrap connection \(connectionID) without a trusted socket peer pid")
             closeUnregisteredBootstrapFD(clientFD)
             return
         }
@@ -3125,7 +3138,7 @@ actor ServerNetworkManager {
             manager = try BootstrapSocketConnectionManager(
                 connectionID: connectionID,
                 sessionToken: sessionToken,
-                clientPid: clientPid,
+                peerIdentity: peerIdentity,
                 clientName: clientName,
                 purpose: purpose,
                 codeMapsDisabled: codeMapsDisabled,
@@ -4471,7 +4484,7 @@ actor ServerNetworkManager {
             if expectedPIDs.contains(current) {
                 return true
             }
-            guard let parent = parentPID(of: current), parent > 1, parent != current else {
+            guard let parent = processAncestryInspector.parentPID(of: current), parent > 1, parent != current else {
                 return false
             }
             current = parent
@@ -4483,23 +4496,13 @@ actor ServerNetworkManager {
         var chain = [String(startPid)]
         var current = startPid
         for _ in 0 ..< 16 {
-            guard let parent = parentPID(of: current), parent > 1, parent != current else {
+            guard let parent = processAncestryInspector.parentPID(of: current), parent > 1, parent != current else {
                 break
             }
             chain.append(String(parent))
             current = parent
         }
         return chain.joined(separator: "<-")
-    }
-
-    private nonisolated func parentPID(of pid: pid_t) -> pid_t? {
-        var info = kinfo_proc()
-        var size = MemoryLayout.stride(ofValue: info)
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else {
-            return nil
-        }
-        return info.kp_eproc.e_ppid
     }
 
     func installClientConnectionPolicy(

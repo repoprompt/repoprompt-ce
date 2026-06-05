@@ -1,18 +1,6 @@
 import Combine
-import CoreServices
 import Dispatch
 import Foundation
-#if DEBUG || EDIT_FLOW_PERF
-    import os
-#endif
-import CoreFoundation
-import Cuchardet
-import UniversalCharsetDetection
-#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-    import Darwin
-#else
-    import Glibc
-#endif
 
 actor FileSystemService {
     // Internal for FileSystemService same-target extensions only.
@@ -21,9 +9,7 @@ actor FileSystemService {
     nonisolated let diagnosticRootToken = UUID()
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     static let maxPendingRawEvents = 50000
-    static let overflowRescanEventFlags = FSEventStreamEventFlags(
-        kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
-    )
+    static let overflowRescanEventFlags = FileSystemWatchEventFlags.overflowRootRescan
 
     #if DEBUG
         /// Static flag to enable verbose debug logging (default: false)
@@ -122,8 +108,9 @@ actor FileSystemService {
     /// True => directory, False => file
     var visitedItems = [String: Bool]()
 
-    /// The FSEvent stream reference
-    var fseventStreamRef: FSEventStreamRef?
+    /// Injected platform watcher. Core policy stores no native watcher reference.
+    let watcherFactory: any FileSystemWatcherCreating
+    var watcher: (any FileSystemWatching)?
 
     /// Publishes ordered delta envelopes whenever changes or watcher progress occur.
     var changePublisher = PassthroughSubject<FileSystemDeltaPublication, Never>()
@@ -133,9 +120,6 @@ actor FileSystemService {
     #if DEBUG
         var lastPublishedDeltaCoalescingDiagnostics: PublishedDeltaCoalescingDiagnostics?
     #endif
-
-    /// Retained pointer to self (to avoid deallocation while FSEvent stream is active)
-    var selfPointer: UnsafeMutableRawPointer?
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
@@ -170,7 +154,7 @@ actor FileSystemService {
     /// Directories affected by ignore file changes since last consumption
     var pendingIgnoreChangeDirs: Set<String> = []
 
-    // A buffer for raw FSEvents + coalescing logic
+    // A buffer for semantic watcher events + coalescing logic
     var pendingFSEvents: [PendingFSEvent] = []
     var pendingWatcherAcceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark?
     var pendingWatcherPublicationSource: FileSystemDeltaPublicationSource = .watcher
@@ -185,10 +169,10 @@ actor FileSystemService {
 
     // MARK: - Event ID-based scan coalescing (prevents dropped events while deduping bursts)
 
-    /// Maps folder relative path → highest FSEvent ID that requires scanning
-    var pendingScanTargets: [String: FSEventStreamEventId] = [:]
-    /// Maps folder relative path → highest FSEvent ID that has already been scanned
-    var lastScannedEventIdByFolder: [String: FSEventStreamEventId] = [:]
+    /// Maps folder relative path → highest watcher event ID that requires scanning
+    var pendingScanTargets: [String: FileSystemWatchEventID] = [:]
+    /// Maps folder relative path → highest watcher event ID that has already been scanned
+    var lastScannedEventIdByFolder: [String: FileSystemWatchEventID] = [:]
 
     /// Short-lived cache
     /// results during a directory walk to avoid repeated allocations.
@@ -233,14 +217,15 @@ actor FileSystemService {
     // MARK: - Init
 
     /// Initializes the FileSystemService for a given path, applying ignore rules, optionally skipping symlinks,
-    /// and immediately starting an FSEvents watcher to track changes in that path.
+    /// and preparing an injected watcher to track changes in that path.
     init(
         path: String,
         respectGitignore: Bool = true,
         respectRepoIgnore: Bool = true,
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
-        enableHierarchicalIgnores: Bool = true
+        enableHierarchicalIgnores: Bool = true,
+        watcherFactory: any FileSystemWatcherCreating = MacOSFSEventsWatcherFactory()
     ) async throws {
         self.path = path
         rootURL = URL(fileURLWithPath: path).standardizedFileURL
@@ -250,6 +235,7 @@ actor FileSystemService {
         self.respectCursorignore = respectCursorignore
         self.skipSymlinks = skipSymlinks
         self.enableHierarchicalIgnores = enableHierarchicalIgnores
+        self.watcherFactory = watcherFactory
 
         watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
 
@@ -286,7 +272,8 @@ actor FileSystemService {
             fileManagerOverride: (any FileSystemProviding)? = nil,
             maxParallelScansOverride: Int? = nil,
             maxFoldersPerBatchOverride: Int? = nil,
-            maxPendingWatcherIngressEntriesOverride: Int? = nil
+            maxPendingWatcherIngressEntriesOverride: Int? = nil,
+            watcherFactory: any FileSystemWatcherCreating = MacOSFSEventsWatcherFactory()
         ) async throws {
             self.path = path
             rootURL = URL(fileURLWithPath: path).standardizedFileURL
@@ -298,6 +285,7 @@ actor FileSystemService {
             self.enableHierarchicalIgnores = enableHierarchicalIgnores
             self.isTestMode = isTestMode
             self.fileManagerOverride = fileManagerOverride
+            self.watcherFactory = watcherFactory
 
             watcherIngressMailbox = FileSystemWatcherIngressMailbox(
                 maxQueuedRawEntries: maxPendingWatcherIngressEntriesOverride ?? Self.maxPendingRawEvents

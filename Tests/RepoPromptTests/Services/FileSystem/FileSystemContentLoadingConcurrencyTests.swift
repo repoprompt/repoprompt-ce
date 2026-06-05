@@ -1,4 +1,3 @@
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -523,8 +522,8 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
     #endif
 
-    private var createdFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+    private var createdFileFlags: FileSystemWatchEventFlags {
+        [.itemCreated, .itemIsFile]
     }
 
     private func makeService(root: URL, skipSymlinks: Bool = true) async throws -> FileSystemService {

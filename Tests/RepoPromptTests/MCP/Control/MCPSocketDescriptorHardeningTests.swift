@@ -46,8 +46,8 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             let server = BootstrapSocketServer(socketURL: fixture.socketURL)
             let acceptedFlag = OptionalBoolRecorder()
 
-            try await server.start { fd, _, _, _ in
-                await acceptedFlag.record(Self.hasCloseOnExec(fd))
+            try await server.start { inboundConnection, _, _ in
+                await acceptedFlag.record(Self.hasCloseOnExec(inboundConnection.connectedFileDescriptor))
                 return .reject()
             }
             do {
@@ -92,7 +92,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
             var clientFDs: [Int32] = []
             defer { clientFDs.forEach(Self.closeIfOpen) }
 
-            try await server.start { _, _, _, _ in
+            try await server.start { _, _, _ in
                 await admissionCount.increment()
                 return .reject()
             }
@@ -240,7 +240,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
 
         await server.stop()
         do {
-            try await server.start { _, _, _, _ in .reject() }
+            try await server.start { _, _, _ in .reject() }
             XCTFail("Expected tombstoned bootstrap listener start to fail")
         } catch BootstrapSocketError.startCancelled {} catch {
             XCTFail("Unexpected tombstoned listener start error: \(error)")
@@ -290,7 +290,7 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         let transferredFDs = SynchronousFDRecorder()
         defer { transferredFDs.closeAll() }
 
-        try await server.start { _, _, _, _ in
+        try await server.start { _, _, _ in
             await gate.suspendUntilReleased()
             return .accept(
                 publishTransferredFD: { transferredFDs.record($0) },

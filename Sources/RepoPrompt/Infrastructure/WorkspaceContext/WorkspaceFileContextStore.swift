@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 import Foundation
 
 enum WorkspaceFileTreeSnapshotMode: String {
@@ -226,6 +225,7 @@ actor WorkspaceFileContextStore {
         let snapshot: WorkspaceSearchCatalogSnapshot
     }
 
+    private let fileSystemWatcherFactory: any FileSystemWatcherCreating
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -265,6 +265,10 @@ actor WorkspaceFileContextStore {
     private var nextScopedIngressBarrierToken: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
+
+    init(fileSystemWatcherFactory: any FileSystemWatcherCreating = MacOSFSEventsWatcherFactory()) {
+        self.fileSystemWatcherFactory = fileSystemWatcherFactory
+    }
 
     deinit {
         codeScanResultTask?.cancel()
@@ -474,7 +478,7 @@ actor WorkspaceFileContextStore {
 
         func acceptWatcherPayloadForTesting(
             rootID: UUID,
-            events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
+            events: [(absolutePath: String, flags: FileSystemWatchEventFlags, eventId: FileSystemWatchEventID)],
             scheduleDrain: Bool = true
         ) async throws -> FileSystemWatcherIngressMailbox.Watermark? {
             let state = try state(for: rootID)
@@ -1608,7 +1612,8 @@ actor WorkspaceFileContextStore {
             respectRepoIgnore: respectRepoIgnore,
             respectCursorignore: respectCursorignore,
             skipSymlinks: skipSymlinks,
-            enableHierarchicalIgnores: enableHierarchicalIgnores
+            enableHierarchicalIgnores: enableHierarchicalIgnores,
+            watcherFactory: fileSystemWatcherFactory
         )
 
         #if DEBUG

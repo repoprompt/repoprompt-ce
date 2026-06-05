@@ -1,5 +1,5 @@
 //
-//  UnixSocketMCPTransport.swift
+//  MacOSUnixSocketMCPTransport.swift
 //  RepoPrompt
 //
 //  UNIX domain socket transport for local MCP connections.

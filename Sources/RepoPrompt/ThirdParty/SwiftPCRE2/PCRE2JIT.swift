@@ -1,3 +1,5 @@
+import CSwiftPCRE2
+
 public enum PCRE2BuildConfiguration: Sendable {
 	/// True when PCRE2 was compiled with build-time JIT support.
 	///

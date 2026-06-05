@@ -70,13 +70,16 @@ final class RepoPromptCoreSession {
         sessionID: RepoPromptSessionID = RepoPromptSessionID(),
         routingSessionID: MCPRoutingSessionID,
         workspaceRepository: WorkspaceRepository,
-        workspaceAccessPolicy: any WorkspaceAccessPolicy
+        workspaceAccessPolicy: any WorkspaceAccessPolicy,
+        platformDependencies: RepoPromptCorePlatformDependencies
     ) {
         self.sessionID = sessionID
         self.routingSessionID = routingSessionID
         self.workspaceRepository = workspaceRepository
         self.workspaceAccessPolicy = workspaceAccessPolicy
-        workspaceFileContextStore = WorkspaceFileContextStore()
+        workspaceFileContextStore = WorkspaceFileContextStore(
+            fileSystemWatcherFactory: platformDependencies.fileSystemWatcherFactory
+        )
         workspaceSearchService = WorkspaceSearchService()
         workspaceSessionController = WorkspaceSessionController(accessPolicy: workspaceAccessPolicy)
         selectionCoordinator = WorkspaceSelectionCoordinator(
@@ -99,24 +102,28 @@ final class RepoPromptCoreHost {
     let workspaceRepository: WorkspaceRepository
     let workspaceAccessPolicy: any WorkspaceAccessPolicy
     let runtimeSessionRegistry: MCPRuntimeSessionRegistry
+    let platformDependencies: RepoPromptCorePlatformDependencies
     private var createdSessions: [RepoPromptSessionID: WeakSession] = [:]
     private var activeSessions: [RepoPromptSessionID: RepoPromptCoreSession] = [:]
 
     init(
         workspaceRepository: WorkspaceRepository,
         workspaceAccessPolicy: any WorkspaceAccessPolicy,
-        runtimeSessionRegistry: MCPRuntimeSessionRegistry
+        runtimeSessionRegistry: MCPRuntimeSessionRegistry,
+        platformDependencies: RepoPromptCorePlatformDependencies
     ) {
         self.workspaceRepository = workspaceRepository
         self.workspaceAccessPolicy = workspaceAccessPolicy
         self.runtimeSessionRegistry = runtimeSessionRegistry
+        self.platformDependencies = platformDependencies
     }
 
     func makeEmbeddedSession(routingSessionID: MCPRoutingSessionID) -> RepoPromptCoreSessionHandle {
         let session = RepoPromptCoreSession(
             routingSessionID: routingSessionID,
             workspaceRepository: workspaceRepository,
-            workspaceAccessPolicy: workspaceAccessPolicy
+            workspaceAccessPolicy: workspaceAccessPolicy,
+            platformDependencies: platformDependencies
         )
         createdSessions[session.sessionID] = WeakSession(session)
         return RepoPromptCoreSessionHandle(session: session)

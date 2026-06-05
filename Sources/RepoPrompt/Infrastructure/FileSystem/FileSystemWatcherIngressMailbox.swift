@@ -1,14 +1,17 @@
-import CoreServices
 import Foundation
 
-/// Owns deep-copied FSEvent callback payloads synchronously before actor entry.
+/// Owns deep-copied filesystem watcher callback payloads synchronously before actor entry.
 ///
-/// The FSEvents callback can run outside the `FileSystemService` actor. This mailbox
+/// The platform watcher callback can run outside the `FileSystemService` actor. This mailbox
 /// assigns a per-root monotonic watermark before any task is created, preserves FIFO
 /// payload order, and retains at most one drain task. Under pressure it collapses
 /// queued details to the existing root-rescan sentinel contract without discarding
 /// accepted progress.
 final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
+    struct AcceptanceGeneration: Hashable {
+        let rawValue: UInt64
+    }
+
     struct Watermark: Hashable, Comparable {
         let rawValue: UInt64
 
@@ -21,9 +24,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     struct AcceptedPayload: @unchecked Sendable {
         enum Contents: @unchecked Sendable {
-            case entries([FSEventCallbackEntry])
+            case entries([FileSystemWatchEvent])
             case overflowRootRescan(
-                highestEventID: FSEventStreamEventId,
+                highestEventID: FileSystemWatchEventID,
                 changedIgnoreAbsolutePaths: Set<String>
             )
         }
@@ -54,7 +57,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     private let lock = NSLock()
     private let maxQueuedRawEntries: Int
-    private var isAccepting = true
+    private var isAccepting = false
+    private var nextAcceptanceGeneration: UInt64 = 0
+    private var activeAcceptanceGeneration: AcceptanceGeneration?
     private var nextAcceptedSequence: UInt64 = 0
     private var acceptedHighWatermark = Watermark.zero
     private var queuedPayloads: [AcceptedPayload] = []
@@ -69,15 +74,20 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         self.maxQueuedRawEntries = max(1, maxQueuedRawEntries)
     }
 
-    func startAccepting() {
+    func startAccepting() -> AcceptanceGeneration {
         lock.lock()
+        nextAcceptanceGeneration &+= 1
+        let generation = AcceptanceGeneration(rawValue: nextAcceptanceGeneration)
+        activeAcceptanceGeneration = generation
         isAccepting = true
         lock.unlock()
+        return generation
     }
 
     func stopAcceptingAndDiscardPending() {
         lock.lock()
         isAccepting = false
+        activeAcceptanceGeneration = nil
         queuedPayloads.removeAll(keepingCapacity: false)
         queuedPayloadHead = 0
         queuedRawEntryCount = 0
@@ -97,14 +107,15 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     @discardableResult
     func accept(
-        _ payload: FSEventCallbackPayload,
+        _ payload: FileSystemWatchEventPayload,
+        acceptanceGeneration: AcceptanceGeneration,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
         scheduleDrain: (@Sendable () async -> Void)?
     ) -> Watermark? {
         guard !payload.entries.isEmpty else { return nil }
 
         lock.lock()
-        guard isAccepting else {
+        guard isAccepting, activeAcceptanceGeneration == acceptanceGeneration else {
             lock.unlock()
             return nil
         }
@@ -172,7 +183,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         let payloads = Array(queuedPayloads.dropFirst(queuedPayloadHead)) + [payload]
         var lowestAcceptedWatermark = payload.lowestAcceptedWatermark
         var acceptedHighWatermark = payload.acceptedHighWatermark
-        var highestEventID: FSEventStreamEventId = 0
+        var highestEventID: FileSystemWatchEventID = 0
         var changedIgnoreAbsolutePaths = Set<String>()
         for queuedPayload in payloads {
             lowestAcceptedWatermark = min(lowestAcceptedWatermark, queuedPayload.lowestAcceptedWatermark)

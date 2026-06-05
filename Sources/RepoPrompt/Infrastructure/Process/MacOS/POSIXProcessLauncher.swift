@@ -2,23 +2,6 @@ import Darwin
 import Foundation
 import RepoPromptShared
 
-struct SpawnedProcess: @unchecked Sendable {
-    let pid: pid_t
-    let stdin: FileHandle?
-    let stdinDescriptor: Int32?
-    let stdout: FileHandle
-    let stderr: FileHandle
-}
-
-enum ProcessLauncherError: Error {
-    case pipeCreationFailed(String)
-    case descriptorConfigurationFailed(label: String, fd: Int32, underlying: POSIXDescriptorConfigurationError)
-    case spawnFileActionsFailed(operation: String, errno: Int32)
-    case changeDirectoryFailed(path: String, errno: Int32)
-    case spawnAttributesFailed(operation: String, errno: Int32)
-    case spawnFailed(errno: Int32)
-}
-
 enum ProcessLauncher {
     static func spawn(
         command: String,
@@ -283,6 +266,23 @@ enum ProcessLauncher {
             stdinDescriptor: stdinPipe[1],
             stdout: stdoutHandle,
             stderr: stderrHandle
+        )
+    }
+}
+
+/// macOS POSIX adapter exposed through the neutral process-launching contract.
+struct POSIXProcessLauncher: ProcessLaunching {
+    func spawn(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        workingDirectory: String?
+    ) throws -> SpawnedProcess {
+        try ProcessLauncher.spawn(
+            command: command,
+            arguments: arguments,
+            environment: environment,
+            workingDirectory: workingDirectory
         )
     }
 }

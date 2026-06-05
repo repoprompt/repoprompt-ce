@@ -6,7 +6,6 @@
 //
 
 import AppKit
-import Darwin
 import Foundation
 import Logging
 import OSLog
@@ -58,6 +57,7 @@ final actor ServerController: ObservableObject {
 
     // –––––  Private implementation helpers  –––––
     private let networkManager = ServerNetworkManager.shared
+    private let bundledHelperPeerVerifier: any BundledHelperPeerVerifying
     private var activeApprovalDialogs: Set<String> = []
     private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
 
@@ -79,7 +79,8 @@ final actor ServerController: ObservableObject {
     }
 
     /// –––––  Init: wire approval-flow & kick off the listener  –––––
-    init() {
+    init(bundledHelperPeerVerifier: any BundledHelperPeerVerifying = MacOSBundledHelperPeerVerifier()) {
+        self.bundledHelperPeerVerifier = bundledHelperPeerVerifier
         Task { [weak self] in
             await self?.bootstrapCallbacks()
         }
@@ -257,7 +258,7 @@ final actor ServerController: ObservableObject {
         }
 
         nonisolated static func test_bundledHelperPathMatches(expectedURL: URL, actualPath: String) -> Bool {
-            bundledHelperPathMatches(expectedURL: expectedURL, actualPath: actualPath)
+            MacOSBundledHelperPeerVerifier.pathsMatch(expectedURL: expectedURL, actualPath: actualPath)
         }
     #endif
 
@@ -269,23 +270,10 @@ final actor ServerController: ObservableObject {
         guard let peerPID = await networkManager.peerPID(for: connectionID) else {
             return false
         }
-        guard let actualPath = Self.executablePath(forPID: peerPID) else {
-            return false
-        }
-        return Self.bundledHelperPathMatches(expectedURL: expectedURL, actualPath: actualPath)
-    }
-
-    private nonisolated static func bundledHelperPathMatches(expectedURL: URL, actualPath: String) -> Bool {
-        let expected = expectedURL.resolvingSymlinksInPath().standardizedFileURL.path
-        let actual = URL(fileURLWithPath: actualPath).resolvingSymlinksInPath().standardizedFileURL.path
-        return actual == expected
-    }
-
-    private nonisolated static func executablePath(forPID pid: Int) -> String? {
-        var buffer = [CChar](repeating: 0, count: 4096)
-        let result = proc_pidpath(pid_t(pid), &buffer, UInt32(buffer.count))
-        guard result > 0 else { return nil }
-        return String(cString: buffer)
+        return bundledHelperPeerVerifier.matches(BundledHelperPeerVerificationInput(
+            expectedExecutableURL: expectedURL,
+            peerPID: peerPID
+        ))
     }
 
     private func addAlwaysAllowed(clientID: String) {

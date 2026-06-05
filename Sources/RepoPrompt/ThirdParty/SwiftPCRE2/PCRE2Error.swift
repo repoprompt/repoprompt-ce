@@ -1,3 +1,4 @@
+import CSwiftPCRE2
 import Foundation
 
 public enum PCRE2LimitKind: Sendable, Equatable {

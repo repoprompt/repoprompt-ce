@@ -1,5 +1,5 @@
 //
-//	BootstrapSocketServer.swift
+//	MacOSBootstrapSocketServer.swift
 //	RepoPrompt
 //
 //	Single app-owned UNIX socket server for MCP connections.
@@ -216,10 +216,9 @@ actor BootstrapSocketServer {
         }
     }
 
-    /// Callback when a new CLI connects and completes handshake
-    /// Parameters: (clientFD, sessionToken, clientPid, clientName)
-    /// Returns: Admission decision with optional postAccept hook for MCP startup
-    private var onNewConnection: ((Int32, String, Int, String?) async -> Admission)?
+    /// Callback when a new CLI connects and completes handshake.
+    /// The macOS listener normalizes peer identity before reusable admission policy sees it.
+    private var onNewConnection: ((MCPAppProxyInboundConnection, String, String?) async -> Admission)?
 
     init(socketURL: URL = MCPFilesystemConstants.bootstrapSocketURL(), logger: Logger? = nil) {
         self.socketURL = socketURL
@@ -239,7 +238,7 @@ actor BootstrapSocketServer {
     /// Starts listening on the bootstrap socket.
     /// - Parameter onNewConnection: Callback invoked for each new CLI connection.
     ///   Return an Admission with postAccept closure for MCP startup.
-    func start(onNewConnection: @escaping (Int32, String, Int, String?) async -> Admission) throws {
+    func start(onNewConnection: @escaping (MCPAppProxyInboundConnection, String, String?) async -> Admission) throws {
         #if DEBUG
             print("[MCPStartup] BootstrapSocketServer.start entered socket=\(socketURL.path)")
         #endif
@@ -726,11 +725,26 @@ actor BootstrapSocketServer {
 
         guard isActiveHandshake(handshakeSocket, generation: generation) else { return }
 
-        let peerPid = Self.peerPID(for: clientFD)
-        let effectivePid = peerPid ?? request.clientPid
-        if let peerPid, peerPid != request.clientPid {
-            bootstrapSocketServerLog("BootstrapSocketServer: clientPid mismatch (request=\(request.clientPid), peer=\(peerPid)); using peer pid")
+        guard MCPPeerIdentity.isValidHandshakeClaimedPID(request.clientPid) else {
+            logger.warning("BootstrapSocketServer: invalid claimed clientPid \(request.clientPid)")
+            _ = await sendResponseAsync(
+                .rejected(reason: "Invalid client PID", errorCode: "invalid_client_pid"),
+                to: handshakeSocket
+            )
+            return
         }
+
+        let peerIdentity = MCPPeerIdentity(
+            socketObservedPID: Self.peerPID(for: clientFD),
+            handshakeClaimedPID: request.clientPid
+        )
+        if let peerPID = peerIdentity.socketObservedPID, peerPID != request.clientPid {
+            bootstrapSocketServerLog("BootstrapSocketServer: clientPid mismatch (request=\(request.clientPid), peer=\(peerPID)); using peer pid")
+        }
+        let inboundConnection = MCPAppProxyInboundConnection(
+            connectedFileDescriptor: clientFD,
+            peerIdentity: peerIdentity
+        )
 
         bootstrapSocketServerLog("BootstrapSocketServer: handshake from '\(request.clientName ?? "unknown")' session=\(request.sessionToken.prefix(8))...")
 
@@ -758,7 +772,7 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        let admission = await handler(inboundConnection, request.sessionToken, request.clientName)
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,

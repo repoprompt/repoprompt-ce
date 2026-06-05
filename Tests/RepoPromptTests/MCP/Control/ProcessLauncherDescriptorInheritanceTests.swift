@@ -199,7 +199,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
     func testLauncherSourcesCheckSpawnFileActionAndAttributeInitializationResults() throws {
         let root = try RepoRoot.url()
         let launcher = try String(
-            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/Process/ProcessLauncher.swift"),
+            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/Process/MacOS/POSIXProcessLauncher.swift"),
             encoding: .utf8
         )
         let runner = try String(

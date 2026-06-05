@@ -18,7 +18,7 @@
             accessMode: KeychainAccessMode
         ) throws {
             guard let data = value.data(using: .utf8) else {
-                throw KeychainService.KeychainError.invalidData
+                throw SecureStorageError.invalidData
             }
 
             withLock {
@@ -32,12 +32,12 @@
         ) throws -> String {
             let data = try withLock {
                 guard let data = entries[key] else {
-                    throw KeychainService.KeychainError.itemNotFound
+                    throw SecureStorageError.itemNotFound
                 }
                 return data
             }
             guard let value = String(data: data, encoding: .utf8) else {
-                throw KeychainService.KeychainError.invalidData
+                throw SecureStorageError.invalidData
             }
             return value
         }

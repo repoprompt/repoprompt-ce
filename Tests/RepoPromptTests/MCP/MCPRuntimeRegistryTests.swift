@@ -12,12 +12,14 @@ final class MCPRuntimeSessionRegistryTests: XCTestCase {
         let first = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 1),
             workspaceRepository: repository,
-            workspaceAccessPolicy: policy
+            workspaceAccessPolicy: policy,
+            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
         let second = RepoPromptCoreSession(
             routingSessionID: MCPRoutingSessionID(rawValue: 2),
             workspaceRepository: repository,
-            workspaceAccessPolicy: policy
+            workspaceAccessPolicy: policy,
+            platformDependencies: MacOSRepoPromptCorePlatformDependencies.embeddedApp()
         )
 
         registry.setMCPEnabled(windowID: first.routingSessionID.rawValue, enabled: true)

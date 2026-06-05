@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -84,7 +83,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         var highest = FileSystemWatcherIngressMailbox.Watermark.zero
         for eventID in 1 ... 3 {
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
-                (absolutePath: "/outside/overflow-\(eventID).swift", flags: createdFileFlags, eventId: FSEventStreamEventId(eventID))
+                (absolutePath: "/outside/overflow-\(eventID).swift", flags: createdFileFlags, eventId: FileSystemWatchEventID(eventID))
             ], scheduleDrain: false)
             highest = try XCTUnwrap(acceptedPayload)
         }
@@ -152,7 +151,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         var highest = FileSystemWatcherIngressMailbox.Watermark.zero
         for eventID in 31 ... 33 {
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
-                (absolutePath: "/outside/overflow-ignore-\(eventID).swift", flags: createdFileFlags, eventId: FSEventStreamEventId(eventID))
+                (absolutePath: "/outside/overflow-ignore-\(eventID).swift", flags: createdFileFlags, eventId: FileSystemWatchEventID(eventID))
             ], scheduleDrain: false)
             highest = try XCTUnwrap(acceptedPayload)
         }
@@ -171,7 +170,8 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         let firstPayload = callbackPayload(path: "/outside/old.swift", eventID: 40)
         let secondPayload = callbackPayload(path: "/outside/new.swift", eventID: 41)
 
-        _ = mailbox.accept(firstPayload, lifecycleCorrelation: nil) {
+        let oldAcceptanceGeneration = mailbox.startAccepting()
+        _ = mailbox.accept(firstPayload, acceptanceGeneration: oldAcceptanceGeneration, lifecycleCorrelation: nil) {
             let invocation = await oldDrainCount.incrementAndValue()
             if invocation == 1 {
                 await oldDrainGate.markStartedAndWaitForRelease()
@@ -181,9 +181,9 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         }
         await oldDrainGate.waitUntilStarted()
         mailbox.stopAcceptingAndDiscardPending()
-        mailbox.startAccepting()
+        let newAcceptanceGeneration = mailbox.startAccepting()
 
-        _ = mailbox.accept(secondPayload, lifecycleCorrelation: nil) {
+        _ = mailbox.accept(secondPayload, acceptanceGeneration: newAcceptanceGeneration, lifecycleCorrelation: nil) {
             _ = await newDrainCount.incrementAndValue()
             await newDrainGate.markStartedAndWaitForRelease()
             while mailbox.takeNextAcceptedPayload() != nil {}
@@ -198,6 +198,35 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(observedOldDrainCount, 1)
         XCTAssertEqual(observedNewDrainCount, 1)
         await newDrainGate.release()
+    }
+
+    func testMailboxRejectsOldAcceptanceGenerationAfterRestart() {
+        let mailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: 10)
+        let oldAcceptanceGeneration = mailbox.startAccepting()
+        let oldPayload = callbackPayload(path: "/outside/old.swift", eventID: 42)
+        let newPayload = callbackPayload(path: "/outside/new.swift", eventID: 43)
+
+        XCTAssertNotNil(mailbox.accept(
+            oldPayload,
+            acceptanceGeneration: oldAcceptanceGeneration,
+            lifecycleCorrelation: nil,
+            scheduleDrain: nil
+        ))
+        mailbox.stopAcceptingAndDiscardPending()
+        let newAcceptanceGeneration = mailbox.startAccepting()
+
+        XCTAssertNil(mailbox.accept(
+            oldPayload,
+            acceptanceGeneration: oldAcceptanceGeneration,
+            lifecycleCorrelation: nil,
+            scheduleDrain: nil
+        ))
+        XCTAssertNotNil(mailbox.accept(
+            newPayload,
+            acceptanceGeneration: newAcceptanceGeneration,
+            lifecycleCorrelation: nil,
+            scheduleDrain: nil
+        ))
     }
 
     func testSyntheticPublicationDoesNotAdvanceWatcherAcceptedWatermark() async throws {
@@ -221,17 +250,17 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
-    private var createdFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+    private var createdFileFlags: FileSystemWatchEventFlags {
+        [.itemCreated, .itemIsFile]
     }
 
-    private var modifiedFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile)
+    private var modifiedFileFlags: FileSystemWatchEventFlags {
+        [.contentChanged, .itemIsFile]
     }
 
-    private func callbackPayload(path: String, eventID: FSEventStreamEventId) -> FSEventCallbackPayload {
-        FSEventCallbackPayload(entries: [
-            FSEventCallbackEntry(path: path, flags: createdFileFlags, id: eventID)
+    private func callbackPayload(path: String, eventID: FileSystemWatchEventID) -> FileSystemWatchEventPayload {
+        FileSystemWatchEventPayload(entries: [
+            FileSystemWatchEvent(path: path, flags: createdFileFlags, id: eventID)
         ])
     }
 

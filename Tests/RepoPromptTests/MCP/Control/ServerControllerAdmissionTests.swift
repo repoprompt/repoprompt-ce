@@ -90,8 +90,9 @@ final class ServerControllerAdmissionTests: XCTestCase {
         for marker in [
             "Bundle.main.url(forAuxiliaryExecutable: \"repoprompt-mcp\")",
             "await networkManager.peerPID(for: connectionID)",
-            "Self.executablePath(forPID: peerPID)",
-            "Self.bundledHelperPathMatches(expectedURL: expectedURL, actualPath: actualPath)"
+            "bundledHelperPeerVerifier.matches(BundledHelperPeerVerificationInput(",
+            "expectedExecutableURL: expectedURL",
+            "peerPID: peerPID"
         ] {
             let range = try XCTUnwrap(source.range(of: marker, range: cursor ..< source.endIndex))
             cursor = range.upperBound

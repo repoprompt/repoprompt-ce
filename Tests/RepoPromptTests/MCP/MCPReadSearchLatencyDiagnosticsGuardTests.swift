@@ -1968,12 +1968,12 @@
                 XCTAssertTrue(fileSystem.contains(hook), "Missing filesystem attribution hook: \(hook)")
             }
 
-            let fileEvents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            let fileEvents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+Watching.swift")
             XCTAssertTrue(fileEvents.contains("EditFlowPerf.Stage.Search.contentFreshnessValidationRootActorBody"))
             XCTAssertTrue(fileEvents.contains("EditFlowPerf.Lifecycle.Search.contentFreshnessRootEntered"))
             XCTAssertTrue(fileEvents.contains("EditFlowPerf.Lifecycle.Search.contentFreshnessRootReturned"))
 
-            let bootstrap = try source("Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketServer.swift")
+            let bootstrap = try source("Sources/RepoPrompt/Infrastructure/MCP/AppProxy/MacOSBootstrapSocketServer.swift")
             for hook in [
                 "EditFlowPerf.Lifecycle.Bootstrap.socketAccepted",
                 "EditFlowPerf.Lifecycle.Bootstrap.handshakeIOQueued",
@@ -2111,7 +2111,7 @@
             XCTAssertTrue(viewModel.contains("EditFlowPerf.Lifecycle.MCPRunTool.idleWaitersResumed"))
 
             let fileSystemService = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
-            let fileSystem = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            let fileSystem = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+Watching.swift")
             assertSourceOrder(
                 in: fileSystem,
                 hooks: [
@@ -2192,7 +2192,7 @@
 
         func testFileSystemChangePublisherSendsRemainCentralized() throws {
             let service = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
-            let fsevents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            let fsevents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+Watching.swift")
             let operations = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FileOperations.swift")
 
             XCTAssertTrue(service.contains("source: FileSystemDeltaPublicationSource"))

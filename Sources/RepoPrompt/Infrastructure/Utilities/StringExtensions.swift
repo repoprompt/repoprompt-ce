@@ -5,8 +5,8 @@
 //  Created by Eric Provencher on 2024-07-25.
 //
 
-import Darwin
 import Foundation
+import RepoPromptC
 
 public extension String {
     internal static func truncateModelName(_ text: String, maxLength: Int = 40) -> String {
@@ -68,7 +68,7 @@ public extension String {
                 guard let cRes = repo_longest_common_subsequence(aPtr, bPtr) else {
                     return ""
                 }
-                defer { free(cRes) }
+                defer { repo_free(cRes) }
                 return String(cString: cRes)
             }
         }
@@ -272,7 +272,7 @@ public extension String {
             guard let raw = repo_encode_indentation(cLine, CChar(115)) else {
                 return line
             }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -284,7 +284,7 @@ public extension String {
             guard let raw = repo_decode_indentation(cLine) else {
                 return encodedLine
             }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -303,7 +303,7 @@ public extension String {
             guard let raw = repo_trim_common_leading_whitespace_preserving_endings(ptr) else {
                 return content
             }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -463,7 +463,7 @@ public extension String {
     internal func escapedString() -> String {
         withCString { ptr in
             guard let raw = repo_escape_string(ptr) else { return self }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -471,7 +471,7 @@ public extension String {
     internal func unescaped() -> String {
         withCString { ptr in
             guard let raw = repo_unescape_string(ptr) else { return self }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -825,7 +825,7 @@ public extension String {
     internal func decodingHTMLEntities() -> String {
         withCString { ptr in
             guard let raw = repo_decode_html_entities(ptr) else { return self }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -910,7 +910,7 @@ public extension String {
     internal func condensingWhitespace() -> String {
         withCString { ptr in
             guard let raw = repo_condense_whitespace(ptr) else { return self }
-            defer { free(raw) }
+            defer { repo_free(raw) }
             return String(cString: raw)
         }
     }
@@ -938,7 +938,7 @@ public extension String {
     internal static func canonicalKey(_ raw: String) -> String? {
         raw.withCString { ptr in
             guard let result = repo_canonical_key(ptr) else { return nil }
-            defer { free(result) }
+            defer { repo_free(result) }
             return String(cString: result)
         }
     }

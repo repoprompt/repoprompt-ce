@@ -235,21 +235,18 @@ Existing app consumers remain adapter-owned until later review: `App/WindowState
 
 ### Bridging-header dependency inventory
 
-`Package.swift` currently applies `Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h` target-wide. Later work must replace accidental target-wide visibility with direct SwiftPM modules and a narrow syntax bridge.
+Item 4 narrowed `Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h` to a syntax-only transitional residual without editing `Package.swift`. Accidental target-wide declarations are gone: Apple APIs are source-local or adapter-owned, RepoPrompt C consumers import `RepoPromptC` directly, PCRE wrappers import `CSwiftPCRE2` directly, and `PathSearchIndex` consumes the published `RepoPromptC` ABI instead of local `@_silgen_name` shadows.
 
-| Current Swift consumer | Header-provided declarations | Reserved owner |
+| Current Swift consumer | Item 4 disposition | Item 5 reserved owner |
 | --- | --- | --- |
-| `Sources/RepoPrompt/App/ApplicationSecurity.swift` | `sysctl`, `ptrace`, `PT_DENY_ATTACH` | app shell/adapter |
-| `Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+DirectoryEnumeration.swift` | `sysctlbyname("hw.ncpu", ...)` | `RepoPromptCoreMacOS` |
-| `Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift` | `sysctl`, `kinfo_proc` parent-PID lookup | split core/macOS adapter |
-| `Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift` | `tree_sitter_*` entry points | `RepoPromptCore` via `RepoPromptSyntaxCBridge` |
-| `Sources/RepoPrompt/Features/Search/SearchMatch.swift`, `SearchPathFiltering.swift` | `repo_wildmatch` | `RepoPromptCore` via direct `RepoPromptC` dependency |
-| `Sources/RepoPrompt/Infrastructure/FileSystem/GitignoreCompiler.swift` | `repo_gitignore_*`, `repo_gitignore_pattern`, `repo_parse_gitignore_line` | `RepoPromptCore` via direct `RepoPromptC` dependency |
-| `Sources/RepoPrompt/Infrastructure/Utilities/StringExtensions.swift` | string-extension C wrappers | `RepoPromptCore` via direct `RepoPromptC` dependency |
-| `Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/RepoSearchBatchScorer.swift` | `repo_file_info`, `repo_score_matches_batch` | `RepoPromptCore` via direct `RepoPromptC` dependency |
-| `Sources/RepoPrompt/ThirdParty/SwiftPCRE2/PCRE2Error.swift`, `PCRE2JIT.swift`, `PCRE2Options.swift`, `PCRE2Regex.swift` | `rp_pcre2_*` wrappers | `RepoPromptCore` via direct `CSwiftPCRE2` dependency |
+| `Sources/RepoPrompt/App/ApplicationSecurity.swift` | imports `Darwin` locally and owns the `PT_DENY_ATTACH` fallback value | app shell |
+| `Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+DirectoryEnumeration.swift` | removed unused `sysctlbyname("hw.ncpu", ...)` helper | n/a |
+| `Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift` | consumes injected `ProcessAncestryInspecting`; `MacOSProcessAncestryInspector` owns `sysctl` / `kinfo_proc` | split core/macOS adapter |
+| `Sources/RepoPrompt/Infrastructure/SyntaxParsing/SyntaxManager.swift` | still receives `tree_sitter_*` declarations from the narrowed header | `RepoPromptCore` via `RepoPromptSyntaxCBridge` |
+| `Sources/RepoPrompt/Features/Search/SearchMatch.swift`, `SearchPathFiltering.swift`, `Infrastructure/FileSystem/GitignoreCompiler.swift`, `Infrastructure/Utilities/StringExtensions.swift`, `Infrastructure/WorkspaceContext/Search/RepoSearchBatchScorer.swift`, `Infrastructure/WorkspaceContext/Search/PathSearchIndex.swift` | import `RepoPromptC` directly; string allocation helpers use narrow `repo_strdup` / `repo_free` wrappers | `RepoPromptCore` via direct `RepoPromptC` dependency |
+| `Sources/RepoPrompt/ThirdParty/SwiftPCRE2/PCRE2Error.swift`, `PCRE2JIT.swift`, `PCRE2Options.swift`, `PCRE2Regex.swift` | import `CSwiftPCRE2` directly | `RepoPromptCore` via direct `CSwiftPCRE2` dependency |
 
-Adjacent audit item: `Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/PathSearchIndex.swift` calls `path_search_*` through local `@_silgen_name` declarations. It is C-linked but does not directly consume bridging-header declarations.
+Syntax declaration strategy: keep the remaining grammar declarations in the current target-wide header through Item 4 so scanner/linker behavior is unchanged. Item 5 creates `RepoPromptSyntaxCBridge`, wires the grammar products to that narrow target, moves the declarations there, and removes the app bridging-header setting atomically with the SwiftPM split. `TreeSitterScannerSupport` remains unchanged.
 
 ### Test ownership inventory
 
@@ -261,18 +258,41 @@ Adjacent audit item: `Sources/RepoPrompt/Infrastructure/WorkspaceContext/Search/
 | `Tests/RepoPromptTests/Security/` | Split neutral secure-store facade coverage from Keychain and runtime-policy adapter coverage |
 | `Scripts/test_release_tooling.py` and embedded-helper validators | Keep app-proxy packaging characterization with release tooling |
 
-## Deferred Item 4 portability ledger
+## Item 4 staged adapter isolation
 
-Do not broaden Item 0 into platform extraction. Item 4 must classify these bounded topics as core-safe, adapter-owned, shell-only, or explicitly deferred:
+Item 4 stages neutral contracts and macOS-owned implementations inside the existing monolithic `RepoPrompt` target. No future Item 5 target roots or `Package.swift` changes land yet.
 
-| Topic | Item 4 question |
-| --- | --- |
-| Combine | Which UI publications stay shell-only, and which runtime multi-observer channels need bounded async-stream seams? |
-| CryptoKit | Which hashing/authentication uses are standalone-toolchain safe versus adapter-owned? |
-| OSLog / `os` | Where is a neutral logging facade required versus shell-only diagnostics? |
-| `FoundationNetworking` | Which imports and uses are standalone-toolchain safe? |
-| Application Support defaults | Which paths are embedded-app defaults versus standalone profile policy? |
-| `UserDefaults` | Which settings remain app preferences versus reusable configuration or standalone persistence? |
+| Boundary | Neutral staged contract | macOS-owned staged implementation | Preserved behavior |
+| --- | --- | --- | --- |
+| Filesystem watching | `Infrastructure/Core/Platform/FileSystemWatching.swift` | `Infrastructure/FileSystem/MacOS/MacOSFSEventsWatcher.swift` | Dedicated callback queue deep-copies native payloads and maps FSEvents flags before the existing mailbox, overflow recovery, ignore evaluation, scan coalescing, and delta generation run. |
+| Process launching | `Infrastructure/Core/Platform/ProcessLaunching.swift` | `Infrastructure/Process/MacOS/POSIXProcessLauncher.swift` | Existing POSIX pipe/spawn semantics remain behind a compatibility facade while the injected adapter is available to staged host composition. |
+| Secure storage | `Infrastructure/Core/Platform/SecureKeyValueStorageBackend.swift` | `Infrastructure/Security/MacOS/KeychainService.swift`, `AppSecureKeyValueStorageFactory.swift`, `RuntimeCodeSigningDetector.swift` | Neutral access modes and errors are separated from embedded-app Keychain/signing selection policy. |
+| App-proxy socket boundary | `Infrastructure/MCP/Platform/MCPAppProxyTransportBoundary.swift` | `Infrastructure/MCP/AppProxy/` | Accepted sockets produce a normalized peer identity with trusted-socket versus handshake-fallback provenance. Only `LOCAL_PEERPID` is authorization input; the range-checked handshake PID is diagnostic metadata and admission fails closed when trusted socket credentials are unavailable. |
+| Bundled-helper verification | `Infrastructure/MCP/Platform/BundledHelperPeerVerifying.swift` | `Infrastructure/MCP/PeerVerification/MacOSBundledHelperPeerVerifier.swift` | Bundle helper URL and peer PID are explicit verifier inputs; canonical symlink-aware executable matching is preserved. |
+| Process ancestry | `Infrastructure/MCP/Platform/ProcessAncestryInspecting.swift` | `Infrastructure/MCP/PeerVerification/MacOSProcessAncestryInspector.swift` | Admission policy retains its ancestor walk while `sysctl` / `kinfo_proc` lookup moves to the adapter. |
+| Syntax declarations | syntax-only residual in `RepoPrompt-Bridging-Header.h` | deferred narrow syntax bridge target | Existing grammar entry points and scanner fallback remain unchanged. |
+
+## Closed Item 4 portability ledger
+
+| Topic | Classification | Exact disposition |
+| --- | --- | --- |
+| Combine | mixed: shell-only plus explicitly deferred runtime seam | Keep SwiftUI `ObservableObject` / `@Published` publications shell-owned. The filesystem publisher and workspace ingress subscription remain transitional inside the monolithic target; Item 5 replaces movable runtime multi-observer channels with bounded per-subscriber async streams before placing them in `RepoPromptCore`. |
+| CryptoKit | core-safe hashing, with standalone toolchain verification deferred | Current movable uses are deterministic SHA-256 hashing rather than secret persistence or UI policy. Keep them in the reusable inventory; if standalone Swift tooling rejects `CryptoKit`, Item 5 introduces a narrow digest helper backed by the package toolchain rather than an Apple adapter leak. |
+| OSLog / `os` | shell-only diagnostics or injected logging facade | Keep signposts and app diagnostics outside reusable runtime ownership. Movable logging sites must consume a neutral logging port during Item 5; `RepoPromptCore` must not import `OSLog` or `os`. |
+| `FoundationNetworking` | explicitly deferred capability seam | The first safe headless profile does not promote AI/network capability ownership. When networking is promoted, reusable Foundation HTTP code gains conditional `FoundationNetworking` imports where standalone Swift toolchains require them; no macOS adapter is implied. |
+| Application Support defaults | adapter-owned embedded-app policy | Reusable stores receive state-directory URLs. Existing embedded-app Application Support defaults stay shell/adapter-owned; the standalone host later receives its separate `Headless/` profile URL explicitly. |
+| `UserDefaults` | shell-only preferences or injected configuration | Reusable runtime code must not read `.standard`. Existing preference reads remain transitional in the monolithic target and move to shell-owned configuration snapshots or standalone JSON profile persistence as the Item 5 boundary is enforced. |
+
+## Exact seams deferred to Item 5
+
+- Create `RepoPromptCore`, `RepoPromptCoreMacOS`, and `RepoPromptSyntaxCBridge` targets and physical roots atomically; update `Package.swift` only then.
+- Move staged neutral contracts into `RepoPromptCore`, move macOS FSEvents, POSIX launcher, Keychain/signing policy, app-proxy socket files, peer verification, and ancestry lookup into `RepoPromptCoreMacOS`, and remove transitional macOS default arguments from reusable initializers in favor of composition-root injection.
+- Split remaining app-proxy connection/runtime policy so raw descriptors and Unix transport lifecycle remain adapter-owned while neutral routing/admission policy becomes reusable.
+- Promote process-launcher call-site injection only when the corresponding capability owners move; Item 4 intentionally preserves the existing static compatibility facade.
+- Replace movable Combine runtime channels with bounded async-stream seams, introduce a core logging port, and inject state-directory/configuration snapshots instead of carrying `UserDefaults.standard` or embedded-app Application Support defaults into core.
+- Create `RepoPromptSyntaxCBridge`, move the syntax-only residual declarations out of `RepoPrompt-Bridging-Header.h`, wire grammar products narrowly, and remove the target-wide bridging-header setting.
+- Run standalone Swift-toolchain compilation after the physical boundary lands and decide whether CryptoKit digest calls need a package-backed helper and where conditional `FoundationNetworking` imports belong.
+- Do not create the standalone host, package/install scripts, or headless commands until Items 6–7.
 
 ## Advisory boundary guardrail
 

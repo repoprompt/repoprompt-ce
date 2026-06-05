@@ -8,28 +8,6 @@
 import Foundation
 import Security
 
-/// Controls whether a Keychain operation may display macOS authentication/approval UI.
-enum KeychainAccessMode: Equatable {
-    case interactive
-    case nonInteractive(reason: KeychainAccessReason)
-
-    var isNonInteractive: Bool {
-        if case .nonInteractive = self {
-            return true
-        }
-        return false
-    }
-}
-
-/// Sanitized reason metadata for noninteractive Keychain access.
-enum KeychainAccessReason: Equatable {
-    case launch
-    case bulkSettingsLoad
-    case permissionDecision
-    case backgroundAvailabilityCheck
-    case test
-}
-
 protocol SecItemClient {
     func copyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<AnyObject?>?) -> OSStatus
     func add(_ query: CFDictionary, _ result: UnsafeMutablePointer<AnyObject?>?) -> OSStatus
@@ -110,34 +88,7 @@ final class KeychainService: SecureKeyValueStorageBackend {
         }
     }
 
-    enum KeychainError: Error, LocalizedError, Equatable {
-        case itemNotFound
-        case duplicateItem
-        case invalidData
-        case interactionNotAllowed
-        case userInteractionCancelled
-        case authenticationFailed
-        case unexpectedStatus(OSStatus)
-
-        var errorDescription: String? {
-            switch self {
-            case .itemNotFound:
-                "Item not found in keychain"
-            case .duplicateItem:
-                "Item already exists"
-            case .invalidData:
-                "Invalid data format"
-            case .interactionNotAllowed:
-                "Keychain interaction is not allowed in the current access mode"
-            case .userInteractionCancelled:
-                "Keychain interaction was cancelled"
-            case .authenticationFailed:
-                "Keychain authentication failed"
-            case let .unexpectedStatus(status):
-                "Keychain error: \(status)"
-            }
-        }
-    }
+    typealias KeychainError = SecureStorageError
 
     // MARK: - Save to Keychain
 

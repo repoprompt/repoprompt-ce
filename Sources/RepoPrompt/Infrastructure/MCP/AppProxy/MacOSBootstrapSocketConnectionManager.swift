@@ -1,5 +1,5 @@
 //
-//  BootstrapSocketConnectionManager.swift
+//  MacOSBootstrapSocketConnectionManager.swift
 //  RepoPrompt
 //
 //  Manages a single MCP connection received via the bootstrap socket.
@@ -37,12 +37,17 @@ private let bootstrapLog: Logger = {
 
 // MARK: - Connection Manager
 
+enum BootstrapSocketConnectionManagerError: Error {
+    case trustedPeerPIDUnavailable
+}
+
 /// Connection manager for bootstrap socket connections.
 /// Unlike FileSystemMCPConnectionManager, this doesn't use filesystem folders or meta.json.
 actor BootstrapSocketConnectionManager: MCPServerConnection {
     private let connectionID: UUID
     private let sessionToken: String
-    private let clientPid: Int
+    private let peerIdentity: MCPPeerIdentity
+    private let trustedPeerPID: Int
     private let _clientName: String?
     private let purpose: MCPRunPurpose
     private let server: MCP.Server
@@ -66,7 +71,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     /// Verified peer PID for this connection (from the bootstrap socket).
     func peerPID() -> Int {
-        clientPid
+        trustedPeerPID
     }
 
     private var healthMonitoringTask: Task<Void, Never>?
@@ -78,16 +83,20 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     init(
         connectionID: UUID,
         sessionToken: String,
-        clientPid: Int,
+        peerIdentity: MCPPeerIdentity,
         clientName: String?,
         purpose: MCPRunPurpose,
         codeMapsDisabled: Bool,
         connectedFD: Int32,
         parentManager: ServerNetworkManager
     ) throws {
+        guard let trustedPeerPID = peerIdentity.trustedPID else {
+            throw BootstrapSocketConnectionManagerError.trustedPeerPIDUnavailable
+        }
         self.connectionID = connectionID
         self.sessionToken = sessionToken
-        self.clientPid = clientPid
+        self.peerIdentity = peerIdentity
+        self.trustedPeerPID = trustedPeerPID
         _clientName = clientName
         self.purpose = purpose
         self.parentManager = parentManager

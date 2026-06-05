@@ -1130,11 +1130,4 @@ extension FileSystemService {
         if child.isEmpty { return base }
         return base + "/" + child
     }
-
-    func getCoreCount() -> Int {
-        var count: Int32 = 0
-        var size = MemoryLayout<Int32>.size
-        sysctlbyname("hw.ncpu", &count, &size, nil, 0)
-        return Int(count)
-    }
 }

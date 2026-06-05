@@ -1,3 +1,5 @@
+import CSwiftPCRE2
+
 public final class PCRE2Regex: @unchecked Sendable {
 	/// A reusable, single-consumer matching session.
 	///

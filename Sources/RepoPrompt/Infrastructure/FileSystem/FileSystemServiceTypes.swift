@@ -1,39 +1,4 @@
-import CoreServices
 import Foundation
-#if DEBUG || EDIT_FLOW_PERF
-    import os
-#endif
-
-enum FileSystemPublishPerf {
-    #if DEBUG || EDIT_FLOW_PERF
-        typealias State = OSSignpostIntervalState
-        static let signposter = OSSignposter(subsystem: "com.repoprompt.workspace", category: "fs-publish")
-        static var isEnabled: Bool {
-            UserDefaults.standard.bool(forKey: "enableRepoFileReplaySignposts")
-        }
-
-        static func begin(_ name: StaticString) -> State? {
-            guard isEnabled else { return nil }
-            return signposter.beginInterval(name)
-        }
-
-        static func end(_ name: StaticString, _ state: State?) {
-            guard isEnabled, let state else { return }
-            signposter.endInterval(name, state)
-        }
-    #else
-        struct State {}
-        static var isEnabled: Bool {
-            false
-        }
-
-        static func begin(_ name: StaticString) -> State? {
-            nil
-        }
-
-        static func end(_ name: StaticString, _ state: State?) {}
-    #endif
-}
 
 public enum FileSystemDelta: Sendable, Equatable {
     case fileAdded(String)
@@ -58,7 +23,7 @@ struct FileSystemDeltaPublication {
     let deltas: [FileSystemDelta]
 }
 
-typealias PendingFSEvent = (path: String, flags: FSEventStreamEventFlags, id: FSEventStreamEventId)
+typealias PendingFSEvent = (path: String, flags: FileSystemWatchEventFlags, id: FileSystemWatchEventID)
 
 struct PendingFSEventBatch {
     var events: [PendingFSEvent] = []

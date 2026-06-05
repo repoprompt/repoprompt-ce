@@ -1,7 +1,5 @@
 import Foundation
-
-/// Define size_t for C interop
-typealias size_t = Int
+import RepoPromptC
 
 /// High-performance path search index using C implementation for binary search
 /// Optimized for >1k files with O(log n + k*m) search complexity
@@ -16,7 +14,7 @@ actor PathSearchIndex {
 
     // MARK: - Private State
 
-    private var cIndex: OpaquePointer? // path_search_index_t*
+    private var cIndex: UnsafeMutablePointer<path_search_index_t>?
     private var originalPaths: [String] = []
     private var filenames: [String] = []
 
@@ -56,7 +54,7 @@ actor PathSearchIndex {
 
         // Convert C results to Swift candidates
         var candidates: [Candidate] = []
-        let resultPtr = UnsafePointer<search_result_t>(searchResult)
+        let resultPtr = UnsafePointer(searchResult)
         let count = Int(resultPtr.pointee.count)
         candidates.reserveCapacity(count)
 
@@ -99,14 +97,14 @@ actor PathSearchIndex {
         }
 
         // Create C string array
-        let cPaths = paths.map { strdup($0) }
+        let cPaths = paths.map { repo_strdup($0) }
         defer {
-            cPaths.forEach { free($0) }
+            cPaths.forEach { repo_free($0) }
         }
 
         // Create index using C implementation
-        let cPathsPointers = cPaths.map { UnsafePointer<CChar>($0) }
-        cPathsPointers.withUnsafeBufferPointer { buffer in
+        var cPathsPointers = cPaths.map { UnsafePointer<CChar>($0) }
+        cPathsPointers.withUnsafeMutableBufferPointer { buffer in
             cIndex = path_search_create(buffer.baseAddress, paths.count)
         }
     }
@@ -169,26 +167,4 @@ actor LRUCacheActor<Key: Hashable, Value> {
     func clear() {
         cache.removeAll()
     }
-}
-
-// MARK: - C Bridge Functions
-
-/// Import the C functions
-@_silgen_name("path_search_create")
-func path_search_create(_ paths: UnsafePointer<UnsafePointer<CChar>?>?, _ count: Int) -> OpaquePointer?
-
-@_silgen_name("path_search_destroy")
-func path_search_destroy(_ index: OpaquePointer?)
-
-@_silgen_name("path_search_find")
-func path_search_find(_ index: OpaquePointer?, _ pattern: UnsafePointer<CChar>?, _ limit: Int) -> OpaquePointer?
-
-@_silgen_name("search_result_destroy")
-func search_result_destroy(_ result: OpaquePointer?)
-
-/// C struct definitions for bridging
-struct search_result_t {
-    var indices: UnsafeMutablePointer<size_t>?
-    var count: size_t
-    var capacity: size_t
 }

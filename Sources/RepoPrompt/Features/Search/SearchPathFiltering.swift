@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptC
 
 enum SearchPathClause: Equatable {
     case exactFile(absPath: String, relPath: String, restrictedRootPath: String?)
