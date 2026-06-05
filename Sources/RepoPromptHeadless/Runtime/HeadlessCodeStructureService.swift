@@ -95,31 +95,31 @@ final class HeadlessCodeStructureService {
     private func patterns(for ext: String) -> [Pattern] {
         switch ext {
         case "swift":
-            return [
+            [
                 Pattern(kind: "type", regex: #"^(?:public|private|fileprivate|internal|open)?\s*(?:final\s+)?(?:class|struct|enum|protocol|actor|extension)\s+[^:{]+"#),
                 Pattern(kind: "function", regex: #"^(?:public|private|fileprivate|internal|open)?\s*(?:static\s+)?func\s+[^\{]+"#),
                 Pattern(kind: "initializer", regex: #"^(?:public|private|fileprivate|internal|open)?\s*init\s*\([^\{]*"#)
             ]
         case "py":
-            return [Pattern(kind: "type", regex: #"^class\s+[^:]+"#), Pattern(kind: "function", regex: #"^(?:async\s+)?def\s+[^:]+"#)]
+            [Pattern(kind: "type", regex: #"^class\s+[^:]+"#), Pattern(kind: "function", regex: #"^(?:async\s+)?def\s+[^:]+"#)]
         case "js", "jsx", "ts", "tsx":
-            return [
+            [
                 Pattern(kind: "type", regex: #"^(?:export\s+)?(?:default\s+)?class\s+[^\{]+"#),
                 Pattern(kind: "function", regex: #"^(?:export\s+)?(?:async\s+)?function\s+[^\{]+"#),
                 Pattern(kind: "function", regex: #"^(?:export\s+)?(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?\([^=]*\)\s*=>"#)
             ]
         case "go":
-            return [Pattern(kind: "type", regex: #"^type\s+\w+\s+(?:struct|interface)"#), Pattern(kind: "function", regex: #"^func\s+[^\{]+"#)]
+            [Pattern(kind: "type", regex: #"^type\s+\w+\s+(?:struct|interface)"#), Pattern(kind: "function", regex: #"^func\s+[^\{]+"#)]
         case "rs":
-            return [Pattern(kind: "type", regex: #"^(?:pub\s+)?(?:struct|enum|trait|impl)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:pub\s+)?(?:async\s+)?fn\s+[^\{]+"#)]
+            [Pattern(kind: "type", regex: #"^(?:pub\s+)?(?:struct|enum|trait|impl)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:pub\s+)?(?:async\s+)?fn\s+[^\{]+"#)]
         case "rb":
-            return [Pattern(kind: "type", regex: #"^class\s+.+"#), Pattern(kind: "type", regex: #"^module\s+.+"#), Pattern(kind: "function", regex: #"^def\s+.+"#)]
+            [Pattern(kind: "type", regex: #"^class\s+.+"#), Pattern(kind: "type", regex: #"^module\s+.+"#), Pattern(kind: "function", regex: #"^def\s+.+"#)]
         case "java", "cs":
-            return [Pattern(kind: "type", regex: #"^(?:public|private|protected|internal|static|sealed|abstract|final|partial|\s)+\s*(?:class|interface|enum|record|struct)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:public|private|protected|internal|static|async|final|virtual|override|\s)+[\w<>\[\],?]+\s+\w+\s*\([^\)]*\)"#)]
+            [Pattern(kind: "type", regex: #"^(?:public|private|protected|internal|static|sealed|abstract|final|partial|\s)+\s*(?:class|interface|enum|record|struct)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:public|private|protected|internal|static|async|final|virtual|override|\s)+[\w<>\[\],?]+\s+\w+\s*\([^\)]*\)"#)]
         case "php":
-            return [Pattern(kind: "type", regex: #"^(?:final\s+|abstract\s+)?(?:class|interface|trait|enum)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:public|private|protected|static|\s)*function\s+[^\{]+"#)]
+            [Pattern(kind: "type", regex: #"^(?:final\s+|abstract\s+)?(?:class|interface|trait|enum)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^(?:public|private|protected|static|\s)*function\s+[^\{]+"#)]
         default:
-            return [Pattern(kind: "type", regex: #"^(?:class|struct|enum|interface)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^[\w\s\*:&<>]+\s+\w+\s*\([^\)]*\)"#)]
+            [Pattern(kind: "type", regex: #"^(?:class|struct|enum|interface)\s+[^\{]+"#), Pattern(kind: "function", regex: #"^[\w\s\*:&<>]+\s+\w+\s*\([^\)]*\)"#)]
         }
     }
 

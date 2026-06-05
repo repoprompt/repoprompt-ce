@@ -132,8 +132,8 @@ enum HeadlessSelectionTools {
         for entry in normalized(selection) {
             lines.append("- `\(displayPath(for: entry, roots: roots))` (\(entry.mode.rawValue)\(rangeSuffix(entry.ranges)))")
         }
-        return HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
-            "files": try HeadlessJSONValue.value(normalized(selection)),
+        return try HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
+            "files": HeadlessJSONValue.value(normalized(selection)),
             "codemap_auto_enabled": false,
             "total_tokens": 0,
             "summary": "\(selection.count) selected entr\(selection.count == 1 ? "y" : "ies")"

@@ -19,7 +19,7 @@ final class HeadlessSearchService {
         let pattern = try HeadlessToolArguments.requiredString(arguments, key: "pattern")
         let mode = HeadlessToolArguments.string(arguments, key: "mode") ?? "auto"
         let countOnly = HeadlessToolArguments.bool(arguments, key: "count_only") ?? false
-        let maxResults = max(1, min(HeadlessToolArguments.int(arguments, key: "max_results") ?? 50, 1_000))
+        let maxResults = max(1, min(HeadlessToolArguments.int(arguments, key: "max_results") ?? 50, 1000))
         let contextLines = max(0, min(HeadlessToolArguments.int(arguments, key: "context_lines") ?? 0, 5))
         let wholeWord = HeadlessToolArguments.bool(arguments, key: "whole_word") ?? false
         let regexFlag = HeadlessToolArguments.bool(arguments, key: "regex")
@@ -38,7 +38,7 @@ final class HeadlessSearchService {
             var entries: [HeadlessCatalogEntry] = []
             for filterPath in filterPaths {
                 let resolved = try resolver.resolve(filterPath)
-                entries.append(contentsOf: try catalog.scan(roots: [resolved.root], under: resolved))
+                try entries.append(contentsOf: catalog.scan(roots: [resolved.root], under: resolved))
             }
             searchRoots = entries
         }
@@ -78,7 +78,7 @@ final class HeadlessSearchService {
                 if contentMatches.count < maxResults {
                     let start = max(0, index - contextLines)
                     let end = min(lines.count - 1, index + contextLines)
-                    let context = (start...end).map { lineIndex in
+                    let context = (start ... end).map { lineIndex in
                         ["line": lineIndex + 1, "text": lines[lineIndex]] as [String: Any]
                     }
                     contentMatches.append([
@@ -174,7 +174,7 @@ final class HeadlessSearchService {
 
         func matches(_ text: String) -> Bool {
             if let regex {
-                let range = NSRange(text.startIndex..<text.endIndex, in: text)
+                let range = NSRange(text.startIndex ..< text.endIndex, in: text)
                 return regex.firstMatch(in: text, range: range) != nil
             }
             return text.localizedCaseInsensitiveContains(pattern)

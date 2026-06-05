@@ -7,7 +7,7 @@ actor HeadlessHost {
 
     init(configurationStore: HeadlessConfigurationStore, fileManager: FileManager = .default) {
         self.configurationStore = configurationStore
-        self.workspaceStore = HeadlessWorkspaceStore(paths: configurationStore.paths, fileManager: fileManager)
+        workspaceStore = HeadlessWorkspaceStore(paths: configurationStore.paths, fileManager: fileManager)
         self.fileManager = fileManager
     }
 
@@ -136,28 +136,33 @@ actor HeadlessHost {
         let exportsRoot = configurationStore.paths.exportsDirectory.standardizedFileURL
         try fileManager.createDirectory(at: exportsRoot, withIntermediateDirectories: true)
 
-        let target: URL
-        if let requestedPath, !requestedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let target: URL = if let requestedPath, !requestedPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if requestedPath.hasPrefix("/") {
-                target = URL(fileURLWithPath: requestedPath).standardizedFileURL
+                URL(fileURLWithPath: requestedPath).standardizedFileURL
             } else {
-                target = exportsRoot.appendingPathComponent(requestedPath, isDirectory: false).standardizedFileURL
+                exportsRoot.appendingPathComponent(requestedPath, isDirectory: false).standardizedFileURL
             }
         } else {
-            target = exportsRoot.appendingPathComponent(defaultFileName, isDirectory: false).standardizedFileURL
+            exportsRoot.appendingPathComponent(defaultFileName, isDirectory: false).standardizedFileURL
         }
 
         let parent = target.deletingLastPathComponent().standardizedFileURL
-        let targetPath = target.path
-        let statePath = stateRoot.path
-        let exportsPath = exportsRoot.path
-        let inState = HeadlessRootAccessPolicy.path(targetPath, isContainedInOrEqualTo: statePath)
-        let inExports = HeadlessRootAccessPolicy.path(targetPath, isContainedInOrEqualTo: exportsPath)
-        guard inState || permissions.exportOutsideStateDirectory else {
+        let resolvedStatePath = stateRoot.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedExportsPath = exportsRoot.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedParentPath = parent.resolvingSymlinksInPath().standardizedFileURL.path
+        let resolvedTargetPath = target.resolvingSymlinksInPath().standardizedFileURL.path
+        let inState = HeadlessRootAccessPolicy.path(resolvedTargetPath, isContainedInOrEqualTo: resolvedStatePath)
+        let inExports = HeadlessRootAccessPolicy.path(resolvedTargetPath, isContainedInOrEqualTo: resolvedExportsPath)
+        let parentInState = HeadlessRootAccessPolicy.path(resolvedParentPath, isContainedInOrEqualTo: resolvedStatePath)
+        let parentInExports = HeadlessRootAccessPolicy.path(resolvedParentPath, isContainedInOrEqualTo: resolvedExportsPath)
+        guard (inState && parentInState) || permissions.exportOutsideStateDirectory else {
             throw HeadlessCommandError("Export path is outside the headless state directory and export_outside_state_directory is false: \(target.path)", exitCode: 2)
         }
-        if !(requestedPath?.hasPrefix("/") ?? false), !inExports {
+        if !(requestedPath?.hasPrefix("/") ?? false), !(inExports && parentInExports) {
             throw HeadlessCommandError("Relative export path escapes the headless Exports directory: \(requestedPath ?? defaultFileName)", exitCode: 2)
+        }
+        if let values = try? target.resourceValues(forKeys: [.isSymbolicLinkKey]), values.isSymbolicLink == true {
+            throw HeadlessCommandError("Export target must not be an existing symbolic link: \(target.path)", exitCode: 2)
         }
         try fileManager.createDirectory(at: parent, withIntermediateDirectories: true)
         return target

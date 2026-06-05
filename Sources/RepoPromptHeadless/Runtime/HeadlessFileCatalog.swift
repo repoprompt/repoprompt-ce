@@ -8,11 +8,11 @@ final class HeadlessFileCatalog {
         self.fileManager = fileManager
     }
 
-    func scan(roots: [HeadlessAllowedRoot], under basePath: HeadlessResolvedPath? = nil, maxEntries: Int = 20_000) throws -> [HeadlessCatalogEntry] {
+    func scan(roots: [HeadlessAllowedRoot], under basePath: HeadlessResolvedPath? = nil, maxEntries: Int = 20000) throws -> [HeadlessCatalogEntry] {
         let scanRoots: [(root: HeadlessAllowedRoot, url: URL)]
         if let basePath {
             guard basePath.isDirectory else {
-                return [try catalogEntry(for: basePath.root, url: basePath.url)]
+                return try [catalogEntry(for: basePath.root, url: basePath.url)]
             }
             scanRoots = [(basePath.root, basePath.url)]
         } else {
@@ -83,7 +83,7 @@ final class HeadlessFileCatalog {
         )
     }
 
-    func filesUnder(_ path: HeadlessResolvedPath, maxFiles: Int = 1_000) throws -> [HeadlessResolvedPath] {
+    func filesUnder(_ path: HeadlessResolvedPath, maxFiles: Int = 1000) throws -> [HeadlessResolvedPath] {
         guard path.isDirectory else {
             return [path]
         }
@@ -108,11 +108,10 @@ final class HeadlessFileCatalog {
         if mode == "selected" {
             return ("", roots.count, false)
         }
-        let targets: [(HeadlessAllowedRoot, URL)]
-        if let basePath {
-            targets = [(basePath.root, basePath.url)]
+        let targets: [(HeadlessAllowedRoot, URL)] = if let basePath {
+            [(basePath.root, basePath.url)]
         } else {
-            targets = roots.map { ($0, URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL) }
+            roots.map { ($0, URL(fileURLWithPath: $0.path, isDirectory: true).standardizedFileURL) }
         }
         var lines: [String] = []
         var truncated = false
@@ -120,7 +119,7 @@ final class HeadlessFileCatalog {
             if index > 0 { lines.append("") }
             let rootLabel = basePath == nil ? target.0.name : (basePath?.displayPath ?? target.0.name)
             lines.append(rootLabel)
-            let result = try appendTreeLines(root: target.0, directory: target.1, prefix: "", depth: 0, maxDepth: maxDepth ?? 4, lines: &lines, maxLines: 1_500)
+            let result = try appendTreeLines(root: target.0, directory: target.1, prefix: "", depth: 0, maxDepth: maxDepth ?? 4, lines: &lines, maxLines: 1500)
             truncated = truncated || result
         }
         return (lines.joined(separator: "\n"), targets.count, truncated)

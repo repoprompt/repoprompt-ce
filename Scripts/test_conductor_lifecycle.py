@@ -146,6 +146,57 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertNotIn("LOCAL_SELF_SIGNED_CERTIFICATE_NAME", env)
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
+    def test_headless_operations_delegate_without_live_app_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            package_argv, package_lanes, _cwd, _env, package_timeout = registry.prepare(
+                {"operation": "package-headless", "args": {"config": "debug"}}
+            )
+            install_argv, install_lanes, _cwd, _env, _install_timeout = registry.prepare(
+                {"operation": "install-headless-debug"}
+            )
+            status_argv, status_lanes, _cwd, _env, status_timeout = registry.prepare(
+                {"operation": "headless-debug-status"}
+            )
+            smoke_argv, smoke_lanes, _cwd, _env, _smoke_timeout = registry.prepare(
+                {"operation": "headless-smoke", "args": {"config": "release"}}
+            )
+
+        self.assertEqual(Path(package_argv[0]).name, "package_headless.sh")
+        self.assertEqual(package_argv[1], "debug")
+        self.assertEqual(package_lanes, ["build", "headlessArtifact"])
+        self.assertEqual(Path(install_argv[0]).name, "install_headless_cli.sh")
+        self.assertEqual(install_argv[1:], ["install", "--configuration", "debug", "--build"])
+        self.assertEqual(install_lanes, ["build", "headlessArtifact"])
+        self.assertEqual(Path(status_argv[0]).name, "install_headless_cli.sh")
+        self.assertEqual(status_argv[1:], ["status", "--configuration", "debug"])
+        self.assertEqual(status_lanes, [])
+        self.assertEqual(status_timeout, conductor.SHORT_TIMEOUT_SECONDS)
+        self.assertEqual(Path(smoke_argv[0]).name, "smoke_headless_mcp.sh")
+        self.assertEqual(smoke_argv[1:], ["--configuration", "release"])
+        self.assertEqual(smoke_lanes, ["build", "headlessArtifact", "headlessSmoke"])
+        for lane_set in (package_lanes, install_lanes, status_lanes, smoke_lanes):
+            self.assertNotIn("liveApp", lane_set)
+        self.assertEqual(package_timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+
+    def test_swift_build_accepts_headless_product_choice(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "swift-build", ["--product", "repoprompt-headless"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"product": "repoprompt-headless"})
+
+    def test_headless_smoke_cli_accepts_configuration(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "headless-smoke", ["--configuration", "release"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"config": "release"})
+
     def test_app_stop_supersedes_queued_live_app_but_not_build_only_work(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)

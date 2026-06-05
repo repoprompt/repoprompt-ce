@@ -27,7 +27,7 @@ enum HeadlessToolResponse {
 }
 
 enum HeadlessJSONValue {
-    static func value<T: Encodable>(_ encodable: T) throws -> Any {
+    static func value(_ encodable: some Encodable) throws -> Any {
         let data = try HeadlessJSONFormatting.encoder(prettyPrinted: false).encode(encodable)
         return try JSONSerialization.jsonObject(with: data, options: [])
     }
@@ -128,13 +128,24 @@ struct HeadlessToolDescriptor {
     let name: String
     let description: String
     let inputSchema: HeadlessJSONObject
+    let readOnlyHint: Bool?
+
+    init(name: String, description: String, inputSchema: HeadlessJSONObject, readOnlyHint: Bool? = nil) {
+        self.name = name
+        self.description = description
+        self.inputSchema = inputSchema
+        self.readOnlyHint = readOnlyHint
+    }
 
     var json: HeadlessJSONObject {
-        [
+        var payload: HeadlessJSONObject = [
             "name": name,
             "description": description,
-            "inputSchema": inputSchema,
-            "annotations": ["readOnlyHint": true]
+            "inputSchema": inputSchema
         ]
+        if let readOnlyHint {
+            payload["annotations"] = ["readOnlyHint": readOnlyHint]
+        }
+        return payload
     }
 }

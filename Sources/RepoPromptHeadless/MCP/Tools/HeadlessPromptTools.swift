@@ -78,9 +78,9 @@ enum HeadlessPromptTools {
         let includes = Set(HeadlessToolArguments.stringArray(arguments, key: "include") ?? ["prompt", "selection", "code", "tokens"])
         let resolver = HeadlessPathResolver(roots: snapshot.roots)
         var sections: [String] = ["## Prompt Context ✅", "- **Workspace**: \(workspace.name)", "- **Copy preset**: Headless Default"]
-        var structured: HeadlessJSONObject = [
-            "workspace": try HeadlessJSONValue.value(workspace),
-            "roots": try HeadlessJSONValue.value(snapshot.roots),
+        var structured: HeadlessJSONObject = try [
+            "workspace": HeadlessJSONValue.value(workspace),
+            "roots": HeadlessJSONValue.value(snapshot.roots),
             "include": Array(includes).sorted()
         ]
 

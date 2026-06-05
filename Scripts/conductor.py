@@ -2,7 +2,7 @@
 """RepoPrompt CE developer daemon.
 
 Implements repo-internal daemon/job mechanics, fake sleep validation support,
-and delegated build/package/test/debug-app/live-smoke/release operation
+and delegated build/package/test/debug-app/live-smoke/headless-smoke/release operation
 families. Synchronous jobs print concise summaries by default and preserve raw
 logs under the daemon jobs directory.
 """
@@ -33,7 +33,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 PROTOCOL_VERSION = 3
 TERMINAL_STATES = {"completed", "failed", "canceled"}
-LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
+LANE_NAMES = {"build", "debugArtifact", "headlessArtifact", "headlessSmoke", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
@@ -77,6 +77,10 @@ IMPLEMENTED_OPERATIONS = {
     "provider-test",
     "install-debug-cli",
     "debug-cli-status",
+    "package-headless",
+    "install-headless-debug",
+    "headless-debug-status",
+    "headless-smoke",
     "run",
     "app",
     "smoke",
@@ -114,13 +118,17 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-headless|all
   ./conductor build
   ./conductor package debug|release
+  ./conductor package-headless [debug|release]
   ./conductor test [--filter <filter>]
   ./conductor provider-test [--filter <filter>]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
+  ./conductor install-headless-debug
+  ./conductor headless-debug-status
+  ./conductor headless-smoke [--configuration debug|release]  # standalone direct-stdio MCP smoke; no app launch
   ./conductor run [-- <app args...>]                  # FIFO coordinated run
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
@@ -133,7 +141,7 @@ Operation commands:
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
   ./conductor fake-sleep <seconds> [same options]
-  valid lanes: build, debugArtifact, liveApp, release, style
+  valid lanes: build, debugArtifact, headlessArtifact, headlessSmoke, liveApp, release, style
 
 Global operation flags:
   --async              enqueue and return a ticket immediately
@@ -777,6 +785,13 @@ class OperationRegistry:
         "REPOPROMPT_DEBUG_APP_BUNDLE",
         "REPOPROMPT_DEBUG_CLI_INSTALL_PATH",
     ]
+    HEADLESS_ENV_KEYS = [
+        "REPOPROMPT_HEADLESS_TOOLS_ROOT",
+        "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_BINARY",
+        "REPOPROMPT_HEADLESS_STATE_DIR",
+    ]
     BUILD_ENV_KEYS = [
         "PATH",
         "DEVELOPER_DIR",
@@ -801,7 +816,7 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + HEADLESS_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -895,6 +910,14 @@ class OperationRegistry:
             return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
+        if operation == "package-headless":
+            return [script("package_headless.sh"), str(args.get("config") or "debug")], ["build", "headlessArtifact"], cwd, env, effective_timeout
+        if operation == "install-headless-debug":
+            return [script("install_headless_cli.sh"), "install", "--configuration", "debug", "--build"], ["build", "headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-debug-status":
+            return [script("install_headless_cli.sh"), "status", "--configuration", "debug"], lanes, cwd, env, effective_timeout
+        if operation == "headless-smoke":
+            return [script("smoke_headless_mcp.sh"), "--configuration", str(args.get("config") or "debug")], ["build", "headlessArtifact", "headlessSmoke"], cwd, env, effective_timeout
         if operation == "run":
             return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
         if operation == "app":
@@ -974,7 +997,7 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {"doctor", "guardrails", "debug-cli-status", "headless-debug-status", "format-tools-status", "check-format-tools"}:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
@@ -2615,7 +2638,7 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
+    for product in ["RepoPrompt", "repoprompt-mcp", "repoprompt-headless"]:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
         if code != 0:
             return code
@@ -2825,6 +2848,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "build",
         "install-debug-cli",
         "debug-cli-status",
+        "install-headless-debug",
+        "headless-debug-status",
         "format",
         "format-check",
         "lint",
@@ -2835,7 +2860,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
-        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-headless", "all"])
         ns = parser.parse_args(rest)
         args["product"] = ns.product
     elif operation == "package":
@@ -2843,6 +2868,16 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
+    elif operation == "package-headless":
+        parser = argparse.ArgumentParser(prog="conductor package-headless")
+        parser.add_argument("config", nargs="?", default="debug", choices=["debug", "release"])
+        ns = parser.parse_args(rest)
+        args["config"] = ns.config
+    elif operation == "headless-smoke":
+        parser = argparse.ArgumentParser(prog="conductor headless-smoke")
+        parser.add_argument("--configuration", default="debug", choices=["debug", "release"])
+        ns = parser.parse_args(rest)
+        args["config"] = ns.configuration
     elif operation == "test":
         parser = argparse.ArgumentParser(prog="conductor test")
         parser.add_argument("--filter")

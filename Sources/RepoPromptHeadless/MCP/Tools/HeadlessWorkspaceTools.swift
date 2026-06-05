@@ -9,19 +9,18 @@ enum HeadlessWorkspaceTools {
             return try workspaceListResponse(config: listing.config, workspaces: listing.workspaces, title: "## Headless Contexts ✅")
         case "get", "status":
             let snapshot = try await host.snapshot(requireWorkspace: false)
-            let text: String
-            if let workspace = snapshot.workspace {
-                text = "## Headless Context Binding ✅\n- **Active workspace**: \(workspace.name) (`\(workspace.id.uuidString)`)\n- **Roots**: \(snapshot.roots.map(\.name).joined(separator: ", "))\n- **State directory**: `\(snapshot.config.activeWorkspaceID == nil ? "unbound" : "bound")`"
+            let text = if let workspace = snapshot.workspace {
+                "## Headless Context Binding ✅\n- **Active workspace**: \(workspace.name) (`\(workspace.id.uuidString)`)\n- **Roots**: \(snapshot.roots.map(\.name).joined(separator: ", "))\n- **State directory**: `\(snapshot.config.activeWorkspaceID == nil ? "unbound" : "bound")`"
             } else {
-                text = "## Headless Context Binding ⚠️\nNo active headless workspace is bound. Configure roots and create/select a workspace first."
+                "## Headless Context Binding ⚠️\nNo active headless workspace is bound. Configure roots and create/select a workspace first."
             }
-            return HeadlessToolResponse.success(text: text, structured: try snapshotJSON(snapshot))
+            return try HeadlessToolResponse.success(text: text, structured: snapshotJSON(snapshot))
         case "bind":
             let token = try workspaceToken(arguments)
             let workspace = try await host.selectWorkspace(token: token)
             let snapshot = try await host.snapshot(requireWorkspace: true)
             let text = "## Headless Context Binding ✅\n- **Bound workspace**: \(workspace.name) (`\(workspace.id.uuidString)`)\n- **Roots**: \(snapshot.roots.map(\.name).joined(separator: ", "))"
-            return HeadlessToolResponse.success(text: text, structured: try snapshotJSON(snapshot))
+            return try HeadlessToolResponse.success(text: text, structured: snapshotJSON(snapshot))
         default:
             throw HeadlessCommandError("Unsupported bind_context op '\(op)'. Supported ops: list, get, bind.", exitCode: 2)
         }
@@ -35,7 +34,7 @@ enum HeadlessWorkspaceTools {
             return try workspaceListResponse(config: listing.config, workspaces: listing.workspaces, title: "## Headless Workspaces ✅")
         case "get":
             let snapshot = try await host.snapshot(requireWorkspace: false)
-            return HeadlessToolResponse.success(text: workspaceSnapshotText(snapshot), structured: try snapshotJSON(snapshot))
+            return try HeadlessToolResponse.success(text: workspaceSnapshotText(snapshot), structured: snapshotJSON(snapshot))
         case "create":
             let name = try HeadlessToolArguments.requiredString(arguments, key: "name")
             let roots = HeadlessToolArguments.stringArray(arguments, key: "roots")
@@ -44,12 +43,12 @@ enum HeadlessWorkspaceTools {
                 ?? []
             let workspace = try await host.createWorkspace(name: name, rootTokens: roots)
             let text = "## Headless Workspace Created ✅\n- **Name**: \(workspace.name)\n- **ID**: `\(workspace.id.uuidString)`\n- **Root count**: \(workspace.rootIDs.count)"
-            return HeadlessToolResponse.success(text: text, structured: try HeadlessJSONValue.value(workspace))
+            return try HeadlessToolResponse.success(text: text, structured: HeadlessJSONValue.value(workspace))
         case "select", "switch":
             let token = try workspaceToken(arguments)
             let workspace = try await host.selectWorkspace(token: token)
             let text = "## Headless Workspace Selected ✅\n- **Name**: \(workspace.name)\n- **ID**: `\(workspace.id.uuidString)`"
-            return HeadlessToolResponse.success(text: text, structured: try HeadlessJSONValue.value(workspace))
+            return try HeadlessToolResponse.success(text: text, structured: HeadlessJSONValue.value(workspace))
         case "rename":
             let token = HeadlessToolArguments.string(arguments, key: "workspace") ?? HeadlessToolArguments.string(arguments, key: "id")
             let newName = HeadlessToolArguments.string(arguments, key: "new_name") ?? HeadlessToolArguments.string(arguments, key: "name")
@@ -58,7 +57,7 @@ enum HeadlessWorkspaceTools {
             }
             let workspace = try await host.renameWorkspace(token: token, newName: newName)
             let text = "## Headless Workspace Renamed ✅\n- **Name**: \(workspace.name)\n- **ID**: `\(workspace.id.uuidString)`"
-            return HeadlessToolResponse.success(text: text, structured: try HeadlessJSONValue.value(workspace))
+            return try HeadlessToolResponse.success(text: text, structured: HeadlessJSONValue.value(workspace))
         case "delete", "hide", "unhide", "add_folder", "remove_folder", "create_tab", "close_tab", "select_tab", "list_tabs":
             throw HeadlessCommandError("manage_workspaces op '\(op)' is app/window or destructive and is not supported by the standalone safe profile.", exitCode: 2)
         default:
@@ -82,9 +81,9 @@ enum HeadlessWorkspaceTools {
             let marker = workspace.id == config.activeWorkspaceID ? "*" : "-"
             lines.append("\(marker) \(workspace.name) (`\(workspace.id.uuidString)`) roots=\(workspace.rootIDs.count) selection=\(workspace.selection.count)")
         }
-        return HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
+        return try HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
             "active_workspace_id": config.activeWorkspaceID?.uuidString ?? NSNull(),
-            "workspaces": try HeadlessJSONValue.value(workspaces)
+            "workspaces": HeadlessJSONValue.value(workspaces)
         ])
     }
 
@@ -96,9 +95,9 @@ enum HeadlessWorkspaceTools {
     }
 
     private static func snapshotJSON(_ snapshot: HeadlessWorkspaceSnapshot) throws -> HeadlessJSONObject {
-        var object: HeadlessJSONObject = [
-            "config": try HeadlessJSONValue.value(snapshot.config),
-            "roots": try HeadlessJSONValue.value(snapshot.roots)
+        var object: HeadlessJSONObject = try [
+            "config": HeadlessJSONValue.value(snapshot.config),
+            "roots": HeadlessJSONValue.value(snapshot.roots)
         ]
         if let workspace = snapshot.workspace {
             object["workspace"] = try HeadlessJSONValue.value(workspace)

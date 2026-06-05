@@ -1,7 +1,7 @@
 import Foundation
 import Security
 
-package struct RuntimeCodeSigningInfo: Equatable, Sendable {
+package struct RuntimeCodeSigningInfo: Equatable {
     package let teamIdentifier: String?
     package let codeIdentifier: String?
     package let detectionErrorDescription: String?

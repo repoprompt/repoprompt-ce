@@ -1,13 +1,13 @@
 import Foundation
 
 /// Origin of the PID used for app-proxy admission policy.
-package enum MCPPeerPIDProvenance: Equatable, Sendable {
+package enum MCPPeerPIDProvenance: Equatable {
     case socketPeer
     case handshakeFallback
 }
 
 /// Neutral peer identity produced by the app-proxy transport adapter.
-package struct MCPPeerIdentity: Equatable, Sendable {
+package struct MCPPeerIdentity: Equatable {
     package let socketObservedPID: Int?
     package let handshakeClaimedPID: Int
 
@@ -37,7 +37,7 @@ package struct MCPPeerIdentity: Equatable, Sendable {
 
 /// Descriptor-bearing handoff from the macOS app-proxy listener into MCP admission.
 /// Raw socket operations remain adapter-owned; policy consumes the normalized identity.
-package struct MCPAppProxyInboundConnection: Equatable, Sendable {
+package struct MCPAppProxyInboundConnection: Equatable {
     package let connectedFileDescriptor: Int32
     package let peerIdentity: MCPPeerIdentity
 

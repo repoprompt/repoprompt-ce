@@ -8,7 +8,7 @@ package typealias FileSystemWatchEventID = UInt64
 /// Platform adapters translate native event bits into this stable vocabulary before events enter
 /// the reusable mailbox. Keeping these semantics neutral lets coalescing, overflow recovery,
 /// ignore evaluation, and delta generation move into the core target unchanged.
-package struct FileSystemWatchEventFlags: OptionSet, Equatable, Sendable {
+package struct FileSystemWatchEventFlags: OptionSet, Equatable {
     package let rawValue: UInt32
 
     package init(rawValue: UInt32) {
@@ -30,7 +30,7 @@ package struct FileSystemWatchEventFlags: OptionSet, Equatable, Sendable {
     package static let overflowRootRescan: Self = [.mustScanSubdirectories, .rootChanged]
 }
 
-package struct FileSystemWatchEvent: Equatable, Sendable {
+package struct FileSystemWatchEvent: Equatable {
     package let path: String
     package let flags: FileSystemWatchEventFlags
     package let id: FileSystemWatchEventID
@@ -42,7 +42,7 @@ package struct FileSystemWatchEvent: Equatable, Sendable {
     }
 }
 
-package struct FileSystemWatchEventPayload: Equatable, Sendable {
+package struct FileSystemWatchEventPayload: Equatable {
     package let entries: [FileSystemWatchEvent]
 
     package init(entries: [FileSystemWatchEvent]) {

@@ -76,6 +76,23 @@ another Mac or redistributed.
 - macOS 26 or later
 - Xcode 26, or matching Command Line Tools with the macOS 26 SDK
 
+### MCP command surfaces
+
+RepoPrompt CE has two MCP command families:
+
+- `rpce-cli` / `rpce-cli-debug` are app-proxy commands. They use the `repoprompt-mcp` helper bundled inside `RepoPrompt.app` and require the app/bootstrap socket for live windows, app approvals, Agent Mode, and app workspace state.
+- `rpce-headless` / `rpce-headless-debug` are standalone direct-stdio commands. They use the independently packaged `repoprompt-headless` host, do not launch the app, and keep separate fail-closed state under `~/Library/Application Support/RepoPrompt CE/Headless/`.
+
+Standalone headless setup starts by adding explicit allowed roots:
+
+```bash
+rpce-headless config roots add /path/to/repo --name Repo
+rpce-headless doctor
+rpce-headless serve
+```
+
+See [`docs/architecture/headless-core.md`](docs/architecture/headless-core.md) for the current safe read-oriented tool profile and packaging boundaries.
+
 ## Features
 
 - **Context engineering**: Build dense, reviewable prompts with the files and
@@ -114,6 +131,8 @@ third-party notices in
   source ownership and placement rules
 - [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):
   Agent Mode provider architecture
+- [`docs/architecture/headless-core.md`](docs/architecture/headless-core.md):
+  app-proxy versus standalone headless MCP architecture and boundaries
 - [`docs/releasing.md`](docs/releasing.md): release-candidate and publishing
   workflows
 - [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public

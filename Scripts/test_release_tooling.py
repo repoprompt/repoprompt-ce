@@ -96,6 +96,90 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertNotIn("repoprompt-headless", package_script)
         self.assertNotIn("rpce-headless", package_script)
 
+    def test_headless_package_install_and_smoke_scripts_are_independent_from_app_proxy(self) -> None:
+        package_script = (SCRIPT_DIR / "package_headless.sh").read_text(encoding="utf-8")
+        install_script = (SCRIPT_DIR / "install_headless_cli.sh").read_text(encoding="utf-8")
+        smoke_script = (SCRIPT_DIR / "smoke_headless_mcp.sh").read_text(encoding="utf-8")
+
+        self.assertIn('BINARY_NAME="repoprompt-headless"', package_script)
+        self.assertIn("HeadlessTools", package_script)
+        self.assertIn('swift build -c "$CONF" --product "$BINARY_NAME"', package_script)
+        self.assertIn('"$TARGET_BINARY" --version', package_script)
+        self.assertIn('Created: %s\\n', package_script)
+        self.assertNotIn("RepoPrompt.app", package_script)
+        self.assertNotIn("repoprompt-mcp", package_script)
+        self.assertNotIn("rpce-cli", package_script)
+
+        self.assertIn("rpce-headless-debug", install_script)
+        self.assertIn("rpce-headless", install_script)
+        self.assertIn("repoprompt_headless_debug", install_script)
+        self.assertIn("repoprompt_headless", install_script)
+        self.assertIn("package_headless.sh", install_script)
+        self.assertNotIn("RepoPrompt.app", install_script)
+        self.assertNotIn("repoprompt-mcp", install_script)
+        self.assertNotIn("rpce-cli", install_script)
+
+        self.assertIn("tools/list", smoke_script)
+        self.assertIn("read_file", smoke_script)
+        self.assertIn("file_search", smoke_script)
+        self.assertIn("export_outside_state_directory is false", smoke_script)
+        self.assertIn("shutdown", smoke_script)
+        self.assertNotIn("rpce-cli-debug", smoke_script)
+        self.assertNotIn("repoprompt-mcp", smoke_script)
+
+    def test_headless_install_script_manages_debug_link_without_app_bundle(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        home = temp_dir / "home"
+        tools_root = temp_dir / "tools"
+        bin_dir = temp_dir / "bin"
+        bin_dir.mkdir(parents=True)
+        binary = tools_root / "Debug" / "repoprompt-headless"
+        binary.parent.mkdir(parents=True)
+        binary.write_text("#!/usr/bin/env bash\necho 'repoprompt-headless 1.0.0'\n", encoding="utf-8")
+        binary.chmod(0o755)
+        path_link = bin_dir / "rpce-headless-debug"
+        user_link = home / "Library" / "Application Support" / "RepoPrompt CE" / "repoprompt_headless_debug"
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "REPOPROMPT_HEADLESS_TOOLS_ROOT": str(tools_root),
+                "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH": str(path_link),
+            }
+        )
+
+        installed = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "install", "--configuration", "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.assertIn("Installed:", installed.stdout)
+        self.assertEqual(os.readlink(path_link), str(user_link))
+        self.assertEqual(os.readlink(user_link), str(binary))
+
+        status = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "status", "--configuration", "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("PATH command: OK", status.stdout)
+        self.assertIn("repoprompt-headless 1.0.0", status.stdout)
+
+        uninstalled = subprocess.run(
+            [str(SCRIPT_DIR / "install_headless_cli.sh"), "uninstall", "--configuration", "debug"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(uninstalled.returncode, 0, uninstalled.stderr)
+        self.assertFalse(path_link.exists())
+        self.assertNotIn("RepoPrompt.app", installed.stdout + status.stdout + uninstalled.stdout)
+
     def test_embedded_mcp_helper_layout_validator_rejects_invalid_metadata(self) -> None:
         def missing_helper(app: Path) -> None:
             (app / "Contents" / "MacOS" / "repoprompt-mcp").unlink()
@@ -644,6 +728,17 @@ class ReleaseToolingTests(unittest.TestCase):
         source = root / "Sources" / "RepoPromptMCP" / "main.swift"
         source.parent.mkdir(parents=True)
         source.write_text('let CLI_VERSION = "9.9.9"\n', encoding="utf-8")
+        headless_source = root / "Sources" / "RepoPromptHeadless" / "HeadlessVersion.swift"
+        headless_source.parent.mkdir(parents=True)
+        headless_source.write_text(
+            """\
+enum HeadlessVersion {
+    static let marketingVersion = "9.9.9"
+    static let buildNumber = "999"
+}
+""",
+            encoding="utf-8",
+        )
         env = os.environ.copy()
         env["REPOPROMPT_RELEASE_SOURCE_ROOT"] = str(root)
         helper = SCRIPT_DIR / "sync_mcp_cli_version.sh"
@@ -656,11 +751,23 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("Run ./Scripts/release.sh sync-cli-version", rejected.stderr)
         self.assertEqual(synced.returncode, 0, synced.stderr)
         self.assertEqual(source.read_text(encoding="utf-8"), 'let CLI_VERSION = "1.0.0"\n')
+        self.assertEqual(
+            headless_source.read_text(encoding="utf-8"),
+            """\
+enum HeadlessVersion {
+    static let marketingVersion = "1.0.0"
+    static let buildNumber = "1"
+}
+""",
+        )
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
     def test_release_preflight_requires_synchronized_mcp_cli_version(self) -> None:
         release_script = (SCRIPT_DIR / "release.sh").read_text(encoding="utf-8")
 
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/package_headless.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/install_headless_cli.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/smoke_headless_mcp.sh"', release_script)
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh"', release_script)
         self.assertIn('"$CONTROL_PLANE_SCRIPTS_DIR/sync_mcp_cli_version.sh" --check', release_script)
         self.assertIn("sync-cli-version) sync_mcp_cli_version", release_script)

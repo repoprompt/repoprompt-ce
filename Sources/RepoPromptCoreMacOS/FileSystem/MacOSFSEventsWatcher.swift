@@ -161,7 +161,7 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
             condition.broadcast()
             condition.unlock()
             return
-        case .watching(let activeStream):
+        case let .watching(activeStream):
             lifecycleState = .idle
             condition.broadcast()
             disposal = StreamDisposal(
@@ -215,7 +215,7 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
 
         condition.lock()
         let shouldCommit: Bool
-        if case .starting(let currentAttempt) = lifecycleState,
+        if case let .starting(currentAttempt) = lifecycleState,
            currentAttempt.generation == attempt.generation
         {
             lifecycleState = .watching(ActiveStream(
@@ -247,7 +247,7 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
     private func clearStartingAttemptIfCurrent(_ attempt: StartAttempt) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        guard case .starting(let currentAttempt) = lifecycleState,
+        guard case let .starting(currentAttempt) = lifecycleState,
               currentAttempt.generation == attempt.generation
         else { return false }
         lifecycleState = .idle
@@ -258,7 +258,7 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
     private func isStartingAttemptCurrent(_ attempt: StartAttempt) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        guard case .starting(let currentAttempt) = lifecycleState else {
+        guard case let .starting(currentAttempt) = lifecycleState else {
             return false
         }
         return currentAttempt.generation == attempt.generation
@@ -268,9 +268,9 @@ package final class MacOSFSEventsWatcher: FileSystemWatching, @unchecked Sendabl
         let handler: (@Sendable (FileSystemWatchEventPayload) -> Void)?
         condition.lock()
         switch lifecycleState {
-        case .starting(let attempt) where attempt.generation == generation:
+        case let .starting(attempt) where attempt.generation == generation:
             handler = attempt.handler
-        case .watching(let activeStream) where activeStream.generation == generation:
+        case let .watching(activeStream) where activeStream.generation == generation:
             handler = activeStream.handler
         case .idle, .starting, .watching:
             handler = nil

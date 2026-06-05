@@ -1,6 +1,6 @@
 # Headless Core Architecture Lock
 
-Status: Slice 5A headless foundation checkpoint, 2026-06-04. Items 0-5 are committed, and the package now has enforceable SwiftPM roots for reusable contracts, narrow workspace policy helpers, macOS adapters, Tree-sitter declarations, and a standalone `RepoPromptHeadless` executable target. Slice 5A adds only version/CLI/config/state/root-policy/permission defaults, doctor/config commands, and a direct stdio JSON-RPC skeleton; the embedded session/workspace-context runtime closure, safe tool profile, packaging/install lane, CI lane, and full docs remain explicitly deferred. App-proxy behavior is unchanged.
+Status: Slice 5C headless packaging/install/smoke checkpoint, 2026-06-05. Items 0-5 plus the Slice 5A/5B standalone host work are committed: the package has enforceable SwiftPM roots, a standalone `RepoPromptHeadless` executable target, fail-closed config/state/root-policy defaults, direct stdio JSON-RPC serving, and the first read-oriented safe MCP tool profile. Slice 5C adds the independent headless package/install/status/smoke lane, managed `rpce-headless[-debug]` paths, CI coverage, and proxy-vs-standalone docs while preserving the app-bundled `repoprompt-mcp` proxy behavior.
 
 ## Locked target graph
 
@@ -22,14 +22,14 @@ The migration uses a library-first host architecture. The macOS app will embed t
   AppKit/SwiftUI shell     direct stdio MCP       existing app proxy
 ```
 
-The package graph now contains the Item 5 library roots plus the Slice 5A standalone executable foundation:
+The package graph now contains the Item 5 library roots plus the standalone executable and Slice 5C package/install/smoke boundary:
 
 | Reserved target or product | Reserved source root | Responsibility |
 | --- | --- | --- |
 | `RepoPromptCore` library | `Sources/RepoPromptCore` | Enforced UI-independent platform contracts, workspace access/root policy helpers, and narrow MCP transport/admission values; runtime-host promotion remains deferred below |
 | `RepoPromptCoreMacOS` library | `Sources/RepoPromptCoreMacOS` | FSEvents, POSIX process/descriptor-write, Keychain, code-signing inspection, peer verification, and macOS adapters |
 | `RepoPromptSyntaxCBridge` target | `Sources/RepoPromptSyntaxCBridge` | Narrow Tree-sitter declarations and grammar/scanner linkage without an app target-wide bridging header |
-| `repoprompt-headless` executable | `Sources/RepoPromptHeadless` | Slice 5A foundation: independent direct-stdio JSON-RPC skeleton, fail-closed config/state/root policy, permission defaults, doctor, and terminal config commands; safe MCP tools and standalone packaging remain deferred |
+| `repoprompt-headless` executable | `Sources/RepoPromptHeadless` | Independent direct-stdio JSON-RPC host with fail-closed config/state/root policy, permission defaults, terminal doctor/config commands, the read-oriented safe MCP profile, and separate package/install/smoke lane |
 
 Existing app/proxy owners remain compatible during the bounded Item 5 split:
 
@@ -69,6 +69,29 @@ Later items may centralize or move implementations only if these behaviors remai
 
 The app and CLI now consume the verified-equivalent bootstrap DTO and endpoint implementations centralized in `RepoPromptShared`. Keep that shared wire contract single-sourced while later runtime ownership moves.
 
+## Command surfaces and managed paths
+
+Slice 5C keeps the app proxy and standalone host as separate command families:
+
+| Command | Backing executable | Transport/state | Validation purpose |
+| --- | --- | --- | --- |
+| `rpce-cli` / `rpce-cli-debug` | app-bundled `RepoPrompt.app/Contents/MacOS/repoprompt-mcp` | Connects to the running app bootstrap socket and uses app windows, workspaces, approvals, and app secure-storage policy | App-proxy MCP behavior and live app integration |
+| `rpce-headless` / `rpce-headless-debug` | independently staged `HeadlessTools/{Release,Debug}/repoprompt-headless` | Direct stdio JSON-RPC; uses `~/Library/Application Support/RepoPrompt CE/Headless/` plus a separate secure-storage namespace; never launches or connects to `RepoPrompt.app` | Standalone safe read-oriented MCP behavior |
+
+Managed standalone links are intentionally outside the app bundle:
+
+```text
+/usr/local/bin/rpce-headless-debug
+  -> ~/Library/Application Support/RepoPrompt CE/repoprompt_headless_debug
+  -> ~/Library/Application Support/RepoPrompt CE/HeadlessTools/Debug/repoprompt-headless
+
+/usr/local/bin/rpce-headless
+  -> ~/Library/Application Support/RepoPrompt CE/repoprompt_headless
+  -> ~/Library/Application Support/RepoPrompt CE/HeadlessTools/Release/repoprompt-headless
+```
+
+`Scripts/package_app.sh` remains the app-bundle owner and must not mention standalone command names. `Scripts/package_headless.sh`, `Scripts/install_headless_cli.sh`, and `Scripts/smoke_headless_mcp.sh` own standalone packaging, managed links, and direct-stdio smoke validation.
+
 ### Current routing priority
 
 Preserve the current `tools/call` routing order while runtime ownership changes later:
@@ -85,9 +108,9 @@ Preserve the current `tools/call` routing order while runtime ownership changes 
 
 `MCPBindingResolver` uses the matching logical-context subset of that order: requested window, existing mapping, same-client reuse, live-run affinity, persisted affinity, only-hosting-window fallback, then ambiguity failure.
 
-## Standalone security defaults and Slice 5A status
+## Standalone security defaults and Slice 5C status
 
-Slice 5A implements the host/config foundation for these locked constraints while intentionally leaving the first safe MCP tool profile and standalone packaging for later slices:
+Slices 5A-5C implement these locked constraints for the first standalone profile:
 
 - `repoprompt-headless` serves direct MCP over stdin/stdout and must not connect to or bind the app-proxy socket.
 - Standalone operation must not launch `RepoPrompt.app`, require `Bundle.main`, reuse app workspace persistence implicitly, or reuse app secrets implicitly.
@@ -97,6 +120,7 @@ Slice 5A implements the host/config foundation for these locked constraints whil
   ~/Library/Application Support/RepoPrompt CE/Headless/
     config.json
     Workspaces/
+    Exports/
   ```
 
 - Standalone secure storage uses a separate namespace and noninteractive reads while serving. Secret writes require explicit terminal commands.
@@ -110,8 +134,9 @@ Slice 5A implements the host/config foundation for these locked constraints whil
   | `launch_agents` | `false` |
   | `export_outside_state_directory` | `false` |
 
-- The first standalone safe profile is read-oriented. Mutation, VCS-write, broader export, oracle, Context Builder, and Agent Mode capabilities remain operation-gated.
-- Slice 5A `tools/list` intentionally returns no tools. `tools/call` and the read-oriented safe profile are not implemented in this checkpoint.
+- The first standalone safe profile is read-oriented and exposes only `bind_context`, constrained `manage_workspaces`, `manage_selection`, `workspace_context`, `get_file_tree`, `get_code_structure`, `read_file`, `file_search`, and `prompt`.
+- Mutation, VCS-write, broader export, oracle, Context Builder, Agent Mode, app settings, and app lifecycle capabilities remain omitted or operation-gated in standalone v1.
+- Slice 5C packaging validates this profile with `Scripts/smoke_headless_mcp.sh` over direct stdio: initialize, `tools/list`, `read_file`, `file_search`, export permission rejection, gated-tool rejection, and shutdown.
 
 ## Concurrency lock for later implementation
 
@@ -307,13 +332,13 @@ These files remain app-owned because moving them now would require the larger ru
 - `MacOSFSEventsWatcher` remains the macOS adapter for the neutral watcher contract; its generation-scoped lifecycle now hardens concurrent/reentrant `start()` / `stop()` and stale native callbacks. Broader `FileSystemService` / `WorkspaceFileContextStore` runtime promotion remains deferred; do not fold that refactor into this physical ownership split.
 - App-proxy `MacOSBootstrapSocketServer`, accepted-FD connection management, Unix transport, and app filesystem constants remain app-owned until listener diagnostics, socket-directory policy, and `ServerNetworkManager` coupling are split. The existing `repoprompt-mcp` proxy behavior is intentionally unchanged.
 - The static `ProcessLauncher` facade lives in `RepoPromptCoreMacOS` temporarily because deferred app capabilities still call it directly. Promote call-site injection only with the corresponding capability owners.
-- Do not add the headless safe tool profile, package/install scripts, smoke scripts, CI lane, or app/proxy lifecycle coupling until later Items 6–7 slices.
+- The headless safe tool profile and independent package/install/smoke/CI lane now live under `Sources/RepoPromptHeadless` and `Scripts/package_headless.sh` / `install_headless_cli.sh` / `smoke_headless_mcp.sh`; keep future parity work additive and do not route it through `repoprompt-mcp` or the app bundle.
 
 ## Enforced boundary guardrail
 
 `Scripts/core_boundary_guardrails.sh` now requires `Sources/RepoPromptCore`, `Sources/RepoPromptCoreMacOS`, and `Sources/RepoPromptSyntaxCBridge`; rejects forbidden imports and embedded-app references under core; and continues to reject app-packaging references to standalone command names so `RepoPrompt.app` embeds only the app-proxy helper. Findings fail `make guardrails`.
 
-`Scripts/source_layout_guardrails.sh` remains responsible for shared `MCPControlMessages.swift` single-sourcing and the narrow `TreeSitterScannerSupport` compatibility target. Slice 5A extends it to require `Sources/RepoPromptHeadless`/`RepoPromptHeadless`/`repoprompt-headless` and reject app UI, app bundle policy, or app-proxy socket references from the standalone source root.
+`Scripts/source_layout_guardrails.sh` remains responsible for shared `MCPControlMessages.swift` single-sourcing and the narrow `TreeSitterScannerSupport` compatibility target. It requires `Sources/RepoPromptHeadless`/`RepoPromptHeadless`/`repoprompt-headless` and rejects app UI, app bundle policy, or app-proxy socket references from the standalone source root.
 
 ## Item 0 characterization coverage
 
@@ -327,4 +352,4 @@ These files remain app-owned because moving them now would require the larger ru
 
 ## Remaining deferred work
 
-The bounded Item 5 split and Slice 5A foundation do not promote the larger runtime closures listed above. Remaining Items 6–7 work includes the read-oriented safe MCP tool profile, standalone package/install/smoke scripts, CI/conductor lanes, and complete proxy-vs-standalone contributor docs. Future runtime promotion must also replace singleton/window hot-path ownership, extract reusable sessions, complete adapter injection, and preserve the characterized app-proxy behavior.
+The bounded Item 5 split and Slices 5A-5C do not promote the larger runtime closures listed above. The first standalone safe profile and independent package/install/smoke/CI/docs lane are additive and intentionally narrower than app parity. Future runtime promotion must replace singleton/window hot-path ownership, extract reusable sessions, complete adapter injection, and preserve the characterized app-proxy behavior.

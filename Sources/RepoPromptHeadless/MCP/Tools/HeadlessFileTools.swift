@@ -21,7 +21,11 @@ enum HeadlessFileTools {
         let lines = text.components(separatedBy: .newlines)
         let totalLines = lines.count
         let range = lineRange(totalLines: totalLines, startLine: HeadlessToolArguments.int(arguments, key: "start_line"), limit: HeadlessToolArguments.int(arguments, key: "limit"))
-        let selectedLines = range.isEmpty ? [] : Array(lines[(range.lowerBound - 1)..<range.upperBound])
+        let selectedLines: [String] = if range.isEmpty {
+            []
+        } else {
+            Array(lines[(range.lowerBound - 1) ..< (range.upperBound - 1)])
+        }
         let content = selectedLines.joined(separator: "\n")
         let language = resolved.url.pathExtension.isEmpty ? "text" : resolved.url.pathExtension
         let textOutput = """
@@ -37,7 +41,7 @@ enum HeadlessFileTools {
             "content": content,
             "total_lines": totalLines,
             "first_line": range.lowerBound,
-            "last_line": range.upperBound,
+            "last_line": max(0, range.upperBound - 1),
             "display_path": resolved.displayPath,
             "path": resolved.url.path
         ])
@@ -59,9 +63,9 @@ enum HeadlessFileTools {
             for root in snapshot.roots {
                 lines.append("- \(root.name): `\(root.path)`")
             }
-            return HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
+            return try HeadlessToolResponse.success(text: lines.joined(separator: "\n"), structured: [
                 "roots_count": snapshot.roots.count,
-                "roots": try HeadlessJSONValue.value(snapshot.roots)
+                "roots": HeadlessJSONValue.value(snapshot.roots)
             ])
         }
         guard type == "files" else {
@@ -123,7 +127,7 @@ enum HeadlessFileTools {
         var files: [HeadlessResolvedPath] = []
         for input in inputs {
             let resolved = try resolver.resolve(input)
-            files.append(contentsOf: try catalog.filesUnder(resolved))
+            try files.append(contentsOf: catalog.filesUnder(resolved))
         }
         return files
     }
@@ -144,7 +148,7 @@ enum HeadlessFileTools {
                 let chunks = entry.ranges.map { range in
                     let start = max(1, min(range.startLine, lines.count))
                     let end = max(start, min(range.endLine, lines.count))
-                    return Array(lines[(start - 1)..<end]).joined(separator: "\n")
+                    return Array(lines[(start - 1) ..< end]).joined(separator: "\n")
                 }
                 output.append((displayPath, chunks.joined(separator: "\n…\n")))
             } else {
@@ -155,21 +159,19 @@ enum HeadlessFileTools {
     }
 
     private static func lineRange(totalLines: Int, startLine: Int?, limit: Int?) -> Range<Int> {
-        guard totalLines > 0 else { return 1..<1 }
-        let start: Int
-        if let startLine, startLine < 0 {
-            start = max(1, totalLines + startLine + 1)
+        guard totalLines > 0 else { return 1 ..< 1 }
+        let start: Int = if let startLine, startLine < 0 {
+            max(1, totalLines + startLine + 1)
         } else {
-            start = max(1, startLine ?? 1)
+            max(1, startLine ?? 1)
         }
         let boundedStart = min(start, totalLines)
-        let endInclusive: Int
-        if let limit, limit > 0 {
-            endInclusive = min(totalLines, boundedStart + limit - 1)
+        let endInclusive: Int = if let limit, limit > 0 {
+            min(totalLines, boundedStart + limit - 1)
         } else {
-            endInclusive = totalLines
+            totalLines
         }
-        return boundedStart..<(endInclusive + 1)
+        return boundedStart ..< (endInclusive + 1)
     }
 
     private static func rangeDescription(range: Range<Int>, totalLines: Int) -> String {

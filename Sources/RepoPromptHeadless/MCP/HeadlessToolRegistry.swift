@@ -79,7 +79,7 @@ final class HeadlessToolRegistry {
     private func descriptor(for name: String) -> HeadlessToolDescriptor {
         switch name {
         case "bind_context":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "List, inspect, or bind the single headless session to a configured workspace.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -88,7 +88,7 @@ final class HeadlessToolRegistry {
                 ])
             )
         case "manage_workspaces":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Manage headless workspaces without adding arbitrary filesystem roots.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -101,7 +101,7 @@ final class HeadlessToolRegistry {
                 ])
             )
         case "manage_selection":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Read or mutate the active workspace selection using allowed root-contained paths only.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -114,7 +114,7 @@ final class HeadlessToolRegistry {
                 ])
             )
         case "workspace_context":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Render or export the active workspace prompt/selection/code/files/tree context.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -125,7 +125,7 @@ final class HeadlessToolRegistry {
                 ])
             )
         case "prompt":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Get, set, append, clear, export, or list the built-in headless prompt preset.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -135,7 +135,7 @@ final class HeadlessToolRegistry {
                 ])
             )
         case "get_file_tree":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Return an ASCII tree for configured roots, a subpath, or selected files.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -143,30 +143,33 @@ final class HeadlessToolRegistry {
                     "mode": HeadlessToolSchemas.string(enum: ["auto", "full", "folders", "selected"]),
                     "path": HeadlessToolSchemas.string(),
                     "max_depth": HeadlessToolSchemas.integer()
-                ])
+                ]),
+                readOnlyHint: true
             )
         case "get_code_structure":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Return lightweight headless code signatures for paths or selected files.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
                     "scope": HeadlessToolSchemas.string(enum: ["paths", "selected"]),
                     "paths": HeadlessToolSchemas.stringArray(),
                     "max_results": HeadlessToolSchemas.integer()
-                ])
+                ]),
+                readOnlyHint: true
             )
         case "read_file":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Read a UTF-8 file under configured roots with optional line slicing.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
                     "path": HeadlessToolSchemas.string(),
                     "start_line": HeadlessToolSchemas.integer(),
                     "limit": HeadlessToolSchemas.integer()
-                ], required: ["path"])
+                ], required: ["path"]),
+                readOnlyHint: true
             )
         case "file_search":
-            return HeadlessToolDescriptor(
+            HeadlessToolDescriptor(
                 name: name,
                 description: "Search paths and/or UTF-8 file contents under configured roots.",
                 inputSchema: HeadlessToolSchemas.object(properties: [
@@ -179,10 +182,11 @@ final class HeadlessToolRegistry {
                     "count_only": HeadlessToolSchemas.boolean(),
                     "context_lines": HeadlessToolSchemas.integer(),
                     "whole_word": HeadlessToolSchemas.boolean()
-                ], required: ["pattern"])
+                ], required: ["pattern"]),
+                readOnlyHint: true
             )
         default:
-            return HeadlessToolDescriptor(name: name, description: "RepoPrompt Headless tool", inputSchema: HeadlessToolSchemas.object())
+            HeadlessToolDescriptor(name: name, description: "RepoPrompt Headless tool", inputSchema: HeadlessToolSchemas.object())
         }
     }
 }
