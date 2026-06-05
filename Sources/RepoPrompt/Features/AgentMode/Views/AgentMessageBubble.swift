@@ -491,21 +491,22 @@ struct AgentMessageBubble: View {
     // MARK: - Tool Call Bubble
 
     private var toolCallBubble: some View {
-        HStack {
+        let presentation = toolCallBubblePresentation(toolName: item.toolName, args: item.toolArgsJSON)
+        return HStack {
             VStack(alignment: .leading, spacing: 4) {
                 VStack(alignment: .leading, spacing: 8) {
                     // Header with tool icon and name
                     HStack(spacing: 6) {
-                        Image(systemName: toolIconName(for: item.toolName))
+                        Image(systemName: presentation.iconName)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                             .foregroundColor(.orange)
 
-                        Text(toolDisplayName(for: item.toolName))
+                        Text(presentation.title)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
                             .foregroundColor(.primary)
 
                         // Show key argument inline for common tools
-                        if let summary = toolArgsSummary(toolName: item.toolName, args: item.toolArgsJSON) {
+                        if let summary = presentation.summary {
                             Text(summary)
                                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                                 .foregroundColor(.secondary)
@@ -965,14 +966,37 @@ struct AgentMessageBubble: View {
 
     // MARK: - Tool Display Helpers
 
+    private struct ToolCallBubblePresentation {
+        let iconName: String
+        let title: String
+        let summary: String?
+    }
+
+    private func toolCallBubblePresentation(toolName: String?, args: String?) -> ToolCallBubblePresentation {
+        let normalized = normalizedToolCardName(toolName) ?? toolName
+        let argsObject = parseJSONObject(args)
+        let webPresentation = AgentWebToolActionPresentation.classify(AgentWebToolActionInput(
+            rawToolName: toolName,
+            normalizedToolName: normalized,
+            argsObject: argsObject,
+            resultObject: nil
+        ))
+        return ToolCallBubblePresentation(
+            iconName: toolIconName(forNormalizedToolName: normalized),
+            title: webPresentation?.title ?? toolDisplayName(forNormalizedToolName: normalized),
+            summary: webPresentation?.subtitle ?? toolArgsSummary(normalizedToolName: normalized, argsObject: argsObject)
+        )
+    }
+
     /// Get appropriate icon for tool call
-    private func toolIconName(for toolName: String?) -> String {
-        switch toolName {
+    private func toolIconName(forNormalizedToolName normalized: String?) -> String {
+        switch normalized {
         case "ask_user_question", "ask_user": "questionmark.circle"
         case "read_file": "doc.text"
         case "apply_edits": "pencil"
         case "file_actions": "doc.badge.plus"
         case "file_search": "magnifyingglass.circle"
+        case "search", "web_read": "globe"
         case "get_file_tree": "folder"
         case "get_code_structure": "list.bullet.indent"
         case "manage_selection": "checkmark.circle"
@@ -986,13 +1010,15 @@ struct AgentMessageBubble: View {
     }
 
     /// Get human-readable display name for tool
-    private func toolDisplayName(for toolName: String?) -> String {
-        switch toolName {
+    private func toolDisplayName(forNormalizedToolName normalized: String?) -> String {
+        switch normalized {
         case "ask_user_question", "ask_user": "User Question"
         case "read_file": "Read File"
         case "apply_edits": "Edit File"
         case "file_actions": "File Action"
         case "file_search": "Search"
+        case "search": "Web Search"
+        case "web_read": "Read Web Page"
         case "get_file_tree": "File Tree"
         case "get_code_structure": "Code Structure"
         case "manage_selection": "Selection"
@@ -1007,10 +1033,10 @@ struct AgentMessageBubble: View {
     }
 
     /// Extract key argument for inline display
-    private func toolArgsSummary(toolName: String?, args: String?) -> String? {
-        guard let json = parseJSONObject(args) else { return nil }
+    private func toolArgsSummary(normalizedToolName: String?, argsObject json: [String: Any]?) -> String? {
+        guard let json else { return nil }
 
-        switch toolName {
+        switch normalizedToolName {
         case "ask_user_question", "ask_user":
             if let question = json["question"] as? String {
                 return compactSingleLine(question, maxLength: 80)

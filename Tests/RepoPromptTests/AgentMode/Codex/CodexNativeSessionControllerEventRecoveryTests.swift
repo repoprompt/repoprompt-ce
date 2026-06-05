@@ -196,6 +196,89 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         }
     }
 
+    func testNativeWebActionTopLevelScalarsSurviveStartedAndCompletedEvents() throws {
+        let controller = makeController()
+        let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/started",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_search_open",
+                "name": "web_search",
+                "query": "docs",
+                "url": "https://docs.example.com/a/b/c",
+                "action": "open"
+            ])
+        ))
+        XCTAssertEqual(started.kind, "call")
+        XCTAssertEqual(started.name, "search")
+        let startedArgs = try XCTUnwrap(jsonObject(from: started.argsJSON))
+        XCTAssertEqual(startedArgs["query"] as? String, "docs")
+        XCTAssertEqual(startedArgs["url"] as? String, "https://docs.example.com/a/b/c")
+        XCTAssertEqual(startedArgs["action"] as? String, "open")
+
+        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_search_open",
+                "name": "web_search",
+                "status": "completed",
+                "url": "https://docs.example.com/a/b/c",
+                "action": "open",
+                "title": "Docs page",
+                "content": String(repeating: "full page body ", count: 80)
+            ])
+        ))
+        XCTAssertEqual(completed.kind, "result")
+        XCTAssertEqual(completed.name, "search")
+        let completedResult = try XCTUnwrap(jsonObject(from: completed.resultJSON))
+        XCTAssertEqual(completedResult["url"] as? String, "https://docs.example.com/a/b/c")
+        XCTAssertEqual(completedResult["action"] as? String, "open")
+        XCTAssertNil(completedResult["content"])
+    }
+
+    func testNativeWebReadAndFindEventsUseCanonicalWebReadNameAndCompactResults() throws {
+        let controller = makeController()
+        let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/started",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_webfetch",
+                "name": "webfetch",
+                "url": "https://docs.example.com/a/b/c",
+                "needle": "install"
+            ])
+        ))
+        XCTAssertEqual(started.kind, "call")
+        XCTAssertEqual(started.name, "web_read")
+        let args = try XCTUnwrap(jsonObject(from: started.argsJSON))
+        XCTAssertEqual(args["url"] as? String, "https://docs.example.com/a/b/c")
+        XCTAssertEqual(args["needle"] as? String, "install")
+
+        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_webfetch",
+                "name": "webfetch",
+                "status": "completed",
+                "url": "https://docs.example.com/a/b/c",
+                "needle": "install",
+                "matches": [["text": String(repeating: "full page body ", count: 80)]],
+                "content": String(repeating: "full page body ", count: 80)
+            ])
+        ))
+        XCTAssertEqual(completed.kind, "result")
+        XCTAssertEqual(completed.name, "web_read")
+        let result = try XCTUnwrap(jsonObject(from: completed.resultJSON))
+        XCTAssertEqual(result["url"] as? String, "https://docs.example.com/a/b/c")
+        XCTAssertEqual(result["needle"] as? String, "install")
+        XCTAssertEqual(result["match_count"] as? Int, 1)
+        XCTAssertNil(result["matches"])
+        XCTAssertNil(result["content"])
+        XCTAssertFalse(completed.resultJSON?.contains("full page body") == true)
+    }
+
     func testNativeWebSearchCompletionPayloadsPreserveCompactSearchFields() throws {
         let rows: [(label: String, alias: String, item: [String: Any], expectedResults: Int?, expectedSources: Int?, expectedDetailKey: String)] = [
             (

@@ -188,6 +188,7 @@ struct AgentToolCardRenderSummary: Codable, Equatable {
         case "git": "Git"
         case "file_search": "Search"
         case "search": "Web Search"
+        case "web_read": "Read Web Page"
         case "manage_selection": "Selection"
         case "read_file": "Read File"
         case "workspace_context": "Context"
@@ -220,6 +221,7 @@ enum AgentToolCardRenderSummaryBuilder {
 
     static func build(
         normalizedToolName: String?,
+        rawToolName: String? = nil,
         statusWord: String,
         rawObject: [String: Any]?,
         argsObject: [String: Any]?,
@@ -234,8 +236,14 @@ enum AgentToolCardRenderSummaryBuilder {
             return readFileSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "file_search":
             return fileSearchSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
-        case "search":
-            return webSearchSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
+        case "search", "web_read":
+            return webToolSummary(
+                normalizedToolName: normalizedToolName,
+                rawToolName: rawToolName,
+                statusWord: statusWord,
+                rawObject: rawObject,
+                argsObject: argsObject
+            )
         case "manage_selection":
             return manageSelectionSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
         case "workspace_context":
@@ -368,6 +376,49 @@ enum AgentToolCardRenderSummaryBuilder {
             detailText: nil,
             status: renderStatus,
             op: "file_search"
+        )
+    }
+
+    private static func webToolSummary(
+        normalizedToolName: String,
+        rawToolName: String?,
+        statusWord: String,
+        rawObject: [String: Any]?,
+        argsObject: [String: Any]?
+    ) -> AgentToolCardRenderSummary? {
+        guard rawObject != nil || argsObject != nil else { return nil }
+        guard let webPresentation = AgentWebToolActionPresentation.classify(AgentWebToolActionInput(
+            rawToolName: rawToolName,
+            normalizedToolName: normalizedToolName,
+            argsObject: argsObject,
+            resultObject: rawObject
+        )) else { return nil }
+        if webPresentation.action == .webSearch {
+            return webSearchSummary(statusWord: statusWord, rawObject: rawObject, argsObject: argsObject)
+        }
+        let baseStatus = status(from: stringValue(rawObject, keys: ["status", "state", "outcome"]) ?? statusWord, defaultStatus: .neutral)
+        let errorDetail = webSearchErrorDetail(rawObject)
+        let detailText: String? = switch webPresentation.action {
+        case .readWebPage:
+            webPageReadDetailText(rawObject)
+        case .findInPage:
+            webFindDetailText(rawObject)
+        case .webSearch:
+            nil
+        }
+        let renderStatus: AgentToolCardRenderStatus = {
+            if errorDetail != nil, baseStatus != .success { return .failure }
+            if baseStatus == .failure || baseStatus == .warning || baseStatus == .running { return baseStatus }
+            if detailText != nil { return .success }
+            return baseStatus
+        }()
+        return AgentToolCardRenderSummary(
+            toolName: normalizedToolName == "web_read" ? "web_read" : "search",
+            title: webPresentation.title,
+            subtitle: webPresentation.subtitle,
+            detailText: renderStatus == .failure ? (errorDetail ?? detailText) : (detailText ?? errorDetail),
+            status: renderStatus,
+            op: webPresentation.op
         )
     }
 
@@ -643,6 +694,31 @@ enum AgentToolCardRenderSummaryBuilder {
             status: renderStatus,
             op: op.lowercased()
         )
+    }
+
+    private static func webPageReadDetailText(_ object: [String: Any]?) -> String? {
+        guard let object else { return nil }
+        if let title = safeCollapsedText(stringValue(object, keys: ["title", "page_title", "pageTitle", "name"])) {
+            return title
+        }
+        if let nested = objectValue(object, keys: ["page", "document", "metadata"]),
+           let title = safeCollapsedText(stringValue(nested, keys: ["title", "page_title", "pageTitle", "name"]))
+        {
+            return title
+        }
+        return nil
+    }
+
+    private static func webFindDetailText(_ object: [String: Any]?) -> String? {
+        guard let object else { return nil }
+        let count = intValue(object, keys: ["match_count", "matchCount", "total_matches", "totalMatches", "count"])
+            ?? arrayValue(object, keys: ["matches"])?.count
+            ?? (object["result"] as? [String: Any]).flatMap { nested in
+                intValue(nested, keys: ["match_count", "matchCount", "total_matches", "totalMatches", "count"])
+                    ?? arrayValue(nested, keys: ["matches"])?.count
+            }
+        guard let count else { return nil }
+        return "\(count) match\(count == 1 ? "" : "es")"
     }
 
     private static func webSearchDetailText(_ object: [String: Any]?) -> String? {
