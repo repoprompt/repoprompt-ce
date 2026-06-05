@@ -473,6 +473,7 @@ allowed_tracked_docs=(
   "docs/architecture/headless-core.md"
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
+  "docs/characterization/shared-runtime-phase0-2026-06-05.md"
   "docs/open-source-readiness.md"
   "docs/releasing.md"
   "docs/worktrees.md"

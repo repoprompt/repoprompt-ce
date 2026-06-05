@@ -1,6 +1,6 @@
 # Source Layout Ownership Map
 
-Current as of 2026-06-04 after the bounded Item 5 headless-core package split, source-layout refactor, Context Builder discovery cleanup, provider extraction, post-native-tree cleanup guardrail pass, provider-neutral workflow prompt catalog cleanup, and upstream Tree-sitter grammar migration. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-06-05 after the bounded core/platform split and the frozen packaging (`2b35091`), app/MCP (`042a500`), and headless (`487cd71`) sibling baselines. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
 
 ## Current source tree shape
 
@@ -46,13 +46,16 @@ Sources/
   RepoPromptCoreMacOS/          # enforced macOS FSEvents, POSIX process, Keychain/signing, and peer-verification adapters
   RepoPromptSyntaxCBridge/      # narrow Tree-sitter declaration/linkage shim; owns grammar/scanner dependencies
   RepoPromptShared/
-    MCP/                         # shared app/CLI MCP control protocol definitions
-  RepoPromptMCP/                 # MCP CLI implementation
+    MCP/                         # shared app/CLI MCP bootstrap/control contracts; POSIX descriptor support is still present pending convergence
+  RepoPromptHeadless/            # independent direct-stdio host, v1 profile/configuration, workspace runtime, and safe tool implementations
+  RepoPromptMCP/                 # app-proxy MCP CLI implementation
   RepoPromptC/                   # C support target
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
 Tests/
-  RepoPromptTests/               # XCTest tests, support, and fixtures
+  RepoPromptTests/               # app/runtime XCTest tests, support, and fixtures
+  RepoPromptHeadlessTests/       # standalone configuration, runtime, JSON-RPC, stdio-adapter, and safe-profile tests
+  SharedRuntimeConvergenceFixtures/ # cross-target Phase 0 frozen fixtures and manifests
 ```
 
 ## Physical headless-core roots
@@ -64,10 +67,10 @@ Sources/
   RepoPromptCore/                # UI-independent contracts, workspace policy helpers, and narrow MCP transport values
   RepoPromptCoreMacOS/           # Apple/Darwin adapter implementations
   RepoPromptSyntaxCBridge/       # narrow Tree-sitter declaration shim
-  RepoPromptHeadless/            # reserved for Item 6; intentionally absent
+  RepoPromptHeadless/            # landed independent direct-stdio runtime; not yet a shared-Core consumer
 ```
 
-`RepoPromptCore`, `RepoPromptCoreMacOS`, and `RepoPromptSyntaxCBridge` are SwiftPM library products/targets. `Scripts/core_boundary_guardrails.sh` now fails on forbidden imports, embedded-app policy references, missing roots, and accidental standalone packaging references. The app-wide Objective-C bridging-header flags are removed; the syntax shim owns grammar and scanner-support linkage.
+`RepoPromptCore`, `RepoPromptCoreMacOS`, and `RepoPromptSyntaxCBridge` are currently SwiftPM library products/targets; removing their public products is a later convergence phase. `RepoPromptHeadless` is an executable target with a separate v1 workspace/tool stack. `Scripts/core_boundary_guardrails.sh` now fails on forbidden imports, embedded-app policy references, missing roots, and accidental standalone packaging references. The app-wide Objective-C bridging-header flags are removed; the syntax shim owns grammar and scanner-support linkage.
 
 The bounded split intentionally leaves the embedded session host and its workspace-context runtime closure under `Sources/RepoPrompt` for now. Moving `RepoPromptCoreHost` requires the deferred filesystem publication conversion from Combine to bounded async streams, neutral diagnostics instead of `os`/`UserDefaults`, explicit state-directory injection for code-map/partition caches, and app-model decoupling in `WorkspaceRepository` and `WorkspaceSessionController`. Do not bypass those blockers by moving app policy into `RepoPromptCore`.
 
@@ -105,8 +108,10 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
 - New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
-- New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
+- New app-proxy CLI-only implementation code goes under `Sources/RepoPromptMCP`.
+- New standalone direct-stdio/profile adapter code goes under `Sources/RepoPromptHeadless`; do not add a second implementation of canonical workspace/search/codemap/selection/prompt behavior while convergence is in progress.
+- New test doubles, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under the matching test target. Cross-target convergence fixtures belong under `Tests/SharedRuntimeConvergenceFixtures`, never under production sources.
+- Intentionally promoted durable characterization records belong under `docs/characterization`. Each tracked record must remain individually named in the source-layout guardrail allowlist; this directory is not a general home for agent working notes. The current promoted record is `docs/characterization/shared-runtime-phase0-2026-06-05.md`.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
@@ -159,6 +164,7 @@ The source-layout guardrail verifies:
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` exists only at `Sources/RepoPromptShared/MCP/MCPControlMessages.swift`;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
+- tracked contributor-facing documentation remains within the explicit file allowlist, including individually promoted durable characterization records;
 - each Item 5 moved contract/adapter file is single-sourced only under its narrow `RepoPromptCore` or `RepoPromptCoreMacOS` owner, so app-local compatibility copies cannot return;
 - the narrow `RepoPromptSyntaxCBridge` target contains exactly its declaration header and anchor C file, exposes exactly the curated fourteen Tree-sitter declarations, owns the exact grammar/scanner linkage set, and replaces the retired app-wide bridging header;
 - the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired only through `RepoPromptSyntaxCBridge`, preserves the pinned grammar products in `Package.swift` and `Package.resolved`, keeps grammar products off the app target, requires the temporary core native-linkage umbrella, and keeps the retired local grammar directories absent;

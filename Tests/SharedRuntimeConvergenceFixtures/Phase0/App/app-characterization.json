@@ -1,0 +1,347 @@
+{
+  "baseline_commit" : "042a500b03b39d04237ec5544811696cf6b2f2f9",
+  "descriptors" : [
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : null,
+        "open_world" : false,
+        "read_only" : false,
+        "title" : null
+      },
+      "description" : "List, inspect, and bind sticky RepoPrompt window/tab context for this MCP connection.\n\nOperations:\n• list    – return **all** open windows, their compose tabs, and this connection's current binding\n• status  – return this connection's current binding only\n• bind    – bind by working_dirs (preferred), context_id, or window_id\n\n**Recommended binding flow:**\nBind by `working_dirs` using absolute workspace root paths:\n\t`{\"op\":\"bind\",\"working_dirs\":[\"/path/to/root1\",\"/path/to/root2\"]}`\nRepoPrompt first looks for an exact workspace `repo_paths` set match (order-insensitive). If no exact match exists, RepoPrompt may fall back to a workspace whose `repo_paths` is a strict superset of the requested roots. Both modes match workspace roots only — not descendant paths.\nIf the matching workspace is already open, RepoPrompt prefers that window. If it exists but is not open, RepoPrompt opens a window and switches to it. Add `create_if_missing=true` to create a new workspace after approval when neither exact nor superset workspace matches.\n\nParameters:\n- op: \"list\" | \"status\" | \"bind\" (required)\n- working_dirs: string | string[]         (for bind: preferred — absolute workspace roots; exact match first, repo_paths superset fallback)\n- context_id: string                      (for bind: canonical compose-tab context UUID from a previous list)\n- window_id: integer                      (for list: filter to one window; for bind with working_dirs: disambiguate when multiple workspaces match; for bind alone: set window affinity)\n- create_if_missing: boolean              (for bind with working_dirs; create a new workspace after approval when no exact or superset workspace matches)\n- tab_name: string                        (optional workspace name hint when creating via working_dirs + create_if_missing)\n\n**Binding modes:**\n- **Window affinity** (from working_dirs or window_id): routes tool calls to whichever tab is currently active in that window. Most agents should use this.\n- **Tab binding** (from context_id): pins tool calls to a specific compose tab, even if you switch to another tab. Use when you need a stable context that won't change.\n\n**Discovery:**\n- Use `bind_context list` to see what's currently open (windows, active workspaces, tabs, context_ids)\n- Use `manage_workspaces list` to see saved visible workspaces, or `include_hidden=true` to include recoverable hidden workspaces",
+      "description_sha256" : "ff77f254f2aeeb52463a1233ba77f1b047536fc52d35af48dbcfbe3ee0696ecc",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"context_id\":{\"description\":\"For bind: canonical compose-tab context UUID\",\"type\":\"string\"},\"create_if_missing\":{\"description\":\"For bind with working_dirs: create a new workspace after approval if no exact or superset workspace matches\",\"type\":\"boolean\"},\"op\":{\"description\":\"Operation: 'list', 'status', or 'bind'\",\"enum\":[\"list\",\"status\",\"bind\"],\"type\":\"string\"},\"tab_name\":{\"description\":\"Optional workspace name when creating via working_dirs + create_if_missing\",\"type\":\"string\"},\"window_id\":{\"description\":\"For list: filter to one window. For bind with working_dirs: disambiguate when multiple workspaces match. For bind alone: set window affinity.\",\"type\":\"integer\"},\"working_dirs\":{\"description\":\"For bind: comma-separated absolute workspace root paths; exact match first, then repo_paths superset fallback\",\"type\":\"string\"}},\"required\":[\"op\"],\"type\":\"object\"}",
+      "name" : "bind_context",
+      "schema_sha256" : "8aaf0472fed4d64315e908fcfb84be34c27a13b80dcbe1a5feb77d30f13ec90f"
+    },
+    {
+      "annotations" : {
+        "destructive" : true,
+        "idempotent" : null,
+        "open_world" : false,
+        "read_only" : false,
+        "title" : null
+      },
+      "description" : "Manage workspaces and compose-tab lifecycle across RepoPrompt windows.\n\n**This is the workspace inventory view.** `bind_context` remains the canonical API for per-window tab routing and context_id discovery. Legacy-compatible `list_tabs` and `select_tab` actions are restored for older clients, but new integrations should prefer `bind_context`.\n\nActions:\n• list         – Return known visible workspaces by default (id, name, repoPaths, showing window IDs, is_hidden)\n• switch       – Switch a window to a specified workspace\n• create       – Create a new workspace (optional folder_path)\n• hide         – Hide a workspace from default workspace lists without deleting it\n• unhide       – Restore a hidden workspace to default workspace lists\n• delete       – Delete a workspace permanently (optionally close window)\n• add_folder   – Add a folder to a workspace (defaults to active workspace)\n• remove_folder – Remove a folder from a workspace (defaults to active workspace)\n• list_tabs    – List compose tabs in one window (Legacy compatibility — prefer bind_context op=list)\n• select_tab   – Bind this connection to a compose tab (Legacy compatibility — prefer bind_context op=bind context_id=<id>)\n• create_tab   – Create a new compose tab in the background\n• close_tab    – Close a compose tab safely\n\nParameters:\n- action: \"list\" | \"switch\" | \"create\" | \"hide\" | \"unhide\" | \"delete\" | \"add_folder\" | \"remove_folder\" | \"list_tabs\" | \"select_tab\" | \"create_tab\" | \"close_tab\" (required)\n- workspace: string                             (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace; UUID or name)\n- name: string                                  (required for 'create'; optional for 'create_tab')\n- folder_path: string                           (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder; absolute path)\n- tab: string                                   (required for 'select_tab'; optional for 'close_tab'; UUID or name)\n- mode: \"blank\" | \"fork\"                      (optional for 'create_tab'; default \"blank\")\n- source_tab: string                            (optional for 'create_tab' when mode=\"fork\"; UUID or name)\n- bind: boolean                                 (optional for 'create_tab'; default true)\n- focus: boolean                                (optional for 'select_tab' or 'create_tab'; if true, also switches the UI to show the tab)\n- allow_active: boolean                         (optional for 'close_tab'; default false)\n- window_id: integer                            (optional; target window, defaults to selected or only window)\n- open_in_new_window: boolean                   (optional for 'switch' or 'create'; when true, opens workspace in a new window and binds the connection to it)\n- switch_to_created: boolean                    (optional for 'create'; when true, switches to the newly created workspace)\n- close_window: boolean                         (optional for 'delete'; when true, switches away without saving, deletes the workspace, then requests window close)\n- include_hidden: boolean                       (optional; default false. For 'list', includes hidden workspaces. For name-based 'switch'/'delete', allows hidden matches. UUID lookup remains explicit and can resolve hidden workspaces.)\n\nHidden workspaces remain persisted/recoverable. Default 'list' and name-based 'switch'/'delete' exclude hidden workspaces unless include_hidden=true; 'hide'/'unhide' are non-destructive. Explicit UUID switch/delete can target hidden workspaces without unhiding them.\n\n**Relationship with bind_context:**\n- `manage_workspaces.list` returns workspace inventory: names, folder paths, and which windows show each workspace\n- `bind_context.list` returns per-window routing state: windows, active tabs, context_ids, and current binding\n- When the same workspace is open in multiple windows, compose tabs are shared — use `bind_context` to discover per-window context_ids\n\ncreate_tab defaults to bind=true and focus=false so automation can create isolated background tabs without stealing UI focus.\n\nIMPORTANT: The 'focus' parameter switches the visible tab in the UI, which can be disruptive to the user's workflow. Only set focus=true when the user explicitly requests to see or switch to a specific tab. For background operations, omit focus or set it to false. The 'close_tab' action refuses to close the last remaining tab, the active visible tab unless allow_active=true, or any tab with a live bound run.",
+      "description_sha256" : "2ea65c3ff723f461a8eab72ef00d43c90dd82a4872436fbb4ed3428c119b555f",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"action\":{\"description\":\"Action to perform. Legacy compatibility: prefer bind_context for list_tabs/select_tab when building new integrations.\",\"enum\":[\"list\",\"switch\",\"create\",\"hide\",\"unhide\",\"delete\",\"add_folder\",\"remove_folder\",\"list_tabs\",\"select_tab\",\"create_tab\",\"close_tab\"],\"type\":\"string\"},\"allow_active\":{\"description\":\"For 'close_tab': allow closing the currently active visible tab\",\"type\":\"boolean\"},\"bind\":{\"description\":\"For 'create_tab': if true, bind this MCP connection to the new tab (default true)\",\"type\":\"boolean\"},\"close_window\":{\"description\":\"For 'delete': when true, switches away without saving, deletes the workspace, then requests window close.\",\"type\":\"boolean\"},\"focus\":{\"description\":\"For 'select_tab' or 'create_tab': if true, also switches the UI to show the tab\",\"type\":\"boolean\"},\"folder_path\":{\"description\":\"Absolute folder path (required for 'add_folder', 'remove_folder'; optional for 'create' to initialize with a root folder)\",\"type\":\"string\"},\"include_hidden\":{\"description\":\"Default false. For list, includes hidden workspaces. For name-based switch/delete, allows hidden matches; UUID lookup remains explicit.\",\"type\":\"boolean\"},\"mode\":{\"description\":\"For 'create_tab': creation mode ('blank' or 'fork')\",\"type\":\"string\"},\"name\":{\"description\":\"Name for new workspace (required for 'create'; optional for 'create_tab')\",\"type\":\"string\"},\"open_in_new_window\":{\"description\":\"For 'switch' or 'create': when true, opens workspace in a new window and binds connection to it. Returns window_id in response.\",\"type\":\"boolean\"},\"source_tab\":{\"description\":\"For 'create_tab' with mode='fork': source compose tab UUID or name\",\"type\":\"string\"},\"switch_to_created\":{\"description\":\"For 'create': when true, switches to the newly created workspace in the target window.\",\"type\":\"boolean\"},\"tab\":{\"description\":\"Compose tab UUID or name (required for 'select_tab'; optional for 'close_tab')\",\"type\":\"string\"},\"window_id\":{\"description\":\"Optional window ID; defaults to selected or only window\",\"type\":\"integer\"},\"workspace\":{\"description\":\"Workspace UUID or name (required for 'switch', 'hide', 'unhide', 'delete'; optional for 'add_folder', 'remove_folder' - defaults to active workspace)\",\"type\":\"string\"}},\"required\":[\"action\"],\"type\":\"object\"}",
+      "name" : "manage_workspaces",
+      "schema_sha256" : "ee13405b233c029cf8f68f29a0ebf14e1fafd2815cab6bce4a8b431b6bad06bc"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : null,
+        "open_world" : false,
+        "read_only" : false,
+        "title" : null
+      },
+      "description" : "Manage the file selection used by all tools.\n\n**Operations**: get | add | remove | set | clear | preview | promote | demote\n\n**Modes** (how files appear in context):\n- `full` (default): Complete file content\n- `slices`: Specific line ranges only\n- `codemap_only`: API signatures only (function/type definitions)\n\n**Key behaviors**:\n- Incremental context changes use `op=add` / `op=remove`\n- `op=set` with `mode=full`: Complete selection replacement\n- `op=set` with `mode=codemap_only`: Complete codemap-only replacement\n- `op=set` with `mode=slices`: File-scoped slice replacement (requires `#L` ranges or `slices` entries; preserves unrelated full files and slices)\n- Mixed full-file + slice additions use `op=add` with both `paths` and `slices`\n- Auto-codemap: When adding files with `mode=full/slices`, related files get auto-added as codemaps\n- Manual mode: Using `mode=codemap_only`, `promote`, or `demote` disables auto-management\n\n**Path handling**:\n- Accepts files or directories (directories expand recursively)\n- Relative or absolute paths accepted\n- Multi-root: prefix with root name (e.g., \"ProjectA/src/main.swift\")\n- Single-root: prefix optional\n- Fuzzy matching enabled by default\n\n**Options**:\n- `view`: \"summary\" | \"files\" | \"content\" | \"codemaps\" (default: \"summary\")\n- `path_display`: \"relative\" | \"full\" (default: \"relative\")\n- `strict`: When true, errors if no paths resolve (default: false)\n\n**Examples**:\n- Get selection: `{\"op\":\"get\",\"view\":\"files\"}`\n- Add files: `{\"op\":\"add\",\"paths\":[\"src/main.swift\"]}`\n- Add slices: `{\"op\":\"add\",\"slices\":[{\"path\":\"file.swift\",\"ranges\":[{\"start_line\":45,\"end_line\":120}]}]}`\n- Set codemap-only: `{\"op\":\"set\",\"paths\":[\"utils/\"],\"mode\":\"codemap_only\"}`\n- Promote codemap→full: `{\"op\":\"promote\",\"paths\":[\"helper.swift\"]}`\n\nRelated: get_file_tree, file_search, workspace_context, prompt, apply_edits",
+      "description_sha256" : "586c45be3d3a4ade60e29ccbbdce01b050be03860a67eee41a3eac95d441d7d9",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"mode\":{\"description\":\"How to represent files in selection: 'full' (complete content), 'slices' (line ranges), or 'codemap_only' (signatures only). With op=set, mode changes semantics (see 'op=set semantics' above).\",\"enum\":[\"full\",\"slices\",\"codemap_only\"],\"type\":\"string\"},\"op\":{\"description\":\"Operation\",\"enum\":[\"get\",\"add\",\"remove\",\"set\",\"clear\",\"preview\",\"promote\",\"demote\"],\"type\":\"string\"},\"path_display\":{\"description\":\"Path display for blocks\",\"enum\":[\"full\",\"relative\"],\"type\":\"string\"},\"paths\":{\"description\":\"File or folder paths (required for add/remove/set)\",\"items\":{\"description\":\"Relative or absolute file or folder path\",\"type\":\"string\"},\"type\":\"array\"},\"slices\":{\"description\":\"Selection slices to apply (path + line ranges)\",\"items\":{\"properties\":{\"lines\":{\"description\":\"Comma-separated shorthand like '10-20,40'\",\"type\":\"string\"},\"path\":{\"description\":\"Relative or absolute file path\",\"type\":\"string\"},\"ranges\":{\"description\":\"Explicit line ranges (inclusive)\",\"items\":{\"properties\":{\"description\":{\"description\":\"Optional slice description (aliases: desc, label)\",\"type\":\"string\"},\"end_line\":{\"description\":\"1-based end line\",\"type\":\"integer\"},\"start_line\":{\"description\":\"1-based start line\",\"type\":\"integer\"}},\"required\":[\"start_line\"],\"type\":\"object\"},\"type\":\"array\"}},\"required\":[\"path\"],\"type\":\"object\"},\"type\":\"array\"},\"strict\":{\"description\":\"Throw when no paths resolve (mutations)\",\"type\":\"boolean\"},\"view\":{\"description\":\"Amount of detail to return\",\"enum\":[\"summary\",\"files\",\"content\",\"codemaps\"],\"type\":\"string\"}},\"type\":\"object\"}",
+      "name" : "manage_selection",
+      "schema_sha256" : "4b7a043e8e48130ee84cc6bbf7b9fd597b495aef238d44f17df6600088a2bb6f"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : true,
+        "open_world" : false,
+        "read_only" : true,
+        "title" : null
+      },
+      "description" : "Return code structure (function/type signatures) for files.\n\n**Scopes**:\n- `paths` (default): Analyze specific files/directories. Requires `paths` parameter.\n- `selected`: Analyze current selection. Also reports files without codemaps.\n\n**Parameters**:\n- `paths`: File or directory paths (directories are recursive)\n- `max_results`: Limit considered codemaps (default: 10). Larger values opt in to broader scans.\n\n**Note**: Files without parseable structure are skipped. Use with get_file_tree and file_search for discovery.\nRendered codemap output is capped near 6k tokens even when `max_results` is larger; narrow `paths` to change which files fit.\nLine numbers are included in the output and match `read_file` line numbering, so you can jump directly to where a function/type is declared within a file. Code structure is refreshed after file edits, so results stay current.\n\n**Examples**:\n- Specific files: `{\"paths\":[\"src/auth/\"]}`\n- Current selection: `{\"scope\":\"selected\"}`",
+      "description_sha256" : "616a8669bc14e69afaad4cfec4e4da2b1f5dcb7142030fb615857175b2146cb4",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"max_results\":{\"description\":\"Maximum number of codemaps to consider before the ~6k-token response cap is applied (default: 10)\",\"type\":\"integer\"},\"paths\":{\"description\":\"Array of file or directory paths (when scope='paths')\",\"items\":{\"description\":\"File path or directory path (absolute or relative)\",\"type\":\"string\"},\"type\":\"array\"},\"scope\":{\"description\":\"Scope of operation: current selection or explicit paths\",\"enum\":[\"paths\",\"selected\"],\"type\":\"string\"}},\"type\":\"object\"}",
+      "name" : "get_code_structure",
+      "schema_sha256" : "f9bbf57f060e5cf70b8104a4b800100459376fb4438bfa80ef8f388aedf7c913"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : true,
+        "open_world" : false,
+        "read_only" : true,
+        "title" : null
+      },
+      "description" : "Generate ASCII directory tree of the project.\n\n**Types**:\n- `files` (default): Directory tree with files\n- `roots`: List loaded root folders only\n\n**Modes** (for type=\"files\"):\n- `auto` (default): Full tree, auto-trims depth if too large (~10k token target)\n- `full`: Complete tree (can be very large)\n- `folders`: Directories only, no files\n- `selected`: Only selected files and their parent directories\n\n**Options**:\n- `path`: Start from specific folder (modes/max_depth apply from there)\n- `max_depth`: Limit depth (root=0, immediate children=1, etc.)\n\n**Markers**: `*` = selected file, `+` = has codemap\n\n**Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads use the bound worktree. Responses include `worktree_scope` when this remapping is active.\n\n**Examples**:\n- Auto tree: `{}`\n- Folders only: `{\"mode\":\"folders\"}`\n- Subtree: `{\"path\":\"src/components\",\"max_depth\":2}`\n- Selected files: `{\"mode\":\"selected\"}`",
+      "description_sha256" : "9bf648121646b463554d58373f61c2dcede04640482994e0cf1533d21ae77093",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"max_depth\":{\"description\":\"Maximum depth (root = 0)\",\"type\":\"integer\"},\"mode\":{\"description\":\"Filter mode (for 'files' type only, default: 'auto')\",\"enum\":[\"auto\",\"full\",\"folders\",\"selected\"],\"type\":\"string\"},\"path\":{\"description\":\"Optional starting folder (absolute or relative) when type='files'. When provided, the tree is generated from this folder and 'mode' and 'max_depth' apply from that subtree.\",\"type\":\"string\"},\"type\":{\"description\":\"Tree type to generate (default: 'files')\",\"enum\":[\"files\",\"roots\"],\"type\":\"string\"}},\"type\":\"object\"}",
+      "name" : "get_file_tree",
+      "schema_sha256" : "91972027e030989cf242fed03377bdc5056c6317cc77d351d3fa5348dd1767a0"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : true,
+        "open_world" : false,
+        "read_only" : true,
+        "title" : null
+      },
+      "description" : "Read file contents with optional line range.\n\n**Parameters**:\n- `path`: File path (required)\n- `start_line`: 1-based line number, or negative for tail behavior\n- `limit`: Number of lines (only with positive start_line)\n\n**Behaviors**:\n- No params: Entire file\n- `start_line=10`: From line 10 to end\n- `start_line=10, limit=20`: Lines 10-29\n- `start_line=-10`: Last 10 lines (like `tail -10`)\n\n**Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads use the bound worktree. Responses include `worktree_scope` when this remapping is active.\n\n**Examples**:\n- Full file: `{\"path\":\"src/main.swift\"}`\n- Lines 50-100: `{\"path\":\"file.swift\",\"start_line\":50,\"limit\":51}`\n- Last 20 lines: `{\"path\":\"file.swift\",\"start_line\":-20}`",
+      "description_sha256" : "f5ccd98a8fc0956c4ebcff540ffc8c0eaf0aaeb654b2f8edc0495c059fcf2807",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"limit\":{\"description\":\"Number of lines to read\",\"type\":\"integer\"},\"path\":{\"description\":\"File path\",\"type\":\"string\"},\"start_line\":{\"description\":\"Line to start from (1-based) or negative for tail behavior (-N reads last N lines)\",\"type\":\"integer\"}},\"required\":[\"path\"],\"type\":\"object\"}",
+      "name" : "read_file",
+      "schema_sha256" : "d023edb446167481751886bebeac7dc8896e2b3f57c12b18591761f846618bb1"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : true,
+        "open_world" : false,
+        "read_only" : true,
+        "title" : null
+      },
+      "description" : "Search files by path pattern and/or content.\n\n**Modes**:\n- `auto` (default): Detects path vs content search from pattern\n- `path`: Match file paths only (glob-style with regex=false, full regex otherwise)\n- `content`: Search inside file contents\n- `both`: Search paths and contents\n\n**Matching** (regex auto-detected by default):\n- Regex mode: Full regex support (groups, lookarounds, anchors)\n- Literal mode (regex=false): Special chars matched literally, `*`/`?` wildcards for paths\n- Tip: Set `regex=false` to force literal substring matching\n\n**Key options**:\n- `pattern`: Search term (required)\n- `max_results`: Result limit (default: 50)\n- `context_lines`: Lines before/after matches (alias: `-C`)\n- `whole_word`: Match whole words only\n- `count_only`: Return counts only, no content\n- `filter.extensions`: Limit to extensions (e.g., [\".swift\"])\n- `filter.paths`: Limit to paths/folders (can also be a loaded root name like 'RepoPrompt')\n- `filter.exclude`: Skip matching patterns\n\n**Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem searches use the bound worktree. Responses include `worktree_scope` when this remapping is active.\n\n**Examples**:\n- Literal: `{\"pattern\":\"frame(minWidth:\",\"regex\":false}`\n- Regex OR: `{\"pattern\":\"performSearch|searchUsers\"}`\n- Find files: `{\"pattern\":\"*.swift\",\"mode\":\"path\",\"regex\":false}`\n- With context: `{\"pattern\":\"TODO\",\"context_lines\":2}`\n- Scoped: `{\"pattern\":\"auth\",\"filter\":{\"paths\":[\"src/auth/\"]}}`\n\nResponse capped at ~50k chars; excess results omitted (count reported).",
+      "description_sha256" : "f2c9e16ca780c4e94f795b6c9489658856052e6d159aa467a64c906ee48a3fe4",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"context_lines\":{\"description\":\"Lines of context before/after matches (alias: -C)\",\"type\":\"integer\"},\"count_only\":{\"description\":\"Return only match count\",\"type\":\"boolean\"},\"filter\":{\"description\":\"File filtering options (alias: use 'path' string parameter for single-file search)\",\"properties\":{\"exclude\":{\"description\":\"Skip files/paths matching these patterns\",\"items\":{\"description\":\"Pattern like 'node_modules' or '*.log'\",\"type\":\"string\"},\"type\":\"array\"},\"extensions\":{\"description\":\"Only search files with these extensions\",\"items\":{\"description\":\"File extension like '.js' or '.swift'\",\"type\":\"string\"},\"type\":\"array\"},\"paths\":{\"description\":\"Limit search to specific file or folder paths, or a loaded root name\",\"items\":{\"description\":\"Absolute path, relative path, or loaded root name (e.g., 'RepoPrompt')\",\"type\":\"string\"},\"type\":\"array\"}},\"type\":\"object\"},\"max_results\":{\"description\":\"Maximum total results (default: 50)\",\"type\":\"integer\"},\"mode\":{\"description\":\"Search scope: auto-detects if not specified\",\"enum\":[\"auto\",\"path\",\"content\",\"both\"],\"type\":\"string\"},\"path\":{\"description\":\"Alias for filter.paths with a single file or folder path\",\"type\":\"string\"},\"pattern\":{\"description\":\"Search pattern\",\"type\":\"string\"},\"regex\":{\"description\":\"Use regex matching (default: auto based on pattern)\",\"type\":\"boolean\"},\"whole_word\":{\"description\":\"Match whole words only\",\"type\":\"boolean\"}},\"required\":[\"pattern\"],\"type\":\"object\"}",
+      "name" : "file_search",
+      "schema_sha256" : "08904f5e241c06414ff476b80b81338a5798961a69d93227d7ed098694546b99"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : true,
+        "open_world" : false,
+        "read_only" : true,
+        "title" : null
+      },
+      "description" : "Canonical workspace context render/export tool.\n\nDefault behavior returns a snapshot of prompt, selection, code structure, and tokens.\nUse `op` for render/export helpers, or omit it for the default snapshot.\n\n**Default includes**: `[\"prompt\",\"selection\",\"code\",\"tokens\"]`\n\n**Available includes**:\n- `prompt`: Current prompt text\n- `selection`: Selected files summary\n- `code`: Code structure (codemaps) for selection\n- `files`: Full file contents\n- `tree`: File tree of selected files\n- `tokens`: Token breakdown by component\n\n**Operations**:\n- `snapshot` (default) — build/render the current workspace context snapshot\n- `export` — write the rendered export to disk\n- `list_presets` — list copy presets\n- `select_preset` — select the active copy preset for the bound tab\n\n**Options**:\n- `include`: Array of sections to include for snapshot rendering\n- `path_display`: \"relative\" | \"full\"\n- `copy_preset`: Override copy preset for token calculation / export rendering\n\n**Worktree scope**: When an agent session is bound to a Git worktree, displayed paths may remain logical/canonical while filesystem reads/searches use the bound worktree. Responses include `worktree_scope` when this remapping is active.\n\n**Examples**:\n- Default snapshot: `{}`\n- With file contents: `{\"include\":[\"prompt\",\"selection\",\"files\"]}`\n- Export: `{\"op\":\"export\",\"path\":\"context.txt\"}`\n- Preset override: `{\"copy_preset\":\"Plan\"}`\n\nRelated: manage_selection, get_file_tree, ask_oracle",
+      "description_sha256" : "fb968e72d430d354b03a0dfdb5251d95bbdea2a38cddcd58fe402f6bcb4f1035",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"copy_preset\":{\"description\":\"Preset UUID, kind, or name\",\"type\":\"string\"},\"include\":{\"description\":\"What to include (defaults to prompt, selection, code, tokens)\",\"items\":{\"enum\":[\"prompt\",\"selection\",\"code\",\"files\",\"tree\",\"tokens\"],\"type\":\"string\"},\"type\":\"array\"},\"op\":{\"description\":\"Operation (default: 'snapshot')\",\"enum\":[\"snapshot\",\"export\",\"list_presets\",\"select_preset\"],\"type\":\"string\"},\"path\":{\"description\":\"File path for export operation\",\"type\":\"string\"},\"path_display\":{\"description\":\"Path display for blocks\",\"enum\":[\"full\",\"relative\"],\"type\":\"string\"},\"preset\":{\"description\":\"Preset UUID, kind, or name\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "name" : "workspace_context",
+      "schema_sha256" : "d41b9e8db1ccb1ce385d2d20619485a211bda4a8474270ef0c08fc77647e8376"
+    },
+    {
+      "annotations" : {
+        "destructive" : false,
+        "idempotent" : null,
+        "open_world" : false,
+        "read_only" : false,
+        "title" : null
+      },
+      "description" : "Get or modify the shared prompt (instructions/notes).\n\n**Operations**: get | set | append | clear | export | list_presets | select_preset\n\n**Parameters by op**:\n- `set`/`append`: `text` (required)\n- `export`: `path` (required), `copy_preset` (optional override)\n- `select_preset`: `preset` (required) - UUID, kind, or name\n\n**Notes**:\n- `select_preset` requires an explicitly bound tab context (not available during discovery runs)\n- `export` writes clipboard content to file so it can be copy/pasted into ChatGPT (or another AI) for a second opinion; use `copy_preset` to override format\n- `list_presets` returns all available copy presets with configurations\n\n**Examples**:\n- Get: `{\"op\":\"get\"}`\n- Set: `{\"op\":\"set\",\"text\":\"Focus on error handling\"}`\n- Export: `{\"op\":\"export\",\"path\":\"context.txt\"}`\n- List presets: `{\"op\":\"list_presets\"}`\n- Select preset: `{\"op\":\"select_preset\",\"preset\":\"Plan\"}`\n\nRelated: workspace_context, manage_selection, ask_oracle",
+      "description_sha256" : "e1377f12a6495829c0ade3e37b9325f7a07dc2065288b16bb810d01a4df9e55d",
+      "enabled_by_default" : true,
+      "input_schema" : "{\"properties\":{\"copy_preset\":{\"description\":\"Preset UUID, kind, or name\",\"type\":\"string\"},\"op\":{\"description\":\"Operation (default: 'get')\",\"enum\":[\"get\",\"set\",\"append\",\"clear\",\"export\",\"list_presets\",\"select_preset\"],\"type\":\"string\"},\"path\":{\"description\":\"File path (required for export)\",\"type\":\"string\"},\"preset\":{\"description\":\"Preset UUID, kind, or name\",\"type\":\"string\"},\"text\":{\"description\":\"Text for set/append\",\"type\":\"string\"}},\"type\":\"object\"}",
+      "name" : "prompt",
+      "schema_sha256" : "8c8ea22a39bbb9e10c364ad483527faf109a52e1eb9c45c0c939f569ecf144d1"
+    }
+  ],
+  "format_version" : 1,
+  "normalized_arguments" : [
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"op\":\"status\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "bind_context",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+        "/tmp/a",
+        "/tmp/b"
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"action\":\"list\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "manage_workspaces",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"op\":\"get\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "manage_selection",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"op\":\"snapshot\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "workspace_context",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"type\":\"roots\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "get_file_tree",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"scope\":\"selected\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "get_code_structure",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"path\":\"Sources/App.swift\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "read_file",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"pattern\":\"needle\",\"regex\":false}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "file_search",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    },
+    {
+      "context_id" : "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+      "payload" : "{\"op\":\"get\"}",
+      "raw_json" : true,
+      "tab_id" : null,
+      "tool" : "prompt",
+      "warnings" : [
+        "Unwrapped tool-name wrapper at top level"
+      ],
+      "window_id" : 41,
+      "working_dirs" : [
+
+      ]
+    }
+  ],
+  "responses" : [
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"bind_context\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"bind_context\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"bind_context\"\n}\n```",
+      "tool" : "bind_context"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"manage_workspaces\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"manage_workspaces\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"manage_workspaces\"\n}\n```",
+      "tool" : "manage_workspaces"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"manage_selection\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"manage_selection\"}",
+      "text" : "## Selection ✅\n**0 total tokens**",
+      "tool" : "manage_selection"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"get_code_structure\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"get_code_structure\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"get_code_structure\"\n}\n```",
+      "tool" : "get_code_structure"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"get_file_tree\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"get_file_tree\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"get_file_tree\"\n}\n```",
+      "tool" : "get_file_tree"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"read_file\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"read_file\"}",
+      "text" : "## File Read ✅\n- **Path**: `Sources/App.swift`\n- **Lines**: 0–1 of 1\n\n```swift\n\n```",
+      "tool" : "read_file"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"file_search\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"file_search\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"file_search\"\n}\n```",
+      "tool" : "file_search"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"workspace_context\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"workspace_context\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"workspace_context\"\n}\n```",
+      "tool" : "workspace_context"
+    },
+    {
+      "raw_text" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"prompt\"}",
+      "source" : "representative formatter-boundary fixture",
+      "structured" : "{\"items\":[\"phase0\"],\"status\":\"ok\",\"tool\":\"prompt\"}",
+      "text" : "```json\n{\n  \"items\" : [\n    \"phase0\"\n  ],\n  \"status\" : \"ok\",\n  \"tool\" : \"prompt\"\n}\n```",
+      "tool" : "prompt"
+    }
+  ],
+  "runtime" : "app-v1",
+  "tool_order" : [
+    "bind_context",
+    "manage_workspaces",
+    "manage_selection",
+    "get_code_structure",
+    "get_file_tree",
+    "read_file",
+    "file_search",
+    "workspace_context",
+    "prompt"
+  ]
+}

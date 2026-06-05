@@ -1,10 +1,10 @@
 # Headless Core Architecture Lock
 
-Status: Slice 5C headless packaging/install/smoke checkpoint, 2026-06-05. Items 0-5 plus the Slice 5A/5B standalone host work are committed: the package has enforceable SwiftPM roots, a standalone `RepoPromptHeadless` executable target, fail-closed config/state/root-policy defaults, direct stdio JSON-RPC serving, and the first read-oriented safe MCP tool profile. Slice 5C adds the independent headless package/install/status/smoke lane, managed `rpce-headless[-debug]` paths, CI coverage, and proxy-vs-standalone docs while preserving the app-bundled `repoprompt-mcp` proxy behavior.
+Status: Phase 0 frozen foundation checkpoint, 2026-06-05. Packaging `2b35091`, app/MCP `042a500`, and headless `487cd71` are the recorded sibling baselines. The package has enforceable SwiftPM contract/adapter roots and an independently packaged fail-closed headless profile, but the mature app runtime has not moved into Core and headless still owns a parallel workspace/search/selection/codemap/prompt/safe-tool implementation. Shared-runtime convergence is incomplete.
 
 ## Locked target graph
 
-The migration uses a library-first host architecture. The macOS app will embed the reusable core in-process, while a separately packaged headless executable will instantiate the same core without requiring `RepoPrompt.app` to be installed or running.
+The target graph below is the convergence destination, not current runtime ownership. Today the app embeds the mature runtime under `Sources/RepoPrompt`, while the separately packaged headless executable uses its own v1 runtime without requiring `RepoPrompt.app` to be installed or running.
 
 ```text
                            RepoPromptShared
@@ -22,7 +22,7 @@ The migration uses a library-first host architecture. The macOS app will embed t
   AppKit/SwiftUI shell     direct stdio MCP       existing app proxy
 ```
 
-The package graph now contains the Item 5 library roots plus the standalone executable and Slice 5C package/install/smoke boundary:
+The current package graph contains bounded contract/adapter roots plus the standalone executable and its separate package/install/smoke boundary:
 
 | Reserved target or product | Reserved source root | Responsibility |
 | --- | --- | --- |
@@ -138,6 +138,28 @@ Slices 5A-5C implement these locked constraints for the first standalone profile
 - Mutation, VCS-write, broader export, oracle, Context Builder, Agent Mode, app settings, and app lifecycle capabilities remain omitted or operation-gated in standalone v1.
 - Slice 5C packaging validates this profile with `Scripts/smoke_headless_mcp.sh` over direct stdio: initialize, `tools/list`, `read_file`, `file_search`, export permission rejection, gated-tool rejection, and shutdown.
 
+## Phase 0 regenerated move inventory
+
+This current-owner inventory supersedes the historical Item 0 path table below for implementation planning. It records the frozen `487cd71` checkout without moving any file in Phase 0.
+
+| Current owner/path family | Future destination/disposition | Phase 0 evidence |
+| --- | --- | --- |
+| `Sources/RepoPrompt/Infrastructure/Core/RepoPromptCoreHost.swift`; neutral MCP service/tool/runtime registries under `Infrastructure/MCP` | `RepoPromptCore/Runtime`; rename window-scoped reusable abstractions to session-scoped | `RepoPromptCoreHostLifecycleTests`, `MCPRuntimeRegistryTests`, dispatch-source guards |
+| `Features/Workspaces/WorkspaceModel.swift`, `Features/Workspaces/Core/WorkspaceRepository.swift`, neutral workspace session/controller state and Codable dependencies | `RepoPromptCore/Workspaces`; app ObservableObject/AppStorage/folder-picker adapters remain in `RepoPrompt` | app-v1 Phase 0 fixture plus repository/no-rewrite characterization |
+| Neutral `Infrastructure/WorkspaceContext/**` indexing, path, search, selection, slices, token accounting, and store behavior | `RepoPromptCore/WorkspaceContext`; watcher factory and diagnostics injected, macOS mechanics remain in CoreMacOS | `WorkspaceFileContextStoreTests`, path/search/selection suites, accepted-ingress barrier tests |
+| Neutral `Features/CodeMap/**`, `Infrastructure/SyntaxParsing/**`, and required PCRE/C/parser wrappers | `RepoPromptCore/CodeMap` and `RepoPromptCore/SyntaxParsing`; File/Folder view-model and AppKit presentation adapters remain app-owned | CodeMap goldens and parser/scanner compatibility tests |
+| Neutral prompt assembly, workspace-context rendering, resolved tree, selection reply, and token accounting behavior | `RepoPromptCore` prompt/context ownership; `PromptFileEntry` view-model adapter remains app-owned | Phase 0 formatter snapshots and existing prompt/context tests |
+| `MCPWindowToolCatalogService`, context/runtime/group/names/helpers, and safe file/selection/prompt providers | Core session MCP catalog/providers/dispatch after capability-facet split | independent nine-tool app descriptor/normalization/formatter snapshot |
+| apply edits, file mutation, VCS/worktree, Oracle, Context Builder, ask-user, Agent Mode, settings, lifecycle, approval, wake/power | remain in `RepoPrompt` | capability omission ledger; no Phase 0 move |
+| `Sources/RepoPromptShared/MCP/POSIXDescriptorSupport.swift` | new internal `RepoPromptPOSIXSupport/Descriptors` | descriptor/process characterization; Phase 1 boundary blocker |
+| app `MacOSBootstrapSocketServer`, accepted-FD manager, Unix transport and socket mechanics | `RepoPromptCoreMacOS/MCP/AppProxy`; app admission/approval/limits/diagnostics/routing remain app-owned | bootstrap contract and socket ownership/order tests |
+| `RepoPromptCorePlatformDependencies.swift` and static process facade | delete after watcher/process/storage/transport injection reaches real owners | process inheritance/SIGPIPE/failure tests |
+| headless workspace models/store, resolver/catalog/search/codemap, registry and nine local tool implementations | replace with Core implementations, migrate v1 storage, then delete | headless-v1 fixture, descriptor/call snapshots, direct-stdio smoke |
+| headless CLI, configuration/state paths/root policy/file lock, JSON-RPC adapter, stdio transport/writer/output | remain in `RepoPromptHeadless` | lifecycle tests and direct-stdio smoke |
+| public Core/CoreMacOS/SyntaxBridge library products | remove public products last; retain internal targets | later manifest phase; `Package.swift` intentionally unchanged in Phase 0 |
+
+The historical table remains below only as an audit record. Where it conflicts with this inventory or the convergence design, this section controls.
+
 ## Concurrency lock for later implementation
 
 | Component | Required isolation |
@@ -150,7 +172,7 @@ Slices 5A-5C implement these locked constraints for the first standalone profile
 
 ## Historical Item 0 move inventory
 
-This inventory records the ownership plan captured before the bounded Item 5 split. Its `Current path` column is historical unless a later section explicitly says a seam remains app-owned; the landed Item 5 roots and explicit deferrals below are authoritative.
+This inventory records the ownership plan captured before the bounded Item 5 split. It is retained for archaeology and does not override the regenerated Phase 0 inventory above. Its `Current path` column is historical unless a later section explicitly says a seam remains app-owned; the landed Item 5 roots and explicit deferrals below are authoritative.
 
 ### Workspace ownership
 
