@@ -284,7 +284,7 @@ def main() -> int:
     ):
         if delegation not in app_packaging_source:
             fail(f"App prompt packaging facade must delegate factual rendering: {delegation}")
-    for retained_app_token in ("private enum GitDiffArtifact", "_git_data"):
+    for retained_app_token in ("enum PromptGitDiffArtifactClassifier", "_git_data"):
         if retained_app_token not in app_packaging_source:
             fail(f"App prompt packaging policy owner missing: {retained_app_token}")
         if retained_app_token in core_rendering_values_source or retained_app_token in core_rendering_service_source:

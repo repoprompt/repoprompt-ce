@@ -313,6 +313,18 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "PATCH-TWO", in: content), 1)
         XCTAssertEqual(occurrences(of: "GENERATED-FALLBACK", in: content), 0)
         XCTAssertEqual(occurrences(of: "_git_data/", in: content), 0)
+
+        let exactPayload = PromptPackagingService.exactRenderedPayload(content, source: .immutableSnapshot)
+        XCTAssertEqual(exactPayload.text, expected)
+        XCTAssertEqual(exactPayload.projection.provenance.view, .userConfigured)
+        XCTAssertEqual(exactPayload.projection.provenance.scope, .export)
+        XCTAssertEqual(exactPayload.projection.provenance.source, .immutableSnapshot)
+        XCTAssertEqual(exactPayload.projection.provenance.basis, .exactRenderedPayload)
+        XCTAssertEqual(exactPayload.projection.components, .init())
+        XCTAssertEqual(
+            exactPayload.projection.total,
+            TokenCalculationService.estimateTokens(for: expected)
+        )
     }
 
     func testCompleteAlternateCodemapCandidatesMatchPromptAccountingEligibility() async throws {

@@ -6,7 +6,61 @@ struct MetaInstruction {
     let content: String
 }
 
+enum PromptGitDiffArtifactClassifier {
+    static let rootFolderName = "_git_data"
+
+    static func isDiffArtifactPath(_ fullPath: String) -> Bool {
+        guard fullPath.contains("/\(rootFolderName)/") else { return false }
+        let lower = fullPath.lowercased()
+        guard lower.hasSuffix(".diff") || lower.hasSuffix(".patch") else { return false }
+        return lower.contains("/diff/") || lower.contains("/diffs/")
+    }
+}
+
 enum PromptPackagingService {
+    struct ExactRenderedPayload {
+        let text: String
+        let projection: TokenProjection
+    }
+
+    static func exactRenderedPayload(
+        _ text: String,
+        source: TokenProjection.Source
+    ) -> ExactRenderedPayload {
+        ExactRenderedPayload(
+            text: text,
+            projection: TokenProjectionService.exactRenderedPayload(
+                text,
+                view: .userConfigured,
+                source: source
+            )
+        )
+    }
+
+    static func exactChatPayload(
+        for message: AIMessage,
+        source: TokenProjection.Source
+    ) -> ExactRenderedPayload {
+        exactRenderedPayload(renderedChatPayload(for: message), source: source)
+    }
+
+    static func renderedChatPayload(for message: AIMessage) -> String {
+        var contents: [String] = []
+        if !message.systemPrompt.isEmpty {
+            contents.append(message.systemPrompt)
+        }
+
+        let tail = message.buildTail(embedSystemPrompt: false)
+        let lastUserIndex = message.conversationMessages.lastIndex { $0.role == .user }
+        for (index, entry) in message.conversationMessages.enumerated() {
+            let text = entry.role == .user && index == lastUserIndex && !tail.isEmpty
+                ? tail + "\n" + entry.content
+                : entry.content
+            contents.append(text)
+        }
+        return contents.joined()
+    }
+
     /// Returns the opening ``` fence, suffixed with the file extension (\"swift\", \"js\", …).
     @inline(__always)
     static func codeFenceStart(for fileName: String) -> String {
@@ -42,17 +96,6 @@ enum PromptPackagingService {
         """
     }
 
-    private enum GitDiffArtifact {
-        static let rootFolderName = "_git_data"
-
-        static func isDiffArtifactPath(_ fullPath: String) -> Bool {
-            guard fullPath.contains("/\(rootFolderName)/") else { return false }
-            let lower = fullPath.lowercased()
-            guard lower.hasSuffix(".diff") || lower.hasSuffix(".patch") else { return false }
-            return lower.contains("/diff/") || lower.contains("/diffs/")
-        }
-    }
-
     static func partitionPromptEntriesForGitDiff(
         _ entries: [PromptFileEntry]
     ) -> (diffEntries: [PromptFileEntry], codeEntries: [PromptFileEntry]) {
@@ -63,7 +106,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if PromptGitDiffArtifactClassifier.isDiffArtifactPath(entry.file.fullPath) {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -183,7 +226,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if PromptGitDiffArtifactClassifier.isDiffArtifactPath(entry.file.fullPath) {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -320,6 +363,7 @@ enum PromptPackagingService {
         fileTreeContent: String?, // NEW simplified parameter for the file tree
         gitDiff: String? = nil,
         includeDatetimeInUserInstructions: Bool = false,
+        renderingDate: Date? = nil,
         // Add parameters needed by PromptAssemblyBuilder
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -351,26 +395,11 @@ enum PromptPackagingService {
 
         // User Instructions Snippet
         if !userInstructions.isEmpty {
-            var snippet = ""
-            if includeDatetimeInUserInstructions {
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let dateString = dateFormatter.string(from: Date())
-                snippet += """
-                <user_instructions date="\(dateString)">
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            } else {
-                snippet += """
-                <user_instructions>
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            }
-            snippets[.userInstructions] = snippet
+            snippets[.userInstructions] = userInstructionsSnippet(
+                userInstructions,
+                includeDatetime: includeDatetimeInUserInstructions,
+                renderingDate: renderingDate
+            )
         }
 
         // --- Build Final User Message ---
@@ -399,6 +428,7 @@ enum PromptPackagingService {
         includeUserPrompt: Bool,
         filePathDisplay: FilePathDisplay,
         includeDatetimeInUserInstructions: Bool = false,
+        renderingDate: Date? = nil,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
         duplicateUserInstructionsAtTop: Bool,
@@ -431,26 +461,11 @@ enum PromptPackagingService {
 
         // User Instructions Snippet
         if includeUserPrompt, !userInstructions.isEmpty {
-            var snippet = ""
-            if includeDatetimeInUserInstructions {
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let dateString = dateFormatter.string(from: Date())
-                snippet += """
-                <user_instructions date="\(dateString)">
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            } else {
-                snippet += """
-                <user_instructions>
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            }
-            snippets[.userInstructions] = snippet
+            snippets[.userInstructions] = userInstructionsSnippet(
+                userInstructions,
+                includeDatetime: includeDatetimeInUserInstructions,
+                renderingDate: renderingDate
+            )
         }
 
         // --- Build Final String ---
@@ -478,6 +493,7 @@ enum PromptPackagingService {
         filePathDisplay: FilePathDisplay,
         codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
         includeDatetimeInUserInstructions: Bool = false,
+        renderingDate: Date? = nil,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
         duplicateUserInstructionsAtTop: Bool,
@@ -507,26 +523,11 @@ enum PromptPackagingService {
         applyFactualSnippets(factualSnippets, to: &snippets)
 
         if includeUserPrompt, !userInstructions.isEmpty {
-            var snippet = ""
-            if includeDatetimeInUserInstructions {
-                let dateFormatter = DateFormatter()
-                dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
-                let dateString = dateFormatter.string(from: Date())
-                snippet += """
-                <user_instructions date="\(dateString)">
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            } else {
-                snippet += """
-                <user_instructions>
-                \(userInstructions)
-                </user_instructions>
-
-                """
-            }
-            snippets[.userInstructions] = snippet
+            snippets[.userInstructions] = userInstructionsSnippet(
+                userInstructions,
+                includeDatetime: includeDatetimeInUserInstructions,
+                renderingDate: renderingDate
+            )
         }
 
         let clipboardContent = PromptAssemblyBuilder.build(
@@ -657,6 +658,30 @@ enum PromptPackagingService {
         if let gitDiff = factual.gitDiff {
             snippets[.gitDiff] = gitDiff
         }
+    }
+
+    private static func userInstructionsSnippet(
+        _ userInstructions: String,
+        includeDatetime: Bool,
+        renderingDate: Date?
+    ) -> String {
+        if includeDatetime {
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+            let dateString = dateFormatter.string(from: renderingDate ?? Date())
+            return """
+            <user_instructions date="\(dateString)">
+            \(userInstructions)
+            </user_instructions>
+
+            """
+        }
+        return """
+        <user_instructions>
+        \(userInstructions)
+        </user_instructions>
+
+        """
     }
 
     // MARK: - Shared builder for <meta prompt> blocks

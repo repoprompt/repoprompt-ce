@@ -100,6 +100,41 @@ final class PromptMigrationRemovalTests: XCTestCase {
         XCTAssertFalse(adapterSource.contains("switch codeMapUsage"))
     }
 
+    func testPromptTokenEstimatesUseExactRenderedPayloadAndRemovedArithmeticCannotReturn() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let packagingSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(packagingSource.contains("TokenProjectionService.exactRenderedPayload"))
+        XCTAssertTrue(packagingSource.contains("PromptGitDiffArtifactClassifier"))
+        XCTAssertTrue(packagingSource.contains("exactChatPayload"))
+        XCTAssertEqual(packagingSource.components(separatedBy: "rootFolderName = \"_git_data\"").count - 1, 1)
+        XCTAssertTrue(viewModelSource.contains("buildClipboardPayload"))
+        XCTAssertTrue(viewModelSource.contains("packagePromptResult"))
+        XCTAssertTrue(viewModelSource.contains("exactPayload.projection.total"))
+
+        for removedTokenPath in [
+            "Int(Double(text.count) / 4.0)",
+            "ChatContextTokenBaselineCache",
+            "baseTokensWithoutPromptText",
+            "supportsPromptTextDeltas",
+            "promptTextDuplicateFactor",
+            "chatContextTokenBaselineCacheKey"
+        ] {
+            XCTAssertFalse(viewModelSource.contains(removedTokenPath), removedTokenPath)
+        }
+    }
+
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {
         let presetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000456"))
         let overridesRaw = """

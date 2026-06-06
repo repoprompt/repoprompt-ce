@@ -1095,79 +1095,29 @@ class PromptViewModel: ObservableObject {
         let fileAPIsVersion: UInt64
     }
 
-    private struct ChatPresetTokenBaselineKey: Equatable {
-        let id: UUID
-        let mode: ChatPresetMode
-        let modelPresetName: String?
-        let fileTreeMode: FileTreeOption?
-        let codeMapUsage: CodeMapUsage?
-        let gitInclusion: GitInclusion?
-        let storedPromptIds: [UUID]
-        let useStoredPromptsAsSystem: Bool
+    struct PackagedPromptResult {
+        let message: AIMessage
+        let exactPayload: PromptPackagingService.ExactRenderedPayload
     }
 
-    private struct PromptContextTokenBaselineKey: Equatable {
+    private struct ClipboardPackagingRequest {
+        let config: PromptContextResolved
+        let selection: StoredSelection
+        let promptText: String
+        let metaInstructions: [MetaInstruction]
+        let includeSavedPrompts: Bool
         let includeFiles: Bool
         let includeUserPrompt: Bool
-        let includeMetaPrompts: Bool
-        let includeFileTree: Bool
-        let fileTreeMode: FileTreeOption
-        let codeMapUsage: CodeMapUsage
-        let gitInclusion: GitInclusion
-        let storedPromptIds: [UUID]
-    }
-
-    private struct StoredPromptTokenBaselineKey: Equatable {
-        let id: UUID
-        let title: String
-        let content: String
-        let isUserEdited: Bool
-    }
-
-    private struct RootTokenBaselineKey: Equatable {
-        let id: UUID
-        let fullPath: String
-        let name: String
-        let isSystemRoot: Bool
-    }
-
-    private struct ChatContextTokenBaselineCacheKey: Equatable {
-        let workspaceID: UUID?
-        let selectedChatPresetID: UUID?
-        let chatPreset: ChatPresetTokenBaselineKey
-        let resolvedContext: PromptContextTokenBaselineKey
-        let fileTreeOptionForChat: FileTreeOption
-        let codeMapUsageForChat: CodeMapUsage
-        let gitDiffInclusionModeForChat: GitDiffInclusionMode
-        let codeMapsGloballyDisabled: Bool
-        let filePathDisplayOption: FilePathDisplay
-        let selectedFilesSortMethod: SortMethod
-        let fileTreeSortMethod: SortMethod
+        let includeLocalDefinitionsInFileTree: Bool
+        let filePathDisplay: FilePathDisplay
         let onlyIncludeRootsWithSelectedFiles: Bool
+        let showCodeMapMarkers: Bool
         let includeDatetimeInUserInstructions: Bool
         let promptSectionsOrder: [PromptSection]
-        let disabledPromptSections: [PromptSection]
+        let disabledPromptSections: Set<PromptSection>
         let duplicateUserInstructionsAtTop: Bool
-        let selectedPromptIDsForChat: [UUID]
-        let hasManualChatPromptSelection: Bool
-        let storedPrompts: [StoredPromptTokenBaselineKey]
-        let hierarchyGenerationSignature: UInt64
-        let rootOrder: [RootTokenBaselineKey]
-        let selectionVersion: UInt64
-        let slicesVersion: UInt64
-        let autoCodemapVersion: UInt64
-        let fileAPIsVersion: UInt64
-        let fileSystemDeltaVersion: UInt64
-    }
-
-    private struct ChatContextTokenBaselineCache {
-        let key: ChatContextTokenBaselineCacheKey
-        let baseTokensWithoutPromptText: Int
-        /// The base token value only safely supports prompt deltas if it was derived
-        /// from a payload that actually contained a user-instructions prompt block.
-        let supportsPromptTextDeltas: Bool
-        /// Exact value for the empty-prompt shape when the cold miss observed it.
-        let emptyPromptTokenCount: Int?
+        let tabTitle: String?
+        let renderingDate: Date
     }
 
     var chatPromptEntriesCache: (
@@ -1182,8 +1132,6 @@ class PromptViewModel: ObservableObject {
     var chatSlicesVersion: UInt64 = 0
     var chatAutoCodemapVersion: UInt64 = 0
     var chatFileAPIsVersion: UInt64 = 0
-    private var chatFileSystemDeltaVersion: UInt64 = 0
-    private var chatContextTokenBaselineCache: ChatContextTokenBaselineCache?
 
     // MARK: - Computed Properties for Token Counting (Legacy Support)
 
@@ -2143,7 +2091,6 @@ class PromptViewModel: ObservableObject {
                 // File changes can replace live view models even when selection is unchanged.
                 // Invalidate and cancel so an in-flight projection cannot publish stale identities.
                 guard let self else { return }
-                chatFileSystemDeltaVersion &+= 1
                 invalidateChatPromptEntriesCache()
             }
             .store(in: &cancellables)
@@ -2208,7 +2155,6 @@ class PromptViewModel: ObservableObject {
         chatPromptEntriesProjectionTask = nil
         chatPromptEntriesProjectionKey = nil
         chatPromptEntriesCache = nil
-        chatContextTokenBaselineCache = nil
     }
 
     private func bumpChatPromptEntriesSelectionVersion() {
@@ -3878,11 +3824,6 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    private func estimateTokens(for text: String) -> Int {
-        // This is a simple estimation. For more accurate results, you might want to use a proper tokenizer.
-        Int(Double(text.count) / 4.0)
-    }
-
     // MARK: - Prompt Section Order Methods
 
     static func resolvedPromptSectionOrder(raw: String) -> [PromptSection] {
@@ -3914,105 +3855,11 @@ class PromptViewModel: ObservableObject {
     // MARK: - Clipboard Operations
 
     func copyToClipboard() {
-        _ = true
-        // Capture all necessary properties before Task to minimize actor hopping
-        let promptContext = resolvePromptContext()
-        let selectionSnapshot = activeComposeTabStoredSelectionForPromptPackaging()
-        let metaInstructions = metaInstructions
-        let promptText = promptText
-        let filePathDisplayOption = filePathDisplayOption
-        let includeFileTree = promptContext.rendersFileTree
-        let fileTreeMode = promptContext.effectiveFileTreeMode
-        let onlyIncludeRoots = onlyIncludeRootsWithSelectedFiles
-        let showCodeMapMarkers = !codeMapsGloballyDisabled
-        let includeSavedPrompts = includeSavedPromptsInClipboard
-        let includeUserPrompt = includeUserPromptInClipboard
-        let includeDatetime = includeDatetimeInUserInstructions
-        let promptSectionsOrder = promptSectionsOrder
-        let disabledPromptSections = disabledPromptSections
-        let duplicateUserInstructions = duplicateUserInstructionsAtTop
-        let includeFilesInClipboard = includeFilesInClipboard
-
-        // NEW: Determine active compose tab title (fallback to empty if unavailable)
-        let tabTitleForClipboard: String = {
-            if let tabID = self.activeComposeTabID,
-               let snapshot = self.workspaceManager?.composeTabSnapshot(for: tabID)
-            {
-                return snapshot.name
-            }
-            return ""
-        }()
-
+        let request = currentClipboardPackagingRequest()
         Task {
-            let store = workspaceFileContextStore
-            let fileTreeContent: String
-            if includeFileTree {
-                let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                    selection: selectionSnapshot,
-                    request: WorkspaceFileTreeSnapshotRequest(
-                        mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: fileTreeMode),
-                        filePathDisplay: filePathDisplayOption,
-                        onlyIncludeRootsWithSelectedFiles: onlyIncludeRoots,
-                        includeLegend: true,
-                        showCodeMapMarkers: showCodeMapMarkers,
-                        rootScope: .allLoaded
-                    ),
-                    profile: .uiAssisted
-                )
-                fileTreeContent = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-            } else {
-                fileTreeContent = ""
-            }
-            let accountingService = PromptContextAccountingService()
-            let resolution = await accountingService.resolveEntries(
-                selection: selectionSnapshot,
-                store: store,
-                rootScope: .allLoaded,
-                profile: .uiAssisted,
-                codeMapUsage: promptContext.codeMapUsage
-            )
-            let fileEntries = resolution.entries
-            let codemapSnapshots = await store.codemapSnapshotDictionary()
-            let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
-            let includeFiles = includeFilesInClipboard && !fileEntries.isEmpty
-
-            // Get git diff based on resolved preset config (not UI state)
-            let gitDiff: String? = await {
-                guard diffEntries.isEmpty else { return nil }
-                switch promptContext.gitInclusion {
-                case .none:
-                    return nil
-                case .selected:
-                    let selectedPaths = await self.resolvedSelectedGitDiffPaths(for: selectionSnapshot)
-                    return await self.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-                case .complete:
-                    return await self.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-                }
-            }()
-
-            // Use captured values inside the Task
-            let clipboardContent = await PromptPackagingService.generateClipboardContent(
-                metaInstructions: metaInstructions,
-                userInstructions: promptText,
-                files: fileEntries,
-                fileTreeContent: fileTreeContent,
-                gitDiff: gitDiff,
-                includeSavedPrompts: includeSavedPrompts,
-                includeFiles: includeFiles,
-                includeUserPrompt: includeUserPrompt,
-                filePathDisplay: filePathDisplayOption,
-                codemapSnapshots: codemapSnapshots,
-                includeDatetimeInUserInstructions: includeDatetime,
-                promptSectionsOrder: promptSectionsOrder,
-                disabledPromptSections: disabledPromptSections,
-                duplicateUserInstructionsAtTop: duplicateUserInstructions,
-                tabTitle: tabTitleForClipboard
-            )
-
-            await MainActor.run {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(clipboardContent, forType: .string)
-            }
+            let payload = await buildClipboardPayload(for: request, source: .activeLive)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(payload.text, forType: .string)
         }
     }
 
@@ -4748,6 +4595,41 @@ class PromptViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil
     ) async -> AIMessage {
+        let source: TokenProjection.Source = if overridePromptConfig == nil,
+                                                overrideChatPreset == nil,
+                                                overrideMode == nil,
+                                                gitInclusionOverride == nil,
+                                                gitBaseOverride == nil,
+                                                selectionOverride == nil
+        {
+            .activeLive
+        } else {
+            .virtualRecomputed
+        }
+        return await packagePromptResult(
+            conversation: conversation,
+            overrideModel: overrideModel,
+            overridePromptConfig: overridePromptConfig,
+            overrideChatPreset: overrideChatPreset,
+            overrideMode: overrideMode,
+            gitInclusionOverride: gitInclusionOverride,
+            gitBaseOverride: gitBaseOverride,
+            selectionOverride: selectionOverride,
+            tokenSource: source
+        ).message
+    }
+
+    func packagePromptResult(
+        conversation: [ConversationEntry],
+        overrideModel: AIModel? = nil,
+        overridePromptConfig: PromptContextResolved? = nil,
+        overrideChatPreset: ChatPreset? = nil,
+        overrideMode: PlanActMode? = nil,
+        gitInclusionOverride: GitInclusion? = nil,
+        gitBaseOverride: String? = nil,
+        selectionOverride: StoredSelection? = nil,
+        tokenSource: TokenProjection.Source
+    ) async -> PackagedPromptResult {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
@@ -4911,7 +4793,7 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
+        let message = PromptPackagingService.buildAIMessage(
             systemPrompt: systemPrompt,
             metaInstructions: metaForThisChat,
             fileTree: fileTreeString,
@@ -4922,6 +4804,10 @@ class PromptViewModel: ObservableObject {
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
             duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+        )
+        return PackagedPromptResult(
+            message: message,
+            exactPayload: PromptPackagingService.exactChatPayload(for: message, source: tokenSource)
         )
     }
 
@@ -5417,48 +5303,103 @@ extension PromptViewModel {
         return combinedMeta
     }
 
-    /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
-    func buildClipboard(
+    private func activeComposeTabTitleForPromptPackaging() -> String? {
+        guard let tabID = activeComposeTabID,
+              let snapshot = workspaceManager?.composeTabSnapshot(for: tabID)
+        else { return nil }
+        return snapshot.name
+    }
+
+    private func currentClipboardPackagingRequest() -> ClipboardPackagingRequest {
+        ClipboardPackagingRequest(
+            config: applyingGlobalCodeMapOverride(resolvePromptContext()),
+            selection: activeComposeTabStoredSelectionForPromptPackaging(),
+            promptText: promptText,
+            metaInstructions: metaInstructions,
+            includeSavedPrompts: includeSavedPromptsInClipboard,
+            includeFiles: includeFilesInClipboard,
+            includeUserPrompt: includeUserPromptInClipboard,
+            includeLocalDefinitionsInFileTree: false,
+            filePathDisplay: filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !codeMapsGloballyDisabled,
+            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tabTitle: activeComposeTabTitleForPromptPackaging(),
+            renderingDate: Date()
+        )
+    }
+
+    private func clipboardPackagingRequest(
         for inputConfig: PromptContextResolved,
-        promptTextOverride: String? = nil,
-        selectionOverride: StoredSelection? = nil,
-        includeLocalDefinitionsInFileTree: Bool = false
-    ) async -> String {
-        let cfg = applyingGlobalCodeMapOverride(inputConfig)
-        let promptText = promptTextOverride ?? promptText
-        let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
+        promptTextOverride: String?,
+        selectionOverride: StoredSelection?,
+        includeLocalDefinitionsInFileTree: Bool,
+        tabTitle: String?,
+        renderingDate: Date
+    ) -> ClipboardPackagingRequest {
+        let config = applyingGlobalCodeMapOverride(inputConfig)
+        let combinedMeta = metaInstructions(for: config)
+        return ClipboardPackagingRequest(
+            config: config,
+            selection: selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging(),
+            promptText: promptTextOverride ?? promptText,
+            metaInstructions: combinedMeta,
+            includeSavedPrompts: !combinedMeta.isEmpty,
+            includeFiles: config.includeFiles,
+            includeUserPrompt: config.includeUserPrompt,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            filePathDisplay: filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !codeMapsGloballyDisabled,
+            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tabTitle: tabTitle,
+            renderingDate: renderingDate
+        )
+    }
+
+    private func buildClipboardPayload(
+        for request: ClipboardPackagingRequest,
+        source: TokenProjection.Source
+    ) async -> PromptPackagingService.ExactRenderedPayload {
         let store = workspaceFileContextStore
         let accountingService = PromptContextAccountingService()
         let resolution = await accountingService.resolveEntries(
-            selection: effectiveSelection,
+            selection: request.selection,
             store: store,
             rootScope: .allLoaded,
             profile: .uiAssisted,
-            codeMapUsage: cfg.codeMapUsage
+            codeMapUsage: request.config.codeMapUsage
         )
         let fileEntries = resolution.entries
         let codemapSnapshots = await store.codemapSnapshotDictionary()
         let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
 
-        // 1) File tree, with optional chat local definitions for token parity.
         let combinedTreeAndMap: String?
-        if cfg.rendersFileTree {
+        if request.config.rendersFileTree {
             let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: effectiveSelection,
+                selection: request.selection,
                 request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: cfg.effectiveFileTreeMode),
-                    filePathDisplay: filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: request.config.effectiveFileTreeMode),
+                    filePathDisplay: request.filePathDisplay,
+                    onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
                     includeLegend: true,
-                    showCodeMapMarkers: !codeMapsGloballyDisabled,
+                    showCodeMapMarkers: request.showCodeMapMarkers,
                     rootScope: .allLoaded
                 ),
                 profile: .uiAssisted
             )
             let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
             let defBlock: String
-            if includeLocalDefinitionsInFileTree {
-                let hasCodemapEntries = codeEntries.contains { $0.isCodemap && codemapSnapshots[$0.file.id]?.fileAPI != nil }
+            if request.includeLocalDefinitionsInFileTree {
+                let hasCodemapEntries = codeEntries.contains {
+                    $0.isCodemap && codemapSnapshots[$0.file.id]?.fileAPI != nil
+                }
                 if hasCodemapEntries {
                     defBlock = ""
                 } else {
@@ -5470,10 +5411,10 @@ extension PromptViewModel {
                     }
                     let allFileAPIs = await store.allCodemapFileAPIs()
                     defBlock = CodeMapExtractor.buildLocalDefinitionBlockIfNeeded(
-                        codeMapUsage: cfg.codeMapUsage,
+                        codeMapUsage: request.config.codeMapUsage,
                         selectedFiles: codeEntries.filter { !$0.isCodemap }.map(\.file),
                         allFileAPIs: allFileAPIs,
-                        filePathDisplay: filePathDisplayOption,
+                        filePathDisplay: request.filePathDisplay,
                         roots: rootInfos
                     ).text
                 }
@@ -5486,192 +5427,90 @@ extension PromptViewModel {
             combinedTreeAndMap = nil
         }
 
-        // 2) Git diff (optional)
-        let gitDiff: String?
-        switch cfg.gitInclusion {
-        case .none:
-            gitDiff = nil
-        case .selected:
-            let selectedPaths = await resolvedSelectedGitDiffPaths(for: effectiveSelection)
-            gitDiff = diffEntries.isEmpty
-                ? await gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
-                : nil
-        case .complete:
-            gitDiff = diffEntries.isEmpty
-                ? await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
-                : nil
-        }
+        let gitDiff: String? = await {
+            guard diffEntries.isEmpty else { return nil }
+            switch request.config.gitInclusion {
+            case .none:
+                return nil
+            case .selected:
+                let selectedPaths = await resolvedSelectedGitDiffPaths(for: request.selection)
+                return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
+            case .complete:
+                return await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            }
+        }()
 
-        // 2.5) Meta prompts assembly.
-        let combinedMeta = metaInstructions(for: cfg)
-        let includeMetaBlock = !combinedMeta.isEmpty
-
-        // 3) Generate clipboard string via existing packaging service
-        return await PromptPackagingService.generateClipboardContent(
-            metaInstructions: combinedMeta,
-            userInstructions: cfg.includeUserPrompt ? promptText : "",
+        let text = await PromptPackagingService.generateClipboardContent(
+            metaInstructions: request.metaInstructions,
+            userInstructions: request.includeUserPrompt ? request.promptText : "",
             files: fileEntries,
             fileTreeContent: combinedTreeAndMap,
             gitDiff: gitDiff,
-            includeSavedPrompts: includeMetaBlock,
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: filePathDisplayOption,
+            includeSavedPrompts: request.includeSavedPrompts,
+            includeFiles: request.includeFiles && !fileEntries.isEmpty,
+            includeUserPrompt: request.includeUserPrompt,
+            filePathDisplay: request.filePathDisplay,
             codemapSnapshots: codemapSnapshots,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
+            renderingDate: request.renderingDate,
+            promptSectionsOrder: request.promptSectionsOrder,
+            disabledPromptSections: request.disabledPromptSections,
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
+            tabTitle: request.tabTitle
         )
+        return PromptPackagingService.exactRenderedPayload(text, source: source)
     }
 
-    /// Estimates the token count for the current Copy context (what would be copied now)
-    /// Uses the resolved copy preset (including manual overrides) and builds the exact clipboard payload.
+    /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
+    func buildClipboard(
+        for inputConfig: PromptContextResolved,
+        promptTextOverride: String? = nil,
+        selectionOverride: StoredSelection? = nil,
+        includeLocalDefinitionsInFileTree: Bool = false
+    ) async -> String {
+        let request = clipboardPackagingRequest(
+            for: inputConfig,
+            promptTextOverride: promptTextOverride,
+            selectionOverride: selectionOverride,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            tabTitle: nil,
+            renderingDate: Date()
+        )
+        return await buildClipboardPayload(for: request, source: .virtualRecomputed).text
+    }
+
+    /// Estimates the exact rendered token count for the current Copy context.
     func calculateTokensForCopyContext() async -> Int {
-        await calculateTokensForCopyContext(using: currentCopyPreset())
+        let request = currentClipboardPackagingRequest()
+        return await buildClipboardPayload(for: request, source: .activeLive).projection.total
     }
 
-    /// Estimates the token count for a specific Copy preset without mutating UI state.
+    /// Estimates the exact rendered token count for a specific Copy preset without mutating UI state.
     func calculateTokensForCopyContext(using preset: CopyPreset, promptTextOverride: String? = nil) async -> Int {
-        let cfg = resolvePromptContext(preset, custom: workingCopyCustomizations)
-        let text = await buildClipboard(for: cfg, promptTextOverride: promptTextOverride)
-        return estimateTokens(for: text)
-    }
-
-    private func chatPresetTokenBaselineKey(_ preset: ChatPreset) -> ChatPresetTokenBaselineKey {
-        ChatPresetTokenBaselineKey(
-            id: preset.id,
-            mode: preset.mode,
-            modelPresetName: preset.modelPresetName,
-            fileTreeMode: preset.fileTreeMode,
-            codeMapUsage: preset.codeMapUsage,
-            gitInclusion: preset.gitInclusion,
-            storedPromptIds: preset.storedPromptIds ?? [],
-            useStoredPromptsAsSystem: preset.useStoredPromptsAsSystem ?? false
+        let config = resolvePromptContext(preset, custom: workingCopyCustomizations)
+        let request = clipboardPackagingRequest(
+            for: config,
+            promptTextOverride: promptTextOverride,
+            selectionOverride: nil,
+            includeLocalDefinitionsInFileTree: false,
+            tabTitle: nil,
+            renderingDate: Date()
         )
+        return await buildClipboardPayload(for: request, source: .virtualRecomputed).projection.total
     }
 
-    private func promptContextTokenBaselineKey(_ cfg: PromptContextResolved) -> PromptContextTokenBaselineKey {
-        PromptContextTokenBaselineKey(
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            includeMetaPrompts: cfg.includeMetaPrompts,
-            includeFileTree: cfg.includeFileTree,
-            fileTreeMode: cfg.fileTreeMode,
-            codeMapUsage: cfg.codeMapUsage,
-            gitInclusion: cfg.gitInclusion,
-            storedPromptIds: cfg.storedPromptIds ?? []
-        )
-    }
-
-    private func chatContextTokenBaselineCacheKey(
-        chatPreset: ChatPreset,
-        config cfg: PromptContextResolved
-    ) -> ChatContextTokenBaselineCacheKey {
-        let disabledSections = disabledPromptSections.sorted { $0.rawValue < $1.rawValue }
-        let selectedPromptIDs = selectedPromptIDsForChat.sorted { $0.uuidString < $1.uuidString }
-        let storedPromptKeys = storedPrompts.map {
-            StoredPromptTokenBaselineKey(
-                id: $0.id,
-                title: $0.title,
-                content: $0.content,
-                isUserEdited: $0.isUserEdited
-            )
-        }
-        let rootOrder = fileManager.visibleRootFolders.map {
-            RootTokenBaselineKey(
-                id: $0.id,
-                fullPath: $0.fullPath,
-                name: $0.name,
-                isSystemRoot: $0.isSystemRoot
-            )
-        }
-
-        return ChatContextTokenBaselineCacheKey(
-            workspaceID: currentWorkspaceID,
-            selectedChatPresetID: selectedChatPresetID,
-            chatPreset: chatPresetTokenBaselineKey(chatPreset),
-            resolvedContext: promptContextTokenBaselineKey(cfg),
-            fileTreeOptionForChat: fileTreeOptionForChat,
-            codeMapUsageForChat: codeMapUsageForChat,
-            gitDiffInclusionModeForChat: gitDiffInclusionModeForChat,
-            codeMapsGloballyDisabled: codeMapsGloballyDisabled,
-            filePathDisplayOption: filePathDisplayOption,
-            selectedFilesSortMethod: selectedFilesSortMethod,
-            fileTreeSortMethod: fileManager.currentSortMethod,
-            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
-            selectedPromptIDsForChat: selectedPromptIDs,
-            hasManualChatPromptSelection: hasManualChatPromptSelection,
-            storedPrompts: storedPromptKeys,
-            hierarchyGenerationSignature: fileManager.currentHierarchyGenerationSignature(),
-            rootOrder: rootOrder,
-            selectionVersion: chatSelectionVersion,
-            slicesVersion: chatSlicesVersion,
-            autoCodemapVersion: chatAutoCodemapVersion,
-            fileAPIsVersion: chatFileAPIsVersion,
-            fileSystemDeltaVersion: chatFileSystemDeltaVersion
-        )
-    }
-
-    private func promptTextDuplicateFactor(for cfg: PromptContextResolved) -> Int {
-        guard cfg.includeUserPrompt else { return 0 }
-        var factor = disabledPromptSections.contains(.userInstructions) ? 0 : 1
-        if duplicateUserInstructionsAtTop {
-            factor += 1
-        }
-        return factor
-    }
-
-    /// Estimates the token count for the current Chat context.
-    /// If the chat preset references a specific copy preset, that configuration is used; otherwise falls back to current state.
+    /// Estimates the exact package-level chat payload for the current Chat context.
     func calculateTokensForChatContext() async -> Int {
         let chatPreset = currentChatPreset()
-        // Prefer the chat preset's resolved configuration (includes git/meta/system flavor overrides),
-        // falling back to the current copy configuration only if unavailable.
-        let cfg: PromptContextResolved = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
-        guard cfg.gitInclusion == .none else {
-            let text = await buildClipboard(for: cfg, includeLocalDefinitionsInFileTree: true)
-            return estimateTokens(for: text)
-        }
-        let cacheKey = chatContextTokenBaselineCacheKey(chatPreset: chatPreset, config: cfg)
+        let config = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
         let promptTextSnapshot = promptText
-        let promptTextTokens = estimateTokens(for: promptTextSnapshot)
-        let duplicateFactor = promptTextDuplicateFactor(for: cfg)
-        let hasPromptText = !promptTextSnapshot.isEmpty
-
-        if let cache = chatContextTokenBaselineCache, cache.key == cacheKey {
-            if hasPromptText, cache.supportsPromptTextDeltas {
-                return cache.baseTokensWithoutPromptText + (promptTextTokens * duplicateFactor)
-            }
-            if !hasPromptText, let emptyPromptTokenCount = cache.emptyPromptTokenCount {
-                return emptyPromptTokenCount
-            }
-        }
-
-        let text = await buildClipboard(
-            for: cfg,
-            promptTextOverride: promptTextSnapshot,
-            includeLocalDefinitionsInFileTree: true
+        let result = await packagePromptResult(
+            conversation: [ConversationEntry(role: .user, content: promptTextSnapshot)],
+            overridePromptConfig: config,
+            overrideChatPreset: chatPreset,
+            tokenSource: .activeLive
         )
-        let tokenCount = estimateTokens(for: text)
-
-        let currentChatPreset = currentChatPreset()
-        let currentCfg: PromptContextResolved = resolvedPromptContext(from: currentChatPreset) ?? resolvePromptContext()
-        let currentCacheKey = chatContextTokenBaselineCacheKey(chatPreset: currentChatPreset, config: currentCfg)
-        if currentCacheKey == cacheKey {
-            chatContextTokenBaselineCache = ChatContextTokenBaselineCache(
-                key: cacheKey,
-                baseTokensWithoutPromptText: max(0, tokenCount - (promptTextTokens * duplicateFactor)),
-                supportsPromptTextDeltas: hasPromptText && duplicateFactor > 0,
-                emptyPromptTokenCount: hasPromptText ? nil : tokenCount
-            )
-        }
-
-        return tokenCount
+        return result.exactPayload.projection.total
     }
 
     /// Resolve, build and place the clipboard content for a specific copy preset without mutating UI state.
