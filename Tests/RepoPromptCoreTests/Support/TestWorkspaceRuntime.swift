@@ -20,6 +20,49 @@ private struct TestFileSystemWatcherFactory: FileSystemWatcherCreating {
     }
 }
 
+private struct TestWorkspaceFileMutationBackend: WorkspaceFileMutationBackend {
+    func createDirectory(at url: URL) throws {
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    }
+
+    func createFile(at url: URL, contents: Data?) throws {
+        guard FileManager.default.createFile(atPath: url.path, contents: contents) else {
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    func write(_ data: Data, to url: URL, atomically: Bool) throws {
+        try data.write(to: url, options: atomically ? .atomic : [])
+    }
+
+    func moveItem(at sourceURL: URL, to destinationURL: URL) throws {
+        try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
+    }
+
+    func removeItem(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+
+    func trashItem(at url: URL) throws {
+        try FileManager.default.removeItem(at: url)
+    }
+
+    func fileExists(atPath path: String, isDirectory: inout Bool) -> Bool {
+        var directoryFlag = ObjCBool(false)
+        let exists = FileManager.default.fileExists(atPath: path, isDirectory: &directoryFlag)
+        isDirectory = directoryFlag.boolValue
+        return exists
+    }
+
+    func modificationDate(at url: URL) throws -> Date {
+        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let date = attributes[.modificationDate] as? Date else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        return date
+    }
+}
+
 private struct TestWorkspaceDirectoryListingBackend: WorkspaceDirectoryListingBackend {
     func listDirectoryWithIgnoreDetection(at path: String) throws -> WorkspaceDirectoryScanResult {
         let urls = try FileManager.default.contentsOfDirectory(
@@ -33,15 +76,17 @@ private struct TestWorkspaceDirectoryListingBackend: WorkspaceDirectoryListingBa
         var entries: [WorkspaceDirectoryEntry] = []
         entries.reserveCapacity(urls.count)
         for url in urls {
-            let values = try url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+            var isDirectory = ObjCBool(false)
+            _ = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
             let name = url.lastPathComponent
             hasGitignore = hasGitignore || name == ".gitignore"
             hasRepoIgnore = hasRepoIgnore || name == ".repoignore"
             hasCursorignore = hasCursorignore || name == ".cursorignore"
             entries.append(WorkspaceDirectoryEntry(
                 name: name,
-                isDirectory: values.isDirectory == true,
-                isSymbolicLink: values.isSymbolicLink == true
+                isDirectory: isDirectory.boolValue,
+                isSymbolicLink: attributes[.type] as? FileAttributeType == .typeSymbolicLink
             ))
         }
         entries.sort { $0.name < $1.name }
@@ -88,7 +133,7 @@ func makeTestWorkspaceRuntimeDependencies(
     return WorkspaceRuntimeDependencies(
         watcherFactory: TestFileSystemWatcherFactory(),
         directoryListingBackend: TestWorkspaceDirectoryListingBackend(),
-        mutationBackend: nil,
+        mutationBackend: TestWorkspaceFileMutationBackend(),
         partitionRoot: root.appendingPathComponent("Partitions", isDirectory: true),
         codeMapCacheRoot: root.appendingPathComponent("CodeMapCaches", isDirectory: true),
         configuration: WorkspaceRuntimeConfiguration(

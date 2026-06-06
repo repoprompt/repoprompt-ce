@@ -32,7 +32,7 @@ final class WorkspaceLoadingDiagnosticsGuardTests: XCTestCase {
         XCTAssertFalse(diagnostics.contains("debugCountTreeShape"), "Diagnostics must not recursively count FolderViewModel trees as the loading source of truth.")
         XCTAssertFalse(diagnostics.contains("rootSummary"), "Diagnostics must not describe workspace size from rootFolders tree summaries.")
 
-        let storePath = root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+        let storePath = root.appendingPathComponent("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
         let storeSource = try String(contentsOf: storePath, encoding: .utf8)
         XCTAssertFalse(storeSource.contains("WorkspaceRootLoadDebugContext"), "Root-load trace context should not live in the core workspace store API.")
         XCTAssertFalse(storeSource.contains("debugContext:"), "WorkspaceFileContextStore.loadRoot should not accept measurement-only debug context.")

@@ -1316,14 +1316,14 @@
             let unloadStart = try XCTUnwrap(store.range(of: "    package func unloadRoots(ids rootIDs: [UUID]) async {"))
             let unloadEnd = try XCTUnwrap(store.range(of: "    package func file(rootID: UUID, relativePath: String)", range: unloadStart.upperBound ..< store.endIndex))
             let unload = String(store[unloadStart.lowerBound ..< unloadEnd.lowerBound])
-            let stopWatching = try XCTUnwrap(unload.range(of: "await stopWatchingRoot(id: entry.rootID)"))
-            let rootDetach = try XCTUnwrap(unload.range(of: "rootStatesByID.removeValue(forKey: entry.rootID)"))
+            let stopWatching = try XCTUnwrap(unload.range(of: "await stopWatchingRoot(id: entry.rootID, service: entry.state.service)"))
+            let rootDetach = try XCTUnwrap(unload.range(of: "rootStatesByID.removeValue(forKey: rootID)"))
             let managedOnlyCleanup = try XCTUnwrap(unload.range(of: "managedOnlyFileIDs.remove(fileID)"))
             let rootSnapshotCleanup = try XCTUnwrap(unload.range(of: "removeCodemapSnapshots(forRootID: rootID)"))
-            XCTAssertLessThan(stopWatching.lowerBound, rootDetach.lowerBound)
-            XCTAssertLessThan(rootDetach.lowerBound, managedOnlyCleanup.lowerBound)
+            XCTAssertLessThan(rootDetach.lowerBound, stopWatching.lowerBound)
+            XCTAssertLessThan(stopWatching.lowerBound, managedOnlyCleanup.lowerBound)
             XCTAssertLessThan(managedOnlyCleanup.lowerBound, rootSnapshotCleanup.lowerBound)
-            XCTAssertFalse(String(unload[stopWatching.lowerBound ..< rootDetach.lowerBound]).contains("invalidateAllCodemapFileAPIsCache"))
+            XCTAssertFalse(String(unload[rootDetach.lowerBound ..< stopWatching.lowerBound]).contains("invalidateAllCodemapFileAPIsCache"))
             XCTAssertFalse(String(unload[managedOnlyCleanup.lowerBound ..< rootSnapshotCleanup.lowerBound]).contains("await"))
 
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
@@ -1432,7 +1432,14 @@
             XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
             XCTAssertTrue(store.contains("private func clearSearchCatalogSnapshotCache() {\n        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)\n    }"))
             XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
-            XCTAssertTrue(store.contains("guard !statesToUnload.isEmpty else { return }\n        clearSearchCatalogSnapshotCache()\n        #if DEBUG"))
+            assertSourceOrder(
+                in: store,
+                hooks: [
+                    "guard let state = rootStatesByID.removeValue(forKey: rootID)",
+                    "clearSearchCatalogSnapshotCache()",
+                    "if let rootUnloadDidDetachHandler"
+                ]
+            )
             XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache()\n        invalidatePathMatchCache()"))
             XCTAssertTrue(store.contains("#endif\n        invalidatePathMatchCache()\n        finishRootUnload(for: unloadingPaths)"))
             XCTAssertTrue(store.contains("cacheHit: true"))

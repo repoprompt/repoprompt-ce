@@ -382,16 +382,20 @@ package actor WorkspaceFileContextStore {
             publisherIngressCoordinator.finishPublisherIngress(rootIDs: [rootID])
             return
         }
+        await stopWatchingRoot(id: rootID, service: state.service)
+    }
 
-        let targetWatermark = await state.service.detachWatcherAndCaptureAcceptedWatermark()
+    private func stopWatchingRoot(id rootID: UUID, service: FileSystemService) async {
+        let detachedStop = await service.detachWatcherAndCaptureAcceptedWatermark()
         let priorAcceptedSequence = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
             .acceptedServicePublicationSequence
+        await waitForCurrentPublisherIngress(rootIDs: [rootID])
         await publisherIngressCoordinator.waitUntilApplied(
             rootID: rootID,
             servicePublicationSequence: priorAcceptedSequence
         )
-        _ = await state.service.flushPendingEventsNow(
-            throughAcceptedWatcherWatermark: targetWatermark
+        _ = await service.flushPendingEventsNow(
+            throughAcceptedWatcherWatermark: detachedStop.acceptedWatermark
         )
         let acceptedDownstreamCut = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
             .acceptedServicePublicationSequence
@@ -400,11 +404,15 @@ package actor WorkspaceFileContextStore {
             servicePublicationSequence: max(priorAcceptedSequence, acceptedDownstreamCut)
         )
         let applied = publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
-        assert(applied.appliedWatcherWatermark >= targetWatermark)
-        await state.service.finishDetachedWatcherStop()
-
+        assert(applied.appliedWatcherWatermark >= detachedStop.acceptedWatermark)
         watcherSubscriptionsByRootID.removeValue(forKey: rootID)?.cancel()
         publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        #if DEBUG
+            if let watcherServiceStateWillReconcileHandler {
+                await watcherServiceStateWillReconcileHandler(rootID, false)
+            }
+        #endif
+        await service.finishDetachedWatcherStop(detachedStop)
         await waitForCurrentPublisherIngress(rootIDs: [rootID])
         publisherIngressCoordinator.finishPublisherIngress(rootIDs: [rootID])
     }
@@ -1753,10 +1761,16 @@ package actor WorkspaceFileContextStore {
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
         for rootID in orderedRootIDs {
-            guard let state = rootStatesByID[rootID] else { continue }
+            guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }
         guard !statesToUnload.isEmpty else { return }
+        let removedRootIDSet = Set(statesToUnload.map(\.rootID))
+        rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
+        for entry in statesToUnload {
+            rootIDsByStandardizedPath.removeValue(forKey: entry.state.root.standardizedFullPath)
+            rootLoadConfigurationsByPath.removeValue(forKey: entry.state.root.standardizedFullPath)
+        }
         clearSearchCatalogSnapshotCache()
         #if DEBUG
             let rootUnloadStartMS = WorkspaceRuntimeDebugLog.timestampMSIfEnabled()
@@ -1783,7 +1797,6 @@ package actor WorkspaceFileContextStore {
             }
         #endif
 
-        let removedRootIDSet = Set(statesToUnload.map(\.rootID))
         #if DEBUG
             WorkspaceRuntimeDebugLog.event(
                 "store.rootUnload.detach",
@@ -1802,7 +1815,7 @@ package actor WorkspaceFileContextStore {
             #if DEBUG
                 let stopWatcherRootStartMS = WorkspaceRuntimeDebugLog.timestampMSIfEnabled()
             #endif
-            await stopWatchingRoot(id: entry.rootID)
+            await stopWatchingRoot(id: entry.rootID, service: entry.state.service)
             #if DEBUG
                 WorkspaceRuntimeDebugLog.event(
                     "store.rootUnload.stopWatcherRoot",
@@ -1813,12 +1826,6 @@ package actor WorkspaceFileContextStore {
                     ]
                 )
             #endif
-        }
-        rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
-        for entry in statesToUnload {
-            rootStatesByID.removeValue(forKey: entry.rootID)
-            rootIDsByStandardizedPath.removeValue(forKey: entry.state.root.standardizedFullPath)
-            rootLoadConfigurationsByPath.removeValue(forKey: entry.state.root.standardizedFullPath)
         }
         #if DEBUG
             WorkspaceRuntimeDebugLog.event(
@@ -2617,7 +2624,7 @@ package actor WorkspaceFileContextStore {
         case .ineligible:
             return .blocked
         }
-        return .materialized(try await materializeCatalogRegularFile(
+        return try await .materialized(materializeCatalogRegularFile(
             rootID: candidate.rootID,
             relativePath: candidate.relativePath,
             managedOnly: managedOnly
@@ -2637,7 +2644,7 @@ package actor WorkspaceFileContextStore {
             // A direct app/MCP write is an explicit request to manage this exact file.
             // Keep it available for follow-up read_file/apply_edits calls without making
             // ignored siblings discoverable through scans or replay.
-            return .materialized(try await materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: true))
+            return try await .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: true))
         case let .ineligible(reason):
             guard isExpectedDiskWriteCatalogIneligibility(reason) else {
                 throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
@@ -2646,7 +2653,7 @@ package actor WorkspaceFileContextStore {
             }
             return .ineligible(reason)
         case .eligible:
-            return .materialized(try await materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
+            return try await .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
         }
     }
 
