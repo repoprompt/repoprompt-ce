@@ -37,8 +37,9 @@ final class HeadlessAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
-        let runAttemptID = UUID()
-        session.activeHeadlessRunAttemptID = runAttemptID
+        let ownership = session.beginRunAttempt(source: "headless")
+        let runAttemptID = ownership.attemptID
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runningStatusText = nil
         session.runningStatusSource = nil
         session.runState = .running
@@ -46,7 +47,7 @@ final class HeadlessAgentModeRunner {
         hooks.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
-            session.activeHeadlessRunAttemptID = nil
+            session.endRunAttempt(ifCurrent: ownership, source: "headless.invalidRoute")
             session.runState = .failed
             session.runningStatusText = nil
             hooks.setAgentRunActive(tabID, false)
@@ -96,6 +97,7 @@ final class HeadlessAgentModeRunner {
                     initialMessage: agentMessage,
                     runID: runID,
                     runAttemptID: runAttemptID,
+                    ownership: ownership,
                     attachments: attachments,
                     attachmentReservationID: attachmentReservationID,
                     lease: lease
@@ -114,11 +116,11 @@ final class HeadlessAgentModeRunner {
         attachmentReservationID: UUID?
     ) async {
         guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+              session.activeRunAttemptID == runAttemptID
         else {
             return
         }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.acquireFailure")
         session.agentTask = nil
         session.provider = nil
         session.runID = nil
@@ -137,6 +139,7 @@ final class HeadlessAgentModeRunner {
         initialMessage: AgentMessage,
         runID: UUID,
         runAttemptID: UUID,
+        ownership: AgentRunOwnership,
         attachments: [AgentImageAttachment],
         attachmentReservationID: UUID?,
         lease: MCPBootstrapLease
@@ -147,14 +150,19 @@ final class HeadlessAgentModeRunner {
             hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
             hooks.markAttachmentsConsumed(session, attachmentReservationID)
             _ = await lease.releaseWhenRouted()
+            if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+            }
 
             for try await result in stream {
                 guard !Task.isCancelled else { break }
+                guard session.isCurrentRunAttempt(ownership, expectedRunID: runID) else { return }
+                session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
                 await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
             }
 
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 return
             }
@@ -168,7 +176,7 @@ final class HeadlessAgentModeRunner {
                 session.mcpFollowUpRunPending = true
                 session.pendingInstructions.removeFirst()
             }
-            session.activeHeadlessRunAttemptID = nil
+            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.completed")
             session.agentTask = nil
             session.provider = nil
             session.runID = nil
@@ -190,7 +198,7 @@ final class HeadlessAgentModeRunner {
         } catch is CancellationError {
             await lease.cancelAndCleanup()
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 return
             }
@@ -198,7 +206,7 @@ final class HeadlessAgentModeRunner {
             hooks.finalizeStreamingItems(session)
             hooks.finalizePendingToolCalls(session, .cancelled)
             hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-            session.activeHeadlessRunAttemptID = nil
+            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.cancelled")
             session.agentTask = nil
             session.provider = nil
             session.runID = nil
@@ -214,7 +222,7 @@ final class HeadlessAgentModeRunner {
         } catch {
             await lease.failAndRelease()
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 return
             }
@@ -222,7 +230,7 @@ final class HeadlessAgentModeRunner {
             hooks.finalizeStreamingItems(session)
             hooks.finalizePendingToolCalls(session, .failed)
             hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-            session.activeHeadlessRunAttemptID = nil
+            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.failed")
             session.agentTask = nil
             session.provider = nil
             session.runID = nil

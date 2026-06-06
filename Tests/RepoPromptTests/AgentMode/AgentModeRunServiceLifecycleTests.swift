@@ -25,7 +25,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = agent
-            session.activeHeadlessRunAttemptID = UUID()
+            session.beginRunAttempt(source: "test")
 
             let outcome = await harness.service.startRun(
                 tabID: session.tabID,
@@ -36,7 +36,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
 
             XCTAssertEqual(session.runState, .failed, agent.rawValue)
-            XCTAssertNil(session.activeHeadlessRunAttemptID, agent.rawValue)
+            XCTAssertNil(session.activeRunAttemptID, agent.rawValue)
             XCTAssertNil(session.agentTask, agent.rawValue)
             XCTAssertNil(session.provider, agent.rawValue)
             XCTAssertEqual(session.items.filter { $0.kind == .error }.map(\.text), [LifecycleTestError.workspaceMissing.errorDescription ?? ""], agent.rawValue)
@@ -58,6 +58,42 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testCodexRejectedSendOnlyEndsOwnershipCreatedByInvocation() async {
+        let recorder = LifecycleRecorder()
+        let codexController = LifecycleNoopCodexController(recorder: recorder, failSend: true)
+        let harness = makeHarness(recorder: recorder, codexController: codexController)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+
+        let freshOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "fresh failure",
+            initialMessageForRun: "fresh failure",
+            attachments: []
+        )
+
+        guard case .failed? = freshOutcome else {
+            return XCTFail("Expected fresh Codex send to fail")
+        }
+        XCTAssertNil(session.activeRunOwnership)
+
+        let reusedOwnership = session.beginRunAttempt(source: "test.reusedCodex")
+        let reusedOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "reused failure",
+            initialMessageForRun: "reused failure",
+            attachments: []
+        )
+
+        guard case .failed? = reusedOutcome else {
+            return XCTFail("Expected reused Codex send to fail")
+        }
+        XCTAssertEqual(session.activeRunOwnership, reusedOwnership)
+        session.endRunAttempt(ifCurrent: reusedOwnership, source: "test.cleanup")
+    }
+
     func testStartRunDispatchesCurrentProviderFamiliesWithoutHeadlessFallback() async throws {
         do {
             let recorder = LifecycleRecorder()
@@ -65,6 +101,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let harness = makeHarness(recorder: recorder, codexController: codexController)
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.selectedAgent = .codexExec
+            session.activeAgentSessionID = UUID()
 
             let outcome = await harness.service.startRun(
                 tabID: session.tabID,
@@ -75,11 +112,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
 
             XCTAssertEqual(outcome, .sent)
+            XCTAssertEqual(session.activeRunOwnership?.binding.tabID, session.tabID)
+            XCTAssertEqual(session.activeRunOwnership?.binding.persistentSessionID, session.activeAgentSessionID)
+            XCTAssertEqual(session.activeRunLiveness?.stage, .running)
             XCTAssertTrue(recorder.contains("codex:send"))
             XCTAssertFalse(recorder.contains("factory:claude"))
             XCTAssertFalse(recorder.contains("factory:acp-provider"))
             XCTAssertFalse(recorder.contains("factory:headless"))
             await harness.service.cancelRun(tabID: session.tabID, session: session)
+            XCTAssertNil(session.activeRunOwnership)
         }
 
         do {
@@ -102,6 +143,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             )
 
             XCTAssertNil(outcome)
+            XCTAssertNotNil(session.activeRunOwnership)
+            XCTAssertEqual(session.activeRunOwnership?.binding.tabID, session.tabID)
             try await waitUntil("Claude dispatch should reach its native controller") {
                 recorder.contains("claude:send")
             }
@@ -138,6 +181,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
             XCTAssertNil(outcome)
             XCTAssertEqual(session.runState, .failed)
+            XCTAssertNil(session.activeRunOwnership)
             XCTAssertTrue(recorder.contains("factory:acp-provider"))
             XCTAssertTrue(recorder.contains("factory:acp-controller"))
             XCTAssertFalse(recorder.contains("factory:claude"))
@@ -283,7 +327,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.runState = .running
             session.runID = UUID()
-            session.activeHeadlessRunAttemptID = UUID()
+            session.beginRunAttempt(source: "test")
 
             switch row {
             case .claudeNative:
@@ -325,7 +369,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             }
 
             XCTAssertEqual(session.runState, .cancelled, row.rawValue)
-            XCTAssertNil(session.activeHeadlessRunAttemptID, row.rawValue)
+            XCTAssertNil(session.activeRunAttemptID, row.rawValue)
             XCTAssertTrue(recorder.contains("attachments:deleteFiles"), row.rawValue)
         }
     }
@@ -441,7 +485,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.selectedAgent = .claudeCode
         session.runState = .running
         session.runID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         session.claudeController = controller
         return session
     }
@@ -453,7 +497,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         AgentModeViewModel.TabSession.ClaudeSteeringInstruction(
             id: UUID(),
             targetRunID: session.runID,
-            targetRunAttemptID: session.activeHeadlessRunAttemptID,
+            targetRunAttemptID: session.activeRunAttemptID,
             providerText: text,
             attachments: [],
             taggedFileAttachments: [],
@@ -468,7 +512,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.selectedAgent = .openCode
         session.runState = .running
         session.runID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         session.acpController = controller
         return session
     }
@@ -480,7 +524,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         AgentModeViewModel.TabSession.ACPSteeringInstruction(
             id: UUID(),
             targetRunID: session.runID,
-            targetRunAttemptID: session.activeHeadlessRunAttemptID,
+            targetRunAttemptID: session.activeRunAttemptID,
             providerText: text,
             interruptedPromptProviderText: nil,
             attachments: [],
@@ -702,6 +746,7 @@ private enum LifecycleTestError: LocalizedError {
     case workspaceMissing
     case expectedACPDispatchStop
     case expectedClaudeSendFailure
+    case expectedCodexSendFailure
 
     var errorDescription: String? {
         switch self {
@@ -711,6 +756,8 @@ private enum LifecycleTestError: LocalizedError {
             "Expected ACP dispatch stop."
         case .expectedClaudeSendFailure:
             "Expected Claude send failure."
+        case .expectedCodexSendFailure:
+            "Expected Codex send failure."
         }
     }
 }
@@ -752,10 +799,12 @@ private final class LifecycleNoopHeadlessProvider: HeadlessAgentProvider {
 
 private final class LifecycleNoopCodexController: CodexSessionControlling {
     private let recorder: LifecycleRecorder
+    private let failSend: Bool
     private(set) var hasActiveThread = false
 
-    init(recorder: LifecycleRecorder) {
+    init(recorder: LifecycleRecorder, failSend: Bool = false) {
         self.recorder = recorder
+        self.failSend = failSend
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -794,19 +843,26 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
     func sendUserMessage(_ text: String) async throws {
-        recorder.record("codex:send")
+        try recordCodexSend()
     }
 
     func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {
-        recorder.record("codex:send")
+        try recordCodexSend()
     }
 
     func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {
-        recorder.record("codex:send")
+        try recordCodexSend()
     }
 
     func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {
+        try recordCodexSend()
+    }
+
+    private func recordCodexSend() throws {
         recorder.record("codex:send")
+        if failSend {
+            throw LifecycleTestError.expectedCodexSendFailure
+        }
     }
 
     func compactThread() async throws {}

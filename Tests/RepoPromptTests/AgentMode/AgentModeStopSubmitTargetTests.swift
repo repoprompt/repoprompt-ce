@@ -18,7 +18,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         runningSession.runState = .running
         runningSession.runID = runID
         runningSession.activeAgentSessionID = agentSessionID
-        runningSession.activeHeadlessRunAttemptID = attemptID
+        runningSession.beginRunAttempt(source: "test", attemptID: attemptID)
         idleSession.runState = .idle
 
         // Simulate mixed props: global state is running, but the explicit composer tab is idle.
@@ -49,11 +49,11 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         targetSession.runState = .running
         targetSession.runID = targetRunID
         targetSession.activeAgentSessionID = UUID()
-        targetSession.activeHeadlessRunAttemptID = UUID()
+        targetSession.beginRunAttempt(source: "test")
         otherSession.runState = .running
         otherSession.runID = otherRunID
         otherSession.activeAgentSessionID = UUID()
-        otherSession.activeHeadlessRunAttemptID = UUID()
+        otherSession.beginRunAttempt(source: "test")
         let cancelTarget = vm.makeRunCancelTarget(tabID: targetTabID, session: targetSession)
         vm.test_setCurrentTabIDOverride(otherTabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
@@ -78,11 +78,11 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         session.runState = .running
         session.runID = UUID()
         session.activeAgentSessionID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
         let newerRunID = UUID()
         session.runID = newerRunID
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
 
         let accepted = await vm.cancelAgentRun(target: staleTarget, waitForCleanup: false)
 
@@ -128,7 +128,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let session = try XCTUnwrap(vm.sessions[tabID])
         session.runState = .running
         session.runID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         vm.storeDraftText(for: tabID, "stale steering")
         let staleTarget = AgentComposerSubmitTarget(
             tabID: tabID,
@@ -136,7 +136,7 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
             expectedSourceAgentSessionID: session.activeAgentSessionID,
             expectedRunState: .running,
             expectedRunID: UUID(),
-            expectedRunAttemptID: session.activeHeadlessRunAttemptID,
+            expectedRunAttemptID: session.activeRunAttemptID,
             expectedInitialStartLocation: nil
         )
 

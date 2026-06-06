@@ -527,7 +527,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         session.hasSentFirstMessage = true
         session.runState = .running
         session.runID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         session.providerSessionID = "provider-from-old-cwd"
         session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: oldWorktree.path)]
         session.items = [.user("in-flight prompt", sequenceIndex: 0)]
@@ -535,7 +535,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
             .init(
                 id: UUID(),
                 targetRunID: session.runID,
-                targetRunAttemptID: session.activeHeadlessRunAttemptID,
+                targetRunAttemptID: session.activeRunAttemptID,
                 providerText: "provider-wrapped queued steering",
                 interruptedPromptProviderText: "in-flight prompt",
                 attachments: [],

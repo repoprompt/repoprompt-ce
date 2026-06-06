@@ -247,10 +247,10 @@ final class AgentModeRunService {
               session.runState == .running,
               attachments.isEmpty,
               session.runID == targetRunID,
-              session.activeHeadlessRunAttemptID == targetRunAttemptID,
+              session.activeRunAttemptID == targetRunAttemptID,
               session.acpController === targetController
         else {
-            steeringDebugLog("[AgentRunSteeringWake] ACP active submit guard rejected agent=\(selectedAgent.rawValue) state=\(session.runState.rawValue) attachments=\(attachments.count) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)")
+            steeringDebugLog("[AgentRunSteeringWake] ACP active submit guard rejected agent=\(selectedAgent.rawValue) state=\(session.runState.rawValue) attachments=\(attachments.count) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)")
             return false
         }
         let workspacePath: String?
@@ -301,7 +301,7 @@ final class AgentModeRunService {
         guard !session.pendingACPSteeringInstructions.isEmpty else { return false }
 
         guard let runID = session.runID,
-              let runAttemptID = session.activeHeadlessRunAttemptID,
+              let runAttemptID = session.activeRunAttemptID,
               let controller = session.acpController else { return false }
 
         let tabID = session.tabID
@@ -453,7 +453,7 @@ final class AgentModeRunService {
     }
 
     private func failBeforeProviderStartup(session: AgentModeViewModel.TabSession, message: String) {
-        session.activeHeadlessRunAttemptID = nil
+        session.endCurrentRunAttempt(source: "runService.startupFailure")
         session.agentTask = nil
         session.provider = nil
         session.runState = .failed
@@ -477,7 +477,7 @@ final class AgentModeRunService {
         session.runState == .running
             && session.selectedAgent.acpProviderID != nil
             && session.runID == runID
-            && session.activeHeadlessRunAttemptID == runAttemptID
+            && session.activeRunAttemptID == runAttemptID
             && session.acpController === controller
     }
 
@@ -600,7 +600,7 @@ final class AgentModeRunService {
         guard session.selectedAgent.usesClaudeNativeRuntime,
               session.runState == .running,
               let runID = session.runID,
-              let runAttemptID = session.activeHeadlessRunAttemptID,
+              let runAttemptID = session.activeRunAttemptID,
               let steeringIndex = session.pendingClaudeSteeringInstructions.firstIndex(where: { $0.id == steeringID })
         else {
             return
@@ -683,7 +683,7 @@ final class AgentModeRunService {
         guard !session.pendingClaudeSteeringInstructions.isEmpty else { return false }
 
         guard let runID = session.runID,
-              let runAttemptID = session.activeHeadlessRunAttemptID else { return false }
+              let runAttemptID = session.activeRunAttemptID else { return false }
 
         if let firstQueuedSteeringID = session.pendingClaudeSteeringInstructions.first?.id {
             protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(
@@ -835,7 +835,7 @@ final class AgentModeRunService {
         session.runState == .running
             && session.selectedAgent.usesClaudeNativeRuntime
             && session.runID == runID
-            && session.activeHeadlessRunAttemptID == runAttemptID
+            && session.activeRunAttemptID == runAttemptID
     }
 
     /// Concatenates queued Claude steering draft texts and restores them to the composer.
@@ -965,7 +965,7 @@ final class AgentModeRunService {
 
         session.agentTask?.cancel()
         session.agentTask = nil
-        session.activeHeadlessRunAttemptID = nil
+        session.endCurrentRunAttempt(source: "runService.cancel")
         if session.selectedAgent == .codexExec {
             hooks.finalizeAttachmentsForTurn(session, nil, .restoreToPending)
         } else {

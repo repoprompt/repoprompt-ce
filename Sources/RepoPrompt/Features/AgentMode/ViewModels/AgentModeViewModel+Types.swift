@@ -47,6 +47,13 @@ extension AgentModeViewModel {
         case runtimeMetrics
     }
 
+    struct AssistantPresentationRequest: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let sourceItemsRevision: Int
+        let flushGeneration: UInt64
+    }
+
     /// Reason tag emitted by sidebar forced-refresh call sites. Used purely for
     /// diagnostics and fingerprint-skipped events; does not gate publication.
     enum SidebarRefreshReason: String, Equatable, Hashable {

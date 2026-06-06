@@ -236,7 +236,19 @@ extension AgentModeViewModel {
 
         // Agent run
         var runID: UUID?
-        var activeHeadlessRunAttemptID: UUID?
+        private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
+        var activeRunOwnership: AgentRunOwnership? {
+            runLifecycleTracker.activeOwnership
+        }
+
+        var activeRunAttemptID: UUID? {
+            activeRunOwnership?.attemptID
+        }
+
+        var activeRunLiveness: AgentRunLivenessSnapshot? {
+            runLifecycleTracker.liveness
+        }
+
         var provider: HeadlessAgentProvider?
         var agentTask: Task<Void, Never>?
 
@@ -322,6 +334,8 @@ extension AgentModeViewModel {
         var reasoningItemIDsByGroupID: [String: UUID] = [:]
         var pendingAssistantDelta: String = ""
         var assistantDeltaFlushTask: Task<Void, Never>?
+        var assistantDeltaTaskGeneration: UInt64 = 0
+        var assistantDeltaFlushGeneration: UInt64 = 0
 
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
@@ -367,6 +381,122 @@ extension AgentModeViewModel {
 
         init(tabID: UUID) {
             self.tabID = tabID
+        }
+
+        @discardableResult
+        func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+            let ownership = runLifecycleTracker.begin(
+                tabID: tabID,
+                persistentSessionID: activeAgentSessionID,
+                attemptID: attemptID
+            )
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started.source.\(source)")
+                AgentModePerfDiagnostics.event(
+                    "run.lifecycle.attemptStarted",
+                    tabID: tabID,
+                    fields: [
+                        "source": source,
+                        "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID),
+                        "bindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.generation),
+                        "persistentSessionID": AgentModePerfDiagnostics.shortID(ownership.binding.persistentSessionID)
+                    ]
+                )
+            #endif
+            return ownership
+        }
+
+        func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+            guard activeRunOwnership == ownership else { return false }
+            if let expectedRunID {
+                return runID == expectedRunID
+            }
+            return true
+        }
+
+        @discardableResult
+        func recordRunProgress(
+            ownership: AgentRunOwnership,
+            kind: AgentRunLivenessSignalKind,
+            stage: AgentRunLifecycleStage,
+            retryIntent: AgentRunRetryIntent = .none,
+            timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+        ) -> AgentRunProgressAcceptance {
+            let result = runLifecycleTracker.record(
+                ownership: ownership,
+                kind: kind,
+                stage: stage,
+                retryIntent: retryIntent,
+                timestampUptimeNanoseconds: timestampUptimeNanoseconds
+            )
+            recordRunProgressDiagnostic(result, kind: kind, stage: stage)
+            return result
+        }
+
+        @discardableResult
+        func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
+            let result = runLifecycleTracker.accept(signal)
+            recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
+            return result
+        }
+
+        @discardableResult
+        func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(ownership, source: source)
+            return true
+        }
+
+        @discardableResult
+        func endCurrentRunAttempt(source: String) -> Bool {
+            guard let ownership = activeRunOwnership else { return false }
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(ownership, source: source)
+            return true
+        }
+
+        @discardableResult
+        func endRunAttempt(ifCurrentAttemptID attemptID: UUID, source: String) -> Bool {
+            guard let ownership = activeRunOwnership, ownership.attemptID == attemptID else { return false }
+            return endRunAttempt(ifCurrent: ownership, source: source)
+        }
+
+        private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended")
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended.source.\(source)")
+                AgentModePerfDiagnostics.event(
+                    "run.lifecycle.attemptEnded",
+                    tabID: tabID,
+                    fields: [
+                        "source": source,
+                        "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID)
+                    ]
+                )
+            #endif
+        }
+
+        private func recordRunProgressDiagnostic(
+            _ result: AgentRunProgressAcceptance,
+            kind: AgentRunLivenessSignalKind,
+            stage: AgentRunLifecycleStage
+        ) {
+            #if DEBUG
+                switch result {
+                case .accepted:
+                    if kind == .stageTransition {
+                        AgentModePerfDiagnostics.increment("run.lifecycle.stage.\(stage.rawValue)", tabID: tabID)
+                    }
+                case let .rejected(reason):
+                    AgentModePerfDiagnostics.increment("run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                    AgentModePerfDiagnostics.event(
+                        "run.lifecycle.progressRejected",
+                        tabID: tabID,
+                        fields: ["reason": reason.rawValue, "kind": kind.rawValue, "stage": stage.rawValue]
+                    )
+                }
+            #endif
         }
 
         @discardableResult

@@ -22,7 +22,16 @@ final class CodexIntegratedAgentModeRunner {
         initialMessageForRun: String,
         attachments: [AgentImageAttachment]
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
-        session.activeHeadlessRunAttemptID = nil
+        let ownership: AgentRunOwnership
+        let createdOwnership: Bool
+        if let activeOwnership = session.activeRunOwnership {
+            ownership = activeOwnership
+            createdOwnership = false
+        } else {
+            ownership = session.beginRunAttempt(source: "codex")
+            createdOwnership = true
+            session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
+        }
         let attachmentReservationID = hooks.reserveAttachmentsForTurn(attachments, session)
 
         let sendTask = Task<CodexAgentModeCoordinator.NativeSendOutcome, Never> { [weak self, weak session] in
@@ -45,6 +54,14 @@ final class CodexIntegratedAgentModeRunner {
                 attachmentReservationID: attachmentReservationID
             )
             hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
+            switch outcome {
+            case .sent:
+                session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+            case .cancelled, .failed, .stale:
+                if createdOwnership {
+                    session.endRunAttempt(ifCurrent: ownership, source: "codex.sendRejected")
+                }
+            }
             return outcome
         }
         session.agentTask = Task {

@@ -193,6 +193,154 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.map(\.text), ["Replacement source", "Replacement answer"])
     }
 
+    func testInactiveAssistantDeltaIsRejectedBeforeQueueAdmission() async {
+        let viewModel = makeViewModel()
+        let activeTabID = UUID()
+        let inactiveTabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(activeTabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let activeSession = await viewModel.ensureSessionReady(tabID: activeTabID)
+        let inactiveSession = await viewModel.ensureSessionReady(tabID: inactiveTabID)
+        activeSession.replaceItems([.user("active", sequenceIndex: 0)])
+        inactiveSession.replaceItems([.user("inactive", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: activeSession)
+        viewModel.applySessionToBindings(activeSession)
+        let activeSnapshot = viewModel.activeTranscriptPresentation
+
+        viewModel.enqueueAssistantDelta(" background delta", session: inactiveSession)
+        viewModel.flushPendingAssistantDelta(inactiveSession)
+
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 0)
+        viewModel.test_flushPendingUIRefresh()
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, activeSnapshot)
+        XCTAssertEqual(inactiveSession.items.last?.text, " background delta")
+    }
+
+    func testActiveGenericAssistantDeltaPublishesTranscriptWithoutFullBindingSync() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.replaceItems([.user("start", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        viewModel.enqueueAssistantDelta("streamed answer", session: session)
+        viewModel.flushPendingAssistantDelta(session)
+
+        let updateBindingsCount = viewModel.test_updateBindingsCallCount
+        let composerSyncCount = viewModel.test_syncComposerCallCount
+        let runtimeSyncCount = viewModel.test_syncRuntimeMetricsCallCount
+        let runInteractionSyncCount = viewModel.test_syncRunInteractionCallCount
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 1)
+        viewModel.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "streamed answer")
+        XCTAssertEqual(viewModel.test_updateBindingsCallCount, updateBindingsCount)
+        XCTAssertEqual(viewModel.test_syncComposerCallCount, composerSyncCount)
+        XCTAssertEqual(viewModel.test_syncRuntimeMetricsCallCount, runtimeSyncCount)
+        XCTAssertEqual(viewModel.test_syncRunInteractionCallCount, runInteractionSyncCount)
+    }
+
+    func testActiveCodexAssistantDeltaUsesPresentationOnlyRefresh() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.selectedAgent = .codexExec
+        session.replaceItems([.user("start", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        let updateBindingsCount = viewModel.test_updateBindingsCallCount
+
+        viewModel.test_codexCoordinator.test_enqueueAssistantDelta("codex answer", session: session)
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 1)
+
+        viewModel.test_flushPendingUIRefresh()
+
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "codex answer")
+        XCTAssertEqual(viewModel.test_updateBindingsCallCount, updateBindingsCount)
+    }
+
+    func testFullRefreshSupersedesPendingAssistantPresentation() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.replaceItems([.user("start", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        session.appendItem(.assistant("full refresh wins", sequenceIndex: session.nextSequenceIndex))
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 1)
+
+        viewModel.requestUIRefresh(tabID: tabID, scope: .full)
+
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 0)
+        viewModel.test_flushPendingUIRefresh()
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "full refresh wins")
+    }
+
+    func testAssistantPresentationRejectsStaleRevisionGenerationAndTabOwnership() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let otherTabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.replaceItems([.user("start", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        let baseline = viewModel.activeTranscriptPresentation
+
+        session.appendItem(.assistant("revision request", sequenceIndex: session.nextSequenceIndex))
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        session.appendItem(.assistant("newer revision", sequenceIndex: session.nextSequenceIndex))
+        viewModel.test_flushPendingUIRefresh()
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, baseline)
+
+        viewModel.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel.test_flushPendingUIRefresh()
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, baseline)
+
+        viewModel.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 1)
+        viewModel.test_setCurrentTabIDOverride(otherTabID)
+        viewModel.test_flushPendingUIRefresh()
+        XCTAssertEqual(viewModel.activeTranscriptPresentation, baseline)
+
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        viewModel.applySessionToBindings(session)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "newer revision")
+    }
+
     func testActivationRepublishesRunInteractionRuntimeAndLiveBashState() async {
         let viewModel = makeViewModel()
         let activeTabID = UUID()

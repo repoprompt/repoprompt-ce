@@ -55,7 +55,7 @@
             session.runningStatusText = nil
             session.runState = .idle
             session.runID = nil
-            session.activeHeadlessRunAttemptID = nil
+            session.endCurrentRunAttempt(source: "stress.reset")
             session.provider = nil
             session.agentTask?.cancel()
             session.agentTask = nil
@@ -139,8 +139,18 @@
             urgentUIRefresh: Bool = true
         ) {
             let session = session(for: tabID)
-            applyAssistantDelta(delta, session: session)
-            requestUIRefresh(tabID: tabID, urgent: urgentUIRefresh)
+            let fullBindingSyncCount = test_updateBindingsCallCount
+            guard applyAssistantDelta(delta, session: session) else { return }
+            session.assistantDeltaFlushGeneration &+= 1
+            requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
+            if urgentUIRefresh {
+                test_flushPendingUIRefresh()
+                assert(test_updateBindingsCallCount == fullBindingSyncCount)
+            }
         }
 
         func testFinalizeStreamingAssistant(
@@ -148,8 +158,18 @@
             urgentUIRefresh: Bool = true
         ) {
             let session = session(for: tabID)
+            let fullBindingSyncCount = test_updateBindingsCallCount
             endActiveAssistantSegment(session)
-            requestUIRefresh(tabID: tabID, urgent: urgentUIRefresh)
+            session.assistantDeltaFlushGeneration &+= 1
+            requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
+            if urgentUIRefresh {
+                test_flushPendingUIRefresh()
+                assert(test_updateBindingsCallCount == fullBindingSyncCount)
+            }
         }
 
         func testSetStressRunState(

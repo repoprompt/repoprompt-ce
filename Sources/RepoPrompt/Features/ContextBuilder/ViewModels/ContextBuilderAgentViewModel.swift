@@ -343,6 +343,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         var pendingAskUserTimeoutGeneration: UInt64 = 0
 
         let runLifecycleGate = TaskSemaphore(1)
+        private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
+        var activeRunOwnership: AgentRunOwnership? {
+            runLifecycleTracker.activeOwnership
+        }
+
+        var activeRunAttemptID: UUID? {
+            activeRunOwnership?.attemptID
+        }
+
+        var activeRunLiveness: AgentRunLivenessSnapshot? {
+            runLifecycleTracker.liveness
+        }
+
         var agentTask: Task<Void, Never>?
         var activeAgentProvider: HeadlessAgentProvider?
         var boundClientID: String?
@@ -360,6 +373,61 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         /// Per-tab selected follow-up type for auto-generate (plan/review/question)
         var selectedFollowUpType: ContextBuilderFollowUpType = .plan
+
+        @discardableResult
+        func beginRunAttempt(source: String) -> AgentRunOwnership {
+            let ownership = runLifecycleTracker.begin(tabID: tabID, persistentSessionID: nil)
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started")
+                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.started.source.\(source)")
+            #endif
+            return ownership
+        }
+
+        @discardableResult
+        func recordRunProgress(
+            ownership: AgentRunOwnership,
+            kind: AgentRunLivenessSignalKind,
+            stage: AgentRunLifecycleStage,
+            retryIntent: AgentRunRetryIntent = .none,
+            timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+        ) -> AgentRunProgressAcceptance {
+            let result = runLifecycleTracker.record(
+                ownership: ownership,
+                kind: kind,
+                stage: stage,
+                retryIntent: retryIntent,
+                timestampUptimeNanoseconds: timestampUptimeNanoseconds
+            )
+            #if DEBUG
+                if case let .rejected(reason) = result {
+                    AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                }
+            #endif
+            return result
+        }
+
+        @discardableResult
+        func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(source: source)
+            return true
+        }
+
+        @discardableResult
+        func endCurrentRunAttempt(source: String) -> Bool {
+            guard let ownership = activeRunOwnership else { return false }
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(source: source)
+            return true
+        }
+
+        private func recordRunAttemptEnded(source: String) {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended")
+                AgentModePerfDiagnostics.increment("contextBuilder.run.lifecycle.attempt.ended.source.\(source)")
+            #endif
+        }
 
         init(tabID: UUID) {
             self.tabID = tabID
@@ -1659,6 +1727,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             )
 
             let runID = UUID()
+            let ownership = session.beginRunAttempt(source: "contextBuilder.mcp")
+            session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
             tabsWithActiveContextBuilderRun.insert(tabID)
             mcpRunTabByRunID[runID] = tabID
             session.agentRunState = .running(runID)
@@ -1683,11 +1753,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                             runID: runID,
                             connectionID: runID,
                             agentKind: agentKind,
-                            modelRaw: modelRaw
+                            modelRaw: modelRaw,
+                            ownership: ownership
                         )
                     }
                 }
 
+                session.endRunAttempt(ifCurrent: ownership, source: "contextBuilder.mcp.cleanup")
                 session.agentTask = nil
                 session.isAgentBusy = false
                 session.isCancelling = false
@@ -1840,6 +1912,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
 
         let runID = UUID()
+        let ownership = session.beginRunAttempt(source: "contextBuilder.ui")
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         tabsWithActiveContextBuilderRun.insert(tabID)
         session.agentRunState = .running(runID)
         session.isCancelling = false
@@ -1863,11 +1937,13 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                         runID: runID,
                         connectionID: runID,
                         agentKind: agentKind,
-                        modelRaw: modelRaw
+                        modelRaw: modelRaw,
+                        ownership: ownership
                     )
                 }
             }
 
+            session.endRunAttempt(ifCurrent: ownership, source: "contextBuilder.ui.cleanup")
             session.agentTask = nil
             session.isAgentBusy = false
             session.isCancelling = false
@@ -1886,7 +1962,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         runID: UUID,
         connectionID: UUID,
         agentKind: AgentProviderKind,
-        modelRaw: String
+        modelRaw: String,
+        ownership: AgentRunOwnership
     ) async {
         await AsyncScope.withCleanup({}, cleanup: { [weak self] in
             await self?.clearTabContextForAgent(agent: agentKind, runID: runID)
@@ -2008,6 +2085,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     self.debugLog("Starting stream with runID: \(runID)")
 
                     let stream = try await provider.streamAgentMessage(message, runID: runID)
+                    session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
 
                     // Centralized "release on routing" – releases the gate once mapping is established or on timeout
                     // Returns true if MCP routing succeeded, false on timeout/failure/cancellation
@@ -2041,6 +2119,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                                 self.debugLog("Task cancelled during streaming")
                                 break
                             }
+                            session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
                             self.debugLog("Received stream result type: \(result.type)")
                             if result.type == "content" {
                                 if session.appendAssistantOutputDelta(result.text ?? "", messageID: result.contentMessageID) {
@@ -2245,6 +2324,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             debugLog("Run task finished")
         }
 
+        session.endCurrentRunAttempt(source: "contextBuilder.cancel")
         session.agentTask = nil
         session.agentRunState = .cancelled
         session.isAgentBusy = false

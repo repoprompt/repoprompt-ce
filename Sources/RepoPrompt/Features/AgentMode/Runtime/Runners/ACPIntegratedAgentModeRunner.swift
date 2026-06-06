@@ -99,8 +99,9 @@ final class ACPIntegratedAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
-        let runAttemptID = UUID()
-        session.activeHeadlessRunAttemptID = runAttemptID
+        let ownership = session.beginRunAttempt(source: "acp")
+        let runAttemptID = ownership.attemptID
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
         hooks.setAgentRunActive(tabID, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
@@ -138,14 +139,14 @@ final class ACPIntegratedAgentModeRunner {
                             guard let self, let session else { return }
                             guard session.acpController === existingController,
                                   session.runID == runID,
-                                  session.activeHeadlessRunAttemptID == runAttemptID
+                                  session.activeRunAttemptID == runAttemptID
                             else {
                                 return
                             }
                             await existingController.cancelPrompt()
                             guard session.acpController === existingController,
                                   session.runID == runID,
-                                  session.activeHeadlessRunAttemptID == runAttemptID,
+                                  session.activeRunAttemptID == runAttemptID,
                                   session.runState.isActive
                             else {
                                 return
@@ -220,7 +221,7 @@ final class ACPIntegratedAgentModeRunner {
                     guard let self, let session else { return }
                     guard session.acpController === controller,
                           session.runID == runID,
-                          session.activeHeadlessRunAttemptID == runAttemptID
+                          session.activeRunAttemptID == runAttemptID
                     else {
                         return
                     }
@@ -247,11 +248,11 @@ final class ACPIntegratedAgentModeRunner {
               controller === targetController,
               let runID = session.runID,
               runID == targetRunID,
-              let runAttemptID = session.activeHeadlessRunAttemptID,
+              let runAttemptID = session.activeRunAttemptID,
               runAttemptID == targetRunAttemptID
         else {
             let diagnosticRunID = session.runID ?? targetRunID ?? UUID()
-            log("active prompt preflight rejected selected=\(session.selectedAgent.rawValue) request=\(runRequest.agentKind.rawValue) state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)", runID: diagnosticRunID)
+            log("active prompt preflight rejected selected=\(session.selectedAgent.rawValue) request=\(runRequest.agentKind.rawValue) state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)", runID: diagnosticRunID)
             return false
         }
         guard await controller.isCompatibleWith(request: runRequest) else {
@@ -260,10 +261,10 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard session.runState == .running,
               session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID,
+              session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
         else {
-            log("active prompt preflight became stale after compatibility check state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID))", runID: runID)
+            log("active prompt preflight became stale after compatibility check state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID))", runID: runID)
             return false
         }
 
@@ -286,10 +287,10 @@ final class ACPIntegratedAgentModeRunner {
 
         guard session.runState == .running,
               session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID,
+              session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
         else {
-            log("active steering became stale after interrupt state=\(session.runState.rawValue) currentRunID=\(String(describing: session.runID)) currentAttempt=\(String(describing: session.activeHeadlessRunAttemptID))", runID: runID)
+            log("active steering became stale after interrupt state=\(session.runState.rawValue) currentRunID=\(String(describing: session.runID)) currentAttempt=\(String(describing: session.activeRunAttemptID))", runID: runID)
             return false
         }
 
@@ -309,7 +310,7 @@ final class ACPIntegratedAgentModeRunner {
             // A successful prompt return means the steering prompt was delivered and
             // completed at the ACP layer. The event consumer may already have handled
             // the terminal and finalized the run, so do not require the original
-            // activeHeadlessRunAttemptID to still be present here.
+            // activeRunAttemptID to still be present here.
             return true
         } catch {
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
@@ -326,7 +327,7 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID? = nil,
         runAttemptID: UUID
     ) -> Bool {
-        guard session.activeHeadlessRunAttemptID == runAttemptID,
+        guard session.activeRunAttemptID == runAttemptID,
               session.runState.isActive
         else {
             return false
@@ -346,7 +347,7 @@ final class ACPIntegratedAgentModeRunner {
         errorText: String
     ) {
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "acp.startupFailure")
         session.agentTask = nil
         session.acpController = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -398,7 +399,7 @@ final class ACPIntegratedAgentModeRunner {
             let bootstrap = try await controller.bootstrap()
             log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 await controller.shutdown()
                 return
@@ -717,13 +718,19 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
+        if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+            session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+        }
         for await event in events {
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil)
             }
 
+            if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
+            }
             switch event {
             case let .stream(result):
                 await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
@@ -768,11 +775,11 @@ final class ACPIntegratedAgentModeRunner {
         attachmentReservationID: UUID?
     ) async {
         guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+              session.activeRunAttemptID == runAttemptID
         else {
             return
         }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "acp.acquireFailure")
         session.agentTask = nil
         session.acpController = nil
         AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -797,7 +804,7 @@ final class ACPIntegratedAgentModeRunner {
         let finalizeErrorDescription = errorText ?? "nil"
         log("finalize requested state=\(terminalState.rawValue) error=\(finalizeErrorDescription)", runID: runID)
         guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+              session.activeRunAttemptID == runAttemptID
         else {
             log("finalize ignored; session no longer owns run", runID: runID)
             return
@@ -814,7 +821,7 @@ final class ACPIntegratedAgentModeRunner {
             session.mcpFollowUpRunPending = true
             session.pendingInstructions.removeFirst()
         }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "acp.finalize")
         session.agentTask = nil
         session.pendingSupersedingTurnCompletions = 0
         if terminalState != .completed {

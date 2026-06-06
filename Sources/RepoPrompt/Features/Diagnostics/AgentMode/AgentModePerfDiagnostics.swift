@@ -350,6 +350,7 @@ import Foundation
                 "structured_event_dropped_count": structuredDropped,
                 "session_snapshot_limit": sessionSnapshotLimit,
                 "pending_sidebar_delete_count": pendingSidebarDeleteCount,
+                "mcp_long_thread_baseline_inventory": MCPAgentLongThreadBaselineInventory.debugSnapshot,
                 "lines": lines,
                 "counters": countersSnapshot,
                 "latest_session_snapshots": sessionSnapshots

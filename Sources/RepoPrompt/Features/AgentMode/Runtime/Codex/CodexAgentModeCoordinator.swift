@@ -3561,16 +3561,30 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
         session.pendingAssistantDelta += normalizedDelta
         guard session.assistantDeltaFlushTask == nil else { return }
+        session.assistantDeltaTaskGeneration &+= 1
+        let taskGeneration = session.assistantDeltaTaskGeneration
         let assistantDeltaFlushDelayNanos = assistantDeltaFlushDelayNanos
         session.assistantDeltaFlushTask = Task { @MainActor [weak self, session] in
-            try? await Task.sleep(nanoseconds: assistantDeltaFlushDelayNanos)
-            guard Self.flushPendingAssistantDeltaState(session) else { return }
-            self?.viewModel?.requestUIRefresh(tabID: session.tabID)
+            do {
+                try await Task.sleep(nanoseconds: assistantDeltaFlushDelayNanos)
+            } catch {
+                return
+            }
+            guard session.assistantDeltaTaskGeneration == taskGeneration,
+                  Self.flushPendingAssistantDeltaState(session)
+            else { return }
+            session.assistantDeltaFlushGeneration &+= 1
+            self?.viewModel?.requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
         }
     }
 
     private static func clearPendingAssistantDeltaState(_ session: AgentModeViewModel.TabSession) {
         session.pendingAssistantDelta = ""
+        session.assistantDeltaTaskGeneration &+= 1
         session.assistantDeltaFlushTask?.cancel()
         session.assistantDeltaFlushTask = nil
     }
@@ -3588,9 +3602,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         Self.clearPendingAssistantDeltaState(session)
     }
 
+    #if DEBUG
+        func test_enqueueAssistantDelta(_ delta: String, session: AgentModeViewModel.TabSession) {
+            enqueueAssistantDelta(delta, session: session)
+        }
+
+        func test_flushPendingAssistantDelta(_ session: AgentModeViewModel.TabSession) {
+            flushPendingAssistantDelta(session)
+        }
+    #endif
+
     private func flushPendingAssistantDelta(_ session: AgentModeViewModel.TabSession) {
         guard Self.flushPendingAssistantDeltaState(session) else { return }
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel?.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
     }
 
     @discardableResult
@@ -3606,7 +3635,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let didFlush = Self.flushPendingAssistantDeltaState(session)
         let didSeal = Self.endActiveAssistantSegmentState(session)
         guard didFlush || didSeal else { return }
-        viewModel?.requestUIRefresh(tabID: session.tabID)
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel?.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
     }
 
     private static func applyAssistantDelta(_ delta: String, session: AgentModeViewModel.TabSession) {
@@ -3875,6 +3909,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         case .failed:
             .failed
         }
+        session.endCurrentRunAttempt(source: "codex.finalize")
         setRunningStatus(nil, source: nil, session: session)
         viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
         if turnStatus == .completed, notifyOnCompleted {
@@ -3923,6 +3958,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 #endif
                 return
             }
+        }
+        if let ownership = session.activeRunOwnership {
+            session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
         }
         #if DEBUG
             if AgentModePerfDiagnostics.isEnabled {

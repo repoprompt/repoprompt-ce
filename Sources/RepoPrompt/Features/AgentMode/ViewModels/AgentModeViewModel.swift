@@ -563,6 +563,7 @@ final class AgentModeViewModel: ObservableObject {
     var sidebarObservedRunStateByTabID: [UUID: AgentSessionRunState] = [:]
     private var pendingTabIDForLoad: UUID?
     private var pendingUIRefreshScopesByTabID: [UUID: Set<UIRefreshScope>] = [:]
+    private var pendingAssistantPresentationByTabID: [UUID: AssistantPresentationRequest] = [:]
     private var uiRefreshTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
@@ -603,6 +604,9 @@ final class AgentModeViewModel: ObservableObject {
 
     #if DEBUG
         var test_updateBindingsCallCount: Int = 0
+        var test_syncComposerCallCount: Int = 0
+        var test_syncRuntimeMetricsCallCount: Int = 0
+        var test_syncRunInteractionCallCount: Int = 0
         var test_workspaceManager: WorkspaceManagerViewModel? {
             workspaceManager
         }
@@ -629,6 +633,14 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(_ value: Bool) {
             test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = value
+        }
+
+        var test_pendingAssistantPresentationCount: Int {
+            pendingAssistantPresentationByTabID.count
+        }
+
+        func test_flushPendingUIRefresh() {
+            flushPendingUIRefresh(cancelScheduled: true)
         }
 
         func test_drainScheduledDerivedTranscriptRefresh(tabID: UUID) async {
@@ -2406,6 +2418,7 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask?.cancel()
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
+        pendingAssistantPresentationByTabID.removeAll()
         sessionListCacheTask?.cancel()
         sessionListCacheTask = nil
         sessionListCacheGeneration &+= 1
@@ -5887,6 +5900,13 @@ final class AgentModeViewModel: ObservableObject {
             let pendingInstructionBytes = session.pendingInstructions.reduce(0) { partial, instruction in
                 partial + instruction.utf8.count
             }
+            let ownership = session.activeRunOwnership
+            let liveness = session.activeRunLiveness
+            let nowUptimeNanoseconds = DispatchTime.now().uptimeNanoseconds
+            let ageMilliseconds: (UInt64?) -> Any = { timestamp in
+                guard let timestamp, timestamp <= nowUptimeNanoseconds else { return NSNull() }
+                return Double(nowUptimeNanoseconds - timestamp) / 1_000_000
+            }
 
             AgentModePerfDiagnostics.recordSessionSnapshot(
                 tabID: session.tabID,
@@ -5894,6 +5914,16 @@ final class AgentModeViewModel: ObservableObject {
                     "source": source,
                     "agent": session.selectedAgent.rawValue,
                     "runState": String(describing: session.runState),
+                    "runAttemptID": AgentModePerfDiagnostics.shortID(ownership?.attemptID),
+                    "runBindingTabID": AgentModePerfDiagnostics.shortID(ownership?.binding.tabID),
+                    "runBindingPersistentSessionID": AgentModePerfDiagnostics.shortID(ownership?.binding.persistentSessionID),
+                    "runBindingGeneration": AgentModePerfDiagnostics.shortID(ownership?.binding.generation),
+                    "runLifecycleStage": liveness?.stage.rawValue ?? "nil",
+                    "runRetryIntent": liveness?.retryIntent.rawValue ?? "nil",
+                    "runProgressSequence": liveness?.lastAcceptedSequence ?? 0,
+                    "runLastSignalAgeMS": ageMilliseconds(liveness?.lastSignalUptimeNanoseconds),
+                    "runLastRealProgressAgeMS": ageMilliseconds(liveness?.lastRealProgressUptimeNanoseconds),
+                    "runLastHeartbeatAgeMS": ageMilliseconds(liveness?.lastHeartbeatUptimeNanoseconds),
                     "items": session.items.count,
                     "turns": session.transcript.turns.count,
                     "baseWorkingRows": session.baseTranscriptProjection.workingRows.count,
@@ -5975,6 +6005,7 @@ final class AgentModeViewModel: ObservableObject {
         let existingScopes = pendingUIRefreshScopesByTabID[tabID] ?? []
         if scope == .full || existingScopes.contains(.full) {
             pendingUIRefreshScopesByTabID[tabID] = [.full]
+            pendingAssistantPresentationByTabID.removeValue(forKey: tabID)
         } else {
             pendingUIRefreshScopesByTabID[tabID] = existingScopes.union([scope])
         }
@@ -5988,9 +6019,58 @@ final class AgentModeViewModel: ObservableObject {
             flushPendingUIRefresh(cancelScheduled: true)
             return
         }
+        scheduleUIRefreshFlushIfNeeded()
+    }
+
+    func requestAssistantPresentationRefresh(
+        session: TabSession,
+        sourceItemsRevision: Int,
+        flushGeneration: UInt64
+    ) {
+        let request = AssistantPresentationRequest(
+            tabID: session.tabID,
+            sessionIdentity: ObjectIdentifier(session),
+            sourceItemsRevision: sourceItemsRevision,
+            flushGeneration: flushGeneration
+        )
+        guard canAdmitAssistantPresentationRequest(request, session: session) else {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedBeforeAdmission", tabID: session.tabID)
+            #endif
+            return
+        }
+        pendingAssistantPresentationByTabID[session.tabID] = request
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("ui.assistantPresentation.admitted", tabID: session.tabID)
+        #endif
+        scheduleUIRefreshFlushIfNeeded()
+    }
+
+    private func canAdmitAssistantPresentationRequest(
+        _ request: AssistantPresentationRequest,
+        session: TabSession
+    ) -> Bool {
+        guard currentTabID == request.tabID,
+              sessions[request.tabID] === session,
+              ObjectIdentifier(session) == request.sessionIdentity,
+              activeSessionLoadInProgressTabID != request.tabID,
+              session.sourceItemsRevision == request.sourceItemsRevision,
+              session.assistantDeltaFlushGeneration == request.flushGeneration,
+              !(pendingUIRefreshScopesByTabID[request.tabID]?.contains(.full) ?? false)
+        else {
+            return false
+        }
+        return true
+    }
+
+    private func scheduleUIRefreshFlushIfNeeded() {
         guard uiRefreshTask == nil else { return }
         uiRefreshTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: Self.uiRefreshCoalesceDelayNanos)
+            do {
+                try await Task.sleep(nanoseconds: Self.uiRefreshCoalesceDelayNanos)
+            } catch {
+                return
+            }
             guard !Task.isCancelled else { return }
             self?.flushPendingUIRefresh()
         }
@@ -6004,14 +6084,16 @@ final class AgentModeViewModel: ObservableObject {
             uiRefreshTask?.cancel()
         }
         uiRefreshTask = nil
-        guard !pendingUIRefreshScopesByTabID.isEmpty else {
+        guard !pendingUIRefreshScopesByTabID.isEmpty || !pendingAssistantPresentationByTabID.isEmpty else {
             #if DEBUG
                 AgentModePerfDiagnostics.event("ui.refresh.flushSkipped", fields: ["reason": "empty", "cancelScheduled": String(cancelScheduled)])
             #endif
             return
         }
         let scopesByTabID = pendingUIRefreshScopesByTabID
+        let assistantPresentationRequests = pendingAssistantPresentationByTabID
         pendingUIRefreshScopesByTabID.removeAll()
+        pendingAssistantPresentationByTabID.removeAll()
         #if DEBUG
             AgentModePerfDiagnostics.increment("ui.refresh.flush")
             AgentModePerfDiagnostics.event(
@@ -6044,6 +6126,10 @@ final class AgentModeViewModel: ObservableObject {
         if didRequestFullRefresh {
             syncSidebarUIState()
         }
+        for (tabID, request) in assistantPresentationRequests {
+            guard let session = sessions[tabID] else { continue }
+            performAssistantPresentationRefresh(session: session, request: request)
+        }
         #if DEBUG
             if let diagnosticsStartMS {
                 AgentModePerfDiagnostics.event(
@@ -6059,9 +6145,45 @@ final class AgentModeViewModel: ObservableObject {
 
     func removePendingUIRefresh(for tabID: UUID) {
         pendingUIRefreshScopesByTabID.removeValue(forKey: tabID)
-        guard pendingUIRefreshScopesByTabID.isEmpty else { return }
+        pendingAssistantPresentationByTabID.removeValue(forKey: tabID)
+        guard pendingUIRefreshScopesByTabID.isEmpty, pendingAssistantPresentationByTabID.isEmpty else { return }
         uiRefreshTask?.cancel()
         uiRefreshTask = nil
+    }
+
+    private func performAssistantPresentationRefresh(
+        session: TabSession,
+        request: AssistantPresentationRequest
+    ) {
+        guard canAdmitAssistantPresentationRequest(request, session: session),
+              activeTranscriptPresentation.tabID == session.tabID,
+              activeTranscriptPresentation.bindingsHydrated
+        else {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedAtFlush", tabID: session.tabID)
+            #endif
+            return
+        }
+
+        let didRefreshDerivedTranscript = withActiveUISyncSuppressed {
+            catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
+        }
+        guard canAdmitAssistantPresentationRequest(request, session: session) else {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedAfterCatchUp", tabID: session.tabID)
+            #endif
+            return
+        }
+
+        if !didRefreshDerivedTranscript {
+            withActiveUISyncSuppressed {
+                _ = publishTranscriptPresentation(from: session)
+            }
+        }
+        syncTranscriptUIState()
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("ui.assistantPresentation.published", tabID: session.tabID)
+        #endif
     }
 
     private func performScopedUIRefresh(
@@ -6945,13 +7067,14 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 
+    @discardableResult
     private func catchUpDerivedTranscriptForActiveBindingIfNeeded(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason,
         validateProjectionIntegrity: Bool = false
-    ) {
-        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
-        guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return }
+    ) -> Bool {
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return false }
+        guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return false }
         let projectionProtection = transcriptProjectionProtection(
             for: session,
             transcript: session.transcript
@@ -6963,13 +7086,14 @@ final class AgentModeViewModel: ObservableObject {
         let projectionLooksStale = validateProjectionIntegrity
             && canReuseDerivedTranscript
             && derivedTranscriptProjectionLooksStale(for: session)
-        guard !canReuseDerivedTranscript || projectionLooksStale else { return }
+        guard !canReuseDerivedTranscript || projectionLooksStale else { return false }
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
         session.derivedTranscriptRefreshTask = nil
         let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
         session.pendingDerivedTranscriptRefreshReason = nil
         refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        return true
     }
 
     private func derivedTranscriptProjectionLooksStale(for session: TabSession) -> Bool {
@@ -7848,6 +7972,7 @@ final class AgentModeViewModel: ObservableObject {
         uiRefreshTask?.cancel()
         uiRefreshTask = nil
         pendingUIRefreshScopesByTabID.removeAll()
+        pendingAssistantPresentationByTabID.removeAll()
         sessionListCacheTask?.cancel()
         sessionListCacheTask = nil
         sessionListCacheGeneration &+= 1
@@ -9082,7 +9207,7 @@ final class AgentModeViewModel: ObservableObject {
     private func isFreshFirstSendDestination(_ session: TabSession) -> Bool {
         !session.runState.isActive
             && session.runID == nil
-            && session.activeHeadlessRunAttemptID == nil
+            && session.activeRunAttemptID == nil
             && session.items.isEmpty
             && session.transcript.turns.isEmpty
             && session.pendingImageAttachments.isEmpty
@@ -9288,7 +9413,7 @@ final class AgentModeViewModel: ObservableObject {
             && !session.hasSentFirstMessage
             && session.runState == .idle
             && session.runID == nil
-            && session.activeHeadlessRunAttemptID == nil
+            && session.activeRunAttemptID == nil
             && session.providerSessionID == nil
             && session.codexConversationID == nil
             && session.worktreeBindings.isEmpty
@@ -9747,7 +9872,7 @@ final class AgentModeViewModel: ObservableObject {
               session.pendingPermissionsRequest == nil,
               attachments.isEmpty,
               session.runID != nil,
-              session.activeHeadlessRunAttemptID != nil,
+              session.activeRunAttemptID != nil,
               session.acpController != nil
         else {
             return false
@@ -9780,7 +9905,7 @@ final class AgentModeViewModel: ObservableObject {
             let steering = TabSession.ACPSteeringInstruction(
                 id: UUID(),
                 targetRunID: session.runID,
-                targetRunAttemptID: session.activeHeadlessRunAttemptID,
+                targetRunAttemptID: session.activeRunAttemptID,
                 providerText: wrappedText,
                 interruptedPromptProviderText: interruptedPromptProviderText,
                 attachments: attachmentsToSend,
@@ -9790,7 +9915,7 @@ final class AgentModeViewModel: ObservableObject {
                 createdAt: Date()
             )
             session.pendingACPSteeringInstructions.append(steering)
-            Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
+            Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingACPSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
             guard !session.isMCPInstructionDispatchInProgress else {
                 Self.steeringDebugLog("[AgentRunSteeringWake] ACP steering flush owned by MCP dispatch tab=\(session.tabID) queue=\(session.pendingACPSteeringInstructions.count)")
                 return
@@ -9824,7 +9949,7 @@ final class AgentModeViewModel: ObservableObject {
             let steering = TabSession.ClaudeSteeringInstruction(
                 id: UUID(),
                 targetRunID: session.runID,
-                targetRunAttemptID: session.activeHeadlessRunAttemptID,
+                targetRunAttemptID: session.activeRunAttemptID,
                 providerText: wrappedText,
                 attachments: attachmentsToSend,
                 taggedFileAttachments: taggedFilesToSend,
@@ -9835,7 +9960,7 @@ final class AgentModeViewModel: ObservableObject {
             )
             session.pendingClaudeSteeringInstructions.append(steering)
             runService.protectCurrentClaudeTurnForAcceptedSteeringIfNeeded(session: session, steeringID: steering.id)
-            Self.steeringDebugLog("[AgentRunSteeringWake] Claude steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID)) queue=\(session.pendingClaudeSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
+            Self.steeringDebugLog("[AgentRunSteeringWake] Claude steering queued tab=\(session.tabID) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID)) queue=\(session.pendingClaudeSteeringInstructions.count) mcpDispatch=\(session.isMCPInstructionDispatchInProgress)")
             guard !session.isMCPInstructionDispatchInProgress else {
                 Self.steeringDebugLog("[AgentRunSteeringWake] Claude steering flush owned by MCP dispatch tab=\(session.tabID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 return
@@ -11140,9 +11265,9 @@ final class AgentModeViewModel: ObservableObject {
         runID: UUID,
         runAttemptID: UUID
     ) async {
-        if session.activeHeadlessRunAttemptID != runAttemptID,
+        if session.activeRunAttemptID != runAttemptID,
            let reroutedSession = sessions.values.first(where: {
-               $0.runID == runID && $0.activeHeadlessRunAttemptID == runAttemptID
+               $0.runID == runID && $0.activeRunAttemptID == runAttemptID
            }),
            reroutedSession !== session
         {
@@ -11156,7 +11281,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         await MainActor.run {
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID else { return }
+                  session.activeRunAttemptID == runAttemptID else { return }
             var shouldUpdateBindings = false
             switch result.type {
             case "content":
@@ -11565,10 +11690,18 @@ final class AgentModeViewModel: ObservableObject {
     func enqueueAssistantDelta(_ delta: String, session: TabSession) {
         session.pendingAssistantDelta += delta
         if session.assistantDeltaFlushTask == nil {
+            session.assistantDeltaTaskGeneration &+= 1
+            let taskGeneration = session.assistantDeltaTaskGeneration
             session.assistantDeltaFlushTask = Task { [weak self, weak session] in
-                try? await Task.sleep(nanoseconds: 250_000_000)
+                do {
+                    try await Task.sleep(nanoseconds: 250_000_000)
+                } catch {
+                    return
+                }
                 await MainActor.run {
-                    guard let self, let session else { return }
+                    guard let self, let session,
+                          session.assistantDeltaTaskGeneration == taskGeneration
+                    else { return }
                     self.flushPendingAssistantDelta(session)
                 }
             }
@@ -11577,6 +11710,7 @@ final class AgentModeViewModel: ObservableObject {
 
     func clearPendingAssistantDelta(_ session: TabSession) {
         session.pendingAssistantDelta = ""
+        session.assistantDeltaTaskGeneration &+= 1
         session.assistantDeltaFlushTask?.cancel()
         session.assistantDeltaFlushTask = nil
     }
@@ -11586,7 +11720,12 @@ final class AgentModeViewModel: ObservableObject {
         let delta = session.pendingAssistantDelta
         clearPendingAssistantDelta(session)
         if applyAssistantDelta(delta, session: session) {
-            requestUIRefresh(tabID: session.tabID)
+            session.assistantDeltaFlushGeneration &+= 1
+            requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
         }
     }
 
@@ -11681,7 +11820,7 @@ final class AgentModeViewModel: ObservableObject {
             tabID: tabID,
             expectedRunID: session.runID,
             expectedActiveAgentSessionID: session.activeAgentSessionID,
-            expectedRunAttemptID: session.activeHeadlessRunAttemptID,
+            expectedRunAttemptID: session.activeRunAttemptID,
             expectedPendingUserInputRequestID: expectedPendingUserInputRequestID
         )
     }
@@ -11722,7 +11861,7 @@ final class AgentModeViewModel: ObservableObject {
         if session.activeAgentSessionID != target.expectedActiveAgentSessionID {
             return "agent_session_id_mismatch"
         }
-        if session.activeHeadlessRunAttemptID != target.expectedRunAttemptID {
+        if session.activeRunAttemptID != target.expectedRunAttemptID {
             return "run_attempt_id_mismatch"
         }
         if let expectedPendingUserInputRequestID = target.expectedPendingUserInputRequestID,
@@ -11748,7 +11887,7 @@ final class AgentModeViewModel: ObservableObject {
                     "expectedAgentSessionID": AgentModePerfDiagnostics.shortID(target.expectedActiveAgentSessionID),
                     "liveAgentSessionID": AgentModePerfDiagnostics.shortID(session?.activeAgentSessionID),
                     "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeHeadlessRunAttemptID),
+                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID),
                     "expectedPendingInputRequestID": target.expectedPendingUserInputRequestID?.displayValue ?? "nil",
                     "livePendingInputRequestID": session?.pendingUserInputRequest?.requestID.displayValue ?? "nil",
                     "liveRunState": session?.runState.rawValue ?? "missing"
@@ -11772,7 +11911,7 @@ final class AgentModeViewModel: ObservableObject {
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let liveRunState = session?.runState ?? .idle
         let liveRunID = session?.runID
-        let liveRunAttemptID = session?.activeHeadlessRunAttemptID
+        let liveRunAttemptID = session?.activeRunAttemptID
         let liveInitialStartLocation = initialStartLocationProps(tabID: target.tabID)?.selection
 
         switch target.route {
@@ -11828,7 +11967,7 @@ final class AgentModeViewModel: ObservableObject {
                     "expectedRunID": AgentModePerfDiagnostics.shortID(target.expectedRunID),
                     "liveRunID": AgentModePerfDiagnostics.shortID(session?.runID),
                     "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeHeadlessRunAttemptID)
+                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID)
                 ]
             )
         #endif
@@ -11932,7 +12071,7 @@ final class AgentModeViewModel: ObservableObject {
                     session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                     session.setRunningStatus(nil, source: nil)
                     tabsWithActiveAgentRun.remove(session.tabID)
-                    session.activeHeadlessRunAttemptID = nil
+                    session.endCurrentRunAttempt(source: "viewModel.sessionReplacement")
                     session.agentTask?.cancel()
                     session.agentTask = nil
                     if let provider = session.provider {

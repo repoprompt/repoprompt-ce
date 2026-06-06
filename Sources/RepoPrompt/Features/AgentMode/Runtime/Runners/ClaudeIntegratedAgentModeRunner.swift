@@ -63,8 +63,9 @@ final class ClaudeIntegratedAgentModeRunner {
             AgentModeProcessRunIdentity.existingProcessRunID(for: session)
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
-        let runAttemptID = UUID()
-        session.activeHeadlessRunAttemptID = runAttemptID
+        let ownership = session.beginRunAttempt(source: "claudeNative")
+        let runAttemptID = ownership.attemptID
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
         session.setRunningStatus("Thinking…", source: .transport)
         session.runState = .running
@@ -131,6 +132,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     return
                 }
 
+                session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
                 let outcome = await self.consumeEvents(
                     events,
                     session: session,
@@ -165,10 +167,14 @@ final class ClaudeIntegratedAgentModeRunner {
 
         eventLoop: for await event in events {
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 exitedDueToAttemptMismatch = true
                 break eventLoop
+            }
+
+            if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
             }
 
             switch event {
@@ -199,6 +205,9 @@ final class ClaudeIntegratedAgentModeRunner {
                     )
                 }
             case let .approvalRequest(request):
+                if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                    session.recordRunProgress(ownership: ownership, kind: .interaction, stage: .waitingForInteraction)
+                }
                 session.pendingApproval = request
                 session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
                 session.setRunningStatus(nil, source: nil)
@@ -293,11 +302,11 @@ final class ClaudeIntegratedAgentModeRunner {
         attachmentReservationID: UUID?
     ) async {
         guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+              session.activeRunAttemptID == runAttemptID
         else {
             return
         }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "claudeNative.acquireFailure")
         session.agentTask = nil
         session.runState = .cancelled
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -319,7 +328,7 @@ final class ClaudeIntegratedAgentModeRunner {
         notifyTurnComplete: Bool
     ) async {
         guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+              session.activeRunAttemptID == runAttemptID
         else {
             return
         }
@@ -331,7 +340,7 @@ final class ClaudeIntegratedAgentModeRunner {
         if queuedInstruction != nil {
             session.pendingInstructions.removeFirst()
         }
-        session.activeHeadlessRunAttemptID = nil
+        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "claudeNative.finalize")
         session.agentTask = nil
         session.runState = terminalState
         session.pendingSupersedingTurnCompletions = 0
