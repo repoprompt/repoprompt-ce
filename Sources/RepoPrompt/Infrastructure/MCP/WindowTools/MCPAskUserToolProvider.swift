@@ -121,12 +121,13 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         case .discoverRun:
             // Route to Context Builder UI.
             let tabContext = try await dependencies.requireCurrentTabContext(MCPWindowToolName.askUser)
-            guard tabContext.runID != nil else {
+            guard let runID = tabContext.runID else {
                 throw MCPError.invalidParams("ask_user requires an active Context Builder run with tab context")
             }
             response = try await targetWindow.contextBuilderAgentViewModel.askUserInteraction(
                 tabID: tabContext.tabID,
-                interaction: parsed.interaction
+                interaction: parsed.interaction,
+                runID: runID
             )
 
         case .agentModeRun:

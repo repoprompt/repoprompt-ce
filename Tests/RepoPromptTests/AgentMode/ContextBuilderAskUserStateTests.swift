@@ -8,6 +8,7 @@ final class ContextBuilderAskUserStateTests: XCTestCase {
 
         XCTAssertNil(session.pendingAskUser)
         XCTAssertNil(session.askUserContinuation)
+        XCTAssertNil(session.pendingAskUserRunID)
         XCTAssertNil(session.askUserTimeoutTask)
         XCTAssertEqual(session.pendingAskUserTimeoutGeneration, 0)
     }
@@ -50,9 +51,12 @@ final class ContextBuilderAskUserStateTests: XCTestCase {
             currentQuestionIndex: 1
         )
 
+        let runID = UUID()
         session.pendingAskUser = pending
+        session.pendingAskUserRunID = runID
 
         let stored = try XCTUnwrap(session.pendingAskUser)
+        XCTAssertEqual(session.pendingAskUserRunID, runID)
         XCTAssertEqual(stored.id, interactionID)
         XCTAssertEqual(stored.currentQuestion?.id, "notes")
         XCTAssertEqual(stored.draftsByQuestionID["scope"]?.selectedOptionLabels, ["All relevant"])
