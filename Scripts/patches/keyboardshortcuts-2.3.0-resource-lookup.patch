@@ -1,0 +1,29 @@
+diff --git a/Sources/KeyboardShortcuts/Utilities.swift b/Sources/KeyboardShortcuts/Utilities.swift
+index bda45c8..196b6f1 100644
+--- a/Sources/KeyboardShortcuts/Utilities.swift
++++ b/Sources/KeyboardShortcuts/Utilities.swift
+@@ -6,0 +7,21 @@ import Carbon.HIToolbox
++private extension Bundle {
++	static var keyboardShortcutsResourceBundle: Bundle {
++		let bundleName = "KeyboardShortcuts_KeyboardShortcuts.bundle"
++		// Intentionally embedded for packaged executable validation; keep in sync with validate_required_swiftpm_resource_bundles.sh.
++		_ = Bundle.main.object(forInfoDictionaryKey: "RepoPromptKeyboardShortcutsResourceLookupV1")
++		let candidates: [URL?] = [
++			Bundle.main.resourceURL?.appendingPathComponent(bundleName),
++			Bundle.main.bundleURL.appendingPathComponent(bundleName)
++		]
++
++		for candidate in candidates {
++			if let candidate, let bundle = Bundle(url: candidate) {
++				return bundle
++			}
++		}
++
++		return .module
++	}
++}
++
++
+@@ -12 +33 @@ extension String {
+-		NSLocalizedString(self, bundle: .module, comment: self)
++		NSLocalizedString(self, bundle: .keyboardShortcutsResourceBundle, comment: self)
