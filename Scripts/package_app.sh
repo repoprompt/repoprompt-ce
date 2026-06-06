@@ -152,6 +152,9 @@ printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
 SWIFT_BUILD_ARGS=(-c "$CONF")
 
+phase "Patching KeyboardShortcuts resource lookup"
+run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+
 phase "Building $APP_NAME ($CONF)"
 run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
@@ -195,6 +198,7 @@ run cp -R "$ROOT_DIR/ThirdPartyLicenses" "$APP_BUNDLE/Contents/Resources/Legal/"
 shopt -s nullglob
 for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done
 shopt -u nullglob
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Packaged app SwiftPM resource bundle layout"
 
 phase "Writing Info.plist"
 run python3 - <<PY

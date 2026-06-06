@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import plistlib
 import shutil
@@ -59,6 +60,12 @@ class ReleaseToolingTests(unittest.TestCase):
             self.assertIn("validate_embedded_mcp_helper_layout.sh", privileged_script)
             self.assertNotIn("smoke_embedded_mcp_helper.sh", privileged_script)
         self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh"', release_script)
+        self.assertIn('require_file "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh"', release_script)
+        self.assertIn(
+            'require_file "$CONTROL_PLANE_SCRIPTS_DIR/patches/keyboardshortcuts-2.3.0-resource-lookup.patch"',
+            release_script,
+        )
         self.assertIn('DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"', release_script)
         self.assertIn('ditto "$APP_BUNDLE" "$distribution_dir/$DISTRIBUTION_APP_BUNDLE_NAME"', release_script)
         self.assertIn('DISTRIBUTION_APP_BUNDLE_NAME="$DISPLAY_NAME.app"', promote_script)
@@ -293,6 +300,101 @@ class ReleaseToolingTests(unittest.TestCase):
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("unexpected or escaping staged symlink", result.stderr)
+
+    def test_staged_release_validator_accepts_keyboard_shortcuts_resources_layout(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("OK: staged release payload matches approved source", result.stdout)
+
+    def test_staged_release_validator_rejects_keyboard_shortcuts_app_root_bundle(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        self.write_keyboard_shortcuts_bundle(app / "KeyboardShortcuts_KeyboardShortcuts.bundle")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected app bundle root entries", result.stderr)
+        self.assertIn("KeyboardShortcuts_KeyboardShortcuts.bundle", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_keyboard_shortcuts_resources_bundle(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        shutil.rmtree(app / "Contents" / "Resources" / "KeyboardShortcuts_KeyboardShortcuts.bundle")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required SwiftPM resource bundle directory", result.stderr)
+        self.assertIn("KeyboardShortcuts_KeyboardShortcuts.bundle", result.stderr)
+
+    def test_staged_release_validator_rejects_missing_keyboard_shortcuts_patch_marker(self) -> None:
+        approved, staged, scripts = self.make_staged_release_fixture()
+        app = staged / ".build" / "release" / "RepoPrompt.app"
+        (app / "Contents" / "MacOS" / "RepoPrompt").write_text("unpatched fixture\n", encoding="utf-8")
+
+        result = self.run_staged_validation(approved, staged, scripts)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing KeyboardShortcuts resource lookup patch marker", result.stderr)
+        self.assertIn("RepoPromptKeyboardShortcutsResourceLookupV1", result.stderr)
+
+    def test_keyboard_shortcuts_patch_helper_applies_and_is_idempotent(self) -> None:
+        root, utilities = self.make_keyboard_shortcuts_patch_fixture()
+
+        applied = self.run_keyboard_shortcuts_patch(root)
+        applied_text = utilities.read_text(encoding="utf-8")
+        skipped = self.run_keyboard_shortcuts_patch(root)
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertIn("Applied KeyboardShortcuts resource lookup patch", applied.stdout)
+        self.assertIn("RepoPromptKeyboardShortcutsResourceLookupV1", applied_text)
+        self.assertIn("Bundle.main.resourceURL?.appendingPathComponent(bundleName)", applied_text)
+        self.assertEqual(skipped.returncode, 0, skipped.stderr)
+        self.assertIn("already applied", skipped.stdout)
+
+    def test_keyboard_shortcuts_patch_helper_checks_pin_before_idempotent_skip(self) -> None:
+        root, _ = self.make_keyboard_shortcuts_patch_fixture()
+        applied = self.run_keyboard_shortcuts_patch(root)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.write_package_resolved(root, "2.3.0", revision="changed-revision")
+
+        rejected = self.run_keyboard_shortcuts_patch(root)
+
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("KeyboardShortcuts dependency version or revision changed", rejected.stderr)
+        self.assertIn("changed-revision", rejected.stderr)
+        self.assertNotIn("already applied", rejected.stdout)
+
+    def test_keyboard_shortcuts_patch_helper_rejects_source_drift(self) -> None:
+        root, _ = self.make_keyboard_shortcuts_patch_fixture(source='extension String {\n\tvar localized: String { self }\n}\n')
+
+        result = self.run_keyboard_shortcuts_patch(root)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("patch no longer applies cleanly", result.stderr)
+
+    def test_package_app_invokes_keyboard_shortcuts_patch_and_shared_swiftpm_bundle_validator(self) -> None:
+        package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
+        staged_validator = (SCRIPT_DIR / "validate_staged_release.sh").read_text(encoding="utf-8")
+        shared_validator = (SCRIPT_DIR / "validate_required_swiftpm_resource_bundles.sh").read_text(encoding="utf-8")
+
+        dependency_patch = package_script.index("patch_keyboard_shortcuts_resource_lookup.sh")
+        first_build = package_script.index('phase "Building $APP_NAME ($CONF)"')
+        broad_resources_copy = package_script.index('for bundle in "$BUILD_DIR"/*.bundle; do run cp -R "$bundle" "$APP_BUNDLE/Contents/Resources/"; done')
+        resources_validation = package_script.index("validate_required_swiftpm_resource_bundles.sh")
+        outer_app_sign = package_script.index('sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"')
+
+        self.assertIn("validate_required_swiftpm_resource_bundles.sh", staged_validator)
+        self.assertIn('required_bundles = ["KeyboardShortcuts_KeyboardShortcuts.bundle"]', shared_validator)
+        self.assertIn("RepoPromptKeyboardShortcutsResourceLookupV1", shared_validator)
+        self.assertNotIn("RepoPromptKeyboardShortcutsResourceLookupV1", package_script)
+        self.assertLess(dependency_patch, first_build)
+        self.assertLess(broad_resources_copy, resources_validation)
+        self.assertLess(resources_validation, outer_app_sign)
 
     def test_runtime_bundle_verifier_is_removed_without_changing_sparkle_or_anti_debug_startup(self) -> None:
         app_delegate = (SCRIPT_DIR.parent / "Sources" / "RepoPrompt" / "App" / "AppDelegate.swift").read_text(
@@ -813,6 +915,61 @@ SIGNING_TEAM_ID=648A27MST5
         )
         return root
 
+    def make_keyboard_shortcuts_patch_fixture(self, source: str | None = None) -> tuple[Path, Path]:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        utilities = root / ".build" / "checkouts" / "KeyboardShortcuts" / "Sources" / "KeyboardShortcuts" / "Utilities.swift"
+        utilities.parent.mkdir(parents=True)
+        utilities.write_text(source if source is not None else self.keyboard_shortcuts_upstream_utilities(), encoding="utf-8")
+        self.write_package_resolved(root, "2.3.0")
+        return root, utilities
+
+    @staticmethod
+    def keyboard_shortcuts_upstream_utilities() -> str:
+        return """\
+import SwiftUI
+
+#if os(macOS)
+import Carbon.HIToolbox
+
+
+extension String {
+\t/**
+\tMakes the string localizable.
+\t*/
+\tvar localized: String {
+\t\tNSLocalizedString(self, bundle: .module, comment: self)
+\t}
+}
+
+
+extension Data {
+\tvar toString: String? { String(data: self, encoding: .utf8) }
+}
+"""
+
+    @staticmethod
+    def write_package_resolved(
+        root: Path,
+        version: str,
+        revision: str = "045cf174010beb335fa1d2567d18c057b8787165",
+    ) -> None:
+        (root / "Package.resolved").write_text(
+            json.dumps(
+                {"pins": [{"identity": "keyboardshortcuts", "state": {"revision": revision, "version": version}}]},
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+    @staticmethod
+    def run_keyboard_shortcuts_patch(root: Path) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(SCRIPT_DIR / "patch_keyboard_shortcuts_resource_lookup.sh"), str(root)],
+            text=True,
+            capture_output=True,
+        )
+
     def make_staged_release_fixture(self) -> tuple[Path, Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, temp_dir, True)
@@ -835,6 +992,7 @@ SIGNING_TEAM_ID=648A27MST5
             "load_release_metadata.sh",
             "validate_embedded_mcp_helper_layout.sh",
             "validate_packaged_legal.sh",
+            "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
@@ -865,11 +1023,15 @@ SIGNING_TEAM_ID=648A27MST5
         }.items():
             template = template.replace(key, value)
         (app / "Contents" / "Info.plist").write_text(template, encoding="utf-8")
-        for name in ("RepoPrompt", "repoprompt-mcp"):
-            (app / "Contents" / "MacOS" / name).write_text(name, encoding="utf-8")
+        (app / "Contents" / "MacOS" / "RepoPrompt").write_text(
+            "RepoPromptKeyboardShortcutsResourceLookupV1\n",
+            encoding="utf-8",
+        )
+        (app / "Contents" / "MacOS" / "repoprompt-mcp").write_text("repoprompt-mcp", encoding="utf-8")
         (app / "Contents" / "MacOS" / "repoprompt-mcp").chmod(0o755)
         (app / "Contents" / "Resources" / "repoprompt-mcp").symlink_to("../MacOS/repoprompt-mcp")
         (app / "Contents" / "Resources" / "bin" / "repoprompt-mcp").symlink_to("../../MacOS/repoprompt-mcp")
+        self.write_keyboard_shortcuts_bundle(app / "Contents" / "Resources" / "KeyboardShortcuts_KeyboardShortcuts.bundle")
         legal = app / "Contents" / "Resources" / "Legal"
         shutil.copy2(staged / "LICENSE", legal / "LICENSE")
         shutil.copy2(staged / "THIRD_PARTY_NOTICES.md", legal / "THIRD_PARTY_NOTICES.md")
@@ -879,6 +1041,12 @@ SIGNING_TEAM_ID=648A27MST5
         )
         (staged / "RELEASE_COMMIT").write_text("fixture-release-commit\n", encoding="utf-8")
         return approved, staged, scripts
+
+    @staticmethod
+    def write_keyboard_shortcuts_bundle(bundle: Path) -> None:
+        (bundle / "en.lproj").mkdir(parents=True, exist_ok=True)
+        (bundle / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
+        (bundle / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
     def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:
