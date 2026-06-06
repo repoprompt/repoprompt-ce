@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct MetaInstruction {
     let title: String

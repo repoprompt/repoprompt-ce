@@ -1,4 +1,5 @@
 @testable import RepoPrompt
+import RepoPromptCore
 import XCTest
 
 final class PromptMigrationRemovalTests: XCTestCase {

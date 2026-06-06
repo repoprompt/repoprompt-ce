@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 2 Slice 2 runtime-ownership and frozen-headless boundary checks."""
+"""Phase 2 runtime, prompt-assembly, and frozen-headless boundary checks."""
 
 from __future__ import annotations
 
@@ -49,6 +49,17 @@ RETIRED_RUNTIME_PATHS = (
     "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionController.swift",
     "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Slices/SelectionSliceCoordinator.swift",
     "Sources/RepoPrompt/App/CoreAdapters/WorkspaceSessionSelectionForwarder.swift",
+)
+
+REQUIRED_PROMPT_ASSEMBLY_PATHS = (
+    "Sources/RepoPromptCore/Prompt/PromptAssemblyBuilder.swift",
+    "Sources/RepoPromptCore/Prompt/PromptRenderPolicy.swift",
+    "Sources/RepoPromptCore/Prompt/PromptSection.swift",
+    "Sources/RepoPrompt/Features/Prompt/Models/PromptSection+DisplayName.swift",
+)
+
+RETIRED_PROMPT_ASSEMBLY_PATHS = (
+    "Sources/RepoPrompt/Features/Prompt/Models/PromptAssemblyBuilder.swift",
 )
 
 CORE_IMPORTERS = {
@@ -211,6 +222,12 @@ def main() -> int:
     for relative in RETIRED_RUNTIME_PATHS:
         if (ROOT / relative).exists():
             fail(f"Retired app runtime owner still exists: {relative}")
+    for relative in REQUIRED_PROMPT_ASSEMBLY_PATHS:
+        if not (ROOT / relative).is_file():
+            fail(f"Required Slice 3 prompt assembly owner missing: {relative}")
+    for relative in RETIRED_PROMPT_ASSEMBLY_PATHS:
+        if (ROOT / relative).exists():
+            fail(f"Retired app prompt assembly owner still exists: {relative}")
 
     core_root = ROOT / "Sources/RepoPromptCore"
     forbidden_imports = {
@@ -290,7 +307,7 @@ def main() -> int:
         if (ROOT / relative).read_bytes() != git_bytes(BASELINE, relative):
             fail(f"Frozen Phase 0 characterization changed relative to {BASELINE}: {relative}")
 
-    print("OK: shared runtime Phase 2 Slice 2 boundaries passed.")
+    print("OK: shared runtime Phase 2 boundaries passed.")
     return 0
 
 

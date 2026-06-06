@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
 
 /// Errors that can occur when publishing git diff artifacts
