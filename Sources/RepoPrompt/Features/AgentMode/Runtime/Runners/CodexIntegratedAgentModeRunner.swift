@@ -51,7 +51,8 @@ final class CodexIntegratedAgentModeRunner {
                 session: session,
                 text: initialMessageForRun,
                 attachments: attachments,
-                attachmentReservationID: attachmentReservationID
+                attachmentReservationID: attachmentReservationID,
+                terminalizeRejectedSend: createdOwnership
             )
             hooks.recordPendingHandoffSendOutcome(session, outcome.didSend)
             switch outcome {

@@ -10,6 +10,7 @@ final class ClaudeIntegratedAgentModeRunner {
 
     private let claudeCoordinator: ClaudeAgentModeCoordinator
     private let hooks: AgentModeRunService.Hooks
+    private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
     #if DEBUG
         private func reasoningDebug(_ message: @autoclosure () -> String) {
@@ -33,10 +34,12 @@ final class ClaudeIntegratedAgentModeRunner {
 
     init(
         claudeCoordinator: ClaudeAgentModeCoordinator,
-        hooks: AgentModeRunService.Hooks
+        hooks: AgentModeRunService.Hooks,
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier
     ) {
         self.claudeCoordinator = claudeCoordinator
         self.hooks = hooks
+        self.terminalCommitBarrier = terminalCommitBarrier
     }
 
     func startRun(
@@ -64,6 +67,18 @@ final class ClaudeIntegratedAgentModeRunner {
         } ?? AgentModeProcessRunIdentity.startFreshProcessRun(for: session)
         let lease = makeLease(runID)
         let ownership = session.beginRunAttempt(source: "claudeNative")
+        session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
+            {
+                switch terminalState {
+                case .failed:
+                    await lease.failAndRelease()
+                case .cancelled:
+                    await lease.cancelAndCleanup()
+                default:
+                    break
+                }
+            }
+        }
         let runAttemptID = ownership.attemptID
         session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
@@ -84,7 +99,7 @@ final class ClaudeIntegratedAgentModeRunner {
                         tabID: tabID,
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
+                        ownership: ownership,
                         attachmentReservationID: attachmentReservationID
                     )
                     return
@@ -102,11 +117,10 @@ final class ClaudeIntegratedAgentModeRunner {
                 )
                 self.hooks.recordPendingHandoffSendOutcome(session, sent)
                 guard sent else {
-                    await lease.failAndRelease()
                     await self.finalize(
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
+                        ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
                         terminalState: .failed,
                         errorText: nil,
@@ -123,7 +137,7 @@ final class ClaudeIntegratedAgentModeRunner {
                     await self.finalize(
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
+                        ownership: ownership,
                         attachmentReservationID: attachmentReservationID,
                         terminalState: .failed,
                         errorText: "Claude native events stream not available.",
@@ -142,18 +156,14 @@ final class ClaudeIntegratedAgentModeRunner {
                 await self.finalize(
                     session: session,
                     runID: runID,
-                    runAttemptID: runAttemptID,
+                    ownership: ownership,
                     attachmentReservationID: attachmentReservationID,
                     terminalState: outcome.terminalState,
                     errorText: outcome.errorText,
-                    notifyTurnComplete: outcome.terminalState == .completed
+                    notifyTurnComplete: outcome.terminalState == .completed,
+                    shouldShutdownSession: outcome.shouldShutdownSession
                 )
-                if outcome.shouldShutdownSession {
-                    await self.claudeCoordinator.shutdownClaudeSession(session)
-                }
-            } onCancel: {
-                Task { await lease.cancelAndCleanup() }
-            }
+            } onCancel: {}
         }
     }
 
@@ -284,104 +294,72 @@ final class ClaudeIntegratedAgentModeRunner {
         // The events stream ended without a terminal turnCompleted event while this
         // attempt was still active.  This means the stream was finished or the Claude
         // process exited unexpectedly.
-        let errorItem = AgentChatItem.error(
-            "Claude events stream ended unexpectedly. The run may need to be restarted.",
-            sequenceIndex: session.nextSequenceIndex
+        return ConsumeEventsOutcome(
+            terminalState: .failed,
+            errorText: "Claude events stream ended unexpectedly. The run may need to be restarted.",
+            shouldShutdownSession: false
         )
-        session.appendItem(errorItem)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
-        return ConsumeEventsOutcome(terminalState: .failed, errorText: nil, shouldShutdownSession: false)
     }
 
     private func handleAcquireFailure(
-        tabID: UUID,
+        tabID _: UUID,
         session: AgentModeViewModel.TabSession,
         runID: UUID,
-        runAttemptID: UUID,
+        ownership: AgentRunOwnership,
         attachmentReservationID: UUID?
     ) async {
-        guard session.runID == runID,
-              session.activeRunAttemptID == runAttemptID
-        else {
-            return
-        }
-        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "claudeNative.acquireFailure")
-        session.agentTask = nil
-        session.runState = .cancelled
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
         hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.setAgentRunActive(tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "claudeNative.acquireFailure",
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false
+        ))
     }
 
     private func finalize(
         session: AgentModeViewModel.TabSession,
         runID: UUID,
-        runAttemptID: UUID,
+        ownership: AgentRunOwnership,
         attachmentReservationID: UUID?,
         terminalState: AgentSessionRunState,
         errorText: String?,
-        notifyTurnComplete: Bool
+        notifyTurnComplete: Bool,
+        shouldShutdownSession: Bool = false
     ) async {
-        guard session.runID == runID,
-              session.activeRunAttemptID == runAttemptID
-        else {
-            return
-        }
-
-        hooks.finalizeStreamingItems(session)
-        hooks.finalizePendingToolCalls(session, terminalState)
-        hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-        let queuedInstruction = terminalState == .completed ? session.pendingInstructions.first : nil
-        if queuedInstruction != nil {
-            session.pendingInstructions.removeFirst()
-        }
-        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "claudeNative.finalize")
-        session.agentTask = nil
-        session.runState = terminalState
-        session.pendingSupersedingTurnCompletions = 0
-        session.claudeSupersedingProtectedTurnIDs.removeAll()
-        session.claudeExpectedTurnIDs.removeAll()
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        hooks.cancelPendingQuestion(session)
-        hooks.cancelPendingApproval(session)
-        let pendingReviewCancellationReason = switch terminalState {
-        case .completed:
-            "Run completed before review decision"
-        case .cancelled:
-            "Run cancelled"
-        case .failed:
-            "Run failed"
-        default:
-            "Run finished"
-        }
-        hooks.cancelPendingApplyEditsReview(session, pendingReviewCancellationReason)
-        hooks.cancelPendingWorktreeMergeReview(session, pendingReviewCancellationReason)
-        hooks.setAgentRunActive(session.tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-
-        if let errorText {
-            let trimmed = errorText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
-                session.appendItem(errorItem)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: terminalState,
+            source: "claudeNative.finalize",
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: notifyTurnComplete,
+            prepareProviderState: { [claudeCoordinator] in
+                session.pendingSupersedingTurnCompletions = 0
+                session.claudeSupersedingProtectedTurnIDs.removeAll()
+                session.claudeExpectedTurnIDs.removeAll()
+                guard shouldShutdownSession else { return nil }
+                let oldController = claudeCoordinator.prepareClaudeCancelSync(session)
+                return {
+                    claudeCoordinator.beginClaudeResumeTransferIfNeeded(
+                        for: session,
+                        oldController: oldController
+                    )
+                    await claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                }
             }
-        }
-
-        hooks.updateBindings(session)
-        if notifyTurnComplete {
-            hooks.notifyAgentTurnComplete(session)
-        }
-        hooks.scheduleSave(session.tabID)
-
-        if let queuedInstruction {
-            hooks.startFollowUpRun(session.tabID, queuedInstruction)
-        }
+        ))
     }
 
     // MARK: - Error Filtering

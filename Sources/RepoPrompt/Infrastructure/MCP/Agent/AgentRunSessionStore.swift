@@ -34,6 +34,7 @@ actor AgentRunSessionStore {
         var latestSnapshot: AgentRunMCPSnapshot?
         var pendingNoteworthySnapshot: AgentRunMCPSnapshot?
         var pendingWakeReason: WakeReason?
+        var lastCommittedPublicationID: UUID?
         var waiters: [Waiter] = []
         var expiryTask: Task<Void, Never>?
     }
@@ -70,6 +71,7 @@ actor AgentRunSessionStore {
         record.latestSnapshot = nil
         record.pendingNoteworthySnapshot = nil
         record.pendingWakeReason = nil
+        record.lastCommittedPublicationID = nil
         records[registration.sessionID] = record
         return record.registration
     }
@@ -84,6 +86,44 @@ actor AgentRunSessionStore {
         reason: WakeReason
     ) {
         ingestSnapshot(snapshot, registration: registration, wakeReason: reason)
+    }
+
+    func signalCommittedSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        commitID: UUID
+    ) {
+        guard snapshot.sessionID == registration.sessionID else {
+            recordRejectedOperation(
+                "publish_terminal_commit",
+                supplied: registration,
+                current: records[registration.sessionID]?.registration,
+                reason: "session_mismatch"
+            )
+            return
+        }
+        guard var record = currentRecord(for: registration, operation: "publish_terminal_commit") else { return }
+        if record.lastCommittedPublicationID == commitID {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.duplicate")
+            #endif
+            return
+        }
+        guard record.lastCommittedPublicationID == nil else {
+            recordRejectedOperation(
+                "publish_terminal_commit",
+                supplied: registration,
+                current: record.registration,
+                reason: "different_commit_already_published"
+            )
+            return
+        }
+        record.lastCommittedPublicationID = commitID
+        records[registration.sessionID] = record
+        ingestSnapshot(snapshot, registration: registration, wakeReason: nil)
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.accepted")
+        #endif
     }
 
     func wakeCurrentWaiters(
@@ -414,6 +454,14 @@ extension AgentRunSessionStore {
 extension AgentRunSessionStore {
     static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) async {
         await shared.noteSnapshot(snapshot, registration: registration)
+    }
+
+    static func signalCommittedSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        commitID: UUID
+    ) async {
+        await shared.signalCommittedSnapshot(snapshot, registration: registration, commitID: commitID)
     }
 
     static func signalSnapshotAndWakeWaiters(

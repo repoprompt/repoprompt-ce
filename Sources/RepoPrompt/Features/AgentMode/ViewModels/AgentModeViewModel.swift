@@ -621,6 +621,10 @@ final class AgentModeViewModel: ObservableObject {
             codexCoordinator
         }
 
+        func test_initializeRunService() {
+            _ = runService
+        }
+
         var test_isCursorModelPollingActive: Bool {
             cursorModelsSubscriptionTask != nil
         }
@@ -1942,8 +1946,17 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingWorktreeMergeReview: { [weak self] session, reason in
                 self?.cancelPendingWorktreeMergeReview(for: session, reason: reason)
             },
+            flushPendingAssistantDelta: { [weak self] session in
+                self?.flushPendingAssistantDelta(session)
+            },
             clearPendingAssistantDelta: { [weak self] session in
                 self?.clearPendingAssistantDelta(session)
+            },
+            prepareTerminalPublication: { [weak self] session in
+                self?.prepareTerminalPublication(for: session)
+            },
+            publishTerminalCommit: { [weak self] session, revision in
+                await self?.publishTerminalCommit(revision, for: session)
             },
             startFollowUpRun: { [weak self] tabID, initialMessage in
                 Task { [weak self] in
@@ -3971,6 +3984,12 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func handleObservedMCPStateChange(for session: TabSession) {
+        guard !session.terminalCommitInProgress else { return }
+        // Terminal waiter publication is owned exclusively by AgentRunTerminalCommitBarrier.
+        // Legacy/special-purpose state changes without a canonical revision must not race it.
+        if session.runState.isTerminalForCommit {
+            return
+        }
         guard let snapshot = mcpSnapshot(for: session),
               let context = session.mcpControlContext
         else {
@@ -3997,6 +4016,45 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             session.mcpControlCleanupTask?.cancel()
             session.mcpControlCleanupTask = nil
+        }
+    }
+
+    private func prepareTerminalPublication(for session: TabSession) {
+        removePendingUIRefresh(for: session.tabID)
+        guard session.tabID == currentTabID,
+              canBuildOrPublishActiveTranscriptBindings(for: session)
+        else {
+            return
+        }
+        catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
+    }
+
+    private func publishTerminalCommit(
+        _ revision: AgentRunTerminalCommitRevision,
+        for session: TabSession
+    ) async {
+        guard session.lastTerminalCommitRevision == revision,
+              session.runState.isTerminalForCommit,
+              session.sourceItemsRevision == revision.sourceItemsRevision,
+              session.assistantDeltaFlushGeneration == revision.assistantDeltaFlushGeneration,
+              let snapshot = mcpSnapshot(for: session),
+              let context = session.mcpControlContext,
+              mcpControlContextMatches(
+                  tabID: session.tabID,
+                  sessionID: snapshot.sessionID,
+                  activationID: context.activationID,
+                  registration: context.registration
+              )
+        else {
+            return
+        }
+        await AgentRunSessionStore.signalCommittedSnapshot(
+            snapshot,
+            registration: context.registration,
+            commitID: revision.commitID
+        )
+        if session.mcpControlCleanupTask == nil {
+            session.mcpControlCleanupTask = Task {}
         }
     }
 
@@ -6062,7 +6120,9 @@ final class AgentModeViewModel: ObservableObject {
             archivedHistoryState: archivedHistoryState,
             isCompressedHistoryRevealed: session.isCompressedHistoryRevealed,
             isWindowCappedWhileActive: isCapped,
-            bindingsHydrated: session.hasLoadedPersistedState,
+            bindingsHydrated: session.authoritativeHydratedBindingTransitionGeneration != nil,
+            hydratedPersistentBinding: session.authoritativeHydratedBinding,
+            hydratedBindingTransitionGeneration: session.authoritativeHydratedBindingTransitionGeneration,
             performanceSnapshot: session.transcriptPerformanceSnapshot,
             metadata: Self.transcriptPresentationMetadata(
                 from: nextVisibleRows,
@@ -6261,11 +6321,29 @@ final class AgentModeViewModel: ObservableObject {
 
     private func setActiveTranscriptBindingsHydrated(_ value: Bool) {
         if !value {
+            if let tabID = activeTranscriptPresentation.tabID {
+                sessions[tabID]?.clearCurrentBindingHydration()
+            }
             publishLoadingTranscriptPresentation(tabID: activeTranscriptPresentation.tabID)
             return
         }
-        guard activeTranscriptPresentation.bindingsHydrated != value else { return }
         let snapshot = activeTranscriptPresentation
+        guard let tabID = snapshot.tabID,
+              let session = sessions[tabID],
+              session.hasLoadedPersistedState,
+              !session.bindingTransitionInProgress
+        else {
+            return
+        }
+        session.markCurrentBindingHydrated()
+        let hydratedBinding = session.authoritativeHydratedBinding
+        let hydratedTransitionGeneration = session.authoritativeHydratedBindingTransitionGeneration
+        guard !snapshot.bindingsHydrated
+            || snapshot.hydratedPersistentBinding != hydratedBinding
+            || snapshot.hydratedBindingTransitionGeneration != hydratedTransitionGeneration
+        else {
+            return
+        }
         activeTranscriptPresentation = .init(
             tabID: snapshot.tabID,
             revision: snapshot.revision,
@@ -6279,6 +6357,8 @@ final class AgentModeViewModel: ObservableObject {
             isCompressedHistoryRevealed: snapshot.isCompressedHistoryRevealed,
             isWindowCappedWhileActive: snapshot.isWindowCappedWhileActive,
             bindingsHydrated: value,
+            hydratedPersistentBinding: hydratedBinding,
+            hydratedBindingTransitionGeneration: hydratedTransitionGeneration,
             performanceSnapshot: snapshot.performanceSnapshot,
             metadata: snapshot.metadata,
             rawToolResultPayloadRenderRevision: snapshot.rawToolResultPayloadRenderRevision
@@ -6372,6 +6452,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             return
         }
+        session.markCurrentBindingHydrated()
         withActiveUISyncSuppressed {
             isRestoringState = true
             defer { isRestoringState = false }
@@ -6684,6 +6765,10 @@ final class AgentModeViewModel: ObservableObject {
               session.bindingTransitionGeneration == request.bindingTransitionGeneration,
               session.sourceItemsRevision == request.sourceItemsRevision,
               session.assistantDeltaFlushGeneration == request.flushGeneration,
+              activeTranscriptPresentation.tabID == request.tabID,
+              activeTranscriptPresentation.bindingsHydrated,
+              activeTranscriptPresentation.hydratedPersistentBinding == request.persistentBinding,
+              activeTranscriptPresentation.hydratedBindingTransitionGeneration == request.bindingTransitionGeneration,
               !(pendingUIRefreshScopesByTabID[request.tabID]?.contains(.full) ?? false)
         else {
             return false
@@ -6783,10 +6868,7 @@ final class AgentModeViewModel: ObservableObject {
         session: TabSession,
         request: AssistantPresentationRequest
     ) {
-        guard canAdmitAssistantPresentationRequest(request, session: session),
-              activeTranscriptPresentation.tabID == session.tabID,
-              activeTranscriptPresentation.bindingsHydrated
-        else {
+        guard canAdmitAssistantPresentationRequest(request, session: session) else {
             #if DEBUG
                 AgentModePerfDiagnostics.increment("ui.assistantPresentation.rejectedAtFlush", tabID: session.tabID)
             #endif
@@ -12794,18 +12876,12 @@ final class AgentModeViewModel: ObservableObject {
                     session.instructionContinuation = nil
                     session.instructionTimeoutTask = nil
                     session.instructionWaitID = nil
-                    session.runState = .cancelled
-                    session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-                    session.setRunningStatus(nil, source: nil)
-                    tabsWithActiveAgentRun.remove(session.tabID)
-                    session.endCurrentRunAttempt(source: "viewModel.sessionReplacement")
-                    session.agentTask?.cancel()
-                    session.agentTask = nil
-                    if let provider = session.provider {
-                        await provider.dispose()
-                        session.provider = nil
-                    }
-                    updateBindingsFromSession(session)
+                    await runService.cancelRun(
+                        tabID: session.tabID,
+                        session: session,
+                        intent: .userStop,
+                        waitForCleanup: false
+                    )
                     continuation.resume(returning: UserInstructionResponse(
                         text: nil,
                         timedOut: true,

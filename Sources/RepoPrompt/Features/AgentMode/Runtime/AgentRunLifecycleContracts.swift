@@ -7,11 +7,21 @@ import Foundation
 struct AgentRunBindingIdentity: Equatable, Hashable {
     let tabID: UUID
     let persistentSessionID: UUID?
+    let persistentBindingGeneration: UUID?
+    let bindingTransitionGeneration: UInt64
     let generation: UUID
 
-    init(tabID: UUID, persistentSessionID: UUID?, generation: UUID = UUID()) {
+    init(
+        tabID: UUID,
+        persistentSessionID: UUID?,
+        persistentBindingGeneration: UUID? = nil,
+        bindingTransitionGeneration: UInt64 = 0,
+        generation: UUID = UUID()
+    ) {
         self.tabID = tabID
         self.persistentSessionID = persistentSessionID
+        self.persistentBindingGeneration = persistentBindingGeneration
+        self.bindingTransitionGeneration = bindingTransitionGeneration
         self.generation = generation
     }
 }
@@ -24,6 +34,27 @@ struct AgentRunOwnership: Equatable, Hashable {
     init(attemptID: UUID = UUID(), binding: AgentRunBindingIdentity) {
         self.attemptID = attemptID
         self.binding = binding
+    }
+}
+
+@MainActor
+final class AgentRunAttemptTerminalResources {
+    typealias Teardown = @MainActor () async -> Void
+    typealias Prepare = @MainActor (_ terminalState: AgentSessionRunState) -> Teardown?
+
+    let ownership: AgentRunOwnership
+    private let prepare: Prepare
+    private(set) var isClaimed = false
+
+    init(ownership: AgentRunOwnership, prepare: @escaping Prepare) {
+        self.ownership = ownership
+        self.prepare = prepare
+    }
+
+    func claim(for ownership: AgentRunOwnership, terminalState: AgentSessionRunState) -> Teardown? {
+        guard !isClaimed, self.ownership == ownership else { return nil }
+        isClaimed = true
+        return prepare(terminalState)
     }
 }
 
@@ -97,6 +128,8 @@ struct AgentRunLifecycleTracker: Equatable {
     mutating func begin(
         tabID: UUID,
         persistentSessionID: UUID?,
+        persistentBindingGeneration: UUID? = nil,
+        bindingTransitionGeneration: UInt64 = 0,
         attemptID: UUID = UUID(),
         timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> AgentRunOwnership {
@@ -104,7 +137,9 @@ struct AgentRunLifecycleTracker: Equatable {
             attemptID: attemptID,
             binding: AgentRunBindingIdentity(
                 tabID: tabID,
-                persistentSessionID: persistentSessionID
+                persistentSessionID: persistentSessionID,
+                persistentBindingGeneration: persistentBindingGeneration,
+                bindingTransitionGeneration: bindingTransitionGeneration
             )
         )
         activeOwnership = ownership

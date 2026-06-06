@@ -436,6 +436,18 @@ final class CodexCLIProvider: AIProvider {
                     case .contextCompacted(turnID: _):
                         continue
 
+                    case .livenessActivity:
+                        continue
+
+                    case let .errorNotification(notification):
+                        let willRetry = notification.willRetry
+                            ?? Self.isRetriableStreamErrorMessage(notification.message)
+                        if willRetry {
+                            continuation.yield(AIStreamResult(type: "status", text: notification.message))
+                            continue
+                        }
+                        throw AIProviderError.invalidConfiguration(detail: notification.message)
+
                     case let .error(message):
                         if Self.isRetriableStreamErrorMessage(message) {
                             continuation.yield(AIStreamResult(type: "status", text: message))
@@ -562,6 +574,17 @@ final class CodexCLIProvider: AIProvider {
 
                     case .contextCompacted(turnID: _):
                         continue
+
+                    case .livenessActivity:
+                        continue
+
+                    case let .errorNotification(notification):
+                        let willRetry = notification.willRetry
+                            ?? Self.isRetriableStreamErrorMessage(notification.message)
+                        if willRetry {
+                            continue
+                        }
+                        throw AIProviderError.invalidConfiguration(detail: notification.message)
 
                     case let .error(message):
                         if Self.isRetriableStreamErrorMessage(message) {

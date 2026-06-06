@@ -4,13 +4,16 @@ import Foundation
 final class HeadlessAgentModeRunner {
     private let headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory
     private let hooks: AgentModeRunService.Hooks
+    private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
     init(
         headlessProviderFactory: @escaping AgentModeViewModel.HeadlessProviderFactory,
-        hooks: AgentModeRunService.Hooks
+        hooks: AgentModeRunService.Hooks,
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier
     ) {
         self.headlessProviderFactory = headlessProviderFactory
         self.hooks = hooks
+        self.terminalCommitBarrier = terminalCommitBarrier
     }
 
     func startRun(
@@ -47,18 +50,24 @@ final class HeadlessAgentModeRunner {
         hooks.updateBindings(session)
 
         guard session.selectedAgent != .codexExec else {
-            session.endRunAttempt(ifCurrent: ownership, source: "headless.invalidRoute")
-            session.runState = .failed
-            session.runningStatusText = nil
-            hooks.setAgentRunActive(tabID, false)
-            hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-            let errorItem = AgentChatItem.error(
-                "Internal routing error: Codex native run attempted to use headless provider path.",
-                sequenceIndex: session.nextSequenceIndex
-            )
-            session.appendItem(errorItem)
-            hooks.updateBindings(session)
-            hooks.scheduleSave(session.tabID)
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .failed,
+                source: "headless.invalidRoute",
+                errorText: "Internal routing error: Codex native run attempted to use headless provider path.",
+                attachmentReservationID: attachmentReservationID,
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                prepareProviderState: {
+                    session.provider = nil
+                    session.runID = nil
+                    return nil
+                }
+            ))
             return
         }
 
@@ -69,6 +78,23 @@ final class HeadlessAgentModeRunner {
                 : session.selectedModelRaw
         )
         session.provider = provider
+        session.installRunAttemptTerminalResources(ownership: ownership) { terminalState in
+            session.provider = nil
+            if session.runID == runID {
+                session.runID = nil
+            }
+            return {
+                switch terminalState {
+                case .failed:
+                    await lease.failAndRelease()
+                case .cancelled:
+                    await lease.cancelAndCleanup()
+                default:
+                    break
+                }
+                await provider.dispose()
+            }
+        }
 
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
@@ -79,8 +105,10 @@ final class HeadlessAgentModeRunner {
                         tabID: tabID,
                         session: session,
                         runID: runID,
-                        runAttemptID: runAttemptID,
-                        attachmentReservationID: attachmentReservationID
+                        ownership: ownership,
+                        provider: provider,
+                        attachmentReservationID: attachmentReservationID,
+                        lease: lease
                     )
                     return
                 }
@@ -102,35 +130,37 @@ final class HeadlessAgentModeRunner {
                     attachmentReservationID: attachmentReservationID,
                     lease: lease
                 )
-            } onCancel: {
-                Task { await lease.cancelAndCleanup() }
-            }
+            } onCancel: {}
         }
     }
 
     private func handleAcquireFailure(
-        tabID: UUID,
+        tabID _: UUID,
         session: AgentModeViewModel.TabSession,
         runID: UUID,
-        runAttemptID: UUID,
-        attachmentReservationID: UUID?
+        ownership: AgentRunOwnership,
+        provider _: HeadlessAgentProvider,
+        attachmentReservationID: UUID?,
+        lease _: MCPBootstrapLease
     ) async {
-        guard session.runID == runID,
-              session.activeRunAttemptID == runAttemptID
-        else {
-            return
-        }
-        session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.acquireFailure")
-        session.agentTask = nil
-        session.provider = nil
-        session.runID = nil
-        session.runState = .cancelled
-        session.runningStatusText = nil
         hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.setAgentRunActive(tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "headless.acquireFailure",
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                session.provider = nil
+                session.runID = nil
+                return nil
+            }
+        ))
     }
 
     private func executeHeadlessRun(
@@ -167,89 +197,62 @@ final class HeadlessAgentModeRunner {
                 return
             }
 
-            hooks.finalizeStreamingItems(session)
-            hooks.finalizePendingToolCalls(session, .completed)
-            hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-            let supportsSessionResume = false
-            let queuedInstruction = supportsSessionResume ? session.pendingInstructions.first : nil
-            if queuedInstruction != nil {
-                session.mcpFollowUpRunPending = true
-                session.pendingInstructions.removeFirst()
-            }
-            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.completed")
-            session.agentTask = nil
-            session.provider = nil
-            session.runID = nil
-            session.runState = .completed
-            session.runningStatusText = nil
-            hooks.cancelPendingQuestion(session)
-            hooks.cancelPendingApproval(session)
-            hooks.cancelPendingApplyEditsReview(session, "Run completed before review decision")
-            hooks.cancelPendingWorktreeMergeReview(session, "Run completed before review decision")
-            hooks.setAgentRunActive(session.tabID, false)
-            hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-            hooks.updateBindings(session)
-            hooks.notifyAgentTurnComplete(session)
-            hooks.scheduleSave(session.tabID)
-
-            if let queuedInstruction {
-                hooks.startFollowUpRun(session.tabID, queuedInstruction)
-            }
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .completed,
+                source: "headless.completed",
+                attachmentReservationID: attachmentReservationID,
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: true,
+                prepareProviderState: {
+                    session.provider = nil
+                    session.runID = nil
+                    return nil
+                }
+            ))
         } catch is CancellationError {
-            await lease.cancelAndCleanup()
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
-            else {
-                return
-            }
             hooks.recordPendingHandoffSendOutcome(session, false)
-            hooks.finalizeStreamingItems(session)
-            hooks.finalizePendingToolCalls(session, .cancelled)
-            hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.cancelled")
-            session.agentTask = nil
-            session.provider = nil
-            session.runID = nil
-            session.runState = .cancelled
-            session.runningStatusText = nil
-            hooks.cancelPendingQuestion(session)
-            hooks.cancelPendingApproval(session)
-            hooks.cancelPendingApplyEditsReview(session, "Run cancelled")
-            hooks.cancelPendingWorktreeMergeReview(session, "Run cancelled")
-            hooks.setAgentRunActive(session.tabID, false)
-            hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-            hooks.updateBindings(session)
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .cancelled,
+                source: "headless.cancelled",
+                attachmentReservationID: attachmentReservationID,
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                prepareProviderState: {
+                    session.provider = nil
+                    session.runID = nil
+                    return nil
+                }
+            ))
         } catch {
-            await lease.failAndRelease()
-            guard session.runID == runID,
-                  session.activeRunAttemptID == runAttemptID
-            else {
-                return
-            }
             hooks.recordPendingHandoffSendOutcome(session, false)
-            hooks.finalizeStreamingItems(session)
-            hooks.finalizePendingToolCalls(session, .failed)
-            hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-            session.endRunAttempt(ifCurrentAttemptID: runAttemptID, source: "headless.failed")
-            session.agentTask = nil
-            session.provider = nil
-            session.runID = nil
-            session.runState = .failed
-            session.runningStatusText = nil
-            hooks.cancelPendingQuestion(session)
-            hooks.cancelPendingApproval(session)
-            hooks.cancelPendingApplyEditsReview(session, "Run failed")
-            hooks.cancelPendingWorktreeMergeReview(session, "Run failed")
-            hooks.setAgentRunActive(session.tabID, false)
-            hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-
-            let errorItem = AgentChatItem.error(
-                "Agent failed: \(error.localizedDescription)",
-                sequenceIndex: session.nextSequenceIndex
-            )
-            session.appendItem(errorItem)
-            hooks.updateBindings(session)
-            hooks.scheduleSave(session.tabID)
+            await terminalCommitBarrier.commit(.init(
+                session: session,
+                ownership: ownership,
+                expectedRunID: runID,
+                terminalState: .failed,
+                source: "headless.failed",
+                errorText: "Agent failed: \(error.localizedDescription)",
+                attachmentReservationID: attachmentReservationID,
+                attachmentDisposition: .deleteFiles,
+                finalizeNonCodexUsage: true,
+                supportsFollowUp: false,
+                notifyTurnComplete: false,
+                prepareProviderState: {
+                    session.provider = nil
+                    session.runID = nil
+                    return nil
+                }
+            ))
         }
     }
 }

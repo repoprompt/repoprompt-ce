@@ -337,6 +337,11 @@ extension AgentModeViewModel {
         var assistantDeltaFlushTask: Task<Void, Never>?
         var assistantDeltaTaskGeneration: UInt64 = 0
         var assistantDeltaFlushGeneration: UInt64 = 0
+        var providerTerminalDrainGeneration: UInt64 = 0
+        var terminalCommitInProgress: Bool = false
+        var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
+        var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
+        var codexCurrentTurnID: String?
 
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
@@ -358,6 +363,8 @@ extension AgentModeViewModel {
         var saveGeneration: UInt64 = 0
         var parentSessionID: UUID?
         var hasLoadedPersistedState: Bool = false
+        private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
+        private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
         var persistedLoadTask: Task<Void, Never>?
         var lastActivityAt: Date = .init()
         var lastUserMessageAt: Date?
@@ -403,6 +410,8 @@ extension AgentModeViewModel {
         func beginPersistentBindingTransition() -> UInt64 {
             bindingTransitionGeneration &+= 1
             bindingTransitionInProgress = true
+            authoritativeHydratedBinding = nil
+            authoritativeHydratedBindingTransitionGeneration = nil
             return bindingTransitionGeneration
         }
 
@@ -415,6 +424,17 @@ extension AgentModeViewModel {
         func finishPersistentBindingTransition(generation: UInt64) {
             guard bindingTransitionGeneration == generation else { return }
             bindingTransitionInProgress = false
+        }
+
+        func markCurrentBindingHydrated() {
+            guard hasLoadedPersistedState, !bindingTransitionInProgress else { return }
+            authoritativeHydratedBinding = persistentSessionBindingIdentity
+            authoritativeHydratedBindingTransitionGeneration = bindingTransitionGeneration
+        }
+
+        func clearCurrentBindingHydration() {
+            authoritativeHydratedBinding = nil
+            authoritativeHydratedBindingTransitionGeneration = nil
         }
 
         var hasBindingBlockingInteraction: Bool {
@@ -450,11 +470,42 @@ extension AgentModeViewModel {
             }
         #endif
 
+        func installRunAttemptTerminalResources(
+            ownership: AgentRunOwnership,
+            prepare: @escaping AgentRunAttemptTerminalResources.Prepare
+        ) {
+            guard isCurrentRunAttempt(ownership) else { return }
+            runAttemptTerminalResources = AgentRunAttemptTerminalResources(
+                ownership: ownership,
+                prepare: prepare
+            )
+        }
+
+        func claimRunAttemptTerminalTeardown(
+            ownership: AgentRunOwnership,
+            terminalState: AgentSessionRunState
+        ) -> AgentRunAttemptTerminalResources.Teardown? {
+            guard let resources = runAttemptTerminalResources else { return nil }
+            let teardown = resources.claim(for: ownership, terminalState: terminalState)
+            if resources.isClaimed {
+                runAttemptTerminalResources = nil
+            }
+            return teardown
+        }
+
         @discardableResult
         func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+            assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
+            runAttemptTerminalResources = nil
+            terminalCommitInProgress = false
+            lastTerminalCommitRevision = nil
+            providerTerminalDrainGeneration = 0
+            codexCurrentTurnID = nil
             let ownership = runLifecycleTracker.begin(
                 tabID: tabID,
                 persistentSessionID: activeAgentSessionID,
+                persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
+                bindingTransitionGeneration: bindingTransitionGeneration,
                 attemptID: attemptID
             )
             #if DEBUG
@@ -467,6 +518,8 @@ extension AgentModeViewModel {
                         "source": source,
                         "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID),
                         "bindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.generation),
+                        "persistentBindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.persistentBindingGeneration),
+                        "bindingTransitionGeneration": String(ownership.binding.bindingTransitionGeneration),
                         "persistentSessionID": AgentModePerfDiagnostics.shortID(ownership.binding.persistentSessionID)
                     ]
                 )

@@ -61,7 +61,10 @@ final class AgentModeRunService {
         let cancelPendingApproval: (AgentModeViewModel.TabSession) -> Void
         let cancelPendingApplyEditsReview: (AgentModeViewModel.TabSession, String) -> Void
         let cancelPendingWorktreeMergeReview: (AgentModeViewModel.TabSession, String) -> Void
+        let flushPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
         let clearPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
+        let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
+        let publishTerminalCommit: (AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void
         let startFollowUpRun: (UUID, String) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void
@@ -88,6 +91,7 @@ final class AgentModeRunService {
     private let codexRunner: CodexIntegratedAgentModeRunner
     private let claudeRunner: ClaudeIntegratedAgentModeRunner
     private let acpRunner: ACPIntegratedAgentModeRunner
+    private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
 
     private static let enableSteeringDebugLogging = false
 
@@ -105,9 +109,13 @@ final class AgentModeRunService {
     ) {
         self.dependencies = dependencies
         self.hooks = hooks
+        let terminalCommitBarrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        self.terminalCommitBarrier = terminalCommitBarrier
+        dependencies.codexCoordinator.installTerminalCommitBarrier(terminalCommitBarrier)
         headlessRunner = HeadlessAgentModeRunner(
             headlessProviderFactory: dependencies.headlessProviderFactory,
-            hooks: hooks
+            hooks: hooks,
+            terminalCommitBarrier: terminalCommitBarrier
         )
         codexRunner = CodexIntegratedAgentModeRunner(
             mcpServerEnabler: dependencies.mcpServerEnabler,
@@ -116,10 +124,12 @@ final class AgentModeRunService {
         )
         claudeRunner = ClaudeIntegratedAgentModeRunner(
             claudeCoordinator: dependencies.claudeCoordinator,
-            hooks: hooks
+            hooks: hooks,
+            terminalCommitBarrier: terminalCommitBarrier
         )
         acpRunner = ACPIntegratedAgentModeRunner(
             hooks: hooks,
+            terminalCommitBarrier: terminalCommitBarrier,
             toolTrackingHooks: toolTrackingHooks,
             providerFactory: dependencies.acpProviderFactory,
             controllerFactory: dependencies.acpControllerFactory
@@ -145,7 +155,7 @@ final class AgentModeRunService {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
-            failBeforeProviderStartup(session: session, message: message)
+            await failBeforeProviderStartup(session: session, message: message)
             return selectedAgent == .codexExec ? .failed(message: message) : nil
         }
 
@@ -258,7 +268,7 @@ final class AgentModeRunService {
             workspacePath = try dependencies.workspacePathProvider(session)
         } catch {
             let message = Self.providerStartupFailureMessage(for: error)
-            failBeforeProviderStartup(session: session, message: message)
+            await failBeforeProviderStartup(session: session, message: message)
             return false
         }
         let runRequest = ACPRunRequest(
@@ -452,20 +462,25 @@ final class AgentModeRunService {
         return description.isEmpty ? String(describing: error) : description
     }
 
-    private func failBeforeProviderStartup(session: AgentModeViewModel.TabSession, message: String) {
-        session.endCurrentRunAttempt(source: "runService.startupFailure")
-        session.agentTask = nil
-        session.provider = nil
-        session.runState = .failed
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
+    private func failBeforeProviderStartup(session: AgentModeViewModel.TabSession, message: String) async {
+        let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.startupFailure")
         hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.setAgentRunActive(session.tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, nil, .deleteFiles)
-        let errorItem = AgentChatItem.error(message, sequenceIndex: session.nextSequenceIndex)
-        session.appendItem(errorItem)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .failed,
+            source: "runService.startupFailure",
+            errorText: message,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: session.selectedAgent != .codexExec,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                session.provider = nil
+                return nil
+            }
+        ))
     }
 
     private func isCurrentACPSteeringAttempt(
@@ -917,8 +932,11 @@ final class AgentModeRunService {
         tabID: UUID,
         session: AgentModeViewModel.TabSession,
         intent: CancellationIntent = .userStop,
-        waitForCleanup: Bool = true
+        waitForCleanup _: Bool = true
     ) async {
+        if session.runState.isTerminalForCommit, session.lastTerminalCommitRevision != nil {
+            return
+        }
         hooks.cancelPendingQuestion(session)
         hooks.cancelPendingApproval(session)
         hooks.cancelPendingApplyEditsReview(session, "Run cancelled")
@@ -963,84 +981,67 @@ final class AgentModeRunService {
             reason: intent == .executionLocationChange ? "execution_location_change" : "user_stop"
         )
 
-        session.agentTask?.cancel()
-        session.agentTask = nil
-        session.endCurrentRunAttempt(source: "runService.cancel")
-        if session.selectedAgent == .codexExec {
-            hooks.finalizeAttachmentsForTurn(session, nil, .restoreToPending)
-        } else {
-            hooks.finalizeAttachmentsForTurn(session, nil, .deleteFiles)
-        }
-
+        let ownership = session.activeRunOwnership ?? session.beginRunAttempt(source: "runService.cancel")
+        let expectedRunID = session.runID
         let provider = session.provider
-        session.provider = nil
-
-        hooks.clearPendingAssistantDelta(session)
-        if session.selectedAgent != .codexExec {
-            hooks.finalizePendingToolCalls(session, .cancelled)
-        }
-        session.runState = .cancelled
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        session.waitingPrompt = nil
-        hooks.setAgentRunActive(tabID, false)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(tabID)
+        let acpController = session.acpController
+        let hasAttemptTerminalResources = session.runAttemptTerminalResources?.ownership == ownership
+        session.agentTask?.cancel()
 
         if session.selectedAgent == .codexExec {
-            if waitForCleanup {
-                await dependencies.codexCoordinator.cancelCodexRun(session)
-            } else {
-                Task { [coordinator = dependencies.codexCoordinator] in
-                    await coordinator.cancelCodexRun(session)
-                }
-            }
-            return
-        }
-        if session.selectedAgent.usesClaudeNativeRuntime {
-            // Step 1 (synchronous): Nil the controller immediately so the next
-            // startRun creates a fresh process with --resume. This must happen
-            // before any awaits to avoid a race with the next send.
-            let oldController = dependencies.claudeCoordinator.prepareClaudeCancelSync(session)
-            // Step 2 (async): Interrupt + capture the best-known session ref +
-            // shut down the old process. Future Claude starts wait on this transfer.
-            dependencies.claudeCoordinator.beginClaudeResumeTransferIfNeeded(
-                for: session,
-                oldController: oldController
-            )
-            if waitForCleanup {
-                await dependencies.claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
-            }
-            session.provider = nil
-            return
-        }
-        if let controller = session.acpController {
-            session.acpController = nil
-            // Preserve the ACP provider session ID on user cancellation so the next
-            // turn can recover interrupted context via session/load when supported.
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-            if waitForCleanup {
-                await controller.cancelPrompt()
-                await controller.shutdown()
-            } else {
-                Task {
-                    await controller.cancelPrompt()
-                    await controller.shutdown()
-                }
-            }
-            return
+            dependencies.codexCoordinator.drainCodexTerminalBuffersForCancellation(session)
         }
 
-        guard let provider else {
-            session.provider = nil
-            return
-        }
-        if waitForCleanup {
-            await provider.dispose()
-        } else {
-            Task { await provider.dispose() }
-        }
-        session.provider = nil
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: expectedRunID,
+            terminalState: .cancelled,
+            source: "runService.cancel",
+            attachmentDisposition: session.selectedAgent == .codexExec ? .restoreToPending : .deleteFiles,
+            finalizeNonCodexUsage: session.selectedAgent != .codexExec,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            providerDrainGeneration: session.providerTerminalDrainGeneration,
+            providerBuffersAreDrained: { [dependencies] in
+                session.selectedAgent != .codexExec
+                    || dependencies.codexCoordinator.codexTerminalBuffersAreDrained(session)
+            },
+            prepareProviderState: { [dependencies] in
+                if session.selectedAgent == .codexExec {
+                    return dependencies.codexCoordinator.prepareCodexCancellationTeardown(
+                        session,
+                        expectedRunID: expectedRunID
+                    )
+                }
+                if session.selectedAgent.usesClaudeNativeRuntime {
+                    let oldController = dependencies.claudeCoordinator.prepareClaudeCancelSync(session)
+                    session.provider = nil
+                    return {
+                        dependencies.claudeCoordinator.beginClaudeResumeTransferIfNeeded(
+                            for: session,
+                            oldController: oldController
+                        )
+                        await dependencies.claudeCoordinator.awaitPendingClaudeResumeTransferIfNeeded(for: session)
+                    }
+                }
+                if let acpController {
+                    if session.acpController === acpController {
+                        session.acpController = nil
+                    }
+                    AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                    session.provider = nil
+                    return {
+                        await acpController.cancelPrompt()
+                        await acpController.shutdown()
+                    }
+                }
+                session.provider = nil
+                session.runID = nil
+                guard let provider, !hasAttemptTerminalResources else { return nil }
+                return { await provider.dispose() }
+            }
+        ))
     }
 
     private func cancelToolsBeforeStoppingProvider(

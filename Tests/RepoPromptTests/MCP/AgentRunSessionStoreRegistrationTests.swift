@@ -19,6 +19,39 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.cleanup(registration: replacement)
     }
 
+    func testTerminalCommitPublicationIsExactlyOncePerRegistration() async throws {
+        let sessionID = UUID()
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+        let waiter = Task {
+            await AgentRunSessionStore.waitUntilInteresting(registration: registration, timeoutSeconds: 1)
+        }
+        try await waitForWaiter(registration: registration)
+
+        let commitID = UUID()
+        let completed = makeSnapshot(sessionID: sessionID, status: .completed)
+        await AgentRunSessionStore.signalCommittedSnapshot(
+            completed,
+            registration: registration,
+            commitID: commitID
+        )
+        await AgentRunSessionStore.signalCommittedSnapshot(
+            completed,
+            registration: registration,
+            commitID: commitID
+        )
+        await AgentRunSessionStore.signalCommittedSnapshot(
+            makeSnapshot(sessionID: sessionID, status: .failed),
+            registration: registration,
+            commitID: UUID()
+        )
+
+        let disposition = await waiter.value
+        let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration)
+        XCTAssertEqual(disposition, .snapshotReady(completed))
+        XCTAssertEqual(storedSnapshot, completed)
+        await AgentRunSessionStore.cleanup(registration: registration)
+    }
+
     func testReplacementRegistrationExpiresOldWaiter() async throws {
         let sessionID = UUID()
         let first = await AgentRunSessionStore.register(sessionID: sessionID)

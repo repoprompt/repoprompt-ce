@@ -5,6 +5,98 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testStructuredErrorNotificationRetainsRetryMetadataAndScope() throws {
+        let retrying = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "error": [
+                "message": "reconnecting",
+                "willRetry": true
+            ]
+        ]))
+        XCTAssertEqual(retrying.message, "reconnecting")
+        XCTAssertEqual(retrying.willRetry, true)
+        XCTAssertEqual(retrying.threadID, "thread-1")
+        XCTAssertEqual(retrying.turnID, "turn-1")
+
+        let nestedRetry = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "error": [
+                "message": "nested retry",
+                "details": [
+                    "will_retry": true,
+                    "thread_id": "thread-2",
+                    "turn_id": "turn-2",
+                    "item_id": "item-2"
+                ]
+            ]
+        ]))
+        XCTAssertEqual(nestedRetry.willRetry, true)
+        XCTAssertEqual(nestedRetry.threadID, "thread-2")
+        XCTAssertEqual(nestedRetry.turnID, "turn-2")
+        XCTAssertEqual(nestedRetry.itemID, "item-2")
+
+        let terminal = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "message": "fatal",
+            "will_retry": false
+        ]))
+        XCTAssertEqual(terminal.willRetry, false)
+
+        let missingMetadata = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
+            "message": "retrying from legacy text"
+        ]))
+        XCTAssertNil(missingMetadata.willRetry)
+    }
+
+    func testProgressOnlyNotificationsRetainLivenessCategoryScopeAndActiveFlags() throws {
+        let rows: [(String, CodexNativeSessionController.LivenessActivity.Kind)] = [
+            ("thread/status/changed", .threadStatusChanged),
+            ("turn/plan/updated", .turnPlanUpdated),
+            ("turn/diff/updated", .turnDiffUpdated),
+            ("item/plan/delta", .itemPlanDelta),
+            ("item/mcpToolCall/progress", .mcpToolProgress),
+            ("command/exec/outputDelta", .commandOrProcessOutput),
+            ("process/exited", .processExited),
+            ("hook/started", .hookLifecycle),
+            ("warning", .warning),
+            ("deprecationNotice", .deprecationNotice),
+            ("serverRequest/resolved", .serverRequestResolved)
+        ]
+
+        for (method, expectedKind) in rows {
+            let activity = try XCTUnwrap(CodexNativeSessionController.test_parseLivenessActivity(
+                method: method,
+                params: [
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "status": [
+                        "type": "active",
+                        "activeFlags": ["waiting_for_user_input"]
+                    ],
+                    "message": "progress"
+                ]
+            ), method)
+            XCTAssertEqual(activity.kind, expectedKind, method)
+            XCTAssertEqual(activity.threadID, "thread-1", method)
+            XCTAssertEqual(activity.turnID, "turn-1", method)
+            XCTAssertEqual(activity.itemID, "item-1", method)
+            XCTAssertEqual(activity.activeFlags, ["waiting_for_user_input"], method)
+            XCTAssertEqual(activity.message, "progress", method)
+        }
+    }
+
+    func testStaleScopedProgressNotificationIsRejectedByRouting() {
+        XCTAssertTrue(CodexNativeSessionController.test_shouldDropNotificationForRouting(
+            method: "turn/plan/updated",
+            params: [
+                "threadId": "stale-thread",
+                "turnId": "stale-turn"
+            ],
+            activeThreadID: "active-thread",
+            currentTurnID: "active-turn"
+        ))
+    }
+
     func testNormalizedCommandExecutionLifecycleParsesAsBashCallAndResult() throws {
         let controller = CodexNativeSessionController(
             client: CodexAppServerClient(),

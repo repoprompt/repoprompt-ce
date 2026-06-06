@@ -174,6 +174,53 @@ final class CodexNativeSessionController {
         let message: String
     }
 
+    struct LivenessActivity: Equatable {
+        enum Kind: String, Equatable {
+            case threadStatusChanged = "thread-status-changed"
+            case turnPlanUpdated = "turn-plan-updated"
+            case turnDiffUpdated = "turn-diff-updated"
+            case itemPlanDelta = "item-plan-delta"
+            case mcpToolProgress = "mcp-tool-progress"
+            case commandOrProcessOutput = "command-or-process-output"
+            case processExited = "process-exited"
+            case hookLifecycle = "hook-lifecycle"
+            case warning
+            case deprecationNotice = "deprecation-notice"
+            case serverRequestResolved = "server-request-resolved"
+            case unknownScoped = "unknown-scoped"
+        }
+
+        let kind: Kind
+        let method: String
+        let threadID: String?
+        let turnID: String?
+        let itemID: String?
+        let activeFlags: [String]
+        let message: String?
+    }
+
+    struct ErrorNotification: Equatable {
+        let message: String
+        let willRetry: Bool?
+        let threadID: String?
+        let turnID: String?
+        let itemID: String?
+
+        init(
+            message: String,
+            willRetry: Bool?,
+            threadID: String?,
+            turnID: String?,
+            itemID: String? = nil
+        ) {
+            self.message = message
+            self.willRetry = willRetry
+            self.threadID = threadID
+            self.turnID = turnID
+            self.itemID = itemID
+        }
+    }
+
     typealias ChatgptAuthTokensRefreshHandler = @Sendable (ChatgptAuthTokensRefreshRequest) async throws -> ChatgptAuthTokensRefreshResponse
 
     enum Event {
@@ -191,6 +238,8 @@ final class CodexNativeSessionController {
         case toolCall(name: String, invocationID: UUID?, argsJSON: String?)
         case toolResult(name: String, invocationID: UUID?, argsJSON: String?, resultJSON: String, isError: Bool?)
         case commandExecutionRunning(CommandExecutionRunningUpdate)
+        case livenessActivity(LivenessActivity)
+        case errorNotification(ErrorNotification)
         case error(String)
         case system(String)
     }
@@ -1991,14 +2040,146 @@ final class CodexNativeSessionController {
                 await emit(.tokenUsage(usage))
             }
         case "error":
-            if let error = params["error"] as? [String: Any],
-               let message = error["message"] as? String
-            {
-                await emit(.error(message))
+            if let errorNotification = Self.parseErrorNotification(from: params) {
+                await emit(.errorNotification(errorNotification))
             }
         default:
-            break
+            if let activity = Self.parseLivenessActivity(method: notification.method, params: params) {
+                await emit(.livenessActivity(activity))
+            }
         }
+    }
+
+    private static func parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
+        let errorObject = firstJSONObject(in: params, keys: ["error"]) ?? params
+        let detailsObject = firstJSONObject(in: errorObject, keys: ["details", "detail"])
+            ?? firstJSONObject(in: params, keys: ["details"])
+        guard let message = firstString(
+            in: errorObject,
+            keys: ["message", "errorMessage", "error_message", "detail", "description"]
+        ) ?? detailsObject.flatMap({
+            firstString(in: $0, keys: ["message", "errorMessage", "error_message", "detail", "description"])
+        }) ?? firstString(
+            in: params,
+            keys: ["message", "errorMessage", "error_message", "detail", "description"]
+        ) else {
+            return nil
+        }
+        let willRetry = boolScalarValue(from: errorObject["willRetry"])
+            ?? boolScalarValue(from: errorObject["will_retry"])
+            ?? detailsObject.flatMap { boolScalarValue(from: $0["willRetry"]) }
+            ?? detailsObject.flatMap { boolScalarValue(from: $0["will_retry"]) }
+            ?? boolScalarValue(from: params["willRetry"])
+            ?? boolScalarValue(from: params["will_retry"])
+        let threadID = notificationThreadID(from: params)
+            ?? firstString(in: errorObject, keys: ["threadId", "thread_id", "threadID", "conversationId", "conversation_id"])
+            ?? detailsObject.flatMap {
+                firstString(in: $0, keys: ["threadId", "thread_id", "threadID", "conversationId", "conversation_id"])
+            }
+        let turnID = notificationTurnID(from: params)
+            ?? firstString(in: errorObject, keys: ["turnId", "turn_id", "turnID"])
+            ?? detailsObject.flatMap { firstString(in: $0, keys: ["turnId", "turn_id", "turnID"]) }
+        let itemID = notificationItemID(from: params)
+            ?? firstString(in: errorObject, keys: ["itemId", "item_id", "itemID", "callId", "call_id"])
+            ?? detailsObject.flatMap { firstString(in: $0, keys: ["itemId", "item_id", "itemID", "callId", "call_id"]) }
+        return ErrorNotification(
+            message: message,
+            willRetry: willRetry,
+            threadID: threadID,
+            turnID: turnID,
+            itemID: itemID
+        )
+    }
+
+    private static func parseLivenessActivity(method: String, params: [String: Any]) -> LivenessActivity? {
+        guard let kind = livenessActivityKind(for: method, params: params) else { return nil }
+        return LivenessActivity(
+            kind: kind,
+            method: method,
+            threadID: notificationThreadID(from: params),
+            turnID: notificationTurnID(from: params),
+            itemID: notificationItemID(from: params),
+            activeFlags: notificationActiveFlags(from: params),
+            message: firstString(
+                in: params,
+                keys: ["message", "warning", "text", "reason", "description", "detail"]
+            )
+        )
+    }
+
+    private static func livenessActivityKind(for method: String, params: [String: Any]) -> LivenessActivity.Kind? {
+        switch method {
+        case "thread/status/changed":
+            return .threadStatusChanged
+        case "turn/plan/updated":
+            return .turnPlanUpdated
+        case "turn/diff/updated":
+            return .turnDiffUpdated
+        case "item/plan/delta":
+            return .itemPlanDelta
+        case "item/mcpToolCall/progress", "item/mcp_tool_call/progress":
+            return .mcpToolProgress
+        case "command/exec/outputDelta", "command/exec/output_delta", "process/outputDelta", "process/output_delta":
+            return .commandOrProcessOutput
+        case "process/exited":
+            return .processExited
+        case "hook/started", "hook/completed":
+            return .hookLifecycle
+        case "warning":
+            return .warning
+        case "deprecationNotice", "deprecation_notice":
+            return .deprecationNotice
+        case "serverRequest/resolved", "server_request/resolved":
+            return .serverRequestResolved
+        default:
+            guard isTurnOrItemScopedNotificationMethod(method),
+                  notificationThreadID(from: params) != nil
+                  || notificationTurnID(from: params) != nil
+                  || notificationItemID(from: params) != nil
+            else {
+                return nil
+            }
+            return .unknownScoped
+        }
+    }
+
+    private static func notificationActiveFlags(from params: [String: Any]) -> [String] {
+        for candidate in notificationEnvelopeDictionaries(from: params) {
+            if let status = candidate["status"] {
+                let parsed = parseThreadRuntimeStatus(from: status)
+                if case let .active(activeFlags) = parsed, !activeFlags.isEmpty {
+                    return activeFlags
+                }
+            }
+            if let thread = candidate["thread"] as? [String: Any], let status = thread["status"] {
+                let parsed = parseThreadRuntimeStatus(from: status)
+                if case let .active(activeFlags) = parsed, !activeFlags.isEmpty {
+                    return activeFlags
+                }
+            }
+            let flags = ((candidate["activeFlags"] ?? candidate["active_flags"]) as? [Any] ?? [])
+                .compactMap { stringScalarValue(from: $0) }
+            if !flags.isEmpty {
+                return flags
+            }
+        }
+        return []
+    }
+
+    private static func notificationEnvelopeDictionaries(from params: [String: Any]) -> [[String: Any]] {
+        var result: [[String: Any]] = [params]
+        let envelopeKeys = ["payload", "event", "request", "error", "msg"]
+        for key in envelopeKeys {
+            if let object = params[key] as? [String: Any] {
+                result.append(object)
+                for nestedKey in envelopeKeys where nestedKey != key {
+                    if let nested = object[nestedKey] as? [String: Any] {
+                        result.append(nested)
+                    }
+                }
+            }
+        }
+        return result
     }
 
     private static func shouldPromoteCurrentTurn(
@@ -2357,6 +2538,17 @@ final class CodexNativeSessionController {
 
         static func test_parseTokenUsage(from params: [String: Any]) -> AgentContextUsage? {
             parseTokenUsagePayload(from: params)
+        }
+
+        static func test_parseErrorNotification(from params: [String: Any]) -> ErrorNotification? {
+            parseErrorNotification(from: params)
+        }
+
+        static func test_parseLivenessActivity(
+            method: String,
+            params: [String: Any]
+        ) -> LivenessActivity? {
+            parseLivenessActivity(method: method, params: params)
         }
 
         static func test_parseThreadSnapshot(
@@ -3615,6 +3807,10 @@ final class CodexNativeSessionController {
             "contextCompacted turnID=\(turnID ?? "nil")"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
+        case let .livenessActivity(activity):
+            "livenessActivity kind=\(activity.kind.rawValue) method=\(activity.method) threadID=\(activity.threadID ?? "nil") turnID=\(activity.turnID ?? "nil") itemID=\(activity.itemID ?? "nil")"
+        case let .errorNotification(notification):
+            "errorNotification willRetry=\(notification.willRetry.map(String.init(describing:)) ?? "nil") message=\(debugPreview(notification.message))"
         case let .error(message):
             "error \(debugPreview(message))"
         case let .system(message):

@@ -341,6 +341,52 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.last?.text, "newer revision")
     }
 
+    func testAssistantPresentationRequiresAuthoritativeHydratedBindingGeneration() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let firstBinding = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(),
+            on: session
+        ))
+        session.replaceItems([.user("start", sequenceIndex: 0)])
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.applySessionToBindings(session)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.hydratedPersistentBinding, firstBinding)
+        XCTAssertEqual(
+            viewModel.activeTranscriptPresentation.hydratedBindingTransitionGeneration,
+            session.bindingTransitionGeneration
+        )
+
+        let rebound = try XCTUnwrap(viewModel.test_installPersistentSessionBinding(
+            sessionID: UUID(),
+            on: session
+        ))
+        XCTAssertNotEqual(rebound.generation, firstBinding.generation)
+
+        viewModel.enqueueAssistantDelta(" stale binding delta", session: session)
+        viewModel.flushPendingAssistantDelta(session)
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 0)
+
+        viewModel.applySessionToBindings(session)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.hydratedPersistentBinding, rebound)
+        viewModel.enqueueAssistantDelta(" current binding delta", session: session)
+        viewModel.flushPendingAssistantDelta(session)
+        XCTAssertEqual(session.items.last?.text, " stale binding delta current binding delta")
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 1)
+        viewModel.refreshDerivedTranscriptState(for: session)
+        viewModel.test_flushPendingUIRefresh()
+
+        let transitionGeneration = session.beginPersistentBindingTransition()
+        viewModel.enqueueAssistantDelta(" transition delta", session: session)
+        viewModel.flushPendingAssistantDelta(session)
+        XCTAssertEqual(viewModel.test_pendingAssistantPresentationCount, 0)
+        session.finishPersistentBindingTransition(generation: transitionGeneration)
+    }
+
     func testActivationRepublishesRunInteractionRuntimeAndLiveBashState() async {
         let viewModel = makeViewModel()
         let activeTabID = UUID()

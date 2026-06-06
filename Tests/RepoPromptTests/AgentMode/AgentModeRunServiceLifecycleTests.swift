@@ -94,6 +94,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.endRunAttempt(ifCurrent: reusedOwnership, source: "test.cleanup")
     }
 
+    func testCodexRejectedSendVariantsPreserveReusedOwnership() async {
+        let rows: [(LifecycleNoopCodexController.SendBehavior, Bool)] = [
+            (.failure, true),
+            (.cancellation, true),
+            (.success, false)
+        ]
+
+        for (behavior, activatesThread) in rows {
+            let recorder = LifecycleRecorder()
+            let codexController = LifecycleNoopCodexController(
+                recorder: recorder,
+                sendBehavior: behavior,
+                activatesThread: activatesThread
+            )
+            let harness = makeHarness(recorder: recorder, codexController: codexController)
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .codexExec
+            session.runState = .running
+            session.runID = UUID()
+            let ownership = session.beginRunAttempt(source: "test.reusedCodexVariant")
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "reused rejected send",
+                initialMessageForRun: "reused rejected send",
+                attachments: []
+            )
+
+            switch behavior {
+            case .cancellation:
+                XCTAssertEqual(outcome, .cancelled)
+            case .failure, .success:
+                guard case .failed? = outcome else {
+                    return XCTFail("Expected rejected Codex send for \(behavior)")
+                }
+            }
+            XCTAssertEqual(session.activeRunOwnership, ownership, "\(behavior)")
+            XCTAssertEqual(session.runState, .running, "\(behavior)")
+            _ = session.endRunAttempt(ifCurrent: ownership, source: "test.cleanup")
+        }
+    }
+
     func testStartRunDispatchesCurrentProviderFamiliesWithoutHeadlessFallback() async throws {
         do {
             let recorder = LifecycleRecorder()
@@ -317,12 +360,153 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testTerminalBarrierRejectsStaleOwnership() async {
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        let staleOwnership = session.beginRunAttempt(source: "test.stale")
+        session.endRunAttempt(ifCurrent: staleOwnership, source: "test.rotate")
+        let currentOwnership = session.beginRunAttempt(source: "test.current")
+
+        let staleRevision = await barrier.commit(.init(
+            session: session,
+            ownership: staleOwnership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.stale",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+        XCTAssertNil(staleRevision)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, currentOwnership)
+        XCTAssertFalse(recorder.contains(prefix: "commit:"))
+    }
+
+    func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        let codexOwnership = session.beginRunAttempt(source: "test.codex")
+        session.providerTerminalDrainGeneration = 4
+        _ = session.endRunAttempt(ifCurrent: codexOwnership, source: "test.rotate")
+
+        let claudeOwnership = session.beginRunAttempt(source: "test.claude")
+        XCTAssertEqual(session.providerTerminalDrainGeneration, 0)
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: claudeOwnership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.claude",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(revision?.providerDrainGeneration, 0)
+    }
+
+    func testClaudeCancellationDrainsBufferedAssistantTailIntoCanonicalTerminalRevision() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        var publishedRevision: AgentRunTerminalCommitRevision?
+        var publishedTail: String?
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeController: controller,
+            flushPendingAssistantDelta: { session in
+                recorder.record("assistant-flush")
+                guard !session.pendingAssistantDelta.isEmpty else { return }
+                let tail = session.pendingAssistantDelta
+                session.pendingAssistantDelta = ""
+                session.assistantDeltaFlushGeneration &+= 1
+                session.appendItem(.assistant(tail, sequenceIndex: session.nextSequenceIndex))
+            },
+            publishTerminalCommit: { session, revision in
+                publishedRevision = revision
+                publishedTail = session.items.last?.text
+                recorder.record("commit:\(revision.commitID.uuidString)")
+            }
+        )
+        let session = makeRunningClaudeSession(controller: controller)
+        session.pendingAssistantDelta = "buffered terminal tail"
+
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+
+        let revision = try XCTUnwrap(publishedRevision)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertEqual(publishedTail, "buffered terminal tail")
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
+        XCTAssertEqual(session.lastTerminalCommitRevision, revision)
+
+        await harness.service.cancelRun(tabID: session.tabID, session: session)
+        XCTAssertEqual(recorder.events.count(where: { $0.hasPrefix("commit:") }), 1)
+
+        assertOrderedEvents(
+            ["assistant-flush", "bindings", "save", "commit:"],
+            in: recorder,
+            prefixMatches: true
+        )
+    }
+
+    func testCancellationPublishesTerminalStateBeforeSlowHeadlessDisposalCompletes() async throws {
+        let recorder = LifecycleRecorder()
+        let provider = LifecycleBlockingHeadlessProvider(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            headlessProviderFactory: { _, _ in provider }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.slowDisposal")
+        session.provider = provider
+
+        try await withLifecycleTimeout("terminal cancellation publication", timeoutSeconds: 0.2) {
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertNotNil(session.lastTerminalCommitRevision)
+        try await waitUntil("Slow disposal should start asynchronously") {
+            recorder.contains("headless:blocking-dispose-start")
+        }
+        let disposeFinishedBeforeRelease = await provider.isDisposeFinished()
+        XCTAssertFalse(disposeFinishedBeforeRelease)
+        assertOrderedEvents(
+            ["commit:", "headless:blocking-dispose-start"],
+            in: recorder,
+            prefixMatches: true
+        )
+
+        await provider.releaseDispose()
+        try await waitUntil("Slow disposal should finish after release") {
+            recorder.contains("headless:blocking-dispose-finish")
+        }
+    }
+
     func testCancelRunCleansClaudeAndACPProvidersAfterCommonMCPToolCancellation() async throws {
         for row in LifecycleCancellationRow.allCases {
             let recorder = LifecycleRecorder()
+            let codexController = LifecycleNoopCodexController(recorder: recorder)
+            let headlessProvider = LifecycleRecordingHeadlessProvider(recorder: recorder)
             let harness = makeHarness(
                 recorder: recorder,
-                cancelMCPTools: { _, _ in recorder.record("mcp-cancel") }
+                cancelMCPTools: { _, _ in recorder.record("mcp-cancel") },
+                codexController: codexController,
+                headlessProviderFactory: { _, _ in headlessProvider }
             )
             let session = AgentModeViewModel.TabSession(tabID: UUID())
             session.runState = .running
@@ -330,6 +514,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             session.beginRunAttempt(source: "test")
 
             switch row {
+            case .codex:
+                session.selectedAgent = .codexExec
+                session.codexController = codexController
+
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+
+                XCTAssertNil(session.codexController, row.rawValue)
+                try await waitUntil("Codex teardown should complete after terminal publication") {
+                    recorder.contains("codex:shutdown")
+                }
+                assertOrderedEvents(["mcp-cancel", "commit:", "codex:cancel", "codex:shutdown"], in: recorder, row: row.rawValue, prefixMatches: true)
             case .claudeNative:
                 let controller = LifecycleFakeNativeController(
                     recorder: recorder,
@@ -342,7 +537,21 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 await harness.service.cancelRun(tabID: session.tabID, session: session)
 
                 XCTAssertNil(session.claudeController, row.rawValue)
-                assertOrderedEvents(["mcp-cancel", "claude:interrupt:interrupt", "claude:shutdown"], in: recorder, row: row.rawValue)
+                try await waitUntil("Claude teardown should complete after terminal publication") {
+                    recorder.contains("claude:shutdown")
+                }
+                assertOrderedEvents(["mcp-cancel", "commit:", "claude:interrupt:interrupt", "claude:shutdown"], in: recorder, row: row.rawValue, prefixMatches: true)
+            case .headless:
+                session.selectedAgent = .cursor
+                session.provider = headlessProvider
+
+                await harness.service.cancelRun(tabID: session.tabID, session: session)
+
+                XCTAssertNil(session.provider, row.rawValue)
+                try await waitUntil("Headless teardown should complete after terminal publication") {
+                    recorder.contains("headless:dispose")
+                }
+                assertOrderedEvents(["mcp-cancel", "commit:", "headless:dispose"], in: recorder, row: row.rawValue, prefixMatches: true)
             case .acp:
                 let scriptURL = try makeFakeACPServerScript()
                 let provider = LifecycleFakeACPProvider(providerID: .openCode, commandPath: scriptURL.path)
@@ -360,17 +569,23 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                     }
 
                     XCTAssertNil(session.acpController, row.rawValue)
+                    try await waitUntil("ACP teardown should complete after terminal publication") {
+                        recorder.contains("acp:session/cancel")
+                    }
                     let hasReusableSession = try await withLifecycleTimeout("ACP reusable-session check") {
                         await controller.hasReusableSession
                     }
                     XCTAssertFalse(hasReusableSession, row.rawValue)
-                    assertOrderedEvents(["mcp-cancel", "acp:session/cancel"], in: recorder, row: row.rawValue)
+                    assertOrderedEvents(["mcp-cancel", "commit:", "acp:session/cancel"], in: recorder, row: row.rawValue, prefixMatches: true)
                 }
             }
 
             XCTAssertEqual(session.runState, .cancelled, row.rawValue)
             XCTAssertNil(session.activeRunAttemptID, row.rawValue)
-            XCTAssertTrue(recorder.contains("attachments:deleteFiles"), row.rawValue)
+            let expectedAttachmentDisposition = row == .codex
+                ? "attachments:restoreToPending"
+                : "attachments:deleteFiles"
+            XCTAssertTrue(recorder.contains(expectedAttachmentDisposition), row.rawValue)
         }
     }
 
@@ -383,7 +598,9 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         claudeController: LifecycleFakeNativeController? = nil,
         headlessProviderFactory: AgentModeViewModel.HeadlessProviderFactory? = nil,
         acpProviderFactory: AgentModeViewModel.ACPProviderFactory? = nil,
-        acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil
+        acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
+        flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
+        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -437,15 +654,29 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return LifecycleHarness(
             service: AgentModeRunService(
                 dependencies: dependencies,
-                hooks: makeHooks(recorder: recorder),
+                hooks: makeHooks(
+                    recorder: recorder,
+                    flushPendingAssistantDelta: flushPendingAssistantDelta,
+                    publishTerminalCommit: publishTerminalCommit
+                ),
                 toolTrackingHooks: .noOp
             ),
             host: host
         )
     }
 
-    private func makeHooks(recorder: LifecycleRecorder) -> AgentModeRunService.Hooks {
-        AgentModeRunService.Hooks(
+    private func makeHooks(
+        recorder: LifecycleRecorder,
+        flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
+        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil
+    ) -> AgentModeRunService.Hooks {
+        let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
+            recorder.record("assistant-flush")
+        }
+        let publishTerminalCommit = publishTerminalCommit ?? { _, revision in
+            recorder.record("commit:\(revision.commitID.uuidString)")
+        }
+        return AgentModeRunService.Hooks(
             estimateRuntimeTokens: { $0.count },
             addUserInputTokensToActiveNonCodexTurn: { tokens, _ in recorder.record("tokens:\(tokens)") },
             startNonCodexTurnAccountingIfNeeded: { _, _ in },
@@ -469,7 +700,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             cancelPendingApproval: { _ in },
             cancelPendingApplyEditsReview: { _, _ in },
             cancelPendingWorktreeMergeReview: { _, _ in },
+            flushPendingAssistantDelta: flushPendingAssistantDelta,
             clearPendingAssistantDelta: { _ in },
+            prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
+            publishTerminalCommit: publishTerminalCommit,
             startFollowUpRun: { _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
             augmentUserMessageForProviderSend: { text, _, _, _ in text },
@@ -690,13 +924,17 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         in recorder: LifecycleRecorder,
         afterFirstMatchOf marker: String? = nil,
         row: String? = nil,
+        prefixMatches: Bool = false,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         let events = recorder.events
         var cursor = marker.flatMap { events.firstIndex(of: $0) }.map { $0 + 1 } ?? 0
         for event in expected {
-            guard let index = events[cursor...].firstIndex(of: event) else {
+            let index = events[cursor...].firstIndex { candidate in
+                prefixMatches ? candidate.hasPrefix(event) : candidate == event
+            }
+            guard let index else {
                 XCTFail("Missing ordered event \(event) for \(row ?? "row"). Events: \(events)", file: file, line: line)
                 return
             }
@@ -738,7 +976,9 @@ private struct LifecycleHarness {
 }
 
 private enum LifecycleCancellationRow: String, CaseIterable {
+    case codex
     case claudeNative
+    case headless
     case acp
 }
 
@@ -787,6 +1027,58 @@ private final class LifecycleRecorder: @unchecked Sendable {
     }
 }
 
+private actor LifecycleBlockingHeadlessProvider: HeadlessAgentProvider {
+    private let recorder: LifecycleRecorder
+    private var disposeContinuation: CheckedContinuation<Void, Never>?
+    private var disposeFinished = false
+
+    init(recorder: LifecycleRecorder) {
+        self.recorder = recorder
+    }
+
+    func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func dispose() async {
+        recorder.record("headless:blocking-dispose-start")
+        await withCheckedContinuation { continuation in
+            disposeContinuation = continuation
+        }
+        disposeFinished = true
+        recorder.record("headless:blocking-dispose-finish")
+    }
+
+    func isDisposeFinished() -> Bool {
+        disposeFinished
+    }
+
+    func releaseDispose() {
+        disposeContinuation?.resume()
+        disposeContinuation = nil
+    }
+}
+
+private final class LifecycleRecordingHeadlessProvider: HeadlessAgentProvider {
+    private let recorder: LifecycleRecorder
+
+    init(recorder: LifecycleRecorder) {
+        self.recorder = recorder
+    }
+
+    func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+        AsyncThrowingStream { continuation in
+            continuation.finish()
+        }
+    }
+
+    func dispose() async {
+        recorder.record("headless:dispose")
+    }
+}
+
 private final class LifecycleNoopHeadlessProvider: HeadlessAgentProvider {
     func streamAgentMessage(_ message: AgentMessage, runID: UUID?) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
         AsyncThrowingStream { continuation in
@@ -798,13 +1090,35 @@ private final class LifecycleNoopHeadlessProvider: HeadlessAgentProvider {
 }
 
 private final class LifecycleNoopCodexController: CodexSessionControlling {
+    enum SendBehavior: CustomStringConvertible {
+        case success
+        case failure
+        case cancellation
+
+        var description: String {
+            switch self {
+            case .success: "success"
+            case .failure: "failure"
+            case .cancellation: "cancellation"
+            }
+        }
+    }
+
     private let recorder: LifecycleRecorder
-    private let failSend: Bool
+    private let sendBehavior: SendBehavior
+    private let activatesThread: Bool
     private(set) var hasActiveThread = false
 
     init(recorder: LifecycleRecorder, failSend: Bool = false) {
         self.recorder = recorder
-        self.failSend = failSend
+        sendBehavior = failSend ? .failure : .success
+        activatesThread = true
+    }
+
+    init(recorder: LifecycleRecorder, sendBehavior: SendBehavior, activatesThread: Bool) {
+        self.recorder = recorder
+        self.sendBehavior = sendBehavior
+        self.activatesThread = activatesThread
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
@@ -814,17 +1128,17 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
     func ensureEventsStreamReady() {}
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
-        hasActiveThread = true
+        hasActiveThread = activatesThread
         return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: nil, reasoningEffort: nil)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?) async throws -> CodexNativeSessionController.SessionRef {
-        hasActiveThread = true
+        hasActiveThread = activatesThread
         return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String, model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexNativeSessionController.SessionRef {
-        hasActiveThread = true
+        hasActiveThread = activatesThread
         return CodexNativeSessionController.SessionRef(conversationID: "lifecycle", rolloutPath: nil, model: model, reasoningEffort: reasoningEffort)
     }
 
@@ -860,8 +1174,13 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
 
     private func recordCodexSend() throws {
         recorder.record("codex:send")
-        if failSend {
+        switch sendBehavior {
+        case .success:
+            return
+        case .failure:
             throw LifecycleTestError.expectedCodexSendFailure
+        case .cancellation:
+            throw CancellationError()
         }
     }
 
