@@ -125,6 +125,49 @@ package struct WorkspaceSearchCatalogSnapshot: Equatable {
     package let diagnostics: WorkspaceCatalogDiagnostics
 }
 
+/// Immutable store-owned inputs captured for later workspace projection composition.
+///
+/// File identities, selection resolution, codemap state, and the file tree are coherent at
+/// `provenance.captureGeneration`. File contents are intentionally excluded and may be read live later.
+package struct WorkspaceFileContextCapture {
+    package struct Provenance: Equatable {
+        package let captureGeneration: UInt64
+        package let catalogGeneration: UInt64
+        package let catalogValidationToken: UInt64
+        package let rootScope: WorkspaceLookupRootScope
+        package let ingressSamples: [WorkspaceIngressBarrierSample]
+    }
+
+    package struct SelectionPath: Equatable {
+        package enum Resolution: Equatable {
+            case file(WorkspaceFileRecord)
+            case folder(WorkspaceFolderRecord, descendantFiles: [WorkspaceFileRecord])
+            case unresolved(PathResolutionIssue)
+        }
+
+        package let input: String
+        package let resolution: Resolution
+    }
+
+    package struct Slice: Equatable {
+        package let path: String
+        package let ranges: [LineRange]
+        package let file: WorkspaceFileRecord?
+        package let issue: PathResolutionIssue?
+    }
+
+    package let provenance: Provenance
+    package let storedSelection: StoredSelection
+    package let selectedPaths: [SelectionPath]
+    package let autoCodemapPaths: [SelectionPath]
+    package let slices: [Slice]
+    package let catalog: WorkspaceSearchCatalogSnapshot
+    package let materializedFolders: [WorkspaceFolderRecord]
+    package let materializedFiles: [WorkspaceFileRecord]
+    package let codemapSnapshots: [WorkspaceCodemapSnapshot]
+    package let fileTree: FileTreeSelectionSnapshot
+}
+
 package struct WorkspaceDirectFolderChildrenSnapshot: Equatable {
     package let generation: UInt64
     package let root: WorkspaceRootRecord

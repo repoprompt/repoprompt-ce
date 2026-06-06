@@ -814,7 +814,283 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1)
             XCTAssertEqual(capture.droppedSampleCount, 0)
         }
+
+        func testWorkspaceCaptureRetriesAcrossCatalogMutationWithoutMixingGenerations() async throws {
+            let root = try makeTemporaryRoot(name: "WorkspaceCaptureGenerationRace")
+            let originalURL = root.appendingPathComponent("Original.swift")
+            let replacementURL = root.appendingPathComponent("Replacement.swift")
+            try write("original", to: originalURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            await store.applyObservedCodemapResults([
+                WorkspaceObservedCodemapResult(
+                    fullPath: originalURL.path,
+                    modificationDate: Date(),
+                    fileAPI: makeFileAPI(path: originalURL.path, symbolName: "OriginalSymbol")
+                )
+            ])
+            let initialCatalogGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+            let sliceRanges = [
+                LineRange(start: 8, end: 10, description: "later"),
+                LineRange(start: 1, end: 2, description: "earlier")
+            ]
+            let selection = StoredSelection(
+                selectedPaths: [originalURL.path],
+                autoCodemapPaths: [originalURL.path],
+                slices: [originalURL.path: sliceRanges],
+                codemapAutoEnabled: false
+            )
+            let treeRequest = WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                rootScope: .visibleWorkspace
+            )
+
+            let preparationGate = AsyncGate()
+            await store.setWorkspaceCaptureDidPrepareHandler { attempt, _ in
+                guard attempt == 1 else { return }
+                await preparationGate.markStartedAndWaitForRelease()
+            }
+            let captureTask = Task {
+                try await store.captureWorkspaceFileContext(
+                    selection: selection,
+                    fileTreeRequest: treeRequest,
+                    profile: .mcpRead
+                )
+            }
+            await preparationGate.waitUntilStarted()
+
+            try FileManager.default.removeItem(at: originalURL)
+            try write("replacement", to: replacementURL)
+            await store.replayObservedFileSystemDeltas(
+                rootID: record.id,
+                deltas: [.fileRemoved("Original.swift"), .fileAdded("Replacement.swift")]
+            )
+            await store.applyObservedCodemapResults([
+                WorkspaceObservedCodemapResult(
+                    fullPath: replacementURL.path,
+                    modificationDate: Date(),
+                    fileAPI: makeFileAPI(path: replacementURL.path, symbolName: "ReplacementSymbol")
+                )
+            ])
+            await preparationGate.release()
+
+            let capture = try await captureTask.value
+            await store.setWorkspaceCaptureDidPrepareHandler(nil)
+
+            let preparationStartCount = await preparationGate.startCount()
+            XCTAssertEqual(preparationStartCount, 1)
+            XCTAssertEqual(capture.storedSelection, selection)
+            XCTAssertEqual(capture.provenance.captureGeneration, 1)
+            XCTAssertGreaterThan(capture.provenance.catalogValidationToken, initialCatalogGeneration)
+            XCTAssertEqual(capture.provenance.catalogGeneration, capture.catalog.generation)
+            XCTAssertEqual(capture.provenance.rootScope, .visibleWorkspace)
+            XCTAssertEqual(capture.provenance.ingressSamples.map(\.rootID), [record.id])
+            XCTAssertEqual(capture.catalog.files.map(\.standardizedRelativePath), ["Replacement.swift"])
+            XCTAssertEqual(capture.codemapSnapshots.map(\.relativePath), ["Replacement.swift"])
+            XCTAssertEqual(capture.slices.map(\.ranges), [sliceRanges])
+            XCTAssertNil(capture.slices.first?.file)
+            XCTAssertEqual(capture.slices.first?.issue, .unresolved(input: originalURL.path))
+            XCTAssertTrue(capture.fileTree.selectedFileIDs.isEmpty)
+
+            XCTAssertEqual(capture.selectedPaths.count, 1)
+            if case .unresolved = capture.selectedPaths[0].resolution {
+                // Expected from the post-mutation generation.
+            } else {
+                XCTFail("Expected removed selected path to be unresolved in the retried capture")
+            }
+            XCTAssertEqual(capture.autoCodemapPaths.count, 1)
+            if case .unresolved = capture.autoCodemapPaths[0].resolution {
+                // Expected from the post-mutation generation.
+            } else {
+                XCTFail("Expected removed codemap path to be unresolved in the retried capture")
+            }
+
+            let tree = CodeMapExtractor.generateFileTree(using: capture.fileTree)
+            XCTAssertTrue(tree.contains("Replacement.swift +"))
+            XCTAssertFalse(tree.contains("Original.swift"))
+        }
+
+        func testWorkspaceCaptureFreezesCodemapAndTreeTogetherWithoutCatalogRetry() async throws {
+            let root = try makeTemporaryRoot(name: "WorkspaceCaptureCodemapRace")
+            let fileURL = root.appendingPathComponent("Codemap.swift")
+            try write("struct Codemap {}", to: fileURL)
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            let initialCatalogGeneration = await store.catalogGeneration(rootScope: .visibleWorkspace)
+            let treeRequest = WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                rootScope: .visibleWorkspace
+            )
+
+            let preparationGate = AsyncGate()
+            await store.setWorkspaceCaptureDidPrepareHandler { attempt, _ in
+                guard attempt == 1 else { return }
+                await preparationGate.markStartedAndWaitForRelease()
+            }
+            let captureTask = Task {
+                try await store.captureWorkspaceFileContext(
+                    selection: StoredSelection(),
+                    fileTreeRequest: treeRequest,
+                    profile: .mcpRead
+                )
+            }
+            await preparationGate.waitUntilStarted()
+
+            await store.applyObservedCodemapResults([
+                WorkspaceObservedCodemapResult(
+                    fullPath: fileURL.path,
+                    modificationDate: Date(),
+                    fileAPI: makeFileAPI(path: fileURL.path, symbolName: "CodemapSymbol")
+                )
+            ])
+            await preparationGate.release()
+
+            let capture = try await captureTask.value
+            await store.setWorkspaceCaptureDidPrepareHandler(nil)
+            let preparationStartCount = await preparationGate.startCount()
+
+            XCTAssertEqual(preparationStartCount, 1)
+            XCTAssertEqual(capture.provenance.catalogValidationToken, initialCatalogGeneration)
+            XCTAssertEqual(capture.codemapSnapshots.map(\.relativePath), ["Codemap.swift"])
+            let tree = CodeMapExtractor.generateFileTree(using: capture.fileTree)
+            XCTAssertTrue(tree.contains("Codemap.swift +"))
+        }
+
+        func testCancelledWorkspaceCaptureLeavesBarrierWatcherAndCaptureStateHealthy() async throws {
+            let root = try makeTemporaryRoot(name: "WorkspaceCaptureCancellation")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let lateURL = root.appendingPathComponent("Late.swift")
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let rootID = record.id
+            let treeRequest = WorkspaceFileTreeSnapshotRequest(
+                mode: .full,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: false,
+                includeLegend: false,
+                rootScope: .visibleWorkspace
+            )
+
+            let barrierGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await barrierGate.markStartedAndWaitForRelease()
+            }
+            let cancelledCapture = Task {
+                try await store.captureWorkspaceFileContext(
+                    selection: StoredSelection(),
+                    fileTreeRequest: treeRequest,
+                    profile: .mcpRead
+                )
+            }
+            await barrierGate.waitUntilStarted()
+            cancelledCapture.cancel()
+            await barrierGate.release()
+
+            do {
+                _ = try await cancelledCapture.value
+                XCTFail("Expected workspace capture cancellation")
+            } catch is CancellationError {
+                // Expected after the shared barrier completes without being cancelled.
+            }
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+
+            let watcherActiveAfterCancellation = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            let pendingIngressAfterCancellation = await store.publisherIngressCountForTesting(rootID: rootID)
+            XCTAssertTrue(watcherActiveAfterCancellation)
+            XCTAssertEqual(pendingIngressAfterCancellation, 0)
+
+            try write("late", to: lateURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileAdded("Late.swift")]
+            )
+            let capture = try await store.captureWorkspaceFileContext(
+                selection: StoredSelection(),
+                fileTreeRequest: treeRequest,
+                profile: .mcpRead
+            )
+
+            XCTAssertEqual(capture.provenance.captureGeneration, 1)
+            XCTAssertEqual(capture.catalog.files.map(\.standardizedRelativePath), ["Late.swift", "Seed.swift"])
+            XCTAssertGreaterThan(capture.provenance.ingressSamples.first?.appliedServicePublicationSequence ?? 0, 0)
+            let pendingIngressAfterRecovery = await store.publisherIngressCountForTesting(rootID: rootID)
+            let watcherActiveAfterRecovery = try await store.rootWatcherIsActiveForTesting(rootID: rootID)
+            XCTAssertEqual(pendingIngressAfterRecovery, 0)
+            XCTAssertTrue(watcherActiveAfterRecovery)
+            await store.stopWatchingRoot(id: rootID)
+        }
     #endif
+
+    func testWorkspaceCaptureIsSendable() {
+        func requireSendable(_: (some Sendable).Type) {}
+        requireSendable(WorkspaceFileContextCapture.self)
+    }
+
+    func testWorkspaceCaptureIncludesManagedOnlyRecordsAndPreservesSelectionOrdering() async throws {
+        let root = try makeTemporaryRoot(name: "WorkspaceCaptureManagedOnly")
+        try write("*.ignored\n", to: root.appendingPathComponent(".gitignore"))
+        let visibleURL = root.appendingPathComponent("Visible.swift")
+        try write("visible", to: visibleURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let host = WorkspaceFileEditHost(
+            store: store,
+            lookupRootScope: .visibleWorkspace,
+            createPathResolutionPolicy: .canonicalAliasFirst,
+            selectCreatedFiles: false
+        )
+        try await host.writeText(path: "Hidden.ignored", content: "hidden", overwrite: false)
+        let hiddenURL = root.appendingPathComponent("Hidden.ignored")
+
+        var slices: [String: [LineRange]] = [:]
+        slices[visibleURL.path] = [LineRange(start: 5, end: 7)]
+        slices[hiddenURL.path] = [LineRange(start: 1, end: 2)]
+        let expectedSliceOrder = Array(slices.keys)
+        let selection = StoredSelection(
+            selectedPaths: [hiddenURL.path, visibleURL.path],
+            autoCodemapPaths: [visibleURL.path, hiddenURL.path],
+            slices: slices,
+            codemapAutoEnabled: false
+        )
+        let capture = try await store.captureWorkspaceFileContext(
+            selection: selection,
+            fileTreeRequest: WorkspaceFileTreeSnapshotRequest(
+                mode: .selected,
+                filePathDisplay: .relative,
+                onlyIncludeRootsWithSelectedFiles: true,
+                includeLegend: false,
+                rootScope: .visibleWorkspace
+            ),
+            profile: .mcpRead
+        )
+
+        XCTAssertEqual(capture.storedSelection, selection)
+        XCTAssertEqual(capture.selectedPaths.map(\.input), selection.selectedPaths)
+        XCTAssertEqual(capture.autoCodemapPaths.map(\.input), selection.autoCodemapPaths)
+        XCTAssertEqual(capture.slices.map(\.path), expectedSliceOrder)
+        XCTAssertFalse(capture.catalog.files.contains { $0.standardizedFullPath == hiddenURL.path })
+        XCTAssertTrue(capture.materializedFiles.contains { $0.standardizedFullPath == hiddenURL.path })
+
+        guard case let .file(hiddenFile) = capture.selectedPaths[0].resolution else {
+            return XCTFail("Expected managed-only selected file to resolve")
+        }
+        XCTAssertTrue(capture.fileTree.selectedFileIDs.contains(hiddenFile.id))
+        XCTAssertTrue(capture.materializedFiles.contains { $0.id == hiddenFile.id })
+        let tree = CodeMapExtractor.generateFileTree(using: capture.fileTree)
+        XCTAssertTrue(tree.contains("Hidden.ignored *"))
+    }
 
     func testSearchCatalogSnapshotCacheInvalidatesAcrossAddRemoveMoveAndRootLifecycle() async throws {
         let rootA = try makeTemporaryRoot(name: "SearchSnapshotLifecycleA")

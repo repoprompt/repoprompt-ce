@@ -158,6 +158,7 @@ package actor WorkspaceFileContextStore {
         private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
         private var appliedIngressDidCaptureWatermarksHandler: (@Sendable ([UUID: UInt64]) async -> Void)?
         private var scopedIngressBarrierWillFlushHandler: (@Sendable (UUID) async -> Void)?
+        private var workspaceCaptureDidPrepareHandler: (@Sendable (Int, UInt64) async -> Void)?
         private var scopedIngressBarrierLaunchCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierJoinCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierSuccessorCountsByRootID: [UUID: Int] = [:]
@@ -198,6 +199,10 @@ package actor WorkspaceFileContextStore {
             scopedIngressBarrierWillFlushHandler = handler
         }
 
+        func setWorkspaceCaptureDidPrepareHandler(_ handler: (@Sendable (Int, UInt64) async -> Void)?) {
+            workspaceCaptureDidPrepareHandler = handler
+        }
+
         func scopedIngressBarrierStatsForTesting(rootID: UUID) -> ScopedIngressBarrierStats {
             ScopedIngressBarrierStats(
                 launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
@@ -222,6 +227,48 @@ package actor WorkspaceFileContextStore {
     private struct SearchCatalogSnapshotCacheEntry {
         let validationToken: UInt64
         let snapshot: WorkspaceSearchCatalogSnapshot
+    }
+
+    private struct WorkspaceCaptureCatalogIdentity: Equatable {
+        let validationToken: UInt64
+        let rootIDs: [UUID]
+    }
+
+    private enum PreparedWorkspaceCapturePathResolution {
+        case file(UUID)
+        case folder(UUID, descendantFileIDs: [UUID])
+        case unresolved(PathResolutionIssue)
+
+        var selectedFileIDs: Set<UUID> {
+            switch self {
+            case let .file(fileID):
+                [fileID]
+            case let .folder(_, descendantFileIDs):
+                Set(descendantFileIDs)
+            case .unresolved:
+                []
+            }
+        }
+    }
+
+    private struct PreparedWorkspaceCapturePath {
+        let input: String
+        let resolution: PreparedWorkspaceCapturePathResolution
+    }
+
+    private struct PreparedWorkspaceCaptureSlice {
+        let path: String
+        let ranges: [LineRange]
+        let fileID: UUID?
+        let issue: PathResolutionIssue?
+    }
+
+    private struct PreparedWorkspaceCapture {
+        let selectedPaths: [PreparedWorkspaceCapturePath]
+        let autoCodemapPaths: [PreparedWorkspaceCapturePath]
+        let slices: [PreparedWorkspaceCaptureSlice]
+        let selectedFileIDs: Set<UUID>
+        let startFolderID: UUID?
     }
 
     private let runtimeDependencies: WorkspaceRuntimeDependencies
@@ -262,6 +309,7 @@ package actor WorkspaceFileContextStore {
     private let publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
     private var scopedIngressBarrierFlightsByRootID: [UUID: ScopedIngressBarrierFlight] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
+    private var nextWorkspaceCaptureGeneration: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
 
@@ -730,6 +778,52 @@ package actor WorkspaceFileContextStore {
     /// existing flight covers both the callback-accepted and publisher-accepted cuts.
     package func awaitAppliedIngress(rootScope: WorkspaceLookupRootScope) async -> [WorkspaceIngressBarrierSample] {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
+    }
+
+    /// Captures immutable store-owned inputs for later workspace projection composition.
+    ///
+    /// The accepted-ingress barrier and any asynchronous path resolution happen before final assembly.
+    /// Catalog changes during preparation force a retry; catalog, codemap, and tree state are then read
+    /// without suspension in one actor turn. File bytes are intentionally not captured and may be read live later.
+    package func captureWorkspaceFileContext(
+        selection: StoredSelection,
+        fileTreeRequest: WorkspaceFileTreeSnapshotRequest,
+        profile: PathLocateProfile = .uiAssisted
+    ) async throws -> WorkspaceFileContextCapture {
+        var attempt = 0
+        while true {
+            try Task.checkCancellation()
+            let ingressSamples = await awaitAppliedIngress(rootScope: fileTreeRequest.rootScope)
+            try Task.checkCancellation()
+
+            let identity = workspaceCaptureCatalogIdentity(rootScope: fileTreeRequest.rootScope)
+            guard identity.rootIDs == ingressSamples.map(\.rootID) else { continue }
+
+            attempt += 1
+            let prepared = try await prepareWorkspaceCapture(
+                selection: selection,
+                fileTreeRequest: fileTreeRequest,
+                profile: profile
+            )
+
+            #if DEBUG
+                if let workspaceCaptureDidPrepareHandler {
+                    await workspaceCaptureDidPrepareHandler(attempt, identity.validationToken)
+                }
+            #endif
+            try Task.checkCancellation()
+
+            guard identity == workspaceCaptureCatalogIdentity(rootScope: fileTreeRequest.rootScope),
+                  let capture = makeWorkspaceFileContextCapture(
+                      selection: selection,
+                      fileTreeRequest: fileTreeRequest,
+                      prepared: prepared,
+                      identity: identity,
+                      ingressSamples: ingressSamples
+                  )
+            else { continue }
+            return capture
+        }
     }
 
     /// Resolves the narrowest safe workspace freshness scope for an explicit request.
@@ -1383,6 +1477,249 @@ package actor WorkspaceFileContextStore {
             showCodeMapMarkers: request.showCodeMapMarkers,
             maxDepth: request.maxDepth
         )
+    }
+
+    private func prepareWorkspaceCapture(
+        selection: StoredSelection,
+        fileTreeRequest: WorkspaceFileTreeSnapshotRequest,
+        profile: PathLocateProfile
+    ) async throws -> PreparedWorkspaceCapture {
+        var selectedPaths: [PreparedWorkspaceCapturePath] = []
+        var selectedFileIDs = Set<UUID>()
+        selectedPaths.reserveCapacity(selection.selectedPaths.count)
+        for input in selection.selectedPaths {
+            let path = try await prepareWorkspaceCapturePath(
+                input,
+                profile: profile,
+                rootScope: fileTreeRequest.rootScope
+            )
+            selectedPaths.append(path)
+            selectedFileIDs.formUnion(path.resolution.selectedFileIDs)
+        }
+
+        var autoCodemapPaths: [PreparedWorkspaceCapturePath] = []
+        autoCodemapPaths.reserveCapacity(selection.autoCodemapPaths.count)
+        for input in selection.autoCodemapPaths {
+            try await autoCodemapPaths.append(prepareWorkspaceCapturePath(
+                input,
+                profile: profile,
+                rootScope: fileTreeRequest.rootScope
+            ))
+        }
+
+        var slices: [PreparedWorkspaceCaptureSlice] = []
+        slices.reserveCapacity(selection.slices.count)
+        for (path, ranges) in selection.slices {
+            let result = await lookupSelectionPath(path, profile: profile, rootScope: fileTreeRequest.rootScope)
+            try Task.checkCancellation()
+            let fileID = result?.file?.id
+            if let fileID { selectedFileIDs.insert(fileID) }
+            let issue = fileID == nil
+                ? exactPathResolutionIssue(for: path, kind: .file, rootScope: fileTreeRequest.rootScope) ?? .unresolved(input: path)
+                : nil
+            slices.append(PreparedWorkspaceCaptureSlice(path: path, ranges: ranges, fileID: fileID, issue: issue))
+        }
+
+        let trimmedStartPath = fileTreeRequest.startPath?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let startFolderID: UUID?
+        if let trimmedStartPath, !trimmedStartPath.isEmpty {
+            let result = await lookupSelectionPath(
+                trimmedStartPath,
+                profile: profile,
+                rootScope: fileTreeRequest.rootScope
+            )
+            try Task.checkCancellation()
+            startFolderID = result?.folder?.id
+        } else {
+            startFolderID = nil
+        }
+
+        return PreparedWorkspaceCapture(
+            selectedPaths: selectedPaths,
+            autoCodemapPaths: autoCodemapPaths,
+            slices: slices,
+            selectedFileIDs: selectedFileIDs,
+            startFolderID: startFolderID
+        )
+    }
+
+    private func prepareWorkspaceCapturePath(
+        _ input: String,
+        profile: PathLocateProfile,
+        rootScope: WorkspaceLookupRootScope
+    ) async throws -> PreparedWorkspaceCapturePath {
+        let result = await lookupSelectionPath(input, profile: profile, rootScope: rootScope)
+        try Task.checkCancellation()
+        guard let result else {
+            let issue = exactPathResolutionIssue(for: input, kind: .either, rootScope: rootScope) ?? .unresolved(input: input)
+            return PreparedWorkspaceCapturePath(input: input, resolution: .unresolved(issue))
+        }
+        if let file = result.file {
+            return PreparedWorkspaceCapturePath(input: input, resolution: .file(file.id))
+        }
+        if let folder = result.folder {
+            return PreparedWorkspaceCapturePath(
+                input: input,
+                resolution: .folder(folder.id, descendantFileIDs: descendantFiles(in: folder.id).map(\.id))
+            )
+        }
+        return PreparedWorkspaceCapturePath(input: input, resolution: .unresolved(.unresolved(input: input)))
+    }
+
+    private func workspaceCaptureCatalogIdentity(rootScope: WorkspaceLookupRootScope) -> WorkspaceCaptureCatalogIdentity {
+        WorkspaceCaptureCatalogIdentity(
+            validationToken: searchCatalogSnapshotValidationToken(scope: rootScope),
+            rootIDs: rootsForPathLookup(scope: rootScope).map(\.id)
+        )
+    }
+
+    private func makeWorkspaceFileContextCapture(
+        selection: StoredSelection,
+        fileTreeRequest: WorkspaceFileTreeSnapshotRequest,
+        prepared: PreparedWorkspaceCapture,
+        identity: WorkspaceCaptureCatalogIdentity,
+        ingressSamples: [WorkspaceIngressBarrierSample]
+    ) -> WorkspaceFileContextCapture? {
+        guard identity == workspaceCaptureCatalogIdentity(rootScope: fileTreeRequest.rootScope) else { return nil }
+        let catalog = searchCatalogSnapshot(rootScope: fileTreeRequest.rootScope)
+        guard catalog.roots.map(\.id) == identity.rootIDs,
+              searchCatalogSnapshotValidationToken(scope: fileTreeRequest.rootScope) == identity.validationToken
+        else { return nil }
+
+        var selectedPaths: [WorkspaceFileContextCapture.SelectionPath] = []
+        selectedPaths.reserveCapacity(prepared.selectedPaths.count)
+        for path in prepared.selectedPaths {
+            guard let materialized = materializeWorkspaceCapturePath(path) else { return nil }
+            selectedPaths.append(materialized)
+        }
+
+        var autoCodemapPaths: [WorkspaceFileContextCapture.SelectionPath] = []
+        autoCodemapPaths.reserveCapacity(prepared.autoCodemapPaths.count)
+        for path in prepared.autoCodemapPaths {
+            guard let materialized = materializeWorkspaceCapturePath(path) else { return nil }
+            autoCodemapPaths.append(materialized)
+        }
+
+        var slices: [WorkspaceFileContextCapture.Slice] = []
+        slices.reserveCapacity(prepared.slices.count)
+        for slice in prepared.slices {
+            let file: WorkspaceFileRecord?
+            if let fileID = slice.fileID {
+                guard let resolvedFile = filesByID[fileID] else { return nil }
+                file = resolvedFile
+            } else {
+                file = nil
+            }
+            slices.append(WorkspaceFileContextCapture.Slice(
+                path: slice.path,
+                ranges: slice.ranges,
+                file: file,
+                issue: slice.issue
+            ))
+        }
+
+        guard prepared.selectedFileIDs.allSatisfy({ filesByID[$0] != nil }) else { return nil }
+        let startFolder: WorkspaceFolderRecord?
+        if let startFolderID = prepared.startFolderID {
+            guard let resolvedStartFolder = foldersByID[startFolderID] else { return nil }
+            startFolder = resolvedStartFolder
+        } else {
+            startFolder = nil
+        }
+
+        let allowedRootIDs = Set(identity.rootIDs)
+        let materializedFolders = foldersByID.values
+            .filter { allowedRootIDs.contains($0.rootID) }
+            .sorted {
+                if $0.standardizedFullPath == $1.standardizedFullPath { return $0.id.uuidString < $1.id.uuidString }
+                return $0.standardizedFullPath < $1.standardizedFullPath
+            }
+        let materializedFiles = filesByID.values
+            .filter { allowedRootIDs.contains($0.rootID) }
+            .sorted {
+                if $0.standardizedFullPath == $1.standardizedFullPath { return $0.id.uuidString < $1.id.uuidString }
+                return $0.standardizedFullPath < $1.standardizedFullPath
+            }
+        let materializedFolderIDs = Set(materializedFolders.map(\.id))
+        let materializedFileIDs = Set(materializedFiles.map(\.id))
+        guard prepared.selectedFileIDs.isSubset(of: materializedFileIDs) else { return nil }
+
+        let codemapSnapshots = allCodemapSnapshots()
+            .filter { allowedRootIDs.contains($0.rootID) }
+        guard Set(codemapSnapshots.map(\.fileID)).isSubset(of: materializedFileIDs) else { return nil }
+
+        let fileTree = makeFileTreeSelectionSnapshot(
+            fileTreeRequest,
+            selectedStoreFileIDs: prepared.selectedFileIDs,
+            startFolder: startFolder
+        )
+        guard workspaceCaptureTreeReferencesMaterializedRecords(
+            fileTree.roots,
+            folderIDs: materializedFolderIDs,
+            fileIDs: materializedFileIDs
+        ) else { return nil }
+
+        nextWorkspaceCaptureGeneration &+= 1
+        return WorkspaceFileContextCapture(
+            provenance: WorkspaceFileContextCapture.Provenance(
+                captureGeneration: nextWorkspaceCaptureGeneration,
+                catalogGeneration: catalog.generation,
+                catalogValidationToken: identity.validationToken,
+                rootScope: fileTreeRequest.rootScope,
+                ingressSamples: ingressSamples
+            ),
+            storedSelection: selection,
+            selectedPaths: selectedPaths,
+            autoCodemapPaths: autoCodemapPaths,
+            slices: slices,
+            catalog: catalog,
+            materializedFolders: materializedFolders,
+            materializedFiles: materializedFiles,
+            codemapSnapshots: codemapSnapshots,
+            fileTree: fileTree
+        )
+    }
+
+    private func materializeWorkspaceCapturePath(
+        _ path: PreparedWorkspaceCapturePath
+    ) -> WorkspaceFileContextCapture.SelectionPath? {
+        let resolution: WorkspaceFileContextCapture.SelectionPath.Resolution
+        switch path.resolution {
+        case let .file(fileID):
+            guard let file = filesByID[fileID] else { return nil }
+            resolution = .file(file)
+        case let .folder(folderID, descendantFileIDs):
+            guard let folder = foldersByID[folderID] else { return nil }
+            let descendantFiles = descendantFileIDs.compactMap { filesByID[$0] }
+            guard descendantFiles.count == descendantFileIDs.count else { return nil }
+            resolution = .folder(folder, descendantFiles: descendantFiles)
+        case let .unresolved(issue):
+            resolution = .unresolved(issue)
+        }
+        return WorkspaceFileContextCapture.SelectionPath(input: path.input, resolution: resolution)
+    }
+
+    private func workspaceCaptureTreeReferencesMaterializedRecords(
+        _ folders: [FileTreeFolderSnapshot],
+        folderIDs: Set<UUID>,
+        fileIDs: Set<UUID>
+    ) -> Bool {
+        for folder in folders {
+            guard folderIDs.contains(folder.id) else { return false }
+            for child in folder.children {
+                switch child {
+                case let .folder(childFolder):
+                    guard workspaceCaptureTreeReferencesMaterializedRecords(
+                        [childFolder],
+                        folderIDs: folderIDs,
+                        fileIDs: fileIDs
+                    ) else { return false }
+                case let .file(file):
+                    guard fileIDs.contains(file.id) else { return false }
+                }
+            }
+        }
+        return true
     }
 
     package func codemapUpdates() -> AsyncStream<WorkspaceCodemapUpdateEvent> {
