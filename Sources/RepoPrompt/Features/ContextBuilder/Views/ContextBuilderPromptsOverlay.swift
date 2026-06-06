@@ -152,7 +152,14 @@ class ContextBuilderPromptStorage: ObservableObject {
 
     /// Get prompt text for selected IDs in XML meta prompt format
     func promptText(for selectedIDs: Set<UUID>) -> String? {
-        let selected = allPrompts.filter { selectedIDs.contains($0.id) }
+        Self.promptText(for: selectedIDs, in: allPrompts)
+    }
+
+    static func promptText(
+        for selectedIDs: Set<UUID>,
+        in orderedPrompts: [ContextBuilderPrompt]
+    ) -> String? {
+        let selected = orderedPrompts.filter { selectedIDs.contains($0.id) }
         guard !selected.isEmpty else { return nil }
 
         return selected

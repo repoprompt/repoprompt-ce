@@ -4,6 +4,9 @@ import XCTest
 
 final class EmbeddedWorkspaceCodecV1Tests: XCTestCase {
     func testRoundTripPreservesAppV1CodingKeysAndValues() throws {
+        let firstContextBuilderPromptID = try XCTUnwrap(UUID(uuidString: "11111111-1111-1111-1111-111111111111"))
+        let secondContextBuilderPromptID = try XCTUnwrap(UUID(uuidString: "22222222-2222-2222-2222-222222222222"))
+        let selectedContextBuilderPromptIDs = [secondContextBuilderPromptID, firstContextBuilderPromptID]
         let tab = ComposeTabState(
             name: "T1",
             selection: StoredSelection(
@@ -13,7 +16,10 @@ final class EmbeddedWorkspaceCodecV1Tests: XCTestCase {
                 codemapAutoEnabled: false
             ),
             promptText: "prompt",
-            contextBuilder: ContextBuilderTabConfig(instructions: "discover instructions")
+            contextBuilder: ContextBuilderTabConfig(
+                instructions: "discover instructions",
+                selectedContextBuilderPromptIDs: selectedContextBuilderPromptIDs
+            )
         )
         let workspace = WorkspaceModel(
             id: UUID(),
@@ -32,8 +38,16 @@ final class EmbeddedWorkspaceCodecV1Tests: XCTestCase {
         XCTAssertEqual(encoded.schemaVersion, EmbeddedWorkspaceCodecV1.formatVersion)
         XCTAssertTrue(json.contains("\"discover\""), json)
         XCTAssertFalse(json.contains("\"contextBuilder\""), json)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded.data) as? [String: Any])
+        let composeTabs = try XCTUnwrap(object["composeTabs"] as? [[String: Any]])
+        let discover = try XCTUnwrap(composeTabs.first?["discover"] as? [String: Any])
+        XCTAssertEqual(
+            discover["selectedContextBuilderPromptIDs"] as? [String],
+            selectedContextBuilderPromptIDs.map(\.uuidString)
+        )
         XCTAssertEqual(decoded.sourceVersion, EmbeddedWorkspaceCodecV1.formatVersion)
         XCTAssertFalse(decoded.requiresRewrite)
+        XCTAssertEqual(decoded.document.composeTabs.first?.contextBuilder.selectedContextBuilderPromptIDs, selectedContextBuilderPromptIDs)
         XCTAssertEqual(decoded.document, workspace)
     }
 
