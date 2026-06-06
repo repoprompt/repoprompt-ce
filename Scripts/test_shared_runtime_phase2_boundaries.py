@@ -57,6 +57,8 @@ REQUIRED_PROMPT_ASSEMBLY_PATHS = (
     "Sources/RepoPromptCore/Prompt/PromptRenderingService.swift",
     "Sources/RepoPromptCore/Prompt/PromptRenderingValues.swift",
     "Sources/RepoPromptCore/Prompt/PromptRenderPolicy.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjection.swift",
+    "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjectionService.swift",
     "Sources/RepoPromptCore/Prompt/PromptSection.swift",
     "Sources/RepoPrompt/Features/Prompt/Models/PromptSection+DisplayName.swift",
     "Sources/RepoPrompt/Features/Prompt/Services/PromptContextAccountingService.swift",
@@ -305,6 +307,47 @@ def main() -> int:
     ):
         if forbidden_core_token in core_rendering_values_source or forbidden_core_token in core_rendering_service_source:
             fail(f"Core prompt rendering leaks app/product policy: {forbidden_core_token}")
+    core_selection_projection_source = (
+        ROOT
+        / "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjection.swift"
+    ).read_text()
+    core_selection_projection_service_source = (
+        ROOT
+        / "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjectionService.swift"
+    ).read_text()
+    for declaration in (
+        "package struct WorkspaceSelectionProjection",
+        "package struct WorkspaceSelectionProjectionRequest",
+    ):
+        if declaration not in core_selection_projection_source:
+            fail(f"Canonical Core selection projection declaration missing: {declaration}")
+    if "package enum WorkspaceSelectionProjectionService" not in core_selection_projection_service_source:
+        fail("Canonical Core selection projection service missing")
+    for forbidden_projection_token in (
+        "ToolResultDTO",
+        "CopyPreset",
+        "PromptViewModel",
+        "PromptContextResolved",
+        "FileViewModel",
+        "WorkspaceRootBindingProjection",
+        "AgentSessionWorktreeBinding",
+        "MCP",
+    ):
+        if (
+            forbidden_projection_token in core_selection_projection_source
+            or forbidden_projection_token in core_selection_projection_service_source
+        ):
+            fail(
+                "Core selection projection leaks app/product policy: "
+                f"{forbidden_projection_token}"
+            )
+    for forbidden_service_token in ("Task", "async", "await", "actor"):
+        if forbidden_service_token in core_selection_projection_service_source:
+            fail(
+                "Core selection projection service must remain synchronous and request-scoped: "
+                f"{forbidden_service_token}"
+            )
+
     for retired_app_helper in (
         "private static func renderFullFileBlock",
         "private static func renderSliceFileBlock",
