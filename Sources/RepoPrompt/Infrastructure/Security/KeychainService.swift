@@ -27,6 +27,7 @@ enum KeychainAccessReason: Equatable {
     case bulkSettingsLoad
     case permissionDecision
     case backgroundAvailabilityCheck
+    case networkMCPAuthentication
     case test
 }
 

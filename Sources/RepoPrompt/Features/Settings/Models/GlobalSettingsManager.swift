@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 // MARK: - Canonical Settings Keys
@@ -780,6 +781,179 @@ class GlobalSettingsStore: ObservableObject {
         updateMCPScalar(commit: commit) { settings in
             settings.temporarilyDisablePresets = enabled
         }
+    }
+
+    // MARK: - Network MCP HTTP Settings
+
+    func networkMCPSettingsSnapshot() -> NetworkMCPSettingsSnapshot {
+        let settings = scalarPreferences.mcp?.networkHTTP
+        return NetworkMCPSettingsSnapshot(
+            enabled: settings?.enabled ?? NetworkMCPSettings.defaultEnabled,
+            bindAddress: normalizedNetworkMCPBindAddress(settings?.bindAddress) ?? NetworkMCPSettings.defaultBindAddress,
+            port: normalizedNetworkMCPPort(settings?.port) ?? NetworkMCPSettings.defaultPort,
+            defaultTarget: settings?.defaultTarget,
+            token: settings?.token,
+            trustedClients: settings?.trustedClients ?? []
+        )
+    }
+
+    func setNetworkMCPBindAddress(_ bindAddress: String, commit: Bool = true) throws {
+        let normalized = try validatedNetworkMCPBindAddress(bindAddress)
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.bindAddress = normalized
+        }
+    }
+
+    func setNetworkMCPPort(_ port: Int, commit: Bool = true) throws {
+        let normalized = try validatedNetworkMCPPort(port)
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.port = normalized
+        }
+    }
+
+    func setNetworkMCPDefaultTarget(
+        _ target: NetworkMCPDefaultTargetMetadata?,
+        commit: Bool = true
+    ) {
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.defaultTarget = normalizedNetworkMCPDefaultTarget(target)
+        }
+    }
+
+    func setNetworkMCPTokenMetadata(
+        _ token: NetworkMCPBearerTokenMetadata?,
+        commit: Bool = true
+    ) {
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.token = normalizedNetworkMCPTokenMetadata(token)
+        }
+    }
+
+    func setNetworkMCPTrustedClients(
+        _ trustedClients: [NetworkMCPTrustedClientPolicy],
+        commit: Bool = true
+    ) {
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.trustedClients = normalizedNetworkMCPTrustedClients(trustedClients)
+        }
+    }
+
+    func setNetworkMCPEnabled(
+        _ enabled: Bool,
+        secureTokenMaterialAvailable: Bool,
+        commit: Bool = true
+    ) throws {
+        if enabled {
+            let snapshot = networkMCPSettingsSnapshot()
+            guard snapshot.defaultTarget != nil else {
+                throw NetworkMCPSettingsError.missingDefaultTarget
+            }
+            guard snapshot.token != nil else {
+                throw NetworkMCPSettingsError.missingTokenMetadata
+            }
+            guard secureTokenMaterialAvailable else {
+                throw NetworkMCPSettingsError.missingSecureTokenMaterial
+            }
+        }
+        updateNetworkMCPSettings(commit: commit) { settings in
+            settings.enabled = enabled
+        }
+    }
+
+    private func updateNetworkMCPSettings(
+        commit: Bool,
+        _ mutation: (inout NetworkMCPSettings) -> Void
+    ) {
+        updateMCPScalar(commit: commit) { settings in
+            var networkSettings = settings.networkHTTP ?? NetworkMCPSettings()
+            mutation(&networkSettings)
+            settings.networkHTTP = networkSettings
+        }
+    }
+
+    private func validatedNetworkMCPBindAddress(_ rawValue: String) throws -> String {
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidNetworkMCPBindAddress(trimmed) else {
+            throw NetworkMCPSettingsError.invalidBindAddress(rawValue)
+        }
+        return trimmed
+    }
+
+    private func validatedNetworkMCPPort(_ port: Int) throws -> Int {
+        guard let normalized = normalizedNetworkMCPPort(port) else {
+            throw NetworkMCPSettingsError.invalidPort(port)
+        }
+        return normalized
+    }
+
+    private func normalizedNetworkMCPBindAddress(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.isValidNetworkMCPBindAddress(trimmed) else { return nil }
+        return trimmed
+    }
+
+    private func normalizedNetworkMCPPort(_ port: Int?) -> Int? {
+        guard let port, (1024 ... 65535).contains(port) else { return nil }
+        return port
+    }
+
+    private func normalizedNetworkMCPDefaultTarget(
+        _ target: NetworkMCPDefaultTargetMetadata?
+    ) -> NetworkMCPDefaultTargetMetadata? {
+        guard var target else { return nil }
+        target.contextID = normalizedNonEmptyString(target.contextID)
+        target.displayName = normalizedNonEmptyString(target.displayName)
+        target.rootPaths = target.rootPaths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return target
+    }
+
+    private func normalizedNetworkMCPTokenMetadata(
+        _ metadata: NetworkMCPBearerTokenMetadata?
+    ) -> NetworkMCPBearerTokenMetadata? {
+        guard var metadata else { return nil }
+        metadata.label = normalizedNonEmptyString(metadata.label) ?? "Network MCP token"
+        metadata.fingerprint = metadata.fingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !metadata.fingerprint.isEmpty else { return nil }
+        return metadata
+    }
+
+    private func normalizedNetworkMCPTrustedClients(
+        _ policies: [NetworkMCPTrustedClientPolicy]
+    ) -> [NetworkMCPTrustedClientPolicy] {
+        policies.compactMap { policy in
+            var policy = policy
+            policy.clientDisplayName = normalizedNonEmptyString(policy.clientDisplayName)
+            policy.normalizedClientID = policy.normalizedClientID.trimmingCharacters(in: .whitespacesAndNewlines)
+            policy.tokenFingerprint = policy.tokenFingerprint.trimmingCharacters(in: .whitespacesAndNewlines)
+            policy.lastAddress = normalizedNonEmptyString(policy.lastAddress)
+            guard !policy.normalizedClientID.isEmpty, !policy.tokenFingerprint.isEmpty else { return nil }
+            return policy
+        }
+    }
+
+    private func normalizedNonEmptyString(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func isValidNetworkMCPBindAddress(_ value: String) -> Bool {
+        guard !value.isEmpty, !value.contains("/"), !value.contains("%") else { return false }
+
+        var ipv4 = in_addr()
+        if value.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            return true
+        }
+
+        var ipv6 = in6_addr()
+        if value.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
+            return true
+        }
+
+        return false
     }
 
     func respectGitignore() -> Bool {
