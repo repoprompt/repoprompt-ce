@@ -2,25 +2,33 @@ import Dispatch
 import Foundation
 
 extension FileSystemService {
+    package struct DetachedWatcherStop {
+        package let acceptedWatermark: FileSystemWatcherIngressMailbox.Watermark
+        package let ingressGeneration: UInt64
+        package let lifecycleEpoch: UInt64
+    }
+
     // MARK: - Public watchers API
 
     /// Installs the sole ordered publication consumer for this root.
-    nonisolated package func subscribeToChanges(
+    package nonisolated func subscribeToChanges(
         _ handler: @escaping FileSystemDeltaPublicationHub.Handler
     ) -> FileSystemDeltaPublicationSubscription {
         publicationHub.subscribe(handler)
     }
 
-    nonisolated package func closeChangePublication() {
+    package nonisolated func closeChangePublication() {
         publicationHub.close()
     }
 
     /// Gracefully tears down the watcher only after every callback that returned
     /// accepted has crossed the service publication boundary.
     package func stopWatchingForChanges() async {
-        let target = detachWatcherAndCaptureAcceptedWatermark()
-        _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: target)
-        finishDetachedWatcherStop()
+        let detachedStop = detachWatcherAndCaptureAcceptedWatermark()
+        _ = await flushPendingEventsNow(
+            throughAcceptedWatcherWatermark: detachedStop.acceptedWatermark
+        )
+        finishDetachedWatcherStop(detachedStop)
     }
 
     /// (Re)start the injected watcher if needed.
@@ -217,6 +225,7 @@ extension FileSystemService {
 
     package func startWatcher() {
         guard watcher == nil else { return }
+        watcherLifecycleEpoch &+= 1
         let acceptanceGeneration = watcherIngressMailbox.startAccepting()
         let watcher = watcherFactory.makeWatcher(path: path)
         guard watcher.start(eventHandler: { [weak self] payload in
@@ -252,18 +261,28 @@ extension FileSystemService {
 
     /// Detaches the platform source and closes admission while preserving all work
     /// whose callback already returned accepted.
-    package func detachWatcherAndCaptureAcceptedWatermark() -> FileSystemWatcherIngressMailbox.Watermark {
-        let target = watcherIngressMailbox.stopAccepting()
+    package func detachWatcherAndCaptureAcceptedWatermark() -> DetachedWatcherStop {
+        let detachedStop = DetachedWatcherStop(
+            acceptedWatermark: watcherIngressMailbox.stopAccepting(),
+            ingressGeneration: watcherIngressGeneration,
+            lifecycleEpoch: watcherLifecycleEpoch
+        )
         if let watcher {
             watcher.stop()
             self.watcher = nil
             fileSystemDebugLog("Filesystem watcher stopped for path: \(path)")
         }
-        return target
+        return detachedStop
     }
 
     /// Destructive cleanup is valid only after `flushPendingEventsNow(through:)`.
-    package func finishDetachedWatcherStop() {
+    package func finishDetachedWatcherStop(_ detachedStop: DetachedWatcherStop) {
+        guard watcher == nil,
+              watcherIngressGeneration == detachedStop.ingressGeneration,
+              watcherLifecycleEpoch == detachedStop.lifecycleEpoch
+        else {
+            return
+        }
         resetWatcherIngressState()
     }
 

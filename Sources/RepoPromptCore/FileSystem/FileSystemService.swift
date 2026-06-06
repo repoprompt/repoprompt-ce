@@ -159,6 +159,7 @@ package actor FileSystemService {
     package var watcherBatchProcessingToken: UInt64?
     package var nextWatcherBatchProcessingToken: UInt64 = 0
     package var watcherIngressGeneration: UInt64 = 0
+    package var watcherLifecycleEpoch: UInt64 = 0
     package let coalescingDelay: TimeInterval = 0.2
 
     // MARK: - Event ID-based scan coalescing (prevents dropped events while deduping bursts)

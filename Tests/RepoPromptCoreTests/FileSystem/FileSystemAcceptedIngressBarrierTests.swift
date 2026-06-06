@@ -238,6 +238,42 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         ))
     }
 
+    func testStaleDetachedStopCannotResetLaterRestartedAndStoppedLifecycle() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressLifecycleEpoch")
+        let service = try await makeService(root: root)
+        let publications = LockedPublications()
+        let subscription = service.subscribeToChanges { publication in
+            publications.append(publication)
+            return true
+        }
+
+        await service.startWatchingForChanges()
+        let staleStop = await service.detachWatcherAndCaptureAcceptedWatermark()
+
+        await service.startWatchingForChanges()
+        let acceptedPayload = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: "/outside/restarted.swift", flags: createdFileFlags, eventId: 44)
+        ], scheduleDrain: false)
+        let accepted = try XCTUnwrap(acceptedPayload)
+        let currentStop = await service.detachWatcherAndCaptureAcceptedWatermark()
+
+        await service.finishDetachedWatcherStop(staleStop)
+        let stateAfterStaleFinish = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertEqual(stateAfterStaleFinish.queuedRawEntryCount, 1)
+        XCTAssertEqual(stateAfterStaleFinish.acceptedHighWatermark, accepted)
+
+        _ = await service.flushPendingEventsNow(
+            throughAcceptedWatcherWatermark: currentStop.acceptedWatermark
+        )
+        await service.finishDetachedWatcherStop(currentStop)
+
+        let publication = try XCTUnwrap(publications.snapshot().last)
+        XCTAssertEqual(publication.watcherAcceptedWatermark, accepted)
+        let finalState = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertEqual(finalState.queuedRawEntryCount, 0)
+        withExtendedLifetime(subscription) {}
+    }
+
     func testSyntheticPublicationDoesNotAdvanceWatcherAcceptedWatermark() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressSynthetic")
         let service = try await makeService(root: root)
