@@ -582,7 +582,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let viewModel = makeViewModel()
         let session = await viewModel.ensureSessionReady(tabID: UUID())
         _ = viewModel.test_installPersistentSessionBinding(sessionID: UUID(), on: session)
-        session.saveGeneration = 7
+        session.saveRequestGeneration = 7
         let token = try XCTUnwrap(viewModel.test_saveCommitToken(for: session, workspaceID: UUID()))
         XCTAssertTrue(viewModel.test_isSaveCommitTokenCurrent(token))
 

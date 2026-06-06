@@ -905,13 +905,6 @@ final class ACPIntegratedAgentModeRunner {
         return { await controller.stopTracking() }
     }
 
-    private func stopToolTracking(
-        for session: AgentModeViewModel.TabSession,
-        matchingRunID: UUID? = nil
-    ) async {
-        await prepareToolTrackingTeardown(for: session, matchingRunID: matchingRunID)?()
-    }
-
     private func setRunningStatus(
         _ text: String?,
         source: AgentModeViewModel.TabSession.RunningStatusSource?,

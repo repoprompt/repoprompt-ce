@@ -152,9 +152,6 @@ public actor UnixSocketMCPTransport: Transport {
     /// Changes whenever socketFD is replaced or synchronously closed.
     private var socketOwnershipGeneration: UInt64 = 0
 
-    /// Optional error captured when read loop terminates (for diagnostics/logging)
-    private var readError: Swift.Error?
-
     #if DEBUG
         /// Forces the adopted-FD startup path to fail after preparation but before reader ownership.
         private var failNextExistingFDConnectBeforeReaderStart = false
@@ -492,7 +489,6 @@ public actor UnixSocketMCPTransport: Transport {
             proposedError
         }
         if ingressSnapshot.terminalCause == .receiveBufferOverflow {
-            readError = resolvedError
             logger.error("UnixSocketMCPTransport ingress terminated: \(String(describing: resolvedError))")
         }
         isConnected = false
@@ -845,13 +841,11 @@ public actor UnixSocketMCPTransport: Transport {
                 return
             }
         #endif
-        readError = error
         tearDownSocket(error: error)
     }
 
     /// Called when read encounters an error.
     private func handleReadError(error: Swift.Error) {
-        readError = error
         tearDownSocket(error: error)
     }
 
@@ -861,7 +855,6 @@ public actor UnixSocketMCPTransport: Transport {
         if hasResidualData {
             // Treat residual incomplete frame as a protocol error
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
-            readError = truncationError
             tearDownSocket(error: truncationError)
         } else {
             tearDownSocket(error: nil)

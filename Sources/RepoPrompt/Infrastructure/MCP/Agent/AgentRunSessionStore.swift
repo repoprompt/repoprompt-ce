@@ -415,18 +415,6 @@ extension AgentRunSessionStore {
         await shared.register(sessionID: sessionID)
     }
 
-    static func noteSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) async {
-        await shared.noteSnapshot(snapshot, registration: registration)
-    }
-
-    static func noteSnapshotAndWakeWaiters(
-        _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
-        reason: WakeReason
-    ) async {
-        await shared.noteSnapshotAndWakeWaiters(snapshot, registration: registration, reason: reason)
-    }
-
     static func waitUntilInteresting(
         registration: Registration,
         timeoutSeconds: TimeInterval? = nil
@@ -449,9 +437,7 @@ extension AgentRunSessionStore {
     static func cleanup(registration: Registration) async {
         await shared.cleanup(registration: registration)
     }
-}
 
-extension AgentRunSessionStore {
     static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) async {
         await shared.noteSnapshot(snapshot, registration: registration)
     }

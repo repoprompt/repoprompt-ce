@@ -102,13 +102,10 @@ final class HeadlessAgentModeRunner {
                 let acquired = await lease.acquire()
                 guard acquired else {
                     await self.handleAcquireFailure(
-                        tabID: tabID,
                         session: session,
                         runID: runID,
                         ownership: ownership,
-                        provider: provider,
-                        attachmentReservationID: attachmentReservationID,
-                        lease: lease
+                        attachmentReservationID: attachmentReservationID
                     )
                     return
                 }
@@ -135,13 +132,10 @@ final class HeadlessAgentModeRunner {
     }
 
     private func handleAcquireFailure(
-        tabID _: UUID,
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         ownership: AgentRunOwnership,
-        provider _: HeadlessAgentProvider,
-        attachmentReservationID: UUID?,
-        lease _: MCPBootstrapLease
+        attachmentReservationID: UUID?
     ) async {
         hooks.recordPendingHandoffSendOutcome(session, false)
         await terminalCommitBarrier.commit(.init(

@@ -15,12 +15,8 @@ struct ContextBuilderAssistantOutputAccumulator {
     private var pendingNormalizedWhitespace = false
     private var trailingNewlineCountCapped = 0
 
-    private(set) var appendedCharacterCount = 0
+    private(set) var accumulatedCharacterCount = 0
     private(set) var fullOutputMaterializationCount = 0
-
-    var isEmpty: Bool {
-        chunks.isEmpty
-    }
 
     var preview: String? {
         guard hasNormalizedContent else { return nil }
@@ -55,17 +51,8 @@ struct ContextBuilderAssistantOutputAccumulator {
         trailingNewlineCountCapped = 0
         processPreviewCharacters(in: output)
         updateTrailingNewlineCount(with: output)
-        appendedCharacterCount = output.count
+        accumulatedCharacterCount = output.count
         return preview != previousPreview
-    }
-
-    mutating func reset() {
-        chunks.removeAll(keepingCapacity: true)
-        lastContentMessageID = nil
-        resetPreviewState()
-        trailingNewlineCountCapped = 0
-        appendedCharacterCount = 0
-        fullOutputMaterializationCount = 0
     }
 
     mutating func fullOutput() -> String? {
@@ -77,7 +64,7 @@ struct ContextBuilderAssistantOutputAccumulator {
     private mutating func appendChunk(_ chunk: String) {
         guard !chunk.isEmpty else { return }
         chunks.append(chunk)
-        appendedCharacterCount += chunk.count
+        accumulatedCharacterCount += chunk.count
         processPreviewCharacters(in: chunk)
         updateTrailingNewlineCount(with: chunk)
     }

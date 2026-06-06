@@ -2238,10 +2238,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         saveHistory: Bool
     ) {
         guard acceptsEvents(from: record) else { return }
-        let session = record.session
-        session.isCancelling = true
-        session.didUserCancelActiveContextBuilderRun = true
-        updateRuntimeBindings(from: session)
+        _ = beginCancellation(forTabID: record.tabID)
         debugLog("Cancel requested for run \(record.runID) tab \(record.tabID)")
 
         finalizeContextBuilderRun(
@@ -2689,7 +2686,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     // MARK: - Error handling
 
     private func extractVerboseErrorMessage(from error: Error) -> String {
-        var errorMessage: String = if let providerError = error as? AIProviderError {
+        let errorMessage: String = if let providerError = error as? AIProviderError {
             switch providerError {
             case let .invalidConfiguration(detail):
                 detail

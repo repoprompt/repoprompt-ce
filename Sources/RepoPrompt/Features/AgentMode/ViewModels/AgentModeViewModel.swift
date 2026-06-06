@@ -4746,7 +4746,7 @@ final class AgentModeViewModel: ObservableObject {
     @discardableResult
     private func copyParentWorktreeBindingsIfNeeded(parentSessionID: UUID, to session: TabSession) -> Bool {
         guard session.worktreeBindings.isEmpty,
-              let parentSession = try? liveSession(forAgentSessionID: parentSessionID),
+              let parentSession = try? authoritativeLiveSession(for: parentSessionID),
               !parentSession.worktreeBindings.isEmpty
         else {
             return false
@@ -4757,12 +4757,8 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    private func liveSession(forAgentSessionID sessionID: UUID) throws -> TabSession? {
-        try authoritativeLiveSession(for: sessionID)
-    }
-
     func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
-        if let live = try? liveSession(forAgentSessionID: sessionID) {
+        if let live = try? authoritativeLiveSession(for: sessionID) {
             return live.worktreeBindings
         }
         if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
@@ -4773,7 +4769,7 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     func applyWorktreeBinding(_ binding: AgentSessionWorktreeBinding, toSessionID sessionID: UUID) throws -> AgentSessionWorktreeBinding? {
-        guard let session = try liveSession(forAgentSessionID: sessionID) else {
+        guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let normalizedRoot = Self.standardizedWorkspacePath(binding.logicalRootPath) ?? binding.logicalRootPath
@@ -4799,7 +4795,7 @@ final class AgentModeViewModel: ObservableObject {
 
     @discardableResult
     func replaceWorktreeBindings(_ bindings: [AgentSessionWorktreeBinding], forSessionID sessionID: UUID) throws -> [AgentSessionWorktreeBinding] {
-        guard let session = try liveSession(forAgentSessionID: sessionID) else {
+        guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let previous = session.worktreeBindings
@@ -4947,7 +4943,7 @@ final class AgentModeViewModel: ObservableObject {
         forSessionID sessionID: UUID,
         intent: WorktreeBindingTransitionIntent
     ) async throws -> [AgentSessionWorktreeBinding] {
-        guard let session = try liveSession(forAgentSessionID: sessionID) else {
+        guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let previousBindings = session.worktreeBindings
@@ -6202,10 +6198,6 @@ final class AgentModeViewModel: ObservableObject {
             || activeTranscriptPresentation.tabID == session.tabID
     }
 
-    private func shouldPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
-        canBuildOrPublishActiveTranscriptBindings(for: session)
-    }
-
     @discardableResult
     private func publishTranscriptPresentation(from session: TabSession, forceRevision: Bool = false) -> Bool {
         let currentSnapshot = activeTranscriptPresentation
@@ -6374,7 +6366,7 @@ final class AgentModeViewModel: ObservableObject {
         guard session.isCompressedHistoryRevealed != isRevealed else { return }
         session.isCompressedHistoryRevealed = isRevealed
         session.transcriptProjection = materializedTranscriptProjection(for: session)
-        guard shouldPublishActiveTranscriptBindings(for: session) else { return }
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         _ = publishTranscriptPresentation(from: session)
     }
 
@@ -6395,7 +6387,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func republishTranscriptPresentationForRunStateChangeIfNeeded(_ session: TabSession) {
-        guard shouldPublishActiveTranscriptBindings(for: session) else { return }
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return }
         if currentTabID == session.tabID {
             updateBindingsFromSession(session)
         } else {
@@ -6692,18 +6684,20 @@ final class AgentModeViewModel: ObservableObject {
         scope: UIRefreshScope = .full
     ) {
         #if DEBUG
-            AgentModePerfDiagnostics.increment(urgent ? "ui.refresh.request.urgent" : "ui.refresh.request.coalesced", tabID: tabID)
-            AgentModePerfDiagnostics.increment("ui.refresh.request.scope.\(scope.rawValue)", tabID: tabID)
-            AgentModePerfDiagnostics.event(
-                "ui.refresh.request",
-                tabID: tabID,
-                fields: [
-                    "urgent": String(urgent),
-                    "scope": scope.rawValue,
-                    "pendingBeforeInsert": String(pendingUIRefreshScopesByTabID.count),
-                    "hasScheduledFlush": String(uiRefreshTask != nil)
-                ]
-            )
+            if AgentModePerfDiagnostics.isEnabled {
+                AgentModePerfDiagnostics.increment(urgent ? "ui.refresh.request.urgent" : "ui.refresh.request.coalesced", tabID: tabID)
+                AgentModePerfDiagnostics.increment("ui.refresh.request.scope.\(scope.rawValue)", tabID: tabID)
+                AgentModePerfDiagnostics.event(
+                    "ui.refresh.request",
+                    tabID: tabID,
+                    fields: [
+                        "urgent": String(urgent),
+                        "scope": scope.rawValue,
+                        "pendingBeforeInsert": String(pendingUIRefreshScopesByTabID.count),
+                        "hasScheduledFlush": String(uiRefreshTask != nil)
+                    ]
+                )
+            }
         #endif
         let existingScopes = pendingUIRefreshScopesByTabID[tabID] ?? []
         if scope == .full || existingScopes.contains(.full) {
@@ -7644,7 +7638,7 @@ final class AgentModeViewModel: ObservableObject {
                 sourceItemCount: session.items.count
             )
         )
-        if shouldPublishActiveTranscriptBindings(for: session) {
+        if canBuildOrPublishActiveTranscriptBindings(for: session) {
             let publishSignpost = EditFlowPerf.begin(
                 EditFlowPerf.Stage.Transcript.publish,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
@@ -9285,7 +9279,7 @@ final class AgentModeViewModel: ObservableObject {
             bindingTransitionGeneration: session.bindingTransitionGeneration,
             sourceItemsRevision: session.sourceItemsRevision,
             persistenceMutationGeneration: session.persistenceMutationGeneration,
-            saveGeneration: session.saveGeneration
+            saveRequestGeneration: session.saveRequestGeneration
         )
     }
 
@@ -9305,7 +9299,7 @@ final class AgentModeViewModel: ObservableObject {
               !session.bindingTransitionInProgress,
               session.sourceItemsRevision == token.sourceItemsRevision,
               session.persistenceMutationGeneration == token.persistenceMutationGeneration,
-              session.saveGeneration == token.saveGeneration
+              session.saveRequestGeneration == token.saveRequestGeneration
         else {
             return false
         }
@@ -9329,7 +9323,7 @@ final class AgentModeViewModel: ObservableObject {
     func scheduleSave(for tabID: UUID) {
         guard !AppLaunchConfiguration.current.suppressesAgentSessionPersistence else { return }
         guard let session = sessions[tabID] else { return }
-        session.saveGeneration &+= 1
+        session.saveRequestGeneration &+= 1
         #if DEBUG
             let replacedPendingSave = session.saveDebounceTask != nil
             AgentModePerfDiagnostics.increment("save.schedule", tabID: tabID)
@@ -9399,7 +9393,7 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         let sessionID = ensureSessionBoundToTab(session)
-        session.saveGeneration &+= 1
+        session.saveRequestGeneration &+= 1
         if saveInFlightSessionIDs.contains(sessionID) {
             saveRequestedWhileInFlightSessionIDs.insert(sessionID)
             return
@@ -9637,13 +9631,6 @@ final class AgentModeViewModel: ObservableObject {
             }
             session.isDirty = false
             session.lastUserMessageAt = lastUserMessageAt
-            if session.isDirty {
-                #if DEBUG
-                    AgentModePerfDiagnostics.increment("save.session.selfReschedule", tabID: tabID)
-                    AgentModePerfDiagnostics.event("save.session.selfReschedule", tabID: tabID)
-                #endif
-                scheduleSave(for: tabID)
-            }
             if let lastUserMessageAt {
                 sessionListSortDates[tabID] = lastUserMessageAt
             } else {
@@ -9673,9 +9660,7 @@ final class AgentModeViewModel: ObservableObject {
                         tabID: tabID,
                         fields: [
                             "duration": AgentModePerfDiagnostics.formatElapsedMS(since: diagnosticsStartMS),
-                            "itemCount": String(canonicalItemCount),
-                            "dirtyAfterSave": String(session.isDirty),
-                            "selfRescheduled": String(session.isDirty)
+                            "itemCount": String(canonicalItemCount)
                         ]
                     )
                 }

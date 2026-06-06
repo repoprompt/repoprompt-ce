@@ -146,10 +146,6 @@ final class ContextBuilderRunRegistry {
     private var recordsByRunID: [UUID: ContextBuilderRunRecord] = [:]
     private var activeRunIDByTabID: [UUID: UUID] = [:]
 
-    var allRecords: [ContextBuilderRunRecord] {
-        Array(recordsByRunID.values)
-    }
-
     @discardableResult
     func register(_ record: ContextBuilderRunRecord) -> Bool {
         guard recordsByRunID[record.runID] == nil,

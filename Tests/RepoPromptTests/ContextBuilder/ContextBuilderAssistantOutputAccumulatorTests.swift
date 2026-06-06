@@ -65,7 +65,7 @@ final class ContextBuilderAssistantOutputAccumulatorTests: XCTestCase {
             accumulator.append("x")
         }
 
-        XCTAssertEqual(accumulator.appendedCharacterCount, chunkCount)
+        XCTAssertEqual(accumulator.accumulatedCharacterCount, chunkCount)
         XCTAssertEqual(accumulator.fullOutputMaterializationCount, 0)
         XCTAssertEqual(accumulator.preview?.count, 160)
 

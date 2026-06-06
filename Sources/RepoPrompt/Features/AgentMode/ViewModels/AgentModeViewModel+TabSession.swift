@@ -360,7 +360,7 @@ extension AgentModeViewModel {
         private(set) var bindingTransitionGeneration: UInt64 = 0
         private(set) var bindingTransitionInProgress: Bool = false
         private(set) var persistenceMutationGeneration: UInt64 = 0
-        var saveGeneration: UInt64 = 0
+        var saveRequestGeneration: UInt64 = 0
         var parentSessionID: UUID?
         var hasLoadedPersistedState: Bool = false
         private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
@@ -533,6 +533,18 @@ extension AgentModeViewModel {
                 return runID == expectedRunID
             }
             return true
+        }
+
+        func isCurrentRunAttemptForCurrentBinding(
+            _ ownership: AgentRunOwnership,
+            expectedRunID: UUID? = nil
+        ) -> Bool {
+            guard isCurrentRunAttempt(ownership, expectedRunID: expectedRunID) else { return false }
+            return ownership.binding.tabID == tabID
+                && ownership.binding.persistentSessionID == activeAgentSessionID
+                && ownership.binding.persistentBindingGeneration == persistentSessionBindingIdentity?.generation
+                && ownership.binding.bindingTransitionGeneration == bindingTransitionGeneration
+                && !bindingTransitionInProgress
         }
 
         @discardableResult

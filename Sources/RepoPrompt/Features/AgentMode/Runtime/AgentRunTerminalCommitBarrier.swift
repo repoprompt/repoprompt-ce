@@ -9,7 +9,6 @@ extension AgentSessionRunState {
 struct AgentRunTerminalCommitRevision: Equatable {
     let commitID: UUID
     let ownership: AgentRunOwnership
-    let expectedRunID: UUID?
     let terminalState: AgentSessionRunState
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
@@ -190,7 +189,6 @@ final class AgentRunTerminalCommitBarrier {
         let revision = AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: request.ownership,
-            expectedRunID: request.expectedRunID,
             terminalState: request.terminalState,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
@@ -233,16 +231,10 @@ final class AgentRunTerminalCommitBarrier {
     }
 
     private func validatesOwnership(_ request: Request) -> Bool {
-        let session = request.session
-        guard session.isCurrentRunAttempt(request.ownership) else { return false }
-        if let expectedRunID = request.expectedRunID, session.runID != expectedRunID {
-            return false
-        }
-        return request.ownership.binding.tabID == session.tabID
-            && request.ownership.binding.persistentSessionID == session.activeAgentSessionID
-            && request.ownership.binding.persistentBindingGeneration == session.persistentSessionBindingIdentity?.generation
-            && request.ownership.binding.bindingTransitionGeneration == session.bindingTransitionGeneration
-            && !session.bindingTransitionInProgress
+        request.session.isCurrentRunAttemptForCurrentBinding(
+            request.ownership,
+            expectedRunID: request.expectedRunID
+        )
     }
 
     private func recordRejection(_ reason: String, request: Request) {

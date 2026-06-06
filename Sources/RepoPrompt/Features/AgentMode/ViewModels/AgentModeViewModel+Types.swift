@@ -89,7 +89,7 @@ extension AgentModeViewModel {
         let bindingTransitionGeneration: UInt64
         let sourceItemsRevision: Int
         let persistenceMutationGeneration: UInt64
-        let saveGeneration: UInt64
+        let saveRequestGeneration: UInt64
     }
 
     enum PersistentBindingResolution: Equatable {
