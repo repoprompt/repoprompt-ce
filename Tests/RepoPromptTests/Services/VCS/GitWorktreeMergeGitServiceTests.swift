@@ -112,6 +112,7 @@ final class GitWorktreeMergeGitServiceTests: XCTestCase {
 
         let dirty = try GitMergeFixture()
         defer { dirty.cleanup() }
+        try dirty.runGit(["config", "status.showUntrackedFiles", "no"], cwd: dirty.source)
         try "dirty\n".write(to: dirty.source.appendingPathComponent("Dirty.txt"), atomically: true, encoding: .utf8)
         let dirtyPreview = try await dirty.preview(publishArtifacts: false)
         XCTAssertTrue(dirtyPreview.inspection.isBlocked)

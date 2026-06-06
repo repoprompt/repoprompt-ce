@@ -639,7 +639,7 @@ actor GitService {
     /// Get uncommitted modified files in the repository
     func getUncommittedFiles(at repoURL: URL) async throws -> [UncommittedFile] {
         let (stdout, stderr, exitCode) = try await runGit(
-            ["status", "--porcelain"],
+            ["status", "--porcelain", "--untracked-files=all"],
             at: repoURL
         )
 
@@ -677,7 +677,7 @@ actor GitService {
     /// Get git status output in porcelain format with NUL delimiters.
     func getStatusPorcelainZ(at repoURL: URL) async throws -> Data {
         let (stdout, stderr, exitCode) = try await runGit(
-            ["status", "--porcelain", "-z"],
+            ["status", "--porcelain", "-z", "--untracked-files=all"],
             at: repoURL
         )
         guard exitCode == 0 else {
@@ -1890,7 +1890,7 @@ actor GitService {
 
     /// Get structured working status with staged, modified, and untracked files.
     func getWorkingStatus(at repoURL: URL) async throws -> WorkingStatus {
-        let args = ["status", "--porcelain", "-z"]
+        let args = ["status", "--porcelain", "-z", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
             throw GitError(message: "git status --porcelain -z failed: \(stderr)")
