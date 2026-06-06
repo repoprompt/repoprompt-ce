@@ -13310,7 +13310,9 @@ final class AgentModeViewModel: ObservableObject {
             rootScope: .allLoaded,
             pathLocateProfile: .uiAssisted
         )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
+        guard let accounting = try? await accountingService.calculatePromptStats(request: request, store: store) else {
+            return ""
+        }
         let entries = accounting.resolvedEntries
         let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
         let codemapSnapshots = await store.codemapSnapshotDictionary()

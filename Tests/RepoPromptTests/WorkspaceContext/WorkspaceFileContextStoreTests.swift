@@ -60,7 +60,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             WorkspaceObservedCodemapResult(fullPath: fileURL.path, modificationDate: Date(), fileAPI: makeFileAPI(path: fileURL.path))
         ])
 
-        let service = PromptContextAccountingService()
+        let service = RepoPrompt.PromptContextAccountingService()
         let selection = StoredSelection(
             selectedPaths: [fileURL.path],
             autoCodemapPaths: [],

@@ -1987,6 +1987,16 @@ package actor WorkspaceFileContextStore {
         }
     }
 
+    #if DEBUG
+        package func setContentReadChunkHandlerForTesting(
+            rootID: UUID,
+            _ handler: (@Sendable (String) async -> Void)?
+        ) async throws {
+            let state = try state(for: rootID)
+            await state.service.setContentReadChunkHandlerForTesting(handler)
+        }
+    #endif
+
     package func readContentWithDate(
         rootID: UUID,
         relativePath: String,

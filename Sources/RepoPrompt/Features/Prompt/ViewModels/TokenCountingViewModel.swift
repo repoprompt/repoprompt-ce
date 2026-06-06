@@ -643,10 +643,21 @@ class TokenCountingViewModel: ObservableObject {
             let accountingStartMS = PromptTokenRecountDiagnostics.start()
             PromptTokenRecountDiagnostics.event("tokenRecount.calculate.accounting.begin")
         #endif
-        let accountingResult = await promptContextAccountingService.calculatePromptStats(
+        guard let accountingResult = try? await promptContextAccountingService.calculatePromptStats(
             request: accountingRequest,
             store: store
-        )
+        ) else {
+            #if DEBUG
+                PromptTokenRecountDiagnostics.event(
+                    "tokenRecount.calculate.cancelled",
+                    fields: [
+                        "phase": "accounting",
+                        "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    ]
+                )
+            #endif
+            return
+        }
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.accounting.end",

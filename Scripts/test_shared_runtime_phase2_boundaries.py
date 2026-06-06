@@ -53,9 +53,11 @@ RETIRED_RUNTIME_PATHS = (
 
 REQUIRED_PROMPT_ASSEMBLY_PATHS = (
     "Sources/RepoPromptCore/Prompt/PromptAssemblyBuilder.swift",
+    "Sources/RepoPromptCore/Prompt/PromptContextAccountingService.swift",
     "Sources/RepoPromptCore/Prompt/PromptRenderPolicy.swift",
     "Sources/RepoPromptCore/Prompt/PromptSection.swift",
     "Sources/RepoPrompt/Features/Prompt/Models/PromptSection+DisplayName.swift",
+    "Sources/RepoPrompt/Features/Prompt/Services/PromptContextAccountingService.swift",
 )
 
 RETIRED_PROMPT_ASSEMBLY_PATHS = (
@@ -228,6 +230,25 @@ def main() -> int:
     for relative in RETIRED_PROMPT_ASSEMBLY_PATHS:
         if (ROOT / relative).exists():
             fail(f"Retired app prompt assembly owner still exists: {relative}")
+
+    core_accounting_source = (
+        ROOT / "Sources/RepoPromptCore/Prompt/PromptContextAccountingService.swift"
+    ).read_text()
+    app_accounting_source = (
+        ROOT / "Sources/RepoPrompt/Features/Prompt/Services/PromptContextAccountingService.swift"
+    ).read_text()
+    for declaration in (
+        "package struct PromptContextAccountingRequest",
+        "package struct PromptContextAccountingResolution",
+        "package struct PromptContextAccountingResult",
+        "package actor PromptContextAccountingService",
+    ):
+        if declaration not in core_accounting_source:
+            fail(f"Canonical Core prompt accounting declaration missing: {declaration}")
+        if declaration in app_accounting_source:
+            fail(f"App prompt accounting facade redeclares Core ownership: {declaration}")
+    if "private let core = RepoPromptCore.PromptContextAccountingService()" not in app_accounting_source:
+        fail("App prompt accounting compatibility owner must delegate to RepoPromptCore")
 
     core_root = ROOT / "Sources/RepoPromptCore"
     forbidden_imports = {

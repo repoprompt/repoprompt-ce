@@ -51,6 +51,9 @@ typealias TokenCalculationResult = RepoPromptCore.TokenCalculationResult
 typealias TokenComponentBreakdown = RepoPromptCore.TokenComponentBreakdown
 typealias PromptEntriesEvaluation = RepoPromptCore.PromptEntriesEvaluation
 typealias TokenCalculationService = RepoPromptCore.TokenCalculationService
+typealias PromptContextAccountingRequest = RepoPromptCore.PromptContextAccountingRequest
+typealias PromptContextAccountingResolution = RepoPromptCore.PromptContextAccountingResolution
+typealias PromptContextAccountingResult = RepoPromptCore.PromptContextAccountingResult
 
 typealias RegexPatternFailure = RepoPromptCore.RegexPatternFailure
 typealias RegexToolkit = RepoPromptCore.RegexToolkit
