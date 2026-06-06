@@ -152,6 +152,58 @@ final class TokenCalculationServiceTests: XCTestCase {
         XCTAssertEqual(survivingResult.totalTokenCount, 33)
     }
 
+    func testScopedCancellationThrowsWhenOperationReturnsAfterCancellation() async {
+        let expectedResult = makeResult(total: 66)
+        let gate = TokenCalculationCancellationIgnoringGate(result: expectedResult)
+        let service = TokenCalculationService { _ in
+            await gate.execute()
+        }
+        let task = Task {
+            try await service.calculatePromptStatsScoped(snapshot: makeSnapshot(promptText: "ignores-cancellation"))
+        }
+        await gate.waitUntilStarted()
+
+        task.cancel()
+        await gate.waitUntilCancellationObserved()
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected caller cancellation to win over a successful operation result")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
+    func testAlreadyCancelledScopedCallerCancelsDetachedOperation() async {
+        let entryGate = TokenCalculationEntryGate()
+        let operationGate = TokenCalculationOperationGate()
+        let service = TokenCalculationService { snapshot in
+            try await operationGate.execute(snapshot: snapshot)
+        }
+        let snapshot = makeSnapshot(promptText: "already-cancelled")
+        let task = Task {
+            await entryGate.wait()
+            return try await service.calculatePromptStatsScoped(snapshot: snapshot)
+        }
+
+        await entryGate.waitUntilWaiting()
+        task.cancel()
+        await entryGate.release()
+        await operationGate.waitUntilStarted("already-cancelled")
+        await operationGate.waitUntilCancelled("already-cancelled")
+
+        do {
+            _ = try await task.value
+            XCTFail("Expected already-cancelled caller to propagate cancellation")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+    }
+
     func testScopedCalculationPropagatesExactOperationError() async {
         let gate = TokenCalculationOperationGate()
         let service = TokenCalculationService { snapshot in
@@ -198,6 +250,38 @@ final class TokenCalculationServiceTests: XCTestCase {
         let secondResult = await secondTask.value
         assertZeroResult(firstResult)
         XCTAssertEqual(secondResult.totalTokenCount, 44)
+    }
+
+    func testLegacyStaleCompletionCannotHideNewerTaskFromShutdown() async {
+        let gate = TokenCalculationOperationGate()
+        let service = TokenCalculationService { snapshot in
+            try await gate.execute(snapshot: snapshot)
+        }
+        let firstSnapshot = makeSnapshot(promptText: "stale-first")
+        let secondSnapshot = makeSnapshot(promptText: "stale-second")
+        let secondExpected = makeResult(total: 55)
+
+        let firstTask = Task {
+            await service.calculatePromptStats(snapshot: firstSnapshot)
+        }
+        await gate.waitUntilStarted("stale-first")
+        let secondTask = Task {
+            await service.calculatePromptStats(snapshot: secondSnapshot)
+        }
+        await gate.waitUntilCancelled("stale-first")
+        await gate.waitUntilStarted("stale-second")
+
+        let firstResult = await firstTask.value
+        assertZeroResult(firstResult)
+        await service.shutdown()
+
+        let secondWasCancelled = await gate.wasCancelled("stale-second")
+        if !secondWasCancelled {
+            await gate.succeed("stale-second", with: secondExpected)
+        }
+        let secondResult = await secondTask.value
+        XCTAssertTrue(secondWasCancelled)
+        assertZeroResult(secondResult)
     }
 
     func testScopedAndLegacyProductionCalculationsHaveFieldForFieldParityExcludingUUIDs() async throws {
@@ -344,6 +428,91 @@ private enum TokenCalculationTestError: Error, Equatable {
     case expected(Int)
 }
 
+private actor TokenCalculationCancellationIgnoringGate {
+    private let result: TokenCalculationResult
+    private var operationContinuation: CheckedContinuation<Void, Never>?
+    private var isStarted = false
+    private var didObserveCancellation = false
+    private var startContinuations: [CheckedContinuation<Void, Never>] = []
+    private var cancellationContinuations: [CheckedContinuation<Void, Never>] = []
+
+    init(result: TokenCalculationResult) {
+        self.result = result
+    }
+
+    func execute() async -> TokenCalculationResult {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                isStarted = true
+                let continuations = startContinuations
+                startContinuations.removeAll()
+                continuations.forEach { $0.resume() }
+                if didObserveCancellation {
+                    continuation.resume()
+                } else {
+                    operationContinuation = continuation
+                }
+            }
+        } onCancel: {
+            Task {
+                await self.observeCancellation()
+            }
+        }
+        return result
+    }
+
+    func waitUntilStarted() async {
+        guard !isStarted else { return }
+        await withCheckedContinuation { continuation in
+            startContinuations.append(continuation)
+        }
+    }
+
+    func waitUntilCancellationObserved() async {
+        guard !didObserveCancellation else { return }
+        await withCheckedContinuation { continuation in
+            cancellationContinuations.append(continuation)
+        }
+    }
+
+    private func observeCancellation() {
+        didObserveCancellation = true
+        operationContinuation?.resume()
+        operationContinuation = nil
+        let continuations = cancellationContinuations
+        cancellationContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+    }
+}
+
+private actor TokenCalculationEntryGate {
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+    private var isWaiting = false
+    private var waitingContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        isWaiting = true
+        let continuations = waitingContinuations
+        waitingContinuations.removeAll()
+        continuations.forEach { $0.resume() }
+        await withCheckedContinuation { continuation in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilWaiting() async {
+        guard !isWaiting else { return }
+        await withCheckedContinuation { continuation in
+            waitingContinuations.append(continuation)
+        }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
 private actor TokenCalculationOperationGate {
     private var continuations: [String: CheckedContinuation<TokenCalculationResult, Error>] = [:]
     private var startedKeys: Set<String> = []
@@ -382,6 +551,10 @@ private actor TokenCalculationOperationGate {
         await withCheckedContinuation { continuation in
             cancellationWaiters[key, default: []].append(continuation)
         }
+    }
+
+    func wasCancelled(_ key: String) -> Bool {
+        cancelledKeys.contains(key)
     }
 
     func succeed(_ key: String, with result: TokenCalculationResult) {

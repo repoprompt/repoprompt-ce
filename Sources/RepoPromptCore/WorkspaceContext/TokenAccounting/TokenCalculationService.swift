@@ -147,10 +147,16 @@ package actor TokenCalculationService {
         self.calculationOperation = calculationOperation
     }
 
+    private struct LegacyCalculationTask {
+        let generation: UInt64
+        let task: Task<TokenCalculationResult, Never>
+    }
+
     private let calculationOperation: CalculationOperation
+    private var nextLegacyCalculationGeneration: UInt64 = 0
 
     /// Hold the currently running calculation task.
-    private var currentCalculationTask: Task<TokenCalculationResult, Never>?
+    private var currentCalculationTask: LegacyCalculationTask?
 
     /// Compute tokens from raw text using a cheap UTF-8 byte count plus a safety multiplier.
     @inline(__always)
@@ -327,19 +333,24 @@ package actor TokenCalculationService {
     package func calculatePromptStats(
         snapshot: TokenCalculationSnapshot
     ) async -> TokenCalculationResult {
-        currentCalculationTask?.cancel()
+        currentCalculationTask?.task.cancel()
 
+        nextLegacyCalculationGeneration &+= 1
+        let generation = nextLegacyCalculationGeneration
         let calculationOperation = calculationOperation
-        currentCalculationTask = Task.detached {
+        let task = Task.detached {
             do {
                 return try await calculationOperation(snapshot)
             } catch {
                 return Self.defaultResult
             }
         }
+        currentCalculationTask = LegacyCalculationTask(generation: generation, task: task)
 
-        let result = await currentCalculationTask!.value
-        currentCalculationTask = nil
+        let result = await task.value
+        if currentCalculationTask?.generation == generation {
+            currentCalculationTask = nil
+        }
         return result
     }
 
@@ -352,7 +363,9 @@ package actor TokenCalculationService {
             try await calculationOperation(snapshot)
         }
         return try await withTaskCancellationHandler {
-            try await task.value
+            let result = try await task.value
+            try Task.checkCancellation()
+            return result
         } onCancel: {
             task.cancel()
         }
@@ -407,9 +420,12 @@ package actor TokenCalculationService {
 
     /// Cancel any pending token calculations.
     package func shutdown() async {
-        currentCalculationTask?.cancel()
-        _ = await currentCalculationTask?.value
-        currentCalculationTask = nil
+        guard let calculation = currentCalculationTask else { return }
+        calculation.task.cancel()
+        _ = await calculation.task.value
+        if currentCalculationTask?.generation == calculation.generation {
+            currentCalculationTask = nil
+        }
     }
 
     private static func buildSliceAssemblies(
