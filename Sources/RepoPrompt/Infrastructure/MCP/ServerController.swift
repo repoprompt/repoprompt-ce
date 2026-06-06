@@ -59,10 +59,11 @@ final actor ServerController: ObservableObject {
     // –––––  Private implementation helpers  –––––
     private let networkManager = ServerNetworkManager.shared
     private var activeApprovalDialogs: Set<String> = []
-    private var pendingApprovals: [(String, () -> Void, () -> Void)] = []
+    private var pendingApprovals: [(MCPApprovalPresentation, (Bool) -> Void, () -> Void)] = []
 
     // –––––  Injected callbacks for approval flow  –––––
     nonisolated(unsafe) var onApprovalRequest: ((String) async -> Void)?
+    nonisolated(unsafe) var onApprovalPresentationRequest: ((MCPApprovalPresentation) async -> Void)?
     nonisolated(unsafe) var onApprovalResolved: ((Bool) -> Void)?
 
     /// Activity token used to disable App Nap while the server runs.
@@ -72,6 +73,10 @@ final actor ServerController: ObservableObject {
     /// Set the approval callback
     func setApprovalCallback(_ callback: @escaping (String) async -> Void) {
         onApprovalRequest = callback
+    }
+
+    func setApprovalPresentationCallback(_ callback: @escaping (MCPApprovalPresentation) async -> Void) {
+        onApprovalPresentationRequest = callback
     }
 
     func setMCPService(_ service: MCPService?) {
@@ -162,7 +167,7 @@ final actor ServerController: ObservableObject {
                     Task {
                         await self.requestApproval(
                             clientID: client.name,
-                            approve: { c.resume(returning: true) },
+                            approve: { _ in c.resume(returning: true) },
                             deny: { c.resume(returning: false) }
                         )
                     }
@@ -180,6 +185,19 @@ final actor ServerController: ObservableObject {
                     }
                 }
                 return approved
+        }
+
+        await networkManager.setRemoteClientApprovalHandler { [weak self] request in
+            guard let self else { return .deny }
+            return await withCheckedContinuation { continuation in
+                Task {
+                    await self.requestApproval(
+                        presentation: request.presentation,
+                        approve: { alwaysAllow in continuation.resume(returning: .allow(alwaysAllow: alwaysAllow)) },
+                        deny: { continuation.resume(returning: .deny) }
+                    )
+                }
+            }
         }
 
         // Register wake observer if not already registered
@@ -455,28 +473,42 @@ final actor ServerController: ObservableObject {
     /// Approval requests are handled in strict FIFO order: exactly one active request at a time.
     private func requestApproval(
         clientID: String,
-        approve: @escaping () -> Void,
+        approve: @escaping (Bool) -> Void,
+        deny: @escaping () -> Void
+    ) async {
+        await requestApproval(
+            presentation: .local(clientID: clientID),
+            approve: approve,
+            deny: deny
+        )
+    }
+
+    private func requestApproval(
+        presentation: MCPApprovalPresentation,
+        approve: @escaping (Bool) -> Void,
         deny: @escaping () -> Void
     ) async {
         // Single-flight guard: queue while another approval is active.
         if currentApprovalCallbacks != nil {
-            pendingApprovals.append((clientID, approve, deny))
+            pendingApprovals.append((presentation, approve, deny))
             return
         }
-        await beginApprovalRequest(clientID: clientID, approve: approve, deny: deny)
+        await beginApprovalRequest(presentation: presentation, approve: approve, deny: deny)
     }
 
     /// Starts a single active approval request and schedules its timeout watchdog.
     private func beginApprovalRequest(
-        clientID: String,
-        approve: @escaping () -> Void,
+        presentation: MCPApprovalPresentation,
+        approve: @escaping (Bool) -> Void,
         deny: @escaping () -> Void
     ) async {
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
+        let clientID = presentation.clientID
         pendingConnectionID = clientID
         activeApprovalDialogs.insert(clientID)
         currentApprovalCallbacks = (approve, deny)
+        currentApprovalPresentation = presentation
         approvalGeneration &+= 1
 
         let expectedClientID = clientID
@@ -491,7 +523,11 @@ final actor ServerController: ObservableObject {
             )
         }
 
-        await onApprovalRequest?(clientID)
+        if let onApprovalPresentationRequest {
+            await onApprovalPresentationRequest(presentation)
+        } else {
+            await onApprovalRequest?(clientID)
+        }
     }
 
     /// Starts the next queued approval request, if any.
@@ -499,8 +535,8 @@ final actor ServerController: ObservableObject {
         guard currentApprovalCallbacks == nil else { return }
         guard pendingConnectionID == nil else { return }
         guard !pendingApprovals.isEmpty else { return }
-        let (nextClientID, approve, deny) = pendingApprovals.removeFirst()
-        await beginApprovalRequest(clientID: nextClientID, approve: approve, deny: deny)
+        let (nextPresentation, approve, deny) = pendingApprovals.removeFirst()
+        await beginApprovalRequest(presentation: nextPresentation, approve: approve, deny: deny)
     }
 
     /// Handle approval timeout - auto-deny the active request and any queued duplicates for that client.
@@ -512,12 +548,13 @@ final actor ServerController: ObservableObject {
         approvalTimeoutTask?.cancel()
         approvalTimeoutTask = nil
         currentApprovalCallbacks = nil
+        currentApprovalPresentation = nil
         pendingConnectionID = nil
         activeApprovalDialogs.remove(clientID)
         deny()
 
         // Also auto-deny queued requests for the same client to avoid backlog/slot buildup.
-        while let idx = pendingApprovals.firstIndex(where: { $0.0 == clientID }) {
+        while let idx = pendingApprovals.firstIndex(where: { $0.0.clientID == clientID }) {
             let (_, _, queuedDeny) = pendingApprovals.remove(at: idx)
             queuedDeny()
         }
@@ -537,7 +574,8 @@ final actor ServerController: ObservableObject {
     }
 
     /// Store current approval callbacks
-    private var currentApprovalCallbacks: (() -> Void, () -> Void)?
+    private var currentApprovalCallbacks: ((Bool) -> Void, () -> Void)?
+    private var currentApprovalPresentation: MCPApprovalPresentation?
 
     /// Called by MCPService when the UI has made a decision.
     func resolvePendingApproval(allow: Bool, alwaysAllow: Bool = false) async {
@@ -557,10 +595,13 @@ final actor ServerController: ObservableObject {
 
         if allow {
             // If user selected "always allow", add to the persistent list
-            if alwaysAllow, let clientID = resolvedClientID {
+            if alwaysAllow,
+               currentApprovalPresentation?.transport == .localMCP,
+               let clientID = resolvedClientID
+            {
                 addAlwaysAllowed(clientID: clientID)
             }
-            approve()
+            approve(alwaysAllow)
         } else {
             deny()
         }
@@ -568,14 +609,15 @@ final actor ServerController: ObservableObject {
         // Process any queued approvals for the same client.
         // Coalescing same-client decisions prevents continuation leaks on reconnect storms.
         if let clientID = resolvedClientID {
-            while let idx = pendingApprovals.firstIndex(where: { $0.0 == clientID }) {
-                let (_, a, d) = pendingApprovals.remove(at: idx)
-                allow ? a() : d()
+            while let idx = pendingApprovals.firstIndex(where: { $0.0.clientID == clientID }) {
+                let (_, approveQueued, denyQueued) = pendingApprovals.remove(at: idx)
+                allow ? approveQueued(alwaysAllow) : denyQueued()
             }
             activeApprovalDialogs.remove(clientID)
         }
 
         currentApprovalCallbacks = nil
+        currentApprovalPresentation = nil
         pendingConnectionID = nil
 
         // Notify resolution callback if needed

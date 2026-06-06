@@ -94,6 +94,9 @@ actor MCPService: Sendable {
             await controller.setApprovalCallback { [weak self] clientID in
                 await self?.setPendingApproval(clientID)
             }
+            await controller.setApprovalPresentationCallback { [weak self] presentation in
+                await self?.setPendingApproval(presentation)
+            }
             await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
             }
