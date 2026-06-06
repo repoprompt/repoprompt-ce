@@ -266,27 +266,21 @@ private struct GitWorktreeIncludeFixture {
     }
 
     private static func runGit(_ arguments: [String], cwd: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(decoding: data, as: UTF8.self)
-        guard process.terminationStatus == 0 else {
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "GitWorktreeIncludeCopyTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(text)"]
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
     }

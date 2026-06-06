@@ -1383,7 +1383,7 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
-        snapshotForSessionID: (UUID) -> AgentRunMCPSnapshot?
+        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, registration: AgentRunSessionStore.Registration)?
     ) async {
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
         guard !sessionIDs.isEmpty else {
@@ -1392,11 +1392,15 @@ final class MCPServerViewModel: ObservableObject {
         }
         steeringDebugLog("[AgentRunSteeringWake] parent wake child agent_run waiters source=\(source) parentRunID=\(runID) childSessions=\(sessionIDs.map(\.uuidString).sorted().joined(separator: ",")) active=\(debugActiveTools(for: runID))")
         for sessionID in sessionIDs {
-            guard let snapshot = snapshotForSessionID(sessionID) else {
+            guard let publication = publicationForSessionID(sessionID) else {
                 steeringDebugLog("[AgentRunSteeringWake] parent wake skipped missing child snapshot source=\(source) parentRunID=\(runID) childSessionID=\(sessionID)")
                 continue
             }
-            await AgentRunSessionStore.wakeCurrentWaiters(snapshot, reason: .steeringRequested)
+            await AgentRunSessionStore.wakeCurrentWaiters(
+                publication.snapshot,
+                registration: publication.registration,
+                reason: .steeringRequested
+            )
         }
         await Task.yield()
         steeringDebugLog("[AgentRunSteeringWake] parent wake yielded source=\(source) parentRunID=\(runID)")
@@ -1407,7 +1411,7 @@ final class MCPServerViewModel: ObservableObject {
         runID: UUID,
         source: String,
         timeoutSeconds: TimeInterval,
-        snapshotForSessionID: (UUID) -> AgentRunMCPSnapshot?
+        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, registration: AgentRunSessionStore.Registration)?
     ) async -> Bool {
         guard hasActiveChildAgentRunWaits(runID: runID) else {
             steeringDebugLog("[AgentRunSteeringWake] parent drain fast-idle source=\(source) parentRunID=\(runID)")
@@ -1419,7 +1423,7 @@ final class MCPServerViewModel: ObservableObject {
             await wakeAgentRunWaitersOwnedByActiveRun(
                 runID: runID,
                 source: source,
-                snapshotForSessionID: snapshotForSessionID
+                publicationForSessionID: publicationForSessionID
             )
 
             guard hasActiveChildAgentRunWaits(runID: runID) else {

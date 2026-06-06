@@ -180,6 +180,42 @@ import Foundation
             }
         }
 
+        static func recordConversationReplay(
+            _ metrics: AgentConversationReplayMetrics,
+            startMS: Double?
+        ) {
+            guard isEnabled else { return }
+            var fields: [String: String] = [
+                "mode": metrics.mode.rawValue,
+                "turnCount": String(metrics.turnCount),
+                "examinedRowCount": String(metrics.examinedRowCount),
+                "unboundedOutputUTF8Bytes": String(metrics.unboundedOutputUTF8Bytes),
+                "outputUTF8Bytes": String(metrics.outputUTF8Bytes),
+                "userAuthoredUTF8Bytes": String(metrics.userAuthoredUTF8Bytes),
+                "originalToolArgumentCharacters": String(metrics.originalToolArgumentCharacters),
+                "emittedToolArgumentCharacters": String(metrics.emittedToolArgumentCharacters),
+                "truncatedToolCallCount": String(metrics.truncatedToolCallCount),
+                "omittedRowCount": String(metrics.omittedRowCount),
+                "essentialOverflowUTF8Bytes": String(metrics.essentialOverflowUTF8Bytes),
+                "finalOverBudgetUTF8Bytes": String(metrics.finalOverBudgetUTF8Bytes)
+            ]
+            for category in AgentConversationReplayCategory.allCases {
+                let categoryMetrics = metrics.categories[category] ?? .init()
+                fields["\(category.rawValue).examined"] = String(categoryMetrics.examinedCount)
+                fields["\(category.rawValue).emitted"] = String(categoryMetrics.emittedCount)
+                fields["\(category.rawValue).omitted"] = String(categoryMetrics.omittedCount)
+                fields["\(category.rawValue).unboundedUTF8Bytes"] = String(categoryMetrics.unboundedUTF8Bytes)
+                fields["\(category.rawValue).emittedUTF8Bytes"] = String(categoryMetrics.emittedUTF8Bytes)
+            }
+            durationEvent("conversationReplay.serialize", startMS: startMS, fields: fields)
+            increment("conversationReplay.serialize.\(metrics.mode.rawValue)")
+            increment("conversationReplay.truncatedToolCalls", by: metrics.truncatedToolCallCount)
+            increment("conversationReplay.omittedRows", by: metrics.omittedRowCount)
+            if metrics.essentialOverflowUTF8Bytes > 0 {
+                increment("conversationReplay.essentialOverflow")
+            }
+        }
+
         static func recordStoreUpdate(_ store: String, published: Bool, details: [String: String] = [:]) {
             guard isEnabled else { return }
             increment("store.\(store).called")
@@ -350,6 +386,7 @@ import Foundation
                 "structured_event_dropped_count": structuredDropped,
                 "session_snapshot_limit": sessionSnapshotLimit,
                 "pending_sidebar_delete_count": pendingSidebarDeleteCount,
+                "mcp_long_thread_baseline_inventory": MCPAgentLongThreadBaselineInventory.debugSnapshot,
                 "lines": lines,
                 "counters": countersSnapshot,
                 "latest_session_snapshots": sessionSnapshots

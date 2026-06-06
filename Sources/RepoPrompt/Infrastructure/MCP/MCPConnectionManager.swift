@@ -117,6 +117,7 @@ protocol MCPServerConnection: Actor {
     func connectionState() -> ConnectionStateSnapshot
     func isViableForRetention() -> Bool
     func secondsSinceLastActivity() async -> TimeInterval
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot?
     /// Whether this is a legacy filesystem-backed connection (deprecated)
     nonisolated var isFilesystemBacked: Bool { get }
     /// Legacy: connection folder URL for filesystem connections
@@ -746,6 +747,13 @@ actor ServerNetworkManager {
             let windowID: Int?
             let state: String?
             let reason: String?
+            let transportIngress: MCPTransportIngressSnapshot?
+        }
+
+        private struct DebugRetainedTransportIngress {
+            let snapshot: MCPTransportIngressSnapshot
+            let clientName: String?
+            let sessionToken: String?
         }
 
         private struct DebugRestartStatus {
@@ -758,11 +766,16 @@ actor ServerNetworkManager {
         private var debugConnectionHistory: [DebugConnectionEvent] = []
         private var debugConnectionHistorySeq: UInt64 = 0
         private var debugRestartStatesByID: [UUID: DebugRestartStatus] = [:]
+        private var debugRetainedTransportIngressByConnectionID: [UUID: DebugRetainedTransportIngress] = [:]
+        private var debugRetainedTransportIngressOrder: [UUID] = []
+        private var debugRecordedTransportTerminalConnectionIDs: Set<UUID> = []
         private let debugConnectionHistoryLimit = 1000
+        private let debugRetainedTransportIngressLimit = 100
         private let debugRestartStatusLimit = 50
     #endif
 
     private var connections: [UUID: any MCPServerConnection] = [:]
+    private var connectionsBeingRemoved: Set<UUID> = []
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
@@ -3829,7 +3842,49 @@ actor ServerNetworkManager {
         await terminateConnection(oldID, reason: .connectionReplaced, message: message, semanticsOverride: hardSemantics)
     }
 
+    func recordTransportIngressTerminal(
+        connectionID: UUID,
+        clientName: String?,
+        sessionToken: String?,
+        snapshot: MCPTransportIngressSnapshot
+    ) {
+        guard snapshot.terminalCause == .receiveBufferOverflow else { return }
+        log.error(
+            "MCP connection \(connectionID) ingress terminated: cause=\(MCPTransportTerminalCause.receiveBufferOverflow.rawValue) capacity=\(snapshot.receiveBufferCapacity) highWaterMark=\(snapshot.receiveBufferHighWaterMark)"
+        )
+        #if DEBUG
+            let retained = DebugRetainedTransportIngress(
+                snapshot: snapshot,
+                clientName: clientName,
+                sessionToken: sessionToken
+            )
+            debugRetainedTransportIngressByConnectionID[connectionID] = retained
+            debugRetainedTransportIngressOrder.removeAll { $0 == connectionID }
+            debugRetainedTransportIngressOrder.append(connectionID)
+            while debugRetainedTransportIngressOrder.count > debugRetainedTransportIngressLimit {
+                let expiredID = debugRetainedTransportIngressOrder.removeFirst()
+                debugRetainedTransportIngressByConnectionID.removeValue(forKey: expiredID)
+                debugRecordedTransportTerminalConnectionIDs.remove(expiredID)
+            }
+            if debugRecordedTransportTerminalConnectionIDs.insert(connectionID).inserted {
+                debugRecordConnectionEvent(
+                    "transport_terminal",
+                    connectionID: connectionID,
+                    reason: MCPTransportTerminalCause.receiveBufferOverflow.rawValue,
+                    clientName: clientName,
+                    sessionToken: sessionToken,
+                    transportIngress: snapshot
+                )
+            }
+        #endif
+    }
+
     func removeConnection(_ id: UUID) async {
+        guard !connectionsBeingRemoved.contains(id) else {
+            connectionLog("removeConnection: \(id) cleanup already in progress; ignoring duplicate call")
+            return
+        }
+
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
         if let reservation = bootstrapReservations.removeValue(forKey: id) {
@@ -3847,6 +3902,9 @@ actor ServerNetworkManager {
             connectionLog("removeConnection: \(id) already removed; ignoring duplicate call")
             return
         }
+
+        connectionsBeingRemoved.insert(id)
+        defer { connectionsBeingRemoved.remove(id) }
 
         connectionLog("Removing connection: \(id)")
 
@@ -4849,7 +4907,8 @@ actor ServerNetworkManager {
                 state: String? = nil,
                 clientName overrideClientName: String? = nil,
                 sessionToken overrideSessionToken: String? = nil,
-                windowID overrideWindowID: Int? = nil
+                windowID overrideWindowID: Int? = nil,
+                transportIngress: MCPTransportIngressSnapshot? = nil
             ) {
                 debugConnectionHistorySeq &+= 1
                 let resolvedClientName = overrideClientName ?? connectionID.flatMap { clientIdentifier(forConnection: $0) }
@@ -4866,12 +4925,26 @@ actor ServerNetworkManager {
                     sessionFingerprint: debugSessionFingerprint(forToken: resolvedSessionToken),
                     windowID: overrideWindowID ?? connectionID.flatMap { connectionWindowMap[$0] },
                     state: resolvedState,
-                    reason: reason
+                    reason: reason,
+                    transportIngress: transportIngress
                 )
                 debugConnectionHistory.append(entry)
                 if debugConnectionHistory.count > debugConnectionHistoryLimit {
                     debugConnectionHistory.removeFirst(debugConnectionHistory.count - debugConnectionHistoryLimit)
                 }
+            }
+
+            private nonisolated func debugTransportIngressObject(
+                _ snapshot: MCPTransportIngressSnapshot
+            ) -> [String: Any] {
+                [
+                    "receive_capacity": snapshot.receiveBufferCapacity,
+                    "accepted_frames": snapshot.acceptedFrameCount,
+                    "dropped_frames": snapshot.droppedFrameCount,
+                    "receive_high_water_mark": snapshot.receiveBufferHighWaterMark,
+                    "terminal": snapshot.isTerminal,
+                    "terminal_cause": snapshot.terminalCause?.rawValue ?? NSNull()
+                ]
             }
 
             private func debugHistoryObject(_ event: DebugConnectionEvent) -> [String: Any] {
@@ -4887,7 +4960,8 @@ actor ServerNetworkManager {
                     "session_fingerprint": event.sessionFingerprint ?? NSNull(),
                     "window_id": event.windowID ?? NSNull(),
                     "state": event.state ?? NSNull(),
-                    "reason": event.reason ?? NSNull()
+                    "reason": event.reason ?? NSNull(),
+                    "transport_ingress": event.transportIngress.map(debugTransportIngressObject) ?? NSNull()
                 ]
             }
 
@@ -5055,6 +5129,48 @@ actor ServerNetworkManager {
                 ]
             }
 
+            func debugTransportIngressSnapshotPayload(
+                currentConnectionID: UUID,
+                requestedConnectionID: UUID?
+            ) async -> [String: Any] {
+                let targetID = requestedConnectionID ?? currentConnectionID
+                if let connection = connections[targetID],
+                   let snapshot = await connection.transportIngressSnapshot()
+                {
+                    return [
+                        "ok": true,
+                        "op": "transport_snapshot",
+                        "current_connection_id": currentConnectionID.uuidString,
+                        "requested_connection_id": targetID.uuidString,
+                        "present": true,
+                        "active": true,
+                        "ingress": debugTransportIngressObject(snapshot)
+                    ]
+                }
+                if let retained = debugRetainedTransportIngressByConnectionID[targetID] {
+                    return [
+                        "ok": true,
+                        "op": "transport_snapshot",
+                        "current_connection_id": currentConnectionID.uuidString,
+                        "requested_connection_id": targetID.uuidString,
+                        "present": true,
+                        "active": false,
+                        "client_name": retained.clientName ?? NSNull(),
+                        "session_fingerprint": debugSessionFingerprint(forToken: retained.sessionToken) ?? NSNull(),
+                        "ingress": debugTransportIngressObject(retained.snapshot)
+                    ]
+                }
+                return [
+                    "ok": true,
+                    "op": "transport_snapshot",
+                    "current_connection_id": currentConnectionID.uuidString,
+                    "requested_connection_id": targetID.uuidString,
+                    "present": false,
+                    "active": false,
+                    "ingress": NSNull()
+                ]
+            }
+
             func debugConnectionSnapshotPayload(
                 currentConnectionID: UUID,
                 requestedConnectionID: UUID?,
@@ -5145,6 +5261,9 @@ actor ServerNetworkManager {
             func debugClearConnectionHistoryPayload() -> [String: Any] {
                 let removed = debugConnectionHistory.count
                 debugConnectionHistory.removeAll()
+                debugRetainedTransportIngressByConnectionID.removeAll()
+                debugRetainedTransportIngressOrder.removeAll()
+                debugRecordedTransportTerminalConnectionIDs.removeAll()
                 return [
                     "ok": true,
                     "op": "clear_connection_history",

@@ -101,6 +101,20 @@ import MCP
             ))
         }
 
+        func debugTransportIngressSnapshotToolPayload(
+            op: String,
+            connectionID: UUID,
+            arguments: [String: Value]
+        ) async -> CallTool.Result {
+            guard let requestedID = debugOptionalUUID(arguments, "connection_id", op: op) else {
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "connection_id must be a UUID string when provided.")
+            }
+            return await debugDiagnosticsResult(debugTransportIngressSnapshotPayload(
+                currentConnectionID: connectionID,
+                requestedConnectionID: requestedID
+            ))
+        }
+
         func debugRoutingSnapshotToolPayload(
             op: String,
             connectionID: UUID,

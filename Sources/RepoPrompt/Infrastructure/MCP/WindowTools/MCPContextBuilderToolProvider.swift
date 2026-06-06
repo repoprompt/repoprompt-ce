@@ -221,10 +221,20 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID
+        let mcpControlToken = try await MainActor.run {
+            try contextBuilderVM.beginMCPControlledRun(
+                forTabID: finalTabID,
+                responseType: responseType?.rawValue,
+                planModelName: nil
+            )
+        }
 
         return try await AsyncScope.withCleanup({}, cleanup: {
             await MainActor.run {
-                contextBuilderVM.clearMCPControlledRun(forTabID: tabIDForCleanup)
+                contextBuilderVM.clearMCPControlledRun(
+                    forTabID: tabIDForCleanup,
+                    controlToken: mcpControlToken
+                )
             }
         }) {
             let wantsResponse = responseType?.wantsResponse ?? false
@@ -290,7 +300,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         agentOverride: preferredAgent,
                         modelOverrideRaw: preferredModelRaw,
                         responseType: responseType?.rawValue,
-                        planModelName: planModelName
+                        planModelName: planModelName,
+                        mcpControlToken: mcpControlToken
                     )
                 }
 

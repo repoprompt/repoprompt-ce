@@ -29,6 +29,8 @@ import MCP
                 return await debugDiagnosticsResult(debugPingPayload(connectionID: connectionID, op: op, arguments: arguments))
             case "connection_snapshot":
                 return await debugConnectionSnapshotToolPayload(op: op, connectionID: connectionID, arguments: arguments)
+            case "transport_snapshot":
+                return await debugTransportIngressSnapshotToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "routing_snapshot":
                 return await debugRoutingSnapshotToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "connection_history":

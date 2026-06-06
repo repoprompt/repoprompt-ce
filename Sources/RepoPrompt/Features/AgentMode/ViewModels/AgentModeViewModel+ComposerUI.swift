@@ -69,7 +69,7 @@ extension AgentModeViewModel {
             if let session {
                 guard !session.runState.isActive,
                       session.runID == nil,
-                      session.activeHeadlessRunAttemptID == nil
+                      session.activeRunAttemptID == nil
                 else { return nil }
             }
             route = .createAgentSessionFromSourceTab
@@ -77,7 +77,7 @@ extension AgentModeViewModel {
 
         let expectedRunState = session?.runState ?? .idle
         let expectedRunID = session?.runID
-        let expectedRunAttemptID = session?.activeHeadlessRunAttemptID
+        let expectedRunAttemptID = session?.activeRunAttemptID
         guard !expectedRunState.isActive || expectedRunID != nil else { return nil }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         return AgentComposerSubmitTarget(
@@ -92,6 +92,9 @@ extension AgentModeViewModel {
     }
 
     func syncComposerUIState(tabID: UUID? = nil) {
+        #if DEBUG
+            test_syncComposerCallCount += 1
+        #endif
         ui.composer.update(makeComposerProps(tabID: tabID))
     }
 

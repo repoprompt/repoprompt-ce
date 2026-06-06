@@ -388,7 +388,11 @@ struct AgentRunMCPToolService {
         let metadata = await captureRequestMetadata()
         let initialSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
         for snapshot in initialSnapshots where snapshot.status == .running {
-            await reconcileStoreForBlockingWait(sessionID: snapshot.sessionID, currentSnapshot: snapshot)
+            await reconcileStoreForBlockingWait(
+                sessionID: snapshot.sessionID,
+                currentSnapshot: snapshot,
+                agentModeVM: agentModeVM
+            )
         }
         print("[AgentRunSteeringWake] agent_run wait-any begin sessions=\(sessionIDs.map(\.uuidString).joined(separator: ",")) timeout=\(timeoutSeconds) initial=\(statusSummary(initialSnapshots))")
 
@@ -491,7 +495,7 @@ struct AgentRunMCPToolService {
             "cancelling",
             "Cancelling the agent run..."
         ) {
-            await agentModeVM.cancelAgentRun(tabID: session.tabID, waitForCleanup: true)
+            await agentModeVM.cancelAgentRun(tabID: session.tabID, completion: .terminalPublished)
             await Task.yield()
             return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
         }
@@ -514,7 +518,9 @@ struct AgentRunMCPToolService {
         {
             // Clear stale snapshot before dispatching so that a previous turn's terminal
             // snapshot doesn't cause waitUntilInteresting to return immediately.
-            await AgentRunSessionStore.resetSnapshotForNewTurn(sessionID: sessionID)
+            guard await agentModeVM.rotateMCPWaitRegistrationForNewTurn(sessionID: sessionID) != nil else {
+                throw MCPError.invalidParams("This session control handle is no longer active.")
+            }
             delivery = try await agentModeVM.mcpDispatchInstruction(
                 sessionID: sessionID,
                 text: text,
@@ -527,7 +533,9 @@ struct AgentRunMCPToolService {
             // Mark follow-up pending so mcpSnapshot(for:) returns .running during the
             // async gap before the new run actually starts.  Also clear the store so
             // the previous turn's terminal snapshot doesn't block new snapshots.
-            await AgentRunSessionStore.resetSnapshotForNewTurn(sessionID: sessionID)
+            guard await agentModeVM.rotateMCPWaitRegistrationForNewTurn(sessionID: sessionID) != nil else {
+                throw MCPError.invalidParams("This session control handle is no longer active.")
+            }
             agentModeVM.setMCPFollowUpRunPending(sessionID: sessionID, true)
             let metadata = await captureRequestMetadata()
             // Carry forward the existing task label kind so `prepareCodexController()`
@@ -588,7 +596,9 @@ struct AgentRunMCPToolService {
                     // previous/startup turn immediately after local dispatch. Reset the store
                     // so the steer waiter blocks for the provider's steering result instead
                     // of returning old output as if it came from the new instruction.
-                    await AgentRunSessionStore.resetSnapshotForNewTurn(sessionID: sessionID)
+                    guard await agentModeVM.rotateMCPWaitRegistrationForNewTurn(sessionID: sessionID) != nil else {
+                        throw MCPError.invalidParams("This session control handle is no longer active.")
+                    }
                 }
                 return try await waitForInterestingState(
                     sessionID: sessionID,
@@ -643,12 +653,19 @@ struct AgentRunMCPToolService {
         initialDelivery: AgentModeViewModel.MCPInstructionDispatch? = nil,
         liveSnapshot: AgentRunMCPSnapshot? = nil
     ) async throws -> Value {
+        guard var registration = agentModeVM.mcpRegistration(sessionID: sessionID) else {
+            throw MCPError.invalidParams("This session control handle is no longer active.")
+        }
         // Defensive reconciliation: if live state says running but the store
         // still holds a stale terminal/interesting snapshot from a previous run,
         // reset the store epoch so waitUntilInteresting blocks on the new run
         // instead of returning immediately with stale state.
         if let liveSnapshot, liveSnapshot.status == .running {
-            await reconcileStoreForBlockingWait(sessionID: sessionID, currentSnapshot: liveSnapshot)
+            registration = await reconcileStoreForBlockingWait(
+                registration: registration,
+                currentSnapshot: liveSnapshot,
+                agentModeVM: agentModeVM
+            ) ?? registration
         }
         print("[AgentRunSteeringWake] agent_run wait entering sessionID=\(sessionID) stage=\(stage) timeout=\(timeoutSeconds)")
         let waitScopeToken = await beginAgentRunWait(metadata, [sessionID], timeoutSeconds)
@@ -661,7 +678,10 @@ struct AgentRunMCPToolService {
                 stage,
                 message
             ) {
-                let disposition = await AgentRunSessionStore.waitUntilInteresting(sessionID: sessionID, timeoutSeconds: timeoutSeconds)
+                let disposition = await AgentRunSessionStore.waitUntilInteresting(
+                    registration: registration,
+                    timeoutSeconds: timeoutSeconds
+                )
                 switch disposition {
                 case let .snapshotReady(triggeringSnapshot):
                     print("[AgentRunSteeringWake] agent_run wait returning snapshotReady sessionID=\(sessionID) status=\(triggeringSnapshot.status.rawValue)")
@@ -679,7 +699,11 @@ struct AgentRunMCPToolService {
                 case .timedOut:
                     print("[AgentRunSteeringWake] agent_run wait returning timedOut sessionID=\(sessionID)")
                     completionBox.set(AgentRunWaitScopeCompletion(reason: .timedOut, result: "timed_out", winnerSessionID: nil, pendingSessionIDs: [sessionID], errorDescription: nil))
-                    return await currentSnapshot(sessionID: sessionID, agentModeVM: agentModeVM).toValue()
+                    return await currentSnapshot(
+                        sessionID: sessionID,
+                        registration: agentModeVM.mcpRegistration(sessionID: sessionID) ?? registration,
+                        agentModeVM: agentModeVM
+                    ).toValue()
                 case .expired:
                     print("[AgentRunSteeringWake] agent_run wait returning expired sessionID=\(sessionID)")
                     completionBox.set(AgentRunWaitScopeCompletion(reason: .expired, result: "expired", winnerSessionID: nil, pendingSessionIDs: [sessionID], errorDescription: nil))
@@ -783,7 +807,6 @@ struct AgentRunMCPToolService {
         guard !snapshots.isEmpty else { return nil }
 
         if let ready = snapshots.first(where: { isInterestingSnapshot($0) && $0.status != .expired }) {
-            await AgentRunSessionStore.signalSnapshot(ready)
             return decoratedMultiWaitValue(
                 snapshot: ready,
                 sessionIDs: sessionIDs,
@@ -883,7 +906,6 @@ struct AgentRunMCPToolService {
             let liveSnapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
             latestSnapshots = liveSnapshots
             if let ready = liveSnapshots.first(where: { isInterestingSnapshot($0) }) {
-                await AgentRunSessionStore.signalSnapshot(ready)
                 return decoratedMultiWaitValue(
                     snapshot: ready,
                     sessionIDs: sessionIDs,
@@ -892,7 +914,11 @@ struct AgentRunMCPToolService {
                 )
             }
             for snapshot in liveSnapshots where snapshot.status == .running {
-                await reconcileStoreForBlockingWait(sessionID: snapshot.sessionID, currentSnapshot: snapshot)
+                await reconcileStoreForBlockingWait(
+                    sessionID: snapshot.sessionID,
+                    currentSnapshot: snapshot,
+                    agentModeVM: agentModeVM
+                )
             }
 
             let remaining = Self.timeInterval(from: clock.now.duration(to: deadline))
@@ -908,7 +934,14 @@ struct AgentRunMCPToolService {
             }
 
             let sliceTimeout = min(remaining, waitAnyLiveReconcileIntervalSeconds)
-            let result = await waitUntilFirstActionable(sessionIDs: sessionIDs, timeoutSeconds: sliceTimeout)
+            let registrations = await MainActor.run {
+                sessionIDs.compactMap { agentModeVM.mcpRegistration(sessionID: $0) }
+            }
+            let result = await waitUntilFirstActionable(
+                registrations: registrations,
+                fallbackSessionID: sessionIDs[0],
+                timeoutSeconds: sliceTimeout
+            )
             switch result.disposition {
             case let .actionable(snapshot):
                 let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
@@ -935,7 +968,6 @@ struct AgentRunMCPToolService {
             case .expired:
                 let snapshots = await collectCurrentSnapshots(sessionIDs: sessionIDs, agentModeVM: agentModeVM)
                 if let ready = snapshots.first(where: { isInterestingSnapshot($0) }) {
-                    await AgentRunSessionStore.signalSnapshot(ready)
                     return decoratedMultiWaitValue(
                         snapshot: ready,
                         sessionIDs: sessionIDs,
@@ -964,17 +996,18 @@ struct AgentRunMCPToolService {
     }
 
     private nonisolated func waitUntilFirstActionable(
-        sessionIDs: [UUID],
+        registrations: [AgentRunSessionStore.Registration],
+        fallbackSessionID: UUID,
         timeoutSeconds: TimeInterval
     ) async -> WaitAnyResult {
         await withTaskGroup(of: WaitAnyResult.self) { group in
-            for sessionID in sessionIDs {
+            for registration in registrations {
                 group.addTask {
-                    await Self.waitUntilActionable(sessionID: sessionID, timeoutSeconds: timeoutSeconds)
+                    await Self.waitUntilActionable(registration: registration, timeoutSeconds: timeoutSeconds)
                 }
             }
             guard let result = await group.next() else {
-                return WaitAnyResult(sessionID: sessionIDs[0], disposition: .timedOut)
+                return WaitAnyResult(sessionID: fallbackSessionID, disposition: .expired)
             }
             if isTimedOutDisposition(result.disposition) {
                 while let nextResult = await group.next() {
@@ -991,9 +1024,10 @@ struct AgentRunMCPToolService {
     }
 
     private nonisolated static func waitUntilActionable(
-        sessionID: UUID,
+        registration: AgentRunSessionStore.Registration,
         timeoutSeconds: TimeInterval
     ) async -> WaitAnyResult {
+        let sessionID = registration.sessionID
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(timeoutSeconds))
         while true {
@@ -1005,7 +1039,7 @@ struct AgentRunMCPToolService {
                 return WaitAnyResult(sessionID: sessionID, disposition: .timedOut)
             }
             let disposition = await AgentRunSessionStore.waitUntilInteresting(
-                sessionID: sessionID,
+                registration: registration,
                 timeoutSeconds: remaining
             )
             switch disposition {
@@ -1045,7 +1079,10 @@ struct AgentRunMCPToolService {
             sessionID: UUID,
             timeoutSeconds: TimeInterval
         ) async -> (disposition: String, wakeReason: String?, sessionID: UUID, snapshotStatus: String?) {
-            let result = await waitUntilActionable(sessionID: sessionID, timeoutSeconds: timeoutSeconds)
+            guard let registration = await AgentRunSessionStore.currentRegistration(for: sessionID) else {
+                return ("expired", nil, sessionID, nil)
+            }
+            let result = await waitUntilActionable(registration: registration, timeoutSeconds: timeoutSeconds)
             switch result.disposition {
             case let .actionable(snapshot):
                 return ("actionable", nil, result.sessionID, snapshot.status.rawValue)
@@ -1404,14 +1441,33 @@ struct AgentRunMCPToolService {
     /// on the new run instead of returning immediately.
     private func reconcileStoreForBlockingWait(
         sessionID: UUID,
-        currentSnapshot: AgentRunMCPSnapshot
+        currentSnapshot: AgentRunMCPSnapshot,
+        agentModeVM: AgentModeViewModel
     ) async {
-        guard currentSnapshot.status == .running else { return }
-        guard let storedSnapshot = await AgentRunSessionStore.snapshot(for: sessionID) else { return }
+        guard let registration = agentModeVM.mcpRegistration(sessionID: sessionID) else { return }
+        _ = await reconcileStoreForBlockingWait(
+            registration: registration,
+            currentSnapshot: currentSnapshot,
+            agentModeVM: agentModeVM
+        )
+    }
+
+    private func reconcileStoreForBlockingWait(
+        registration: AgentRunSessionStore.Registration,
+        currentSnapshot: AgentRunMCPSnapshot,
+        agentModeVM: AgentModeViewModel
+    ) async -> AgentRunSessionStore.Registration? {
+        guard currentSnapshot.status == .running else { return registration }
+        guard let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) else { return registration }
         let isStaleInteresting = storedSnapshot.isActionableForMCPWait
-        guard isStaleInteresting else { return }
-        await AgentRunSessionStore.resetSnapshotForNewTurn(sessionID: sessionID)
-        await AgentRunSessionStore.signalSnapshot(currentSnapshot)
+        guard isStaleInteresting else { return registration }
+        guard let replacement = await agentModeVM.rotateMCPWaitRegistrationForNewTurn(
+            sessionID: registration.sessionID
+        ) else {
+            return nil
+        }
+        await AgentRunSessionStore.signalSnapshot(currentSnapshot, registration: replacement)
+        return replacement
     }
 
     private func collectCurrentSnapshots(sessionIDs: [UUID], agentModeVM: AgentModeViewModel) async -> [AgentRunMCPSnapshot] {
@@ -1431,14 +1487,21 @@ struct AgentRunMCPToolService {
         snapshots.filter { !isInterestingSnapshot($0) }.map(\.sessionID)
     }
 
-    private func currentSnapshot(sessionID: UUID, agentModeVM: AgentModeViewModel) async -> AgentRunMCPSnapshot {
+    private func currentSnapshot(
+        sessionID: UUID,
+        registration suppliedRegistration: AgentRunSessionStore.Registration? = nil,
+        agentModeVM: AgentModeViewModel
+    ) async -> AgentRunMCPSnapshot {
         if let providedSnapshot = await currentSnapshotProvider?(sessionID, agentModeVM) {
             return providedSnapshot
         }
-        if let liveSnapshot = agentModeVM.mcpSnapshot(sessionID: sessionID) {
+        guard let registration = suppliedRegistration ?? agentModeVM.mcpRegistration(sessionID: sessionID) else {
+            return .expired(sessionID: sessionID)
+        }
+        if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot
         }
-        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: sessionID) {
+        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
             return storedSnapshot
         }
         return .expired(sessionID: sessionID)

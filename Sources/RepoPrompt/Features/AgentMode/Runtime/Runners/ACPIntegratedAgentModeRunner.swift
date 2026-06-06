@@ -9,10 +9,12 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private let hooks: AgentModeRunService.Hooks
+    private let terminalCommitBarrier: AgentRunTerminalCommitBarrier
     private let toolTrackingHooks: AgentToolTrackingHooks
     private let providerFactory: AgentModeViewModel.ACPProviderFactory
     private let controllerFactory: AgentModeViewModel.ACPControllerFactory
     private var toolTrackingByTabID: [UUID: AgentToolTrackingController] = [:]
+    private var toolTrackingRunIDByTabID: [UUID: UUID] = [:]
     private var acpProviderInvocationByTrackerInvocationIDByTabID: [UUID: [UUID: UUID]] = [:]
     private var acpProviderPlaceholderInvocationIDsByTabID: [UUID: Set<UUID>] = [:]
 
@@ -68,11 +70,13 @@ final class ACPIntegratedAgentModeRunner {
 
     init(
         hooks: AgentModeRunService.Hooks,
+        terminalCommitBarrier: AgentRunTerminalCommitBarrier,
         toolTrackingHooks: AgentToolTrackingHooks,
         providerFactory: @escaping AgentModeViewModel.ACPProviderFactory,
         controllerFactory: @escaping AgentModeViewModel.ACPControllerFactory
     ) {
         self.hooks = hooks
+        self.terminalCommitBarrier = terminalCommitBarrier
         self.toolTrackingHooks = toolTrackingHooks
         self.providerFactory = providerFactory
         self.controllerFactory = controllerFactory
@@ -99,8 +103,9 @@ final class ACPIntegratedAgentModeRunner {
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
 
-        let runAttemptID = UUID()
-        session.activeHeadlessRunAttemptID = runAttemptID
+        let ownership = session.beginRunAttempt(source: "acp")
+        let runAttemptID = ownership.attemptID
+        session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .preparingRuntime)
         session.runState = .running
         hooks.setAgentRunActive(tabID, true)
         setRunningStatus(initialTransportStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
@@ -116,6 +121,9 @@ final class ACPIntegratedAgentModeRunner {
                let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session)
             {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+                session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] _ in
+                    self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+                }
                 session.agentTask = Task { [weak self, weak session] in
                     guard let self, let session else { return }
                     if let clientNameHint = runRequest.agentKind.mcpClientNameHint {
@@ -133,27 +141,7 @@ final class ACPIntegratedAgentModeRunner {
                             runRequest: runRequest,
                             attachmentReservationID: attachmentReservationID
                         )
-                    } onCancel: {
-                        Task { @MainActor [weak self, weak session] in
-                            guard let self, let session else { return }
-                            guard session.acpController === existingController,
-                                  session.runID == runID,
-                                  session.activeHeadlessRunAttemptID == runAttemptID
-                            else {
-                                return
-                            }
-                            await existingController.cancelPrompt()
-                            guard session.acpController === existingController,
-                                  session.runID == runID,
-                                  session.activeHeadlessRunAttemptID == runAttemptID,
-                                  session.runState.isActive
-                            else {
-                                return
-                            }
-                            await existingController.shutdown()
-                            await stopToolTracking(for: session)
-                        }
-                    }
+                    } onCancel: {}
                 }
                 return
             }
@@ -168,7 +156,7 @@ final class ACPIntegratedAgentModeRunner {
         guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
 
         guard let provider = providerFactory(runRequest.agentKind, runRequest.modelString) else {
-            failBeforeProviderSend(
+            await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
                 runID: runID,
@@ -182,7 +170,7 @@ final class ACPIntegratedAgentModeRunner {
         do {
             controller = try controllerFactory(provider, freshRunRequest)
         } catch {
-            failBeforeProviderSend(
+            await failBeforeProviderSend(
                 tabID: tabID,
                 session: session,
                 runID: runID,
@@ -195,6 +183,20 @@ final class ACPIntegratedAgentModeRunner {
 
         await controller.setExpectedMCPRunID(runID)
         session.acpController = controller
+        session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
+            let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+            return {
+                await trackerTeardown?()
+                switch terminalState {
+                case .failed:
+                    await lease.failAndRelease()
+                case .cancelled:
+                    await lease.cancelAndCleanup()
+                default:
+                    break
+                }
+            }
+        }
         session.agentTask = Task { [weak self, weak session] in
             guard let self, let session else { return }
             if let clientNameHint = runRequest.agentKind.mcpClientNameHint {
@@ -213,21 +215,7 @@ final class ACPIntegratedAgentModeRunner {
                     lease: lease,
                     attachmentReservationID: attachmentReservationID
                 )
-            } onCancel: {
-                Task { @MainActor [weak self, weak session] in
-                    await controller.cancelPrompt()
-                    await lease.cancelAndCleanup()
-                    guard let self, let session else { return }
-                    guard session.acpController === controller,
-                          session.runID == runID,
-                          session.activeHeadlessRunAttemptID == runAttemptID
-                    else {
-                        return
-                    }
-                    await controller.shutdown()
-                    await stopToolTracking(for: session)
-                }
-            }
+            } onCancel: {}
         }
     }
 
@@ -247,11 +235,11 @@ final class ACPIntegratedAgentModeRunner {
               controller === targetController,
               let runID = session.runID,
               runID == targetRunID,
-              let runAttemptID = session.activeHeadlessRunAttemptID,
+              let runAttemptID = session.activeRunAttemptID,
               runAttemptID == targetRunAttemptID
         else {
             let diagnosticRunID = session.runID ?? targetRunID ?? UUID()
-            log("active prompt preflight rejected selected=\(session.selectedAgent.rawValue) request=\(runRequest.agentKind.rawValue) state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)", runID: diagnosticRunID)
+            log("active prompt preflight rejected selected=\(session.selectedAgent.rawValue) request=\(runRequest.agentKind.rawValue) state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)", runID: diagnosticRunID)
             return false
         }
         guard await controller.isCompatibleWith(request: runRequest) else {
@@ -260,10 +248,10 @@ final class ACPIntegratedAgentModeRunner {
         }
         guard session.runState == .running,
               session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID,
+              session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
         else {
-            log("active prompt preflight became stale after compatibility check state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeHeadlessRunAttemptID))", runID: runID)
+            log("active prompt preflight became stale after compatibility check state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) attempt=\(String(describing: session.activeRunAttemptID))", runID: runID)
             return false
         }
 
@@ -286,10 +274,10 @@ final class ACPIntegratedAgentModeRunner {
 
         guard session.runState == .running,
               session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID,
+              session.activeRunAttemptID == runAttemptID,
               session.acpController === controller
         else {
-            log("active steering became stale after interrupt state=\(session.runState.rawValue) currentRunID=\(String(describing: session.runID)) currentAttempt=\(String(describing: session.activeHeadlessRunAttemptID))", runID: runID)
+            log("active steering became stale after interrupt state=\(session.runState.rawValue) currentRunID=\(String(describing: session.runID)) currentAttempt=\(String(describing: session.activeRunAttemptID))", runID: runID)
             return false
         }
 
@@ -309,7 +297,7 @@ final class ACPIntegratedAgentModeRunner {
             // A successful prompt return means the steering prompt was delivered and
             // completed at the ACP layer. The event consumer may already have handled
             // the terminal and finalized the run, so do not require the original
-            // activeHeadlessRunAttemptID to still be present here.
+            // activeRunAttemptID to still be present here.
             return true
         } catch {
             let identity = await controller.refreshProviderSessionIdentityAfterPromptInterruption()
@@ -326,7 +314,7 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID? = nil,
         runAttemptID: UUID
     ) -> Bool {
-        guard session.activeHeadlessRunAttemptID == runAttemptID,
+        guard session.activeRunAttemptID == runAttemptID,
               session.runState.isActive
         else {
             return false
@@ -338,28 +326,36 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func failBeforeProviderSend(
-        tabID: UUID,
+        tabID _: UUID,
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         runAttemptID: UUID,
         attachmentReservationID: UUID?,
         errorText: String
-    ) {
-        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
-        session.activeHeadlessRunAttemptID = nil
-        session.agentTask = nil
-        session.acpController = nil
-        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        session.runState = .failed
-        setRunningStatus(nil, source: nil, session: session, urgent: true)
+    ) async {
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID
+        else { return }
         hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-        hooks.setAgentRunActive(tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-        let errorItem = AgentChatItem.error(errorText, sequenceIndex: session.nextSequenceIndex)
-        session.appendItem(errorItem)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .failed,
+            source: "acp.startupFailure",
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                session.acpController = nil
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                return nil
+            }
+        ))
     }
 
     private func startFreshRun(
@@ -381,13 +377,13 @@ final class ACPIntegratedAgentModeRunner {
         let acquired = await lease.acquire()
         guard acquired else {
             log("lease acquire failed", runID: runID)
-            await controller.shutdown()
-            await stopToolTracking(for: session)
             await handleAcquireFailure(
                 tabID: tabID,
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
+                controller: controller,
+                lease: lease,
                 attachmentReservationID: attachmentReservationID
             )
             return
@@ -398,7 +394,7 @@ final class ACPIntegratedAgentModeRunner {
             let bootstrap = try await controller.bootstrap()
             log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 await controller.shutdown()
                 return
@@ -426,16 +422,16 @@ final class ACPIntegratedAgentModeRunner {
             let routed = await lease.releaseWhenRouted()
             log("releaseWhenRouted routed=\(routed)", runID: runID)
             guard routed else {
-                await controller.shutdown()
-                await stopToolTracking(for: session)
                 await finalize(
                     session: session,
                     runID: runID,
                     runAttemptID: runAttemptID,
+                    controller: controller,
                     attachmentReservationID: attachmentReservationID,
                     terminalState: .failed,
                     errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
-                    notifyTurnComplete: false
+                    notifyTurnComplete: false,
+                    shouldShutdownController: true
                 )
                 return
             }
@@ -453,24 +449,31 @@ final class ACPIntegratedAgentModeRunner {
             )
         } catch is CancellationError {
             log("fresh start cancelled", runID: runID)
-            await controller.shutdown()
-            await stopToolTracking(for: session)
-            await lease.cancelAndCleanup()
-        } catch {
-            let normalized = await controller.normalizeError(error)
-            let normalizedText = displayText(for: normalized)
-            log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await controller.shutdown()
-            await stopToolTracking(for: session)
-            await lease.failAndRelease()
             await finalize(
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .cancelled,
+                errorText: nil,
+                notifyTurnComplete: false,
+                shouldShutdownController: true
+            )
+        } catch {
+            let normalized = await controller.normalizeError(error)
+            let normalizedText = displayText(for: normalized)
+            log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
                 attachmentReservationID: attachmentReservationID,
                 terminalState: .failed,
                 errorText: normalizedText,
-                notifyTurnComplete: false
+                notifyTurnComplete: false,
+                shouldShutdownController: true
             )
         }
     }
@@ -488,17 +491,16 @@ final class ACPIntegratedAgentModeRunner {
     ) async {
         do {
             guard await controller.hasReusableSession else {
-                await controller.shutdown()
-                session.acpController = nil
-                await stopToolTracking(for: session)
                 await finalize(
                     session: session,
                     runID: runID,
                     runAttemptID: runAttemptID,
+                    controller: controller,
                     attachmentReservationID: attachmentReservationID,
                     terminalState: .failed,
                     errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
-                    notifyTurnComplete: false
+                    notifyTurnComplete: false,
+                    shouldShutdownController: true
                 )
                 return
             }
@@ -519,22 +521,31 @@ final class ACPIntegratedAgentModeRunner {
                 prepareControllerForNextTurn: true
             )
         } catch is CancellationError {
-            await controller.shutdown()
-            await stopToolTracking(for: session)
-        } catch {
-            let normalized = await controller.normalizeError(error)
-            let normalizedText = displayText(for: normalized)
-            log("continue failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await controller.shutdown()
-            await stopToolTracking(for: session)
             await finalize(
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
+                controller: controller,
+                attachmentReservationID: attachmentReservationID,
+                terminalState: .cancelled,
+                errorText: nil,
+                notifyTurnComplete: false,
+                shouldShutdownController: true
+            )
+        } catch {
+            let normalized = await controller.normalizeError(error)
+            let normalizedText = displayText(for: normalized)
+            log("continue failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
+            await finalize(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                controller: controller,
                 attachmentReservationID: attachmentReservationID,
                 terminalState: .failed,
                 errorText: normalizedText,
-                notifyTurnComplete: false
+                notifyTurnComplete: false,
+                shouldShutdownController: true
             )
         }
     }
@@ -565,16 +576,16 @@ final class ACPIntegratedAgentModeRunner {
         if prepareControllerForNextTurn {
             let prepared = await controller.prepareForNextTurn()
             guard prepared else {
-                await controller.shutdown()
-                await stopToolTracking(for: session)
                 await finalize(
                     session: session,
                     runID: runID,
                     runAttemptID: runAttemptID,
+                    controller: controller,
                     attachmentReservationID: attachmentReservationID,
                     terminalState: .failed,
                     errorText: "\(runRequest.agentKind.displayName) ACP session is no longer reusable.",
-                    notifyTurnComplete: false
+                    notifyTurnComplete: false,
+                    shouldShutdownController: true
                 )
                 return
             }
@@ -604,18 +615,18 @@ final class ACPIntegratedAgentModeRunner {
             let normalizedError = await controller.normalizeError(error)
             let normalizedText = displayText(for: normalizedError)
             log("controller.prompt failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)
-            await controller.shutdown()
-            await stopToolTracking(for: session)
             let outcome = await consumeTask.value
             let errorText = promptFailureErrorText(outcome: outcome, fallback: normalizedText)
             await finalize(
                 session: session,
                 runID: runID,
                 runAttemptID: runAttemptID,
+                controller: controller,
                 attachmentReservationID: attachmentReservationID,
                 terminalState: .failed,
                 errorText: errorText,
-                notifyTurnComplete: false
+                notifyTurnComplete: false,
+                shouldShutdownController: true
             )
             return
         }
@@ -623,18 +634,16 @@ final class ACPIntegratedAgentModeRunner {
         let outcome = await consumeTask.value
         let outcomeErrorDescription = outcome.errorText ?? "nil"
         log("event consumer completed state=\(outcome.terminalState.rawValue) error=\(outcomeErrorDescription)", runID: runID)
-        if outcome.terminalState != .completed {
-            await controller.shutdown()
-        }
-        await stopToolTracking(for: session)
         await finalize(
             session: session,
             runID: runID,
             runAttemptID: runAttemptID,
+            controller: controller,
             attachmentReservationID: attachmentReservationID,
             terminalState: outcome.terminalState,
             errorText: outcome.errorText,
-            notifyTurnComplete: outcome.terminalState == .completed
+            notifyTurnComplete: outcome.terminalState == .completed,
+            shouldShutdownController: outcome.terminalState != .completed
         )
     }
 
@@ -717,13 +726,19 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         runAttemptID: UUID
     ) async -> ConsumeEventsOutcome {
+        if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+            session.recordRunProgress(ownership: ownership, kind: .stageTransition, stage: .running)
+        }
         for await event in events {
             guard session.runID == runID,
-                  session.activeHeadlessRunAttemptID == runAttemptID
+                  session.activeRunAttemptID == runAttemptID
             else {
                 return ConsumeEventsOutcome(terminalState: .cancelled, errorText: nil)
             }
 
+            if let ownership = session.activeRunOwnership, ownership.attemptID == runAttemptID {
+                session.recordRunProgress(ownership: ownership, kind: .providerEvent, stage: .running)
+            }
             switch event {
             case let .stream(result):
                 await hooks.handleHeadlessStreamResult(result, session, runID, runAttemptID)
@@ -761,110 +776,88 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func handleAcquireFailure(
-        tabID: UUID,
+        tabID _: UUID,
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         runAttemptID: UUID,
+        controller: ACPAgentSessionController,
+        lease _: MCPBootstrapLease,
         attachmentReservationID: UUID?
     ) async {
-        guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
-        else {
-            return
-        }
-        session.activeHeadlessRunAttemptID = nil
-        session.agentTask = nil
-        session.acpController = nil
-        AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        session.runState = .cancelled
-        setRunningStatus(nil, source: nil, session: session, urgent: true)
+        guard let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID
+        else { return }
         hooks.recordPendingHandoffSendOutcome(session, false)
-        hooks.setAgentRunActive(tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-        hooks.updateBindings(session)
-        hooks.scheduleSave(session.tabID)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "acp.acquireFailure",
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                if session.acpController === controller {
+                    session.acpController = nil
+                }
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                return { await controller.shutdown() }
+            }
+        ))
     }
 
     private func finalize(
         session: AgentModeViewModel.TabSession,
         runID: UUID,
         runAttemptID: UUID,
+        controller: ACPAgentSessionController?,
         attachmentReservationID: UUID?,
         terminalState: AgentSessionRunState,
         errorText: String?,
-        notifyTurnComplete: Bool
+        notifyTurnComplete: Bool,
+        shouldShutdownController: Bool
     ) async {
         let finalizeErrorDescription = errorText ?? "nil"
         log("finalize requested state=\(terminalState.rawValue) error=\(finalizeErrorDescription)", runID: runID)
-        guard session.runID == runID,
-              session.activeHeadlessRunAttemptID == runAttemptID
+        guard let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID
         else {
             log("finalize ignored; session no longer owns run", runID: runID)
             return
         }
-
-        hooks.finalizeStreamingItems(session)
-        hooks.finalizePendingToolCalls(session, terminalState)
-        hooks.finalizeNonCodexTurnUsage(session, nil, nil, nil)
-        let supportsSessionResume = session.acpController != nil
-        let queuedInstruction = (terminalState == .completed && supportsSessionResume)
-            ? session.pendingInstructions.first
-            : nil
-        if queuedInstruction != nil {
-            session.mcpFollowUpRunPending = true
-            session.pendingInstructions.removeFirst()
-        }
-        session.activeHeadlessRunAttemptID = nil
-        session.agentTask = nil
-        session.pendingSupersedingTurnCompletions = 0
-        if terminalState != .completed {
-            session.acpController = nil
-            // Keep providerSessionID bound to this RepoPrompt agent session even
-            // after cancellation/failure; resetting it silently starts a new provider
-            // conversation and loses prior state.
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        } else if session.acpController == nil {
-            // Completed but controller was already cleared (shouldn't happen normally)
-            AgentModeProcessRunIdentity.clearProcessRunID(for: session)
-        }
-        // When acpController is kept alive (completed), preserve runID so the next
-        // turn reuses the same MCP connection → runID mapping for tool tracking.
-        session.runState = terminalState
-        setRunningStatus(nil, source: nil, session: session, urgent: true)
-        hooks.cancelPendingQuestion(session)
-        hooks.cancelPendingApproval(session)
-        let pendingReviewCancellationReason = switch terminalState {
-        case .completed:
-            "Run completed before review decision"
-        case .cancelled:
-            "Run cancelled"
-        case .failed:
-            "Run failed"
-        default:
-            "Run finished"
-        }
-        hooks.cancelPendingApplyEditsReview(session, pendingReviewCancellationReason)
-        hooks.cancelPendingWorktreeMergeReview(session, pendingReviewCancellationReason)
-        hooks.setAgentRunActive(session.tabID, false)
-        hooks.finalizeAttachmentsForTurn(session, attachmentReservationID, .deleteFiles)
-
-        if let errorText {
-            let trimmed = errorText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty {
-                let errorItem = AgentChatItem.error(trimmed, sequenceIndex: session.nextSequenceIndex)
-                session.appendItem(errorItem)
+        let supportsSessionResume = terminalState == .completed && controller != nil
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: terminalState,
+            source: "acp.finalize",
+            errorText: errorText,
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: supportsSessionResume,
+            notifyTurnComplete: notifyTurnComplete,
+            prepareProviderState: {
+                session.pendingSupersedingTurnCompletions = 0
+                if terminalState != .completed {
+                    if let controller, session.acpController === controller {
+                        session.acpController = nil
+                    }
+                    AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                } else if session.acpController == nil {
+                    AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                }
+                return {
+                    if shouldShutdownController, let controller {
+                        await controller.shutdown()
+                    }
+                }
             }
-        }
-
-        hooks.updateBindings(session)
-        if notifyTurnComplete {
-            hooks.notifyAgentTurnComplete(session)
-        }
-        hooks.scheduleSave(session.tabID)
-
-        if let queuedInstruction {
-            hooks.startFollowUpRun(session.tabID, queuedInstruction)
-        }
+        ))
     }
 
     // MARK: - Tool Tracking (per-tab, using shared AgentToolTrackingController)
@@ -874,10 +867,12 @@ final class ACPIntegratedAgentModeRunner {
         runID: UUID,
         clientNameHint: String
     ) async {
+        guard session.runID == runID, session.runState.isActive else { return }
         #if DEBUG
             print("[ACPAgentRunToolTracking] ACP startToolTracking session=\(session.activeAgentSessionID?.uuidString ?? "nil") tab=\(session.tabID.uuidString) agent=\(session.selectedAgent.rawValue) runID=\(runID.uuidString) clientHint=\(clientNameHint)")
         #endif
         resetACPToolCorrelation(for: session.tabID)
+        toolTrackingRunIDByTabID[session.tabID] = runID
         let controller = toolTrackingByTabID[session.tabID] ?? {
             let c = AgentToolTrackingController()
             toolTrackingByTabID[session.tabID] = c
@@ -897,10 +892,17 @@ final class ACPIntegratedAgentModeRunner {
         )
     }
 
-    private func stopToolTracking(for session: AgentModeViewModel.TabSession) async {
-        guard let controller = toolTrackingByTabID.removeValue(forKey: session.tabID) else { return }
+    private func prepareToolTrackingTeardown(
+        for session: AgentModeViewModel.TabSession,
+        matchingRunID: UUID? = nil
+    ) -> AgentRunAttemptTerminalResources.Teardown? {
+        if let matchingRunID, toolTrackingRunIDByTabID[session.tabID] != matchingRunID {
+            return nil
+        }
+        toolTrackingRunIDByTabID.removeValue(forKey: session.tabID)
+        guard let controller = toolTrackingByTabID.removeValue(forKey: session.tabID) else { return nil }
         resetACPToolCorrelation(for: session.tabID)
-        await controller.stopTracking()
+        return { await controller.stopTracking() }
     }
 
     private func setRunningStatus(

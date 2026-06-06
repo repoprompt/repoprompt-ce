@@ -689,7 +689,7 @@ extension AgentModeViewModel {
     }
 
     private func worktreeMergeSession(sessionID: UUID) throws -> TabSession {
-        guard let session = sessions.values.first(where: { $0.activeAgentSessionID == sessionID }) else {
+        guard let session = try authoritativeLiveSession(for: sessionID) else {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         return session

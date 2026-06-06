@@ -55,7 +55,7 @@
             session.runningStatusText = nil
             session.runState = .idle
             session.runID = nil
-            session.activeHeadlessRunAttemptID = nil
+            session.endCurrentRunAttempt(source: "stress.reset")
             session.provider = nil
             session.agentTask?.cancel()
             session.agentTask = nil
@@ -139,8 +139,18 @@
             urgentUIRefresh: Bool = true
         ) {
             let session = session(for: tabID)
-            applyAssistantDelta(delta, session: session)
-            requestUIRefresh(tabID: tabID, urgent: urgentUIRefresh)
+            let fullBindingSyncCount = test_updateBindingsCallCount
+            guard applyAssistantDelta(delta, session: session) else { return }
+            session.assistantDeltaFlushGeneration &+= 1
+            requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
+            if urgentUIRefresh {
+                test_flushPendingUIRefresh()
+                assert(test_updateBindingsCallCount == fullBindingSyncCount)
+            }
         }
 
         func testFinalizeStreamingAssistant(
@@ -148,8 +158,18 @@
             urgentUIRefresh: Bool = true
         ) {
             let session = session(for: tabID)
+            let fullBindingSyncCount = test_updateBindingsCallCount
             endActiveAssistantSegment(session)
-            requestUIRefresh(tabID: tabID, urgent: urgentUIRefresh)
+            session.assistantDeltaFlushGeneration &+= 1
+            requestAssistantPresentationRefresh(
+                session: session,
+                sourceItemsRevision: session.sourceItemsRevision,
+                flushGeneration: session.assistantDeltaFlushGeneration
+            )
+            if urgentUIRefresh {
+                test_flushPendingUIRefresh()
+                assert(test_updateBindingsCallCount == fullBindingSyncCount)
+            }
         }
 
         func testSetStressRunState(
@@ -421,7 +441,7 @@
                 guard let workspace = test_workspaceManager?.activeWorkspace else {
                     throw StressHarnessPersistenceError.noActiveWorkspace
                 }
-                guard var tab = test_workspaceManager?.composeTab(with: tabID) else {
+                guard test_workspaceManager?.composeTab(with: tabID) != nil else {
                     throw StressHarnessPersistenceError.missingComposeTab(tabID)
                 }
 
@@ -432,8 +452,6 @@
                 let fileURL = try await test_dataService.saveAgentSession(agentSession, for: workspace)
                 agentSession.fileURL = fileURL
 
-                tab.activeAgentSessionID = agentSession.id
-                test_workspaceManager?.updateComposeTabStoredOnly(tab)
                 upsertSessionIndex(
                     sessionID: agentSession.id,
                     tabID: tabID,
@@ -448,10 +466,15 @@
                     autoEditEnabled: agentSession.autoEditEnabled
                 )
 
-                if let liveSession = session(for: tabID, createIfNeeded: false) {
+                let liveSession = session(for: tabID)
+                _ = test_installPersistentSessionBinding(
+                    sessionID: agentSession.id,
+                    on: liveSession,
+                    updateWorkspaceMetadata: true
+                )
+                if liveSession.activeAgentSessionID == agentSession.id {
                     cancelPersistedLoad(for: liveSession)
                     removePendingUIRefresh(for: tabID)
-                    liveSession.activeAgentSessionID = agentSession.id
                     liveSession.hasLoadedPersistedState = false
                     applyTranscriptViewportBindingState(
                         to: liveSession,

@@ -89,7 +89,7 @@ final class AgentModeWorkspaceSwitchSessionProvider: WorkspaceSwitchSessionProvi
         guard let agentModeViewModel else { return }
         let activeTabs = agentModeViewModel.tabsWithActiveAgentRun
         for tabID in activeTabs {
-            await agentModeViewModel.cancelAgentRun(tabID: tabID, waitForCleanup: false)
+            await agentModeViewModel.cancelAgentRun(tabID: tabID, completion: .terminalPublished)
         }
     }
 

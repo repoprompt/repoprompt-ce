@@ -451,7 +451,7 @@ struct AgentManageMCPToolService {
             guard let sessionID = target.sessionID else {
                 throw MCPError.internalError("Failed to resolve created agent session ID.")
             }
-            await agentModeVM.mcpActivateControlContext(
+            try await agentModeVM.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
                 originatingConnectionID: metadata.connectionID,
@@ -510,7 +510,7 @@ struct AgentManageMCPToolService {
         )
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
         do {
-            await agentModeVM.mcpActivateControlContext(
+            try await agentModeVM.mcpActivateControlContext(
                 forTabID: target.tabID,
                 sessionID: sessionID,
                 originatingConnectionID: metadata.connectionID,
@@ -526,8 +526,10 @@ struct AgentManageMCPToolService {
             try await bindCurrentRequestToTab(target.tabID, metadata)
         } catch {
             if !hadMatchingMCPControl {
-                await agentModeVM.mcpDeactivateControlContext(sessionID: sessionID)
-                await AgentRunSessionStore.cleanup(sessionID: sessionID)
+                await agentModeVM.mcpDeactivateControlContext(
+                    sessionID: sessionID,
+                    cleanupSessionStore: true
+                )
             }
             await agentModeVM.mcpDiscardSessionTarget(target)
             throw error
@@ -577,7 +579,7 @@ struct AgentManageMCPToolService {
         let session = await agentModeVM.ensureSessionReady(tabID: target.tabID)
         let wasActive = session.runState.isActive
         if wasActive {
-            await agentModeVM.cancelAgentRun(tabID: target.tabID, waitForCleanup: false)
+            await agentModeVM.cancelAgentRun(tabID: target.tabID, completion: .terminalPublished)
             await Task.yield()
         }
 
@@ -629,7 +631,7 @@ struct AgentManageMCPToolService {
 
         for sessionID in requestedIDs {
             let candidate: CleanupSessionCandidate?
-            if let liveSession = agentModeVM.sessions.values.first(where: { $0.activeAgentSessionID == sessionID }) {
+            if let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) {
                 let snapshotStatus = agentModeVM.mcpSnapshot(for: liveSession)?.status
                 let isEffectivelyActive = snapshotStatus.map { !$0.isTerminal }
                     ?? (
@@ -855,9 +857,8 @@ struct AgentManageMCPToolService {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
-           let liveSession = agentModeVM.sessions.values.first(where: {
-               $0.activeAgentSessionID == referenceUUID
-           }), let sessionID = liveSession.activeAgentSessionID
+           let liveSession = try agentModeVM.authoritativeLiveSession(for: referenceUUID),
+           let sessionID = liveSession.activeAgentSessionID
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = agentModeVM.sessionIndex[sessionID]?.name
@@ -878,9 +879,8 @@ struct AgentManageMCPToolService {
         let normalizedReference = reference.trimmingCharacters(in: .whitespacesAndNewlines)
         let referenceUUID = UUID(uuidString: normalizedReference)
         if let referenceUUID,
-           let liveSession = agentModeVM.sessions.values.first(where: {
-               $0.activeAgentSessionID == referenceUUID
-           }), let sessionID = liveSession.activeAgentSessionID
+           let liveSession = try agentModeVM.authoritativeLiveSession(for: referenceUUID),
+           let sessionID = liveSession.activeAgentSessionID
         {
             let hydrated = await agentModeVM.ensureSessionReady(tabID: liveSession.tabID)
             let liveName = targetWindow.workspaceManager.composeTab(with: hydrated.tabID)?.name

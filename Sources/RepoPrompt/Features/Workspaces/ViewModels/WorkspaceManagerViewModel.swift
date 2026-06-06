@@ -3088,9 +3088,15 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     @discardableResult
-    func setActiveAgentSessionID(_ sessionID: UUID?, forTabID tabID: UUID, inWorkspaceID workspaceID: UUID? = nil) -> Bool {
+    func compareAndSetActiveAgentSessionID(
+        expected expectedSessionID: UUID?,
+        replacement sessionID: UUID?,
+        forTabID tabID: UUID,
+        inWorkspaceID workspaceID: UUID? = nil
+    ) -> Bool {
         for workspaceIndex in workspaces.indices where workspaceID == nil || workspaces[workspaceIndex].id == workspaceID {
             if let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tabID }) {
+                guard workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID == expectedSessionID else { return false }
                 workspaces[workspaceIndex].composeTabs[tabIndex].activeAgentSessionID = sessionID
                 workspaces[workspaceIndex].composeTabs[tabIndex].lastModified = Date()
                 workspaces[workspaceIndex].dateModified = Date()
@@ -3099,6 +3105,7 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
 
             if let stashedIndex = workspaces[workspaceIndex].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
+                guard workspaces[workspaceIndex].stashedTabs[stashedIndex].tab.activeAgentSessionID == expectedSessionID else { return false }
                 workspaces[workspaceIndex].stashedTabs[stashedIndex].tab.activeAgentSessionID = sessionID
                 workspaces[workspaceIndex].stashedTabs[stashedIndex].tab.lastModified = Date()
                 workspaces[workspaceIndex].dateModified = Date()

@@ -2442,7 +2442,7 @@ struct AgentModeChatDetailView: View {
                 onStop: {
                     guard let cancelTarget else { return }
                     Task {
-                        _ = await agentModeVM.cancelAgentRun(target: cancelTarget, waitForCleanup: false)
+                        _ = await agentModeVM.cancelAgentRun(target: cancelTarget, completion: .terminalPublished)
                     }
                 }
             )

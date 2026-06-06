@@ -1,5 +1,31 @@
 import Foundation
 
+enum MCPTransportTerminalCause: String, Equatable {
+    case receiveBufferOverflow = "receive_buffer_overflow"
+}
+
+struct MCPTransportIngressSnapshot: Equatable {
+    let receiveBufferCapacity: Int
+    let acceptedFrameCount: Int
+    let droppedFrameCount: Int
+    let receiveBufferHighWaterMark: Int
+    let isTerminal: Bool
+    let terminalCause: MCPTransportTerminalCause?
+}
+
+struct MCPReceiveBufferOverflowError: Error, Equatable, CustomStringConvertible, LocalizedError {
+    let capacity: Int
+    let highWaterMark: Int
+
+    var description: String {
+        "MCP receive buffer overflow (cause=\(MCPTransportTerminalCause.receiveBufferOverflow.rawValue), capacity=\(capacity), highWaterMark=\(highWaterMark))"
+    }
+
+    var errorDescription: String? {
+        description
+    }
+}
+
 enum MCPServerIssue: Equatable {
     case none
     case localNetworkPermissionDenied

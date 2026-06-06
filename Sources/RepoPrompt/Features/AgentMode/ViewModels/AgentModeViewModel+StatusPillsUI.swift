@@ -99,7 +99,7 @@ extension AgentModeViewModel {
             && !session.hasSentFirstMessage
             && session.runState == .idle
             && session.runID == nil
-            && session.activeHeadlessRunAttemptID == nil
+            && session.activeRunAttemptID == nil
             && session.providerSessionID == nil
             && session.codexConversationID == nil
             && session.worktreeBindings.isEmpty

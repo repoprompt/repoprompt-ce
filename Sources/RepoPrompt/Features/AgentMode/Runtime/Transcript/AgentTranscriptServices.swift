@@ -1,6 +1,64 @@
 import CryptoKit
 import Foundation
 
+enum AgentConversationReplayMode: String, Equatable {
+    case equivalent
+    case bounded
+}
+
+struct AgentConversationReplayBudget: Equatable {
+    let maxOutputUTF8Bytes: Int
+    let maxToolArgumentCharacters: Int
+
+    init(maxOutputUTF8Bytes: Int, maxToolArgumentCharacters: Int) {
+        self.maxOutputUTF8Bytes = max(0, maxOutputUTF8Bytes)
+        self.maxToolArgumentCharacters = max(0, maxToolArgumentCharacters)
+    }
+}
+
+enum AgentConversationReplayPolicy: Equatable {
+    case equivalent
+    case bounded(AgentConversationReplayBudget)
+}
+
+enum AgentConversationReplayCategory: String, CaseIterable, Hashable {
+    case user
+    case assistant
+    case toolCall
+    case toolResult
+    case system
+    case error
+}
+
+struct AgentConversationReplayCategoryMetrics: Equatable {
+    var examinedCount: Int = 0
+    var emittedCount: Int = 0
+    var omittedCount: Int = 0
+    var unboundedUTF8Bytes: Int = 0
+    var emittedUTF8Bytes: Int = 0
+}
+
+struct AgentConversationReplayMetrics: Equatable {
+    let mode: AgentConversationReplayMode
+    let turnCount: Int
+    let examinedRowCount: Int
+    let unboundedOutputUTF8Bytes: Int
+    let outputUTF8Bytes: Int
+    let userAuthoredUTF8Bytes: Int
+    let originalToolArgumentCharacters: Int
+    let emittedToolArgumentCharacters: Int
+    let truncatedToolCallCount: Int
+    let omittedRowCount: Int
+    let essentialOverflowUTF8Bytes: Int
+    let finalOverBudgetUTF8Bytes: Int
+    let categories: [AgentConversationReplayCategory: AgentConversationReplayCategoryMetrics]
+}
+
+struct AgentConversationReplaySerialization: Equatable {
+    let text: String
+    let metrics: AgentConversationReplayMetrics
+}
+
 #if DEBUG
     struct AgentTranscriptProtectedTailScanMetrics: Equatable {
         let transcriptTurnCount: Int
@@ -2657,17 +2715,126 @@ enum AgentTranscriptIO {
         return nil
     }
 
+    private struct ConversationReplayWriter {
+        private(set) var text = ""
+        private(set) var utf8ByteCount = 0
+        private var hasLine = false
+
+        mutating func appendLine(_ line: String) {
+            if hasLine {
+                text.append("\n")
+                utf8ByteCount += 1
+            }
+            text.append(line)
+            utf8ByteCount += line.utf8.count
+            hasLine = true
+        }
+    }
+
+    private enum BoundedReplayOmissionPriority: Int {
+        case conclusionAssistant = 1
+        case context = 2
+        case intermediateAssistant = 3
+        case toolCall = 4
+        case toolResult = 5
+    }
+
+    private struct BoundedReplayItem {
+        let category: AgentConversationReplayCategory
+        let line: String
+        let unboundedLineUTF8Bytes: Int
+        let omissionPriority: BoundedReplayOmissionPriority?
+        let emittedToolArgumentCharacters: Int
+        let toolArgumentsWereTruncated: Bool
+    }
+
     static func buildConversationHistory(
         from transcript: AgentTranscript,
         renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)? = nil
     ) -> String {
-        var lines: [String] = []
+        #if DEBUG
+            let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
+        #endif
+        let serialization = serializeConversationHistory(
+            from: transcript,
+            renderUserMessage: renderUserMessage,
+            policy: .equivalent
+        )
+        #if DEBUG
+            AgentModePerfDiagnostics.recordConversationReplay(
+                serialization.metrics,
+                startMS: startMS
+            )
+        #endif
+        return serialization.text
+    }
+
+    static func serializeConversationHistory(
+        from transcript: AgentTranscript,
+        renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)? = nil,
+        policy: AgentConversationReplayPolicy = .equivalent
+    ) -> AgentConversationReplaySerialization {
+        switch policy {
+        case .equivalent:
+            serializeEquivalentConversationHistory(
+                from: transcript,
+                renderUserMessage: renderUserMessage
+            )
+        case let .bounded(budget):
+            serializeBoundedConversationHistory(
+                from: transcript,
+                renderUserMessage: renderUserMessage,
+                budget: budget
+            )
+        }
+    }
+
+    private static func serializeEquivalentConversationHistory(
+        from transcript: AgentTranscript,
+        renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)?
+    ) -> AgentConversationReplaySerialization {
+        var writer = ConversationReplayWriter()
+        var categories = emptyConversationReplayCategoryMetrics()
+        var examinedRowCount = 0
+        var userAuthoredUTF8Bytes = 0
+        var toolArgumentCharacters = 0
+
+        func recordLine(
+            _ line: String,
+            category: AgentConversationReplayCategory,
+            writer: inout ConversationReplayWriter,
+            categories: inout [AgentConversationReplayCategory: AgentConversationReplayCategoryMetrics]
+        ) {
+            writer.appendLine(line)
+            var metrics = categories[category] ?? .init()
+            metrics.emittedCount += 1
+            metrics.unboundedUTF8Bytes += line.utf8.count
+            metrics.emittedUTF8Bytes += line.utf8.count
+            categories[category] = metrics
+        }
+
         for turn in transcript.turns {
             if let request = turn.request {
+                examinedRowCount += 1
+                var metrics = categories[.user] ?? .init()
+                metrics.examinedCount += 1
+                categories[.user] = metrics
                 let rendered = renderUserMessage?(request) ?? request.text
-                lines.append("<user>\(rendered)</user>")
+                userAuthoredUTF8Bytes += rendered.utf8.count
+                recordLine(
+                    "<user>\(rendered)</user>",
+                    category: .user,
+                    writer: &writer,
+                    categories: &categories
+                )
             }
             for activity in renderableRows(for: turn, includeArchivedPresentation: true) {
+                guard activity.kind != .user else { continue }
+                examinedRowCount += 1
+                guard let category = conversationReplayCategory(for: activity.kind) else { continue }
+                var metrics = categories[category] ?? .init()
+                metrics.examinedCount += 1
+                categories[category] = metrics
                 if AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(activity) {
                     continue
                 }
@@ -2675,32 +2842,348 @@ enum AgentTranscriptIO {
                 case .assistant, .assistantInline:
                     if AgentDisplayableText.hasDisplayableBody(activity.text) {
                         let trimmed = activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                        lines.append("<assistant>\(trimmed)</assistant>")
+                        recordLine(
+                            "<assistant>\(trimmed)</assistant>",
+                            category: .assistant,
+                            writer: &writer,
+                            categories: &categories
+                        )
                     }
                 case .toolCall:
                     if let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) {
                         let args = activity.toolArgsJSON ?? ""
-                        if args.isEmpty {
-                            lines.append("<tool_call name=\"\(toolName)\"/>")
-                        } else {
-                            lines.append("<tool_call name=\"\(toolName)\">\(args)</tool_call>")
-                        }
+                        toolArgumentCharacters += args.count
+                        let line = args.isEmpty
+                            ? "<tool_call name=\"\(toolName)\"/>"
+                            : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
+                        recordLine(
+                            line,
+                            category: .toolCall,
+                            writer: &writer,
+                            categories: &categories
+                        )
                     }
                 case .toolResult:
                     if let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) {
-                        lines.append("<tool_result name=\"\(toolName)\"/>")
+                        recordLine(
+                            "<tool_result name=\"\(toolName)\"/>",
+                            category: .toolResult,
+                            writer: &writer,
+                            categories: &categories
+                        )
                     }
                 case .system:
-                    lines.append("<system>\(activity.text)</system>")
+                    recordLine(
+                        "<system>\(activity.text)</system>",
+                        category: .system,
+                        writer: &writer,
+                        categories: &categories
+                    )
                 case .error:
-                    lines.append("<error>\(activity.text)</error>")
+                    recordLine(
+                        "<error>\(activity.text)</error>",
+                        category: .error,
+                        writer: &writer,
+                        categories: &categories
+                    )
                 case .user, .thinking:
                     break
                 }
             }
         }
-        return lines.joined(separator: "\n")
+
+        return AgentConversationReplaySerialization(
+            text: writer.text,
+            metrics: AgentConversationReplayMetrics(
+                mode: .equivalent,
+                turnCount: transcript.turns.count,
+                examinedRowCount: examinedRowCount,
+                unboundedOutputUTF8Bytes: writer.utf8ByteCount,
+                outputUTF8Bytes: writer.utf8ByteCount,
+                userAuthoredUTF8Bytes: userAuthoredUTF8Bytes,
+                originalToolArgumentCharacters: toolArgumentCharacters,
+                emittedToolArgumentCharacters: toolArgumentCharacters,
+                truncatedToolCallCount: 0,
+                omittedRowCount: 0,
+                essentialOverflowUTF8Bytes: 0,
+                finalOverBudgetUTF8Bytes: 0,
+                categories: categories
+            )
+        )
     }
+
+    private static func serializeBoundedConversationHistory(
+        from transcript: AgentTranscript,
+        renderUserMessage: ((AgentTranscriptRequestAnchor) -> String)?,
+        budget: AgentConversationReplayBudget
+    ) -> AgentConversationReplaySerialization {
+        var items: [BoundedReplayItem] = []
+        var categories = emptyConversationReplayCategoryMetrics()
+        var examinedRowCount = 0
+        var userAuthoredUTF8Bytes = 0
+        var originalToolArgumentCharacters = 0
+        var truncatedToolCallCount = 0
+
+        func appendItem(_ item: BoundedReplayItem) {
+            items.append(item)
+            var metrics = categories[item.category] ?? .init()
+            metrics.emittedCount += 1
+            metrics.unboundedUTF8Bytes += item.unboundedLineUTF8Bytes
+            categories[item.category] = metrics
+        }
+
+        for turn in transcript.turns {
+            if let request = turn.request {
+                examinedRowCount += 1
+                var metrics = categories[.user] ?? .init()
+                metrics.examinedCount += 1
+                categories[.user] = metrics
+                let rendered = renderUserMessage?(request) ?? request.text
+                userAuthoredUTF8Bytes += rendered.utf8.count
+                let line = "<user>\(rendered)</user>"
+                appendItem(BoundedReplayItem(
+                    category: .user,
+                    line: line,
+                    unboundedLineUTF8Bytes: line.utf8.count,
+                    omissionPriority: nil,
+                    emittedToolArgumentCharacters: 0,
+                    toolArgumentsWereTruncated: false
+                ))
+            }
+
+            let rows = renderableRows(for: turn, includeArchivedPresentation: true)
+            let conclusionAssistantID = rows.last(where: { activity in
+                !AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(activity) &&
+                    (activity.kind == .assistant || activity.kind == .assistantInline) &&
+                    AgentDisplayableText.hasDisplayableBody(activity.text)
+            })?.id
+
+            for activity in rows {
+                guard activity.kind != .user else { continue }
+                examinedRowCount += 1
+                guard let category = conversationReplayCategory(for: activity.kind) else { continue }
+                var metrics = categories[category] ?? .init()
+                metrics.examinedCount += 1
+                categories[category] = metrics
+                if AgentTranscriptToolVisibilityPolicy.shouldSuppressRow(activity) {
+                    continue
+                }
+
+                switch activity.kind {
+                case .assistant, .assistantInline:
+                    guard AgentDisplayableText.hasDisplayableBody(activity.text) else { continue }
+                    let trimmed = activity.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let line = "<assistant>\(trimmed)</assistant>"
+                    appendItem(BoundedReplayItem(
+                        category: .assistant,
+                        line: line,
+                        unboundedLineUTF8Bytes: line.utf8.count,
+                        omissionPriority: activity.id == conclusionAssistantID ? .conclusionAssistant : .intermediateAssistant,
+                        emittedToolArgumentCharacters: 0,
+                        toolArgumentsWereTruncated: false
+                    ))
+                case .toolCall:
+                    guard let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) else { continue }
+                    let args = activity.toolArgsJSON ?? ""
+                    let originalCharacterCount = args.count
+                    originalToolArgumentCharacters += originalCharacterCount
+                    let emittedPrefix = String(args.prefix(budget.maxToolArgumentCharacters))
+                    let omittedCharacterCount = max(0, originalCharacterCount - emittedPrefix.count)
+                    let emittedArgs: String = if omittedCharacterCount > 0 {
+                        emittedPrefix + conversationReplayToolArgumentTruncationMarker(
+                            omittedCharacterCount: omittedCharacterCount
+                        )
+                    } else {
+                        args
+                    }
+                    let line = emittedArgs.isEmpty
+                        ? "<tool_call name=\"\(toolName)\"/>"
+                        : "<tool_call name=\"\(toolName)\">\(emittedArgs)</tool_call>"
+                    let unboundedLine = args.isEmpty
+                        ? "<tool_call name=\"\(toolName)\"/>"
+                        : "<tool_call name=\"\(toolName)\">\(args)</tool_call>"
+                    appendItem(BoundedReplayItem(
+                        category: .toolCall,
+                        line: line,
+                        unboundedLineUTF8Bytes: unboundedLine.utf8.count,
+                        omissionPriority: .toolCall,
+                        emittedToolArgumentCharacters: emittedPrefix.count,
+                        toolArgumentsWereTruncated: omittedCharacterCount > 0
+                    ))
+                case .toolResult:
+                    guard let toolName = AgentTranscriptToolVisibilityPolicy.normalizedVisibleToolName(activity.toolName) else { continue }
+                    let line = "<tool_result name=\"\(toolName)\"/>"
+                    appendItem(BoundedReplayItem(
+                        category: .toolResult,
+                        line: line,
+                        unboundedLineUTF8Bytes: line.utf8.count,
+                        omissionPriority: .toolResult,
+                        emittedToolArgumentCharacters: 0,
+                        toolArgumentsWereTruncated: false
+                    ))
+                case .system:
+                    let line = "<system>\(activity.text)</system>"
+                    appendItem(BoundedReplayItem(
+                        category: .system,
+                        line: line,
+                        unboundedLineUTF8Bytes: line.utf8.count,
+                        omissionPriority: .context,
+                        emittedToolArgumentCharacters: 0,
+                        toolArgumentsWereTruncated: false
+                    ))
+                case .error:
+                    let line = "<error>\(activity.text)</error>"
+                    appendItem(BoundedReplayItem(
+                        category: .error,
+                        line: line,
+                        unboundedLineUTF8Bytes: line.utf8.count,
+                        omissionPriority: .context,
+                        emittedToolArgumentCharacters: 0,
+                        toolArgumentsWereTruncated: false
+                    ))
+                case .user, .thinking:
+                    break
+                }
+            }
+        }
+
+        let unboundedOutputUTF8Bytes = conversationReplayOutputUTF8Bytes(
+            lineUTF8Bytes: items.map(\.unboundedLineUTF8Bytes)
+        )
+        let userLineUTF8Bytes = items
+            .filter { $0.category == .user }
+            .map(\.line.utf8.count)
+        let essentialUserOutputUTF8Bytes = conversationReplayOutputUTF8Bytes(
+            lineUTF8Bytes: userLineUTF8Bytes
+        )
+        let essentialOverflowUTF8Bytes = max(
+            0,
+            essentialUserOutputUTF8Bytes - budget.maxOutputUTF8Bytes
+        )
+
+        let omissionCandidates = items.indices
+            .filter { items[$0].omissionPriority != nil }
+            .sorted { lhs, rhs in
+                let lhsPriority = items[lhs].omissionPriority?.rawValue ?? 0
+                let rhsPriority = items[rhs].omissionPriority?.rawValue ?? 0
+                if lhsPriority == rhsPriority {
+                    return lhs < rhs
+                }
+                return lhsPriority > rhsPriority
+            }
+
+        var droppedIndices = Set<Int>()
+        var retainedLineUTF8Bytes = items.reduce(0) { $0 + $1.line.utf8.count }
+        var retainedLineCount = items.count
+
+        func projectedOutputUTF8Bytes() -> Int {
+            let omissionMarkerBytes = droppedIndices.isEmpty
+                ? nil
+                : conversationReplayOmissionMarker(omittedRowCount: droppedIndices.count).utf8.count
+            let essentialMarkerBytes = essentialOverflowUTF8Bytes > 0
+                ? conversationReplayEssentialOverflowMarker.utf8.count
+                : nil
+            let markerBytes = [omissionMarkerBytes, essentialMarkerBytes].compactMap(\.self)
+            return conversationReplayOutputUTF8Bytes(
+                totalLineUTF8Bytes: retainedLineUTF8Bytes + markerBytes.reduce(0, +),
+                lineCount: retainedLineCount + markerBytes.count
+            )
+        }
+
+        for index in omissionCandidates where projectedOutputUTF8Bytes() > budget.maxOutputUTF8Bytes {
+            droppedIndices.insert(index)
+            retainedLineUTF8Bytes -= items[index].line.utf8.count
+            retainedLineCount -= 1
+        }
+
+        var writer = ConversationReplayWriter()
+        var emittedToolArgumentCharacters = 0
+        for (index, item) in items.enumerated() {
+            var metrics = categories[item.category] ?? .init()
+            if droppedIndices.contains(index) {
+                metrics.emittedCount -= 1
+                metrics.omittedCount += 1
+            } else {
+                writer.appendLine(item.line)
+                metrics.emittedUTF8Bytes += item.line.utf8.count
+                emittedToolArgumentCharacters += item.emittedToolArgumentCharacters
+                if item.toolArgumentsWereTruncated {
+                    truncatedToolCallCount += 1
+                }
+            }
+            categories[item.category] = metrics
+        }
+        if !droppedIndices.isEmpty {
+            writer.appendLine(conversationReplayOmissionMarker(omittedRowCount: droppedIndices.count))
+        }
+        if essentialOverflowUTF8Bytes > 0 {
+            writer.appendLine(conversationReplayEssentialOverflowMarker)
+        }
+
+        return AgentConversationReplaySerialization(
+            text: writer.text,
+            metrics: AgentConversationReplayMetrics(
+                mode: .bounded,
+                turnCount: transcript.turns.count,
+                examinedRowCount: examinedRowCount,
+                unboundedOutputUTF8Bytes: unboundedOutputUTF8Bytes,
+                outputUTF8Bytes: writer.utf8ByteCount,
+                userAuthoredUTF8Bytes: userAuthoredUTF8Bytes,
+                originalToolArgumentCharacters: originalToolArgumentCharacters,
+                emittedToolArgumentCharacters: emittedToolArgumentCharacters,
+                truncatedToolCallCount: truncatedToolCallCount,
+                omittedRowCount: droppedIndices.count,
+                essentialOverflowUTF8Bytes: essentialOverflowUTF8Bytes,
+                finalOverBudgetUTF8Bytes: max(0, writer.utf8ByteCount - budget.maxOutputUTF8Bytes),
+                categories: categories
+            )
+        )
+    }
+
+    private static func emptyConversationReplayCategoryMetrics() -> [AgentConversationReplayCategory: AgentConversationReplayCategoryMetrics] {
+        Dictionary(uniqueKeysWithValues: AgentConversationReplayCategory.allCases.map { ($0, .init()) })
+    }
+
+    private static func conversationReplayCategory(
+        for kind: AgentChatItemKind
+    ) -> AgentConversationReplayCategory? {
+        switch kind {
+        case .user: .user
+        case .assistant, .assistantInline: .assistant
+        case .toolCall: .toolCall
+        case .toolResult: .toolResult
+        case .system: .system
+        case .error: .error
+        case .thinking: nil
+        }
+    }
+
+    private static func conversationReplayOutputUTF8Bytes(lineUTF8Bytes: [Int]) -> Int {
+        conversationReplayOutputUTF8Bytes(
+            totalLineUTF8Bytes: lineUTF8Bytes.reduce(0, +),
+            lineCount: lineUTF8Bytes.count
+        )
+    }
+
+    private static func conversationReplayOutputUTF8Bytes(
+        totalLineUTF8Bytes: Int,
+        lineCount: Int
+    ) -> Int {
+        totalLineUTF8Bytes + max(0, lineCount - 1)
+    }
+
+    private static func conversationReplayToolArgumentTruncationMarker(
+        omittedCharacterCount: Int
+    ) -> String {
+        "[replay_tool_arguments_truncated omitted_characters=\(omittedCharacterCount)]"
+    }
+
+    private static func conversationReplayOmissionMarker(omittedRowCount: Int) -> String {
+        "<system>[replay_rows_omitted count=\(omittedRowCount)]</system>"
+    }
+
+    private static let conversationReplayEssentialOverflowMarker =
+        "<system>[replay_budget_exceeded_by_user_text user_text_preserved=true]</system>"
 
     // MARK: - Fork Transcript XML (priority-based budget)
 

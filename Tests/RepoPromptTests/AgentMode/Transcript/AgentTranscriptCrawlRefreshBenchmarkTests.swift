@@ -135,6 +135,20 @@
             let representativeSourceItem = try XCTUnwrap(session.items.first(where: { $0.id == seed.representativeToolResultID }))
             XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: representativeSourceItem.toolResultJSON ?? ""))
 
+            let presentationMark = recorder.mark()
+            let fullBindingSyncCount = viewModel.test_updateBindingsCallCount
+            viewModel.enqueueAssistantDelta("\nCE_CRAWL_PRESENTATION_ONLY_PREFLIGHT", session: session)
+            viewModel.flushPendingAssistantDelta(session)
+            viewModel.test_flushPendingUIRefresh()
+            let presentationMetrics = recorder.slice(since: presentationMark)
+            XCTAssertEqual(presentationMetrics.presentationPublishes.count, 1)
+            XCTAssertEqual(viewModel.test_updateBindingsCallCount, fullBindingSyncCount)
+
+            session.setItemsSilently(seed.items, reason: .testOverride)
+            viewModel.refreshDerivedTranscriptState(for: session)
+            viewModel.applySessionToBindings(session)
+            await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
             var warmups: [CrawlRefreshBenchmarkSample] = []
             for ordinal in 1 ... config.warmupSampleCount {
                 try await warmups.append(runCrawlRefreshBenchmarkSample(

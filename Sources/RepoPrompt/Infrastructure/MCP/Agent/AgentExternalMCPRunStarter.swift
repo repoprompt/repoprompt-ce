@@ -62,7 +62,7 @@ enum AgentExternalMCPRunStarter {
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
-        await agentModeVM.mcpActivateControlContext(
+        try await agentModeVM.mcpActivateControlContext(
             forTabID: target.tabID,
             sessionID: sessionID,
             originatingConnectionID: metadata.connectionID,
@@ -108,8 +108,10 @@ enum AgentExternalMCPRunStarter {
             #endif
             return StartOutcome(snapshot: snapshot, delivery: delivery)
         } catch {
-            await agentModeVM.mcpDeactivateControlContext(sessionID: sessionID)
-            await AgentRunSessionStore.cleanup(sessionID: sessionID)
+            await agentModeVM.mcpDeactivateControlContext(
+                sessionID: sessionID,
+                cleanupSessionStore: true
+            )
             throw error
         }
     }
@@ -118,17 +120,20 @@ enum AgentExternalMCPRunStarter {
         sessionID: UUID,
         agentModeVM: AgentModeViewModel
     ) async -> AgentRunMCPSnapshot {
-        if let liveSnapshot = agentModeVM.mcpSnapshot(sessionID: sessionID) {
+        guard let registration = agentModeVM.mcpRegistration(sessionID: sessionID) else {
+            return .expired(sessionID: sessionID)
+        }
+        if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot
         }
-        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: sessionID) {
+        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
             return storedSnapshot
         }
         await Task.yield()
-        if let liveSnapshot = agentModeVM.mcpSnapshot(sessionID: sessionID) {
+        if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot
         }
-        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: sessionID) {
+        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
             return storedSnapshot
         }
         return .expired(sessionID: sessionID)

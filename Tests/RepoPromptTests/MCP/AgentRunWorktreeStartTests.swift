@@ -79,18 +79,18 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let parentID = UUID()
         let viewModel = makeViewModel(workspacePath: root.path)
         let parent = viewModel.session(for: UUID())
-        parent.activeAgentSessionID = parentID
+        parent.testInstallPersistentSessionBinding(sessionID: parentID)
         parent.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
 
         let inheritedChild = viewModel.session(for: UUID())
-        inheritedChild.activeAgentSessionID = UUID()
+        inheritedChild.testInstallPersistentSessionBinding(sessionID: UUID())
         viewModel.applySpawnParentSessionID(parentID, to: inheritedChild)
         XCTAssertEqual(inheritedChild.parentSessionID, parentID)
         XCTAssertEqual(inheritedChild.worktreeBindings, parent.worktreeBindings)
         XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: inheritedChild), worktree.path)
 
         let optedOutChild = viewModel.session(for: UUID())
-        optedOutChild.activeAgentSessionID = UUID()
+        optedOutChild.testInstallPersistentSessionBinding(sessionID: UUID())
         viewModel.applySpawnParentSessionID(parentID, to: optedOutChild, inheritWorktreeBindings: false)
         XCTAssertEqual(optedOutChild.parentSessionID, parentID)
         XCTAssertTrue(optedOutChild.worktreeBindings.isEmpty)
@@ -115,7 +115,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
                 installParentAgentSession(parentID, binding: parentBinding, sourceTabID: sourceTabID, in: window)
             } else {
                 let source = window.agentModeViewModel.session(for: sourceTabID)
-                source.activeAgentSessionID = parentID
+                source.testInstallPersistentSessionBinding(sessionID: parentID)
                 source.worktreeBindings = [parentBinding]
                 XCTAssertNil(source.mcpControlContext)
             }
@@ -496,7 +496,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let viewModel = makeViewModel(workspacePath: root.path)
         let tabID = UUID()
         let session = viewModel.session(for: tabID)
-        session.activeAgentSessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
         session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)]
@@ -522,12 +522,12 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let tabID = UUID()
         let session = viewModel.session(for: tabID)
         let sessionID = UUID()
-        session.activeAgentSessionID = sessionID
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.hasLoadedPersistedState = true
         session.hasSentFirstMessage = true
         session.runState = .running
         session.runID = UUID()
-        session.activeHeadlessRunAttemptID = UUID()
+        session.beginRunAttempt(source: "test")
         session.providerSessionID = "provider-from-old-cwd"
         session.worktreeBindings = [makeBinding(logicalRoot: root.path, worktreeRoot: oldWorktree.path)]
         session.items = [.user("in-flight prompt", sequenceIndex: 0)]
@@ -535,7 +535,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
             .init(
                 id: UUID(),
                 targetRunID: session.runID,
-                targetRunAttemptID: session.activeHeadlessRunAttemptID,
+                targetRunAttemptID: session.activeRunAttemptID,
                 providerText: "provider-wrapped queued steering",
                 interruptedPromptProviderText: "in-flight prompt",
                 attachments: [],
@@ -575,7 +575,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         let viewModel = makeViewModel(workspacePath: root.path)
         let session = viewModel.session(for: UUID())
         let sessionID = UUID()
-        session.activeAgentSessionID = sessionID
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
         session.runState = .running
         session.runID = UUID()
         session.providerSessionID = "managed-old-identity"
@@ -759,7 +759,10 @@ final class AgentRunWorktreeStartTests: XCTestCase {
                         throw FixtureError.trackedSessionMissing
                     }
                     observeFirstAgentTaskIfNeeded()
-                    await window.agentModeViewModel.cancelAgentRun(tabID: trackedTabID, waitForCleanup: true)
+                    await window.agentModeViewModel.cancelAgentRun(
+                        tabID: trackedTabID,
+                        completion: .terminalTeardownCompleted
+                    )
                     if let firstObservedAgentTask {
                         firstObservedAgentTask.cancel()
                         try await boundedAwaitRetainedAgentTask(firstObservedAgentTask)
@@ -919,7 +922,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         in window: WindowState
     ) {
         let source = window.agentModeViewModel.session(for: sourceTabID)
-        source.activeAgentSessionID = parentID
+        source.testInstallPersistentSessionBinding(sessionID: parentID)
         source.mcpControlContext = makeMCPControlContext(sessionID: parentID)
         source.worktreeBindings = [binding]
     }
@@ -928,6 +931,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         AgentModeViewModel.AgentMCPControlContext(
             sessionID: sessionID,
             activationID: UUID(),
+            registration: .init(sessionID: sessionID, generation: 0),
             originatingConnectionID: nil,
             interactionTransport: .mcp(sessionID: sessionID, originatingConnectionID: nil),
             suppressUserNotifications: false,
@@ -961,27 +965,21 @@ final class AgentRunWorktreeStartTests: XCTestCase {
     }
 
     private func runGit(_ arguments: [String], cwd: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let text = String(decoding: data, as: UTF8.self)
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "AgentRunWorktreeStartTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(text)"]
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
     }

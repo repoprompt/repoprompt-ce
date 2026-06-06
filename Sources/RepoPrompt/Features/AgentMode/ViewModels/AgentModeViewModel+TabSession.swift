@@ -122,6 +122,7 @@ extension AgentModeViewModel {
         var mcpControlContext: AgentMCPControlContext?
         var mcpStateObservationCancellable: AnyCancellable?
         var mcpControlCleanupTask: Task<Void, Never>?
+        var mcpControlActivationGeneration: UInt64 = 0
         var mcpFollowUpRunPendingUpdatedAt: Date?
         var mcpFollowUpRunPending: Bool = false {
             didSet {
@@ -236,7 +237,19 @@ extension AgentModeViewModel {
 
         // Agent run
         var runID: UUID?
-        var activeHeadlessRunAttemptID: UUID?
+        private(set) var runLifecycleTracker = AgentRunLifecycleTracker()
+        var activeRunOwnership: AgentRunOwnership? {
+            runLifecycleTracker.activeOwnership
+        }
+
+        var activeRunAttemptID: UUID? {
+            activeRunOwnership?.attemptID
+        }
+
+        var activeRunLiveness: AgentRunLivenessSnapshot? {
+            runLifecycleTracker.liveness
+        }
+
         var provider: HeadlessAgentProvider?
         var agentTask: Task<Void, Never>?
 
@@ -322,6 +335,14 @@ extension AgentModeViewModel {
         var reasoningItemIDsByGroupID: [String: UUID] = [:]
         var pendingAssistantDelta: String = ""
         var assistantDeltaFlushTask: Task<Void, Never>?
+        var assistantDeltaTaskGeneration: UInt64 = 0
+        var assistantDeltaFlushGeneration: UInt64 = 0
+        var providerTerminalDrainGeneration: UInt64 = 0
+        var terminalCommitInProgress: Bool = false
+        var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
+        var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
+        var codexCurrentTurnID: String?
+        var codexCurrentTurnKind: CodexTurnKind?
 
         /// Handoff payload (injected into provider-facing text on first user send).
         /// Cleared only after the provider accepts the turn.
@@ -332,15 +353,32 @@ extension AgentModeViewModel {
         }
 
         // Persistence
-        var activeAgentSessionID: UUID?
+        private(set) var persistentSessionBindingIdentity: AgentPersistentSessionBindingIdentity?
+        var activeAgentSessionID: UUID? {
+            persistentSessionBindingIdentity?.sessionID
+        }
+
+        private(set) var bindingTransitionGeneration: UInt64 = 0
+        private(set) var bindingTransitionInProgress: Bool = false
+        private(set) var persistenceMutationGeneration: UInt64 = 0
+        var saveRequestGeneration: UInt64 = 0
         var parentSessionID: UUID?
         var hasLoadedPersistedState: Bool = false
+        private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
+        private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
         var persistedLoadTask: Task<Void, Never>?
         var lastActivityAt: Date = .init()
         var lastUserMessageAt: Date?
         var lastCommandOutputSaveAt: Date?
         var saveDebounceTask: Task<Void, Never>?
-        var isDirty: Bool = false
+        var isDirty: Bool = false {
+            didSet {
+                if isDirty {
+                    persistenceMutationGeneration &+= 1
+                }
+            }
+        }
+
         var sourceItemsRevision: Int = 0
         var pendingSourceItemsMutationSummary: PendingSourceItemsMutationSummary?
         var pendingDerivedTranscriptRefreshReason: DerivedTranscriptRefreshReason?
@@ -367,6 +405,232 @@ extension AgentModeViewModel {
 
         init(tabID: UUID) {
             self.tabID = tabID
+        }
+
+        @discardableResult
+        func beginPersistentBindingTransition() -> UInt64 {
+            bindingTransitionGeneration &+= 1
+            bindingTransitionInProgress = true
+            authoritativeHydratedBinding = nil
+            authoritativeHydratedBindingTransitionGeneration = nil
+            return bindingTransitionGeneration
+        }
+
+        func installPersistentSessionBinding(_ binding: AgentPersistentSessionBindingIdentity?) {
+            precondition(binding == nil || binding?.tabID == tabID)
+            persistentSessionBindingIdentity = binding
+            bindingTransitionInProgress = false
+        }
+
+        func finishPersistentBindingTransition(generation: UInt64) {
+            guard bindingTransitionGeneration == generation else { return }
+            bindingTransitionInProgress = false
+        }
+
+        func markCurrentBindingHydrated() {
+            guard hasLoadedPersistedState, !bindingTransitionInProgress else { return }
+            authoritativeHydratedBinding = persistentSessionBindingIdentity
+            authoritativeHydratedBindingTransitionGeneration = bindingTransitionGeneration
+        }
+
+        func clearCurrentBindingHydration() {
+            authoritativeHydratedBinding = nil
+            authoritativeHydratedBindingTransitionGeneration = nil
+        }
+
+        var hasBindingBlockingInteraction: Bool {
+            waitingPrompt != nil
+                || instructionContinuation != nil
+                || pendingAskUser != nil
+                || pendingUserInputRequest != nil
+                || pendingApproval != nil
+                || pendingPermissionsRequest != nil
+                || pendingMCPElicitationRequest != nil
+                || pendingApplyEditsReview != nil
+                || pendingWorktreeMergeReview != nil
+                || !queuedUserInputRequests.isEmpty
+                || !queuedMCPElicitationRequests.isEmpty
+        }
+
+        func persistentBindingTransitionToken() -> PersistentBindingTransitionToken {
+            PersistentBindingTransitionToken(
+                tabID: tabID,
+                sessionIdentity: ObjectIdentifier(self),
+                binding: persistentSessionBindingIdentity,
+                transitionGeneration: bindingTransitionGeneration,
+                sourceItemsRevision: sourceItemsRevision
+            )
+        }
+
+        #if DEBUG
+            func testInstallPersistentSessionBinding(sessionID: UUID?) {
+                _ = beginPersistentBindingTransition()
+                installPersistentSessionBinding(
+                    sessionID.map { AgentPersistentSessionBindingIdentity(tabID: tabID, sessionID: $0) }
+                )
+            }
+        #endif
+
+        func installRunAttemptTerminalResources(
+            ownership: AgentRunOwnership,
+            prepare: @escaping AgentRunAttemptTerminalResources.Prepare
+        ) {
+            guard isCurrentRunAttempt(ownership) else { return }
+            runAttemptTerminalResources = AgentRunAttemptTerminalResources(
+                ownership: ownership,
+                prepare: prepare
+            )
+        }
+
+        func claimRunAttemptTerminalTeardown(
+            ownership: AgentRunOwnership,
+            terminalState: AgentSessionRunState
+        ) -> AgentRunAttemptTerminalResources.Teardown? {
+            guard let resources = runAttemptTerminalResources else { return nil }
+            let teardown = resources.claim(for: ownership, terminalState: terminalState)
+            if resources.isClaimed {
+                runAttemptTerminalResources = nil
+            }
+            return teardown
+        }
+
+        @discardableResult
+        func beginRunAttempt(source: String, attemptID: UUID = UUID()) -> AgentRunOwnership {
+            assert(runAttemptTerminalResources == nil || runAttemptTerminalResources?.isClaimed == true)
+            runAttemptTerminalResources = nil
+            terminalCommitInProgress = false
+            lastTerminalCommitRevision = nil
+            providerTerminalDrainGeneration = 0
+            codexCurrentTurnID = nil
+            codexCurrentTurnKind = nil
+            let ownership = runLifecycleTracker.begin(
+                tabID: tabID,
+                persistentSessionID: activeAgentSessionID,
+                persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
+                bindingTransitionGeneration: bindingTransitionGeneration,
+                attemptID: attemptID
+            )
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started.source.\(source)")
+                AgentModePerfDiagnostics.event(
+                    "run.lifecycle.attemptStarted",
+                    tabID: tabID,
+                    fields: [
+                        "source": source,
+                        "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID),
+                        "bindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.generation),
+                        "persistentBindingGeneration": AgentModePerfDiagnostics.shortID(ownership.binding.persistentBindingGeneration),
+                        "bindingTransitionGeneration": String(ownership.binding.bindingTransitionGeneration),
+                        "persistentSessionID": AgentModePerfDiagnostics.shortID(ownership.binding.persistentSessionID)
+                    ]
+                )
+            #endif
+            return ownership
+        }
+
+        func isCurrentRunAttempt(_ ownership: AgentRunOwnership, expectedRunID: UUID? = nil) -> Bool {
+            guard activeRunOwnership == ownership else { return false }
+            if let expectedRunID {
+                return runID == expectedRunID
+            }
+            return true
+        }
+
+        func isCurrentRunAttemptForCurrentBinding(
+            _ ownership: AgentRunOwnership,
+            expectedRunID: UUID? = nil
+        ) -> Bool {
+            guard isCurrentRunAttempt(ownership, expectedRunID: expectedRunID) else { return false }
+            return ownership.binding.tabID == tabID
+                && ownership.binding.persistentSessionID == activeAgentSessionID
+                && ownership.binding.persistentBindingGeneration == persistentSessionBindingIdentity?.generation
+                && ownership.binding.bindingTransitionGeneration == bindingTransitionGeneration
+                && !bindingTransitionInProgress
+        }
+
+        @discardableResult
+        func recordRunProgress(
+            ownership: AgentRunOwnership,
+            kind: AgentRunLivenessSignalKind,
+            stage: AgentRunLifecycleStage,
+            retryIntent: AgentRunRetryIntent = .none,
+            timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+        ) -> AgentRunProgressAcceptance {
+            let result = runLifecycleTracker.record(
+                ownership: ownership,
+                kind: kind,
+                stage: stage,
+                retryIntent: retryIntent,
+                timestampUptimeNanoseconds: timestampUptimeNanoseconds
+            )
+            recordRunProgressDiagnostic(result, kind: kind, stage: stage)
+            return result
+        }
+
+        @discardableResult
+        func acceptRunProgress(_ signal: AgentRunProgressSignal) -> AgentRunProgressAcceptance {
+            let result = runLifecycleTracker.accept(signal)
+            recordRunProgressDiagnostic(result, kind: signal.kind, stage: signal.stage)
+            return result
+        }
+
+        @discardableResult
+        func endRunAttempt(ifCurrent ownership: AgentRunOwnership, source: String) -> Bool {
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(ownership, source: source)
+            return true
+        }
+
+        @discardableResult
+        func endCurrentRunAttempt(source: String) -> Bool {
+            guard let ownership = activeRunOwnership else { return false }
+            guard runLifecycleTracker.end(ifCurrent: ownership) else { return false }
+            recordRunAttemptEnded(ownership, source: source)
+            return true
+        }
+
+        @discardableResult
+        func endRunAttempt(ifCurrentAttemptID attemptID: UUID, source: String) -> Bool {
+            guard let ownership = activeRunOwnership, ownership.attemptID == attemptID else { return false }
+            return endRunAttempt(ifCurrent: ownership, source: source)
+        }
+
+        private func recordRunAttemptEnded(_ ownership: AgentRunOwnership, source: String) {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended")
+                AgentModePerfDiagnostics.increment("run.lifecycle.attempt.ended.source.\(source)")
+                AgentModePerfDiagnostics.event(
+                    "run.lifecycle.attemptEnded",
+                    tabID: tabID,
+                    fields: [
+                        "source": source,
+                        "attemptID": AgentModePerfDiagnostics.shortID(ownership.attemptID)
+                    ]
+                )
+            #endif
+        }
+
+        private func recordRunProgressDiagnostic(
+            _ result: AgentRunProgressAcceptance,
+            kind: AgentRunLivenessSignalKind,
+            stage: AgentRunLifecycleStage
+        ) {
+            #if DEBUG
+                switch result {
+                case .accepted:
+                    if kind == .stageTransition {
+                        AgentModePerfDiagnostics.increment("run.lifecycle.stage.\(stage.rawValue)", tabID: tabID)
+                    }
+                case let .rejected(reason):
+                    AgentModePerfDiagnostics.increment("run.lifecycle.progress.rejected.\(reason.rawValue)", tabID: tabID)
+                    AgentModePerfDiagnostics.event(
+                        "run.lifecycle.progressRejected",
+                        tabID: tabID,
+                        fields: ["reason": reason.rawValue, "kind": kind.rawValue, "stage": stage.rawValue]
+                    )
+                }
+            #endif
         }
 
         @discardableResult

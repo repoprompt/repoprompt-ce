@@ -363,7 +363,7 @@ struct AgentExploreMCPToolService {
         agentModeVM: AgentModeViewModel
     ) throws {
         for sessionID in sessionIDs {
-            guard let liveSession = liveSession(for: sessionID, agentModeVM: agentModeVM) else {
+            guard let liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID) else {
                 throw MCPError.invalidParams("Session '\(sessionID.uuidString)' is not a live explore child of the current agent session.")
             }
             guard liveSession.parentSessionID == callerSessionID,
@@ -371,12 +371,6 @@ struct AgentExploreMCPToolService {
             else {
                 throw MCPError.invalidParams("Session '\(sessionID.uuidString)' is not an explore child of the current agent session.")
             }
-        }
-    }
-
-    private func liveSession(for sessionID: UUID, agentModeVM: AgentModeViewModel) -> AgentModeViewModel.TabSession? {
-        agentModeVM.sessions.values.first { session in
-            session.activeAgentSessionID == sessionID || session.mcpControlContext?.sessionID == sessionID
         }
     }
 
@@ -422,9 +416,13 @@ struct AgentExploreMCPToolService {
         var snapshots: [AgentRunMCPSnapshot] = []
         snapshots.reserveCapacity(sessionIDs.count)
         for sessionID in sessionIDs {
-            if let liveSnapshot = agentModeVM.mcpSnapshot(sessionID: sessionID) {
+            if let registration = agentModeVM.mcpRegistration(sessionID: sessionID),
+               let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration)
+            {
                 snapshots.append(liveSnapshot)
-            } else if let storedSnapshot = await AgentRunSessionStore.snapshot(for: sessionID) {
+            } else if let registration = agentModeVM.mcpRegistration(sessionID: sessionID),
+                      let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration)
+            {
                 snapshots.append(storedSnapshot)
             } else {
                 snapshots.append(.expired(sessionID: sessionID))

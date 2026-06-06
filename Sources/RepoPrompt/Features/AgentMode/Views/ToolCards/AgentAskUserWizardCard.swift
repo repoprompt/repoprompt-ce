@@ -15,14 +15,12 @@ struct AgentAskUserWizardCard: View {
     @FocusState private var focusedField: FocusedField?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 12) {
             headerSection
 
             if let context = nonEmpty(pending.interaction.context) {
                 contextBlock(context)
             }
-
-            questionPager
 
             if let question = currentQuestion {
                 questionSection(question)
@@ -58,6 +56,10 @@ struct AgentAskUserWizardCard: View {
         pending.currentQuestion
     }
 
+    private var currentIndex: Int {
+        pending.currentQuestionIndex
+    }
+
     private var currentDraft: AgentAskUserDraft {
         guard let question = currentQuestion else { return AgentAskUserDraft() }
         return pending.draftsByQuestionID[question.id] ?? AgentAskUserDraft()
@@ -67,16 +69,18 @@ struct AgentAskUserWizardCard: View {
         pending.interaction.questions.count
     }
 
-    private var canGoPrevious: Bool {
-        pending.currentQuestionIndex > 0
+    private var isFirstQuestion: Bool {
+        currentIndex <= 0
     }
 
-    private var canGoNext: Bool {
-        pending.currentQuestionIndex < max(0, questionCount - 1)
+    private var isLastQuestion: Bool {
+        currentIndex >= questionCount - 1
     }
 
-    private var submitButtonLabel: String {
-        questionCount > 1 ? "Submit Answers" : "Submit"
+    private var canMoveForward: Bool {
+        guard let question = currentQuestion else { return false }
+        let answer = question.answer(from: currentDraft)
+        return answer.skipped || !answer.answers.isEmpty
     }
 
     private var headerTitle: String {
@@ -89,17 +93,12 @@ struct AgentAskUserWizardCard: View {
                 .font(.title2)
                 .foregroundColor(.blue)
 
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(headerTitle)
                     .font(.headline)
-                Text("Waiting for your response…")
+                Text("Question \(min(currentIndex + 1, questionCount)) of \(questionCount)")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                if questionCount > 1 {
-                    Text("Question \(pending.currentQuestionIndex + 1) of \(questionCount)")
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
             }
 
             Spacer()
@@ -110,65 +109,9 @@ struct AgentAskUserWizardCard: View {
         }
     }
 
-    @ViewBuilder
-    private var questionPager: some View {
-        if questionCount > 1 {
-            HStack(spacing: 8) {
-                Button {
-                    goToQuestion(pending.currentQuestionIndex - 1)
-                } label: {
-                    Label("Previous", systemImage: "chevron.left")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!canGoPrevious)
-
-                Spacer()
-
-                questionProgressDots
-
-                Spacer()
-
-                Button {
-                    goToQuestion(pending.currentQuestionIndex + 1)
-                } label: {
-                    Label("Next", systemImage: "chevron.right")
-                        .labelStyle(.titleAndIcon)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!canGoNext)
-            }
-        }
-    }
-
-    private var questionProgressDots: some View {
-        HStack(spacing: 5) {
-            ForEach(Array(pending.interaction.questions.enumerated()), id: \.element.id) { index, question in
-                Button {
-                    goToQuestion(index)
-                } label: {
-                    Circle()
-                        .fill(progressColor(for: question, at: index))
-                        .frame(width: 7, height: 7)
-                }
-                .buttonStyle(.plain)
-                .help("Question \(index + 1)")
-            }
-        }
-    }
-
-    private func progressColor(for question: AgentAskUserQuestion, at index: Int) -> Color {
-        if index == pending.currentQuestionIndex { return .blue }
-        let draft = pending.draftsByQuestionID[question.id] ?? AgentAskUserDraft()
-        if draft.skipped { return .secondary.opacity(0.7) }
-        if draft.hasContent { return .green }
-        return .secondary.opacity(0.25)
-    }
-
     private func questionSection(_ question: AgentAskUserQuestion) -> some View {
         let draft = pending.draftsByQuestionID[question.id] ?? AgentAskUserDraft()
-        return VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 10) {
             if let header = nonEmpty(question.header) {
                 Text(header)
                     .font(.subheadline)
@@ -193,11 +136,19 @@ struct AgentAskUserWizardCard: View {
                 customResponseField(question: question, draft: draft)
             }
 
-            skipQuestionToggle(question: question, draft: draft)
+            if draft.skipped {
+                Label("This question is marked skipped.", systemImage: "forward.fill")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
         }
         .padding(12)
-        .background(Color.white.opacity(0.35))
+        .background(Color.blue.opacity(0.045))
         .cornerRadius(8)
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.blue.opacity(0.14), lineWidth: 1)
+        )
     }
 
     private func contextBlock(_ text: String) -> some View {
@@ -220,12 +171,6 @@ struct AgentAskUserWizardCard: View {
                 Text(question.allowsMultiple ? "Select all that apply" : "Select one option")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Spacer()
-                if draft.skipped {
-                    Text("Skipped")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
             }
 
             ForEach(question.options, id: \.label) { option in
@@ -286,41 +231,20 @@ struct AgentAskUserWizardCard: View {
     }
 
     private func customResponseField(question: AgentAskUserQuestion, draft: AgentAskUserDraft) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(question.options.isEmpty ? "Response" : "Custom response")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            TextField("Type your response…", text: customResponseBinding(for: question), axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(1 ... 5)
-                .disabled(draft.skipped)
-                .focused($focusedField, equals: .custom(question.id))
-                .onSubmit {
-                    if pending.isComplete {
-                        onSubmit()
-                    }
-                }
-        }
-    }
-
-    private func skipQuestionToggle(question: AgentAskUserQuestion, draft: AgentAskUserDraft) -> some View {
-        Button {
-            var updated = draft
-            updated.skipped.toggle()
-            if updated.skipped {
-                updated.selectedOptionLabels = []
-                updated.customResponse = ""
+        TextField(
+            question.options.isEmpty ? "Type your response…" : "Other…",
+            text: customResponseBinding(for: question),
+            axis: .vertical
+        )
+        .textFieldStyle(.roundedBorder)
+        .lineLimit(1 ... 6)
+        .disabled(draft.skipped)
+        .focused($focusedField, equals: .custom(question.id))
+        .onSubmit {
+            if isLastQuestion, pending.isComplete {
+                onSubmit()
             }
-            emitDraft(updated, for: question)
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: draft.skipped ? "checkmark.circle.fill" : "circle")
-                Text(draft.skipped ? "Question skipped" : "Skip this question")
-            }
-            .font(.caption)
-            .foregroundColor(draft.skipped ? .secondary : .blue)
         }
-        .buttonStyle(.plain)
     }
 
     private var actionButtons: some View {
@@ -331,21 +255,38 @@ struct AgentAskUserWizardCard: View {
             .buttonStyle(.plain)
             .foregroundColor(.secondary)
 
+            if let question = currentQuestion {
+                Button(currentDraft.skipped ? "Answer Question" : "Skip Question") {
+                    if currentDraft.skipped {
+                        emitDraft(AgentAskUserDraft(), for: question)
+                    } else {
+                        skipCurrentQuestion(question)
+                    }
+                }
+                .buttonStyle(.plain)
+            }
+
             Spacer()
 
-            if canGoNext {
-                Button("Next") {
-                    goToQuestion(pending.currentQuestionIndex + 1)
-                }
-                .buttonStyle(.bordered)
+            Button("Back") {
+                goToQuestion(currentIndex - 1)
             }
+            .disabled(isFirstQuestion)
 
-            Button(action: onSubmit) {
-                Label(submitButtonLabel, systemImage: "checkmark.circle.fill")
+            if isLastQuestion {
+                Button(action: onSubmit) {
+                    Label("Submit Answers", systemImage: "checkmark.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!pending.isComplete)
+                .keyboardShortcut(.return, modifiers: .shift)
+            } else {
+                Button("Next") {
+                    goToQuestion(currentIndex + 1)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!canMoveForward)
             }
-            .buttonStyle(.borderedProminent)
-            .disabled(!pending.isComplete)
-            .keyboardShortcut(.return, modifiers: .shift)
         }
     }
 
@@ -370,11 +311,13 @@ struct AgentAskUserWizardCard: View {
         guard !draft.skipped else { return }
         var updated = draft
         if question.allowsMultiple {
-            if updated.selectedOptionLabels.contains(label) {
-                updated.selectedOptionLabels.removeAll { $0 == label }
+            var selected = Set(updated.selectedOptionLabels)
+            if selected.contains(label) {
+                selected.remove(label)
             } else {
-                updated.selectedOptionLabels.append(label)
+                selected.insert(label)
             }
+            updated.selectedOptionLabels = question.optionLabels.filter { selected.contains($0) }
         } else {
             if updated.selectedOptionLabels.contains(label) {
                 updated.selectedOptionLabels = []
@@ -385,6 +328,13 @@ struct AgentAskUserWizardCard: View {
         }
         updated.skipped = false
         emitDraft(updated, for: question)
+    }
+
+    private func skipCurrentQuestion(_ question: AgentAskUserQuestion) {
+        emitDraft(AgentAskUserDraft(skipped: true), for: question)
+        if !isLastQuestion {
+            goToQuestion(currentIndex + 1)
+        }
     }
 
     private func emitDraft(_ draft: AgentAskUserDraft, for question: AgentAskUserQuestion) {

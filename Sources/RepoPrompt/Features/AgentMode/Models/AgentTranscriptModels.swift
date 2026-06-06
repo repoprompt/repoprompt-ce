@@ -991,6 +991,8 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
     let isCompressedHistoryRevealed: Bool
     let isWindowCappedWhileActive: Bool
     let bindingsHydrated: Bool
+    let hydratedPersistentBinding: AgentPersistentSessionBindingIdentity?
+    let hydratedBindingTransitionGeneration: UInt64?
     let performanceSnapshot: AgentTranscriptPerformanceSnapshot
     let metadata: AgentTranscriptPresentationMetadata
     let rawToolResultPayloadRenderRevision: Int
@@ -1008,6 +1010,8 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         isCompressedHistoryRevealed: Bool = false,
         isWindowCappedWhileActive: Bool = false,
         bindingsHydrated: Bool = true,
+        hydratedPersistentBinding: AgentPersistentSessionBindingIdentity? = nil,
+        hydratedBindingTransitionGeneration: UInt64? = nil,
         performanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty,
         metadata: AgentTranscriptPresentationMetadata = .empty,
         rawToolResultPayloadRenderRevision: Int = 0
@@ -1024,6 +1028,8 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
         self.isCompressedHistoryRevealed = isCompressedHistoryRevealed
         self.isWindowCappedWhileActive = isWindowCappedWhileActive
         self.bindingsHydrated = bindingsHydrated
+        self.hydratedPersistentBinding = hydratedPersistentBinding
+        self.hydratedBindingTransitionGeneration = hydratedBindingTransitionGeneration
         self.performanceSnapshot = performanceSnapshot
         self.metadata = metadata
         self.rawToolResultPayloadRenderRevision = rawToolResultPayloadRenderRevision
@@ -1041,6 +1047,8 @@ struct AgentTranscriptPresentationSnapshot: Equatable {
             && isCompressedHistoryRevealed == other.isCompressedHistoryRevealed
             && isWindowCappedWhileActive == other.isWindowCappedWhileActive
             && bindingsHydrated == other.bindingsHydrated
+            && hydratedPersistentBinding == other.hydratedPersistentBinding
+            && hydratedBindingTransitionGeneration == other.hydratedBindingTransitionGeneration
             && metadata == other.metadata
             && rawToolResultPayloadRenderRevision == other.rawToolResultPayloadRenderRevision
     }

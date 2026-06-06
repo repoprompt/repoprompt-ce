@@ -3,6 +3,11 @@ import Foundation
 actor AgentRunSessionStore {
     static let shared = AgentRunSessionStore()
 
+    struct Registration: Equatable, Hashable {
+        let sessionID: UUID
+        let generation: UInt64
+    }
+
     enum WaitDisposition: Equatable {
         case snapshotReady(AgentRunMCPSnapshot)
         case noteworthySnapshot(AgentRunMCPSnapshot, WakeReason)
@@ -25,10 +30,11 @@ actor AgentRunSessionStore {
     }
 
     private struct Record {
-        var generation: UInt64 = 0
+        var registration: Registration
         var latestSnapshot: AgentRunMCPSnapshot?
         var pendingNoteworthySnapshot: AgentRunMCPSnapshot?
         var pendingWakeReason: WakeReason?
+        var lastCommittedPublicationID: UUID?
         var waiters: [Waiter] = []
         var expiryTask: Task<Void, Never>?
     }
@@ -36,50 +42,101 @@ actor AgentRunSessionStore {
     private static let terminalSnapshotTTL: TimeInterval = 300
 
     private var records: [UUID: Record] = [:]
-    private var retiredSessionIDs: Set<UUID> = []
     private var nextGeneration: UInt64 = 1
 
-    func register(sessionID: UUID) {
-        retiredSessionIDs.remove(sessionID)
-        var record = records[sessionID] ?? Record()
+    func register(sessionID: UUID) -> Registration {
+        if let previous = records.removeValue(forKey: sessionID) {
+            previous.expiryTask?.cancel()
+            expireWaiters(previous.waiters)
+            recordRejectedOperation(
+                "register",
+                supplied: previous.registration,
+                current: nil,
+                reason: "replaced_registration"
+            )
+        }
+        let registration = makeRegistration(sessionID: sessionID)
+        records[sessionID] = Record(registration: registration)
+        return registration
+    }
+
+    /// Clears the stored snapshot for a freshly dispatched turn and rotates the
+    /// publication generation. Already-parked waiters remain attached to the new turn.
+    @discardableResult
+    func resetSnapshotForNewTurn(registration: Registration) -> Registration? {
+        guard var record = currentRecord(for: registration, operation: "reset_new_turn") else { return nil }
         record.expiryTask?.cancel()
         record.expiryTask = nil
-        record.generation = nextGeneration
-        nextGeneration &+= 1
+        record.registration = makeRegistration(sessionID: registration.sessionID)
         record.latestSnapshot = nil
         record.pendingNoteworthySnapshot = nil
         record.pendingWakeReason = nil
-        records[sessionID] = record
+        record.lastCommittedPublicationID = nil
+        records[registration.sessionID] = record
+        return record.registration
     }
 
-    /// Clears the stored snapshot for a session so that a freshly dispatched turn's
-    /// running/waiting snapshots are not blocked by a stale terminal snapshot from
-    /// a previous turn.  Does not affect waiters, generation, or expiry scheduling.
-    func resetSnapshotForNewTurn(sessionID: UUID) {
-        guard var record = records[sessionID] else { return }
-        record.latestSnapshot = nil
-        record.pendingNoteworthySnapshot = nil
-        record.pendingWakeReason = nil
-        record.expiryTask?.cancel()
-        record.expiryTask = nil
-        records[sessionID] = record
+    func noteSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) {
+        ingestSnapshot(snapshot, registration: registration, wakeReason: nil)
     }
 
-    func noteSnapshot(_ snapshot: AgentRunMCPSnapshot) {
-        ingestSnapshot(snapshot, wakeReason: nil)
+    func noteSnapshotAndWakeWaiters(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        reason: WakeReason
+    ) {
+        ingestSnapshot(snapshot, registration: registration, wakeReason: reason)
     }
 
-    func noteSnapshotAndWakeWaiters(_ snapshot: AgentRunMCPSnapshot, reason: WakeReason) {
-        ingestSnapshot(snapshot, wakeReason: reason)
-    }
-
-    func wakeCurrentWaiters(_ snapshot: AgentRunMCPSnapshot, reason: WakeReason) {
-        guard !retiredSessionIDs.contains(snapshot.sessionID) else {
-            print("[AgentRunSteeringWake] store wake ignored retired sessionID=\(snapshot.sessionID) reason=\(reason.rawValue)")
+    func signalCommittedSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        commitID: UUID
+    ) {
+        guard snapshot.sessionID == registration.sessionID else {
+            recordRejectedOperation(
+                "publish_terminal_commit",
+                supplied: registration,
+                current: records[registration.sessionID]?.registration,
+                reason: "session_mismatch"
+            )
             return
         }
-        var record = records[snapshot.sessionID] ?? Record()
-        print("[AgentRunSteeringWake] store wake requested sessionID=\(snapshot.sessionID) reason=\(reason.rawValue) status=\(snapshot.status.rawValue) waiters=\(record.waiters.count) pending=\(record.pendingWakeReason?.rawValue ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none")")
+        guard var record = currentRecord(for: registration, operation: "publish_terminal_commit") else { return }
+        if record.lastCommittedPublicationID == commitID {
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.duplicate")
+            #endif
+            return
+        }
+        guard record.lastCommittedPublicationID == nil else {
+            recordRejectedOperation(
+                "publish_terminal_commit",
+                supplied: registration,
+                current: record.registration,
+                reason: "different_commit_already_published"
+            )
+            return
+        }
+        record.lastCommittedPublicationID = commitID
+        records[registration.sessionID] = record
+        ingestSnapshot(snapshot, registration: registration, wakeReason: nil)
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.accepted")
+        #endif
+    }
+
+    func wakeCurrentWaiters(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        reason: WakeReason
+    ) {
+        guard snapshot.sessionID == registration.sessionID else {
+            recordRejectedOperation("wake", supplied: registration, current: records[registration.sessionID]?.registration, reason: "session_mismatch")
+            return
+        }
+        guard var record = currentRecord(for: registration, operation: "wake") else { return }
+        print("[AgentRunSteeringWake] store wake requested sessionID=\(snapshot.sessionID) generation=\(registration.generation) reason=\(reason.rawValue) status=\(snapshot.status.rawValue) waiters=\(record.waiters.count) pending=\(record.pendingWakeReason?.rawValue ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none")")
         if let latestSnapshot = record.latestSnapshot {
             if latestSnapshot.status.isTerminal {
                 print("[AgentRunSteeringWake] store wake ignored terminal latest sessionID=\(snapshot.sessionID) latest=\(latestSnapshot.status.rawValue)")
@@ -109,9 +166,16 @@ actor AgentRunSessionStore {
         }
     }
 
-    private func ingestSnapshot(_ snapshot: AgentRunMCPSnapshot, wakeReason: WakeReason?) {
-        guard !retiredSessionIDs.contains(snapshot.sessionID) else { return }
-        var record = records[snapshot.sessionID] ?? Record()
+    private func ingestSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        wakeReason: WakeReason?
+    ) {
+        guard snapshot.sessionID == registration.sessionID else {
+            recordRejectedOperation("publish", supplied: registration, current: records[registration.sessionID]?.registration, reason: "session_mismatch")
+            return
+        }
+        guard var record = currentRecord(for: registration, operation: "publish") else { return }
         var acceptedSnapshot = snapshot
         var shouldStoreIncomingSnapshot = true
         if let latestSnapshot = record.latestSnapshot {
@@ -159,11 +223,10 @@ actor AgentRunSessionStore {
 
         if shouldStoreIncomingSnapshot, snapshot.status.isTerminal {
             record.expiryTask?.cancel()
-            let generation = record.generation
-            record.expiryTask = Task { [sessionID = snapshot.sessionID, generation] in
+            record.expiryTask = Task { [registration] in
                 do {
                     try await Task.sleep(nanoseconds: UInt64(Self.terminalSnapshotTTL * 1_000_000_000))
-                    await Self.shared.expire(sessionID: sessionID, generation: generation)
+                    await Self.shared.expire(registration: registration)
                 } catch {
                     // Ignore cancellation.
                 }
@@ -180,15 +243,18 @@ actor AgentRunSessionStore {
         }
     }
 
-    func waitUntilInteresting(sessionID: UUID, timeoutSeconds: TimeInterval? = nil) async -> WaitDisposition {
-        guard let record = records[sessionID] else {
-            print("[AgentRunSteeringWake] store wait expired missing record sessionID=\(sessionID)")
+    func waitUntilInteresting(
+        registration: Registration,
+        timeoutSeconds: TimeInterval? = nil
+    ) async -> WaitDisposition {
+        guard let record = currentRecord(for: registration, operation: "wait") else {
+            print("[AgentRunSteeringWake] store wait expired missing or stale registration sessionID=\(registration.sessionID) generation=\(registration.generation)")
             return .expired
         }
         if let snapshot = record.latestSnapshot,
            snapshot.isActionableForMCPWait
         {
-            print("[AgentRunSteeringWake] store wait immediate snapshot sessionID=\(sessionID) status=\(snapshot.status.rawValue) interaction=\(snapshot.interaction != nil)")
+            print("[AgentRunSteeringWake] store wait immediate snapshot sessionID=\(registration.sessionID) status=\(snapshot.status.rawValue) interaction=\(snapshot.interaction != nil)")
             return .snapshotReady(snapshot)
         }
         if let snapshot = record.pendingNoteworthySnapshot,
@@ -198,28 +264,28 @@ actor AgentRunSessionStore {
             var updated = record
             updated.pendingNoteworthySnapshot = nil
             updated.pendingWakeReason = nil
-            records[sessionID] = updated
-            print("[AgentRunSteeringWake] store wait consumed pending wake sessionID=\(sessionID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
+            records[registration.sessionID] = updated
+            print("[AgentRunSteeringWake] store wait consumed pending wake sessionID=\(registration.sessionID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
             return .noteworthySnapshot(returnedSnapshot, reason)
         }
         if let timeout = timeoutSeconds, timeout <= 0 {
-            print("[AgentRunSteeringWake] store wait timed out immediately sessionID=\(sessionID)")
+            print("[AgentRunSteeringWake] store wait timed out immediately sessionID=\(registration.sessionID)")
             return .timedOut
         }
 
         let waiterID = UUID()
-        print("[AgentRunSteeringWake] store wait registering waiter sessionID=\(sessionID) waiterID=\(waiterID) timeout=\(timeoutSeconds.map { String($0) } ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none") existingWaiters=\(record.waiters.count)")
+        print("[AgentRunSteeringWake] store wait registering waiter sessionID=\(registration.sessionID) generation=\(registration.generation) waiterID=\(waiterID) timeout=\(timeoutSeconds.map { String($0) } ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none") existingWaiters=\(record.waiters.count)")
         return await withTaskCancellationHandler {
             await withCheckedContinuation { (continuation: CheckedContinuation<WaitDisposition, Never>) in
-                guard var current = records[sessionID] else {
-                    print("[AgentRunSteeringWake] store wait continuation expired missing record sessionID=\(sessionID) waiterID=\(waiterID)")
+                guard var current = currentRecord(for: registration, operation: "wait_park") else {
+                    print("[AgentRunSteeringWake] store wait continuation expired stale registration sessionID=\(registration.sessionID) waiterID=\(waiterID)")
                     continuation.resume(returning: .expired)
                     return
                 }
                 if let snapshot = current.latestSnapshot,
                    snapshot.isActionableForMCPWait
                 {
-                    print("[AgentRunSteeringWake] store wait continuation immediate snapshot sessionID=\(sessionID) waiterID=\(waiterID) status=\(snapshot.status.rawValue)")
+                    print("[AgentRunSteeringWake] store wait continuation immediate snapshot sessionID=\(registration.sessionID) waiterID=\(waiterID) status=\(snapshot.status.rawValue)")
                     continuation.resume(returning: .snapshotReady(snapshot))
                     return
                 }
@@ -229,8 +295,8 @@ actor AgentRunSessionStore {
                     let returnedSnapshot = current.latestSnapshot ?? snapshot
                     current.pendingNoteworthySnapshot = nil
                     current.pendingWakeReason = nil
-                    records[sessionID] = current
-                    print("[AgentRunSteeringWake] store wait continuation consumed pending wake sessionID=\(sessionID) waiterID=\(waiterID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
+                    records[registration.sessionID] = current
+                    print("[AgentRunSteeringWake] store wait continuation consumed pending wake sessionID=\(registration.sessionID) waiterID=\(waiterID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
                     continuation.resume(returning: .noteworthySnapshot(returnedSnapshot, reason))
                     return
                 }
@@ -239,33 +305,38 @@ actor AgentRunSessionStore {
                     timeoutTask = Task { [weak self] in
                         do {
                             try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                            await self?.timeoutWaiter(sessionID: sessionID, waiterID: waiterID)
+                            await self?.timeoutWaiter(sessionID: registration.sessionID, waiterID: waiterID)
                         } catch {
                             // Cancelled — snapshot or cleanup woke the waiter first.
                         }
                     }
                 }
                 current.waiters.append(Waiter(id: waiterID, continuation: continuation, timeoutTask: timeoutTask))
-                print("[AgentRunSteeringWake] store wait waiter parked sessionID=\(sessionID) waiterID=\(waiterID) waiters=\(current.waiters.count)")
-                records[sessionID] = current
+                print("[AgentRunSteeringWake] store wait waiter parked sessionID=\(registration.sessionID) waiterID=\(waiterID) waiters=\(current.waiters.count)")
+                records[registration.sessionID] = current
             }
         } onCancel: {
-            Task { await self.cancelWaiter(sessionID: sessionID, waiterID: waiterID) }
+            Task { await self.cancelWaiter(sessionID: registration.sessionID, waiterID: waiterID) }
         }
     }
 
-    func snapshot(for sessionID: UUID) -> AgentRunMCPSnapshot? {
-        records[sessionID]?.latestSnapshot
+    func snapshot(for registration: Registration) -> AgentRunMCPSnapshot? {
+        currentRecord(for: registration, operation: "snapshot")?.latestSnapshot
     }
 
-    func cleanup(sessionID: UUID) {
-        retiredSessionIDs.insert(sessionID)
-        guard let record = records.removeValue(forKey: sessionID) else { return }
+    func currentRegistration(for sessionID: UUID) -> Registration? {
+        records[sessionID]?.registration
+    }
+
+    func hasActiveRegistration(sessionID: UUID) -> Bool {
+        records[sessionID] != nil
+    }
+
+    func cleanup(registration: Registration) {
+        guard let record = currentRecord(for: registration, operation: "cleanup") else { return }
+        records.removeValue(forKey: registration.sessionID)
         record.expiryTask?.cancel()
-        for waiter in record.waiters {
-            waiter.timeoutTask?.cancel()
-            waiter.continuation.resume(returning: .expired)
-        }
+        expireWaiters(record.waiters)
     }
 
     private func cancelWaiter(sessionID: UUID, waiterID: UUID) {
@@ -295,73 +366,121 @@ actor AgentRunSessionStore {
         waiter.continuation.resume(returning: .timedOut)
     }
 
-    private func expire(sessionID: UUID, generation: UInt64) {
-        guard let record = records[sessionID], record.generation == generation else { return }
-        retiredSessionIDs.insert(sessionID)
-        guard let expiredRecord = records.removeValue(forKey: sessionID) else { return }
-        for waiter in expiredRecord.waiters {
+    private func expire(registration: Registration) {
+        guard let record = currentRecord(for: registration, operation: "expire") else { return }
+        records.removeValue(forKey: registration.sessionID)
+        expireWaiters(record.waiters)
+    }
+
+    private func makeRegistration(sessionID: UUID) -> Registration {
+        let registration = Registration(sessionID: sessionID, generation: nextGeneration)
+        nextGeneration &+= 1
+        return registration
+    }
+
+    private func currentRecord(for registration: Registration, operation: String) -> Record? {
+        guard let record = records[registration.sessionID] else {
+            recordRejectedOperation(operation, supplied: registration, current: nil, reason: "missing")
+            return nil
+        }
+        guard record.registration == registration else {
+            recordRejectedOperation(operation, supplied: registration, current: record.registration, reason: "stale_generation")
+            return nil
+        }
+        return record
+    }
+
+    private func expireWaiters(_ waiters: [Waiter]) {
+        for waiter in waiters {
             waiter.timeoutTask?.cancel()
             waiter.continuation.resume(returning: .expired)
         }
     }
+
+    private func recordRejectedOperation(
+        _ operation: String,
+        supplied: Registration,
+        current: Registration?,
+        reason: String
+    ) {
+        print("[AgentRunSessionStore] ignored operation=\(operation) sessionID=\(supplied.sessionID) suppliedGeneration=\(supplied.generation) currentGeneration=\(current.map { String($0.generation) } ?? "none") reason=\(reason)")
+        #if DEBUG
+            AgentModePerfDiagnostics.increment("mcp.waitStore.rejected.\(operation).\(reason)")
+        #endif
+    }
 }
 
 extension AgentRunSessionStore {
-    static func register(sessionID: UUID) async {
+    static func register(sessionID: UUID) async -> Registration {
         await shared.register(sessionID: sessionID)
     }
 
-    static func noteSnapshot(_ snapshot: AgentRunMCPSnapshot) async {
-        await shared.noteSnapshot(snapshot)
+    static func waitUntilInteresting(
+        registration: Registration,
+        timeoutSeconds: TimeInterval? = nil
+    ) async -> WaitDisposition {
+        await shared.waitUntilInteresting(registration: registration, timeoutSeconds: timeoutSeconds)
     }
 
-    static func noteSnapshotAndWakeWaiters(_ snapshot: AgentRunMCPSnapshot, reason: WakeReason) async {
-        await shared.noteSnapshotAndWakeWaiters(snapshot, reason: reason)
+    static func snapshot(for registration: Registration) async -> AgentRunMCPSnapshot? {
+        await shared.snapshot(for: registration)
     }
 
-    static func waitUntilInteresting(sessionID: UUID, timeoutSeconds: TimeInterval? = nil) async -> WaitDisposition {
-        await shared.waitUntilInteresting(sessionID: sessionID, timeoutSeconds: timeoutSeconds)
+    static func currentRegistration(for sessionID: UUID) async -> Registration? {
+        await shared.currentRegistration(for: sessionID)
     }
 
-    static func snapshot(for sessionID: UUID) async -> AgentRunMCPSnapshot? {
-        await shared.snapshot(for: sessionID)
+    static func hasActiveRegistration(sessionID: UUID) async -> Bool {
+        await shared.hasActiveRegistration(sessionID: sessionID)
     }
 
-    static func cleanup(sessionID: UUID) async {
-        await shared.cleanup(sessionID: sessionID)
-    }
-}
-
-extension AgentRunSessionStore {
-    static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot) async {
-        await shared.noteSnapshot(snapshot)
+    static func cleanup(registration: Registration) async {
+        await shared.cleanup(registration: registration)
     }
 
-    static func signalSnapshotAndWakeWaiters(_ snapshot: AgentRunMCPSnapshot, reason: WakeReason) async {
-        await shared.noteSnapshotAndWakeWaiters(snapshot, reason: reason)
+    static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) async {
+        await shared.noteSnapshot(snapshot, registration: registration)
     }
 
-    static func wakeCurrentWaiters(_ snapshot: AgentRunMCPSnapshot, reason: WakeReason) async {
-        await shared.wakeCurrentWaiters(snapshot, reason: reason)
+    static func signalCommittedSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        commitID: UUID
+    ) async {
+        await shared.signalCommittedSnapshot(snapshot, registration: registration, commitID: commitID)
     }
 
-    static func resetSnapshotForNewTurn(sessionID: UUID) async {
-        await shared.resetSnapshotForNewTurn(sessionID: sessionID)
+    static func signalSnapshotAndWakeWaiters(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        reason: WakeReason
+    ) async {
+        await shared.noteSnapshotAndWakeWaiters(snapshot, registration: registration, reason: reason)
+    }
+
+    static func wakeCurrentWaiters(
+        _ snapshot: AgentRunMCPSnapshot,
+        registration: Registration,
+        reason: WakeReason
+    ) async {
+        await shared.wakeCurrentWaiters(snapshot, registration: registration, reason: reason)
+    }
+
+    @discardableResult
+    static func resetSnapshotForNewTurn(registration: Registration) async -> Registration? {
+        await shared.resetSnapshotForNewTurn(registration: registration)
     }
 }
 
 #if DEBUG
     extension AgentRunSessionStore {
-        func test_waiterCount(sessionID: UUID) -> Int {
-            records[sessionID]?.waiters.count ?? 0
+        func test_waiterCount(registration: Registration) -> Int {
+            guard records[registration.sessionID]?.registration == registration else { return 0 }
+            return records[registration.sessionID]?.waiters.count ?? 0
         }
 
-        func test_generation(sessionID: UUID) -> UInt64? {
-            records[sessionID]?.generation
-        }
-
-        func test_expire(sessionID: UUID, generation: UInt64) {
-            expire(sessionID: sessionID, generation: generation)
+        func test_expire(registration: Registration) {
+            expire(registration: registration)
         }
     }
 #endif

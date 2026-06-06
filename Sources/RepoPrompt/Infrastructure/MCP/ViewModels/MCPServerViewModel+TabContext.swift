@@ -2005,12 +2005,16 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func commitAndClearTabContext(connectionID: UUID, expectedRunID: UUID? = nil) async {
+    func commitAndClearTabContext(
+        connectionID: UUID,
+        expectedRunID: UUID? = nil,
+        isStillCurrent: @MainActor () -> Bool = { true }
+    ) async {
         guard var context = tabContextByConnectionID[connectionID] else { return }
 
-        // Decide whether we will commit stored UI state for this context
-        // Mismatch => clear binding only (do not commit old/stale state)
-        var shouldCommit = true
+        // Decide whether we will commit stored UI state for this context.
+        // Mismatch or logical cancellation => clear binding only.
+        var shouldCommit = isStillCurrent()
         if let expected = expectedRunID, context.runID != expected {
             tabContextLog("commitAndClearTabContext run mismatch connectionID=\(connectionID) expectedRunID=\(expected.uuidString) actualRunID=\(context.runID?.uuidString ?? "nil") tab=\(context.tabID) — clearing binding without commit")
             shouldCommit = false
@@ -2021,6 +2025,9 @@ extension MCPServerViewModel {
             await readFileAutoSelectionCoordinator.finish(context: key)
             if let latest = tabContextByConnectionID[connectionID], latest.runID == context.runID {
                 context = latest
+            }
+            if !isStillCurrent() || Task.isCancelled {
+                shouldCommit = false
             }
         } else {
             invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
@@ -2036,13 +2043,14 @@ extension MCPServerViewModel {
         }
         connectionIDToRunID.removeValue(forKey: connectionID)
 
-        guard shouldCommit else { return }
+        guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return }
 
         tabContextLog("commitAndClearTabContext committing tab=\(context.tabID) connectionID=\(connectionID) runID=\(context.runID?.uuidString ?? "nil")")
 
         // IMPORTANT: Await the commit to ensure tab state is written before caller reads it.
         // This fixes a race condition where context_builder would read stale tab state.
-        await commitTabContext(context)
+        await commitTabContext(context, isStillCurrent: isStillCurrent)
+        guard isStillCurrent(), !Task.isCancelled else { return }
 
         var discoveredTabName: String?
         if let manager = workspaceManager,
@@ -2124,7 +2132,11 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func commitTabContext(_ context: TabScopedContext) async {
+    private func commitTabContext(
+        _ context: TabScopedContext,
+        isStillCurrent: @MainActor () -> Bool = { true }
+    ) async {
+        guard isStillCurrent(), !Task.isCancelled else { return }
         guard let manager = workspaceManager else {
             tabContextLog("[warning] commitTabContext missing workspace manager for windowID \(context.windowID); skipping commit.")
             return
@@ -2156,11 +2168,12 @@ extension MCPServerViewModel {
         }
 
         // 1) Persist to backing store without publishing UI snapshots (prevents tool echo)
+        guard isStillCurrent(), !Task.isCancelled else { return }
         manager.updateComposeTabStoredOnly(updatedTab)
         tabContextLog("commitTabContext stored selection/prompt tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil") workspaceID=\(workspaceID)")
 
-        // 2) Apply to live UI ONLY if this tab is the active tab
-        guard isActive else {
+        // 2) Apply to live UI ONLY if this tab is the active tab and the run still owns commit.
+        guard isActive, isStillCurrent(), !Task.isCancelled else {
             tabContextLog("commitTabContext skipping live UI apply (tab not active) tab=\(updatedTab.id)")
             return
         }

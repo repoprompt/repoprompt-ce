@@ -35,11 +35,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: createdWorktreePath), createdWorktreePath)
 
         let bindSessionID = UUID()
-        let activeWorkspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
         let bindTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let bindSession = window.agentModeViewModel.session(for: bindTabID)
-        bindSession.activeAgentSessionID = bindSessionID
-        XCTAssertTrue(window.workspaceManager.setActiveAgentSessionID(bindSessionID, forTabID: bindTabID, inWorkspaceID: activeWorkspaceID))
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: bindSessionID,
+            on: bindSession,
+            updateWorkspaceMetadata: true
+        )
+        XCTAssertEqual(window.workspaceManager.activeAgentSessionID(forTabID: bindTabID), bindSessionID)
 
         let bindValue = try await manageWorktree([
             "op": .string("bind"),
@@ -120,7 +123,11 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let sessionID = UUID()
         let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
         let session = window.agentModeViewModel.session(for: tabID)
-        session.activeAgentSessionID = sessionID
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
 
         let createValue = try await manageWorktree([
             "op": .string("create"),
@@ -382,27 +389,21 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     }
 
     private static func runGit(_ arguments: [String], cwd: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = arguments
-        process.currentDirectoryURL = cwd
         var environment = ProcessInfo.processInfo.environment
         environment["GIT_CONFIG_NOSYSTEM"] = "1"
         environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        process.environment = environment
-        let output = Pipe()
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let text = String(decoding: data, as: UTF8.self)
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
             throw NSError(
                 domain: "WorktreeAPISmokeHarnessTests.git",
-                code: Int(process.terminationStatus),
-                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(text)"]
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(result.outputText)"]
             )
         }
     }

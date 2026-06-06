@@ -6,7 +6,7 @@ import XCTest
 final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
     func testWaitAnyPerSessionSteeringWakeSurfacesAsNonActionableWake() async throws {
         let sessionID = UUID()
-        await AgentRunSessionStore.register(sessionID: sessionID)
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
 
         let waitTask = Task {
             await AgentRunMCPToolService.test_waitUntilActionableDisposition(
@@ -18,6 +18,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
 
         await AgentRunSessionStore.wakeCurrentWaiters(
             makeRunningSnapshot(sessionID: sessionID),
+            registration: registration,
             reason: .steeringRequested
         )
 
@@ -26,7 +27,7 @@ final class AgentRunMCPToolServiceWaitAnyTests: XCTestCase {
         XCTAssertEqual(result.disposition, "non_actionable_wake")
         XCTAssertEqual(result.wakeReason, AgentRunSessionStore.WakeReason.steeringRequested.rawValue)
         XCTAssertEqual(result.snapshotStatus, AgentRunMCPSnapshot.Status.running.rawValue)
-        await AgentRunSessionStore.cleanup(sessionID: sessionID)
+        await AgentRunSessionStore.cleanup(registration: registration)
     }
 
     func testWaitAnySteeringInterruptValueShapeOmitsNonTerminalAssistantText() throws {
