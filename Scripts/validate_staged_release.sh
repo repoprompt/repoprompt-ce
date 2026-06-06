@@ -70,6 +70,7 @@ for path in [
     root / "THIRD_PARTY_NOTICES.md",
     root / "RELEASE_COMMIT",
     app / "Contents" / "Info.plist",
+    root / ".build" / "release" / "RepoPrompt-artifact-manifest.json",
     app / "Contents" / "MacOS" / "RepoPrompt",
     app / "Contents" / "MacOS" / "repoprompt-mcp",
 ]:
@@ -103,6 +104,11 @@ PYTHON
 
 "$SCRIPT_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Staged app SwiftPM resource bundle layout"
 "$SCRIPT_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Staged app MCP helper layout"
+"$SCRIPT_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "arm64,x86_64" "Staged public app"
+"$SCRIPT_DIR/write_app_artifact_manifest.py" verify \
+    --app "$APP_BUNDLE" \
+    --manifest "$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json" \
+    --expected-architectures "arm64,x86_64"
 
 [[ "$(cat "$ROOT_DIR/RELEASE_COMMIT")" == "$RELEASE_COMMIT" ]] ||
     fail "Staged release commit does not match approved commit"
@@ -131,6 +137,8 @@ for key, value in {
     "__BUILD_NUMBER__": build,
     "__DEBUG_SECURE_STORAGE_BACKEND__": "alternate-in-memory",
     "__SIGNING_MODE__": "release-candidate-adhoc",
+    "__LOCAL_SIGNING_CERTIFICATE_SHA256__": "",
+    "__LOCAL_SECURE_STORAGE_GENERATION__": "",
 }.items():
     text = text.replace(key, value)
 if plistlib.loads(text.encode("utf-8")) != plistlib.loads(Path(actual).read_bytes()):

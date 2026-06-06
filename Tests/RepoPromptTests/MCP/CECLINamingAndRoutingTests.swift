@@ -13,6 +13,14 @@ final class CECLINamingAndRoutingTests: XCTestCase {
         #endif
     }
 
+    func testConfigExporterUsesCEOwnedStablePath() {
+        let path = MCPConfigExportService.stableWrapperConfigURL.path
+        XCTAssertTrue(path.contains("Library/Application Support/RepoPrompt CE/MCP"), path)
+        #if DEBUG
+            XCTAssertTrue(CLIPathInstaller.test_claudeRPScriptContent().contains(path))
+        #endif
+    }
+
     func testUserSpaceSymlinkPathUsesApplicationSupport() {
         let path = CLISymlinkManagerUserSpace.userSymlinkPath
         XCTAssertTrue(path.contains("Library/Application Support/RepoPrompt CE"), path)
@@ -29,6 +37,7 @@ final class CECLINamingAndRoutingTests: XCTestCase {
             XCTAssertTrue(generated.contains("# claude-rpce: Claude Code wrapper configured for RepoPrompt CE"))
             XCTAssertTrue(CLIPathInstaller.test_isManagedClaudeRPScript(generated))
             XCTAssertTrue(CLIPathInstaller.test_isManagedClaudeRPScript("# claude-rp-ce: Claude Code wrapper configured for RepoPrompt CE\n"))
+            XCTAssertFalse(CLIPathInstaller.test_isManagedClaudeRPScript("#!/bin/bash\necho '# claude-rpce: Claude Code wrapper configured for RepoPrompt CE'\n"))
             XCTAssertFalse(CLIPathInstaller.test_isManagedClaudeRPScript("#!/bin/bash\necho unrelated\n"))
         }
     #endif

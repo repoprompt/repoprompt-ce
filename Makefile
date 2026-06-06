@@ -55,6 +55,7 @@ conductor-selftest:
 	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py
+	python3 Scripts/test_security_inventory.py
 
 release-selftest:
 	python3 Scripts/test_release_promotion.py

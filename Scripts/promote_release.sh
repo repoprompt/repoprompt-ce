@@ -23,6 +23,7 @@ UPDATE_ZIP_NAME="$ARCHIVE_BASENAME.zip"
 DMG_NAME="$ARCHIVE_BASENAME.dmg"
 APPCAST_NAME="appcast.xml"
 CHECKSUMS_NAME="SHA256SUMS"
+ARTIFACT_MANIFEST_NAME="$ARCHIVE_BASENAME-artifact-manifest.json"
 PUBLIC_UPDATE_BASE_URL="https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/download/$RELEASE_TAG"
 PUBLIC_FEED_URL="https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/latest/download/$APPCAST_NAME"
 SOURCE_RELEASE_BASE_URL="https://github.com/$SOURCE_GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
@@ -98,9 +99,10 @@ assert_exact_release_assets() {
         --arg dmg "$DMG_NAME" \
         --arg appcast "$APPCAST_NAME" \
         --arg checksums "$CHECKSUMS_NAME" \
-        '([.assets[].name] | sort) == ([$zip, $dmg, $appcast, $checksums] | sort)' \
+        --arg manifest "$ARTIFACT_MANIFEST_NAME" \
+        '([.assets[].name] | sort) == ([$zip, $dmg, $appcast, $checksums, $manifest] | sort)' \
         <<< "$release_json" >/dev/null ||
-        fail "$release_label must contain exactly: $UPDATE_ZIP_NAME, $DMG_NAME, $APPCAST_NAME, $CHECKSUMS_NAME"
+        fail "$release_label must contain exactly: $UPDATE_ZIP_NAME, $DMG_NAME, $APPCAST_NAME, $CHECKSUMS_NAME, $ARTIFACT_MANIFEST_NAME"
 }
 
 assert_exact_update_assets() {
@@ -109,9 +111,10 @@ assert_exact_update_assets() {
         --arg zip "$UPDATE_ZIP_NAME" \
         --arg appcast "$APPCAST_NAME" \
         --arg checksums "$CHECKSUMS_NAME" \
-        '([.assets[].name] | sort) == ([$zip, $appcast, $checksums] | sort)' \
+        --arg manifest "$ARTIFACT_MANIFEST_NAME" \
+        '([.assets[].name] | sort) == ([$zip, $appcast, $checksums, $manifest] | sort)' \
         <<< "$release_json" >/dev/null ||
-        fail "Public updater release must contain exactly: $UPDATE_ZIP_NAME, $APPCAST_NAME, $CHECKSUMS_NAME"
+        fail "Public updater release must contain exactly: $UPDATE_ZIP_NAME, $APPCAST_NAME, $CHECKSUMS_NAME, $ARTIFACT_MANIFEST_NAME"
 }
 
 derive_sparkle_public_key() {
@@ -122,10 +125,10 @@ derive_sparkle_public_key() {
 validate_checksum_manifest() {
     (
         cd "$SOURCE_ASSETS_DIR"
-        printf '%s\n' "$APPCAST_NAME" "$DMG_NAME" "$UPDATE_ZIP_NAME" | sort > "$TMP_DIR/expected-checksum-files.txt"
+        printf '%s\n' "$APPCAST_NAME" "$DMG_NAME" "$UPDATE_ZIP_NAME" "$ARTIFACT_MANIFEST_NAME" | sort > "$TMP_DIR/expected-checksum-files.txt"
         awk '{ print $2 }' "$CHECKSUMS_NAME" | sort > "$TMP_DIR/checksum-files.txt"
         diff -u "$TMP_DIR/expected-checksum-files.txt" "$TMP_DIR/checksum-files.txt" ||
-            fail "$CHECKSUMS_NAME must contain exactly the reviewed ZIP, DMG, and appcast"
+            fail "$CHECKSUMS_NAME must contain exactly the reviewed ZIP, DMG, appcast, and artifact manifest"
         shasum -a 256 -c "$CHECKSUMS_NAME"
     )
 }
@@ -140,6 +143,7 @@ verify_reviewed_checksums_digest() {
 
 validate_app_bundle() {
     local app_bundle="$1"
+    local artifact_manifest="$2"
     codesign --verify --deep --strict --verbose=2 "$app_bundle"
 
     local signature_details team_identifier
@@ -155,6 +159,14 @@ validate_app_bundle() {
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/validate_packaged_legal.sh" "$app_bundle"
     validate_embedded_mcp_helper_layout "$app_bundle" "Reviewed ZIP MCP helper layout"
+    "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
+        "$app_bundle" \
+        "arm64,x86_64" \
+        "Reviewed ZIP app"
+    "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
+        --app "$app_bundle" \
+        --manifest "$artifact_manifest" \
+        --expected-architectures "arm64,x86_64"
 }
 
 validate_dmg_matches_zip_app() {
@@ -167,6 +179,14 @@ validate_dmg_matches_zip_app() {
     diff -qr "$APP_BUNDLE" "$dmg_app" ||
         fail "DMG app contents do not match the verified update ZIP app"
     validate_embedded_mcp_helper_layout "$dmg_app" "Mounted DMG MCP helper layout"
+    "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" \
+        "$dmg_app" \
+        "arm64,x86_64" \
+        "Mounted DMG app"
+    "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" verify \
+        --app "$dmg_app" \
+        --manifest "$ARTIFACT_MANIFEST" \
+        --expected-architectures "arm64,x86_64"
 
     hdiutil detach "$DMG_MOUNT_POINT" >/dev/null
     DMG_MOUNT_POINT=""
@@ -244,6 +264,8 @@ verify_source_release() {
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_signature.swift"
     require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh"
+    require_file "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py"
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_remote_release_commit.sh" "$RELEASE_TAG" "$RELEASE_COMMIT"
     REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
         "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh"
@@ -280,19 +302,21 @@ verify_source_release() {
         --dir "$SOURCE_ASSETS_DIR" \
         --pattern "$UPDATE_ZIP_NAME" \
         --pattern "$DMG_NAME" \
-        --pattern "$APPCAST_NAME"
+        --pattern "$APPCAST_NAME" \
+        --pattern "$ARTIFACT_MANIFEST_NAME"
     recheck_source_assets
 
     UPDATE_ZIP="$SOURCE_ASSETS_DIR/$UPDATE_ZIP_NAME"
     DMG="$SOURCE_ASSETS_DIR/$DMG_NAME"
     APPCAST="$SOURCE_ASSETS_DIR/$APPCAST_NAME"
+    ARTIFACT_MANIFEST="$SOURCE_ASSETS_DIR/$ARTIFACT_MANIFEST_NAME"
     validate_checksum_manifest
 
     ditto -x -k "$UPDATE_ZIP" "$EXTRACT_DIR"
     [[ -d "$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME" ]] ||
         fail "Update ZIP must contain $DISTRIBUTION_APP_BUNDLE_NAME at its root"
     APP_BUNDLE="$EXTRACT_DIR/$DISTRIBUTION_APP_BUNDLE_NAME"
-    validate_app_bundle "$APP_BUNDLE"
+    validate_app_bundle "$APP_BUNDLE" "$ARTIFACT_MANIFEST"
     xcrun stapler validate "$DMG"
     validate_dmg_matches_zip_app
 
@@ -383,10 +407,12 @@ verify_existing_update_release() {
         --dir "$existing_assets_dir" \
         --pattern "$UPDATE_ZIP_NAME" \
         --pattern "$APPCAST_NAME" \
-        --pattern "$CHECKSUMS_NAME"
+        --pattern "$CHECKSUMS_NAME" \
+        --pattern "$ARTIFACT_MANIFEST_NAME"
     cmp "$UPDATE_ZIP" "$existing_assets_dir/$UPDATE_ZIP_NAME"
     cmp "$APPCAST" "$existing_assets_dir/$APPCAST_NAME"
     cmp "$CHECKSUMS" "$existing_assets_dir/$CHECKSUMS_NAME"
+    cmp "$ARTIFACT_MANIFEST" "$existing_assets_dir/$ARTIFACT_MANIFEST_NAME"
 }
 
 prepare_update_release() {
@@ -412,6 +438,7 @@ prepare_update_release() {
         "$UPDATE_ZIP" \
         "$APPCAST" \
         "$CHECKSUMS" \
+        "$ARTIFACT_MANIFEST" \
         --repo "$PUBLIC_UPDATE_REPOSITORY" \
         --target main \
         --draft \
@@ -467,26 +494,32 @@ verify_anonymous_publish() {
     local published_update_appcast="$TMP_DIR/published-update-appcast.xml"
     local published_update_zip="$TMP_DIR/published-update-$UPDATE_ZIP_NAME"
     local published_update_checksums="$TMP_DIR/published-update-$CHECKSUMS_NAME"
+    local published_update_manifest="$TMP_DIR/published-update-$ARTIFACT_MANIFEST_NAME"
     local published_source_zip="$TMP_DIR/published-source-$UPDATE_ZIP_NAME"
     local published_source_dmg="$TMP_DIR/published-source-$DMG_NAME"
     local published_source_appcast="$TMP_DIR/published-source-$APPCAST_NAME"
     local published_source_checksums="$TMP_DIR/published-source-$CHECKSUMS_NAME"
+    local published_source_manifest="$TMP_DIR/published-source-$ARTIFACT_MANIFEST_NAME"
 
     curl_anonymous "$PUBLIC_FEED_URL" --output "$published_update_appcast"
     curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$UPDATE_ZIP_NAME" --output "$published_update_zip"
     curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$CHECKSUMS_NAME" --output "$published_update_checksums"
+    curl_anonymous "$PUBLIC_UPDATE_BASE_URL/$ARTIFACT_MANIFEST_NAME" --output "$published_update_manifest"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$UPDATE_ZIP_NAME" --output "$published_source_zip"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$DMG_NAME" --output "$published_source_dmg"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$APPCAST_NAME" --output "$published_source_appcast"
     curl_anonymous "$SOURCE_RELEASE_BASE_URL/$CHECKSUMS_NAME" --output "$published_source_checksums"
+    curl_anonymous "$SOURCE_RELEASE_BASE_URL/$ARTIFACT_MANIFEST_NAME" --output "$published_source_manifest"
 
     cmp "$APPCAST" "$published_update_appcast"
     cmp "$UPDATE_ZIP" "$published_update_zip"
     cmp "$CHECKSUMS" "$published_update_checksums"
+    cmp "$ARTIFACT_MANIFEST" "$published_update_manifest"
     cmp "$UPDATE_ZIP" "$published_source_zip"
     cmp "$DMG" "$published_source_dmg"
     cmp "$APPCAST" "$published_source_appcast"
     cmp "$CHECKSUMS" "$published_source_checksums"
+    cmp "$ARTIFACT_MANIFEST" "$published_source_manifest"
 
     local update_latest_url source_latest_url
     update_latest_url="$(curl_anonymous \

@@ -166,6 +166,7 @@ actor BootstrapSocketServer {
     )
 
     private var listenFD: Int32 = -1
+    private var socketOwnership: BootstrapSocketOwnership?
     private var isRunning = false
     /// One-way tombstone for this listener actor. A stop queued ahead of start must
     /// prevent that later start intent from binding after full shutdown returns.
@@ -254,12 +255,21 @@ actor BootstrapSocketServer {
             print("[MCPStartup] ensured socket dir=\(socketURL.deletingLastPathComponent().path) exists=\(FileManager.default.fileExists(atPath: socketURL.deletingLastPathComponent().path))")
         #endif
 
-        // Remove stale socket if exists
-        unlink(socketURL.path)
+        let ownership = try BootstrapSocketOwnership.acquire(socketURL: socketURL)
+        socketOwnership = ownership
+        do {
+            try ownership.preparePathForBinding()
+        } catch {
+            socketOwnership = nil
+            ownership.release()
+            throw error
+        }
 
         // Create socket
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else {
+            socketOwnership = nil
+            ownership.release()
             throw BootstrapSocketError.socketCreationFailed(errno: errno)
         }
 
@@ -267,6 +277,8 @@ actor BootstrapSocketServer {
             try POSIXDescriptorSupport.setCloseOnExec(fd)
         } catch {
             Darwin.close(fd)
+            socketOwnership = nil
+            ownership.release()
             let descriptorError = error as? POSIXDescriptorConfigurationError
                 ?? .setDescriptorFlagsFailed(fd: fd, errno: errno)
             throw BootstrapSocketError.descriptorConfigurationFailed(role: "listener", error: descriptorError)
@@ -283,6 +295,8 @@ actor BootstrapSocketServer {
         let pathBytes = socketURL.path.utf8CString
         guard pathBytes.count <= MemoryLayout.size(ofValue: addr.sun_path) else {
             Darwin.close(fd)
+            socketOwnership = nil
+            ownership.release()
             throw BootstrapSocketError.pathTooLong
         }
 
@@ -306,13 +320,29 @@ actor BootstrapSocketServer {
                 print("[MCPStartup] bind failed errno=\(bindErrno) socket=\(socketURL.path)")
             #endif
             Darwin.close(fd)
+            socketOwnership = nil
+            ownership.release()
             throw BootstrapSocketError.bindFailed(errno: bindErrno)
+        }
+
+        do {
+            try ownership.captureBoundSocketIdentity()
+        } catch {
+            Darwin.close(fd)
+            _ = ownership.removeOwnedSocketIfCurrent()
+            socketOwnership = nil
+            ownership.release()
+            throw error
         }
 
         // Listen with generous backlog for connection bursts
         guard listen(fd, 128) == 0 else {
+            let listenErrno = errno
             Darwin.close(fd)
-            throw BootstrapSocketError.listenFailed(errno: errno)
+            _ = ownership.removeOwnedSocketIfCurrent()
+            socketOwnership = nil
+            ownership.release()
+            throw BootstrapSocketError.listenFailed(errno: listenErrno)
         }
 
         // Set non-blocking for async accept
@@ -468,8 +498,10 @@ actor BootstrapSocketServer {
         }
         inFlightHandshakeSockets.removeAll()
 
-        // Clean up socket file
-        try? FileManager.default.removeItem(at: socketURL)
+        // Remove only the pathname that still identifies this listener.
+        socketOwnership?.removeOwnedSocketIfCurrent()
+        socketOwnership?.release()
+        socketOwnership = nil
 
         bootstrapSocketServerLog("BootstrapSocketServer stopped")
     }
@@ -613,6 +645,8 @@ actor BootstrapSocketServer {
     struct ListenerDiagnostics {
         let isRunning: Bool
         let listenFDValid: Bool
+        let ownsSocketPath: Bool
+        let socketPathStatus: BootstrapSocketOwnership.PathStatus?
         let acceptSourceExists: Bool
         let acceptSuspendedForBackpressure: Bool
         let inFlightHandshakes: Int
@@ -628,9 +662,12 @@ actor BootstrapSocketServer {
             return errno != EBADF
         }()
 
+        let pathStatus = socketOwnership?.pathStatus()
         return ListenerDiagnostics(
             isRunning: isRunning,
             listenFDValid: fdValid,
+            ownsSocketPath: pathStatus == .owned,
+            socketPathStatus: pathStatus,
             acceptSourceExists: acceptSource != nil,
             acceptSuspendedForBackpressure: acceptSuspendedForBackpressure,
             inFlightHandshakes: inFlightHandshakeSockets.count,
@@ -639,7 +676,7 @@ actor BootstrapSocketServer {
     }
 
     func ensureAccepting() {
-        guard isRunning, listenFD >= 0 else { return }
+        guard isRunning, listenFD >= 0, socketOwnership?.pathStatus() == .owned else { return }
         if acceptSource == nil {
             do {
                 try startAcceptSource()

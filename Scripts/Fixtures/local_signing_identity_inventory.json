@@ -1,0 +1,44 @@
+{
+  "certificates": [
+    {
+      "certificateName": "RepoPrompt CE Local Self-Signed Code Signing",
+      "sha1": "1111111111111111111111111111111111111111",
+      "sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "notAfter": "2099-01-01T00:00:00Z",
+      "hasPrivateKey": true,
+      "isExpired": false
+    },
+    {
+      "certificateName": "RepoPrompt CE Local Self-Signed Code Signing",
+      "sha1": "2222222222222222222222222222222222222222",
+      "sha256": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "notAfter": "2099-01-01T00:00:00Z",
+      "hasPrivateKey": true,
+      "isExpired": false
+    },
+    {
+      "certificateName": "RepoPrompt CE Local Self-Signed Code Signing",
+      "sha1": "3333333333333333333333333333333333333333",
+      "sha256": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "notAfter": "2099-01-01T00:00:00Z",
+      "hasPrivateKey": false,
+      "isExpired": false
+    },
+    {
+      "certificateName": "RepoPrompt CE Local Self-Signed Code Signing",
+      "sha1": "4444444444444444444444444444444444444444",
+      "sha256": "DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+      "notAfter": "2020-01-01T00:00:00Z",
+      "hasPrivateKey": true,
+      "isExpired": true
+    },
+    {
+      "certificateName": "RepoPrompt CE Local Self-Signed Code Signing Copy",
+      "sha1": "5555555555555555555555555555555555555555",
+      "sha256": "EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+      "notAfter": "2099-01-01T00:00:00Z",
+      "hasPrivateKey": true,
+      "isExpired": false
+    }
+  ]
+}

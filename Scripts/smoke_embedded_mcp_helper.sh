@@ -12,8 +12,22 @@ fail() {
 [[ -n "$APP_BUNDLE" ]] || fail "Usage: $0 <app-bundle> [label]"
 [[ -d "$APP_BUNDLE" ]] || fail "Missing app bundle: $APP_BUNDLE"
 
-MCP_HELPER="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
-[[ -x "$MCP_HELPER" ]] || fail "Missing executable MCP helper: $MCP_HELPER"
+MCP_HELPER="$(python3 - "$APP_BUNDLE" <<'PYTHON'
+import stat
+import sys
+from pathlib import Path
+
+app = Path(sys.argv[1]).resolve(strict=True)
+helper = (app / "Contents" / "MacOS" / "repoprompt-mcp").resolve(strict=True)
+if not helper.is_relative_to(app):
+    raise SystemExit(f"ERROR: canonical MCP helper escapes app bundle: {helper}")
+mode = helper.lstat().st_mode
+if not stat.S_ISREG(mode) or not mode & 0o111:
+    raise SystemExit(f"ERROR: canonical MCP helper is not an executable regular file: {helper}")
+print(helper)
+PYTHON
+)"
+[[ -n "$MCP_HELPER" ]] || fail "Could not resolve contained executable MCP helper"
 
 status=0
 "$MCP_HELPER" --version || status=$?

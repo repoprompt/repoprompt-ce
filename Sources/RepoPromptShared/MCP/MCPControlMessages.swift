@@ -201,15 +201,9 @@ public extension RepoPromptControlNotification where T == RepoPromptProgressPara
 /// This works for both network and filesystem transports as a reliable side-channel.
 /// The CLI sets up a watcher on this directory and exits when it sees its session killed.
 public enum MCPKillSignal {
-    /// Directory where kill signal files are written
-    public static var signalsDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/RepoPrompt/MCPKillSignals", isDirectory: true)
-    }
-
-    /// Kill signal file for a specific session token
-    public static func signalFileURL(forSessionToken token: String) -> URL {
-        signalsDirectory.appendingPathComponent("\(token).kill")
+    /// Kill signal file for a specific session token in the caller-selected flavor directory.
+    public static func signalFileURL(forSessionToken token: String, directory: URL) -> URL {
+        directory.appendingPathComponent("\(token).kill")
     }
 
     /// Content of a kill signal file
@@ -230,10 +224,11 @@ public enum MCPKillSignal {
     public static func writeKillSignal(
         sessionToken: String,
         reason: TerminationReason,
-        message: String? = nil
+        message: String? = nil,
+        directory: URL
     ) throws {
         let fm = FileManager.default
-        try fm.createDirectory(at: signalsDirectory, withIntermediateDirectories: true)
+        try fm.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let content = SignalContent(
             reason: reason,
@@ -246,13 +241,13 @@ public enum MCPKillSignal {
         encoder.outputFormatting = [.sortedKeys]
         let data = try encoder.encode(content)
 
-        let url = signalFileURL(forSessionToken: sessionToken)
+        let url = signalFileURL(forSessionToken: sessionToken, directory: directory)
         try data.write(to: url, options: .atomic)
     }
 
     /// Reads a kill signal if it exists for this session.
-    public static func readKillSignal(forSessionToken token: String) -> SignalContent? {
-        let url = signalFileURL(forSessionToken: token)
+    public static func readKillSignal(forSessionToken token: String, directory: URL) -> SignalContent? {
+        let url = signalFileURL(forSessionToken: token, directory: directory)
         guard let data = try? Data(contentsOf: url) else { return nil }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -260,17 +255,17 @@ public enum MCPKillSignal {
     }
 
     /// Removes a kill signal file (called by CLI after acknowledging).
-    public static func removeKillSignal(forSessionToken token: String) {
-        try? FileManager.default.removeItem(at: signalFileURL(forSessionToken: token))
+    public static func removeKillSignal(forSessionToken token: String, directory: URL) {
+        try? FileManager.default.removeItem(at: signalFileURL(forSessionToken: token, directory: directory))
     }
 
     /// Cleans up old kill signal files (older than 1 hour).
-    public static func cleanupStaleSignals() {
+    public static func cleanupStaleSignals(in directory: URL) {
         let fm = FileManager.default
         let cutoff = Date().addingTimeInterval(-3600) // 1 hour
 
         guard let contents = try? fm.contentsOfDirectory(
-            at: signalsDirectory,
+            at: directory,
             includingPropertiesForKeys: [.contentModificationDateKey],
             options: [.skipsHiddenFiles]
         ) else { return }

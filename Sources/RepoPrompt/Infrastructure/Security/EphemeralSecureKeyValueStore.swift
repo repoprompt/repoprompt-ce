@@ -1,60 +1,58 @@
-#if DEBUG
-    import Foundation
+import Foundation
 
-    /// Debug-build-only in-memory secure storage used when local app signing cannot safely use Keychain.
-    final class EphemeralSecureKeyValueStore: SecureKeyValueStorageBackend {
-        static let shared = EphemeralSecureKeyValueStore()
+/// Process-local secure storage used whenever runtime signing cannot select a persistent domain.
+final class EphemeralSecureKeyValueStore: SecureKeyValueStorageBackend, @unchecked Sendable {
+    static let shared = EphemeralSecureKeyValueStore()
 
-        let persistsValuesAcrossLaunches = false
+    let persistsValuesAcrossLaunches = false
 
-        private var entries: [String: Data] = [:]
-        private let lock = NSRecursiveLock()
+    private var entries: [String: Data] = [:]
+    private let lock = NSRecursiveLock()
 
-        init() {}
+    init() {}
 
-        func save(
-            _ value: String,
-            for key: String,
-            accessMode: KeychainAccessMode
-        ) throws {
-            guard let data = value.data(using: .utf8) else {
-                throw KeychainService.KeychainError.invalidData
-            }
-
-            withLock {
-                entries[key] = data
-            }
+    func save(
+        _ value: String,
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        guard let data = value.data(using: .utf8) else {
+            throw KeychainService.KeychainError.invalidData
         }
 
-        func get(
-            for key: String,
-            accessMode: KeychainAccessMode
-        ) throws -> String {
-            let data = try withLock {
-                guard let data = entries[key] else {
-                    throw KeychainService.KeychainError.itemNotFound
-                }
-                return data
-            }
-            guard let value = String(data: data, encoding: .utf8) else {
-                throw KeychainService.KeychainError.invalidData
-            }
-            return value
-        }
-
-        func delete(
-            for key: String,
-            accessMode: KeychainAccessMode
-        ) throws {
-            _ = withLock {
-                entries.removeValue(forKey: key)
-            }
-        }
-
-        private func withLock<T>(_ body: () throws -> T) rethrows -> T {
-            lock.lock()
-            defer { lock.unlock() }
-            return try body()
+        withLock {
+            entries[key] = data
         }
     }
-#endif
+
+    func get(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws -> String {
+        let data = try withLock {
+            guard let data = entries[key] else {
+                throw KeychainService.KeychainError.itemNotFound
+            }
+            return data
+        }
+        guard let value = String(data: data, encoding: .utf8) else {
+            throw KeychainService.KeychainError.invalidData
+        }
+        return value
+    }
+
+    func delete(
+        for key: String,
+        accessMode: KeychainAccessMode
+    ) throws {
+        _ = withLock {
+            entries.removeValue(forKey: key)
+        }
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}

@@ -3,9 +3,9 @@ import Foundation
 protocol SecurePlainStringStoring {
     var persistsValuesAcrossLaunches: Bool { get }
 
-    func getPlainValue(for key: String, accessMode: KeychainAccessMode) throws -> String?
-    func savePlainValue(_ value: String, for key: String, accessMode: KeychainAccessMode) throws
-    func deletePlainValue(for key: String, accessMode: KeychainAccessMode) throws
+    func getPlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws -> String?
+    func savePlainValue(_ value: String, for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws
+    func deletePlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws
 }
 
 extension SecurePlainStringStoring {
@@ -13,16 +13,16 @@ extension SecurePlainStringStoring {
         true
     }
 
-    func getPlainValue(for key: String) throws -> String? {
-        try getPlainValue(for: key, accessMode: .interactive)
+    func getPlainValue(for account: SecureStorageAccount) throws -> String? {
+        try getPlainValue(for: account, accessMode: .interactive)
     }
 
-    func savePlainValue(_ value: String, for key: String) throws {
-        try savePlainValue(value, for: key, accessMode: .interactive)
+    func savePlainValue(_ value: String, for account: SecureStorageAccount) throws {
+        try savePlainValue(value, for: account, accessMode: .interactive)
     }
 
-    func deletePlainValue(for key: String) throws {
-        try deletePlainValue(for: key, accessMode: .interactive)
+    func deletePlainValue(for account: SecureStorageAccount) throws {
+        try deletePlainValue(for: account, accessMode: .interactive)
     }
 }
 
@@ -40,56 +40,56 @@ final class SecureKeysService {
 
     func saveAPIKey(
         _ key: String,
-        for identifier: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
-        try secureStorage.save(key, for: identifier, accessMode: accessMode)
+        try secureStorage.save(key, for: account.identifier, accessMode: accessMode)
     }
 
     func getAPIKey(
-        for identifier: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) async throws -> String? {
         do {
-            return try secureStorage.get(for: identifier, accessMode: accessMode)
+            return try secureStorage.get(for: account.identifier, accessMode: accessMode)
         } catch KeychainService.KeychainError.itemNotFound {
             return nil
         }
     }
 
     func deleteAPIKey(
-        for identifier: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
-        try secureStorage.delete(for: identifier, accessMode: accessMode)
+        try secureStorage.delete(for: account.identifier, accessMode: accessMode)
     }
 
     // MARK: - Plain String Storage
 
     func savePlainValue(
         _ value: String,
-        for key: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
-        try secureStorage.save(value, for: key, accessMode: accessMode)
+        try secureStorage.save(value, for: account.identifier, accessMode: accessMode)
     }
 
     func getPlainValue(
-        for key: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) throws -> String? {
         do {
-            return try secureStorage.get(for: key, accessMode: accessMode)
+            return try secureStorage.get(for: account.identifier, accessMode: accessMode)
         } catch KeychainService.KeychainError.itemNotFound {
             return nil
         }
     }
 
     func deletePlainValue(
-        for key: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode = .interactive
     ) throws {
-        try secureStorage.delete(for: key, accessMode: accessMode)
+        try secureStorage.delete(for: account.identifier, accessMode: accessMode)
     }
 }
 

@@ -55,22 +55,39 @@ struct SystemSecItemClient: SecItemClient {
     }
 }
 
-/// Secure storage service using the canonical CE macOS Keychain service.
-final class KeychainService: SecureKeyValueStorageBackend {
-    static let canonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
-    static let localSelfSignedServiceName = "com.pvncher.repoprompt.ce.local-self-signed.keychain"
+/// Secure storage service for one explicitly selected CE macOS Keychain domain.
+final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
+    static let legacyCanonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
+    static let officialV2ServiceName = "com.pvncher.repoprompt.ce.developer-id.keychain.v2"
+    static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
+    static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
 
-    static let shared = KeychainService()
-    static let localSelfSignedShared = KeychainService(serviceName: localSelfSignedServiceName)
+    static let officialV2Shared = KeychainService(serviceName: officialV2ServiceName)
+    static let debugShared = KeychainService(serviceName: debugServiceName)
 
-    private let serviceName: String
+    static func localSelfSignedServiceName(fingerprint: String, generation: Int) -> String {
+        let normalizedFingerprint = fingerprint.filter(\.isHexDigit).lowercased()
+        precondition(normalizedFingerprint.count == 64, "Local certificate fingerprint must be SHA-256")
+        precondition(generation > 0, "Local secure-storage generation must be positive")
+        return "\(localSelfSignedServiceNamePrefix)\(normalizedFingerprint).keychain.v\(generation)"
+    }
+
+    static func localSelfSigned(fingerprint: String, generation: Int) -> KeychainService {
+        KeychainService(serviceName: localSelfSignedServiceName(fingerprint: fingerprint, generation: generation))
+    }
+
+    static func legacyRepairSource(secItemClient: SecItemClient = SystemSecItemClient()) -> KeychainService {
+        KeychainService(serviceName: legacyCanonicalServiceName, secItemClient: secItemClient)
+    }
+
+    let serviceName: String
     private let secItemClient: SecItemClient
     private let operationLock = NSRecursiveLock()
 
     let persistsValuesAcrossLaunches = true
 
     init(
-        serviceName: String = KeychainService.canonicalServiceName,
+        serviceName: String = KeychainService.officialV2ServiceName,
         secItemClient: SecItemClient = SystemSecItemClient()
     ) {
         self.serviceName = serviceName
@@ -141,7 +158,7 @@ final class KeychainService: SecureKeyValueStorageBackend {
 
     // MARK: - Save to Keychain
 
-    /// Save a UTF-8 string to the canonical CE keychain service.
+    /// Save a UTF-8 string to this service only.
     func save(
         _ value: String,
         for key: String,
@@ -190,7 +207,7 @@ final class KeychainService: SecureKeyValueStorageBackend {
 
     // MARK: - Retrieve from Keychain
 
-    /// Retrieve a UTF-8 string from the canonical CE keychain service only.
+    /// Retrieve a UTF-8 string from this service only.
     func get(
         for key: String,
         accessMode: KeychainAccessMode = .interactive
@@ -224,7 +241,7 @@ final class KeychainService: SecureKeyValueStorageBackend {
 
     // MARK: - Delete from Keychain
 
-    /// Delete an item from canonical CE keychain storage only.
+    /// Delete an item from this service only.
     func delete(for key: String, accessMode: KeychainAccessMode = .interactive) throws {
         try withLock {
             let itemQuery = query([

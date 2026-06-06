@@ -45,10 +45,7 @@ enum MCPRoutingStateStore {
     /// Set to true to enable debug logging for MCP routing state operations
     static var debugLoggingEnabled = false
     private static var url: URL {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return home.appendingPathComponent(
-            "Library/Application Support/RepoPrompt/mcp-routing.json"
-        )
+        MCPFilesystemConstants.identity.routingStateURL()
     }
 
     static func load() -> MCPRoutingState {

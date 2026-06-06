@@ -14,6 +14,7 @@ PUBLIC_UPDATE_BASE_URL="https://github.com/$PUBLIC_UPDATE_REPOSITORY/releases/do
 PUBLIC_FEED_URL="$PUBLIC_UPDATE_BASE_URL/appcast.xml"
 SPARKLE_KEY_ACCOUNT="${SPARKLE_KEY_ACCOUNT:-repoprompt-ce}"
 UPDATE_ZIP="${1:-$ROOT_DIR/dist/${APP_NAME}-${MARKETING_VERSION}-${BUILD_NUMBER}.zip}"
+ARTIFACT_MANIFEST="${UPDATE_ZIP%.zip}-artifact-manifest.json"
 GENERATE_APPCAST="$ROOT_DIR/Vendor/Sparkle/bin/generate_appcast"
 TMP_DIR=""
 
@@ -34,6 +35,7 @@ trap cleanup EXIT
 [[ "${CONFIRM_PUBLIC_UPDATE_TEST:-}" == "1" ]] ||
     fail "Set CONFIRM_PUBLIC_UPDATE_TEST=1 to acknowledge that this publishes a signed test update publicly."
 [[ -f "$UPDATE_ZIP" ]] || fail "Missing update ZIP: $UPDATE_ZIP"
+[[ -f "$ARTIFACT_MANIFEST" ]] || fail "Missing update artifact manifest: $ARTIFACT_MANIFEST"
 [[ -x "$GENERATE_APPCAST" ]] || fail "Missing Sparkle generate_appcast tool: $GENERATE_APPCAST"
 [[ -x "$ROOT_DIR/Scripts/validate_embedded_mcp_helper_layout.sh" ]] ||
     fail "Missing embedded MCP helper layout validator"
@@ -69,6 +71,11 @@ printf '%s\n' "$signature_details" | grep -q '^Authority=Developer ID Applicatio
     fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team_identifier:-<missing>}"
 xcrun stapler validate "$APP_BUNDLE"
 "$ROOT_DIR/Scripts/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Public updater ZIP MCP helper layout"
+"$ROOT_DIR/Scripts/validate_app_architectures.sh" "$APP_BUNDLE" "arm64,x86_64" "Public updater ZIP app"
+"$ROOT_DIR/Scripts/write_app_artifact_manifest.py" verify \
+    --app "$APP_BUNDLE" \
+    --manifest "$ARTIFACT_MANIFEST" \
+    --expected-architectures "arm64,x86_64"
 
 bundle_identifier="$(plutil -extract CFBundleIdentifier raw "$APP_BUNDLE/Contents/Info.plist")"
 marketing_version="$(plutil -extract CFBundleShortVersionString raw "$APP_BUNDLE/Contents/Info.plist")"
@@ -92,12 +99,15 @@ cp "$UPDATE_ZIP" "$APPCAST_DIR/"
     shasum -a 256 "$(basename "$UPDATE_ZIP")"
     cd "$TMP_DIR"
     shasum -a 256 "$(basename "$APPCAST")"
+    cd "$(dirname "$ARTIFACT_MANIFEST")"
+    shasum -a 256 "$(basename "$ARTIFACT_MANIFEST")"
 ) > "$CHECKSUMS"
 
 gh release create "$PUBLIC_UPDATE_TAG" \
     "$UPDATE_ZIP" \
     "$APPCAST" \
     "$CHECKSUMS" \
+    "$ARTIFACT_MANIFEST" \
     --repo "$PUBLIC_UPDATE_REPOSITORY" \
     --target main \
     --latest=false \

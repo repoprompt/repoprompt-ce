@@ -3,7 +3,7 @@
 //  RepoPrompt
 //
 //  Centralized XOR obfuscation for security-sensitive strings.
-//  Encoded values are internal for testability; decoded values stay private to each consumer.
+//  Encoded values are internal for testability; decoded values stay scoped to their catalog or consumer.
 //
 
 import Foundation
@@ -15,33 +15,6 @@ enum SecurityObfuscation {
         let decoded = bytes.map { $0 ^ key }
         return String(bytes: decoded, encoding: .utf8) ?? ""
     }
-
-    // MARK: - Agent Permission Secure Store Keys
-
-    static let agentPermissionSubagentDocumentKeyEncoded: [UInt8] = [
-        40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-        51, 53, 52, 41, 116, 41, 47, 56, 59, 61, 63, 52, 46, 116, 44, 107
-    ]
-
-    static let agentPermissionCodexDocumentKeyEncoded: [UInt8] = [
-        40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-        51, 53, 52, 41, 116, 57, 53, 62, 63, 34, 116, 44, 107
-    ]
-
-    static let agentPermissionClaudeDocumentKeyEncoded: [UInt8] = [
-        40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-        51, 53, 52, 41, 116, 57, 54, 59, 47, 62, 63, 116, 44, 107
-    ]
-
-    static let agentPermissionOpenCodeDocumentKeyEncoded: [UInt8] = [
-        40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-        51, 53, 52, 41, 116, 53, 42, 63, 52, 25, 53, 62, 63, 116, 44, 107
-    ]
-
-    static let agentPermissionCursorDocumentKeyEncoded: [UInt8] = [
-        40, 42, 116, 59, 61, 63, 52, 46, 116, 42, 63, 40, 55, 51, 41, 41,
-        51, 53, 52, 41, 116, 57, 47, 40, 41, 53, 40, 116, 44, 107
-    ]
 
     // MARK: - SparkleUpdateManager Keys
 

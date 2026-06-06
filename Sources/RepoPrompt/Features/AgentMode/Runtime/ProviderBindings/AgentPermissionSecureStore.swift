@@ -10,19 +10,23 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
     case openCode
     case cursor
 
-    var storageKey: String {
+    var secureStorageAccount: SecureStorageAccount {
         switch self {
         case .subagent:
-            SecurityObfuscation.decode(SecurityObfuscation.agentPermissionSubagentDocumentKeyEncoded)
+            .agentPermissionSubagentDocument
         case .codex:
-            SecurityObfuscation.decode(SecurityObfuscation.agentPermissionCodexDocumentKeyEncoded)
+            .agentPermissionCodexDocument
         case .claude:
-            SecurityObfuscation.decode(SecurityObfuscation.agentPermissionClaudeDocumentKeyEncoded)
+            .agentPermissionClaudeDocument
         case .openCode:
-            SecurityObfuscation.decode(SecurityObfuscation.agentPermissionOpenCodeDocumentKeyEncoded)
+            .agentPermissionOpenCodeDocument
         case .cursor:
-            SecurityObfuscation.decode(SecurityObfuscation.agentPermissionCursorDocumentKeyEncoded)
+            .agentPermissionCursorDocument
         }
+    }
+
+    var storageKey: String {
+        secureStorageAccount.identifier
     }
 }
 
@@ -581,7 +585,7 @@ final class AgentPermissionSecureStore {
         let plainPayload: String?
         do {
             plainPayload = try secureStrings.getPlainValue(
-                for: domain.storageKey,
+                for: domain.secureStorageAccount,
                 accessMode: permissionDecisionAccessMode
             )
         } catch {
@@ -729,7 +733,7 @@ final class AgentPermissionSecureStore {
         } catch {
             recordDiagnostic(domain: domain, kind: keychainFailureKind(for: error, fallback: .keychainWriteFailed), error: error)
             effects.requestDiagnosticsNotification(for: domain)
-            try? secureStrings.deletePlainValue(for: domain.storageKey, accessMode: .interactive)
+            try? secureStrings.deletePlainValue(for: domain.secureStorageAccount, accessMode: .interactive)
             cache = document
             effects.requestChangeNotification(domain: domain, writeSucceeded: false)
             return false
@@ -745,7 +749,7 @@ final class AgentPermissionSecureStore {
         guard let payload = String(data: data, encoding: .utf8) else {
             throw AgentPermissionSecureStoreError.encodingFailed
         }
-        try secureStrings.savePlainValue(payload, for: domain.storageKey, accessMode: accessMode)
+        try secureStrings.savePlainValue(payload, for: domain.secureStorageAccount, accessMode: accessMode)
     }
 
     // MARK: - Normalization

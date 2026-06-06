@@ -67,7 +67,10 @@ ALLOW_ADHOC_SIGNING="${ALLOW_ADHOC_SIGNING:-0}"
 RELEASE_ALLOW_ADHOC_SIGNING="${RELEASE_ALLOW_ADHOC_SIGNING:-0}"
 LOCAL_SELF_SIGNED_RELEASE="${LOCAL_SELF_SIGNED_RELEASE:-0}"
 LOCAL_SELF_SIGNED_CERTIFICATE_NAME="RepoPrompt CE Local Self-Signed Code Signing"
-LOCAL_SELF_SIGNED_REQUIREMENT="anchor trusted and identifier \"$BUNDLE_ID\" and certificate leaf[subject.CN] = \"$LOCAL_SELF_SIGNED_CERTIFICATE_NAME\""
+LOCAL_SIGNING_CERTIFICATE_SHA1="${LOCAL_SIGNING_CERTIFICATE_SHA1:-}"
+LOCAL_SIGNING_CERTIFICATE_SHA256="${LOCAL_SIGNING_CERTIFICATE_SHA256:-}"
+LOCAL_SIGNING_SERVICE_GENERATION="${LOCAL_SIGNING_SERVICE_GENERATION:-}"
+LOCAL_SELF_SIGNED_REQUIREMENT=""
 PREFER_STABLE_DEBUG_SIGNING="${PREFER_STABLE_DEBUG_SIGNING:-1}"
 DEBUG_SECURE_STORAGE_BACKEND="${DEBUG_SECURE_STORAGE_BACKEND:-}"
 REPOPROMPT_PROVISIONING_PROFILE="${REPOPROMPT_PROVISIONING_PROFILE:-}"
@@ -91,6 +94,12 @@ warn_release_candidate_signing(){
 if [[ "$LOCAL_SELF_SIGNED_RELEASE" == "1" || "$LOCAL_SELF_SIGNED_RELEASE" == "true" ]]; then
     (( IS_RELEASE )) || fail "LOCAL_SELF_SIGNED_RELEASE is only supported for release packaging."
     [[ -n "$SIGN_IDENTITY" ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires SIGN_IDENTITY pointing at the user-local self-signed code-signing identity."
+    [[ "$LOCAL_SIGNING_CERTIFICATE_SHA1" =~ ^[[:xdigit:]]{40}$ ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires LOCAL_SIGNING_CERTIFICATE_SHA1 with the selected certificate SHA-1 fingerprint."
+    [[ "$LOCAL_SIGNING_CERTIFICATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires LOCAL_SIGNING_CERTIFICATE_SHA256 with the selected certificate SHA-256 fingerprint."
+    [[ "$LOCAL_SIGNING_SERVICE_GENERATION" =~ ^[1-9][0-9]*$ ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires a positive LOCAL_SIGNING_SERVICE_GENERATION."
+    LOCAL_SIGNING_CERTIFICATE_SHA1="$(tr '[:lower:]' '[:upper:]' <<< "$LOCAL_SIGNING_CERTIFICATE_SHA1")"
+    LOCAL_SIGNING_CERTIFICATE_SHA256="$(tr '[:lower:]' '[:upper:]' <<< "$LOCAL_SIGNING_CERTIFICATE_SHA256")"
+    LOCAL_SELF_SIGNED_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$LOCAL_SIGNING_CERTIFICATE_SHA1\""
     USE_LOCAL_SELF_SIGNED_RELEASE=1
     echo "WARNING: Building a local-only self-signed production app."
     echo "WARNING: This app is for installation on this Mac only. It is not notarized and must not be uploaded to GitHub Releases."
@@ -151,33 +160,54 @@ printf 'Debug secure storage backend marker: %s\n' "$DEBUG_STORAGE_BACKEND_MARKE
 printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 
 SWIFT_BUILD_ARGS=(-c "$CONF")
+PUBLIC_UNIVERSAL_RELEASE=0
+ARCHITECTURE_POLICY="matching"
+if (( IS_RELEASE )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )); then
+    PUBLIC_UNIVERSAL_RELEASE=1
+    ARCHITECTURE_POLICY="arm64,x86_64"
+fi
 
 # KeyboardShortcuts' default Bundle.module lookup does not match RepoPrompt's
-# packaged resource layout. Patch the pinned SwiftPM checkout before compiling;
-# this is intentionally not a post-build or post-signing mutation.
-phase "Patching KeyboardShortcuts resource lookup"
-run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
+# packaged resource layout. Host-native builds patch the default checkout below;
+# the universal builder patches each isolated architecture checkout before compiling.
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    phase "Building universal public release products in isolated SwiftPM directories"
+    BUILD_DIR="$ROOT_DIR/.build/public-release-products/release"
+    run env \
+        REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
+        REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS="$RUN_WITHOUT_GITHUB_TOKENS" \
+        "$CONTROL_PLANE_SCRIPTS_DIR/build_swiftpm_release_products.sh" "$BUILD_DIR"
+else
+    phase "Patching KeyboardShortcuts resource lookup"
+    run "$CONTROL_PLANE_SCRIPTS_DIR/patch_keyboard_shortcuts_resource_lookup.sh" "$ROOT_DIR"
 
-phase "Building $APP_NAME ($CONF)"
-run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
+    phase "Building $APP_NAME ($CONF, host-native)"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_NAME"
 
-phase "Building repoprompt-mcp ($CONF)"
-run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
+    phase "Building repoprompt-mcp ($CONF, host-native)"
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift build "${SWIFT_BUILD_ARGS[@]}" --product repoprompt-mcp
 
-phase "Resolving build artifact paths"
-echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
-BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
-if (( IS_RELEASE )); then
+    phase "Resolving build artifact paths"
+    echo_cmd "$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path
+    BUILD_DIR="$("$RUN_WITHOUT_GITHUB_TOKENS" swift build -c "$CONF" --show-bin-path)"
+fi
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    APP_BUNDLE="$ROOT_DIR/.build/release/$APP_NAME.app"
+elif (( IS_RELEASE )); then
     APP_BUNDLE="$BUILD_DIR/$APP_NAME.app"
 else
     APP_BUNDLE="${REPOPROMPT_DEBUG_APP_BUNDLE:-$HOME/Library/Application Support/RepoPrompt CE/DebugApps/$APP_NAME.app}"
 fi
 COMPAT_APP_BUNDLE="$ROOT_DIR/.build/$CONF/$APP_NAME.app"
 CLI_PATH="$BUILD_DIR/repoprompt-mcp"
-printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+printf 'BUILD_DIR=%s\nAPP_BUNDLE=%s\nCOMPAT_APP_BUNDLE=%s\nCLI_PATH=%s\nAD_HOC_SIGNING=%s\nARCHITECTURE_POLICY=%s\n' "$BUILD_DIR" "$APP_BUNDLE" "$COMPAT_APP_BUNDLE" "$CLI_PATH" "$USE_ADHOC_SIGNING" "$ARCHITECTURE_POLICY"
 
 phase "Creating app bundle layout"
 run rm -rf "$APP_BUNDLE"
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    run rm -f "$ARTIFACT_MANIFEST"
+fi
 if [[ "$(python3 - <<PY
 from pathlib import Path
 import os
@@ -207,7 +237,7 @@ phase "Writing Info.plist"
 run python3 - <<PY
 from pathlib import Path
 s=Path('AppBundle/Info.plist.template').read_text()
-for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER'}.items(): s=s.replace(k,v)
+for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION'}.items(): s=s.replace(k,v)
 Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
@@ -250,6 +280,7 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
     "$CONTROL_PLANE_SCRIPTS_DIR/verify_sparkle_vendor.sh" "$SPARKLE_FRAMEWORK"
 run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
 
 phase "Signing app bundle"
 sign_path(){
@@ -276,7 +307,7 @@ sign_sparkle_framework(){
     sign_path "$framework"
 }
 verify_signed_app_identity(){
-    local details identifier team authorities
+    local details identifier team authorities designated_requirement certificate_dir certificate_prefix actual_fingerprint
     details="$(codesign -dv --verbose=4 "$APP_BUNDLE" 2>&1 || true)"
     identifier="$(awk -F= '/^Identifier=/{print $2; exit}' <<< "$details")"
     team="$(awk -F= '/^TeamIdentifier=/{print $2; exit}' <<< "$details")"
@@ -294,6 +325,25 @@ verify_signed_app_identity(){
     elif (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
         [[ -z "$team" || "$team" == "not set" ]] || fail "Local self-signed app unexpectedly has team identifier '$team'."
         run codesign --verify --deep --strict --verbose=2 -R="$LOCAL_SELF_SIGNED_REQUIREMENT" "$APP_BUNDLE"
+        certificate_dir="$(mktemp -d)"
+        certificate_prefix="$certificate_dir/leaf"
+        codesign -d --extract-certificates "$certificate_prefix" "$APP_BUNDLE" >/dev/null 2>&1 || {
+            rm -rf "$certificate_dir"
+            fail "Could not extract the local signing certificate from the packaged app."
+        }
+        [[ -f "${certificate_prefix}0" ]] || {
+            rm -rf "$certificate_dir"
+            fail "Packaged app did not expose a leaf signing certificate."
+        }
+        actual_fingerprint="$(shasum -a 256 "${certificate_prefix}0" | awk '{print toupper($1)}')"
+        rm -rf "$certificate_dir"
+        [[ "$actual_fingerprint" == "$LOCAL_SIGNING_CERTIFICATE_SHA256" ]] || fail "Packaged app certificate fingerprint mismatch: expected $LOCAL_SIGNING_CERTIFICATE_SHA256, got ${actual_fingerprint:-<missing>}."
+        designated_requirement="$(codesign -d -r- "$APP_BUNDLE" 2>&1 | sed -n 's/^designated => //p')"
+        [[ -n "$designated_requirement" ]] || fail "Could not extract the packaged app designated requirement."
+        grep -F -i -- "$LOCAL_SIGNING_CERTIFICATE_SHA1" <<< "$designated_requirement" >/dev/null || fail "Packaged app designated requirement is not pinned to the selected local certificate."
+        printf 'Selected local certificate SHA-256: %s\n' "$LOCAL_SIGNING_CERTIFICATE_SHA256"
+        printf 'Local secure-storage service generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
+        printf 'Extracted designated requirement: %s\n' "$designated_requirement"
     elif (( IS_RELEASE )); then
         [[ "$team" == "$SIGNING_TEAM_ID" ]] || fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team:-<missing>}"
     else
@@ -307,6 +357,9 @@ APP_SIGN_ARGS=()
 if (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     APP_SIGN_ARGS+=(--entitlements "$APP_ENTITLEMENTS")
 fi
+if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
+    APP_SIGN_ARGS+=(--requirements "designated => $LOCAL_SELF_SIGNED_REQUIREMENT")
+fi
 if (( ${#APP_SIGN_ARGS[@]} )); then
     sign_path "$APP_BUNDLE" "${APP_SIGN_ARGS[@]}"
 else
@@ -314,6 +367,13 @@ else
 fi
 run codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
 verify_signed_app_identity
+run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Post-sign packaged app"
+if (( PUBLIC_UNIVERSAL_RELEASE )); then
+    run "$CONTROL_PLANE_SCRIPTS_DIR/write_app_artifact_manifest.py" write \
+        --app "$APP_BUNDLE" \
+        --output "$ARTIFACT_MANIFEST" \
+        --expected-architectures "$ARCHITECTURE_POLICY"
+fi
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_embedded_mcp_helper_layout.sh" "$APP_BUNDLE" "Packaged app MCP helper layout"
 run "$RUN_WITHOUT_GITHUB_TOKENS" "$CONTROL_PLANE_SCRIPTS_DIR/smoke_embedded_mcp_helper.sh" "$APP_BUNDLE" "Packaged app MCP helper"
 if [[ "$(python3 - <<PY

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 // MARK: - MCP Debug Logging
 
@@ -59,23 +60,28 @@ func mcpRoutingDebugLog(_ message: @autoclosure () -> String) {
 }
 
 enum MCPFilesystemConstants {
-    /// UNIX domain socket transport.
-    /// Current CE bootstrap socket is placed in a per-user /tmp directory.
-    /// sun_path limit is 104 bytes - typical path is ~40 bytes, well under limit.
-    static let socketDirName = "repoprompt-ce-mcp"
+    #if DEBUG
+        static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+    #else
+        static let identity = MCPFilesystemIdentity.repoPromptCE(.release)
+    #endif
 
-    /// Returns the primary socket directory URL in /tmp.
-    /// Uses /tmp/repoprompt-ce-mcp-{uid}/ which:
-    /// - Is accessible by external sandboxed apps (Claude Desktop, Cursor, etc.)
-    /// - Per-user suffix prevents conflicts between users
-    /// - Is a well-known, stable path (not containerized per-app)
-    static func socketDirectoryURL() -> URL {
-        let uid = getuid()
-        return URL(fileURLWithPath: "/tmp/\(socketDirName)-\(uid)", isDirectory: true)
+    static var socketDirName: String {
+        identity.socketDirectoryName
     }
 
-    /// Creates the socket directory with secure permissions (0700)
-    /// - Returns: true if directory exists or was created successfully
+    static var socketVersion: Int {
+        identity.protocolVersion
+    }
+
+    static var bootstrapSocketName: String {
+        identity.bootstrapSocketName
+    }
+
+    static func socketDirectoryURL() -> URL {
+        identity.socketDirectoryURL()
+    }
+
     @discardableResult
     static func ensureSocketDirectoryExists() -> Bool {
         let url = socketDirectoryURL()
@@ -86,7 +92,6 @@ enum MCPFilesystemConstants {
         }
 
         do {
-            // Create with owner-only permissions for security
             try fm.createDirectory(
                 at: url,
                 withIntermediateDirectories: true,
@@ -99,39 +104,11 @@ enum MCPFilesystemConstants {
         }
     }
 
-    // MARK: - Bootstrap Socket (Single App-Owned Socket)
-
-    /// Name of the single bootstrap socket owned by the app.
-    /// CLI connects to this socket for all MCP communication.
-    ///
-    /// CE socket naming scheme:
-    /// - `repoprompt-ce-{version}.sock`
-    ///
-    /// Keep path short due to sun_path 104-byte limit.
-    static let socketVersion = 6
-
-    static var bootstrapSocketName: String {
-        "repoprompt-ce-\(socketVersion).sock"
-    }
-
-    /// Returns the bootstrap socket URL.
-    /// This is a single well-known socket that the app listens on.
-    /// CLI connects to this socket to initiate MCP sessions.
     static func bootstrapSocketURL() -> URL {
-        socketDirectoryURL().appendingPathComponent(bootstrapSocketName, isDirectory: false)
+        identity.bootstrapSocketURL()
     }
 
-    // MARK: - External Client Events Directory
-
-    /// Directory for external client error events.
-    /// Gated by build flavor and socket version so different app versions don't cross-pollinate.
-    /// e.g. "MCPEvents-6" for release, "MCPEvents-D-6" for debug
     static func eventsDirectoryURL() -> URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-        let dirname = "MCPEvents-CE-\(socketVersion)"
-        return appSupport.appendingPathComponent("RepoPrompt CE/\(dirname)", isDirectory: true)
+        identity.externalEventsDirectoryURL()
     }
 }

@@ -73,7 +73,8 @@ jobs:
             --repo "$SOURCE_GITHUB_REPOSITORY" \
             --dir reviewed-assets \
             --pattern '*.zip' \
-            --pattern SHA256SUMS
+            --pattern SHA256SUMS \
+            --pattern '*-artifact-manifest.json'
 
       - name: Verify reviewed ZIP checksum binding
         env:
@@ -85,7 +86,9 @@ jobs:
           [[ "$actual_digest" == "$REVIEWED_CHECKSUMS_SHA256" ]] || { echo "Reviewed SHA256SUMS digest mismatch" >&2; exit 1; }
           shopt -s nullglob
           archives=(reviewed-assets/*.zip)
+          artifact_manifests=(reviewed-assets/*-artifact-manifest.json)
           [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one reviewed ZIP" >&2; exit 1; }
+          [[ "${#artifact_manifests[@]}" == "1" ]] || { echo "Expected exactly one reviewed artifact manifest" >&2; exit 1; }
           grep -F "  $(basename "${archives[0]}")" "$checksums" > reviewed-assets/reviewed-zip.sha256
           [[ "$(wc -l < reviewed-assets/reviewed-zip.sha256 | tr -d ' ')" == "1" ]] || { echo "Reviewed ZIP checksum entry mismatch" >&2; exit 1; }
           (cd reviewed-assets && shasum -a 256 -c reviewed-zip.sha256)
@@ -94,16 +97,37 @@ jobs:
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
             "extracted/RepoPrompt CE.app" \
             "Reviewed ZIP MCP helper layout"
+          ./trusted-control-plane/Scripts/validate_app_architectures.sh \
+            "extracted/RepoPrompt CE.app" \
+            "arm64,x86_64" \
+            "Reviewed ZIP app"
+          ./trusted-control-plane/Scripts/write_app_artifact_manifest.py verify \
+            --app "extracted/RepoPrompt CE.app" \
+            --manifest "${artifact_manifests[0]}" \
+            --expected-architectures "arm64,x86_64"
+          echo "ARTIFACT_MANIFEST_PATH=${artifact_manifests[0]}" >> "$GITHUB_ENV"
 
-      - name: Execute reviewed helper without inherited secrets
+      - name: Execute reviewed helper and packaged roundtrip without inherited secrets
         run: |
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             HOME="$HOME" \
             TMPDIR="$RUNNER_TEMP" \
+            USER="$USER" \
+            LOGNAME="$LOGNAME" \
             ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
             "extracted/RepoPrompt CE.app" \
             "Reviewed ZIP MCP helper"
+          env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME="$HOME" \
+            TMPDIR="$RUNNER_TEMP" \
+            USER="$USER" \
+            LOGNAME="$LOGNAME" \
+            ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
+            "extracted/RepoPrompt CE.app" \
+            "Reviewed packaged app" \
+            "$ARTIFACT_MANIFEST_PATH"
 
   promote:
     name: Mirror and Promote Reviewed Draft

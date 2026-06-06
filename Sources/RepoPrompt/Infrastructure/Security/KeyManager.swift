@@ -19,8 +19,8 @@ actor KeyManager {
             return cached
         }
 
-        let identifier = provider.secureIdentifier
-        let keyFromDisk = try await secureService.getAPIKey(for: identifier, accessMode: accessMode)
+        let account = provider.secureStorageAccount
+        let keyFromDisk = try await secureService.getAPIKey(for: account, accessMode: accessMode)
 
         if let k = keyFromDisk {
             cache[provider] = k
@@ -36,8 +36,8 @@ actor KeyManager {
         accessMode: KeychainAccessMode = .interactive
     ) throws {
         cache[provider] = key
-        let identifier = provider.secureIdentifier
-        try secureService.saveAPIKey(key, for: identifier, accessMode: accessMode)
+        let account = provider.secureStorageAccount
+        try secureService.saveAPIKey(key, for: account, accessMode: accessMode)
     }
 
     /// Deletes from both in-memory cache and disk.
@@ -46,31 +46,31 @@ actor KeyManager {
         accessMode: KeychainAccessMode = .interactive
     ) throws {
         cache.removeValue(forKey: provider)
-        let identifier = provider.secureIdentifier
-        try secureService.deleteAPIKey(for: identifier, accessMode: accessMode)
+        let account = provider.secureStorageAccount
+        try secureService.deleteAPIKey(for: account, accessMode: accessMode)
     }
 }
 
 extension AIProviderType {
-    /// Maps each `AIProviderType` to the secureIdentifier used by `SecureKeysService`.
-    var secureIdentifier: String {
+    /// Maps each provider to its frozen secure-storage account.
+    var secureStorageAccount: SecureStorageAccount {
         switch self {
-        case .anthropic: "AnthropicAPI"
-        case .openAI: "OpenAIAPI"
-        case .gemini: "GeminiAPI"
-        case .openRouter: "OpenRouterAPI"
-        case .ollama: "OllamaURL"
-        case .azure: "AzureAPI"
-        case .deepseek: "DeepSeekAPI"
-        case .customProvider: "CustomProviderAPI"
-        case .fireworks: "FireworksAPI" // Add Fireworks case
-        case .grok: "GrokAPI" // Add Grok case
-        case .groq: "GroqAPI" // Add Groq case
-        case .claudeCode: "ClaudeCodeAPI" // Add Claude Code case
-        case .codex: "CodexCLIAPI"
-        case .openCode: "OpenCodeCLIAPI"
-        case .cursor: "CursorCLIAPI"
-        case .zAI: "ZAIAPI"
+        case .anthropic: .anthropicAPI
+        case .openAI: .openAIAPI
+        case .gemini: .geminiAPI
+        case .openRouter: .openRouterAPI
+        case .ollama: .ollamaURL
+        case .azure: .azureAPI
+        case .deepseek: .deepSeekAPI
+        case .customProvider: .customProviderAPI
+        case .fireworks: .fireworksAPI
+        case .grok: .grokAPI
+        case .groq: .groqAPI
+        case .claudeCode: .claudeCodeAPI
+        case .codex: .codexCLIAPI
+        case .openCode: .openCodeCLIAPI
+        case .cursor: .cursorCLIAPI
+        case .zAI: .zAIAPI
         }
     }
 }

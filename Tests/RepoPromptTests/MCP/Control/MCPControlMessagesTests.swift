@@ -87,8 +87,9 @@ final class MCPControlMessagesTests: XCTestCase {
     }
 
     func testKillSignalPayloadPathAndJSONRoundTrip() throws {
-        let url = MCPKillSignal.signalFileURL(forSessionToken: "session-token")
-        XCTAssertTrue(url.path.hasSuffix("Library/Application Support/RepoPrompt/MCPKillSignals/session-token.kill"))
+        let directory = URL(fileURLWithPath: "/tmp/MCPKillSignals-CE-D-7", isDirectory: true)
+        let url = MCPKillSignal.signalFileURL(forSessionToken: "session-token", directory: directory)
+        XCTAssertEqual(url.path, "/tmp/MCPKillSignals-CE-D-7/session-token.kill")
 
         let killedAt = Date(timeIntervalSince1970: 0)
         let content = MCPKillSignal.SignalContent(

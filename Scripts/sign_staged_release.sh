@@ -12,6 +12,7 @@ TRUSTED_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 ENTITLEMENTS_TEMPLATE="$TRUSTED_ROOT/AppBundle/RepoPrompt.entitlements.template"
 TRUSTED_SPARKLE_FRAMEWORK="$TRUSTED_ROOT/Vendor/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 STAGED_SPARKLE_FRAMEWORK="$APP_BUNDLE/Contents/Frameworks/Sparkle.framework"
+ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
 
 fail() {
     printf 'ERROR: %s\n' "$*" >&2
@@ -32,6 +33,10 @@ mkdir -p "$(dirname "$STAGED_SPARKLE_FRAMEWORK")"
 ditto "$TRUSTED_SPARKLE_FRAMEWORK" "$STAGED_SPARKLE_FRAMEWORK"
 REPOPROMPT_RELEASE_SOURCE_ROOT="$TRUSTED_ROOT" \
     "$SCRIPT_DIR/verify_sparkle_vendor.sh" "$STAGED_SPARKLE_FRAMEWORK"
+"$SCRIPT_DIR/validate_app_architectures.sh" \
+    "$APP_BUNDLE" \
+    "arm64,x86_64" \
+    "Trusted Sparkle replacement pre-sign app"
 
 profile_plist="$(mktemp)"
 app_entitlements="$(mktemp)"
@@ -82,6 +87,14 @@ sign_path "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 sign_path "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 sign_path "$APP_BUNDLE" --entitlements "$app_entitlements"
 codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+"$SCRIPT_DIR/validate_app_architectures.sh" \
+    "$APP_BUNDLE" \
+    "arm64,x86_64" \
+    "Developer ID staged app post-sign"
+"$SCRIPT_DIR/write_app_artifact_manifest.py" write \
+    --app "$APP_BUNDLE" \
+    --output "$ARTIFACT_MANIFEST" \
+    --expected-architectures "arm64,x86_64"
 codesign -d --entitlements :- "$APP_BUNDLE" > "$signed_entitlements"
 plutil -convert xml1 -o "$canonical_app_entitlements" "$app_entitlements"
 plutil -convert xml1 -o "$canonical_signed_entitlements" "$signed_entitlements"

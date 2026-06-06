@@ -7,8 +7,9 @@ set -euo pipefail
 
 ROOT_DIR="${1:-}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_WITHOUT_GITHUB_TOKENS="$SCRIPT_DIR/run_without_github_tokens.sh"
-CHECKOUT_DIR="$ROOT_DIR/.build/checkouts/KeyboardShortcuts"
+RUN_WITHOUT_GITHUB_TOKENS="${REPOPROMPT_RUN_WITHOUT_GITHUB_TOKENS:-$SCRIPT_DIR/run_without_github_tokens.sh}"
+SWIFTPM_SCRATCH_PATH="${REPOPROMPT_SWIFTPM_SCRATCH_PATH:-$ROOT_DIR/.build}"
+CHECKOUT_DIR="$SWIFTPM_SCRATCH_PATH/checkouts/KeyboardShortcuts"
 UTILITIES_FILE="$CHECKOUT_DIR/Sources/KeyboardShortcuts/Utilities.swift"
 PATCH_FILE="$SCRIPT_DIR/patches/keyboardshortcuts-2.3.0-resource-lookup.patch"
 EXPECTED_VERSION="2.3.0"
@@ -31,7 +32,10 @@ run() {
 [[ -f "$PATCH_FILE" ]] || fail "Missing KeyboardShortcuts resource lookup patch: $PATCH_FILE"
 
 if [[ ! -f "$UTILITIES_FILE" ]]; then
-    run "$RUN_WITHOUT_GITHUB_TOKENS" swift package resolve
+    run "$RUN_WITHOUT_GITHUB_TOKENS" swift package \
+        --package-path "$ROOT_DIR" \
+        --scratch-path "$SWIFTPM_SCRATCH_PATH" \
+        resolve
 fi
 [[ -f "$UTILITIES_FILE" ]] || fail "Could not locate KeyboardShortcuts Utilities.swift after package resolution: $UTILITIES_FILE"
 

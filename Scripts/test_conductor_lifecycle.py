@@ -117,6 +117,17 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(lanes, ["build", "debugArtifact", "release"])
         self.assertEqual(timeout, conductor.RELEASE_TIMEOUT_SECONDS)
 
+    def test_packaged_smoke_uses_only_live_app_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, _env, _timeout = registry.prepare(
+                {"operation": "smoke", "args": {"packagedApp": "/tmp/RepoPrompt CE.app"}}
+            )
+
+        self.assertEqual(lanes, ["liveApp"])
+        self.assertTrue(Path(argv[0]).name.startswith("python3"))
+        self.assertIn('"kind":"smoke"', argv[-1].replace(" ", ""))
+
     def test_release_local_install_delegates_installer_with_release_lanes_and_confirmation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             registry = conductor.OperationRegistry(Path(tmp))
@@ -340,6 +351,60 @@ class SmokeOperationTests(unittest.TestCase):
                 ),
             ],
         )
+
+
+    def test_launch_smoke_uses_exact_embedded_helper_and_ignores_other_resolvers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = Path(tmp) / "RepoPrompt.app"
+            helper = app / "Contents" / "MacOS" / "repoprompt-mcp"
+            helper.parent.mkdir(parents=True)
+            helper.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            helper.chmod(0o755)
+            calls: list[tuple[str, list[str]]] = []
+
+            def record_command(name: str, argv: list[str], *_args: object, **_kwargs: object) -> tuple[int, str, str]:
+                calls.append((name, argv))
+                return 0, "", ""
+
+            with mock.patch.object(conductor, "debug_app_bundle_path", return_value=app), mock.patch.object(
+                conductor, "require_debug_cli"
+            ) as fallback, mock.patch.object(conductor, "run_operation_command", side_effect=record_command):
+                code = conductor.operation_smoke(Path(tmp), {"launch": True, "windowId": 1, "workspace": "fixture"})
+
+        self.assertEqual(code, 0)
+        fallback.assert_not_called()
+        self.assertEqual(calls[0][0], "launch debug app")
+        for name, argv in calls[1:]:
+            self.assertEqual(argv[0], str(helper.resolve()), name)
+
+    def test_embedded_helper_resolution_rejects_symlink_escape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = root / "RepoPrompt.app"
+            helper = app / "Contents" / "MacOS" / "repoprompt-mcp"
+            helper.parent.mkdir(parents=True)
+            outside = root / "outside-helper"
+            outside.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            outside.chmod(0o755)
+            helper.symlink_to(outside)
+
+            with self.assertRaises(conductor.ConductorError):
+                conductor.resolve_embedded_helper(app)
+
+    def test_packaged_app_smoke_delegates_to_roundtrip_script_without_launch_resolution(self) -> None:
+        with mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")) as run, mock.patch.object(
+            conductor, "require_debug_cli"
+        ) as fallback:
+            code = conductor.operation_smoke(
+                Path("/tmp/repo"),
+                {"packagedApp": "/tmp/App.app", "artifactManifest": "/tmp/manifest.json"},
+            )
+
+        self.assertEqual(code, 0)
+        fallback.assert_not_called()
+        argv = run.call_args.args[1]
+        self.assertEqual(Path(argv[0]).name, "smoke_packaged_mcp_roundtrip.sh")
+        self.assertEqual(argv[-2:], ["Conductor packaged app", "/tmp/manifest.json"])
 
 
 class RunScriptTransitionTests(unittest.TestCase):

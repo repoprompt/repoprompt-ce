@@ -81,7 +81,7 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
         for id: ClaudeCodeCompatibleBackendID,
         accessMode: KeychainAccessMode = .interactive
     ) async throws -> String? {
-        try await secureService.getAPIKey(for: id.secretIdentifier, accessMode: accessMode)
+        try await secureService.getAPIKey(for: id.secureStorageAccount, accessMode: accessMode)
     }
 
     func saveSecret(_ secret: String, for id: ClaudeCodeCompatibleBackendID) async throws {
@@ -90,12 +90,12 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
             try await deleteSecret(for: id)
             return
         }
-        try secureService.saveAPIKey(trimmed, for: id.secretIdentifier)
+        try secureService.saveAPIKey(trimmed, for: id.secureStorageAccount)
         _ = setConfigured(true, for: id)
     }
 
     func deleteSecret(for id: ClaudeCodeCompatibleBackendID) async throws {
-        try secureService.deleteAPIKey(for: id.secretIdentifier)
+        try secureService.deleteAPIKey(for: id.secureStorageAccount)
         _ = setConfigured(false, for: id)
     }
 

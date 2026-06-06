@@ -145,7 +145,9 @@ final class ClaudeCodeProvider: AIProvider {
         let prompt = nativePromptMode.sendsRepoPromptAsUserMessage
             ? ClaudeCodePromptDelivery.decoratedUserMessage(basePrompt, instructions: aiMessage.systemPrompt)
             : basePrompt
-        var options = try await makeOptions(for: aiMessage, model: model)
+        let emptyConfigLease = try await configService.prepareEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
+        var options = try await makeOptions(for: aiMessage, model: model, emptyConfigURL: emptyConfigLease.url)
         options.systemPromptOverride = nativePromptMode.nativeSystemPromptOverride(instructions: aiMessage.systemPrompt)
         if options.timeout == nil {
             options.timeout = defaultRequestTimeout
@@ -213,10 +215,6 @@ final class ClaudeCodeProvider: AIProvider {
 
     // MARK: - Private Helpers
 
-    private func getEmptyConfigURL() async throws -> URL {
-        try await configService.prepareEmptyConfigFile()
-    }
-
     static func resolveCLIModelSelection(for model: AIModel) throws -> ClaudeCodeCLIModelSelection {
         guard model.providerType == .claudeCode else {
             throw AIProviderError.invalidModel
@@ -239,11 +237,10 @@ final class ClaudeCodeProvider: AIProvider {
         )
     }
 
-    private func makeOptions(for aiMessage: AIMessage, model: AIModel) async throws -> ClaudeCLIOptions {
+    private func makeOptions(for aiMessage: AIMessage, model: AIModel, emptyConfigURL: URL) async throws -> ClaudeCLIOptions {
         var options = ClaudeCLIOptions()
         options.disallowedTools = disallowedTools
         // Use empty MCP config to prevent CLI from loading user's default config (which may include RepoPrompt)
-        let emptyConfigURL = try await getEmptyConfigURL()
         options.mcpConfigPath = emptyConfigURL.path
         if let descriptor = ClaudeCodeAIModelCatalog.compatibleBackendDescriptor(for: model) {
             let resolver = ClaudeCodeLaunchEnvironmentResolver()
@@ -429,10 +426,11 @@ final class ClaudeCodeProvider: AIProvider {
             variant: Self.runtimeVariant(for: backendID),
             requestedModel: Self.compatibleBackendTestRequestedModel(for: backendID)
         )
+        let emptyConfigLease = try await configService.prepareEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
         var options = ClaudeCLIOptions()
         options.disallowedTools = disallowedTools
-        let emptyConfigURL = try await getEmptyConfigURL()
-        options.mcpConfigPath = emptyConfigURL.path
+        options.mcpConfigPath = emptyConfigLease.url.path
         options.model = launchEnvironment.effectiveModel
         options.systemPromptOverride = ClaudeAgentToolPreferences.agentModePromptDelivery().nativeSystemPromptOverride(instructions: "")
         options.timeout = timeout ?? testRequestTimeout
@@ -511,7 +509,13 @@ final class ClaudeCodeProvider: AIProvider {
     }
 
     private func testConnectionWithModel(_ model: AIModel, timeout: TimeInterval?) async throws -> Bool {
-        var options = try await makeOptions(for: AIMessage(systemPrompt: "", userMessage: ""), model: model)
+        let emptyConfigLease = try await configService.prepareEmptyLaunchConfig()
+        defer { emptyConfigLease.release() }
+        var options = try await makeOptions(
+            for: AIMessage(systemPrompt: "", userMessage: ""),
+            model: model,
+            emptyConfigURL: emptyConfigLease.url
+        )
         options.systemPromptOverride = ClaudeAgentToolPreferences.agentModePromptDelivery().nativeSystemPromptOverride(instructions: "")
         options.timeout = timeout ?? testRequestTimeout
         let args = options.toTokens()

@@ -35,9 +35,16 @@ for dir in "${required_dirs[@]}"; do
   fi
 done
 
-if [[ ! -f "Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
-  fail "required shared MCP control message file missing"
-fi
+shared_mcp_required_files=(
+  "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
+  "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"
+  "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift"
+)
+for file in "${shared_mcp_required_files[@]}"; do
+  if [[ ! -f "$file" ]]; then
+    fail "required shared MCP file missing: $file"
+  fi
+done
 
 # Exact-snapshot Tree-sitter scanner support must remain narrow and reproducible.
 # Remove this block together with the support target only after validated upstream
@@ -194,6 +201,22 @@ done < <(find Sources -name MCPControlMessages.swift -type f -print | sort)
 if [[ "${#mcp_control_files[@]}" -ne 1 || "${mcp_control_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPControlMessages.swift" ]]; then
   fail "MCPControlMessages.swift must exist only at Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
   printf '%s\n' "${mcp_control_files[@]}" >&2
+fi
+
+# 3a. MCP filesystem and event wire identity also have one shared source of truth.
+mcp_identity_files=()
+while IFS= read -r file; do
+  mcp_identity_files+=("$file")
+done < <(find Sources -name MCPFilesystemIdentity.swift -type f -print | sort)
+if [[ "${#mcp_identity_files[@]}" -ne 1 || "${mcp_identity_files[0]:-}" != "Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift" ]]; then
+  fail "MCPFilesystemIdentity.swift must exist only under RepoPromptShared"
+  printf '%s\n' "${mcp_identity_files[@]}" >&2
+fi
+
+mcp_event_declarations="$(grep -R -l -E '^(public )?struct MCPExternalClientEvent' Sources --include='*.swift' | sort || true)"
+if [[ "$mcp_event_declarations" != "Sources/RepoPromptShared/MCP/MCPExternalClientEvent.swift" ]]; then
+  fail "MCPExternalClientEvent wire DTO must be declared only under RepoPromptShared"
+  printf '%s\n' "$mcp_event_declarations" >&2
 fi
 
 # 4. Parser fixtures and sample parser inputs must not live in app source.

@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "capture_label": "synthetic offline classification fixture",
+  "evaluated_at": "2026-06-06T00:00:00Z",
+  "certificate_name": "RepoPrompt CE Local Self-Signed Code Signing",
+  "all_identity_output": "  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \"RepoPrompt CE Local Self-Signed Code Signing\"\n  2) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB \"RepoPrompt CE Local Self-Signed Code Signing\" (CSSMERR_TP_CERT_EXPIRED)\n  3) DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD \"Different Name\"\n",
+  "valid_identity_output": "  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA \"RepoPrompt CE Local Self-Signed Code Signing\"\n",
+  "certificates": [
+    {
+      "subject": "CN=RepoPrompt CE Local Self-Signed Code Signing,O=RepoPrompt CE Local",
+      "common_name": "RepoPrompt CE Local Self-Signed Code Signing",
+      "serial": "01",
+      "not_before": "2026-06-01T00:00:00Z",
+      "not_after": "2036-06-01T00:00:00Z",
+      "sha1": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "subject": "CN=RepoPrompt CE Local Self-Signed Code Signing,O=RepoPrompt CE Local",
+      "common_name": "RepoPrompt CE Local Self-Signed Code Signing",
+      "serial": "02",
+      "not_before": "2015-06-01T00:00:00Z",
+      "not_after": "2025-06-01T00:00:00Z",
+      "sha1": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "subject": "CN=RepoPrompt CE Local Self-Signed Code Signing,O=RepoPrompt CE Local",
+      "common_name": "RepoPrompt CE Local Self-Signed Code Signing",
+      "serial": "03",
+      "not_before": "2026-06-01T00:00:00Z",
+      "not_after": "2036-06-01T00:00:00Z",
+      "sha1": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+      "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ]
+}

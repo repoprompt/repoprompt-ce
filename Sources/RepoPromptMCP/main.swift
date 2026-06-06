@@ -79,26 +79,6 @@ enum CLIRuntimeError: Swift.Error {
 // ────────────────────────────────────────────────────────────
 
 enum CLIEventLogger {
-    /// Event structure mirroring MCPExternalClientEvent in the app
-    struct Event: Codable {
-        enum Source: String, Codable { case repopromptCLI }
-        enum Kind: String, Codable { case runtimeError }
-        enum Code: String, Codable {
-            case connectionFailed = "connection_failed"
-            case approvalDenied = "approval_denied"
-            case unknown
-        }
-
-        let id: UUID
-        let timestamp: Date
-        let source: Source
-        let kind: Kind
-        let code: Code
-        let humanMessage: String
-        let clientName: String?
-        let details: [String: String]?
-    }
-
     /// Events directory - uses shared constant for consistent gating by build flavor and version
     private static let eventsDir: URL = MCPFilesystemConstants.eventsDirectoryURL()
 
@@ -155,7 +135,7 @@ enum CLIEventLogger {
         let (code, message, details) = mapRuntimeError(err)
         let detectedClient = detectClientName()
         log.debug("Writing runtime error event for client: \(detectedClient ?? "unknown")")
-        let event = Event(
+        let event = MCPExternalClientEvent(
             id: UUID(),
             timestamp: Date(),
             source: .repopromptCLI,
@@ -168,7 +148,7 @@ enum CLIEventLogger {
         writeEvent(event)
     }
 
-    private static func mapRuntimeError(_ err: CLIRuntimeError) -> (Event.Code, String, [String: String]?) {
+    private static func mapRuntimeError(_ err: CLIRuntimeError) -> (MCPExternalClientEvent.Code, String, [String: String]?) {
         switch err {
         case let .connectionFailed(underlying):
             var details: [String: String] = ["underlying": String(describing: underlying)]
@@ -212,7 +192,7 @@ enum CLIEventLogger {
         }
     }
 
-    private static func writeEvent(_ event: Event) {
+    private static func writeEvent(_ event: MCPExternalClientEvent) {
         do {
             // Ensure directory exists
             try FileManager.default.createDirectory(
@@ -252,22 +232,22 @@ enum CLIKillSignal {
 
     /// Directory where kill signal files are written by the app
     static var signalsDirectory: URL {
-        MCPKillSignal.signalsDirectory
+        MCPFilesystemConstants.identity.killSignalsDirectoryURL()
     }
 
     /// Kill signal file for a specific session token
     static func signalFileURL(forSessionToken token: String) -> URL {
-        MCPKillSignal.signalFileURL(forSessionToken: token)
+        MCPKillSignal.signalFileURL(forSessionToken: token, directory: signalsDirectory)
     }
 
     /// Reads a kill signal if it exists for this session.
     static func readKillSignal(forSessionToken token: String) -> SignalContent? {
-        MCPKillSignal.readKillSignal(forSessionToken: token)
+        MCPKillSignal.readKillSignal(forSessionToken: token, directory: signalsDirectory)
     }
 
     /// Removes a kill signal file after acknowledging it.
     static func removeKillSignal(forSessionToken token: String) {
-        MCPKillSignal.removeKillSignal(forSessionToken: token)
+        MCPKillSignal.removeKillSignal(forSessionToken: token, directory: signalsDirectory)
     }
 
     /// Returns a human-readable message for a termination reason.

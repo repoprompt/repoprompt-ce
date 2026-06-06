@@ -21,6 +21,38 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(query.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
     }
 
+    func testInteractiveReadDoesNotAddUISkip() throws {
+        let fake = FakeSecItemClient { _, result in
+            result?.pointee = Data("stored-value".utf8) as NSData
+            return errSecSuccess
+        }
+        let service = makeService(secItemClient: fake)
+
+        XCTAssertEqual(try service.get(for: "api-key", accessMode: .interactive), "stored-value")
+        let query = try XCTUnwrap(fake.copyQueries.first)
+        XCTAssertNil(query.stringValue(for: kSecUseAuthenticationUI))
+    }
+
+    func testReadMapsSecurityStatusesToSanitizedErrors() {
+        let scenarios: [(OSStatus, KeychainService.KeychainError)] = [
+            (errSecItemNotFound, .itemNotFound),
+            (errSecInteractionNotAllowed, .interactionNotAllowed),
+            (errSecUserCanceled, .userInteractionCancelled),
+            (errSecAuthFailed, .authenticationFailed),
+            (OSStatus(-12345), .unexpectedStatus(-12345))
+        ]
+
+        for (status, expectedError) in scenarios {
+            let service = makeService(secItemClient: FakeSecItemClient { _, _ in status })
+            XCTAssertThrowsError(
+                try service.get(for: "api-key", accessMode: .nonInteractive(reason: .test)),
+                "status=\(status)"
+            ) { error in
+                XCTAssertEqual(error as? KeychainService.KeychainError, expectedError, "status=\(status)")
+            }
+        }
+    }
+
     func testCanonicalMissingThrowsItemNotFoundWithoutFallback() throws {
         let canonicalService = "test.canonical.missing"
         let fake = FakeSecItemClient { _, _ in
@@ -81,7 +113,7 @@ final class KeychainServiceTests: XCTestCase {
             copyHandler: { _, _ in errSecItemNotFound },
             updateHandler: { _, _ in errSecSuccess }
         )
-        let service = makeService(serviceName: KeychainService.canonicalServiceName, secItemClient: fake)
+        let service = makeService(serviceName: KeychainService.officialV2ServiceName, secItemClient: fake)
 
         try service.save("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
 
@@ -89,7 +121,7 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertTrue(fake.addQueries.isEmpty)
         let updateQuery = try XCTUnwrap(fake.updateQueries.first)
         XCTAssertEqual(updateQuery.stringValue(for: kSecClass), kSecClassGenericPassword as String)
-        XCTAssertEqual(updateQuery.stringValue(for: kSecAttrService), KeychainService.canonicalServiceName)
+        XCTAssertEqual(updateQuery.stringValue(for: kSecAttrService), KeychainService.officialV2ServiceName)
         XCTAssertEqual(updateQuery.stringValue(for: kSecAttrAccount), "api-key")
         XCTAssertEqual(updateQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
         let updateAttributes = try XCTUnwrap(fake.updateAttributes.first)
@@ -102,18 +134,18 @@ final class KeychainServiceTests: XCTestCase {
             addHandler: { _, _ in errSecSuccess },
             updateHandler: { _, _ in errSecItemNotFound }
         )
-        let service = makeService(serviceName: KeychainService.canonicalServiceName, secItemClient: fake)
+        let service = makeService(serviceName: KeychainService.officialV2ServiceName, secItemClient: fake)
 
         try service.save("stored-value", for: "api-key", accessMode: .nonInteractive(reason: .test))
 
         XCTAssertEqual(fake.operationLog, ["update", "add"])
         let updateQuery = try XCTUnwrap(fake.updateQueries.first)
-        XCTAssertEqual(updateQuery.stringValue(for: kSecAttrService), KeychainService.canonicalServiceName)
+        XCTAssertEqual(updateQuery.stringValue(for: kSecAttrService), KeychainService.officialV2ServiceName)
         XCTAssertEqual(updateQuery.stringValue(for: kSecAttrAccount), "api-key")
         XCTAssertEqual(updateQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
         let addQuery = try XCTUnwrap(fake.addQueries.first)
         XCTAssertEqual(addQuery.stringValue(for: kSecClass), kSecClassGenericPassword as String)
-        XCTAssertEqual(addQuery.stringValue(for: kSecAttrService), KeychainService.canonicalServiceName)
+        XCTAssertEqual(addQuery.stringValue(for: kSecAttrService), KeychainService.officialV2ServiceName)
         XCTAssertEqual(addQuery.stringValue(for: kSecAttrAccount), "api-key")
         XCTAssertEqual(addQuery.stringValue(for: kSecUseAuthenticationUI), kSecUseAuthenticationUISkip as String)
         XCTAssertEqual(addQuery.dataValue(for: kSecValueData), Data("stored-value".utf8))
@@ -121,12 +153,26 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertEqual(addQuery.boolValue(for: kSecAttrSynchronizable), false)
     }
 
-    func testPersistentBackendPolicySeparatesSigningModes() {
-        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: "developer-id"), .canonical)
-        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: " LOCAL-SELF-SIGNED "), .localSelfSigned)
-        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: "release-candidate-adhoc"), .canonical)
-        XCTAssertEqual(PersistentKeychainRuntimePolicy.backendKind(signingModeMarker: nil), .canonical)
-        XCTAssertNotEqual(KeychainService.canonicalServiceName, KeychainService.localSelfSignedServiceName)
+    func testPersistentServiceNamesAreIsolatedAndLegacyIsRepairOnly() throws {
+        let fingerprintA = String(repeating: "A", count: 64)
+        let fingerprintB = String(repeating: "B", count: 64)
+        let names = Set([
+            KeychainService.legacyCanonicalServiceName,
+            KeychainService.officialV2ServiceName,
+            KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
+            KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
+            KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
+            KeychainService.debugServiceName
+        ])
+        XCTAssertEqual(names.count, 6)
+
+        let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
+        let legacy = KeychainService.legacyRepairSource(secItemClient: fake)
+        XCTAssertThrowsError(try legacy.get(for: "api-key", accessMode: .nonInteractive(reason: .test)))
+        XCTAssertEqual(
+            fake.copyQueries.map { $0.stringValue(for: kSecAttrService) },
+            [KeychainService.legacyCanonicalServiceName]
+        )
     }
 
     private func makeService(

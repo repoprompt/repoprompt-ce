@@ -16,14 +16,14 @@ enum ClaudeCodeCompatibleBackendID: String, CaseIterable, Codable, Hashable {
         }
     }
 
-    var secretIdentifier: String {
+    var secureStorageAccount: SecureStorageAccount {
         switch self {
         case .glmZAI:
-            AIProviderType.zAI.secureIdentifier
+            .zAIAPI
         case .kimi:
-            "ClaudeCompatibleBackend.kimi.apiKey"
+            .claudeCompatibleKimiAPIKey
         case .custom:
-            "ClaudeCompatibleBackend.custom.apiKey"
+            .claudeCompatibleCustomAPIKey
         }
     }
 

@@ -125,8 +125,8 @@ Operation commands:
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
   ./conductor app relaunch [-- <app args...>]          # latest interactive relaunch intent
-  ./conductor smoke [--launch] [--workspace <name>] [--window-id <id>] [--agent-run]
-    (without --launch, requires the CE debug app to already be running and CLI installed)
+  ./conductor smoke [--launch | --packaged-app <path>] [--artifact-manifest <path>] [--workspace <name>] [--window-id <id>] [--agent-run]
+    (without --launch/--packaged-app, requires the CE debug app to already be running and CLI installed)
   ./conductor diagnostics agent-mode-on [--log-file <path>]
   ./conductor release preflight|artifact|package|local-install
 
@@ -689,7 +689,11 @@ def latest_lifecycle_intent(operation: str, args: Dict[str, Any]) -> Optional[st
 
 
 def is_launch_capable_job(operation: str, args: Dict[str, Any]) -> bool:
-    return operation == "run" or (operation == "app" and args.get("subcommand") == "relaunch") or (operation == "smoke" and bool(args.get("launch")))
+    return (
+        operation == "run"
+        or (operation == "app" and args.get("subcommand") == "relaunch")
+        or (operation == "smoke" and bool(args.get("launch") or args.get("packagedApp")))
+    )
 
 
 @dataclasses.dataclass
@@ -912,6 +916,8 @@ class OperationRegistry:
             lanes = ["debugArtifact", "liveApp"]
             if args.get("launch"):
                 lanes = ["build", "debugArtifact", "liveApp"]
+            elif args.get("packagedApp"):
+                lanes = ["liveApp"]
             smoke_args = dict(args)
             smoke_args["operationTimeout"] = effective_timeout
             return self._internal_argv("smoke", smoke_args), lanes, cwd, env, effective_timeout
@@ -2497,6 +2503,21 @@ def resolve_debug_cli() -> Optional[str]:
     return None
 
 
+def resolve_embedded_helper(app_bundle: Path) -> str:
+    app = app_bundle.expanduser().resolve(strict=True)
+    candidate = app / "Contents" / "MacOS" / "repoprompt-mcp"
+    if candidate.is_symlink():
+        raise ConductorError(f"embedded MCP helper must not be a symlink: {candidate}")
+    helper = candidate.resolve(strict=True)
+    try:
+        helper.relative_to(app)
+    except ValueError as exc:
+        raise ConductorError(f"embedded MCP helper escapes launched app bundle: {helper}") from exc
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        raise ConductorError(f"embedded MCP helper is not an executable regular file: {helper}")
+    return str(helper)
+
+
 def require_debug_cli() -> Optional[str]:
     cli = resolve_debug_cli()
     if cli:
@@ -2630,6 +2651,23 @@ def operation_release_preflight_missing(_repo_root: Path) -> int:
 
 def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
     env = os.environ.copy()
+    packaged_app = args.get("packagedApp")
+    if packaged_app:
+        argv = [
+            str(repo_root / "Scripts" / "smoke_packaged_mcp_roundtrip.sh"),
+            str(packaged_app),
+            "Conductor packaged app",
+        ]
+        if args.get("artifactManifest"):
+            argv.append(str(args["artifactManifest"]))
+        code, _stdout, _stderr = run_operation_command(
+            "packaged app MCP roundtrip",
+            argv,
+            repo_root,
+            env=env,
+        )
+        return code
+
     window_id = str(args.get("windowId") or 1)
     workspace = str(args.get("workspace") or "repoprompt-ce")
     operation_timeout = float(args.get("operationTimeout") or MEDIUM_TIMEOUT_SECONDS)
@@ -2641,9 +2679,17 @@ def operation_smoke(repo_root: Path, args: Dict[str, Any]) -> int:
         if code != 0:
             return code
 
-    cli = require_debug_cli()
-    if not cli:
-        return 1
+    if launched:
+        try:
+            cli = resolve_embedded_helper(debug_app_bundle_path())
+        except (ConductorError, FileNotFoundError, OSError) as exc:
+            print(f"ERROR: could not resolve exact helper from launched app: {exc}", flush=True)
+            return 1
+        print(f"Resolved launched app embedded helper: {cli}", flush=True)
+    else:
+        cli = require_debug_cli()
+        if not cli:
+            return 1
 
     if launched:
         print("Polling rpce-cli-debug windows until the app is ready...", flush=True)
@@ -2871,7 +2917,10 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
             args["appArgs"] = trailing[1:] if trailing else []
     elif operation == "smoke":
         parser = argparse.ArgumentParser(prog="conductor smoke")
-        parser.add_argument("--launch", action="store_true")
+        launch_group = parser.add_mutually_exclusive_group()
+        launch_group.add_argument("--launch", action="store_true")
+        launch_group.add_argument("--packaged-app")
+        parser.add_argument("--artifact-manifest")
         parser.add_argument("--workspace", default="repoprompt-ce")
         parser.add_argument("--window-id", type=int, default=1)
         parser.add_argument("--agent-run", action="store_true")
@@ -2879,9 +2928,15 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         ns = parser.parse_args(rest)
         if ns.agent_timeout < 0:
             raise ConductorError("--agent-timeout must be non-negative")
+        if ns.artifact_manifest and not ns.packaged_app:
+            raise ConductorError("--artifact-manifest requires --packaged-app")
+        if ns.packaged_app and ns.agent_run:
+            raise ConductorError("--agent-run is not supported with --packaged-app")
         args.update(
             {
                 "launch": ns.launch,
+                "packagedApp": ns.packaged_app,
+                "artifactManifest": ns.artifact_manifest,
                 "workspace": ns.workspace,
                 "windowId": ns.window_id,
                 "agentRun": ns.agent_run,

@@ -84,6 +84,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New generic extensions/helpers should prefer a narrow feature or infrastructure owner first; otherwise use `Sources/RepoPrompt/Infrastructure/Utilities`.
 - New app-visible diagnostic surfaces go under `Sources/RepoPrompt/Features/Diagnostics` and must have a documented purpose and entry point.
 - New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
+- MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
 - New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
 - New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
@@ -135,7 +136,7 @@ The guardrail script verifies:
 
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
-- `MCPControlMessages.swift` exists only at `Sources/RepoPromptShared/MCP/MCPControlMessages.swift`;
+- `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
 - parser fixtures/sample inputs do not live under app syntax parsing source;
 - the narrow `TreeSitterScannerSupport` compatibility target has exactly its approved JavaScript/Python scanner snapshots and helper headers, matches curated checksums, remains wired in `Package.swift`, preserves the seven migrated grammar pins/products in `Package.swift` and `Package.resolved`, and keeps the seven retired local grammar directories absent;
 - Agent/MCP runtime code does not depend on `WorkspaceFilesViewModel`, `FileViewModel`, or `FolderViewModel`;
@@ -147,7 +148,7 @@ The guardrail script verifies:
 
 ## Historical resolved items
 
-- `MCPControlMessages.swift` now has one source of truth in `Sources/RepoPromptShared/MCP/MCPControlMessages.swift`; the app and CLI targets depend on `RepoPromptShared`.
+- `MCPControlMessages.swift`, `MCPFilesystemIdentity.swift`, and the `MCPExternalClientEvent` wire DTO now have one source of truth in `Sources/RepoPromptShared/MCP`; the app and CLI targets depend on `RepoPromptShared`.
 - The old production dependency on a test-named filesystem seam was renamed to `FileSystemProviding`; test doubles/support live under tests.
 - The dead Dart parser fixture under app source was removed rather than retained as production code.
 - Workspace, Agent Mode, MCP infrastructure, workspace context/files, Prompt, Context Builder, Chat, Search, Settings, Code Map, and syntax parsing were moved toward the hybrid feature/infrastructure layout.

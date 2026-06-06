@@ -29,8 +29,10 @@ CONFIRM_LOCAL_PRODUCTION_INSTALL=1 make dev-install-local-production
 This app is not notarized and must not be distributed or uploaded to GitHub
 Releases.
 
-Report the files written under `dist/`. Clearly state that the archive is
-ad-hoc signed, intended for packaging validation, and not distributable.
+Report the ZIP, `SHA256SUMS`, and external artifact manifest written under
+`dist/`. Confirm that the public candidate is universal `arm64+x86_64`, ad-hoc
+signed, intended for packaging validation, and not distributable. Debug and
+local self-signed packages remain host-native.
 
 ## Maintainer publish
 
@@ -38,8 +40,9 @@ Read [`docs/releasing.md`](../../../docs/releasing.md) before publishing.
 
 Use the environment-scoped GitHub **Publish Release** workflow for production
 draft creation. It requires an existing pushed tag and the `release`
-environment secrets documented there. Review and test the resulting reviewed
-draft assets, then use the environment-scoped **Promote Release** workflow for the same
+environment secrets documented there. Review the resulting ZIP, DMG, checksum, appcast, and artifact-manifest assets
+and require the fresh secret-free exact-helper packaged roundtrip to pass, then
+use the environment-scoped **Promote Release** workflow for the same
 tag. Promotion verifies and mirrors the existing reviewed assets, publishes
 both releases without rebuilding, resumes matching partial states, enforces a
 monotonically increasing stable build, and runs anonymous post-publish checks.

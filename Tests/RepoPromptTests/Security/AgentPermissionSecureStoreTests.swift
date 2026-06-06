@@ -215,32 +215,32 @@ private final class FakeSecurePlainStringStore: SecurePlainStringStoring {
         self.persistsValuesAcrossLaunches = persistsValuesAcrossLaunches
     }
 
-    func getPlainValue(for key: String, accessMode: KeychainAccessMode) throws -> String? {
+    func getPlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws -> String? {
         plainGetAccessModes.append(accessMode)
         if let plainGetError {
             throw plainGetError
         }
-        return plainValues[key]
+        return plainValues[account.identifier]
     }
 
     func savePlainValue(
         _ value: String,
-        for key: String,
+        for account: SecureStorageAccount,
         accessMode: KeychainAccessMode
     ) throws {
         plainSaveAccessModes.append(accessMode)
         if let saveError {
             throw saveError
         }
-        if failSaveKeys.contains(key) {
+        if failSaveKeys.contains(account.identifier) {
             throw KeychainService.KeychainError.invalidData
         }
-        plainValues[key] = value
-        savedPlainValues.append((key: key, value: value))
+        plainValues[account.identifier] = value
+        savedPlainValues.append((key: account.identifier, value: value))
     }
 
-    func deletePlainValue(for key: String, accessMode: KeychainAccessMode) throws {
+    func deletePlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws {
         plainDeleteAccessModes.append(accessMode)
-        plainValues.removeValue(forKey: key)
+        plainValues.removeValue(forKey: account.identifier)
     }
 }

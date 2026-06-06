@@ -213,6 +213,7 @@ jobs:
           path: |
             release-source/dist/*.zip
             release-source/dist/SHA256SUMS
+            release-source/dist/*-artifact-manifest.json
           if-no-files-found: error
           retention-days: 1
 
@@ -245,13 +246,15 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           archives=(signed-release/*.zip)
-          manifests=(signed-release/*SHA256SUMS)
+          checksum_manifests=(signed-release/*SHA256SUMS)
+          artifact_manifests=(signed-release/*-artifact-manifest.json)
           [[ "${#archives[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP" >&2; exit 1; }
-          [[ "${#manifests[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP checksum manifest" >&2; exit 1; }
+          [[ "${#checksum_manifests[@]}" == "1" ]] || { echo "Expected exactly one signed ZIP checksum manifest" >&2; exit 1; }
+          [[ "${#artifact_manifests[@]}" == "1" ]] || { echo "Expected exactly one signed app artifact manifest" >&2; exit 1; }
           archive="${archives[0]}"
           archive_name="$(basename "$archive")"
           archive_checksum_entry="$RUNNER_TEMP/signed-release-zip.sha256"
-          awk -v archive_name="$archive_name" '$2 == archive_name { print }' "${manifests[0]}" > "$archive_checksum_entry"
+          awk -v archive_name="$archive_name" '$2 == archive_name { print }' "${checksum_manifests[0]}" > "$archive_checksum_entry"
           [[ "$(wc -l < "$archive_checksum_entry" | tr -d ' ')" == "1" ]] || { echo "Expected exactly one signed ZIP checksum entry" >&2; exit 1; }
           (cd signed-release && shasum -a 256 -c "$archive_checksum_entry")
           mkdir extracted
@@ -259,13 +262,34 @@ jobs:
           ./trusted-control-plane/Scripts/validate_embedded_mcp_helper_layout.sh \
             "extracted/RepoPrompt CE.app" \
             "Signed draft MCP helper layout"
+          ./trusted-control-plane/Scripts/validate_app_architectures.sh \
+            "extracted/RepoPrompt CE.app" \
+            "arm64,x86_64" \
+            "Signed draft app"
+          ./trusted-control-plane/Scripts/write_app_artifact_manifest.py verify \
+            --app "extracted/RepoPrompt CE.app" \
+            --manifest "${artifact_manifests[0]}" \
+            --expected-architectures "arm64,x86_64"
+          echo "ARTIFACT_MANIFEST_PATH=${artifact_manifests[0]}" >> "$GITHUB_ENV"
 
-      - name: Execute signed helper without inherited secrets
+      - name: Execute signed helper and packaged roundtrip without inherited secrets
         run: |
           env -i \
             PATH=/usr/bin:/bin:/usr/sbin:/sbin \
             HOME="$HOME" \
             TMPDIR="$RUNNER_TEMP" \
+            USER="$USER" \
+            LOGNAME="$LOGNAME" \
             ./trusted-control-plane/Scripts/smoke_embedded_mcp_helper.sh \
             "extracted/RepoPrompt CE.app" \
             "Signed draft MCP helper"
+          env -i \
+            PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+            HOME="$HOME" \
+            TMPDIR="$RUNNER_TEMP" \
+            USER="$USER" \
+            LOGNAME="$LOGNAME" \
+            ./trusted-control-plane/Scripts/smoke_packaged_mcp_roundtrip.sh \
+            "extracted/RepoPrompt CE.app" \
+            "Signed draft packaged app" \
+            "$ARTIFACT_MANIFEST_PATH"

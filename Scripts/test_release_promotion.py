@@ -158,6 +158,8 @@ class ReleasePromotionTests(unittest.TestCase):
         (scripts / "validate_packaged_legal.sh").chmod(0o755)
         self.write_stub(scripts, "verify_remote_release_commit.sh", "printf 'OK: fixture remote tag remains bound.\\n'\n")
         self.write_stub(scripts, "verify_sparkle_vendor.sh", "printf 'OK: fixture Sparkle payload matches.\\n'\n")
+        self.write_stub(scripts, "validate_app_architectures.sh", "printf 'OK: fixture universal architectures.\\n'\n")
+        self.write_stub(scripts, "write_app_artifact_manifest.py", "printf 'OK: fixture artifact manifest.\\n'\n")
         (root / "version.env").write_text(
             textwrap.dedent(
                 """\
@@ -188,9 +190,11 @@ class ReleasePromotionTests(unittest.TestCase):
         dmg_path = assets / "RepoPrompt-1.0.0-1.dmg"
         appcast_path = assets / "appcast.xml"
         checksums_path = assets / "SHA256SUMS"
+        artifact_manifest_path = assets / "RepoPrompt-1.0.0-1-artifact-manifest.json"
         previous_appcast = assets / "previous-appcast.xml"
         zip_path.write_text("fixture zip\n", encoding="utf-8")
         dmg_path.write_text("fixture dmg\n", encoding="utf-8")
+        artifact_manifest_path.write_text('{"schema_version":1}\n', encoding="utf-8")
         item = textwrap.dedent(
             f"""\
             <item>
@@ -224,7 +228,10 @@ class ReleasePromotionTests(unittest.TestCase):
             encoding="utf-8",
         )
         checksums_path.write_text(
-            "".join(f"{self.sha256(path)}  {path.name}\n" for path in (zip_path, dmg_path, appcast_path)),
+            "".join(
+                f"{self.sha256(path)}  {path.name}\n"
+                for path in (zip_path, dmg_path, appcast_path, artifact_manifest_path)
+            ),
             encoding="utf-8",
         )
 
@@ -235,11 +242,11 @@ class ReleasePromotionTests(unittest.TestCase):
             "gh",
             """\
             printf '%s\\n' "$*" >> "$FAKE_GH_CAPTURE"
-            source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"}]'
+            source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"}]'
             if [[ "$FAKE_EXTRA_SOURCE_ASSET" == "true" ]]; then
-                source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"unexpected.txt"}]'
+                source_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"RepoPrompt-1.0.0-1.dmg"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"},{"name":"unexpected.txt"}]'
             fi
-            update_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"appcast.xml"},{"name":"SHA256SUMS"}]'
+            update_assets='[{"name":"RepoPrompt-1.0.0-1.zip"},{"name":"appcast.xml"},{"name":"SHA256SUMS"},{"name":"RepoPrompt-1.0.0-1-artifact-manifest.json"}]'
             if [[ "$1" == "release" && "$2" == "view" && "$*" == *"--repo repoprompt/repoprompt-ce "* ]]; then
                 printf '{"tagName":"v1.0.0","isDraft":%s,"isPrerelease":false,"assets":%s,"body":"Release-Commit: `fixture-release-commit`"}\\n' "$FAKE_SOURCE_IS_DRAFT" "$source_assets"
             elif [[ "$1" == "release" && "$2" == "view" && "$*" == *"--repo repoprompt/repoprompt-ce-updates "* ]]; then
@@ -264,6 +271,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1.zip "$target/"
                 cp "$FAKE_ASSET_DIR"/appcast.xml "$target/"
                 cp "$FAKE_ASSET_DIR"/SHA256SUMS "$target/"
+                cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1-artifact-manifest.json "$target/"
                 if [[ "$*" != *"--repo repoprompt/repoprompt-ce-updates "* ]]; then
                     cp "$FAKE_ASSET_DIR"/RepoPrompt-1.0.0-1.dmg "$target/"
                 fi
@@ -371,6 +379,7 @@ class ReleasePromotionTests(unittest.TestCase):
                 */RepoPrompt-1.0.0-1.zip) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1.zip" "$output" ;;
                 */RepoPrompt-1.0.0-1.dmg) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1.dmg" "$output" ;;
                 */SHA256SUMS) cp "$FAKE_ASSET_DIR/SHA256SUMS" "$output" ;;
+                */RepoPrompt-1.0.0-1-artifact-manifest.json) cp "$FAKE_ASSET_DIR/RepoPrompt-1.0.0-1-artifact-manifest.json" "$output" ;;
                 *) printf 'unexpected curl URL: %s\\n' "$url" >&2; exit 1 ;;
             esac
             """,

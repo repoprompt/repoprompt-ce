@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-06-06",
+  "item0_status": {
+    "status": "incomplete",
+    "reason": "Safe Item 0 source, catalog, and fixture work is complete. All four architecture/product probes pass, but the authorization-UI OSStatus matrix remains unmeasured."
+  },
+  "safety_constraints": {
+    "keychain_or_security_commands_executed_during_completion": false,
+    "temporary_keychains_created_or_read_during_completion": false,
+    "apps_launched_during_completion": false,
+    "x86_64_repoprompt_probe_rerun_during_completion": true
+  },
+  "architecture_probes": [
+    {
+      "architecture": "arm64",
+      "product": "RepoPrompt",
+      "status": "pass",
+      "basis": "measured before Item 0 completion"
+    },
+    {
+      "architecture": "arm64",
+      "product": "repoprompt-mcp",
+      "status": "pass",
+      "basis": "measured before Item 0 completion"
+    },
+    {
+      "architecture": "x86_64",
+      "product": "repoprompt-mcp",
+      "status": "pass",
+      "basis": "measured before Item 0 completion"
+    },
+    {
+      "architecture": "x86_64",
+      "product": "RepoPrompt",
+      "status": "pass",
+      "basis": "measured with isolated SwiftPM scratch path .build/item8-probe/RepoPrompt-x86_64 using swift build -c release --arch x86_64 --product RepoPrompt; exit status 0"
+    }
+  ],
+  "item8_gate": {
+    "status": "pass",
+    "reason": "RepoPrompt and repoprompt-mcp have completed measured arm64 and x86_64 release-build passes in isolated SwiftPM paths."
+  },
+  "keychain_access_measurement": {
+    "status": "incomplete",
+    "startup_scan_approved": false,
+    "reason": "Authorization-UI behavior was not probed during completion. Any future measurement requires a separately approved disposable-user procedure."
+  },
+  "local_signing_identity_inventory": {
+    "status": "partially_measured_before_completion",
+    "certificate_name": "RepoPrompt CE Local Self-Signed Code Signing",
+    "exact_name_certificate_count": 1,
+    "valid_private_key_backed_identity_count": 1,
+    "certificate_without_private_key_count": 0,
+    "duplicate_certificate_count": 0,
+    "sha1_fingerprints": [
+      "29755530491CF1B92EE6D3DED3E57AB641A25B39"
+    ],
+    "sha256_fingerprints": [],
+    "expiration_details": "not recorded in the preserved measurement"
+  }
+}

@@ -1,144 +1,197 @@
-// CLISymlinkManager.swift
-// Installs a *stable* user-space symlink that points to the bundled
-// "repoprompt-mcp" CLI, so external editors can locate it regardless of
-// where the app bundle lives.
-//
-// ──────────────────────────────────────────────────────────────────────
-// NEW: Debug vs Release separation
-// • Debug builds →  ~/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug
-// • Release builds → ~/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli
-//
-// Having two distinct paths means you can keep a production build
-// installed while running a debug build side-by-side without conflicts.
-// ──────────────────────────────────────────────────────────────────────
-
+import Darwin
 import Foundation
 import OSLog
+import RepoPromptShared
 
+/// Maintains the flavor-specific CE user-space link. The link is repaired only
+/// when its existing destination is on the explicit CE managed allowlist.
 enum CLISymlinkManagerUserSpace {
     private static let logger = Logger(
         subsystem: "CLI.SymlinkMgr",
         category: "install"
     )
 
-    /// File name of the symlink (differs for debug builds).
-    private static var linkName: String {
-        #if DEBUG
-            return "repoprompt_ce_cli_debug"
-        #else
-            return "repoprompt_ce_cli"
-        #endif
-    }
+    #if DEBUG
+        static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+    #else
+        static let identity = MCPFilesystemIdentity.repoPromptCE(.release)
+    #endif
 
-    /// Absolute path of the user-space link, e.g.
-    /// ~/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli[_debug]
     static var userSymlinkPath: String {
-        let supportDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        return supportDir.appendingPathComponent(linkName).path
+        identity.userSpaceCLIURL().path
     }
 
-    /// Returns the stable CLI path, falling back to bundle path if symlink is invalid.
-    /// This should be used by external integrations to ensure they always get a working path.
     static var stableCLIPath: String {
-        // Try to ensure symlink exists first
-        ensureLocalSymlink()
-
-        // If symlink is valid, use it
-        if validateSymlink() {
+        guard let cliURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp") else {
+            logger.error("Bundled CLI not found")
             return userSymlinkPath
         }
-
-        // Fallback to direct bundle path
-        if let cliURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp") {
-            logger.info("Symlink invalid, falling back to bundle path: \(cliURL.path)")
-            return cliURL.path
+        _ = ensureLocalSymlink(userSymlinkURL: URL(fileURLWithPath: userSymlinkPath), bundledCLIURL: cliURL)
+        if validateSymlink(userSymlinkURL: URL(fileURLWithPath: userSymlinkPath), bundledCLIURL: cliURL) {
+            return userSymlinkPath
         }
-
-        // Last resort: return the symlink path anyway (will likely fail, but provides consistency)
-        logger.error("Both symlink and bundle CLI paths are unavailable")
-        return userSymlinkPath
+        logger.info("Managed symlink unavailable, falling back to bundle path: \(cliURL.path)")
+        return cliURL.path
     }
 
-    /// Validates that the symlink exists and points to a valid, executable target.
     static func validateSymlink() -> Bool {
-        let linkPath = userSymlinkPath
-        let fm = FileManager.default
-
-        // Check if symlink exists
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: linkPath, isDirectory: &isDirectory) else {
-            logger.debug("Symlink does not exist at: \(linkPath)")
-            return false
-        }
-
-        // Check if we can read the symlink destination
-        guard let destination = try? fm.destinationOfSymbolicLink(atPath: linkPath) else {
-            logger.debug("Cannot read symlink destination at: \(linkPath)")
-            return false
-        }
-
-        // Check if the target file exists
-        guard fm.fileExists(atPath: destination) else {
-            logger.debug("Symlink target does not exist: \(destination)")
-            return false
-        }
-
-        // Check if the target is executable
-        guard fm.isExecutableFile(atPath: destination) else {
-            logger.debug("Symlink target is not executable: \(destination)")
-            return false
-        }
-
-        return true
+        guard let cliURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp") else { return false }
+        return validateSymlink(userSymlinkURL: URL(fileURLWithPath: userSymlinkPath), bundledCLIURL: cliURL)
     }
 
-    /// Ensures the symlink exists and points to the current bundle's CLI.
     static func ensureLocalSymlink() {
         guard let cliURL = Bundle.main.url(forAuxiliaryExecutable: "repoprompt-mcp") else {
             logger.error("Bundled CLI not found")
             return
         }
+        _ = ensureLocalSymlink(userSymlinkURL: URL(fileURLWithPath: userSymlinkPath), bundledCLIURL: cliURL)
+    }
 
-        let supportDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support", isDirectory: true)
-            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
-        let linkPath = supportDir.appendingPathComponent(linkName).path
-        let destPath = cliURL.path
-        let fm = FileManager.default
-
-        // Create container folder if missing
-        try? fm.createDirectory(
-            at: supportDir,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o755]
-        )
-
-        // Skip if link already correct and valid
-        if let current = try? fm.destinationOfSymbolicLink(atPath: linkPath),
-           current == destPath, validateSymlink()
-        {
-            return
-        }
-
-        // Replace atomically
+    @discardableResult
+    static func ensureLocalSymlink(
+        userSymlinkURL: URL,
+        bundledCLIURL: URL,
+        fileManager: FileManager = .default,
+        beforeCommit: (() -> Void)? = nil
+    ) -> Bool {
+        let supportDirectory = userSymlinkURL.deletingLastPathComponent()
         do {
-            let tmp = supportDir.appendingPathComponent(UUID().uuidString).path
-            try? fm.removeItem(atPath: tmp) // clean if exists
-            try fm.createSymbolicLink(atPath: tmp, withDestinationPath: destPath)
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: tmp)
-            try fm.replaceItemAt(
-                URL(fileURLWithPath: linkPath),
-                withItemAt: URL(fileURLWithPath: tmp)
+            try fileManager.createDirectory(
+                at: supportDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o755]
             )
-
-            // Verify the symlink was created successfully
-            if !validateSymlink() {
-                logger.warning("Symlink created but validation failed - external integrations will fall back to bundle path")
-            }
         } catch {
-            logger.error("Failed to install user-space symlink: \(error.localizedDescription) - external integrations will fall back to bundle path")
+            logger.error("Failed to create CLI support directory: \(error.localizedDescription)")
+            return false
         }
+
+        let allowlist = ManagedCLIPathPolicy.managedDestinations(
+            currentBundledCLIPath: bundledCLIURL.path,
+            fileManager: fileManager
+        )
+        let initial = ManagedCLIPathPolicy.classifySymlink(
+            at: userSymlinkURL.path,
+            desiredDestination: bundledCLIURL.path,
+            managedDestinations: allowlist,
+            fileManager: fileManager
+        )
+        switch initial {
+        case .managedCurrent:
+            return true
+        case .unmanaged:
+            logger.error("Refusing to replace unmanaged CLI entry at \(userSymlinkURL.path)")
+            return false
+        case .missing, .managedStale:
+            break
+        }
+
+        let temporaryURL = supportDirectory.appendingPathComponent(".\(userSymlinkURL.lastPathComponent).\(UUID().uuidString).tmp")
+        do {
+            try fileManager.createSymbolicLink(
+                atPath: temporaryURL.path,
+                withDestinationPath: bundledCLIURL.path
+            )
+            guard commitManagedSymlink(
+                temporaryURL: temporaryURL,
+                destinationURL: userSymlinkURL,
+                desiredDestination: bundledCLIURL.path,
+                managedDestinations: allowlist,
+                fileManager: fileManager,
+                beforeCommit: beforeCommit
+            ) else {
+                return false
+            }
+            return validateSymlink(
+                userSymlinkURL: userSymlinkURL,
+                bundledCLIURL: bundledCLIURL,
+                fileManager: fileManager
+            )
+        } catch {
+            try? fileManager.removeItem(at: temporaryURL)
+            logger.error("Failed to install managed user-space symlink: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    private static func commitManagedSymlink(
+        temporaryURL: URL,
+        destinationURL: URL,
+        desiredDestination: String,
+        managedDestinations: Set<String>,
+        fileManager: FileManager,
+        beforeCommit: (() -> Void)?
+    ) -> Bool {
+        var beforeCommit = beforeCommit
+        for _ in 0 ..< 3 {
+            let classification = ManagedCLIPathPolicy.classifySymlink(
+                at: destinationURL.path,
+                desiredDestination: desiredDestination,
+                managedDestinations: managedDestinations,
+                fileManager: fileManager
+            )
+            guard classification != .unmanaged else {
+                try? fileManager.removeItem(at: temporaryURL)
+                logger.error("Refusing to replace unmanaged CLI entry at \(destinationURL.path)")
+                return false
+            }
+
+            beforeCommit?()
+            beforeCommit = nil
+
+            switch classification {
+            case .missing:
+                if renamex_np(temporaryURL.path, destinationURL.path, UInt32(RENAME_EXCL)) == 0 {
+                    return true
+                }
+                if errno == EEXIST || errno == ENOENT { continue }
+            case .managedCurrent, .managedStale:
+                if renamex_np(temporaryURL.path, destinationURL.path, UInt32(RENAME_SWAP)) != 0 {
+                    if errno == ENOENT { continue }
+                    break
+                }
+                let displaced = ManagedCLIPathPolicy.classifySymlink(
+                    at: temporaryURL.path,
+                    desiredDestination: desiredDestination,
+                    managedDestinations: managedDestinations,
+                    fileManager: fileManager
+                )
+                guard displaced != .unmanaged else {
+                    if renamex_np(temporaryURL.path, destinationURL.path, UInt32(RENAME_SWAP)) == 0 {
+                        try? fileManager.removeItem(at: temporaryURL)
+                    } else {
+                        logger.fault("Could not roll back raced unmanaged CLI entry; preserved it at \(temporaryURL.path)")
+                    }
+                    logger.error("CLI entry ownership changed during replacement at \(destinationURL.path)")
+                    return false
+                }
+                try? fileManager.removeItem(at: temporaryURL)
+                return true
+            case .unmanaged:
+                break
+            }
+        }
+
+        try? fileManager.removeItem(at: temporaryURL)
+        logger.error("Failed to atomically install managed user-space symlink at \(destinationURL.path)")
+        return false
+    }
+
+    static func validateSymlink(
+        userSymlinkURL: URL,
+        bundledCLIURL: URL,
+        fileManager: FileManager = .default
+    ) -> Bool {
+        let classification = ManagedCLIPathPolicy.classifySymlink(
+            at: userSymlinkURL.path,
+            desiredDestination: bundledCLIURL.path,
+            managedDestinations: ManagedCLIPathPolicy.managedDestinations(
+                currentBundledCLIPath: bundledCLIURL.path,
+                fileManager: fileManager
+            ),
+            fileManager: fileManager
+        )
+        guard case .managedCurrent = classification else { return false }
+        return fileManager.isExecutableFile(atPath: bundledCLIURL.path)
     }
 }

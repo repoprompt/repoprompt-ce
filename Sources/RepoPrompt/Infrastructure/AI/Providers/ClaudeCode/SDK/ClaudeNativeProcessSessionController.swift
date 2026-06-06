@@ -141,7 +141,11 @@ final actor ClaudeNativeProcessSessionController {
     private var stderrChunkChannel: FileHandleChunkChannel?
     private var stdoutConsumerTask: Task<Void, Never>?
     private var stderrConsumerTask: Task<Void, Never>?
-    private var configURL: URL?
+    private var configLease: MCPConfigLease?
+    private var configURL: URL? {
+        configLease?.url
+    }
+
     private var initialFlagSettingsRequest: [String: Any]?
     private var latestFlagSettingsIntentGeneration: UInt64 = 0
     private var flagSettingsRequestGeneration: UInt64 = 0
@@ -449,9 +453,9 @@ final actor ClaudeNativeProcessSessionController {
         hasCompletedInitialFlagSettings = false
         stdoutFramer = LineFramer()
 
-        if let configURL {
-            await configService.cleanupConfigFile(configURL)
-            self.configURL = nil
+        if let configLease {
+            configLease.release()
+            self.configLease = nil
         }
         rawEventLogFileURL = nil
         rawEventLogFileSessionID = nil
@@ -468,7 +472,7 @@ final actor ClaudeNativeProcessSessionController {
         guard isRunning else {
             throw AIProviderError.invalidConfiguration(detail: "Could not start MCP server. Check MCP settings and try again.")
         }
-        configURL = try await configService.prepareConfigFile()
+        configLease = try await configService.prepareLaunchConfig()
     }
 
     private func startProcessIfNeeded(

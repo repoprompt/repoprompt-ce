@@ -7,6 +7,8 @@ struct APISettingsView: View {
     var onAPIKeyUpdated: (() -> Void)?
     var closeAction: (() -> Void)?
 
+    @StateObject private var secureStorageRepairViewModel = SecureStorageRepairViewModel()
+    @State private var showSecureStorageRepair = false
     @State private var showAlert = false
     @State private var alertMessage = ""
     @State private var isLoading = false
@@ -45,6 +47,12 @@ struct APISettingsView: View {
                         .font(fontPreset.subheadlineFont)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if secureStorageRepairViewModel.isAvailable {
+                    SecureStorageRepairBanner {
+                        showSecureStorageRepair = true
+                    }
                 }
 
                 // Recommendation banner (shows when API keys are configured)
@@ -272,6 +280,14 @@ struct APISettingsView: View {
             .padding()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(isPresented: $showSecureStorageRepair) {
+            SecureStorageRepairView(viewModel: secureStorageRepairViewModel) {
+                Task {
+                    await viewModel.loadStoredData()
+                    onAPIKeyUpdated?()
+                }
+            }
+        }
         .alert(isPresented: $showAlert) {
             Alert(
                 title: Text("API Key Management"),

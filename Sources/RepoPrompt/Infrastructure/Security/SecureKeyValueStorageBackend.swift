@@ -1,6 +1,6 @@
 import Foundation
 
-protocol SecureKeyValueStorageBackend: AnyObject {
+protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
     var persistsValuesAcrossLaunches: Bool { get }
 
     func save(
@@ -20,98 +20,51 @@ protocol SecureKeyValueStorageBackend: AnyObject {
     ) throws
 }
 
+struct SecureKeyValueStorageSelection {
+    let decision: RuntimeSecureStorageDecision
+    let backend: SecureKeyValueStorageBackend
+}
+
 enum SecureKeyValueStorageFactory {
-    private static let cachedBackend: SecureKeyValueStorageBackend = {
-        #if DEBUG
-            let signingInfo = RuntimeCodeSigningDetector.currentProcessSigningInfo()
-            let marker = DebugSecureStorageRuntimePolicy.currentDebugStorageMarker()
-            switch DebugSecureStorageRuntimePolicy.backendKind(for: signingInfo, debugStorageMarker: marker) {
-            case .keychain:
-                return KeychainService.shared
-            case .alternateInMemory:
-                return EphemeralSecureKeyValueStore.shared
-            }
-        #else
-            switch PersistentKeychainRuntimePolicy.backendKind() {
-            case .localSelfSigned:
-                return KeychainService.localSelfSignedShared
-            case .canonical:
-                return KeychainService.shared
-            }
-        #endif
+    private static let cachedSelection: SecureKeyValueStorageSelection = {
+        let localSigningContext = RuntimeCodeSigningPolicy.currentLocalSigningContext()
+        let signingInfo = RuntimeCodeSigningDetector.currentProcessSigningInfo(
+            localSigningExpectation: localSigningContext.expectation
+        )
+        return selection(
+            for: RuntimeCodeSigningPolicy.currentDecision(
+                signingInfo: signingInfo,
+                localSigningContext: localSigningContext
+            )
+        )
     }()
 
     static func defaultBackend() -> SecureKeyValueStorageBackend {
-        cachedBackend
-    }
-}
-
-enum PersistentKeychainBackendKind: Equatable {
-    case localSelfSigned
-    case canonical
-}
-
-enum PersistentKeychainRuntimePolicy {
-    private static let localSelfSignedMarker = "local-self-signed"
-    private static let signingModePlistKey = "RepoPromptSigningMode"
-
-    static func backendKind() -> PersistentKeychainBackendKind {
-        backendKind(signingModeMarker: Bundle.main.object(forInfoDictionaryKey: signingModePlistKey) as? String)
+        cachedSelection.backend
     }
 
-    static func backendKind(signingModeMarker: String?) -> PersistentKeychainBackendKind {
-        switch normalizedString(signingModeMarker) {
-        case localSelfSignedMarker:
-            .localSelfSigned
-        default:
-            .canonical
-        }
+    static func currentDecision() -> RuntimeSecureStorageDecision {
+        cachedSelection.decision
     }
 
-    private static func normalizedString(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-#if DEBUG
-    enum DebugSecureStorageBackendKind: Equatable {
-        case keychain
-        case alternateInMemory
-    }
-
-    enum DebugSecureStorageRuntimePolicy {
-        private static let keychainMarker = "keychain"
-        private static let plistMarkerKey = "RepoPromptDebugSecureStorageBackend"
-
-        static func currentDebugStorageMarker() -> String? {
-            if let environmentMarker = normalizedString(ProcessInfo.processInfo.environment[plistMarkerKey]) {
-                return environmentMarker
+    static func selection(for decision: RuntimeSecureStorageDecision) -> SecureKeyValueStorageSelection {
+        let backend: SecureKeyValueStorageBackend = switch decision.domain {
+        case .officialDeveloperID:
+            KeychainService.officialV2Shared
+        case .localSelfSigned:
+            if let fingerprint = decision.localCertificateFingerprint,
+               let generation = decision.localServiceGeneration,
+               generation > 0
+            {
+                KeychainService.localSelfSigned(fingerprint: fingerprint, generation: generation)
+            } else {
+                EphemeralSecureKeyValueStore.shared
             }
-            return normalizedString(Bundle.main.object(forInfoDictionaryKey: plistMarkerKey) as? String)
+        case .appleDevelopmentDebug:
+            KeychainService.debugShared
+        case .ephemeral:
+            EphemeralSecureKeyValueStore.shared
         }
-
-        static func backendKind(
-            for signingInfo: RuntimeCodeSigningInfo,
-            debugStorageMarker: String?
-        ) -> DebugSecureStorageBackendKind {
-            // DEBUG uses persistent Keychain only when packaging explicitly opted in and
-            // the launched binary has a real TeamIdentifier. Auto-detected debug signing
-            // deliberately keeps using alternate in-memory storage to avoid Keychain prompts.
-            guard normalizedString(debugStorageMarker) == keychainMarker,
-                  let teamIdentifier = signingInfo.teamIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines),
-                  !teamIdentifier.isEmpty
-            else {
-                return .alternateInMemory
-            }
-            return .keychain
-        }
-
-        private static func normalizedString(_ value: String?) -> String? {
-            guard let value else { return nil }
-            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            return trimmed.isEmpty ? nil : trimmed
-        }
+        return SecureKeyValueStorageSelection(decision: decision, backend: backend)
     }
-#endif
+}

@@ -3,6 +3,7 @@ import Foundation
 struct HeadlessAgentContext {
     let runID: UUID
     let configURL: URL?
+    let configLease: MCPConfigLease?
     /// Working directory for the agent. Defaults to temp directory to avoid macOS security popups.
     let workingDirectory: String
     let environment: [String: String]
@@ -10,13 +11,15 @@ struct HeadlessAgentContext {
 
     init(
         runID: UUID,
-        configURL: URL?,
+        configURL: URL? = nil,
+        configLease: MCPConfigLease? = nil,
         workingDirectory: String? = nil,
         environment: [String: String],
         launchEnvironment: ClaudeCodeLaunchEnvironment? = nil
     ) {
         self.runID = runID
-        self.configURL = configURL
+        self.configLease = configLease
+        self.configURL = configLease?.url ?? configURL
         self.workingDirectory = workingDirectory ?? FileManager.default.temporaryDirectory.path
         self.environment = environment
         self.launchEnvironment = launchEnvironment
@@ -69,9 +72,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Preparing config file")
             }
-            let configURL = try await configService.prepareConfigFile()
+            let configLease = try await configService.prepareLaunchConfig()
             if enableDebugLogging {
-                print("[DEBUG] ClaudeCodeAgent: Config file at: \(configURL.path)")
+                print("[DEBUG] ClaudeCodeAgent: Config file at: \(configLease.url.path)")
             }
             let launchEnvironment = try await environmentResolver.resolve(
                 variant: config.runtimeVariant,
@@ -79,7 +82,7 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
             )
             return HeadlessAgentContext(
                 runID: actualRunID,
-                configURL: configURL,
+                configLease: configLease,
                 environment: ProcessInfo.processInfo.environment,
                 launchEnvironment: launchEnvironment
             )
@@ -325,8 +328,9 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
         if enableDebugLogging {
             print("[DEBUG] ClaudeCodeAgent: Cleaning up context \(context.runID)")
         }
-        if let configURL = context.configURL {
-            await configService.cleanupConfigFile(configURL)
+        if let configLease = context.configLease {
+            let configURL = configLease.url
+            configLease.release()
             if enableDebugLogging {
                 print("[DEBUG] ClaudeCodeAgent: Cleaned up config file at \(configURL.path)")
             }

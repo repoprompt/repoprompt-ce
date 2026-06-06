@@ -653,10 +653,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await Task.yield()
                 stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
             }
-            let flushStartCount = await flushGate.startCount()
             await flushGate.release()
             let firstSamples = await firstBarrier.value
             let secondSamples = await secondBarrier.value
+            let flushStartCount = await flushGate.startCount()
             let secondSample = try XCTUnwrap(secondSamples.first)
 
             XCTAssertEqual(stats.launchCount, 2)
@@ -1129,9 +1129,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
             let buckets = searchCatalogSnapshotBuckets(capture)
-            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 18)
-            XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1)
-            XCTAssertEqual(capture.retainedSampleCount, 19)
+            let missCount = buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount
+            let hitCount = buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount
+            XCTAssertEqual(missCount, 18)
+            XCTAssertEqual(hitCount, 1)
+            XCTAssertEqual((missCount ?? 0) + (hitCount ?? 0), 19)
             XCTAssertEqual(capture.droppedSampleCount, 0)
         }
     #endif

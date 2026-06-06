@@ -9,26 +9,23 @@
 
 import Foundation
 import OSLog
+import RepoPromptShared
 
 enum CLIPathInstaller {
     private static let logger = Logger(subsystem: "CLI.PathInstaller", category: "install")
 
-    /// The name of the CLI command in PATH (nonisolated - compile-time constant)
+    #if DEBUG
+        nonisolated static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+    #else
+        nonisolated static let identity = MCPFilesystemIdentity.repoPromptCE(.release)
+    #endif
+
     nonisolated static var cliCommandName: String {
-        #if DEBUG
-            return "rpce-cli-debug"
-        #else
-            return "rpce-cli"
-        #endif
+        identity.pathCLICommandName
     }
 
-    /// The name of the claude-rp wrapper command (nonisolated - compile-time constant)
     nonisolated static var claudeRPCommandName: String {
-        #if DEBUG
-            return "claude-rpce-debug"
-        #else
-            return "claude-rpce"
-        #endif
+        identity.claudeWrapperCommandName
     }
 
     /// The installation directory for the CLI symlink (nonisolated - constant)
@@ -53,21 +50,15 @@ enum CLIPathInstaller {
     /// Built-in Claude Code tools to disable in the claude-rp wrapper.
     /// These overlap with RepoPrompt MCP tools and should use RP versions instead.
     private static let claudeRPDisallowedTools = ["Read", "Write", "Edit", "Glob", "Grep"]
-    private static let claudeRPManagedMarker = "# claude-rpce: Claude Code wrapper configured for RepoPrompt CE"
-    private static let legacyClaudeRPManagedMarkers = [
-        "# claude-rp-ce: Claude Code wrapper configured for RepoPrompt CE",
-        "# claude-rp: Claude Code wrapper configured for RepoPrompt"
-    ]
+    private static let claudeRPManagedMarker = ManagedCLIPathPolicy.currentClaudeWrapperMarker
 
     private static func isManagedClaudeRPScript(_ content: String) -> Bool {
-        content.contains(claudeRPManagedMarker) || legacyClaudeRPManagedMarkers.contains { content.contains($0) }
+        ManagedCLIPathPolicy.isManagedWrapper(content)
     }
 
-    /// Path to the MCP config file used by claude-rp wrapper
+    /// Path to the stable MCP config file used by claude-rp wrapper.
     private static var claudeRPConfigPath: String {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let fileName = MCPConfigExportService.discoveryConfigFileName
-        return "\(home)/Library/Application Support/RepoPrompt CE/MCP/\(fileName)"
+        MCPConfigExportService.stableWrapperConfigURL.path
     }
 
     /// Generates the shell script content for the claude-rp wrapper
@@ -108,6 +99,32 @@ enum CLIPathInstaller {
         static func test_isManagedClaudeRPScript(_ content: String) -> Bool {
             isManagedClaudeRPScript(content)
         }
+
+        static func test_atomicManagedSymlinkInstallCommand(
+            installPath: String,
+            desiredDestination: String,
+            managedDestinations: [String]
+        ) -> String {
+            atomicManagedSymlinkInstallCommand(
+                installPath: installPath,
+                desiredDestination: desiredDestination,
+                managedDestinations: managedDestinations
+            )
+        }
+
+        static func test_managedSymlinkRemovalCommand(
+            installPath: String,
+            managedDestinations: [String]
+        ) -> String {
+            managedSymlinkRemovalCommand(
+                installPath: installPath,
+                managedDestinations: managedDestinations
+            )
+        }
+
+        static func test_atomicManagedWrapperInstallCommand(sourcePath: String, installPath: String) -> String {
+            atomicManagedWrapperInstallCommand(sourcePath: sourcePath, installPath: installPath)
+        }
     #endif
 
     // MARK: - Installation Status
@@ -120,45 +137,34 @@ enum CLIPathInstaller {
         case directoryMissing // /usr/local/bin doesn't exist
     }
 
-    /// Check the current installation status
+    /// Check the current installation status using lstat/readlink ownership semantics.
     @MainActor
     static func checkStatus() -> InstallationStatus {
-        let fm = FileManager.default
-        let path = installPath
-
-        // Check if /usr/local/bin exists
-        var isDir: ObjCBool = false
-        guard fm.fileExists(atPath: installDirectory, isDirectory: &isDir), isDir.boolValue else {
+        let fileManager = FileManager.default
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: installDirectory, isDirectory: &isDirectory), isDirectory.boolValue else {
             return .directoryMissing
         }
 
-        // Check if file exists at install path
-        guard fm.fileExists(atPath: path) else {
+        let desiredDestination = CLISymlinkManagerUserSpace.userSymlinkPath
+        let classification = ManagedCLIPathPolicy.classifySymlink(
+            at: installPath,
+            desiredDestination: desiredDestination,
+            managedDestinations: ManagedCLIPathPolicy.managedDestinations(
+                currentBundledCLIPath: bundledCLIPath,
+                fileManager: fileManager
+            ),
+            fileManager: fileManager
+        )
+        switch classification {
+        case .missing:
             return .notInstalled
-        }
-
-        // Check if it's a symlink
-        guard let attrs = try? fm.attributesOfItem(atPath: path),
-              let fileType = attrs[.type] as? FileAttributeType,
-              fileType == .typeSymbolicLink
-        else {
-            // File exists but isn't a symlink
-            return .installedByOther
-        }
-
-        // Check if symlink points to our CLI
-        guard let destination = try? fm.destinationOfSymbolicLink(atPath: path) else {
-            return .installedByOther
-        }
-
-        guard let bundledPath = bundledCLIPath else {
+        case .managedCurrent:
+            return fileManager.isExecutableFile(atPath: installPath) ? .installed : .installedButStale
+        case .managedStale:
             return .installedButStale
-        }
-
-        if destination == bundledPath {
-            return .installed
-        } else {
-            return .installedButStale
+        case .unmanaged:
+            return .installedByOther
         }
     }
 
@@ -228,20 +234,24 @@ enum CLIPathInstaller {
             break
         }
 
-        // Build the shell command to run with admin privileges
-        let escapedBundledPath = bundledPath.replacingOccurrences(of: "'", with: "'\\''")
-        let escapedInstallPath = installPath.replacingOccurrences(of: "'", with: "'\\''")
-
-        var shellCommand = if status == .installedButStale {
-            // Remove old symlink first
-            "rm -f '\(escapedInstallPath)' && ln -s '\(escapedBundledPath)' '\(escapedInstallPath)'"
-        } else {
-            "ln -s '\(escapedBundledPath)' '\(escapedInstallPath)'"
+        let userLink = CLISymlinkManagerUserSpace.userSymlinkPath
+        guard CLISymlinkManagerUserSpace.ensureLocalSymlink(
+            userSymlinkURL: URL(fileURLWithPath: userLink),
+            bundledCLIURL: URL(fileURLWithPath: bundledPath)
+        ) else {
+            throw InstallError.pathExistsNotOurs
         }
 
-        // Use osascript to request admin privileges
+        let managedDestinations = ManagedCLIPathPolicy.managedDestinations(
+            currentBundledCLIPath: bundledPath
+        ).sorted()
+        let shellCommand = atomicManagedSymlinkInstallCommand(
+            installPath: installPath,
+            desiredDestination: userLink,
+            managedDestinations: managedDestinations
+        )
         let script = """
-        do shell script "\(shellCommand)" with administrator privileges
+        do shell script "\(appleScriptEscaped(shellCommand))" with administrator privileges
         """
 
         logger.info("Installing CLI: \(shellCommand)")
@@ -276,11 +286,15 @@ enum CLIPathInstaller {
             break
         }
 
-        let escapedInstallPath = installPath.replacingOccurrences(of: "'", with: "'\\''")
-        let shellCommand = "rm -f '\(escapedInstallPath)'"
+        let shellCommand = managedSymlinkRemovalCommand(
+            installPath: installPath,
+            managedDestinations: ManagedCLIPathPolicy.managedDestinations(
+                currentBundledCLIPath: bundledCLIPath
+            ).sorted()
+        )
 
         let script = """
-        do shell script "\(shellCommand)" with administrator privileges
+        do shell script "\(appleScriptEscaped(shellCommand))" with administrator privileges
         """
 
         logger.info("Uninstalling CLI: \(shellCommand)")
@@ -323,29 +337,19 @@ enum CLIPathInstaller {
             return .directoryMissing
         }
 
-        // Check if file exists at install path
-        guard fm.fileExists(atPath: path) else {
+        switch ManagedCLIPathPolicy.classifyWrapper(
+            at: path,
+            expectedContent: claudeRPScriptContent(),
+            fileManager: fm
+        ) {
+        case .missing:
             return .notInstalled
-        }
-
-        // Read the file contents
-        guard let existingContent = try? String(contentsOfFile: path, encoding: .utf8) else {
-            return .installedByOther
-        }
-
-        // Check if it's our script (current CE marker or a legacy managed marker)
-        guard isManagedClaudeRPScript(existingContent) else {
-            return .installedByOther
-        }
-
-        // Check if content matches current version
-        let expectedContent = claudeRPScriptContent()
-        if existingContent.trimmingCharacters(in: .whitespacesAndNewlines) ==
-            expectedContent.trimmingCharacters(in: .whitespacesAndNewlines)
-        {
+        case .managedCurrent:
             return .installed
-        } else {
+        case .managedOutdated:
             return .installedButOutdated
+        case .unmanaged:
+            return .installedByOther
         }
     }
 
@@ -379,7 +383,7 @@ enum CLIPathInstaller {
         case .installed:
             // Wrapper is already installed, but still refresh the MCP config file
             logger.info("claude-rp already installed at \(claudeRPInstallPath)")
-            try await MCPConfigExportService.shared.prepareConfigFile()
+            try await MCPConfigExportService.shared.prepareStableWrapperConfigFile()
             logger.info("MCP config file refreshed at \(claudeRPConfigPath)")
             return
         case .notInstalled, .installedButOutdated:
@@ -401,18 +405,13 @@ enum CLIPathInstaller {
             try? FileManager.default.removeItem(at: tempFile)
         }
 
-        let escapedTempPath = tempFile.path.replacingOccurrences(of: "'", with: "'\\''")
-        let escapedInstallPath = claudeRPInstallPath.replacingOccurrences(of: "'", with: "'\\''")
-
-        // Move temp file to install location and make executable
-        let shellCommand = if status == .installedButOutdated {
-            "rm -f '\(escapedInstallPath)' && cp '\(escapedTempPath)' '\(escapedInstallPath)' && chmod +x '\(escapedInstallPath)'"
-        } else {
-            "cp '\(escapedTempPath)' '\(escapedInstallPath)' && chmod +x '\(escapedInstallPath)'"
-        }
+        let shellCommand = atomicManagedWrapperInstallCommand(
+            sourcePath: tempFile.path,
+            installPath: claudeRPInstallPath
+        )
 
         let script = """
-        do shell script "\(shellCommand)" with administrator privileges
+        do shell script "\(appleScriptEscaped(shellCommand))" with administrator privileges
         """
 
         logger.info("Installing claude-rp: \(shellCommand)")
@@ -425,7 +424,7 @@ enum CLIPathInstaller {
             logger.info("claude-rp installed successfully at \(claudeRPInstallPath)")
 
             // Create the MCP config file that claude-rp references
-            try await MCPConfigExportService.shared.prepareConfigFile()
+            try await MCPConfigExportService.shared.prepareStableWrapperConfigFile()
             logger.info("MCP config file created at \(claudeRPConfigPath)")
         } catch {
             logger.error("Failed to install claude-rp: \(error.localizedDescription)")
@@ -451,11 +450,10 @@ enum CLIPathInstaller {
             break
         }
 
-        let escapedInstallPath = claudeRPInstallPath.replacingOccurrences(of: "'", with: "'\\''")
-        let shellCommand = "rm -f '\(escapedInstallPath)'"
+        let shellCommand = managedWrapperRemovalCommand(installPath: claudeRPInstallPath)
 
         let script = """
-        do shell script "\(shellCommand)" with administrator privileges
+        do shell script "\(appleScriptEscaped(shellCommand))" with administrator privileges
         """
 
         logger.info("Uninstalling claude-rp: \(shellCommand)")
@@ -476,6 +474,68 @@ enum CLIPathInstaller {
     }
 
     // MARK: - Helper
+
+    private static func atomicManagedSymlinkInstallCommand(
+        installPath: String,
+        desiredDestination: String,
+        managedDestinations: [String]
+    ) -> String {
+        let path = shellQuoted(installPath)
+        let destination = shellQuoted(desiredDestination)
+        let temporary = shellQuoted("\(installPath).\(UUID().uuidString).tmp")
+        let backup = shellQuoted("\(installPath).\(UUID().uuidString).backup")
+        let ownershipFunction = symlinkOwnershipFunction(managedDestinations: managedDestinations)
+        return "set -e; \(ownershipFunction); path=\(path); tmp=\(temporary); backup=\(backup); trap 'rm -f \"$tmp\"' EXIT; managed_link \"$path\" || exit 73; ln -s \(destination) \"$tmp\"; if [ -e \"$path\" ] || [ -L \"$path\" ]; then mv \"$path\" \"$backup\"; managed_link \"$backup\" || { [ -e \"$path\" ] || [ -L \"$path\" ] || mv -n \"$backup\" \"$path\"; exit 73; }; fi; mv -n \"$tmp\" \"$path\"; if [ ! -L \"$path\" ] || [ \"$(readlink \"$path\")\" != \(destination) ]; then rm -f \"$backup\"; exit 73; fi; rm -f \"$backup\"; trap - EXIT"
+    }
+
+    private static func managedSymlinkRemovalCommand(
+        installPath: String,
+        managedDestinations: [String]
+    ) -> String {
+        let path = shellQuoted(installPath)
+        let backup = shellQuoted("\(installPath).\(UUID().uuidString).removing")
+        let ownershipFunction = symlinkOwnershipFunction(managedDestinations: managedDestinations)
+        return "set -e; \(ownershipFunction); path=\(path); backup=\(backup); managed_link \"$path\" || exit 73; [ -e \"$path\" ] || [ -L \"$path\" ] || exit 0; mv \"$path\" \"$backup\"; managed_link \"$backup\" || { [ -e \"$path\" ] || [ -L \"$path\" ] || mv -n \"$backup\" \"$path\"; exit 73; }; rm -f \"$backup\""
+    }
+
+    private static func symlinkOwnershipFunction(managedDestinations: [String]) -> String {
+        let comparisons = managedDestinations
+            .map { "[ \"$current\" = \(shellQuoted($0)) ]" }
+            .joined(separator: " || ")
+        return "managed_link(){ candidate=\"$1\"; if [ -e \"$candidate\" ] || [ -L \"$candidate\" ]; then [ -L \"$candidate\" ] || return 1; current=$(readlink \"$candidate\"); { \(comparisons); } || return 1; fi; }"
+    }
+
+    private static func atomicManagedWrapperInstallCommand(sourcePath: String, installPath: String) -> String {
+        let source = shellQuoted(sourcePath)
+        let path = shellQuoted(installPath)
+        let temporary = shellQuoted("\(installPath).\(UUID().uuidString).tmp")
+        let backup = shellQuoted("\(installPath).\(UUID().uuidString).backup")
+        let ownershipFunction = wrapperOwnershipFunction()
+        return "set -e; \(ownershipFunction); source=\(source); path=\(path); tmp=\(temporary); backup=\(backup); trap 'rm -f \"$tmp\"' EXIT; managed_wrapper \"$path\" || exit 73; cp \"$source\" \"$tmp\"; chmod 755 \"$tmp\"; if [ -e \"$path\" ] || [ -L \"$path\" ]; then mv \"$path\" \"$backup\"; managed_wrapper \"$backup\" || { [ -e \"$path\" ] || [ -L \"$path\" ] || mv -n \"$backup\" \"$path\"; exit 73; }; fi; mv -n \"$tmp\" \"$path\"; if [ ! -f \"$path\" ] || [ -L \"$path\" ] || ! cmp -s \"$source\" \"$path\"; then rm -f \"$backup\"; exit 73; fi; rm -f \"$backup\"; trap - EXIT"
+    }
+
+    private static func managedWrapperRemovalCommand(installPath: String) -> String {
+        let path = shellQuoted(installPath)
+        let backup = shellQuoted("\(installPath).\(UUID().uuidString).removing")
+        return "set -e; \(wrapperOwnershipFunction()); path=\(path); backup=\(backup); managed_wrapper \"$path\" || exit 73; [ -e \"$path\" ] || [ -L \"$path\" ] || exit 0; mv \"$path\" \"$backup\"; managed_wrapper \"$backup\" || { [ -e \"$path\" ] || [ -L \"$path\" ] || mv -n \"$backup\" \"$path\"; exit 73; }; rm -f \"$backup\""
+    }
+
+    private static func wrapperOwnershipFunction() -> String {
+        let markers = ([ManagedCLIPathPolicy.currentClaudeWrapperMarker] + ManagedCLIPathPolicy.legacyClaudeWrapperMarkers)
+            .map { "head -n 8 \"$candidate\" | grep -Fqx \(shellQuoted($0))" }
+            .joined(separator: " || ")
+        return "managed_wrapper(){ candidate=\"$1\"; if [ -e \"$candidate\" ] || [ -L \"$candidate\" ]; then [ -f \"$candidate\" ] && [ ! -L \"$candidate\" ] || return 1; { \(markers); } || return 1; fi; }"
+    }
+
+    private static func shellQuoted(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+    }
 
     private static func runAppleScript(_ script: String) async throws -> String? {
         try await withCheckedThrowingContinuation { continuation in

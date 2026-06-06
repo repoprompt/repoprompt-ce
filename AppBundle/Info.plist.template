@@ -16,6 +16,8 @@
   <key>NSPrincipalClass</key><string>NSApplication</string>
   <key>RepoPromptDebugSecureStorageBackend</key><string>__DEBUG_SECURE_STORAGE_BACKEND__</string>
   <key>RepoPromptSigningMode</key><string>__SIGNING_MODE__</string>
+  <key>RepoPromptLocalSigningCertificateSHA256</key><string>__LOCAL_SIGNING_CERTIFICATE_SHA256__</string>
+  <key>RepoPromptLocalSecureStorageGeneration</key><string>__LOCAL_SECURE_STORAGE_GENERATION__</string>
   <key>LSEnvironment</key><dict><key>REPOPROMPT_LAUNCH_SOURCE</key><string>launchservices</string></dict>
   <key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>com.pvncher.repoprompt.ce</string><key>CFBundleURLSchemes</key><array><string>repoprompt-ce</string></array><key>CFBundleURLIconFile</key><string>AppIcon</string></dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>

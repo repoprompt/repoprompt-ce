@@ -41,10 +41,40 @@ done
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 
 is_managed_path_link(){
-	[[ -L "$PATH_LINK" ]] || return 1
-	local target
-	target="$(readlink "$PATH_LINK" 2>/dev/null || true)"
+	local path="${1:-$PATH_LINK}" target
+	[[ -L "$path" ]] || return 1
+	target="$(readlink "$path" 2>/dev/null || true)"
 	[[ "$target" == "$USER_LINK" || "$target" == "$BUNDLED_CLI" ]]
+}
+
+is_managed_user_link(){
+	local path="${1:-$USER_LINK}" target canonical_debug_cli
+	[[ -L "$path" ]] || return 1
+	target="$(readlink "$path" 2>/dev/null || true)"
+	canonical_debug_cli="$HOME/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp"
+	[[ "$target" == "$BUNDLED_CLI" || "$target" == "$canonical_debug_cli" ]]
+}
+
+atomic_symlink_replace(){
+	local target="$1" path="$2" classifier="$3" tmp backup
+	tmp="$(dirname "$path")/.$(basename "$path").$$.$RANDOM.tmp"
+	backup="$(dirname "$path")/.$(basename "$path").$$.$RANDOM.backup"
+	trap 'rm -f "$tmp"' RETURN
+	ln -s "$target" "$tmp"
+	if [[ -e "$path" || -L "$path" ]]; then
+		mv "$path" "$backup"
+		if ! "$classifier" "$backup"; then
+			[[ -e "$path" || -L "$path" ]] || mv -n "$backup" "$path"
+			fail "CLI ownership changed during replacement: $path"
+		fi
+	fi
+	mv -n "$tmp" "$path"
+	if [[ ! -L "$path" || "$(readlink "$path" 2>/dev/null || true)" != "$target" ]]; then
+		rm -f "$backup"
+		fail "Refusing to overwrite a raced CLI entry at $path"
+	fi
+	rm -f "$backup"
+	trap - RETURN
 }
 
 ensure_bundled_cli(){
@@ -64,16 +94,24 @@ ensure_user_link(){
 	link_dir="$(dirname "$USER_LINK")"
 	mkdir -p "$link_dir"
 
-	if [[ -e "$USER_LINK" && ! -L "$USER_LINK" ]]; then
-		fail "User-space debug CLI path exists but is not a symlink: $USER_LINK"
+	if [[ -e "$USER_LINK" || -L "$USER_LINK" ]]; then
+		if [[ ! -L "$USER_LINK" ]]; then
+			fail "User-space debug CLI path exists but is not a symlink: $USER_LINK"
+		fi
+		if ! is_managed_user_link; then
+			fail "Refusing to replace unmanaged user-space symlink at $USER_LINK"
+		fi
 	fi
 
 	if [[ -L "$USER_LINK" && "$(readlink "$USER_LINK")" == "$BUNDLED_CLI" && -x "$USER_LINK" ]]; then
 		return
 	fi
 
-	rm -f "$USER_LINK"
-	ln -s "$BUNDLED_CLI" "$USER_LINK"
+	# Recheck ownership immediately before atomic rename.
+	if [[ -e "$USER_LINK" || -L "$USER_LINK" ]]; then
+		is_managed_user_link || fail "User-space CLI ownership changed before replacement: $USER_LINK"
+	fi
+	atomic_symlink_replace "$BUNDLED_CLI" "$USER_LINK" is_managed_user_link
 }
 
 install_path_link(){
@@ -90,15 +128,32 @@ install_path_link(){
 	fi
 
 	if [[ -w "$INSTALL_DIR" ]]; then
-		rm -f "$PATH_LINK"
-		ln -s "$USER_LINK" "$PATH_LINK"
+		if [[ -e "$PATH_LINK" || -L "$PATH_LINK" ]]; then
+			is_managed_path_link || fail "PATH CLI ownership changed before replacement: $PATH_LINK"
+		fi
+		atomic_symlink_replace "$USER_LINK" "$PATH_LINK" is_managed_path_link
 	else
 		if [[ ! -t 0 ]]; then
 			fail "$INSTALL_DIR is not writable. Re-run from an interactive terminal so sudo can install $COMMAND_NAME, or install it from Settings -> MCP -> CLI Tools."
 		fi
 		echo "Installing $COMMAND_NAME with administrator privileges..."
-		sudo rm -f "$PATH_LINK"
-		sudo ln -s "$USER_LINK" "$PATH_LINK"
+		local privileged_tmp="$INSTALL_DIR/.${COMMAND_NAME}.$$.$RANDOM.tmp"
+		local privileged_backup="$INSTALL_DIR/.${COMMAND_NAME}.$$.$RANDOM.backup"
+		sudo ln -s "$USER_LINK" "$privileged_tmp"
+		if [[ -e "$PATH_LINK" || -L "$PATH_LINK" ]]; then
+			sudo mv "$PATH_LINK" "$privileged_backup"
+			if ! is_managed_path_link "$privileged_backup"; then
+				[[ -e "$PATH_LINK" || -L "$PATH_LINK" ]] || sudo mv -n "$privileged_backup" "$PATH_LINK"
+				sudo rm -f "$privileged_tmp"
+				fail "PATH CLI ownership changed during replacement: $PATH_LINK"
+			fi
+		fi
+		sudo mv -n "$privileged_tmp" "$PATH_LINK"
+		if [[ ! -L "$PATH_LINK" || "$(readlink "$PATH_LINK" 2>/dev/null || true)" != "$USER_LINK" ]]; then
+			sudo rm -f "$privileged_tmp" "$privileged_backup"
+			fail "Refusing to overwrite a raced PATH CLI entry at $PATH_LINK"
+		fi
+		sudo rm -f "$privileged_backup"
 	fi
 
 	echo "Installed: $PATH_LINK -> $USER_LINK"
@@ -115,14 +170,25 @@ uninstall_path_link(){
 		fail "Refusing to remove unmanaged file at $PATH_LINK"
 	fi
 
+	local removal_backup="$INSTALL_DIR/.${COMMAND_NAME}.$$.$RANDOM.removing"
 	if [[ -w "$INSTALL_DIR" ]]; then
-		rm -f "$PATH_LINK"
+		mv "$PATH_LINK" "$removal_backup"
+		if ! is_managed_path_link "$removal_backup"; then
+			[[ -e "$PATH_LINK" || -L "$PATH_LINK" ]] || mv -n "$removal_backup" "$PATH_LINK"
+			fail "PATH CLI ownership changed during removal: $PATH_LINK"
+		fi
+		rm -f "$removal_backup"
 	else
 		if [[ ! -t 0 ]]; then
 			fail "$INSTALL_DIR is not writable. Re-run from an interactive terminal so sudo can remove $COMMAND_NAME."
 		fi
 		echo "Removing $COMMAND_NAME with administrator privileges..."
-		sudo rm -f "$PATH_LINK"
+		sudo mv "$PATH_LINK" "$removal_backup"
+		if ! is_managed_path_link "$removal_backup"; then
+			[[ -e "$PATH_LINK" || -L "$PATH_LINK" ]] || sudo mv -n "$removal_backup" "$PATH_LINK"
+			fail "PATH CLI ownership changed during removal: $PATH_LINK"
+		fi
+		sudo rm -f "$removal_backup"
 	fi
 
 	echo "Removed: $PATH_LINK"
@@ -142,9 +208,13 @@ print_status(){
 		target="$(readlink "$USER_LINK" 2>/dev/null || true)"
 		if [[ "$target" == "$BUNDLED_CLI" && -x "$USER_LINK" ]]; then
 			echo "  User-space symlink: OK ($USER_LINK -> $target)"
-		else
+		elif is_managed_user_link; then
 			echo "  User-space symlink: stale ($USER_LINK -> $target)"
+		else
+			echo "  User-space symlink: unmanaged ($USER_LINK -> $target)"
 		fi
+	elif [[ -e "$USER_LINK" ]]; then
+		echo "  User-space symlink: unmanaged file ($USER_LINK)"
 	else
 		echo "  User-space symlink: missing ($USER_LINK)"
 	fi
