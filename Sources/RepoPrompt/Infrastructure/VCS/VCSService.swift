@@ -549,11 +549,10 @@ public extension VCSService {
         guard let layout = gitRepositoryLayout(forRepoRoot: repoURL) else {
             return nil
         }
-        let mainWorktreeRoot = layout.commonDir.deletingLastPathComponent()
-        let isMain = !layout.isWorktree
+        let isMain = !layout.isLinkedWorktree
         let identity = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: layout.commonDir,
-            mainWorktreeRoot: mainWorktreeRoot
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
         )
         let branch = try? await gitBackend().getCurrentBranch(at: repoURL)
         let head = try? await gitBackend().getHeadID(at: repoURL)

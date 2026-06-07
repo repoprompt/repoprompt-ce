@@ -778,22 +778,22 @@ struct GitDiffSnapshotStore {
         return url.path
     }
 
-    private func worktreeMetadata(for repoRoot: String?) -> (isWorktree: Bool?, worktreeName: String?, worktreeRoot: String?, mainWorktreeRoot: String?, commonGitDir: String?) {
+    func worktreeMetadata(for repoRoot: String?) -> (isWorktree: Bool?, worktreeName: String?, worktreeRoot: String?, mainWorktreeRoot: String?, commonGitDir: String?) {
         guard let repoRoot, !repoRoot.isEmpty else {
             return (nil, nil, nil, nil, nil)
         }
         let rootURL = URL(fileURLWithPath: repoRoot)
-        guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: rootURL), layout.isWorktree else {
+        guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: rootURL), layout.isLinkedWorktree else {
             return (nil, nil, nil, nil, nil)
         }
-        let candidate: URL = if layout.commonDir.lastPathComponent == ".git" {
-            layout.commonDir.deletingLastPathComponent()
-        } else {
-            layout.commonDir
-        }
-        let mainRoot = FileManager.default.fileExists(atPath: candidate.path) ? candidate.path : nil
         let worktreeName = layout.gitDir.lastPathComponent.isEmpty ? nil : layout.gitDir.lastPathComponent
-        return (true, worktreeName, layout.workTreeRoot.path, mainRoot, layout.commonDir.path)
+        return (
+            true,
+            worktreeName,
+            layout.workTreeRoot.path,
+            layout.knownMainWorktreeRoot?.path,
+            layout.commonDir.path
+        )
     }
 
     private func buildHunkIndex(for diffText: String) -> [DiffHunkIndex]? {

@@ -126,6 +126,10 @@ struct GitContextBranchSwitchCapsule: View {
         fontPreset.scaledClamped(410, min: 360, max: 540)
     }
 
+    private var branchListMinimumHeight: CGFloat {
+        fontPreset.scaledClamped(168, min: 150, max: 220)
+    }
+
     private var branchSectionSpacing: CGFloat {
         6
     }
@@ -204,11 +208,11 @@ struct GitContextBranchSwitchCapsule: View {
             Text(context.tooltipText)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(6)
             Text("Switches this checkout in place. It does not create or select another worktree.")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                 .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(2)
 
             Divider()
 
@@ -217,7 +221,9 @@ struct GitContextBranchSwitchCapsule: View {
                     Text(actionErrorMessage)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                         .foregroundStyle(.orange)
-                        .fixedSize(horizontal: false, vertical: true)
+                        .lineLimit(2)
+                        .help(actionErrorMessage)
+                        .accessibilityLabel(actionErrorMessage)
                 }
 
                 if isLoading {
@@ -227,7 +233,9 @@ struct GitContextBranchSwitchCapsule: View {
                         Text(optionErrorMessage)
                             .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                             .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .lineLimit(3)
+                            .help(optionErrorMessage)
+                            .accessibilityLabel(optionErrorMessage)
                         Button("Reload branches") {
                             startUITask { await reloadOptions() }
                         }
@@ -298,7 +306,12 @@ struct GitContextBranchSwitchCapsule: View {
                 .scrollIndicators(.automatic)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: branchListMinimumHeight,
+            maxHeight: .infinity,
+            alignment: .topLeading
+        )
     }
 
     private struct BranchSwitchBranchRow: View {

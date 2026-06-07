@@ -23,8 +23,38 @@ public struct GitRepositoryLayout: Sendable, Equatable {
     /// For worktrees: the main repo's `.git` directory
     public let commonDir: URL
 
-    /// Whether this is a gitfile-based worktree (`.git` is a file, not a directory).
+    /// Whether this checkout uses a gitfile (`.git` is a file, not a directory).
+    ///
+    /// A gitfile can represent either a linked worktree or a primary checkout created with
+    /// `git init --separate-git-dir`; use `isLinkedWorktree` when that distinction matters.
     public let isWorktree: Bool
+
+    /// Whether this checkout has a per-worktree git directory distinct from the shared common directory.
+    public var isLinkedWorktree: Bool {
+        gitDir.standardizedFileURL.path != commonDir.standardizedFileURL.path
+    }
+
+    /// The primary checkout root when it can be established without invoking Git.
+    ///
+    /// Primary checkouts, including `--separate-git-dir`, are authoritative for themselves.
+    /// Linked worktrees can only infer the main checkout from a conventional `<root>/.git`
+    /// common directory. External common directories require structured Git metadata.
+    public var knownMainWorktreeRoot: URL? {
+        if !isLinkedWorktree {
+            return workTreeRoot.standardizedFileURL
+        }
+        guard commonDir.lastPathComponent == ".git" else {
+            return nil
+        }
+        let candidate = commonDir.deletingLastPathComponent().standardizedFileURL
+        guard let candidateLayout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: candidate),
+              !candidateLayout.isLinkedWorktree,
+              candidateLayout.commonDir.standardizedFileURL.path == commonDir.standardizedFileURL.path
+        else {
+            return nil
+        }
+        return candidate
+    }
 }
 
 // MARK: - Git Repository Layout Resolver

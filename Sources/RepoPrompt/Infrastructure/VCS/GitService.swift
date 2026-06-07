@@ -121,7 +121,7 @@ actor GitService {
 
         if exitCode == 0 {
             let records = try GitWorktreePorcelainParser.parse(stdout, format: .nulTerminated)
-            return try makeWorktreeDescriptors(from: records, currentRepoURL: repoURL)
+            return try await makeWorktreeDescriptors(from: records, currentRepoURL: repoURL)
         }
 
         guard Self.shouldFallbackFromWorktreeListZError(stderr) else {
@@ -137,7 +137,7 @@ actor GitService {
         }
 
         let records = try GitWorktreePorcelainParser.parse(fallbackStdout, format: .newlineTerminated)
-        return try makeWorktreeDescriptors(from: records, currentRepoURL: repoURL)
+        return try await makeWorktreeDescriptors(from: records, currentRepoURL: repoURL)
     }
 
     /// Create a Git worktree using the existing Git subprocess plumbing.
@@ -2437,15 +2437,87 @@ actor GitService {
             || lowercased.contains("usage: git worktree")
     }
 
+    private func resolveMainWorktreeRoot(
+        for layout: GitRepositoryLayout,
+        at repoURL: URL
+    ) async -> URL? {
+        if let knownRoot = layout.knownMainWorktreeRoot {
+            return knownRoot
+        }
+
+        let queries: [(arguments: [String], directory: URL, requiresRepoContext: Bool)] = [
+            (["config", "--path", "--get", "core.worktree"], repoURL, true),
+            (["--git-dir", layout.commonDir.path, "config", "--worktree", "--path", "--get", "core.worktree"], layout.commonDir, false)
+        ]
+        for query in queries {
+            guard let result = try? await runGit(
+                query.arguments,
+                at: query.directory,
+                requiresRepoContext: query.requiresRepoContext
+            ), result.2 == 0
+            else {
+                continue
+            }
+            let rawPath = result.0.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !rawPath.isEmpty else { continue }
+
+            let candidate = if rawPath.hasPrefix("/") {
+                URL(fileURLWithPath: rawPath).standardizedFileURL
+            } else {
+                layout.commonDir.appendingPathComponent(rawPath).standardizedFileURL
+            }
+            guard let candidateLayout = getLayout(for: candidate),
+                  !candidateLayout.isLinkedWorktree,
+                  candidateLayout.commonDir.standardizedFileURL.path == layout.commonDir.standardizedFileURL.path
+            else {
+                continue
+            }
+            return candidate
+        }
+        return nil
+    }
+
+    private func normalizedWorktreeRecords(
+        _ records: [GitWorktreePorcelainRecord],
+        currentLayout: GitRepositoryLayout?,
+        resolvedMainRoot: URL?
+    ) -> [GitWorktreePorcelainRecord] {
+        guard let currentLayout else { return records }
+        let commonGitDirPath = currentLayout.commonDir.standardizedFileURL.path
+
+        return records.compactMap { record in
+            let recordPath = URL(fileURLWithPath: record.path).standardizedFileURL.path
+            guard recordPath == commonGitDirPath else {
+                return record
+            }
+            guard let resolvedMainRoot else {
+                return nil
+            }
+            var normalized = record
+            normalized.path = resolvedMainRoot.standardizedFileURL.path
+            return normalized
+        }
+    }
+
     private func makeWorktreeDescriptors(
         from records: [GitWorktreePorcelainRecord],
         currentRepoURL: URL
-    ) throws -> [GitWorktreeDescriptor] {
-        let worktreeRecords = records.filter { !$0.isBare }
+    ) async throws -> [GitWorktreeDescriptor] {
+        let currentLayout = getLayout(for: currentRepoURL)
+        let resolvedMainRoot: URL? = if let currentLayout {
+            await resolveMainWorktreeRoot(for: currentLayout, at: currentRepoURL)
+        } else {
+            nil
+        }
+        let worktreeRecords = normalizedWorktreeRecords(
+            records.filter { !$0.isBare },
+            currentLayout: currentLayout,
+            resolvedMainRoot: resolvedMainRoot
+        )
         guard !worktreeRecords.isEmpty else { return [] }
 
         let layoutsByPath: [String: GitRepositoryLayout] = Dictionary(
-            uniqueKeysWithValues: worktreeRecords.compactMap { record in
+            uniqueKeysWithValues: worktreeRecords.compactMap { record -> (String, GitRepositoryLayout)? in
                 let pathURL = URL(fileURLWithPath: record.path)
                 guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: pathURL) else {
                     return nil
@@ -2454,22 +2526,17 @@ actor GitService {
             }
         )
 
-        let currentLayout = getLayout(for: currentRepoURL)
         let commonGitDir = currentLayout?.commonDir
             ?? layoutsByPath.values.first?.commonDir
         guard let commonGitDir else {
             throw GitError(message: "git worktree list succeeded but repository layout could not be resolved")
         }
 
-        let mainPath = worktreeRecords.first { record in
+        let discoveredMainRoot = worktreeRecords.first { record in
             let path = URL(fileURLWithPath: record.path).standardizedFileURL.path
-            if let layout = layoutsByPath[path] {
-                return !layout.isWorktree && layout.gitDir.standardizedFileURL == layout.commonDir.standardizedFileURL
-            }
-            return false
-        }?.path
-
-        let mainURL = mainPath.map { URL(fileURLWithPath: $0).standardizedFileURL }
+            return layoutsByPath[path].map { !$0.isLinkedWorktree } ?? false
+        }.map { URL(fileURLWithPath: $0.path).standardizedFileURL }
+        let mainURL = resolvedMainRoot ?? discoveredMainRoot
         let repository = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: commonGitDir,
             mainWorktreeRoot: mainURL
@@ -2482,7 +2549,7 @@ actor GitService {
             let layout = layoutsByPath[path]
             let gitDir = layout?.gitDir.standardizedFileURL
             let isMain: Bool = if let layout {
-                !layout.isWorktree && layout.gitDir.standardizedFileURL == layout.commonDir.standardizedFileURL
+                !layout.isLinkedWorktree
             } else {
                 mainURL?.path == path && !record.isBare
             }
