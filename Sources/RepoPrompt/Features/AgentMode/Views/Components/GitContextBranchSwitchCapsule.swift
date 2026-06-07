@@ -213,10 +213,6 @@ struct GitContextBranchSwitchCapsule: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 8) {
-                if isLoading {
-                    ProgressView().controlSize(.small)
-                }
-
                 if let actionErrorMessage {
                     Text(actionErrorMessage)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
@@ -225,7 +221,7 @@ struct GitContextBranchSwitchCapsule: View {
                 }
 
                 if isLoading {
-                    EmptyView()
+                    ProgressView().controlSize(.small)
                 } else if let optionErrorMessage {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(optionErrorMessage)
