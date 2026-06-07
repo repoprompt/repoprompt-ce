@@ -47,11 +47,14 @@ struct AgentWebToolActionPresentation: Equatable {
 
 enum AgentWebToolPayloadKeys {
     static let wrapperKeys = ["input", "args", "arguments", "parameters", "params", "rawInput"]
+    static let resultWrapperKeys = ["result", "output", "response", "content"]
+    static let actionTypeKeys = ["type", "action_type", "actionType"]
     static let urlTargetKeys = ["url", "uri", "href", "link", "page_url", "pageUrl", "source_url", "sourceUrl"]
     static let refTargetKeys = ["ref", "ref_id", "refId", "page_ref", "pageRef"]
     static let findKeys = ["pattern", "needle", "find", "find_text", "findText", "text_to_find", "textToFind", "phrase"]
     static let operationKeys = ["op", "action", "operation"]
     static let queryKeys = ["query", "q", "search_query", "searchQuery", "search_text", "searchText"]
+    static let queryListKeys = ["queries", "search_queries", "searchQueries"]
     static let legacySearchQueryKeys = queryKeys + ["text", "value"]
     static let compactScalarKeys = urlTargetKeys + refTargetKeys + findKeys + operationKeys
     static let readResultMetadataKeys = [
@@ -61,6 +64,20 @@ enum AgentWebToolPayloadKeys {
 }
 
 enum AgentWebToolCanonicalNames {
+    static func canonicalWebActionType(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        switch raw {
+        case "search":
+            return "search"
+        case "open_page", "openPage":
+            return "open_page"
+        case "find_in_page", "findInPage":
+            return "find_in_page"
+        default:
+            return nil
+        }
+    }
+
     static func canonicalToolCardName(_ raw: String?) -> String? {
         guard let raw else { return nil }
         let names = normalizedNameCandidates(raw)
@@ -139,11 +156,11 @@ private enum AgentWebToolActionClassifier {
 
     private struct PayloadSignals {
         let source: PayloadSource
+        let authoritativeActionType: String?
         let target: Target?
         let findText: String?
         let hasFindOperation: Bool
         let hasReadOperation: Bool
-        let hasQuery: Bool
         let query: String?
     }
 
@@ -179,30 +196,26 @@ private enum AgentWebToolActionClassifier {
             input.resultObject.map { payloadSignals(from: $0, source: .result, isSupportedWebName: isSupportedWebName) }
         }
 
-        if let find = actionPresentation(
-            action: .findInPage,
-            signals: argsSignals,
-            isSearchName: isSearchName,
-            isReadName: isReadName
-        ) {
+        if let find = findInPagePresentation(signals: argsSignals) {
             return find
         }
 
         if let argsSignals,
-           argsSignals.hasQuery,
+           argsSignals.query != nil,
            isSearchName,
            !argsSignals.hasReadOperation,
            argsSignals.findText == nil,
            !argsSignals.hasFindOperation
         {
-            if let codexQueryPresentation = codexSearchQueryPresentation(query: argsSignals.query) {
+            if argsSignals.authoritativeActionType == nil,
+               let codexQueryPresentation = codexSearchQueryPresentation(query: argsSignals.query)
+            {
                 return codexQueryPresentation
             }
             return webSearch(query: argsSignals.query)
         }
 
-        if let read = actionPresentation(
-            action: .readWebPage,
+        if let read = readWebPagePresentation(
             signals: argsSignals,
             isSearchName: isSearchName,
             isReadName: isReadName
@@ -211,16 +224,10 @@ private enum AgentWebToolActionClassifier {
         }
 
         let fallbackResultSignals = resultSignals()
-        if let find = actionPresentation(
-            action: .findInPage,
-            signals: fallbackResultSignals,
-            isSearchName: isSearchName,
-            isReadName: isReadName
-        ) {
+        if let find = findInPagePresentation(signals: fallbackResultSignals) {
             return find
         }
-        if let read = actionPresentation(
-            action: .readWebPage,
+        if let read = readWebPagePresentation(
             signals: fallbackResultSignals,
             isSearchName: isSearchName,
             isReadName: isReadName
@@ -238,43 +245,42 @@ private enum AgentWebToolActionClassifier {
         return webSearch(query: argsSignals?.query ?? fallbackResultSignals?.query)
     }
 
-    private static func actionPresentation(
-        action: AgentWebToolActionPresentation.Action,
+    private static func findInPagePresentation(signals: PayloadSignals?) -> AgentWebToolActionPresentation? {
+        guard let signals,
+              signals.findText != nil || signals.hasFindOperation
+        else { return nil }
+        if signals.authoritativeActionType == "find_in_page" {
+            return findInPage(target: signals.target, findText: signals.findText)
+        }
+        guard let target = signals.target else { return nil }
+        return findInPage(target: target, findText: signals.findText)
+    }
+
+    private static func readWebPagePresentation(
         signals: PayloadSignals?,
         isSearchName: Bool,
         isReadName: Bool
     ) -> AgentWebToolActionPresentation? {
-        guard let signals else { return nil }
-        switch action {
-        case .findInPage:
-            guard let target = signals.target,
-                  signals.findText != nil || signals.hasFindOperation
-            else { return nil }
-            return findInPage(target: target, findText: signals.findText)
-        case .readWebPage:
-            guard let target = signals.target else { return nil }
-            if case .result = signals.source,
-               !isReadName,
-               !signals.hasReadOperation,
-               !signals.hasFindOperation
-            {
-                return nil
-            }
-            if isSearchName,
-               signals.hasQuery,
-               !signals.hasReadOperation,
-               !signals.hasFindOperation,
-               !isReadName
-            {
-                return nil
-            }
-            if isReadName || signals.hasReadOperation || signals.hasFindOperation || targetIsURL(target) {
-                return readWebPage(target: target)
-            }
-            return nil
-        case .webSearch:
+        guard let signals, let target = signals.target else { return nil }
+        if case .result = signals.source,
+           !isReadName,
+           !signals.hasReadOperation,
+           !signals.hasFindOperation
+        {
             return nil
         }
+        if isSearchName,
+           signals.query != nil,
+           !signals.hasReadOperation,
+           !signals.hasFindOperation,
+           !isReadName
+        {
+            return nil
+        }
+        if isReadName || signals.hasReadOperation || signals.hasFindOperation || targetIsURL(target) {
+            return readWebPage(target: target)
+        }
+        return nil
     }
 
     private static func payloadSignals(
@@ -283,11 +289,15 @@ private enum AgentWebToolActionClassifier {
         isSupportedWebName: Bool
     ) -> PayloadSignals {
         let objects = boundedPayloadObjects(from: object)
-        let operation = firstString(in: objects, keys: AgentWebToolPayloadKeys.operationKeys)?.lowercased()
-        let hasFindOperation = operation == "find"
-        let hasReadOperation = ["read", "open", "fetch", "get", "retrieve"].contains(operation ?? "")
+        let rawOperation = firstString(in: objects, keys: AgentWebToolPayloadKeys.operationKeys)
+        let authoritativeActionType = firstCanonicalWebActionType(in: objects)
+            ?? AgentWebToolCanonicalNames.canonicalWebActionType(rawOperation)
+        let operation = authoritativeActionType
+            ?? rawOperation?.lowercased()
+        let hasFindOperation = operation == "find" || operation == "find_in_page"
+        let hasReadOperation = ["read", "open", "open_page", "fetch", "get", "retrieve"].contains(operation ?? "")
         let findText = firstString(in: objects, keys: AgentWebToolPayloadKeys.findKeys)
-        let query = firstString(in: objects, keys: AgentWebToolPayloadKeys.legacySearchQueryKeys)
+        let query = firstSearchQuery(in: objects)
         let target = firstTarget(
             in: objects,
             isSupportedWebName: isSupportedWebName,
@@ -295,11 +305,11 @@ private enum AgentWebToolActionClassifier {
         )
         return PayloadSignals(
             source: source,
+            authoritativeActionType: authoritativeActionType,
             target: target,
             findText: findText,
             hasFindOperation: hasFindOperation,
             hasReadOperation: hasReadOperation,
-            hasQuery: query != nil,
             query: query
         )
     }
@@ -311,7 +321,25 @@ private enum AgentWebToolActionClassifier {
                 objects.append(nested)
             }
         }
+        let containers = objects
+        for payload in containers {
+            if let action = payload["action"] as? [String: Any] {
+                objects.append(action)
+            }
+        }
         return objects
+    }
+
+    private static func firstCanonicalWebActionType(in objects: [[String: Any]]) -> String? {
+        for object in objects {
+            for key in AgentWebToolPayloadKeys.actionTypeKeys {
+                guard let value = object[key], let raw = stringValue(value) else { continue }
+                if let canonical = AgentWebToolCanonicalNames.canonicalWebActionType(raw) {
+                    return canonical
+                }
+            }
+        }
+        return nil
     }
 
     private static func containsInvalidLocalTarget(in object: [String: Any]) -> Bool {
@@ -319,6 +347,24 @@ private enum AgentWebToolActionClassifier {
             guard let rawURL = firstString(in: [payload], keys: AgentWebToolPayloadKeys.urlTargetKeys) else { return false }
             return compactWebURLSubtitle(rawURL) == nil && isLocalOrInternalTarget(rawURL)
         }
+    }
+
+    private static func firstSearchQuery(in objects: [[String: Any]]) -> String? {
+        if let query = firstString(in: objects, keys: AgentWebToolPayloadKeys.legacySearchQueryKeys) {
+            return query
+        }
+        for object in objects {
+            for key in AgentWebToolPayloadKeys.queryListKeys {
+                guard let queries = object[key] as? [String] else { continue }
+                let compactQueries = queries.compactMap { query -> String? in
+                    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return trimmed.isEmpty ? nil : trimmed
+                }
+                guard let first = compactQueries.first else { continue }
+                return compactQueries.count > 1 ? "\(first) ..." : first
+            }
+        }
+        return nil
     }
 
     private static func firstTarget(
@@ -432,15 +478,15 @@ private enum AgentWebToolActionClassifier {
         )
     }
 
-    private static func findInPage(target: Target, findText: String?) -> AgentWebToolActionPresentation {
+    private static func findInPage(target: Target?, findText: String?) -> AgentWebToolActionPresentation {
         let compactFind = findText.map { compactText($0, maxLength: 48) }
-        let subtitle = [target.subtitle, compactFind.map { "\"\($0)\"" }]
+        let subtitle = [target?.subtitle, compactFind.map { "\"\($0)\"" }]
             .compactMap(\.self)
             .joined(separator: " • ")
         return AgentWebToolActionPresentation(
             action: .findInPage,
             title: "Find In Page",
-            subtitle: subtitle.isEmpty ? target.subtitle : subtitle,
+            subtitle: subtitle.isEmpty ? nil : subtitle,
             op: "find_in_page"
         )
     }

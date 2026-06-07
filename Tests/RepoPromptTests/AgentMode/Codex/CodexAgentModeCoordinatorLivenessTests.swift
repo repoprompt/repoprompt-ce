@@ -49,6 +49,44 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .running)
     }
 
+    func testUnmatchedCompletionOnlyWebResultPreservesArgsForPersistenceAndReplay() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let invocationID = UUID()
+        let argsJSON = #"{"action":"find_in_page","url":"https://example.com/docs","pattern":"install"}"#
+        let resultJSON = #"{"status":"completed","match_count":2}"#
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .toolResult(
+                name: "search",
+                invocationID: invocationID,
+                argsJSON: argsJSON,
+                resultJSON: resultJSON,
+                isError: false
+            ),
+            session: session
+        )
+
+        let item = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(item.kind, .toolResult)
+        XCTAssertEqual(item.toolInvocationID, invocationID)
+        XCTAssertEqual(item.toolArgsJSON, argsJSON)
+        let livePresentation = try XCTUnwrap(
+            NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "search")
+        )
+        XCTAssertEqual(livePresentation.title, "Find In Page")
+
+        let persisted = AgentChatItemPersist(from: item)
+        let restored = persisted.toItem()
+        XCTAssertEqual(restored.toolInvocationID, invocationID)
+        let restoredPresentation = try XCTUnwrap(
+            NativeToolCardPresentationBuilder.build(item: restored, normalizedToolName: "search")
+        )
+        XCTAssertEqual(restoredPresentation.title, "Find In Page")
+        XCTAssertEqual(restoredPresentation.detailText, "2 matches")
+    }
+
     func testStructuredRetryAndMissingMetadataFallbackRemainActiveWithoutRows() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)

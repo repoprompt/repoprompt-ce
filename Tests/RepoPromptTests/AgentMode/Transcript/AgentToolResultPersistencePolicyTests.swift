@@ -127,6 +127,35 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
     }
 
+    func testCompletionOnlyToolResultFactoryPreservesArgsForPersistenceClassification() throws {
+        let args = jsonString([
+            "action": "find_in_page",
+            "url": "https://example.com/docs",
+            "pattern": "install"
+        ])
+        let invocationID = UUID()
+        let raw = jsonString(["status": "completed", "match_count": 2])
+        let item = AgentChatItem.toolResult(
+            name: "search",
+            invocationID: invocationID,
+            argsJSON: args,
+            resultJSON: raw,
+            isError: false,
+            sequenceIndex: 42
+        )
+
+        XCTAssertEqual(item.toolInvocationID, invocationID)
+        XCTAssertEqual(item.toolArgsJSON, args)
+        XCTAssertEqual(item.toolResultJSON, raw)
+        XCTAssertEqual(item.toolIsError, false)
+        XCTAssertEqual(item.sequenceIndex, 42)
+        let persisted = AgentChatItemPersist(from: item)
+        let object = try decodedObject(XCTUnwrap(persisted.toolResultJSON))
+        let renderSummary = try XCTUnwrap(object["render_summary"] as? [String: Any])
+        XCTAssertEqual(renderSummary["title"] as? String, "Find In Page")
+        XCTAssertEqual(renderSummary["op"] as? String, "find_in_page")
+    }
+
     func testWebSearchPersistsBoundedSummaryOnlySuccessPresentation() throws {
         let bulkySnippet = String(repeating: "full page body ", count: 80)
         let raw = jsonString([

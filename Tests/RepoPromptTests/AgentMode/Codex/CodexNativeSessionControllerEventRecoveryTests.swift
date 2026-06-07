@@ -237,6 +237,167 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         XCTAssertNil(completedResult["content"])
     }
 
+    func testActualCodexWebSearchLifecycleShapesPreserveQueriesAndIgnoreRawDuplicate() throws {
+        let controller = makeController()
+        let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/started",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "ws_actual",
+                "query": "",
+                "action": ["type": "other"]
+            ])
+        ))
+        XCTAssertEqual(started.kind, "call")
+        XCTAssertEqual(started.name, "search")
+        XCTAssertNil(started.argsJSON)
+
+        let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "ws_actual",
+                "query": "first query ...",
+                "action": [
+                    "type": "search",
+                    "query": NSNull(),
+                    "queries": ["first query", "second query"]
+                ]
+            ])
+        ))
+        XCTAssertEqual(completed.kind, "result")
+        XCTAssertEqual(completed.name, "search")
+        XCTAssertEqual(completed.invocationID, started.invocationID)
+        XCTAssertNil(completed.isError)
+        let args = try XCTUnwrap(jsonObject(from: completed.argsJSON))
+        let result = try XCTUnwrap(jsonObject(from: completed.resultJSON))
+        XCTAssertEqual(args["action"] as? String, "search")
+        XCTAssertEqual(args["query"] as? String, "first query ...")
+        XCTAssertEqual(args["queries"] as? [String], ["first query", "second query"])
+        XCTAssertEqual(result["action"] as? String, "search")
+        XCTAssertEqual(result["query"] as? String, "first query ...")
+        XCTAssertEqual(result["queries"] as? [String], ["first query", "second query"])
+
+        XCTAssertFalse(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("rawResponseItem/completed"))
+        XCTAssertNil(controller.test_parseToolLifecycleEvent(
+            method: "rawResponseItem/completed",
+            params: toolParams(item: [
+                "type": "web_search_call",
+                "status": "completed",
+                "action": [
+                    "type": "search",
+                    "queries": ["first query", "second query"]
+                ]
+            ])
+        ))
+
+        let recovered = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "ws_recovered_begin",
+                "query": "",
+                "action": NSNull()
+            ])
+        ))
+        XCTAssertEqual(recovered.name, "search")
+        XCTAssertNil(recovered.argsJSON)
+    }
+
+    func testNativeWebSearchNestedTaggedActionsPreserveCompactFieldsAcrossLifecycle() throws {
+        let rows: [(label: String, action: [String: Any], expectedAction: String, expectedFields: [String: String])] = [
+            (
+                "search",
+                ["type": "search", "query": "nested Codex query"],
+                "search",
+                ["query": "nested Codex query"]
+            ),
+            (
+                "camel open page",
+                ["type": "openPage", "url": "https://docs.example.com/open", "refId": "turn0search0"],
+                "open_page",
+                ["url": "https://docs.example.com/open", "refId": "turn0search0"]
+            ),
+            (
+                "actual targetless find in page",
+                ["type": "findInPage", "url": NSNull(), "pattern": "installation"],
+                "find_in_page",
+                ["pattern": "installation"]
+            )
+        ]
+
+        for (index, row) in rows.enumerated() {
+            let controller = makeController()
+            let itemID = "call_nested_web_\(index)"
+            let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/started",
+                params: toolParams(item: [
+                    "type": "webSearch",
+                    "id": itemID,
+                    "action": row.action
+                ])
+            ), row.label)
+            XCTAssertEqual(started.kind, "call", row.label)
+            XCTAssertEqual(started.name, "search", row.label)
+            let startedArgs = try XCTUnwrap(jsonObject(from: started.argsJSON), row.label)
+            XCTAssertEqual(startedArgs["action"] as? String, row.expectedAction, row.label)
+            for (key, value) in row.expectedFields {
+                XCTAssertEqual(startedArgs[key] as? String, value, "\(row.label) started \(key)")
+            }
+
+            let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/completed",
+                params: toolParams(item: [
+                    "type": "webSearch",
+                    "id": itemID,
+                    "status": "completed",
+                    "action": row.action
+                ])
+            ), row.label)
+            XCTAssertEqual(completed.kind, "result", row.label)
+            XCTAssertEqual(completed.name, "search", row.label)
+            XCTAssertEqual(completed.invocationID, started.invocationID, row.label)
+            let completedArgs = try XCTUnwrap(jsonObject(from: completed.argsJSON), row.label)
+            let completedResult = try XCTUnwrap(jsonObject(from: completed.resultJSON), row.label)
+            XCTAssertEqual(completedArgs["action"] as? String, row.expectedAction, row.label)
+            XCTAssertEqual(completedResult["action"] as? String, row.expectedAction, row.label)
+            for (key, value) in row.expectedFields {
+                XCTAssertEqual(completedArgs[key] as? String, value, "\(row.label) completed args \(key)")
+                XCTAssertEqual(completedResult[key] as? String, value, "\(row.label) completed result \(key)")
+            }
+        }
+
+        let bodyMarker = "wrapped nested web body"
+        let wrappedController = makeController()
+        let wrapped = try XCTUnwrap(wrappedController.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "call_nested_wrapped_find",
+                "status": "failed",
+                "action": [
+                    "type": "findInPage",
+                    "url": "https://docs.example.com/wrapped-find",
+                    "pattern": "installation"
+                ],
+                "response": [
+                    "title": "Wrapped find page",
+                    "matches": [["text": String(repeating: bodyMarker, count: 100)]],
+                    "error": ["message": "wrapped find failed"],
+                    "content": String(repeating: bodyMarker, count: 100)
+                ]
+            ])
+        ))
+        let wrappedResult = try XCTUnwrap(jsonObject(from: wrapped.resultJSON))
+        XCTAssertEqual(wrappedResult["action"] as? String, "find_in_page")
+        XCTAssertEqual(wrappedResult["url"] as? String, "https://docs.example.com/wrapped-find")
+        XCTAssertEqual(wrappedResult["pattern"] as? String, "installation")
+        XCTAssertEqual(wrappedResult["title"] as? String, "Wrapped find page")
+        XCTAssertEqual(wrappedResult["match_count"] as? Int, 1)
+        XCTAssertEqual((wrappedResult["error"] as? [String: Any])?["message"] as? String, "wrapped find failed")
+        XCTAssertFalse(wrapped.resultJSON?.contains(bodyMarker) == true)
+    }
+
     func testNativeWebReadAndFindEventsUseCanonicalWebReadNameAndCompactResults() throws {
         let controller = makeController()
         let started = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
@@ -279,7 +440,159 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
         XCTAssertFalse(completed.resultJSON?.contains("full page body") == true)
     }
 
+    func testNativeWebReadWrapperResultsUnwrapCompactMetadataAndErrors() throws {
+        for wrapperKey in ["result", "output", "response", "content"] {
+            let bodyMarker = "full wrapped page body"
+            let controller = makeController()
+            let completed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/completed",
+                params: toolParams(item: [
+                    "type": "toolCall",
+                    "id": "call_web_read_\(wrapperKey)",
+                    "name": "web_fetch",
+                    "url": "https://docs.example.com/wrapped",
+                    wrapperKey: [
+                        "status": "completed",
+                        "title": "Wrapped docs",
+                        "description": String(repeating: "compact metadata ", count: 80),
+                        "error": [
+                            "message": "bounded warning",
+                            "code": 42,
+                            "details": String(repeating: "unbounded detail ", count: 100)
+                        ],
+                        "content": String(repeating: bodyMarker, count: 100)
+                    ]
+                ])
+            ), wrapperKey)
+
+            XCTAssertEqual(completed.name, "web_read", wrapperKey)
+            let result = try XCTUnwrap(jsonObject(from: completed.resultJSON), wrapperKey)
+            XCTAssertEqual(result["url"] as? String, "https://docs.example.com/wrapped", wrapperKey)
+            XCTAssertEqual(result["status"] as? String, "completed", wrapperKey)
+            XCTAssertEqual(result["title"] as? String, "Wrapped docs", wrapperKey)
+            XCTAssertLessThanOrEqual((result["description"] as? String)?.count ?? 0, 500, wrapperKey)
+            let error = try XCTUnwrap(result["error"] as? [String: Any], wrapperKey)
+            XCTAssertEqual(error["message"] as? String, "bounded warning", wrapperKey)
+            XCTAssertEqual(error["code"] as? Int, 42, wrapperKey)
+            XCTAssertNil(error["details"], wrapperKey)
+            XCTAssertNil(result[wrapperKey], wrapperKey)
+            XCTAssertFalse(completed.resultJSON?.contains(bodyMarker) == true, wrapperKey)
+
+            let bodyOnly = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/completed",
+                params: toolParams(item: [
+                    "type": "toolCall",
+                    "id": "call_web_read_body_only_\(wrapperKey)",
+                    "name": "web_fetch",
+                    wrapperKey: ["content": String(repeating: bodyMarker, count: 100)]
+                ])
+            ), "\(wrapperKey) body only")
+            XCTAssertEqual(try XCTUnwrap(jsonObject(from: bodyOnly.resultJSON)).count, 0, wrapperKey)
+            XCTAssertFalse(bodyOnly.resultJSON?.contains(bodyMarker) == true, wrapperKey)
+
+            let successfulScalar = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/completed",
+                params: toolParams(item: [
+                    "type": "toolCall",
+                    "id": "call_web_read_scalar_success_\(wrapperKey)",
+                    "name": "web_fetch",
+                    "status": "completed",
+                    wrapperKey: String(repeating: bodyMarker, count: 100)
+                ])
+            ), "\(wrapperKey) successful scalar")
+            let scalarResult = try XCTUnwrap(jsonObject(from: successfulScalar.resultJSON), wrapperKey)
+            XCTAssertEqual(scalarResult.count, 1, wrapperKey)
+            XCTAssertEqual(scalarResult["status"] as? String, "completed", wrapperKey)
+            XCTAssertFalse(successfulScalar.resultJSON?.contains(bodyMarker) == true, wrapperKey)
+        }
+
+        for wrapperKey in ["result", "output", "response"] {
+            let controller = makeController()
+            let failed = try XCTUnwrap(controller.test_parseToolLifecycleEvent(
+                method: "item/completed",
+                params: toolParams(item: [
+                    "type": "toolCall",
+                    "id": "call_web_read_scalar_failure_\(wrapperKey)",
+                    "name": "web_fetch",
+                    "status": "failed",
+                    wrapperKey: "request timed out"
+                ])
+            ), "\(wrapperKey) failed scalar")
+            let failedResult = try XCTUnwrap(jsonObject(from: failed.resultJSON), wrapperKey)
+            XCTAssertEqual(failedResult["status"] as? String, "failed", wrapperKey)
+            XCTAssertEqual(failedResult["errorMessage"] as? String, "request timed out", wrapperKey)
+        }
+
+        let nestedFailureController = makeController()
+        let nestedFailure = try XCTUnwrap(nestedFailureController.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_web_read_nested_failure",
+                "name": "web_fetch",
+                "result": [
+                    "status": "failed",
+                    "message": "request blocked"
+                ]
+            ])
+        ))
+        let nestedFailureResult = try XCTUnwrap(jsonObject(from: nestedFailure.resultJSON))
+        XCTAssertEqual(nestedFailureResult["status"] as? String, "failed")
+        XCTAssertEqual(nestedFailureResult["errorMessage"] as? String, "request blocked")
+
+        let legacyMessageController = makeController()
+        let legacyMessage = try XCTUnwrap(legacyMessageController.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "toolCall",
+                "id": "call_web_read_legacy_message",
+                "name": "web_fetch",
+                "isError": true,
+                "message": "legacy request failed"
+            ])
+        ))
+        let legacyMessageResult = try XCTUnwrap(jsonObject(from: legacyMessage.resultJSON))
+        XCTAssertEqual(legacyMessageResult["errorMessage"] as? String, "legacy request failed")
+    }
+
     func testNativeWebSearchCompletionPayloadsPreserveCompactSearchFields() throws {
+        let longQuery = String(repeating: "query", count: 140)
+        let boundedController = makeController()
+        let bounded = try XCTUnwrap(boundedController.test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "call_search_bounded_query",
+                "query": longQuery,
+                "action": ["type": "search", "query": longQuery]
+            ])
+        ))
+        let boundedArgs = try XCTUnwrap(jsonObject(from: bounded.argsJSON))
+        let boundedResult = try XCTUnwrap(jsonObject(from: bounded.resultJSON))
+        XCTAssertEqual((boundedArgs["query"] as? String)?.count, 500)
+        XCTAssertEqual((boundedResult["query"] as? String)?.count, 500)
+        XCTAssertTrue((boundedResult["query"] as? String)?.hasSuffix("…") == true)
+
+        let rawQueries = (0 ..< 12).map { index in
+            index == 0 ? longQuery : "query \(index)"
+        }
+        let boundedList = try XCTUnwrap(makeController().test_parseToolLifecycleEvent(
+            method: "item/completed",
+            params: toolParams(item: [
+                "type": "webSearch",
+                "id": "call_search_bounded_queries",
+                "action": ["type": "search", "queries": rawQueries]
+            ])
+        ))
+        let boundedListArgs = try XCTUnwrap(jsonObject(from: boundedList.argsJSON))
+        let boundedListResult = try XCTUnwrap(jsonObject(from: boundedList.resultJSON))
+        let argsQueries = try XCTUnwrap(boundedListArgs["queries"] as? [String])
+        let resultQueries = try XCTUnwrap(boundedListResult["queries"] as? [String])
+        XCTAssertEqual(argsQueries.count, 10)
+        XCTAssertEqual(resultQueries, argsQueries)
+        XCTAssertEqual(argsQueries.first?.count, 500)
+        XCTAssertTrue(argsQueries.first?.hasSuffix("…") == true)
+
         let rows: [(label: String, alias: String, item: [String: Any], expectedResults: Int?, expectedSources: Int?, expectedDetailKey: String)] = [
             (
                 "root results",

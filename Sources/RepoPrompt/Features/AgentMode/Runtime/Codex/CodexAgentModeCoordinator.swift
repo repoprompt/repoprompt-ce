@@ -3586,14 +3586,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             updated.text = resultJSON
             session.replaceItem(at: index, with: updated)
         } else {
-            var toolResultItem = AgentChatItem.toolResult(
+            let toolResultItem = AgentChatItem.toolResult(
                 name: toolName,
                 invocationID: invocationID,
+                argsJSON: argsJSON,
                 resultJSON: resultJSON,
                 isError: isError,
                 sequenceIndex: session.nextSequenceIndex
             )
-            toolResultItem.toolArgsJSON = argsJSON
             session.appendItem(toolResultItem)
         }
         reconcileCodexCommandExecutionRunningUpdate(
@@ -4431,6 +4431,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 let toolResultItem = AgentChatItem.toolResult(
                     name: toolName,
                     invocationID: invocationID,
+                    argsJSON: argsJSON,
                     resultJSON: resultJSON,
                     isError: isError,
                     sequenceIndex: session.nextSequenceIndex
@@ -5087,14 +5088,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         } else {
             let runningJSON = Self.initialRunningCommandExecutionJSON(argsJSON: argsJSON)
-            var runningItem = AgentChatItem.toolResult(
+            let runningItem = AgentChatItem.toolResult(
                 name: toolName,
                 invocationID: invocationID,
+                argsJSON: argsJSON,
                 resultJSON: runningJSON,
                 isError: false,
                 sequenceIndex: session.nextSequenceIndex
             )
-            runningItem.toolArgsJSON = argsJSON
             session.appendItem(runningItem)
             itemIndex = session.items.count - 1
         }

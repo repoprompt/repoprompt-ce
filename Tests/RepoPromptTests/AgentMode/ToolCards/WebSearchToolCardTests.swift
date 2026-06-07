@@ -50,6 +50,52 @@ final class WebSearchToolCardTests: XCTestCase {
         XCTAssertEqual(webPresentation(toolName: "search", result: ["results": [["url": "https://example.com/result"]]])?.title, "Web Search")
     }
 
+    func testNestedTaggedWebActionsClassifySearchOpenAndFind() throws {
+        let search = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["action": ["type": "search", "query": "nested query"]]
+        ))
+        XCTAssertEqual(search.title, "Web Search")
+        XCTAssertEqual(search.subtitle, "\"nested query\"")
+
+        let multiSearch = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["action": ["type": "search", "queries": ["first query", "second query"]]]
+        ))
+        XCTAssertEqual(multiSearch.title, "Web Search")
+        XCTAssertEqual(multiSearch.subtitle, "\"first query ...\"")
+
+        let open = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["action": ["type": "openPage", "url": "https://example.com/docs"]]
+        ))
+        XCTAssertEqual(open.title, "Read Web Page")
+        XCTAssertEqual(open.subtitle, "example.com/docs")
+
+        let find = try XCTUnwrap(webPresentation(
+            toolName: "search",
+            args: ["action": ["type": "findInPage", "url": NSNull(), "pattern": "install"]]
+        ))
+        XCTAssertEqual(find.title, "Find In Page")
+        XCTAssertEqual(find.subtitle, "\"install\"")
+        XCTAssertEqual(
+            webPresentation(toolName: "search", args: ["action": "find_in_page", "pattern": "install"])?.title,
+            "Find In Page"
+        )
+
+        for query in [
+            "https://example.com/docs",
+            "'installation' in https://example.com/docs"
+        ] {
+            let authoritativeSearch = try XCTUnwrap(webPresentation(
+                toolName: "search",
+                args: ["query": query, "action": ["type": "search", "query": query]]
+            ), query)
+            XCTAssertEqual(authoritativeSearch.title, "Web Search", query)
+            XCTAssertEqual(authoritativeSearch.op, "search", query)
+        }
+    }
+
     func testCodexSearchQueryGrammarRecognizesReadAndFindInPage() throws {
         let read = try XCTUnwrap(webPresentation(
             toolName: "search",
@@ -189,6 +235,47 @@ final class WebSearchToolCardTests: XCTestCase {
         let stored = try XCTUnwrap(NativeToolCardPresentationBuilder.build(item: storedItem, normalizedToolName: "search"))
         XCTAssertEqual(stored.title, "Find In Page")
         XCTAssertEqual(stored.subtitle, find.subtitle)
+    }
+
+    func testLegacyWebReadSummaryAliasesRestoreByCanonicalEquivalenceWithoutSpoofing() throws {
+        for alias in ["webfetch", "web_fetch"] {
+            let renderSummary = AgentToolCardRenderSummary(
+                toolName: alias,
+                title: "Read Web Page",
+                subtitle: "example.com/docs",
+                detailText: "Legacy docs",
+                status: .success,
+                op: "read_web_page"
+            )
+            let summaryOnly = jsonString([
+                "status": "success",
+                "summary_only": true,
+                "render_summary": renderSummary.dictionary
+            ])
+            let legacyItem = AgentChatItem(
+                kind: .toolResult,
+                text: summaryOnly,
+                toolName: alias,
+                toolResultJSON: summaryOnly,
+                toolIsError: false
+            )
+            let restored = try XCTUnwrap(
+                NativeToolCardPresentationBuilder.build(item: legacyItem, normalizedToolName: "web_read"),
+                alias
+            )
+            XCTAssertEqual(restored.title, "Read Web Page", alias)
+            XCTAssertEqual(restored.subtitle, "example.com/docs", alias)
+
+            XCTAssertNil(NativeToolCardPresentationBuilder.build(
+                item: AgentChatItem(
+                    kind: .toolResult,
+                    text: summaryOnly,
+                    toolName: "weather_lookup",
+                    toolResultJSON: summaryOnly
+                ),
+                normalizedToolName: "weather_lookup"
+            ), alias)
+        }
     }
 
     func testWebSearchPresentationCoversLiveAndSummaryOnlyPayloads() throws {

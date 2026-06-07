@@ -4295,8 +4295,13 @@ final class CodexNativeSessionController {
     }
 
     private static func isItemLifecycleCompletedMethod(_ lowerMethod: String) -> Bool {
+        guard !isRawResponseItemCompletedMethod(lowerMethod) else { return false }
         guard lowerMethod.contains("item/") || lowerMethod.contains("item_") else { return false }
         return lowerMethod.hasSuffix("/completed") || lowerMethod.hasSuffix("_completed")
+    }
+
+    private static func isRawResponseItemCompletedMethod(_ lowerMethod: String) -> Bool {
+        lowerMethod == "rawresponseitem/completed"
     }
 
     private static let minimalCompletedCommandExecutionResultJSON = #"{"type":"commandExecution","status":"completed"}"#
@@ -6375,12 +6380,12 @@ final class CodexNativeSessionController {
             }
         }
         if toolName == "search", var payload = compactWebActionScalars(from: candidate) {
-            if payload["query"] == nil, let query = searchQueryValue(from: candidate), !query.isEmpty {
+            if payload["query"] == nil, let query = searchQueryValue(from: candidate) {
                 payload["query"] = query
             }
             return jsonString(from: payload)
         }
-        if toolName == "search", let query = searchQueryValue(from: candidate), !query.isEmpty {
+        if toolName == "search", let query = searchQueryValue(from: candidate) {
             return jsonString(from: ["query": query])
         }
         if toolName == "web_read", let payload = compactWebActionScalars(from: candidate) {
@@ -6411,7 +6416,7 @@ final class CodexNativeSessionController {
         if toolName == "web_read", let readJSON = webReadToolResultJSON(from: candidate) {
             return readJSON
         }
-        for key in ["result", "output", "response", "content"] {
+        for key in AgentWebToolPayloadKeys.resultWrapperKeys {
             if let value = candidate[key], let json = jsonString(from: value), !json.isEmpty {
                 return json
             }
@@ -6428,19 +6433,20 @@ final class CodexNativeSessionController {
     private func webReadToolResultJSON(from candidate: [String: Any]) -> String? {
         var object: [String: Any] = [:]
         copyWebActionScalars(from: candidate, into: &object)
-        copyWebReadResultFields(from: candidate, into: &object)
-        return object.isEmpty ? nil : jsonString(from: object)
+        copyWebReadResultFieldsIncludingWrappers(from: candidate, into: &object)
+        let hasResultWrapper = AgentWebToolPayloadKeys.resultWrapperKeys.contains { candidate[$0] != nil }
+        return object.isEmpty && !hasResultWrapper ? nil : jsonString(from: object)
     }
 
     private func webSearchToolResultJSON(from candidate: [String: Any]) -> String? {
         var object: [String: Any] = [:]
         copySearchMetadata(from: candidate, into: &object)
         if isSearchWebReadOrFindPayload(object) {
-            copyWebReadResultFields(from: candidate, into: &object)
+            copyWebReadResultFieldsIncludingWrappers(from: candidate, into: &object)
             return jsonString(from: object)
         }
 
-        for key in ["result", "output", "response", "content"] {
+        for key in AgentWebToolPayloadKeys.resultWrapperKeys {
             guard let value = candidate[key] else { continue }
             if let array = value as? [Any] {
                 if !array.isEmpty { object[searchArrayKey(forWrapper: key)] = array }
@@ -6474,14 +6480,20 @@ final class CodexNativeSessionController {
 
     private func copySearchMetadata(from candidate: [String: Any], into object: inout [String: Any]) {
         copyWebActionScalars(from: candidate, into: &object)
-        for key in ["status", "query", "q", "searchQuery", "search_query", "isError", "is_error"] {
+        for key in ["status", "isError", "is_error"] {
             if object[key] == nil, let value = candidate[key] {
                 object[key] = value
             }
         }
+        for key in AgentWebToolPayloadKeys.queryKeys {
+            guard object[key] == nil,
+                  let value = candidate[key] as? String,
+                  let query = compactWebQueryText(value)
+            else { continue }
+            object[key] = query
+        }
         if object["query"] == nil,
-           let query = searchQueryValue(from: candidate),
-           !query.isEmpty
+           let query = searchQueryValue(from: candidate)
         {
             object["query"] = query
         }
@@ -6492,14 +6504,23 @@ final class CodexNativeSessionController {
 
     private func copyWebReadResultFields(from candidate: [String: Any], into object: inout [String: Any]) {
         for key in AgentWebToolPayloadKeys.readResultMetadataKeys {
-            guard object[key] == nil, let value = candidate[key] else { continue }
-            object[key] = value
+            guard object[key] == nil,
+                  let value = candidate[key],
+                  let compactValue = compactWebReadResultValue(value)
+            else { continue }
+            object[key] = compactValue
         }
-        if object["error"] == nil, let error = candidate["error"] {
-            object["error"] = error
+        if object["error"] == nil,
+           let error = candidate["error"],
+           let compactError = compactWebReadErrorValue(error)
+        {
+            object["error"] = compactError
         }
-        if object["errorMessage"] == nil, let errorMessage = candidate["errorMessage"] ?? candidate["error_message"] {
-            object["errorMessage"] = errorMessage
+        if object["errorMessage"] == nil,
+           let errorMessage = candidate["errorMessage"] ?? candidate["error_message"],
+           let compactErrorMessage = compactWebReadResultValue(errorMessage)
+        {
+            object["errorMessage"] = compactErrorMessage
         }
         if object["match_count"] == nil, object["matchCount"] == nil,
            let matches = candidate["matches"] as? [Any], !matches.isEmpty
@@ -6508,9 +6529,63 @@ final class CodexNativeSessionController {
         }
     }
 
+    private func copyWebReadResultFieldsIncludingWrappers(
+        from candidate: [String: Any],
+        into object: inout [String: Any]
+    ) {
+        copyWebReadResultFields(from: candidate, into: &object)
+        for key in AgentWebToolPayloadKeys.resultWrapperKeys {
+            guard let wrapped = candidate[key] as? [String: Any] else { continue }
+            copyWebActionScalars(from: wrapped, into: &object)
+            copyWebReadResultFields(from: wrapped, into: &object)
+            copyWebReadFailureMessage(from: wrapped, into: &object)
+        }
+        copyWebReadFailureMessage(from: candidate, into: &object)
+    }
+
+    private func copyWebReadFailureMessage(from candidate: [String: Any], into object: inout [String: Any]) {
+        guard webReadResultIndicatesFailure(candidate), object["errorMessage"] == nil else { return }
+        for key in ["errorMessage", "error_message", "result", "output", "response", "message", "text"] {
+            guard let value = candidate[key],
+                  !(value is [String: Any]),
+                  let compactErrorMessage = compactWebReadResultValue(value)
+            else { continue }
+            object["errorMessage"] = compactErrorMessage
+            return
+        }
+    }
+
+    private func webReadResultIndicatesFailure(_ candidate: [String: Any]) -> Bool {
+        if boolValue(from: candidate, keys: ["isError", "is_error"]) == true { return true }
+        if let status = stringValue(from: candidate, keys: ["status"])?.lowercased(),
+           ["error", "failed", "failure"].contains(status)
+        {
+            return true
+        }
+        return hasNonEmptyErrorSignal(in: candidate)
+    }
+
+    private func compactWebReadResultValue(_ value: Any) -> Any? {
+        if let text = value as? String { return compactWebText(text) }
+        if value is NSNumber { return value }
+        return nil
+    }
+
+    private func compactWebReadErrorValue(_ value: Any) -> Any? {
+        if let compact = compactWebReadResultValue(value) { return compact }
+        guard let error = value as? [String: Any] else { return nil }
+        var compactError: [String: Any] = [:]
+        for key in ["message", "type", "code", "param", "status"] {
+            guard let value = error[key], let compact = compactWebReadResultValue(value) else { continue }
+            compactError[key] = compact
+        }
+        return compactError.isEmpty ? nil : compactError
+    }
+
     private func isSearchWebReadOrFindPayload(_ object: [String: Any]) -> Bool {
-        let action = stringValue(from: object, keys: AgentWebToolPayloadKeys.operationKeys)?.lowercased()
-        if ["open", "read", "fetch", "find"].contains(action ?? "") { return true }
+        let rawAction = stringValue(from: object, keys: AgentWebToolPayloadKeys.operationKeys)
+        let action = AgentWebToolCanonicalNames.canonicalWebActionType(rawAction) ?? rawAction?.lowercased()
+        if ["open", "open_page", "read", "fetch", "find", "find_in_page"].contains(action ?? "") { return true }
         let hasTarget = stringValue(from: object, keys: AgentWebToolPayloadKeys.urlTargetKeys + AgentWebToolPayloadKeys.refTargetKeys) != nil
         let hasFind = stringValue(from: object, keys: AgentWebToolPayloadKeys.findKeys) != nil
         return hasTarget && hasFind
@@ -6527,6 +6602,43 @@ final class CodexNativeSessionController {
             guard object[key] == nil, let value = candidate[key], isCompactWebActionScalar(value) else { continue }
             object[key] = value
         }
+
+        var containers = [candidate]
+        for key in AgentWebToolPayloadKeys.wrapperKeys {
+            if let nested = candidate[key] as? [String: Any] {
+                containers.append(nested)
+            }
+        }
+        for container in containers {
+            guard let action = container["action"] as? [String: Any],
+                  let actionType = stringValue(from: action, keys: AgentWebToolPayloadKeys.actionTypeKeys),
+                  let canonicalActionType = AgentWebToolCanonicalNames.canonicalWebActionType(actionType)
+            else { continue }
+            if object["action"] == nil {
+                object["action"] = canonicalActionType
+            }
+            for key in AgentWebToolPayloadKeys.compactScalarKeys {
+                guard key != "action",
+                      object[key] == nil,
+                      let value = action[key],
+                      isCompactWebActionScalar(value)
+                else { continue }
+                object[key] = value
+            }
+            copyCompactWebSearchQueries(from: action, into: &object)
+        }
+    }
+
+    private func copyCompactWebSearchQueries(from candidate: [String: Any], into object: inout [String: Any]) {
+        guard object["queries"] == nil else { return }
+        for key in AgentWebToolPayloadKeys.queryListKeys {
+            guard let queries = candidate[key] as? [String] else { continue }
+            let compactQueries = queries.prefix(10).compactMap(compactWebText)
+            if !compactQueries.isEmpty {
+                object["queries"] = compactQueries
+                return
+            }
+        }
     }
 
     private func isCompactWebActionScalar(_ value: Any) -> Bool {
@@ -6539,17 +6651,33 @@ final class CodexNativeSessionController {
 
     private func searchQueryValue(from candidate: [String: Any]) -> String? {
         if let query = stringValue(from: candidate, keys: AgentWebToolPayloadKeys.queryKeys),
-           !query.isEmpty
+           let compactQuery = compactWebQueryText(query)
         {
-            return query
+            return compactQuery
+        }
+        for key in AgentWebToolPayloadKeys.queryListKeys {
+            guard let queries = candidate[key] as? [String] else { continue }
+            let compactQueries = queries.compactMap(compactWebQueryText)
+            guard let first = compactQueries.first else { continue }
+            return compactWebQueryText(compactQueries.count > 1 ? "\(first) ..." : first)
         }
         for key in ["action", "search", "request", "parameters", "params"] {
             guard let nested = candidate[key] as? [String: Any] else { continue }
-            if let query = searchQueryValue(from: nested), !query.isEmpty {
+            if let query = searchQueryValue(from: nested) {
                 return query
             }
         }
         return nil
+    }
+
+    private func compactWebQueryText(_ raw: String) -> String? {
+        compactWebText(raw)
+    }
+
+    private func compactWebText(_ raw: String) -> String? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count <= 500 ? trimmed : String(trimmed.prefix(499)) + "…"
     }
 
     private func copySearchPayloadFields(from candidate: [String: Any], into object: inout [String: Any]) {

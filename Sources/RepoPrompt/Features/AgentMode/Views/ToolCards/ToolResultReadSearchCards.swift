@@ -218,9 +218,17 @@ enum NativeToolCardPresentationBuilder {
         _ renderSummary: AgentToolCardRenderSummary,
         normalizedToolName: String?
     ) -> Bool {
-        guard let normalizedToolName, renderSummary.toolName == normalizedToolName else { return false }
-        if normalizedToolName == "search" { return true }
-        return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(normalizedToolName)
+        guard let normalizedToolName else { return false }
+        let storedName = summaryToolNameKey(renderSummary.toolName)
+        let currentName = summaryToolNameKey(normalizedToolName)
+        guard storedName == currentName else { return false }
+        if currentName == "search" { return true }
+        return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(currentName)
+    }
+
+    private static func summaryToolNameKey(_ raw: String) -> String {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return AgentWebToolCanonicalNames.canonicalToolCardName(normalized) ?? normalized
     }
 
     private static func statusWord(for item: AgentChatItem) -> String {
