@@ -100,8 +100,16 @@ final class CodeBlockTextView: NSTextView {
 
     private static let plainTextLayoutHeightAllowance: CGFloat = 2
     private static let textTableLayoutHeightAllowance: CGFloat = 4
+    private static let textTableLayoutInset: CGFloat = 1
+    private static let geometryComparisonTolerance: CGFloat = 0.5
 
-    /// The (contentVersion, width) pair that produced `lastMeasuredSize`.
+    private struct TextLayoutGeometry {
+        let textContainerInset: NSSize
+        let effectiveContainerWidth: CGFloat
+        let heightAllowance: CGFloat
+    }
+
+    /// The (contentVersion, outer width) pair that produced `lastMeasuredSize`.
     private var cachedMeasurementKey: (version: UInt64, width: CGFloat) = (0, 0)
 
     func scrollWheelForwardingTarget() -> NSScrollView? {
@@ -169,53 +177,98 @@ final class CodeBlockTextView: NSTextView {
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         guard newSize.width > 1 else { return }
-        if let container = textContainer,
-           abs(container.containerSize.width - newSize.width) > 0.5
-        {
-            container.containerSize = NSSize(
-                width: newSize.width,
-                height: .greatestFiniteMagnitude
-            )
-            // Keep the fallback width aligned with the actual frame, but invalidate
+        if synchronizeTextLayoutGeometry(outerWidth: newSize.width).didChange {
+            // Keep the fallback width aligned with the actual outer frame, but invalidate
             // the measured-height cache. During rapid shrinks SwiftUI can assign a
             // narrower frame after measuring at a wider proposal; preserving that
             // old cached height lets the table render taller than its allocation
             // until a later 1px resize forces another measurement.
-            lastMeasuredSize = CGSize(
-                width: newSize.width,
-                height: lastMeasuredSize.height
-            )
-            cachedMeasurementKey = (version: contentVersion &+ 1, width: -1)
-            needsDisplay = true
+            invalidateMeasurementCacheForGeometryChange(outerWidth: newSize.width)
         }
     }
 
     func measuredHeight(constrainedTo width: CGFloat) -> CGFloat {
-        let measureWidth = max(width, 1)
+        let outerWidth = max(width, 1)
 
-        // Fast path: return cached result when content and width are unchanged.
+        // Fast path: return cached result when content and outer width are unchanged.
         if cachedMeasurementKey.version == contentVersion,
-           abs(cachedMeasurementKey.width - measureWidth) < 0.5
+           abs(cachedMeasurementKey.width - outerWidth) < Self.geometryComparisonTolerance
         {
             return lastMeasuredSize.height
         }
 
-        textContainer?.containerSize = NSSize(
-            width: measureWidth,
-            height: .greatestFiniteMagnitude
-        )
+        let layoutSync = synchronizeTextLayoutGeometry(outerWidth: outerWidth)
         if let container = textContainer {
             layoutManager?.ensureLayout(for: container)
         }
         let used = layoutManager?.usedRect(for: textContainer!).size ?? .zero
-        let heightAllowance = containsTextTableBlocks()
-            ? Self.textTableLayoutHeightAllowance
-            : Self.plainTextLayoutHeightAllowance
-        let height = ceil(used.height) + heightAllowance
+        let height = ceil(used.height) + layoutSync.geometry.heightAllowance
 
-        lastMeasuredSize = CGSize(width: measureWidth, height: height)
-        cachedMeasurementKey = (contentVersion, measureWidth)
+        lastMeasuredSize = CGSize(width: outerWidth, height: height)
+        cachedMeasurementKey = (contentVersion, outerWidth)
         return height
+    }
+
+    func resynchronizeTextLayoutGeometryForCurrentBounds() {
+        guard bounds.width > 1 else { return }
+        if synchronizeTextLayoutGeometry(outerWidth: bounds.width).didChange {
+            invalidateMeasurementCacheForGeometryChange(outerWidth: bounds.width)
+        }
+    }
+
+    private func textLayoutGeometry(outerWidth: CGFloat) -> TextLayoutGeometry {
+        let safeOuterWidth = max(outerWidth, 1)
+        guard containsTextTableBlocks() else {
+            return TextLayoutGeometry(
+                textContainerInset: .zero,
+                effectiveContainerWidth: safeOuterWidth,
+                heightAllowance: Self.plainTextLayoutHeightAllowance
+            )
+        }
+
+        let inset = Self.textTableLayoutInset
+        return TextLayoutGeometry(
+            textContainerInset: NSSize(width: inset, height: inset),
+            effectiveContainerWidth: max(safeOuterWidth - inset * 2, 1),
+            heightAllowance: Self.textTableLayoutHeightAllowance + inset * 2
+        )
+    }
+
+    @discardableResult
+    private func synchronizeTextLayoutGeometry(outerWidth: CGFloat) -> (geometry: TextLayoutGeometry, didChange: Bool) {
+        let geometry = textLayoutGeometry(outerWidth: outerWidth)
+        var didChange = false
+
+        if abs(textContainerInset.width - geometry.textContainerInset.width) > Self.geometryComparisonTolerance ||
+            abs(textContainerInset.height - geometry.textContainerInset.height) > Self.geometryComparisonTolerance
+        {
+            textContainerInset = geometry.textContainerInset
+            didChange = true
+        }
+
+        if let container = textContainer,
+           abs(container.containerSize.width - geometry.effectiveContainerWidth) > Self.geometryComparisonTolerance
+        {
+            container.containerSize = NSSize(
+                width: geometry.effectiveContainerWidth,
+                height: .greatestFiniteMagnitude
+            )
+            didChange = true
+        }
+
+        if didChange {
+            needsDisplay = true
+        }
+        return (geometry, didChange)
+    }
+
+    private func invalidateMeasurementCacheForGeometryChange(outerWidth: CGFloat) {
+        lastMeasuredSize = CGSize(
+            width: outerWidth,
+            height: lastMeasuredSize.height
+        )
+        cachedMeasurementKey = (version: contentVersion &+ 1, width: -1)
+        needsDisplay = true
     }
 
     private func containsTextTableBlocks() -> Bool {
@@ -490,8 +543,10 @@ struct AttributedTextView: NSViewRepresentable {
             textView.textStorage?.setAttributedString(attributedString)
             textView.setSelectedRange(previousSelection)
             textView.clampSelectionToCurrentString(scrollToVisible: shouldScrollSelectionToVisible)
-            // Bump content version so the next sizeThatFits performs a real measurement.
+            // Bump content version so the next sizeThatFits performs a real measurement,
+            // then resync any table-aware geometry for the current draw bounds.
             textView.incrementContentVersion()
+            textView.resynchronizeTextLayoutGeometryForCurrentBounds()
             textView.needsDisplay = true
         }
 

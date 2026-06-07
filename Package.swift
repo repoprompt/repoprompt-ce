@@ -100,7 +100,11 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPrompt", "RepoPromptShared"],
+            dependencies: [
+                "RepoPrompt",
+                "RepoPromptShared",
+                .product(name: "Markdown", package: "swift-markdown")
+            ],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),
