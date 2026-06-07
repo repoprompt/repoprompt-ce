@@ -86,9 +86,9 @@ final class GitWorktreeContextResolverTests: XCTestCase {
         process.standardOutput = output
         process.standardError = output
         try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
             let text = String(data: data, encoding: .utf8) ?? ""
             throw NSError(
                 domain: "GitWorktreeContextResolverTests",

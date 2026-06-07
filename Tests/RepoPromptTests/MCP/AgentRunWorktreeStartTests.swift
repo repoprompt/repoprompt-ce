@@ -974,9 +974,9 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         process.standardOutput = output
         process.standardError = output
         try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
-            let data = output.fileHandleForReading.readDataToEndOfFile()
             let text = String(decoding: data, as: UTF8.self)
             throw NSError(
                 domain: "AgentRunWorktreeStartTests.git",

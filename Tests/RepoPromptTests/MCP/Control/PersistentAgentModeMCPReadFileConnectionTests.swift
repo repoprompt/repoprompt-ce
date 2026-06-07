@@ -168,6 +168,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await startTask.value
             } catch {
                 startTask.cancel()
+                fixture.socketClient.close()
                 await manager.stop()
                 _ = try? await startTask.value
                 throw error
@@ -660,6 +661,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             // earlier tests are filtered by window ID instead of relying on singleton cleanliness.
             WindowStatesManager.shared.registerWindowState(routingGuardWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            await window.workspaceManager.awaitInitialized()
+            await routingGuardWindow.workspaceManager.awaitInitialized()
 
             var rootID: UUID?
             var catalogService: MCPWindowToolCatalogService?
@@ -698,6 +701,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
                 catalogService = resolvedCatalogService
+                ServerNetworkManager.shared.runtimeSessionRegistry.setMCPEnabled(
+                    windowID: window.windowID,
+                    enabled: true
+                )
                 ServiceRegistry.register(resolvedCatalogService)
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
@@ -765,8 +772,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     lease: resolvedLease
                 )
             } catch {
-                await connectionManager?.stop()
                 socketClient?.close()
+                await connectionManager?.stop()
                 await ServerNetworkManager.shared.removeConnection(connectionID)
                 await ServerNetworkManager.shared.clearExpectedAgentPID(
                     getpid(),
@@ -839,8 +846,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             guard !cleanedUp else { return }
             cleanedUp = true
 
-            await connectionManager.stop()
             socketClient.close()
+            await connectionManager.stop()
             await networkManager.removeConnection(Self.connectionID)
             await networkManager.clearExpectedAgentPID(
                 getpid(),

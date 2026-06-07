@@ -94,8 +94,8 @@ private struct GitMergePreviewFixture {
         process.standardOutput = output
         process.standardError = output
         try process.run()
-        process.waitUntilExit()
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         let text = String(decoding: data, as: UTF8.self)
         guard process.terminationStatus == 0 else {
             throw NSError(
