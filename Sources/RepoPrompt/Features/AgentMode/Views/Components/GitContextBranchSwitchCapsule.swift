@@ -114,24 +114,16 @@ struct GitContextBranchSwitchCapsule: View {
         context.branchDisplayText ?? "unknown branch"
     }
 
-    private var branchRowEstimatedHeight: CGFloat {
-        fontPreset.scaledClamped(34, min: 28, max: 44)
-    }
-
-    private var branchListMaxHeight: CGFloat {
-        fontPreset.scaledClamped(224, min: 168, max: 300)
-    }
-
     private var capsuleLabelMaxWidth: CGFloat {
         fontPreset.scaledClamped(88, min: 56, max: 128)
     }
 
-    private var popoverMinHeight: CGFloat {
-        fontPreset.scaledClamped(310, min: 260, max: 390)
+    private var popoverWidth: CGFloat {
+        fontPreset.scaledClamped(300, min: 280, max: 380)
     }
 
-    private var branchSectionHeaderEstimatedHeight: CGFloat {
-        fontPreset.scaledClamped(18, min: 14, max: 22)
+    private var popoverHeight: CGFloat {
+        fontPreset.scaledClamped(410, min: 360, max: 540)
     }
 
     private var branchSectionSpacing: CGFloat {
@@ -140,19 +132,6 @@ struct GitContextBranchSwitchCapsule: View {
 
     private var branchSectionContentSpacing: CGFloat {
         2
-    }
-
-    private func branchListViewportHeight(for presentation: BranchSwitchBranchListPresentation) -> CGFloat {
-        let visibleRowCount = min(CGFloat(presentation.branchCount), 8)
-        let visibleSectionCount = min(CGFloat(presentation.sections.count), max(1, visibleRowCount))
-        let sectionHeaderHeight = visibleSectionCount * branchSectionHeaderEstimatedHeight
-        let sectionSpacing = max(0, visibleSectionCount - 1) * branchSectionSpacing
-        let headerContentSpacing = visibleRowCount * branchSectionContentSpacing
-        let estimatedHeight = visibleRowCount * branchRowEstimatedHeight
-            + sectionHeaderHeight
-            + sectionSpacing
-            + headerContentSpacing
-        return min(branchListMaxHeight, estimatedHeight)
     }
 
     var body: some View {
@@ -233,41 +212,43 @@ struct GitContextBranchSwitchCapsule: View {
 
             Divider()
 
-            if isLoading {
-                ProgressView().controlSize(.small)
-            }
+            VStack(alignment: .leading, spacing: 8) {
+                if isLoading {
+                    ProgressView().controlSize(.small)
+                }
 
-            if let actionErrorMessage {
-                Text(actionErrorMessage)
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+                if let actionErrorMessage {
+                    Text(actionErrorMessage)
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
-            if isLoading {
-                EmptyView()
-            } else if let optionErrorMessage {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(optionErrorMessage)
+                if isLoading {
+                    EmptyView()
+                } else if let optionErrorMessage {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(optionErrorMessage)
+                            .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Reload branches") {
+                            startUITask { await reloadOptions() }
+                        }
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
+                    }
+                } else if let options {
+                    branchList(options)
+                } else {
+                    Text("Open the menu to load local branches.")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button("Reload branches") {
-                        startUITask { await reloadOptions() }
-                    }
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
                 }
-            } else if let options {
-                branchList(options)
-            } else {
-                Text("Open the menu to load local branches.")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    .foregroundStyle(.secondary)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .padding(12)
-        .frame(width: fontPreset.scaledClamped(300, min: 280, max: 380), alignment: .leading)
-        .frame(minHeight: popoverMinHeight, alignment: .topLeading)
+        .frame(width: popoverWidth, height: popoverHeight, alignment: .topLeading)
     }
 
     private func branchList(_ options: GitBranchSwitchOptions) -> some View {
@@ -315,11 +296,13 @@ struct GitContextBranchSwitchCapsule: View {
                             }
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .frame(height: branchListViewportHeight(for: presentation))
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                 .scrollIndicators(.automatic)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private struct BranchSwitchBranchRow: View {
