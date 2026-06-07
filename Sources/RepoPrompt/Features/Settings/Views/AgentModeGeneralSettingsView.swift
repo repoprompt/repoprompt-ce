@@ -107,6 +107,8 @@ struct AgentModeGeneralSettingsView: View {
 
             providersLinkRow
 
+            agentComputerUseLinkRow
+
             agentPermissionsCard
 
             linkRow(
@@ -118,6 +120,21 @@ struct AgentModeGeneralSettingsView: View {
 
             agentWorkflowsLinkRow
         }
+    }
+
+    // MARK: - Computer Use row
+
+    private var agentComputerUseLinkRow: some View {
+        let status = CodexComputerUseWorkflow.availability
+        let detail = status.isReady
+            ? "Ready for explicit /computer-use turns. Codex app access, sensitive actions, and RepoPrompt sandbox approvals still remain separate."
+            : status.primaryUnavailableMessage
+        return linkRow(
+            icon: "display",
+            title: "Computer Use",
+            detail: detail,
+            tab: .agentComputerUse
+        )
     }
 
     // MARK: - Agent Workflows row

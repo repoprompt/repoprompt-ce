@@ -798,6 +798,50 @@ private enum AppSettingsMCPRegistry {
             read: { .bool($0.codexGoalSupportEnabled()) },
             write: { try $0.setCodexGoalSupportEnabled(requiredBool(from: $1)) }
         ),
+        boolSetting(
+            key: "agent_mode.codex_computer_use_enabled",
+            group: "agent_mode",
+            label: "Codex Computer Use",
+            description: "Opt-in toggle for /computer-use. This can be enabled before setup is complete; the workflow is exposed only when the Codex Computer Use plugin is installed or configured, live availability is not explicitly unavailable, and macOS Screen Recording and Accessibility permissions are granted.",
+            read: { .bool($0.codexComputerUseEnabled()) },
+            write: { try $0.setCodexComputerUseEnabled(requiredBool(from: $1)) }
+        ),
+        boolSetting(
+            key: "agent_mode.codex_raw_event_logging_enabled",
+            group: "agent_mode",
+            label: "Codex Raw Event Logging",
+            description: "Opt-in toggle for Codex native raw event JSONL capture. Disabled by default. Writes UserDefaults key 'codexRawEventLoggingEnabled'.",
+            read: { .bool($0.codexRawEventLoggingEnabled()) },
+            write: { try $0.setCodexRawEventLoggingEnabled(requiredBool(from: $1)) }
+        ),
+        rawTextSetting(
+            key: "agent_mode.codex_raw_event_log_file_path",
+            group: "agent_mode",
+            label: "Codex Raw Event Log Directory",
+            description: "Directory override for Codex native raw event JSONL files. Empty string clears the override; enabled logging then writes under the workspace .codexlogs directory or a temp fallback. Writes UserDefaults key 'codexRawEventLogFilePath'.",
+            maxLength: debugDefaultsStringMaxLength,
+            allowEmpty: true,
+            read: { .string($0.codexRawEventLogFilePath()) },
+            write: { try $0.setCodexRawEventLogFilePath(requiredString(from: $1)) }
+        ),
+        boolSetting(
+            key: "agent_mode.codex_app_server_diagnostics_enabled",
+            group: "agent_mode",
+            label: "Codex App Server Diagnostics",
+            description: "Opt-in toggle for sanitized Codex app-server process, JSON-RPC, stderr, and runtime configuration diagnostics. Disabled by default. Writes UserDefaults key 'codexAppServerDiagnosticsEnabled'.",
+            read: { .bool($0.codexAppServerDiagnosticsEnabled()) },
+            write: { try $0.setCodexAppServerDiagnosticsEnabled(requiredBool(from: $1)) }
+        ),
+        rawTextSetting(
+            key: "agent_mode.codex_app_server_diagnostics_log_file_path",
+            group: "agent_mode",
+            label: "Codex App Server Diagnostics Directory",
+            description: "Directory override for sanitized Codex app-server diagnostics JSONL files. Empty string clears the override; enabled logging then writes to a temp diagnostics directory. Writes UserDefaults key 'codexAppServerDiagnosticsLogFilePath'.",
+            maxLength: debugDefaultsStringMaxLength,
+            allowEmpty: true,
+            read: { .string($0.codexAppServerDiagnosticsLogFilePath()) },
+            write: { try $0.setCodexAppServerDiagnosticsLogFilePath(requiredString(from: $1)) }
+        ),
 
         // File-system / ignore preferences. Local .repo_ignore file content remains
         // repository content; this group exposes app-wide scalar behavior only.

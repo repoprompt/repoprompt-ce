@@ -1416,7 +1416,7 @@ struct AgentComposerView: View, Equatable {
             steeringUnsupportedMessage = message
         }
         steeringUnsupportedDismissTask = Task {
-            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
                 withAnimation(.easeInOut(duration: 0.2)) {

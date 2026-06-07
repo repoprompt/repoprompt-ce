@@ -913,6 +913,60 @@ class GlobalSettingsStore: ObservableObject {
         CodexGoalSupport.postDidChangeIfNeeded(previousValue: oldValue, currentValue: codexGoalSupportEnabled())
     }
 
+    func codexComputerUseEnabled() -> Bool {
+        scalarPreferences.agentMode?.codexComputerUseEnabled ?? false
+    }
+
+    func setCodexComputerUseEnabled(_ enabled: Bool, commit: Bool = true) {
+        let previousAvailability = CodexComputerUseWorkflow.resolvedAvailability(
+            persistedOptIn: codexComputerUseEnabled(),
+            prerequisites: CodexComputerUseWorkflow.prerequisiteSnapshot()
+        ).isReady
+        updateAgentModeScalar(commit: commit) { settings in
+            settings.codexComputerUseEnabled = enabled
+        }
+        let currentAvailability = CodexComputerUseWorkflow.resolvedAvailability(
+            persistedOptIn: codexComputerUseEnabled(),
+            prerequisites: CodexComputerUseWorkflow.prerequisiteSnapshot()
+        ).isReady
+        CodexComputerUseWorkflow.postAvailabilityDidChangeIfNeeded(
+            previousValue: previousAvailability,
+            currentValue: currentAvailability
+        )
+    }
+
+    func codexRawEventLoggingEnabled() -> Bool {
+        CodexAppServerDiagnostics.rawEventLoggingEnabled(defaults: defaults)
+    }
+
+    func setCodexRawEventLoggingEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: CodexAppServerDiagnostics.rawEventLoggingEnabledKey)
+    }
+
+    func codexRawEventLogFilePath() -> String {
+        CodexAppServerDiagnostics.rawEventLogFilePath(defaults: defaults)
+    }
+
+    func setCodexRawEventLogFilePath(_ path: String) {
+        CodexAppServerDiagnostics.setRawEventLogFilePath(path, defaults: defaults)
+    }
+
+    func codexAppServerDiagnosticsEnabled() -> Bool {
+        CodexAppServerDiagnostics.appServerDiagnosticsEnabled(defaults: defaults)
+    }
+
+    func setCodexAppServerDiagnosticsEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: CodexAppServerDiagnostics.appServerDiagnosticsEnabledKey)
+    }
+
+    func codexAppServerDiagnosticsLogFilePath() -> String {
+        CodexAppServerDiagnostics.appServerDiagnosticsLogFilePath(defaults: defaults)
+    }
+
+    func setCodexAppServerDiagnosticsLogFilePath(_ path: String) {
+        CodexAppServerDiagnostics.setAppServerDiagnosticsLogFilePath(path, defaults: defaults)
+    }
+
     #if DEBUG
         func claudeRawEventLoggingEnabled() -> Bool {
             defaults.bool(forKey: "claudeRawEventLoggingEnabled")

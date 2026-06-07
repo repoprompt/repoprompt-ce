@@ -133,6 +133,39 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(entries.isEmpty)
     }
 
+    func testMCPServerConfigurationParserExtractsRuntimeFields() throws {
+        let content = """
+        [mcp_servers."computer-use"]
+        command = "./bin/computer-use"
+        args = ["mcp", "--flag"]
+        cwd = "helpers"
+        enabled = false
+        tool_timeout_sec = 10_000
+
+        [mcp_servers."computer-use".env]
+        SKY_CUA_SERVICE_PATH = "./service"
+        TOKEN = "abc"
+
+        [mcp_servers.RepoPromptCE.env]
+        IGNORED = "true"
+        """
+
+        let configuration = try XCTUnwrap(CodexIntegrationConfiguration.mcpServerConfiguration(
+            named: "Computer-Use",
+            fromConfigContent: content
+        ))
+        XCTAssertEqual(configuration.normalizedName, "computer-use")
+        XCTAssertEqual(configuration.command, "./bin/computer-use")
+        XCTAssertEqual(configuration.args, ["mcp", "--flag"])
+        XCTAssertEqual(configuration.cwd, "helpers")
+        XCTAssertEqual(configuration.enabled, false)
+        XCTAssertEqual(configuration.toolTimeoutSec, 10000)
+        XCTAssertEqual(configuration.env, [
+            "SKY_CUA_SERVICE_PATH": "./service",
+            "TOKEN": "abc"
+        ])
+    }
+
     func testPersistentMutationPreservesUnderscoredGlobalLimitAndStripsServerLevelLimit() {
         let input = """
         tool_output_token_limit = 25_000 # user configured

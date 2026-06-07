@@ -2,6 +2,7 @@ import Foundation
 
 extension Notification.Name {
     static let codexGoalSupportDidChange = Notification.Name("RepoPrompt.codexGoalSupportDidChange")
+    static let codexComputerUseAvailabilityDidChange = Notification.Name("RepoPrompt.codexComputerUseAvailabilityDidChange")
 }
 
 private enum CodexNativeFeatureGate: Hashable {
@@ -129,15 +130,74 @@ enum CodexGoalSupport {
 
 enum CodexComputerUseWorkflow {
     static let commandName = "computer-use"
-    static let disabledMessage = "Codex computer-use is currently disabled in RepoPrompt because it requires additional computer permissions/accessibility setup."
 
+    @MainActor
+    static var disabledMessage: String {
+        availability.primaryUnavailableMessage
+    }
+
+    @MainActor
+    static var availability: CodexComputerUseAvailability {
+        CodexComputerUseAvailability(status: currentStatus(includeTimestamp: false))
+    }
+
+    @MainActor
     static var isEnabled: Bool {
-        CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: false)
+        availability.isReady
+    }
+
+    @MainActor
+    static func currentStatus(includeTimestamp: Bool = true) -> CodexComputerUseStatus {
+        currentStatus(
+            persistedOptIn: GlobalSettingsStore.shared.codexComputerUseEnabled(),
+            includeTimestamp: includeTimestamp
+        )
+    }
+
+    static func currentStatus(
+        persistedOptIn: Bool,
+        statusService: CodexComputerUseStatusService = .shared,
+        includeTimestamp: Bool = true
+    ) -> CodexComputerUseStatus {
+        let effectiveOptIn = CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedOptIn)
+        return statusService.currentStatus(
+            optInEnabled: effectiveOptIn,
+            includeTimestamp: includeTimestamp
+        )
+    }
+
+    static func resolvedAvailability(
+        persistedOptIn: Bool,
+        prerequisites: CodexComputerUsePrerequisiteSnapshot
+    ) -> CodexComputerUseAvailability {
+        let featureOptIn = CodexNativeFeatureGate.computerUse.isEnabled(persistedValue: persistedOptIn)
+        return CodexComputerUseAvailability(
+            featureOptIn: featureOptIn,
+            prerequisites: prerequisites
+        )
+    }
+
+    @MainActor
+    static func setEnabled(_ enabled: Bool) {
+        GlobalSettingsStore.shared.setCodexComputerUseEnabled(enabled)
+    }
+
+    static func postAvailabilityDidChangeIfNeeded(previousValue: Bool, currentValue: Bool) {
+        guard currentValue != previousValue else { return }
+        NotificationCenter.default.post(name: .codexComputerUseAvailabilityDidChange, object: nil)
+    }
+
+    static func prerequisiteSnapshot() -> CodexComputerUsePrerequisiteSnapshot {
+        CodexComputerUseStatusService.shared.prerequisiteSnapshot()
     }
 
     #if DEBUG
         static func setEnabledForTesting(_ value: Bool?) {
             CodexNativeFeatureGate.computerUse.setEnabledForTesting(value)
+        }
+
+        static func setPrerequisiteSnapshotForTesting(_ snapshot: CodexComputerUsePrerequisiteSnapshot?) {
+            CodexComputerUseStatusService.setPrerequisiteSnapshotForTesting(snapshot)
         }
     #endif
 
@@ -167,9 +227,10 @@ enum CodexComputerUseWorkflow {
 
         Safety requirements:
         - Clarify missing target app/site/account, destination, credentials, or intended action before operating.
-        - Ask for explicit confirmation before destructive, purchasing, sending, publishing, account-changing, or otherwise externally visible actions.
+        - Treat macOS Screen Recording/Accessibility as OS prerequisites only; still ask for app access when Codex prompts for an allowed target app.
         - Do not treat RepoPrompt MCP auto-approval as approval for non-RepoPrompt MCP, plugin, browser, or computer-use tools.
-        - Keep RepoPrompt workspace file edits separate from external UI automation; explain which surface you are acting on.
+        - Keep RepoPrompt workspace file edits and shell commands under the session's sandbox/approval policy; desktop app actions are a separate surface.
+        - Ask for explicit confirmation before destructive, purchasing, sending, publishing, account-changing, or otherwise externally visible actions.
         - Prefer non-destructive inspection and reporting before taking action.
 
         <user_instructions>

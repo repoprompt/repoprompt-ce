@@ -246,7 +246,7 @@ struct SettingsView: View {
             // Overview (formerly "Behavior") is the top-level entry point that
             // deep-links into each of the other Agent Mode settings surfaces, so
             // it sits first in the sidebar.
-            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentWorkflows, .contextBuilder]
+            [.agentMode, .cliProviders, .agentModels, .agentPermissions, .agentComputerUse, .agentWorkflows, .contextBuilder]
         case .mcp:
             [.mcp, .mcpTools, .permissions, .modelPresets]
         case .api:
@@ -418,6 +418,11 @@ struct SettingsView: View {
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+        case .agentComputerUse:
+            AgentModeComputerUseSettingsView(
+                onNavigate: { tab in selectedTab = tab }
+            )
+            .transition(.opacity.animation(.easeInOut(duration: 0.15)))
         case .agentWorkflows:
             AgentModeWorkflowsSettingsView(
                 workflowStore: .shared,
@@ -534,6 +539,7 @@ enum SettingsTab: String, CaseIterable {
     case agentMode // Agent Mode "Overview" tab (formerly labeled "Agent Mode Behavior")
     case agentModels // NEW: Unified model config shell (Phase 1 IA scaffolding)
     case agentPermissions // NEW: Unified permissions shell (Phase 1 IA scaffolding)
+    case agentComputerUse // Codex Computer Use setup and prerequisite status
     case agentWorkflows // Agent Mode workflow prompts and featured/custom workflows
 
     var title: String {
@@ -563,6 +569,7 @@ enum SettingsTab: String, CaseIterable {
         case .agentMode: "Overview"
         case .agentModels: "Agent Models"
         case .agentPermissions: "Agent Permissions"
+        case .agentComputerUse: "Computer Use"
         case .agentWorkflows: "Agent Workflows"
         }
     }
@@ -594,6 +601,7 @@ enum SettingsTab: String, CaseIterable {
         case .agentMode: "brain.head.profile"
         case .agentModels: "brain"
         case .agentPermissions: "lock.shield"
+        case .agentComputerUse: "display"
         case .agentWorkflows: "bolt.fill"
         }
     }
@@ -604,6 +612,7 @@ enum SettingsTab: String, CaseIterable {
         case .cliProviders,
              .agentModels,
              .agentPermissions,
+             .agentComputerUse,
              .agentWorkflows,
              .contextBuilder,
              .agentMode:
@@ -1131,6 +1140,23 @@ enum SettingsTab: String, CaseIterable {
                 "tool search",
                 "permission profile",
                 "provider permissions"
+            ]
+        case .agentComputerUse:
+            [
+                "computer use",
+                "codex computer use",
+                "desktop automation",
+                "screen recording",
+                "accessibility",
+                "macos permissions",
+                "system settings",
+                "codex plugin",
+                "computer-use plugin",
+                "allowed apps",
+                "target apps",
+                "codex approvals",
+                "destructive actions",
+                "/computer-use"
             ]
         case .agentWorkflows:
             [

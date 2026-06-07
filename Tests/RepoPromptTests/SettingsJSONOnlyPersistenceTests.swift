@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import XCTest
 @_spi(TestSupport) @testable import RepoPrompt
 
@@ -46,6 +47,83 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         )
 
         XCTAssertFalse(store.respectGitignore())
+    }
+
+    func testCodexComputerUseOptInPersistsInJSONSettings() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        XCTAssertFalse(store.codexComputerUseEnabled())
+        store.setCodexComputerUseEnabled(true)
+
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.codexComputerUseEnabled())
+        let rawJSON = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(rawJSON.contains("codexComputerUseEnabled"))
+    }
+
+    func testCodexDiagnosticsSettingsUseUserDefaultsNotGlobalSettingsJSON() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+
+        XCTAssertFalse(store.codexRawEventLoggingEnabled())
+        XCTAssertFalse(store.codexAppServerDiagnosticsEnabled())
+        store.setCodexRawEventLoggingEnabled(true)
+        store.setCodexRawEventLogFilePath("/tmp/codex-raw")
+        store.setCodexAppServerDiagnosticsEnabled(true)
+        store.setCodexAppServerDiagnosticsLogFilePath("/tmp/codex-diag")
+
+        let reloaded = GlobalSettingsStore(defaults: defaults, fileStore: fileStore)
+        XCTAssertTrue(reloaded.codexRawEventLoggingEnabled())
+        XCTAssertEqual(reloaded.codexRawEventLogFilePath(), "/tmp/codex-raw")
+        XCTAssertTrue(reloaded.codexAppServerDiagnosticsEnabled())
+        XCTAssertEqual(reloaded.codexAppServerDiagnosticsLogFilePath(), "/tmp/codex-diag")
+
+        let rawJSON = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(rawJSON.contains("codexRawEventLoggingEnabled"))
+        XCTAssertFalse(rawJSON.contains("codexAppServerDiagnosticsEnabled"))
+    }
+
+    func testCodexDiagnosticsAppSettingsAreExposedAndWritable() async throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let store = GlobalSettingsStore(
+            defaults: defaults,
+            fileStore: GlobalSettingsFileStore(fileURL: fileURL)
+        )
+        let service = AppSettingsMCPService(store: store)
+        let tools = await service.tools
+        let tool = try XCTUnwrap(tools.first { $0.name == AppSettingsMCPService.toolName })
+
+        let listValue = try await tool(["op": .string("list"), "group": .string("agent_mode")])
+        let listObject = try XCTUnwrap(listValue.objectValue)
+        let settings = try XCTUnwrap(listObject["settings"]?.arrayValue)
+        let keys = Set(settings.compactMap { $0.objectValue?["key"]?.stringValue })
+        XCTAssertTrue(keys.contains("agent_mode.codex_raw_event_logging_enabled"))
+        XCTAssertTrue(keys.contains("agent_mode.codex_app_server_diagnostics_enabled"))
+
+        _ = try await tool([
+            "op": .string("set"),
+            "key": .string("agent_mode.codex_app_server_diagnostics_enabled"),
+            "value": .bool(true)
+        ])
+        XCTAssertTrue(store.codexAppServerDiagnosticsEnabled())
     }
 
     func testWorktreeVisualIdentityDefaultsAreEmptyAndFallbackDoesNotPersist() throws {

@@ -28,6 +28,45 @@ enum CodexIntegrationConfiguration {
         let wasRepoPromptServerPresent: Bool
     }
 
+    struct ServerConfiguration: Equatable {
+        let rawName: String
+        let normalizedName: String
+        let cliPathComponent: String
+        let command: String?
+        let args: [String]?
+        let cwd: String?
+        let env: [String: String]
+        let enabled: Bool?
+        let toolTimeoutSec: Int?
+    }
+
+    private struct ServerConfigurationBuilder {
+        let rawName: String
+        let normalizedName: String
+        let cliPathComponent: String
+        var command: String?
+        var args: [String]?
+        var cwd: String?
+        var env: [String: String] = [:]
+        var enabled: Bool?
+        var toolTimeoutSec: Int?
+        var hasRootHeader = false
+
+        var configuration: ServerConfiguration {
+            ServerConfiguration(
+                rawName: rawName,
+                normalizedName: normalizedName,
+                cliPathComponent: cliPathComponent,
+                command: command,
+                args: args,
+                cwd: cwd,
+                env: env,
+                enabled: enabled,
+                toolTimeoutSec: toolTimeoutSec
+            )
+        }
+    }
+
     private struct BlockRange {
         var start: Int
         var end: Int
@@ -153,6 +192,88 @@ enum CodexIntegrationConfiguration {
 
     static func mcpServerNames() -> [String] {
         mcpServerEntries().map(\.normalizedName)
+    }
+
+    static func mcpServerConfigurations(from content: String) -> [ServerConfiguration] {
+        mcpServerConfigurations(fromConfigContent: content)
+    }
+
+    static func mcpServerConfiguration(
+        named targetName: String,
+        fromConfigContent content: String
+    ) -> ServerConfiguration? {
+        mcpServerConfigurations(fromConfigContent: content).first {
+            $0.normalizedName.caseInsensitiveCompare(targetName) == .orderedSame
+        }
+    }
+
+    static func mcpServerConfigurations(fromConfigContent content: String) -> [ServerConfiguration] {
+        var buildersByName: [String: ServerConfigurationBuilder] = [:]
+        var orderedNames: [String] = []
+        var activeRootName: String?
+        var activeEnvName: String?
+
+        func ensureBuilder(for component: TOMLKeyComponent, hasRootHeader: Bool) {
+            if buildersByName[component.normalized] == nil {
+                orderedNames.append(component.normalized)
+                buildersByName[component.normalized] = ServerConfigurationBuilder(
+                    rawName: component.raw,
+                    normalizedName: component.normalized,
+                    cliPathComponent: cliPathComponent(forNormalizedServerName: component.normalized),
+                    hasRootHeader: hasRootHeader
+                )
+            } else if hasRootHeader {
+                buildersByName[component.normalized]?.hasRootHeader = true
+            }
+        }
+
+        for line in splitTOMLLines(content) {
+            if let header = parseTOMLHeader(line) {
+                activeRootName = nil
+                activeEnvName = nil
+                guard !header.isArrayTable,
+                      header.keyPath.count >= 2,
+                      header.keyPath[0].normalized == "mcp_servers"
+                else {
+                    continue
+                }
+
+                let serverComponent = header.keyPath[1]
+                if header.keyPath.count == 2 {
+                    ensureBuilder(for: serverComponent, hasRootHeader: true)
+                    activeRootName = serverComponent.normalized
+                } else if header.keyPath.count == 3, header.keyPath[2].normalized == "env" {
+                    ensureBuilder(for: serverComponent, hasRootHeader: false)
+                    activeEnvName = serverComponent.normalized
+                }
+                continue
+            }
+
+            guard let assignment = parseTOMLAssignment(line) else { continue }
+            if let serverName = activeRootName {
+                if assignment.isSingleKey("command") {
+                    buildersByName[serverName]?.command = parseTOMLStringValue(assignment.valueText)
+                } else if assignment.isSingleKey("args") {
+                    buildersByName[serverName]?.args = parseTOMLStringArrayValue(assignment.valueText)
+                } else if assignment.isSingleKey("cwd") {
+                    buildersByName[serverName]?.cwd = parseTOMLStringValue(assignment.valueText)
+                } else if assignment.isSingleKey("enabled") {
+                    buildersByName[serverName]?.enabled = parseTOMLBoolValue(assignment.valueText)
+                } else if assignment.isSingleKey("tool_timeout_sec") {
+                    buildersByName[serverName]?.toolTimeoutSec = parseTOMLIntegerValue(assignment.valueText)
+                }
+            } else if let serverName = activeEnvName,
+                      assignment.keyPath.count == 1,
+                      let value = parseTOMLStringValue(assignment.valueText)
+            {
+                buildersByName[serverName]?.env[assignment.keyPath[0].normalized] = value
+            }
+        }
+
+        return orderedNames.compactMap { name in
+            guard let builder = buildersByName[name], builder.hasRootHeader else { return nil }
+            return builder.configuration
+        }
     }
 
     /// Installs the RepoPrompt MCP server into Codex CLI (`~/.codex/config.toml`).
@@ -651,6 +772,82 @@ enum CodexIntegrationConfiguration {
                 let trailing = text[text.index(after: cursor)...].trimmingCharacters(in: .whitespacesAndNewlines)
                 guard trailing.isEmpty || trailing.hasPrefix("#") else { return nil }
                 return quote == "\"" ? decodeDoubleQuotedTomlKey(inner) : inner
+            }
+            inner.append(ch)
+            cursor = text.index(after: cursor)
+        }
+        return nil
+    }
+
+    private static func parseTOMLBoolValue(_ valueText: Substring) -> Bool? {
+        let stripped = stripComment(fromValueText: String(valueText)).trimmingCharacters(in: .whitespacesAndNewlines)
+        if stripped == "true" { return true }
+        if stripped == "false" { return false }
+        return nil
+    }
+
+    private static func parseTOMLStringArrayValue(_ valueText: Substring) -> [String]? {
+        let text = String(valueText)
+        var index = text.startIndex
+        skipWhitespace(in: text, from: &index)
+        guard index < text.endIndex, text[index] == "[" else { return nil }
+        index = text.index(after: index)
+
+        var values: [String] = []
+        var expectsValue = true
+        while index < text.endIndex {
+            skipWhitespace(in: text, from: &index)
+            guard index < text.endIndex else { return nil }
+
+            if text[index] == "]" {
+                let trailing = text[text.index(after: index)...].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trailing.isEmpty || trailing.hasPrefix("#") else { return nil }
+                return values
+            }
+
+            guard expectsValue else { return nil }
+            guard let parsed = parseTOMLStringLiteral(in: text, from: index) else { return nil }
+            values.append(parsed.value)
+            index = parsed.endIndex
+            skipWhitespace(in: text, from: &index)
+            guard index < text.endIndex else { return nil }
+            if text[index] == "," {
+                index = text.index(after: index)
+                expectsValue = true
+            } else {
+                expectsValue = false
+            }
+        }
+        return nil
+    }
+
+    private static func parseTOMLStringLiteral(
+        in text: String,
+        from start: String.Index
+    ) -> (value: String, endIndex: String.Index)? {
+        guard start < text.endIndex else { return nil }
+        let quote = text[start]
+        guard quote == "\"" || quote == "'" else { return nil }
+
+        var cursor = text.index(after: start)
+        var escaped = false
+        var inner = ""
+        while cursor < text.endIndex {
+            let ch = text[cursor]
+            if quote == "\"", escaped {
+                inner.append("\\")
+                inner.append(ch)
+                escaped = false
+                cursor = text.index(after: cursor)
+                continue
+            }
+            if quote == "\"", ch == "\\" {
+                escaped = true
+                cursor = text.index(after: cursor)
+                continue
+            }
+            if ch == quote {
+                return (quote == "\"" ? decodeDoubleQuotedTomlKey(inner) : inner, text.index(after: cursor))
             }
             inner.append(ch)
             cursor = text.index(after: cursor)

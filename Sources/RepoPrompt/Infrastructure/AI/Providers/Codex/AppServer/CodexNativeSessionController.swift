@@ -62,9 +62,10 @@ final class CodexNativeSessionController {
 
     private static let maxRunningAggregatedOutputCharacters = 24000
     private static let computerUseMCPServerName = "computer-use"
+    private static let computerUseMCPToolTimeoutSeconds = 10000
     private static let runningOutputTruncationMarker = "\n...(output truncated)...\n"
-    private static let rawEventLogFilePathKey = "codexRawEventLogFilePath"
-    private static let lastRawEventLogFilePathKey = "codexLastRawEventLogFilePath"
+    private static let rawEventLogFilePathKey = CodexAppServerDiagnostics.rawEventLogFilePathKey
+    private static let lastRawEventLogFilePathKey = CodexAppServerDiagnostics.lastRawEventLogFilePathKey
     private static let rawEventTimestampFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -326,6 +327,9 @@ final class CodexNativeSessionController {
         var authTokensRefreshHandler: ChatgptAuthTokensRefreshHandler?
         var goalSupportEnabledProvider: @MainActor () -> Bool = { false }
         var computerUseEnabledProvider: @MainActor () -> Bool = { false }
+        var computerUseRuntimeConfigurationProvider: () -> CodexComputerUseRuntimeConfiguration.Resolution = {
+            CodexComputerUseRuntimeConfiguration.resolve()
+        }
 
         static func agentModeDefault(
             forceExperimentalSteering: Bool,
@@ -334,7 +338,10 @@ final class CodexNativeSessionController {
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
-            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
+            computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false },
+            computerUseRuntimeConfigurationProvider: @escaping () -> CodexComputerUseRuntimeConfiguration.Resolution = {
+                CodexComputerUseRuntimeConfiguration.resolve()
+            }
         ) -> Options {
             Options(
                 requestTimeout: 120,
@@ -345,6 +352,9 @@ final class CodexNativeSessionController {
                             computerUseEnabled: computerUseEnabledProvider()
                         )
                     }
+                    let computerUseRuntimeResolution = featurePolicy.computerUseEnabled
+                        ? computerUseRuntimeConfigurationProvider()
+                        : nil
                     return CodexNativeSessionController.defaultAppServerConfigOverrides(
                         forceExperimentalSteering: forceExperimentalSteering,
                         approvalPolicy: approvalPolicyProvider(),
@@ -352,7 +362,8 @@ final class CodexNativeSessionController {
                         approvalReviewer: approvalReviewerProvider(),
                         shellToolEnabled: shellToolEnabled,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
-                        computerUseEnabled: featurePolicy.computerUseEnabled
+                        computerUseEnabled: featurePolicy.computerUseEnabled,
+                        computerUseRuntimeConfigurationResolution: computerUseRuntimeResolution
                     )
                 },
                 approvalPolicyProvider: approvalPolicyProvider,
@@ -360,7 +371,8 @@ final class CodexNativeSessionController {
                 approvalReviewerProvider: approvalReviewerProvider,
                 authTokensRefreshHandler: nil,
                 goalSupportEnabledProvider: goalSupportEnabledProvider,
-                computerUseEnabledProvider: computerUseEnabledProvider
+                computerUseEnabledProvider: computerUseEnabledProvider,
+                computerUseRuntimeConfigurationProvider: computerUseRuntimeConfigurationProvider
             )
         }
     }
@@ -396,6 +408,7 @@ final class CodexNativeSessionController {
     private let options: Options
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
+    private let appServerDiagnosticsLogger: CodexAppServerDiagnostics.Logger?
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
     private var rawEventLogFileThreadID: String?
@@ -548,6 +561,7 @@ final class CodexNativeSessionController {
         self.options = options ?? Self.Options.agentModeDefault(forceExperimentalSteering: forceExperimentalSteering)
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
+        appServerDiagnosticsLogger = CodexAppServerDiagnostics.makeLoggerIfEnabled()
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
@@ -677,7 +691,7 @@ final class CodexNativeSessionController {
     }
 
     private static func isRawEventFileLoggingEnabled() -> Bool {
-        false
+        CodexAppServerDiagnostics.rawEventLoggingEnabled()
     }
 
     private static func normalizedThreadIdentifier(_ raw: String?) -> String {
@@ -811,6 +825,87 @@ final class CodexNativeSessionController {
         appendRawEventLogRecord(record)
     }
 
+    private func recordThreadConfigDiagnostics(
+        operation: String,
+        configOverrides: [String: Any],
+        model: String?,
+        reasoningEffort: String?,
+        serviceTier: String?
+    ) {
+        guard let appServerDiagnosticsLogger else { return }
+        appServerDiagnosticsLogger.record(kind: "thread.configSummary", payload: [
+            "operation": operation,
+            "threadID": threadID ?? "",
+            "workspacePath": workspacePath ?? "",
+            "modelProvided": model?.isEmpty == false,
+            "reasoningEffortProvided": reasoningEffort?.isEmpty == false,
+            "serviceTier": serviceTier ?? "",
+            "configKeyCount": configOverrides.count,
+            "configKeys": Array(configOverrides.keys).sorted(),
+            "computerUse": Self.computerUseRuntimeDiagnosticSummary(from: configOverrides)
+        ])
+    }
+
+    private func recordComputerUseRuntimeResolutionDiagnosticsIfNeeded() async {
+        guard let appServerDiagnosticsLogger else { return }
+        let computerUseEnabled = await MainActor.run { options.computerUseEnabledProvider() }
+        guard computerUseEnabled else {
+            appServerDiagnosticsLogger.record(kind: "runtime.computerUseResolution", payload: [
+                "enabled": false
+            ])
+            return
+        }
+        let resolution = options.computerUseRuntimeConfigurationProvider()
+        appServerDiagnosticsLogger.record(kind: "runtime.computerUseResolution", payload: Self.computerUseRuntimeDiagnosticSummary(from: resolution))
+    }
+
+    private static func computerUseRuntimeDiagnosticSummary(
+        from resolution: CodexComputerUseRuntimeConfiguration.Resolution
+    ) -> [String: Any] {
+        switch resolution {
+        case let .resolved(configuration):
+            [
+                "enabled": true,
+                "status": "resolved",
+                "serverName": configuration.serverName,
+                "source": String(describing: configuration.source),
+                "command": configuration.command,
+                "argsCount": configuration.args.count,
+                "cwd": configuration.cwd ?? "",
+                "envKeys": Array(configuration.env.keys).sorted(),
+                "toolTimeoutSec": configuration.toolTimeoutSec ?? NSNull()
+            ]
+        case let .incomplete(incomplete):
+            [
+                "enabled": true,
+                "status": "incomplete",
+                "path": incomplete.path,
+                "message": incomplete.message
+            ]
+        case let .missingConfigFile(path):
+            ["enabled": true, "status": "missingConfigFile", "path": path]
+        case let .serverEntryMissing(path):
+            ["enabled": true, "status": "serverEntryMissing", "path": path]
+        case let .unreadable(path, message):
+            ["enabled": true, "status": "unreadable", "path": path, "message": message]
+        }
+    }
+
+    private static func computerUseRuntimeDiagnosticSummary(from configOverrides: [String: Any]) -> [String: Any] {
+        let prefix = "mcp_servers.\(computerUseMCPServerName)."
+        let keys = configOverrides.keys.filter { $0.hasPrefix(prefix) }.sorted()
+        return [
+            "featureEnabled": configOverrides["features.computer_use"] as? Bool ?? false,
+            "pluginsEnabled": configOverrides["features.plugins"] as? Bool ?? false,
+            "serverOverrideKeys": keys,
+            "serverEnabled": configOverrides["\(prefix)enabled"] as? Bool ?? false,
+            "hasCommandOverride": configOverrides["\(prefix)command"] != nil,
+            "hasCWDOverride": configOverrides["\(prefix)cwd"] != nil,
+            "hasEnvOverride": configOverrides["\(prefix)env"] != nil,
+            "toolTimeoutSec": configOverrides["\(prefix)tool_timeout_sec"] ?? NSNull()
+        ]
+    }
+
     func startOrResume(existing: SessionRef?, baseInstructions: String) async throws -> SessionRef {
         try await startOrResume(
             existing: existing,
@@ -861,6 +956,7 @@ final class CodexNativeSessionController {
             try await client.startIfNeeded()
             await ensureInboundStreamsStarted()
 
+            await recordComputerUseRuntimeResolutionDiagnosticsIfNeeded()
             let configOverrides = await options.configOverridesProvider()
             let pathValue = existing?.rolloutPath
             let existingID = existing?.conversationID ?? ""
@@ -930,6 +1026,14 @@ final class CodexNativeSessionController {
                     return requestParams
                 }
             }
+
+            recordThreadConfigDiagnostics(
+                operation: existing != nil ? "thread/resume" : "thread/start",
+                configOverrides: configOverrides,
+                model: model,
+                reasoningEffort: reasoningEffort,
+                serviceTier: serviceTier
+            )
 
             let pendingSessionRef = Self.parseThreadSnapshot(from: result, fallbackEffort: reasoningEffort).sessionRef
             try await disableThreadMemoryMode(threadID: pendingSessionRef.conversationID)
@@ -1342,17 +1446,13 @@ final class CodexNativeSessionController {
     private func applyThreadResponse(_ result: [String: Any], fallbackEffort: String?) -> SessionRef {
         let snapshot = Self.parseThreadSnapshot(from: result, fallbackEffort: fallbackEffort)
         restoreThreadSnapshot(snapshot)
-        #if DEBUG
-            ensureRawEventLogFileReadyIfNeeded()
-        #endif
-        #if DEBUG
-            writeRawEventLogRecord(kind: "session.threadReady", payload: [
-                "conversationID": snapshot.conversationID,
-                "rolloutPath": snapshot.rolloutPath ?? NSNull(),
-                "activeTurnIDs": snapshot.activeTurnIDs,
-                "currentTurnID": snapshot.currentTurnID ?? NSNull()
-            ] as [String: Any])
-        #endif
+        ensureRawEventLogFileReadyIfNeeded()
+        writeRawEventLogRecord(kind: "session.threadReady", payload: [
+            "conversationID": snapshot.conversationID,
+            "rolloutPath": snapshot.rolloutPath ?? NSNull(),
+            "activeTurnIDs": snapshot.activeTurnIDs,
+            "currentTurnID": snapshot.currentTurnID ?? NSNull()
+        ] as [String: Any])
         return snapshot.sessionRef
     }
 
@@ -1730,9 +1830,7 @@ final class CodexNativeSessionController {
     private func handleNotification(_ notification: CodexAppServerClient.Notification) async {
         guard let threadID else { return }
         let params = decodeParams(notification.params)
-        #if DEBUG
-            writeRawEventLogRecord(kind: "notification.received", method: notification.method, payload: params)
-        #endif
+        writeRawEventLogRecord(kind: "notification.received", method: notification.method, payload: params)
 
         // Pre-register observed turn IDs before the routing drop decision to prevent
         // cascade drops when a lifecycle event (turn/started) was missed due to decode
@@ -1757,9 +1855,7 @@ final class CodexNativeSessionController {
             currentTurnID: currentTurnID,
             activeTurnIDs: activeTurnIDs
         ) {
-            #if DEBUG
-                writeRawEventLogRecord(kind: "notification.dropped", method: notification.method, payload: params)
-            #endif
+            writeRawEventLogRecord(kind: "notification.dropped", method: notification.method, payload: params)
             return
         }
         let notifiedTurnID = Self.notificationTurnID(from: params)
@@ -2585,6 +2681,14 @@ final class CodexNativeSessionController {
             return controller.parseExecCommandEndEvent(params: params)?.resultJSON
         }
 
+        static func test_isComputerUseMCPElicitationRequest(params: [String: Any]) -> Bool {
+            isComputerUseMCPElicitationRequest(params: params)
+        }
+
+        func test_computerUseMCPElicitationAutoAcceptResult(params: [String: Any]) async -> [String: Any]? {
+            await computerUseMCPElicitationAutoAcceptResult(params: params)
+        }
+
         struct TestToolLifecycleEvent: Equatable {
             let kind: String
             let name: String
@@ -2688,9 +2792,13 @@ final class CodexNativeSessionController {
     private func handleServerRequest(_ request: CodexAppServerClient.ServerRequest) async {
         let method = request.method
         let params = decodeParams(request.params)
-        #if DEBUG
-            writeRawEventLogRecord(kind: "serverRequest.received", method: method, payload: params)
-        #endif
+        writeRawEventLogRecord(kind: "serverRequest.received", method: method, payload: params)
+        appServerDiagnosticsLogger?.record(kind: "serverRequest.received", payload: [
+            "requestID": request.id.displayValue,
+            "method": method,
+            "routing": String(describing: Self.classifyServerRequestMethod(method)),
+            "params": CodexAppServerDiagnostics.valueSummary(params)
+        ])
 
         switch Self.classifyServerRequestMethod(method) {
         case .approval:
@@ -2805,15 +2913,17 @@ final class CodexNativeSessionController {
     }
 
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {
-        #if DEBUG
-            writeRawEventLogRecord(
-                kind: "serverRequest.respond",
-                payload: [
-                    "requestID": id.displayValue,
-                    "result": result
-                ]
-            )
-        #endif
+        writeRawEventLogRecord(
+            kind: "serverRequest.respond",
+            payload: [
+                "requestID": id.displayValue,
+                "result": result
+            ]
+        )
+        appServerDiagnosticsLogger?.record(kind: "serverRequest.respond", payload: [
+            "requestID": id.displayValue,
+            "result": CodexAppServerDiagnostics.valueSummary(result)
+        ])
         do {
             try await client.respondToServerRequest(id: id, result: result)
         } catch {
@@ -2877,6 +2987,11 @@ final class CodexNativeSessionController {
             return
         }
         do {
+            appServerDiagnosticsLogger?.record(kind: "serverRequest.respond", payload: [
+                "requestID": requestID.displayValue,
+                "method": method,
+                "resultKeys": Array(response.payload.keys).sorted()
+            ])
             try await client.respondToServerRequest(id: requestID, result: response.payload)
         } catch {
             await emit(.error("Codex server request response failed: \(error.localizedDescription)"))
@@ -3758,12 +3873,13 @@ final class CodexNativeSessionController {
 
     private func emit(_ event: Event) async {
         Self.logCodexDebug("[CodexNativeController] emit \(Self.debugEventSummary(event))")
-        #if DEBUG
-            writeRawEventLogRecord(
-                kind: "event.emit",
-                payload: ["summary": Self.debugEventSummary(event)]
-            )
-        #endif
+        writeRawEventLogRecord(
+            kind: "event.emit",
+            payload: ["summary": Self.debugEventSummary(event)]
+        )
+        appServerDiagnosticsLogger?.record(kind: "event.emit", payload: [
+            "summary": Self.debugEventSummary(event)
+        ])
         currentEventsContinuation()?.yield(event)
     }
 
@@ -6750,10 +6866,13 @@ final class CodexNativeSessionController {
         approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         shellToolEnabled: Bool? = nil,
         goalSupportEnabled: Bool = false,
-        computerUseEnabled: Bool = false
+        computerUseEnabled: Bool = false,
+        computerUseRuntimeConfigurationResolution: CodexComputerUseRuntimeConfiguration.Resolution? = nil,
+        serverEntries injectedServerEntries: [MCPIntegrationHelper.CodexServerEntry]? = nil,
+        preferences injectedPreferences: CodexAgentToolPreferences.Snapshot? = nil
     ) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
-        let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
+        let serverEntries = injectedServerEntries ?? MCPIntegrationHelper.codexMCPServerEntries()
+        let preferences = injectedPreferences ?? CodexAgentToolPreferences.snapshot(for: serverEntries)
         let toolPolicy = CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: shellToolEnabled ?? preferences.bashToolEnabled,
@@ -6769,22 +6888,26 @@ final class CodexNativeSessionController {
             toolPolicy: toolPolicy,
             featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
         )
-        var enabledMCPServerNames = preferences.enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: { $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame })
-        {
-            enabledMCPServerNames.insert(Self.computerUseMCPServerName)
-        }
+        let computerUseRuntimeConfiguration = Self.resolvedComputerUseRuntimeConfiguration(
+            enabled: computerUseEnabled,
+            resolution: computerUseRuntimeConfigurationResolution
+        )
         let mcpOverrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,
             policy: .enableSelected(
-                enabledNormalizedNames: enabledMCPServerNames,
+                enabledNormalizedNames: preferences.enabledMCPServerNames,
                 repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
                 exceptBroken: []
             )
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
+        }
+        if let computerUseRuntimeConfiguration {
+            Self.applyComputerUseRuntimeOverrides(
+                to: &overrides,
+                configuration: computerUseRuntimeConfiguration
+            )
         }
         let effectiveApprovalPolicy = approvalPolicy ?? preferences.approvalPolicy
         let effectiveSandboxMode = sandboxMode ?? preferences.sandboxMode
@@ -6793,6 +6916,41 @@ final class CodexNativeSessionController {
         overrides["sandbox_mode"] = effectiveSandboxMode.appServerConfigOverrideValue
         overrides["approvals_reviewer"] = effectiveApprovalReviewer.appServerConfigOverrideValue
         return overrides
+    }
+
+    private static func resolvedComputerUseRuntimeConfiguration(
+        enabled: Bool,
+        resolution: CodexComputerUseRuntimeConfiguration.Resolution?
+    ) -> CodexComputerUseRuntimeConfiguration? {
+        guard enabled else { return nil }
+        let effectiveResolution = resolution ?? CodexComputerUseRuntimeConfiguration.resolve()
+        guard case let .resolved(configuration) = effectiveResolution else {
+            return nil
+        }
+        return configuration
+    }
+
+    private static func applyComputerUseRuntimeOverrides(
+        to overrides: inout [String: Any],
+        configuration: CodexComputerUseRuntimeConfiguration
+    ) {
+        let serverComponent = MCPIntegrationHelper.codexCLIPathComponent(
+            forNormalizedServerName: configuration.serverName
+        )
+        let serverKeyPrefix = "mcp_servers.\(serverComponent)"
+        overrides["\(serverKeyPrefix).enabled"] = true
+        overrides["\(serverKeyPrefix).tool_timeout_sec"] = configuration.toolTimeoutSec ?? Self.computerUseMCPToolTimeoutSeconds
+
+        guard case .appManagedBundledPlugin = configuration.source else {
+            return
+        }
+
+        overrides["\(serverKeyPrefix).command"] = configuration.command
+        overrides["\(serverKeyPrefix).args"] = configuration.args
+        if let cwd = configuration.cwd {
+            overrides["\(serverKeyPrefix).cwd"] = cwd
+        }
+        overrides["\(serverKeyPrefix).env"] = configuration.env
     }
 }
 

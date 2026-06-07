@@ -252,6 +252,13 @@ actor CodexAppServerClient {
         }
     }
 
+    static func timeoutFailureMessage(method: String?, requestID: String, timeout: TimeInterval) -> String {
+        let timeoutText = timeout.rounded(.towardZero) == timeout ? String(Int(timeout)) : String(timeout)
+        let trimmedMethod = method?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let methodText = trimmedMethod?.isEmpty == false ? trimmedMethod! : "<unknown>"
+        return "Codex app-server JSON-RPC request timed out after \(timeoutText)s (method: \(methodText), request id: \(requestID))."
+    }
+
     private var config = Config()
     private var process: SpawnedProcess?
     private var stdoutChunkChannel: FileHandleChunkChannel?
@@ -277,6 +284,7 @@ actor CodexAppServerClient {
     /// newly started process.
     private var transportGeneration: UInt64 = 0
     private var startupTask: (id: UUID, task: Task<Void, Error>)?
+    private var diagnosticsLogger: CodexAppServerDiagnostics.Logger?
     private var expectedAgentPIDRegistration: ExpectedAgentPIDRegistration?
     private var registeredExpectedAgentPID: RegisteredExpectedAgentPID?
     private static let maxDecodeRecoveryAttemptsPerGeneration = 128
@@ -300,6 +308,11 @@ actor CodexAppServerClient {
 
     func updateConfig(_ config: Config) {
         self.config = config
+        refreshDiagnosticsLoggerFromDefaults()
+    }
+
+    private func refreshDiagnosticsLoggerFromDefaults() {
+        diagnosticsLogger = CodexAppServerDiagnostics.makeLoggerIfEnabled()
     }
 
     func setExpectedAgentPIDRegistration(_ registration: ExpectedAgentPIDRegistration?) async {
@@ -567,6 +580,9 @@ actor CodexAppServerClient {
 
     private func finishTransportTermination(_ terminatingTransport: TerminatingTransport?) async {
         guard let terminatingTransport else { return }
+        diagnosticsLogger?.record(kind: "transport.terminate", payload: [
+            "reason": String(describing: lastTransportTerminationReason ?? TransportTerminationReason.explicitStop)
+        ])
         if let expectedAgentPIDToClear = terminatingTransport.expectedAgentPIDToClear {
             await expectedAgentPIDRegistrar.clear(
                 expectedAgentPIDToClear.pid,
@@ -799,6 +815,7 @@ actor CodexAppServerClient {
     }
 
     private func startProcess() async throws {
+        refreshDiagnosticsLoggerFromDefaults()
         let environmentResult = await ProcessEnvironmentBuilder.build(
             ProcessEnvironmentRequest(
                 purpose: .codexAppServer,
@@ -812,6 +829,14 @@ actor CodexAppServerClient {
             additionalPathHints: config.additionalPathHints,
             logger: config.enableDebugLogging ? { print("[CodexAppServer] \($0)") } : nil
         )
+        diagnosticsLogger?.record(kind: "runtime.executableResolution", payload: [
+            "commandName": resolution.commandName,
+            "resolvedCommand": resolution.resolvedCommand,
+            "status": String(describing: resolution.status),
+            "additionalPathHints": resolution.additionalPathHints,
+            "pathPresent": resolution.pathValue?.isEmpty == false,
+            "userMessage": resolution.userMessage
+        ])
         guard resolution.status == .available else {
             throw ClientError.executableUnavailable(resolution.userMessage)
         }
@@ -820,12 +845,22 @@ actor CodexAppServerClient {
             featurePolicy: config.processFeaturePolicy
         )
         let args = processOverrides + ["app-server"]
+        diagnosticsLogger?.record(kind: "process.start", payload: [
+            "command": resolution.resolvedCommand,
+            "arguments": args,
+            "workingDirectory": config.workingDirectory ?? "",
+            "environmentKeys": Array(environment.keys).sorted(),
+            "featurePolicy": String(describing: config.processFeaturePolicy)
+        ])
         let spawned = try ProcessLauncher.spawn(
             command: resolution.resolvedCommand,
             arguments: args,
             environment: environment,
             workingDirectory: config.workingDirectory
         )
+        diagnosticsLogger?.record(kind: "process.started", payload: [
+            "pid": Int(spawned.pid)
+        ])
         stdoutFramer = LineFramer()
         stdoutTail.removeAll(keepingCapacity: false)
         didTerminateTransport = false
@@ -899,6 +934,7 @@ actor CodexAppServerClient {
         let channel = FileHandleChunkChannel()
         stderrChunkChannel = channel
         let enableDebugLogging = config.enableDebugLogging
+        let diagnosticsLogger = diagnosticsLogger
         handle.readabilityHandler = { readable in
             let data = readable.availableData
             if data.isEmpty {
@@ -911,6 +947,10 @@ actor CodexAppServerClient {
         stderrConsumerTask = Task { [weak self] in
             for await chunk in channel.stream {
                 guard self != nil else { break }
+                diagnosticsLogger?.record(
+                    kind: "process.stderr",
+                    payload: CodexAppServerDiagnostics.lineRecordPayload(from: chunk)
+                )
                 if enableDebugLogging,
                    let line = String(data: chunk, encoding: .utf8),
                    !line.isEmpty
@@ -1024,8 +1064,13 @@ actor CodexAppServerClient {
             let idString = String(describing: idValue)
             if let result = json["result"] as? [String: Any] {
                 if let continuation = pendingRequests.removeValue(forKey: idString) {
-                    pendingRequestMetadata.removeValue(forKey: idString)
+                    let metadata = pendingRequestMetadata.removeValue(forKey: idString)
                     cancelTimeout(for: idString)
+                    diagnosticsLogger?.record(kind: "jsonrpc.response", payload: [
+                        "requestID": idString,
+                        "method": metadata?.method ?? "<unknown>",
+                        "resultKeys": Array(result.keys).sorted()
+                    ])
                     if config.enableDebugLogging {
                         print("[CodexAppServer] Response for request \(idString)")
                     }
@@ -1037,8 +1082,13 @@ actor CodexAppServerClient {
                let message = error["message"] as? String
             {
                 if let continuation = pendingRequests.removeValue(forKey: idString) {
-                    pendingRequestMetadata.removeValue(forKey: idString)
+                    let metadata = pendingRequestMetadata.removeValue(forKey: idString)
                     cancelTimeout(for: idString)
+                    diagnosticsLogger?.record(kind: "jsonrpc.error", payload: [
+                        "requestID": idString,
+                        "method": metadata?.method ?? "<unknown>",
+                        "message": message
+                    ])
                     if config.enableDebugLogging {
                         print("[CodexAppServer] Error for request \(idString): \(message)")
                     }
@@ -1050,6 +1100,12 @@ actor CodexAppServerClient {
                let requestID = CodexAppServerRequestID(raw: idValue)
             {
                 let params = codexJSONDictionary(from: json["params"] as? [String: Any] ?? [:])
+                diagnosticsLogger?.record(kind: "jsonrpc.serverRequest", payload: [
+                    "requestID": requestID.displayValue,
+                    "method": method,
+                    "listenerCount": serverRequestContinuations.count,
+                    "params": CodexAppServerDiagnostics.valueSummary(params.mapValues { $0.toAny() })
+                ])
                 if config.enableDebugLogging {
                     print("[CodexAppServer] Server request: \(method) -> broadcasting to \(serverRequestContinuations.count) listeners")
                 }
@@ -1065,6 +1121,11 @@ actor CodexAppServerClient {
         }
         if let method = json["method"] as? String {
             let params = json["params"] as? [String: Any] ?? [:]
+            diagnosticsLogger?.record(kind: "jsonrpc.notification", payload: [
+                "method": method,
+                "listenerCount": notificationContinuations.count,
+                "params": CodexAppServerDiagnostics.valueSummary(params)
+            ])
             if config.enableDebugLogging {
                 print("[CodexAppServer] Notification: \(method) -> broadcasting to \(notificationContinuations.count) listeners")
             }
@@ -1293,6 +1354,10 @@ actor CodexAppServerClient {
     private func sendJSONLine(_ payload: [String: Any], method: String?) throws {
         guard let process else { throw ClientError.processNotRunning }
         let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+        diagnosticsLogger?.record(kind: "jsonrpc.send", payload: [
+            "method": method ?? "<response>",
+            "payload": CodexAppServerDiagnostics.jsonRPCPayloadSummary(payload)
+        ])
         if config.enableDebugLogging {
             if let line = String(data: data, encoding: .utf8) {
                 print("[CodexAppServer] -> \(line)")
@@ -1403,7 +1468,18 @@ actor CodexAppServerClient {
             )
             scheduleTransportCleanup(terminatingTransport)
         }
-        continuation.resume(throwing: ClientError.requestFailed("Request timed out after \(timeout)s"))
+        let message = Self.timeoutFailureMessage(
+            method: metadata?.method,
+            requestID: id,
+            timeout: timeout
+        )
+        diagnosticsLogger?.record(kind: "jsonrpc.timeout", payload: [
+            "requestID": id,
+            "method": metadata?.method ?? "<unknown>",
+            "timeoutSeconds": timeout,
+            "poisonedTransport": metadata.map { Self.shouldPoisonTransportOnTimeout(method: $0.method) } ?? false
+        ])
+        continuation.resume(throwing: ClientError.requestFailed(message))
     }
 
     private func cancelTimeout(for requestID: String) {

@@ -88,6 +88,157 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testDefaultOverridesMaterializeAppManagedComputerUseRuntimeServer() {
+        let runtime = makeComputerUseRuntimeConfiguration(
+            source: .appManagedBundledPlugin(
+                mcpConfigPath: "/tmp/cua/.mcp.json",
+                manifestPath: "/tmp/cua/.codex-plugin/plugin.json",
+                version: "1.2.3"
+            ),
+            toolTimeoutSec: 456
+        )
+
+        let overrides = deterministicDefaultOverrides(
+            computerUseEnabled: true,
+            resolution: .resolved(runtime)
+        )
+
+        XCTAssertEqual(overrides["features.computer_use"] as? Bool, true)
+        XCTAssertEqual(overrides["features.plugins"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.computer-use.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.computer-use.command"] as? String, "/tmp/cua/helper")
+        XCTAssertEqual(overrides["mcp_servers.computer-use.args"] as? [String], ["mcp", "--stdio"])
+        XCTAssertEqual(overrides["mcp_servers.computer-use.cwd"] as? String, "/tmp/cua")
+        XCTAssertEqual(overrides["mcp_servers.computer-use.env"] as? [String: String], ["SKY_CUA_SERVICE_PATH": "/tmp/cua/service"])
+        XCTAssertEqual(overrides["mcp_servers.computer-use.tool_timeout_sec"] as? Int, 456)
+    }
+
+    func testDefaultOverridesOnlyEnableAndTimeoutExplicitComputerUseMCP() {
+        let runtime = makeComputerUseRuntimeConfiguration(
+            source: .explicitMCPServer(configPath: "/tmp/.codex/config.toml"),
+            toolTimeoutSec: nil
+        )
+
+        let overrides = deterministicDefaultOverrides(
+            computerUseEnabled: true,
+            resolution: .resolved(runtime)
+        )
+
+        XCTAssertEqual(overrides["mcp_servers.computer-use.enabled"] as? Bool, true)
+        XCTAssertEqual(overrides["mcp_servers.computer-use.tool_timeout_sec"] as? Int, 10000)
+        XCTAssertNil(overrides["mcp_servers.computer-use.command"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.args"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.cwd"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.env"])
+    }
+
+    func testDefaultOverridesSkipComputerUseRuntimeWhenDisabled() {
+        let runtime = makeComputerUseRuntimeConfiguration(
+            source: .appManagedBundledPlugin(mcpConfigPath: "/tmp/cua/.mcp.json", manifestPath: nil, version: nil),
+            toolTimeoutSec: 456
+        )
+
+        let overrides = deterministicDefaultOverrides(
+            computerUseEnabled: false,
+            resolution: .resolved(runtime)
+        )
+
+        XCTAssertEqual(overrides["features.computer_use"] as? Bool, false)
+        XCTAssertNil(overrides["mcp_servers.computer-use.enabled"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.command"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.args"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.cwd"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.env"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.tool_timeout_sec"])
+    }
+
+    func testDefaultOverridesSkipIncompleteComputerUseRuntimeResolution() {
+        let overrides = deterministicDefaultOverrides(
+            computerUseEnabled: true,
+            resolution: .incomplete(.init(path: "/tmp/cua/.mcp.json", message: "missing command"))
+        )
+
+        XCTAssertEqual(overrides["features.computer_use"] as? Bool, true)
+        XCTAssertNil(overrides["mcp_servers.computer-use.enabled"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.command"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.args"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.cwd"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.env"])
+        XCTAssertNil(overrides["mcp_servers.computer-use.tool_timeout_sec"])
+    }
+
+    func testAgentModeDefaultDoesNotResolveComputerUseRuntimeWhenDisabled() async throws {
+        var didResolveComputerUseRuntime = false
+        let options = CodexNativeSessionController.Options.agentModeDefault(
+            forceExperimentalSteering: true,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user },
+            computerUseEnabledProvider: { false },
+            computerUseRuntimeConfigurationProvider: {
+                didResolveComputerUseRuntime = true
+                return .resolved(self.makeComputerUseRuntimeConfiguration(
+                    source: .appManagedBundledPlugin(mcpConfigPath: "/tmp/cua/.mcp.json", manifestPath: nil, version: nil),
+                    toolTimeoutSec: 456
+                ))
+            }
+        )
+        let (controller, recordURL) = try await makeController(options: options)
+
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        XCTAssertFalse(didResolveComputerUseRuntime)
+        let params = try recordedParams(for: "thread/start", at: recordURL)
+        let config = try XCTUnwrap(params["config"] as? [String: Any])
+        XCTAssertNil(config["mcp_servers.computer-use.command"])
+        XCTAssertNil(config["mcp_servers.computer-use.args"])
+        XCTAssertNil(config["mcp_servers.computer-use.cwd"])
+        XCTAssertNil(config["mcp_servers.computer-use.env"])
+        XCTAssertNil(config["mcp_servers.computer-use.tool_timeout_sec"])
+    }
+
+    private func deterministicDefaultOverrides(
+        computerUseEnabled: Bool,
+        resolution: CodexComputerUseRuntimeConfiguration.Resolution?
+    ) -> [String: Any] {
+        CodexNativeSessionController.defaultAppServerConfigOverrides(
+            forceExperimentalSteering: false,
+            approvalPolicy: .never,
+            sandboxMode: .readOnly,
+            approvalReviewer: .user,
+            shellToolEnabled: false,
+            goalSupportEnabled: false,
+            computerUseEnabled: computerUseEnabled,
+            computerUseRuntimeConfigurationResolution: resolution,
+            serverEntries: [],
+            preferences: .init(
+                bashToolEnabled: false,
+                searchToolEnabled: false,
+                approvalPolicy: .never,
+                sandboxMode: .readOnly,
+                approvalReviewer: .user,
+                enabledMCPServerNames: []
+            )
+        )
+    }
+
+    private func makeComputerUseRuntimeConfiguration(
+        source: CodexComputerUseRuntimeConfiguration.Source,
+        toolTimeoutSec: Int?
+    ) -> CodexComputerUseRuntimeConfiguration {
+        CodexComputerUseRuntimeConfiguration(
+            serverName: "computer-use",
+            command: "/tmp/cua/helper",
+            args: ["mcp", "--stdio"],
+            cwd: "/tmp/cua",
+            env: ["SKY_CUA_SERVICE_PATH": "/tmp/cua/service"],
+            enabled: nil,
+            toolTimeoutSec: toolTimeoutSec,
+            source: source
+        )
+    }
+
     private func makeController(
         options: CodexNativeSessionController.Options
     ) async throws -> (CodexNativeSessionController, URL) {
