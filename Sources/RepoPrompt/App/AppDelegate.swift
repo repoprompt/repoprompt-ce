@@ -18,6 +18,7 @@ import SwiftUI
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
+    private let dockMenuController = DockMenuController()
 
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
@@ -122,15 +123,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     // MARK: - Application Lifecycle
 
     func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
-        let menu = NSMenu()
-        let newWindowItem = NSMenuItem(
-            title: "New Window",
-            action: #selector(openNewWindowFromDockMenu(_:)),
-            keyEquivalent: ""
-        )
-        newWindowItem.target = self
-        menu.addItem(newWindowItem)
-        return menu
+        dockMenuController.makeMenu()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -174,16 +167,6 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         }
 
         return .terminateLater
-    }
-
-    @objc private func openNewWindowFromDockMenu(_ sender: NSMenuItem) {
-        do {
-            try AppWindowOpener.shared.openMainWindow()
-        } catch WindowOpenError.openerUnavailable {
-            appDelegateDebugLog("Dock New Window requested before AppWindowOpener was available")
-        } catch {
-            appDelegateDebugLog("Dock New Window failed: \(error.localizedDescription)")
-        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
