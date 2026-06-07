@@ -137,6 +137,9 @@ final class PromptRenderingServiceTests: XCTestCase {
             gitDiff: "DIFF"
         )
 
+        XCTAssertEqual(PromptFactualEnvelopePolicy.canonical.fileMapTag, "file_map")
+        XCTAssertEqual(PromptFactualEnvelopePolicy.canonical.fileContentsTag, "file_contents")
+        XCTAssertEqual(PromptFactualEnvelopePolicy.canonical.gitDiffTag, "git_diff")
         XCTAssertEqual(snippets.fileMap, "<file_map>\nTREE\n\nMAP-ONE\n\nMAP-TWO\n</file_map>\n")
         XCTAssertEqual(snippets.fileContents, "<file_contents>\nFILE-ONE\n\nFILE-TWO\n</file_contents>\n")
         XCTAssertEqual(snippets.gitDiff, "<git_diff>\nDIFF\n</git_diff>\n")
@@ -150,5 +153,52 @@ final class PromptRenderingServiceTests: XCTestCase {
             ),
             PromptRenderedFactualSnippets(fileMap: nil, fileContents: nil, gitDiff: nil)
         )
+        XCTAssertEqual(
+            PromptRenderingService.renderFactualSnippets(
+                fileTreeContent: nil,
+                codemapBlocks: [],
+                contentBlocks: [""],
+                gitDiff: nil
+            ).fileContents,
+            "<file_contents>\n\n</file_contents>\n"
+        )
+    }
+
+    func testFactualSnippetRenderingSupportsChatStyleTreeEnvelopePolicy() {
+        let snippets = PromptRenderingService.renderFactualSnippets(
+            fileTreeContent: "TREE",
+            codemapBlocks: [],
+            contentBlocks: ["FILE"],
+            gitDiff: "DIFF",
+            envelopePolicy: .chatStyleTree
+        )
+
+        XCTAssertEqual(PromptFactualEnvelopePolicy.chatStyleTree.fileMapTag, "file_tree")
+        XCTAssertEqual(snippets.fileMap, "<file_tree>\nTREE\n</file_tree>")
+        XCTAssertEqual(snippets.fileContents, "<file_contents>\nFILE\n\n</file_contents>")
+        XCTAssertEqual(snippets.gitDiff, "<git_diff>\nDIFF\n</git_diff>")
+    }
+
+    func testFactualSnippetRenderingKeepsCoreOwnedCloseSpacingAndOmissionRules() {
+        let treeOnly = PromptRenderingService.renderFactualSnippets(
+            fileTreeContent: "TREE\n",
+            codemapBlocks: [],
+            contentBlocks: [],
+            gitDiff: nil
+        )
+        XCTAssertEqual(treeOnly.fileMap, "<file_map>\nTREE\n\n</file_map>\n")
+        XCTAssertNil(treeOnly.fileContents)
+        XCTAssertNil(treeOnly.gitDiff)
+
+        let codemapOnly = PromptRenderingService.renderFactualSnippets(
+            fileTreeContent: nil,
+            codemapBlocks: ["CODEMAP"],
+            contentBlocks: [],
+            gitDiff: nil,
+            envelopePolicy: .chatStyleTree
+        )
+        XCTAssertEqual(codemapOnly.fileMap, "<file_tree>\nCODEMAP\n</file_tree>")
+        XCTAssertNil(codemapOnly.fileContents)
+        XCTAssertNil(codemapOnly.gitDiff)
     }
 }

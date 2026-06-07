@@ -108,49 +108,63 @@ package enum PromptRenderingService {
         fileTreeContent: String?,
         codemapBlocks: [String],
         contentBlocks: [String],
-        gitDiff: String?
+        gitDiff: String?,
+        envelopePolicy: PromptFactualEnvelopePolicy = .canonical
     ) -> PromptRenderedFactualSnippets {
         let codemapText = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapText.isEmpty
-        let fileMap: String? = if hasTree || hasCodemaps {
-            """
-            <file_map>
-            \([fileTreeContent ?? "", codemapText].filter { !$0.isEmpty }.joined(separator: "\n\n"))
-            </file_map>
+        let fileMapBody = [fileTreeContent ?? "", codemapText]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        let fileMap = wrapFactualBody(
+            fileMapBody,
+            tag: envelopePolicy.fileMapTag,
+            closeSpacing: envelopePolicy.fileMapCloseSpacing,
+            terminator: envelopePolicy.fragmentTerminator
+        )
 
-            """
-        } else {
-            nil
-        }
+        let fileContents = wrapFactualBody(
+            contentBlocks.joined(separator: "\n\n"),
+            tag: envelopePolicy.fileContentsTag,
+            closeSpacing: envelopePolicy.fileContentsCloseSpacing,
+            terminator: envelopePolicy.fragmentTerminator,
+            allowEmptyBody: !contentBlocks.isEmpty
+        )
 
-        let fileContents: String? = if !contentBlocks.isEmpty {
-            """
-            <file_contents>
-            \(contentBlocks.joined(separator: "\n\n"))
-            </file_contents>
-
-            """
-        } else {
-            nil
-        }
-
-        let gitDiffSnippet: String? = if let gitDiff, !gitDiff.isEmpty {
-            """
-            <git_diff>
-            \(gitDiff)
-            </git_diff>
-
-            """
-        } else {
-            nil
-        }
+        let gitDiffSnippet = wrapFactualBody(
+            gitDiff ?? "",
+            tag: envelopePolicy.gitDiffTag,
+            closeSpacing: envelopePolicy.gitDiffCloseSpacing,
+            terminator: envelopePolicy.fragmentTerminator
+        )
 
         return PromptRenderedFactualSnippets(
             fileMap: fileMap,
             fileContents: fileContents,
             gitDiff: gitDiffSnippet
         )
+    }
+
+    private static func wrapFactualBody(
+        _ body: String,
+        tag: String,
+        closeSpacing: PromptFactualEnvelopePolicy.WrapperCloseSpacing,
+        terminator: PromptFactualEnvelopePolicy.FragmentTerminator,
+        allowEmptyBody: Bool = false
+    ) -> String? {
+        guard allowEmptyBody || !body.isEmpty else { return nil }
+        let closePrefix = switch closeSpacing {
+        case .direct:
+            "\n"
+        case .blankLine:
+            "\n\n"
+        }
+        let suffix = switch terminator {
+        case .lineFeed:
+            "\n"
+        case .none:
+            ""
+        }
+        return "<\(tag)>\n\(body)\(closePrefix)</\(tag)>\(suffix)"
     }
 
     private static func renderFullFileBlock(

@@ -70,3 +70,73 @@ package struct PromptRenderedFactualSnippets: Equatable {
         self.gitDiff = gitDiff
     }
 }
+
+package struct PromptFactualEnvelopePolicy: Equatable {
+    package enum FileMapEnvelope: Equatable {
+        case canonicalFileMap
+        case chatStyleFileTree
+    }
+
+    package enum WrapperCloseSpacing: Equatable {
+        case direct
+        case blankLine
+    }
+
+    package enum FragmentTerminator: Equatable {
+        case lineFeed
+        case none
+    }
+
+    package let fileMapEnvelope: FileMapEnvelope
+    package let fileMapCloseSpacing: WrapperCloseSpacing
+    package let fileContentsCloseSpacing: WrapperCloseSpacing
+    package let gitDiffCloseSpacing: WrapperCloseSpacing
+    package let fragmentTerminator: FragmentTerminator
+
+    package init(
+        fileMapEnvelope: FileMapEnvelope,
+        fileMapCloseSpacing: WrapperCloseSpacing,
+        fileContentsCloseSpacing: WrapperCloseSpacing,
+        gitDiffCloseSpacing: WrapperCloseSpacing,
+        fragmentTerminator: FragmentTerminator
+    ) {
+        self.fileMapEnvelope = fileMapEnvelope
+        self.fileMapCloseSpacing = fileMapCloseSpacing
+        self.fileContentsCloseSpacing = fileContentsCloseSpacing
+        self.gitDiffCloseSpacing = gitDiffCloseSpacing
+        self.fragmentTerminator = fragmentTerminator
+    }
+
+    package static let canonical = PromptFactualEnvelopePolicy(
+        fileMapEnvelope: .canonicalFileMap,
+        fileMapCloseSpacing: .direct,
+        fileContentsCloseSpacing: .direct,
+        gitDiffCloseSpacing: .direct,
+        fragmentTerminator: .lineFeed
+    )
+
+    package static let chatStyleTree = PromptFactualEnvelopePolicy(
+        fileMapEnvelope: .chatStyleFileTree,
+        fileMapCloseSpacing: .direct,
+        fileContentsCloseSpacing: .blankLine,
+        gitDiffCloseSpacing: .direct,
+        fragmentTerminator: .none
+    )
+
+    package var fileMapTag: String {
+        switch fileMapEnvelope {
+        case .canonicalFileMap:
+            "file_map"
+        case .chatStyleFileTree:
+            "file_tree"
+        }
+    }
+
+    package var fileContentsTag: String {
+        "file_contents"
+    }
+
+    package var gitDiffTag: String {
+        "git_diff"
+    }
+}

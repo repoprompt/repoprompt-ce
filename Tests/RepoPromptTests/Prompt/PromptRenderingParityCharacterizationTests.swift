@@ -327,6 +327,174 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
         )
     }
 
+    func testStandardAppPromptPayloadGoldensCaptureCurrentOwnershipBeforeMigration() async throws {
+        let file = makeEntry(
+            id: "77777777-7777-7777-7777-777777777777",
+            relativePath: "Sources/App.swift",
+            content: "print(\"hi\")\n"
+        )
+        let clipboard = await PromptPackagingService.generateClipboardContent(
+            metaInstructions: [MetaInstruction(title: "Rules", content: "META")],
+            userInstructions: "FINAL",
+            files: [file],
+            fileTreeContent: "TREE",
+            gitDiff: "DIFF",
+            includeSavedPrompts: true,
+            includeFiles: true,
+            includeUserPrompt: true,
+            filePathDisplay: .relative,
+            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            disabledPromptSections: [],
+            duplicateUserInstructionsAtTop: false
+        )
+        let expectedClipboard = """
+        <file_map>
+        TREE
+        </file_map>
+        <file_contents>
+        File: Sources/App.swift
+        ```swift
+        print("hi")
+
+        ```
+        </file_contents>
+        <git_diff>
+        DIFF
+        </git_diff>
+        <meta prompt 1 = "Rules">
+        META
+        </meta prompt 1>
+        <user_instructions>
+        FINAL
+        </user_instructions>
+
+        """
+        XCTAssertEqual(clipboard, expectedClipboard)
+        let exactClipboard = PromptPackagingService.exactRenderedPayload(clipboard, source: .immutableSnapshot)
+        XCTAssertEqual(Array(exactClipboard.text.utf8), Array(expectedClipboard.utf8))
+        XCTAssertEqual(
+            exactClipboard.projection.total,
+            TokenCalculationService.estimateTokens(for: expectedClipboard)
+        )
+
+        let message = PromptPackagingService.buildAIMessage(
+            systemPrompt: "SYSTEM",
+            metaInstructions: [MetaInstruction(title: "Rules", content: "META")],
+            fileTree: "TREE",
+            fileContents: ["File: Sources/App.swift\n```swift\nprint(\"hi\")\n```"],
+            gitDiff: "DIFF",
+            conversation: [
+                ConversationEntry(role: .user, content: "EARLY"),
+                ConversationEntry(role: .assistant, content: "ASSISTANT"),
+                ConversationEntry(role: .user, content: "FINAL")
+            ],
+            temperature: nil,
+            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            disabledPromptSections: [],
+            duplicateUserInstructionsAtTop: false
+        )
+        let expectedTail = """
+        <file_tree>
+        TREE
+        </file_tree>
+
+        <file_contents>
+        File: Sources/App.swift
+        ```swift
+        print("hi")
+        ```
+
+        </file_contents>
+
+        <git_diff>
+        DIFF
+        </git_diff>
+
+        <meta prompt "Rules">
+        META
+        </meta prompt>
+        """
+        let expectedFinalUser = """
+        <user_instructions>
+        FINAL
+        </user_instructions>
+        """
+        XCTAssertEqual(message.buildTail(embedSystemPrompt: false), expectedTail)
+        XCTAssertEqual(message.fileTreeXML, "<file_tree>\nTREE\n</file_tree>")
+        XCTAssertEqual(
+            message.fileBlocksXML,
+            "<file_contents>\nFile: Sources/App.swift\n```swift\nprint(\"hi\")\n```\n\n</file_contents>"
+        )
+        XCTAssertEqual(message.gitDiffXML, "<git_diff>\nDIFF\n</git_diff>")
+        XCTAssertEqual(
+            message.combinedXML,
+            "<system_prompt>\nSYSTEM\n</system_prompt>\n\n<meta_prompts>\n<meta prompt \"Rules\">\nMETA\n</meta prompt>\n\n</meta_prompts>\n\n<file_tree>\nTREE\n</file_tree>\n\n<file_contents>\nFile: Sources/App.swift\n```swift\nprint(\"hi\")\n```\n\n</file_contents>\n\n<git_diff>\nDIFF\n</git_diff>"
+        )
+
+        let coreFactual = PromptRenderingService.renderFactualSnippets(
+            fileTreeContent: "TREE",
+            codemapBlocks: [],
+            contentBlocks: ["File: Sources/App.swift\n```swift\nprint(\"hi\")\n```"],
+            gitDiff: "DIFF",
+            envelopePolicy: .chatStyleTree
+        )
+        XCTAssertEqual(
+            try PromptAssemblyBuilder.build(
+                order: PromptAssemblyBuilder.defaultSectionOrder,
+                disabled: [],
+                duplicateUserInstructionsAtTop: false,
+                snippets: [
+                    .fileMap: XCTUnwrap(coreFactual.fileMap),
+                    .fileContents: XCTUnwrap(coreFactual.fileContents),
+                    .gitDiff: XCTUnwrap(coreFactual.gitDiff),
+                    .metaPrompts: "<meta prompt \"Rules\">\nMETA\n</meta prompt>"
+                ],
+                layout: .blankLineSeparatedFragments
+            ),
+            expectedTail
+        )
+
+        let chatMessages = message.openAIChatMessages(embedSystemPrompt: false)
+        let chatRoleNames = chatMessages.map { String(describing: $0.role) }
+        XCTAssertEqual(chatRoleNames, ["system", "user", "assistant", "user"])
+        let finalChatText: String? = if let finalChatMessage = chatMessages.last {
+            switch finalChatMessage.content {
+            case let .text(text):
+                text
+            case let .contentArray(items):
+                items.compactMap { item in
+                    if case let .text(text) = item { return text }
+                    return nil
+                }.joined()
+            }
+        } else {
+            nil
+        }
+        XCTAssertEqual(finalChatText, expectedTail + "\n" + expectedFinalUser)
+
+        let responseMessages: [(role: String, text: String)] = switch message.openAIResponsesInput() {
+        case let .array(items):
+            items.compactMap { item in
+                guard case let .message(message) = item else { return nil }
+                guard case let .text(text) = message.content else {
+                    return nil
+                }
+                return (role: message.role, text: text)
+            }
+        default:
+            []
+        }
+        XCTAssertEqual(responseMessages.map(\.role), ["user", "assistant", "user"])
+        XCTAssertEqual(responseMessages.first?.text, expectedTail + "\n\nEARLY")
+        XCTAssertEqual(responseMessages.last?.text, expectedFinalUser)
+
+        let exactChat = PromptPackagingService.exactChatPayload(for: message, source: .activeLive)
+        let expectedExactChatBytes = Array(
+            ("SYSTEM" + "EARLY" + "ASSISTANT" + expectedTail + "\n" + expectedFinalUser).utf8
+        )
+        XCTAssertEqual(Array(exactChat.text.utf8), expectedExactChatBytes)
+    }
+
     func testCompleteAlternateCodemapCandidatesMatchPromptAccountingEligibility() async throws {
         let root = try makeTemporaryRoot(name: "CompleteAlternateParity")
         defer { try? FileManager.default.removeItem(at: root) }
