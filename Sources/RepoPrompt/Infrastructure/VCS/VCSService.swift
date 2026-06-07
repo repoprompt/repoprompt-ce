@@ -550,6 +550,7 @@ public extension VCSService {
             return nil
         }
         let mainWorktreeRoot = layout.commonDir.deletingLastPathComponent()
+        let isMain = !layout.isWorktree
         let identity = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: layout.commonDir,
             mainWorktreeRoot: mainWorktreeRoot
@@ -560,7 +561,7 @@ public extension VCSService {
         let worktreeID = GitWorktreeIdentity.worktreeID(
             repositoryID: identity.repositoryID,
             gitDir: layout.gitDir,
-            isMain: !layout.isWorktree,
+            isMain: isMain,
             path: layout.workTreeRoot
         )
         return GitWorktreeContextSummary(
@@ -570,6 +571,7 @@ public extension VCSService {
             worktreeID: worktreeID,
             worktreePath: repoRootPath,
             worktreeName: worktreeName,
+            isMain: isMain,
             branch: branch,
             head: head,
             isDetached: branch == nil && head != nil
