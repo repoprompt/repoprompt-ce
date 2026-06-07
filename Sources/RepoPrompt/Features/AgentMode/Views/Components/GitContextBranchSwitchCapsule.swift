@@ -271,7 +271,7 @@ struct GitContextBranchSwitchCapsule: View {
                     .foregroundStyle(.secondary)
             } else {
                 ScrollView(.vertical) {
-                    LazyVStack(alignment: .leading, spacing: branchSectionSpacing) {
+                    VStack(alignment: .leading, spacing: branchSectionSpacing) {
                         ForEach(presentation.sections) { section in
                             VStack(alignment: .leading, spacing: branchSectionContentSpacing) {
                                 Text(section.title)
