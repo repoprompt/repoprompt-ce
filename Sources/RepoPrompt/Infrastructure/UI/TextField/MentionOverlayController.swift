@@ -213,7 +213,7 @@ extension MentionOverlayController {
 
             isOpaque = false
             backgroundColor = .clear
-            hasShadow = true
+            hasShadow = false
             level = .floating
 
             // Vibrancy background -----------------------------------------------

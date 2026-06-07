@@ -17,4 +17,16 @@ final class MentionOverlayControllerTests: XCTestCase {
         overlay.visibleRowLimit = -4
         XCTAssertEqual(overlay.visibleRowLimit, 1)
     }
+
+    func testSuggestionWindowDisablesNativeShadowForRoundedPopup() {
+        let window = MentionOverlayController.SuggestionWindow(
+            parent: nil,
+            placement: .below
+        )
+
+        XCTAssertFalse(
+            window.hasShadow,
+            "Native NSWindow shadows are rectangular and can show through around the rounded mention popup."
+        )
+    }
 }
