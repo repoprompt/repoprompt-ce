@@ -2,11 +2,18 @@ import AppKit
 
 @MainActor
 final class DockMenuController: NSObject {
+    private let activateApplication: @MainActor () -> Void
     private let requestNewWindow: @MainActor () -> Void
 
-    init(requestNewWindow: @escaping @MainActor () -> Void = {
-        AppWindowOpener.shared.requestMainWindowFromDock()
-    }) {
+    init(
+        activateApplication: @escaping @MainActor () -> Void = {
+            NSApplication.shared.activate(ignoringOtherApps: true)
+        },
+        requestNewWindow: @escaping @MainActor () -> Void = {
+            AppWindowOpener.shared.requestMainWindowFromDock()
+        }
+    ) {
+        self.activateApplication = activateApplication
         self.requestNewWindow = requestNewWindow
         super.init()
     }
@@ -25,5 +32,6 @@ final class DockMenuController: NSObject {
 
     @objc private func openNewWindow(_ sender: Any?) {
         requestNewWindow()
+        activateApplication()
     }
 }

@@ -15,10 +15,15 @@ final class DockMenuTests: XCTestCase {
     }
 
     func testDockNewWindowMenuItemMetadataAndNilSenderRouting() throws {
-        var requestCount = 0
-        let controller = DockMenuController {
-            requestCount += 1
-        }
+        var events: [String] = []
+        let controller = DockMenuController(
+            activateApplication: {
+                events.append("activate")
+            },
+            requestNewWindow: {
+                events.append("request")
+            }
+        )
 
         let menu = controller.makeMenu()
         XCTAssertEqual(menu.items.count, 1)
@@ -35,26 +40,32 @@ final class DockMenuTests: XCTestCase {
             from: nil
         )
         XCTAssertTrue(didSend)
-        XCTAssertEqual(requestCount, 1)
+        XCTAssertEqual(events, ["request", "activate"])
     }
 
     func testDockRequestsQueueUntilOpenerIsInstalled() throws {
+        var activationCount = 0
         var openCount = 0
-        let controller = DockMenuController()
+        let controller = DockMenuController(activateApplication: {
+            activationCount += 1
+        })
         let item = try XCTUnwrap(controller.makeMenu().items.first)
         let action = try XCTUnwrap(item.action)
 
         XCTAssertTrue(NSApplication.shared.sendAction(action, to: item.target, from: nil))
         XCTAssertTrue(NSApplication.shared.sendAction(action, to: item.target, from: nil))
         XCTAssertFalse(AppWindowOpener.shared.isAvailable)
+        XCTAssertEqual(activationCount, 2)
         XCTAssertEqual(openCount, 0)
 
         AppWindowOpener.shared.install {
             openCount += 1
         }
+        XCTAssertEqual(activationCount, 2)
         XCTAssertEqual(openCount, 2)
 
         XCTAssertTrue(NSApplication.shared.sendAction(action, to: item.target, from: nil))
+        XCTAssertEqual(activationCount, 3)
         XCTAssertEqual(openCount, 3)
     }
 
