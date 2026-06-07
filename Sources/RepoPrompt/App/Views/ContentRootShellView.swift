@@ -54,7 +54,7 @@ struct ContentRootShellView: View {
                 onboardingViewModel: viewModel.onboardingViewModel,
                 onCreateOnboardingViewModelIfNeeded: { viewModel.ensureOnboardingViewModel() },
                 onContinueToMain: {
-                    viewModel.dismissWorkspaceEntryIfAllowed()
+                    viewModel.continueFromOnboarding()
                 }
             )
         } else {
