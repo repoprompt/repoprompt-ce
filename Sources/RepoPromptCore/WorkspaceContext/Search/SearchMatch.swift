@@ -89,7 +89,7 @@ package struct SearchMatch: Hashable, Codable {
  * `.content` – search **only** inside files.
  * `.both`    – execute *both* path and content search stages.
  */
-package enum SearchMode: String, Codable, Sendable {
+package enum SearchMode: String, Codable {
     case auto, path, content, both
 }
 

@@ -1,14 +1,14 @@
 import Foundation
 import RepoPromptC
 
-package enum SearchPathClause: Equatable, Sendable {
+package enum SearchPathClause: Equatable {
     case exactFile(absPath: String, relPath: String, restrictedRootPath: String?)
     case exactFolder(absLower: String, relLower: String, restrictedRootPath: String?)
     case glob(pattern: String, restrictedRootPath: String?)
     case legacyPrefix(candidateLower: String)
 }
 
-package struct SearchPathFilterSpec: Equatable, Sendable {
+package struct SearchPathFilterSpec: Equatable {
     package let caseInsensitive: Bool
     package let clauses: [SearchPathClause]
 
@@ -18,7 +18,7 @@ package struct SearchPathFilterSpec: Equatable, Sendable {
     }
 }
 
-package struct FileSearchPathSnapshot: Sendable {
+package struct FileSearchPathSnapshot {
     package let standardizedFullPath: String
     package let standardizedRelativePath: String
     package let standardizedRootPath: String
@@ -37,7 +37,7 @@ package struct FileSearchPathSnapshot: Sendable {
     }
 }
 
-package struct FileSearchPathFilterResult: Equatable, Sendable {
+package struct FileSearchPathFilterResult: Equatable {
     package let matchedFullPaths: [String]
     package let visitedSnapshotCount: Int
     package let cancelled: Bool
@@ -47,7 +47,7 @@ package struct FileSearchPathFilterResult: Equatable, Sendable {
 /// holds indices into the input `snapshots` array, in snapshot iteration order, with
 /// each snapshot appearing at most once. Lets callers map matches directly back to
 /// their source array without a full-path string round trip.
-package struct FileSearchPathIndexFilterResult: Equatable, Sendable {
+package struct FileSearchPathIndexFilterResult: Equatable {
     package let matchedSnapshotIndices: [Int]
     package let visitedSnapshotCount: Int
     package let cancelled: Bool

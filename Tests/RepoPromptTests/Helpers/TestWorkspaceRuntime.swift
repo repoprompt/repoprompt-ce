@@ -4,7 +4,7 @@ import Foundation
 @testable import RepoPromptCoreMacOS
 
 func makeAppTestWorkspaceRuntimeDependencies(
-    maxPendingWatcherEntries: Int = 50_000,
+    maxPendingWatcherEntries: Int = 50000,
     maxParallelScans: Int? = nil,
     maxFoldersPerBatch: Int = 256,
     diagnostics: (any WorkspaceRuntimeDiagnosticsSink)? = nil
@@ -101,7 +101,7 @@ extension FileSystemService {
                 maxFoldersPerBatchOverride: maxFoldersPerBatchOverride,
                 maxPendingWatcherIngressEntriesOverride: maxPendingWatcherIngressEntriesOverride,
                 dependencies: makeAppTestWorkspaceRuntimeDependencies(
-                    maxPendingWatcherEntries: maxPendingWatcherIngressEntriesOverride ?? 50_000,
+                    maxPendingWatcherEntries: maxPendingWatcherIngressEntriesOverride ?? 50000,
                     maxParallelScans: maxParallelScansOverride,
                     maxFoldersPerBatch: maxFoldersPerBatchOverride ?? 256
                 )

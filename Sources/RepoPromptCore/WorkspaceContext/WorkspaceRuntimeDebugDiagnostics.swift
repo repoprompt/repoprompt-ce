@@ -30,6 +30,11 @@ package enum WorkspaceRuntimeDebugLog {
 }
 
 package enum WorkspaceRootLoadDiagnosticFields {
-    package static func rootRecordCreatedFields(forPath _: String) -> [String: String] { [:] }
-    package static func firstPreparedChunkFields(forPath _: String) -> [String: String] { [:] }
+    package static func rootRecordCreatedFields(forPath _: String) -> [String: String] {
+        [:]
+    }
+
+    package static func firstPreparedChunkFields(forPath _: String) -> [String: String] {
+        [:]
+    }
 }

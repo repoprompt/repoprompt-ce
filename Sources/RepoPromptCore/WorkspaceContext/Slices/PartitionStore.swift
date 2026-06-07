@@ -34,7 +34,7 @@ public struct PartitionScope: Sendable, Equatable {
     }
 }
 
-package struct PartitionStoreSaveEvent: Sendable, Equatable {
+package struct PartitionStoreSaveEvent: Equatable {
     package let rootPath: String
     package let scope: PartitionScope
     package let sourceID: UUID
@@ -365,7 +365,6 @@ package actor PartitionStore {
         let fileName = "filepartitions-\(scope.workspaceID.uuidString.lowercased())\(suffix).json"
         return folder.appendingPathComponent(fileName, isDirectory: false)
     }
-
 
     private func loadPartition(at url: URL) -> PartitionData? {
         do {

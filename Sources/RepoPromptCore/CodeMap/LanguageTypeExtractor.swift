@@ -2104,8 +2104,8 @@ package enum LanguageTypeExtractor {
     }
 }
 
-extension LanguageTypeExtractor {
-    package enum TS {
+package extension LanguageTypeExtractor {
+    enum TS {
         static func extractTypeAnnotation(from line: String) -> String? {
             LanguageTypeExtractor.extractTSTypeAnnotation(from: line)
         }

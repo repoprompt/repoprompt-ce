@@ -264,11 +264,11 @@ package struct IgnoreRulesSnapshot {
     }
 }
 
-extension IgnoreRules {
+package extension IgnoreRules {
     /// Appends a **pre-compiled** layer as the new highest-priority node.
     /// This avoids recompiling the same file multiple times when the caller
     /// already has a `CompiledIgnoreRules` instance.
-    package func addCompiledLayer(_ compiled: CompiledIgnoreRules) {
+    func addCompiledLayer(_ compiled: CompiledIgnoreRules) {
         cachedSnapshot = nil
         tail = RulesNode(compiled: compiled, parent: tail)
     }

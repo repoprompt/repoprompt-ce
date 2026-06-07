@@ -1,6 +1,6 @@
 import Foundation
 
-package enum WorkspaceSearchReadinessPhase: String, Sendable, Equatable {
+package enum WorkspaceSearchReadinessPhase: String, Equatable {
     case idle
     case activating
     case loadingCatalog
@@ -9,7 +9,7 @@ package enum WorkspaceSearchReadinessPhase: String, Sendable, Equatable {
     case degraded
 }
 
-package struct WorkspaceSearchReadinessSnapshot: Sendable, Equatable {
+package struct WorkspaceSearchReadinessSnapshot: Equatable {
     package let workspaceID: UUID?
     package let phase: WorkspaceSearchReadinessPhase
     package let generation: UInt64

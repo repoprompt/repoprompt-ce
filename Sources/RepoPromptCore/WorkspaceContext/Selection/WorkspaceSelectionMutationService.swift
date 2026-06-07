@@ -1,6 +1,6 @@
 import Foundation
 
-package struct WorkspaceSelectionSliceInput: Equatable, Sendable {
+package struct WorkspaceSelectionSliceInput: Equatable {
     package let path: String
     package let ranges: [LineRange]
 

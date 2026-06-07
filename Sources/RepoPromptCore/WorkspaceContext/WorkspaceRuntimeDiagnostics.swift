@@ -1,7 +1,7 @@
 import Foundation
 
-package struct WorkspaceRuntimeDiagnosticEvent: Sendable, Equatable {
-    package enum Kind: String, Sendable {
+package struct WorkspaceRuntimeDiagnosticEvent: Equatable {
+    package enum Kind: String {
         case intervalBegan
         case intervalEnded
         case lifecycle

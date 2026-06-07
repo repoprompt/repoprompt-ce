@@ -1,12 +1,17 @@
 import Foundation
 
-package struct WorkspaceDirectoryEntry: Sendable, Equatable {
+package struct WorkspaceDirectoryEntry: Equatable {
     package let name: String
     package let isDirectory: Bool
     package let isSymbolicLink: Bool
 
-    package var isDir: Bool { isDirectory }
-    package var isSym: Bool { isSymbolicLink }
+    package var isDir: Bool {
+        isDirectory
+    }
+
+    package var isSym: Bool {
+        isSymbolicLink
+    }
 
     package init(name: String, isDirectory: Bool, isSymbolicLink: Bool) {
         self.name = name
@@ -15,7 +20,7 @@ package struct WorkspaceDirectoryEntry: Sendable, Equatable {
     }
 }
 
-package struct WorkspaceDirectoryScanResult: Sendable, Equatable {
+package struct WorkspaceDirectoryScanResult: Equatable {
     package let entries: [WorkspaceDirectoryEntry]
     package let hasGitignore: Bool
     package let hasRepoIgnore: Bool
@@ -34,7 +39,7 @@ package struct WorkspaceDirectoryScanResult: Sendable, Equatable {
     }
 }
 
-package struct WorkspaceDirectoryIdentity: Sendable, Hashable {
+package struct WorkspaceDirectoryIdentity: Hashable {
     package let device: UInt64
     package let inode: UInt64
 

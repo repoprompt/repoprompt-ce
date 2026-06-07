@@ -21,7 +21,7 @@ package final class WorkspaceSelectionObservationToken {
 /// Canonical session-backed selection owner. UI flushing and mirroring remain app adapters.
 @MainActor
 package final class WorkspaceSelectionController {
-    package struct Target: Hashable, Sendable {
+    package struct Target: Hashable {
         package let workspaceID: UUID
         package let tabID: UUID
 
@@ -55,7 +55,7 @@ package final class WorkspaceSelectionController {
         }
     }
 
-    package enum Source: String, Equatable, Sendable {
+    package enum Source: String, Equatable {
         case uiFlush
         case runtimeMutation
         case virtual

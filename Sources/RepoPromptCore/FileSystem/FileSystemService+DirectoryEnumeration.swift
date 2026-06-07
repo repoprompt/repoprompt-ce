@@ -1,10 +1,10 @@
 import Foundation
 
-extension FileSystemService {
+package extension FileSystemService {
     // MARK: - Parallel scanning support
 
     /// Result of scanning a single folder (Sendable for cross-task usage)
-    package struct ScanResult {
+    struct ScanResult {
         let folderRel: String
         let children: [String: Bool] // relPath -> isDirectory
         let ignoreFiles: (hasGitignore: Bool, hasRepoIgnore: Bool, hasCursorignore: Bool)
@@ -12,7 +12,7 @@ extension FileSystemService {
 
     /// Heavy I/O operation that runs outside the actor for parallelism.
     /// Uses POSIX opendir/readdir for better performance than FileManager.contentsOfDirectory.
-    package static func enumerateOneLevel(
+    static func enumerateOneLevel(
         absFolder: String,
         relFolder: String,
         skipSymlinks: Bool,
@@ -75,7 +75,7 @@ extension FileSystemService {
 
     /// Scan multiple folders in parallel for better I/O performance.
     /// Uses configurable caps to prevent CPU saturation.
-    package func scanFoldersInParallel(_ folders: Set<String>) async throws -> [FileSystemDelta] {
+    func scanFoldersInParallel(_ folders: Set<String>) async throws -> [FileSystemDelta] {
         guard !folders.isEmpty else { return [] }
 
         // In test mode, always use serial scanning to avoid thread safety issues with SpyFS
@@ -219,7 +219,7 @@ extension FileSystemService {
 
     // MARK: - Single-level scanning & removal
 
-    package func scanOneLevelAndDiff(_ folderRelPath: String) async throws -> [FileSystemDelta] {
+    func scanOneLevelAndDiff(_ folderRelPath: String) async throws -> [FileSystemDelta] {
         let fm = fm // Cache for multiple calls in this method
         let absFolder = fullPath(forRelativePath: folderRelPath)
         var isDir: ObjCBool = false
@@ -351,7 +351,7 @@ extension FileSystemService {
     }
 
     /// Recursively enumerates everything in a newly discovered folder, creating .fileAdded / .folderAdded deltas.
-    package func scanSubtreeForNewFolder(_ folderRelPath: String) async throws -> [FileSystemDelta] {
+    func scanSubtreeForNewFolder(_ folderRelPath: String) async throws -> [FileSystemDelta] {
         let absFolder = fullPath(forRelativePath: folderRelPath)
         let subtreeItems = try await gatherPathsUsingEnumerator(
             rootURL: URL(fileURLWithPath: absFolder),
@@ -383,7 +383,7 @@ extension FileSystemService {
     }
 
     /// Removes an entire subtree for a given folder from visitedPaths. Returns .fileRemoved / .folderRemoved deltas.
-    package func removeSubtree(for topRelPath: String) -> [FileSystemDelta] {
+    func removeSubtree(for topRelPath: String) -> [FileSystemDelta] {
         let oldSet = visitedPaths.filter {
             $0 == topRelPath || $0.hasPrefix(topRelPath + "/")
         }
@@ -403,7 +403,7 @@ extension FileSystemService {
         return deltas
     }
 
-    package func loadContentsInChunks(
+    func loadContentsInChunks(
         of folderURL: URL,
         chunkSize: Int = 200
     ) -> AsyncThrowingStream<LoadContentsEvent, Error> {
@@ -457,7 +457,7 @@ extension FileSystemService {
     }
 
     /// Load the entire tree (recursively) as an AsyncThrowingStream of items, respecting skipSymlinks & ignore rules.
-    package func loadContents(of folder: URL) -> AsyncThrowingStream<(any FileSystemItem, [String]), Error> {
+    func loadContents(of folder: URL) -> AsyncThrowingStream<(any FileSystemItem, [String]), Error> {
         AsyncThrowingStream { continuation in
             let streamingTask = Task {
                 do {
@@ -506,7 +506,7 @@ extension FileSystemService {
         }
     }
 
-    package final class DirChain: @unchecked Sendable {
+    final class DirChain: @unchecked Sendable {
         let id: DirID
         let parent: DirChain?
 
@@ -525,7 +525,7 @@ extension FileSystemService {
         }
     }
 
-    package struct DirectoryContext {
+    struct DirectoryContext {
         let absPath: String
         let relPath: String
         let hierarchy: Int
@@ -533,14 +533,14 @@ extension FileSystemService {
         let chain: DirChain?
     }
 
-    package struct DirectoryChunkResult {
+    struct DirectoryChunkResult {
         let folders: [FSItemDTO]
         let files: [FSItemDTO]
         let subdirs: [DirectoryContext]
         let ignoreCacheDelta: [IgnoreCacheStore.PathKey: Bool]
     }
 
-    package static func buildDirectoryChunk(
+    static func buildDirectoryChunk(
         service: FileSystemService,
         context: DirectoryContext,
         scanResult: DirectoryScanResult,
@@ -683,7 +683,7 @@ extension FileSystemService {
     }
 
     @inline(__always)
-    package static func joinRootAndRelative(root: String, relative: String) -> String {
+    static func joinRootAndRelative(root: String, relative: String) -> String {
         guard !relative.isEmpty else { return root }
         if root.isEmpty {
             return relative
@@ -694,7 +694,7 @@ extension FileSystemService {
         return root + "/" + relative
     }
 
-    package func walkPosixRecursivelyEmitChunks(
+    func walkPosixRecursivelyEmitChunks(
         baseURL: URL,
         parentRules: IgnoreRules,
         chunkSize: Int,
@@ -844,7 +844,9 @@ extension FileSystemService {
         flush(force: true)
         return totalFilesSeen
     }
+}
 
+extension FileSystemService {
     #if DEBUG
         func gatherPathsUsingVirtualFS(
             rootURL: URL,
@@ -964,14 +966,16 @@ extension FileSystemService {
             )
         }
     #endif
+}
 
-    package func folderURLRootPath(_ folderURL: URL) -> String {
+package extension FileSystemService {
+    func folderURLRootPath(_ folderURL: URL) -> String {
         folderURL.standardizedFileURL.path
     }
 
     // MARK: - Internal enumeration & helpers
 
-    package func gatherPathsUsingEnumerator(
+    func gatherPathsUsingEnumerator(
         rootURL: URL,
         skipSymlinks: Bool,
         baseRelativePath: String
@@ -1124,7 +1128,7 @@ extension FileSystemService {
         return results
     }
 
-    package static func joinRelativePaths(base: String, child: String) -> String {
+    static func joinRelativePaths(base: String, child: String) -> String {
         if base.isEmpty { return child }
         if child.isEmpty { return base }
         return base + "/" + child

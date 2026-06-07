@@ -22,9 +22,11 @@ private final class WorkspaceRuntimeProcessDiagnostics: @unchecked Sendable {
 /// Foundation-only diagnostic vocabulary for the shared runtime. The app may
 /// install an injected sink around runtime entry points; Core owns no signposter.
 package enum WorkspaceRuntimePerf {
-    package struct LifecycleCorrelation: Sendable {
+    package struct LifecycleCorrelation {
         let id: UUID
-        init(id: UUID = UUID()) { self.id = id }
+        init(id: UUID = UUID()) {
+            self.id = id
+        }
     }
 
     @TaskLocal static var currentLifecycleCorrelation: LifecycleCorrelation?
@@ -49,7 +51,7 @@ package enum WorkspaceRuntimePerf {
         }
     }
 
-    package struct IntervalState: Sendable {
+    package struct IntervalState {
         let correlationID: UUID?
         let intervalID: UUID
     }

@@ -25,8 +25,8 @@ package struct Folder: FileSystemItem {
     }
 }
 
-extension FileSystemItem {
-    package func relativePath(rootPath: String) -> String {
+package extension FileSystemItem {
+    func relativePath(rootPath: String) -> String {
         RelativePath.from(absolutePath: path, rootPath: rootPath)
     }
 }

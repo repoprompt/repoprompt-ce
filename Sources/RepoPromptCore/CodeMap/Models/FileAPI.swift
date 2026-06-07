@@ -209,22 +209,30 @@ package struct FileAPI: Codable {
         if !aliases.isEmpty {
             lines.append("")
             lines.append("Type-aliases:")
-            for alias in aliases { lines.append("  - \(alias.name)") }
+            for alias in aliases {
+                lines.append("  - \(alias.name)")
+            }
         }
         if !literalUnions.isEmpty {
             lines.append("")
             lines.append("Literal-union aliases:")
-            for union in literalUnions { lines.append("  - \(union)") }
+            for union in literalUnions {
+                lines.append("  - \(union)")
+            }
         }
         if !functions.isEmpty {
             lines.append("")
             lines.append("Functions:")
-            for function in functions { lines.append("  - \(formatFunctionLine(function))") }
+            for function in functions {
+                lines.append("  - \(formatFunctionLine(function))")
+            }
         }
         if !enums.isEmpty {
             lines.append("")
             lines.append("Enums:")
-            for enumInfo in enums { lines.append("  - \(enumInfo.name)") }
+            for enumInfo in enums {
+                lines.append("  - \(enumInfo.name)")
+            }
         }
         if !globalVars.isEmpty {
             lines.append("")
@@ -236,12 +244,16 @@ package struct FileAPI: Codable {
         if !exports.isEmpty {
             lines.append("")
             lines.append("Exports:")
-            for export in exports { lines.append("  - \(export)") }
+            for export in exports {
+                lines.append("  - \(export)")
+            }
         }
         if !macros.isEmpty {
             lines.append("")
             lines.append("Macros:")
-            for macro in macros { lines.append("  - \(macro)") }
+            for macro in macros {
+                lines.append("  - \(macro)")
+            }
         }
         lines.append("---")
 

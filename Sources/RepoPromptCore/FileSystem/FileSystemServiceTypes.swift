@@ -9,14 +9,14 @@ public enum FileSystemDelta: Sendable, Equatable {
     case folderModified(String, Date? = nil) // observed disk mtime when available
 }
 
-package enum FileSystemDeltaPublicationSource: String, Sendable {
+package enum FileSystemDeltaPublicationSource: String {
     case watcher
     case syntheticMutation
     case watcherBarrierNoop
     case overflowRootRescan
 }
 
-package struct FileSystemDeltaPublication: Sendable {
+package struct FileSystemDeltaPublication {
     package let servicePublicationSequence: UInt64
     package let source: FileSystemDeltaPublicationSource
     package let watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?

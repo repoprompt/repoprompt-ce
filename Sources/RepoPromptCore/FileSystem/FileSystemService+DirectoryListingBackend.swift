@@ -1,7 +1,7 @@
 import Foundation
 
-extension FileSystemService {
-    package func listDirectoryForCurrentFilesystem(_ path: String) throws -> WorkspaceDirectoryScanResult {
+package extension FileSystemService {
+    func listDirectoryForCurrentFilesystem(_ path: String) throws -> WorkspaceDirectoryScanResult {
         #if DEBUG
             if let override = fileManagerOverride, !(override is FileManager) {
                 return try Self.listDirectory(path, using: override)
@@ -9,8 +9,10 @@ extension FileSystemService {
         #endif
         return try directoryListingBackend.listDirectoryWithIgnoreDetection(at: path)
     }
+}
 
-    #if DEBUG
+#if DEBUG
+    extension FileSystemService {
         nonisolated static func listDirectory(
             _ path: String,
             using fileSystem: any FileSystemProviding
@@ -49,10 +51,12 @@ extension FileSystemService {
                 hasCursorignore: hasCursorignore
             )
         }
-    #endif
+    }
+#endif
 
+package extension FileSystemService {
     @inline(__always)
-    package nonisolated static func isRepoPromptTempFilename(_ name: String) -> Bool {
+    nonisolated static func isRepoPromptTempFilename(_ name: String) -> Bool {
         name.hasPrefix(".repoprompt.tmp.")
     }
 }

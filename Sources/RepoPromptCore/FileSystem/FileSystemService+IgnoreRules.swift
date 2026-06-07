@@ -190,11 +190,10 @@ extension FileSystemService {
         let parentRules = try await ensureRulesChain(for: parent)
         let absPath = fullPath(forRelativePath: relativeDirectory)
 
-        let scan: WorkspaceDirectoryScanResult
-        if let provided = scanResult {
-            scan = provided
+        let scan: WorkspaceDirectoryScanResult = if let provided = scanResult {
+            provided
         } else {
-            scan = try listDirectoryForCurrentFilesystem(absPath)
+            try listDirectoryForCurrentFilesystem(absPath)
         }
 
         let dirURL = URL(fileURLWithPath: absPath)

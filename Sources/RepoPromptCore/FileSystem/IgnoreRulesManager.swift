@@ -48,7 +48,6 @@ package enum IgnoreSettingsDefaults {
     **/*.temp
     **/*.bak
     """
-
 }
 
 /// A lightweight manager that builds `IgnoreRules` on demand, with no caching.

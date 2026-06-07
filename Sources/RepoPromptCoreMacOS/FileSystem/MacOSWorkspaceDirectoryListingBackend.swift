@@ -96,11 +96,11 @@ package struct MacOSWorkspaceDirectoryListingBackend: WorkspaceDirectoryListingB
     ) -> (isDirectory: Bool, isSymbolicLink: Bool) {
         switch Int32(entry.d_type) {
         case DT_DIR:
-            return (true, false)
+            (true, false)
         case DT_LNK, DT_UNKNOWN:
-            return fallbackFileType(directory: directory, entry: entry, nameLength: nameLength)
+            fallbackFileType(directory: directory, entry: entry, nameLength: nameLength)
         default:
-            return (false, false)
+            (false, false)
         }
     }
 

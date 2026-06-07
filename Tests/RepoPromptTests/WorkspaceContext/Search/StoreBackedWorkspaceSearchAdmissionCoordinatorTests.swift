@@ -564,9 +564,9 @@ import XCTest
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
                     try await WorkspaceRuntimePerf.withLifecycleCorrelation(id: correlation.id) {
                         try await coordinator.withBroadSearchPermit(
-                        for: store,
-                        searchMode: .content,
-                        admissionClass: .unscopedContent
+                            for: store,
+                            searchMode: .content,
+                            admissionClass: .unscopedContent
                         ) {
                             value
                         }

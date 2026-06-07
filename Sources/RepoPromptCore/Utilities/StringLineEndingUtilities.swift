@@ -2,7 +2,7 @@ import Foundation
 import RepoPromptC
 
 package extension String {
-    package static func splitContentPreservingLineEndings(_ content: String) -> ([String], String) {
+    static func splitContentPreservingLineEndings(_ content: String) -> ([String], String) {
         content.withCString { pointer in
             guard let result = repo_split_content_preserving_endings(pointer) else {
                 return ([], "\n")
@@ -20,7 +20,7 @@ package extension String {
         }
     }
 
-    package static func splitContentPreservingAllLineEndings(_ content: String) -> [(line: String, ending: String)] {
+    static func splitContentPreservingAllLineEndings(_ content: String) -> [(line: String, ending: String)] {
         guard !content.isEmpty else { return [] }
         var result: [(String, String)] = []
         result.reserveCapacity(32)

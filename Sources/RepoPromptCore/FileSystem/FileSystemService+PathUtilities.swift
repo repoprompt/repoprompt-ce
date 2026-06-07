@@ -1,9 +1,9 @@
 import Foundation
 
-extension FileSystemService {
+package extension FileSystemService {
     // MARK: - Helpers
 
-    package func fullPath(forRelativePath relativePath: String) -> String {
+    func fullPath(forRelativePath relativePath: String) -> String {
         let sanitized: String
         if relativePath.hasPrefix("/") {
             let trimmed = relativePath.drop { $0 == "/" }
@@ -14,12 +14,12 @@ extension FileSystemService {
         return (path as NSString).appendingPathComponent(sanitized)
     }
 
-    package enum RelativeEventPath {
+    enum RelativeEventPath {
         case inside(relative: String)
         case outside(originalAbsolute: String)
     }
 
-    package func fileOrFolderIsDir(_ relativePath: String) -> Bool {
+    func fileOrFolderIsDir(_ relativePath: String) -> Bool {
         let full = (path as NSString).appendingPathComponent(relativePath)
         var isDir: ObjCBool = false
         _ = fm.fileExists(atPath: full, isDirectory: &isDir)
@@ -27,7 +27,7 @@ extension FileSystemService {
     }
 
     @inline(__always)
-    package nonisolated static func trimPathSlashes(_ value: some StringProtocol) -> String {
+    nonisolated static func trimPathSlashes(_ value: some StringProtocol) -> String {
         var start = value.startIndex
         var end = value.endIndex
         while start < end, value[start] == "/" {
@@ -42,7 +42,7 @@ extension FileSystemService {
     }
 
     @inline(__always)
-    package func mapToRelativeEventPath(_ absolutePath: String) -> RelativeEventPath {
+    func mapToRelativeEventPath(_ absolutePath: String) -> RelativeEventPath {
         guard Self.eventPathIsSafeForRawPrefixMapping(absolutePath) else {
             return mapToRelativeEventPathFallback(absolutePath)
         }
@@ -59,7 +59,7 @@ extension FileSystemService {
         return mapToRelativeEventPathFallback(absolutePath)
     }
 
-    package func mapToRelativeEventPathFallback(_ absolutePath: String) -> RelativeEventPath {
+    func mapToRelativeEventPathFallback(_ absolutePath: String) -> RelativeEventPath {
         guard !absolutePath.isEmpty else {
             return .outside(originalAbsolute: absolutePath)
         }
@@ -80,7 +80,7 @@ extension FileSystemService {
     }
 
     @inline(__always)
-    package nonisolated static func eventPathIsSafeForRawPrefixMapping(_ path: String) -> Bool {
+    nonisolated static func eventPathIsSafeForRawPrefixMapping(_ path: String) -> Bool {
         var byteCount = 0
         var previousWasSlash = false
         var currentComponentLength = 0
@@ -131,14 +131,14 @@ extension FileSystemService {
     }
 
     @inline(__always)
-    package func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
+    func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
         guard path.hasPrefix(base) else { return false }
         if path.count == base.count { return true }
         let idx = path.index(path.startIndex, offsetBy: base.count)
         return path[idx] == "/"
     }
 
-    package func relativePathFor(_ absolutePath: String) -> String {
+    func relativePathFor(_ absolutePath: String) -> String {
         switch mapToRelativeEventPath(absolutePath) {
         case let .inside(relative):
             relative
@@ -147,29 +147,29 @@ extension FileSystemService {
         }
     }
 
-    package func parentDirectory(of relativePath: String) -> String {
+    func parentDirectory(of relativePath: String) -> String {
         guard let slashIndex = relativePath.lastIndex(of: "/") else {
             return ""
         }
         return String(relativePath[..<slashIndex])
     }
 
-    package func isSpecialControlFile(_ relPath: String) -> Bool {
+    func isSpecialControlFile(_ relPath: String) -> Bool {
         isIgnoreFile(relPath)
     }
 
-    package func isIgnoreFile(_ relPath: String) -> Bool {
+    func isIgnoreFile(_ relPath: String) -> Bool {
         let filename = (relPath as NSString).lastPathComponent.lowercased()
         return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
     }
 
     @inline(__always)
-    package func isRepoPromptTempPath(_ relPath: String) -> Bool {
+    func isRepoPromptTempPath(_ relPath: String) -> Bool {
         if relPath.hasPrefix(".repoprompt.tmp.") { return true }
         return relPath.contains("/.repoprompt.tmp.")
     }
 
-    package func isGitMetadataPath(_ relPath: String) -> Bool {
+    func isGitMetadataPath(_ relPath: String) -> Bool {
         if relPath.isEmpty { return false }
         if relPath == ".git" { return true }
         return relPath.hasPrefix(".git/")
@@ -177,7 +177,7 @@ extension FileSystemService {
 
     /// Static version so off-actor code can do the same boundary check.
     @inline(__always)
-    package static func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
+    static func hasDirectoryPrefix(_ path: String, _ base: String) -> Bool {
         guard path.hasPrefix(base) else { return false }
         if path.count == base.count { return true }
         let idx = path.index(path.startIndex, offsetBy: base.count)
@@ -187,8 +187,8 @@ extension FileSystemService {
 
 // MARK: - FileManager extension
 
-extension FileManager {
-    package func isFolder(atPath path: String) -> Bool {
+package extension FileManager {
+    func isFolder(atPath path: String) -> Bool {
         var isDir: ObjCBool = false
         fileExists(atPath: path, isDirectory: &isDir)
         return isDir.boolValue
@@ -197,8 +197,8 @@ extension FileManager {
 
 // MARK: - URL extension
 
-extension URL {
-    package func relativePath(from base: URL) -> String {
+package extension URL {
+    func relativePath(from base: URL) -> String {
         let basePath = (base.path as NSString).standardizingPath
         let filePath = (path as NSString).standardizingPath
 

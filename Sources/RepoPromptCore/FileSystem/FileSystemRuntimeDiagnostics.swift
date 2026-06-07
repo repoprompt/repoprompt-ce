@@ -1,6 +1,6 @@
 import Foundation
 
-package struct FileSystemDiagnosticContext: Sendable, Equatable {
+package struct FileSystemDiagnosticContext: Equatable {
     package let correlationID: UUID
 
     package init(correlationID: UUID = UUID()) {

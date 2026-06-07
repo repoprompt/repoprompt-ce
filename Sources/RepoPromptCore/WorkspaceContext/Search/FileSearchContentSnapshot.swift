@@ -1,6 +1,6 @@
 import Foundation
 
-package enum FileContentFreshnessPolicy: Sendable {
+package enum FileContentFreshnessPolicy {
     /// Trust existing metadata/cache fast paths.
     case cachedMetadata
     /// Validate disk metadata before trusting cached content; never return stale fallback on validation/load failure.
@@ -8,7 +8,7 @@ package enum FileContentFreshnessPolicy: Sendable {
 }
 
 /// Snapshot of file content plus a stable in-memory revision for search cache identity.
-package struct FileSearchContentSnapshot: Sendable {
+package struct FileSearchContentSnapshot {
     package let content: String?
     package let contentRevision: UInt64?
     package let modificationDate: Date

@@ -8,11 +8,11 @@ import Foundation
 /// queued details to the existing root-rescan sentinel contract without discarding
 /// accepted progress.
 package final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
-    package struct AcceptanceGeneration: Hashable, Sendable {
+    package struct AcceptanceGeneration: Hashable {
         package let rawValue: UInt64
     }
 
-    package struct Watermark: Hashable, Comparable, Sendable {
+    package struct Watermark: Hashable, Comparable {
         package let rawValue: UInt64
 
         package static let zero = Watermark(rawValue: 0)

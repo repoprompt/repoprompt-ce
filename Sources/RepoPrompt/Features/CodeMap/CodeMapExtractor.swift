@@ -628,7 +628,7 @@ enum CodeMapExtractor {
         }
     }
 
-    // Slice 3 keeps definition-block rendering app-owned, including this record-to-render-input projection.
+    /// Slice 3 keeps definition-block rendering app-owned, including this record-to-render-input projection.
     private static func acceptedFileAPIs(from files: [WorkspaceFileRecord], allFileAPIs: [FileAPI]) -> [FileAPI] {
         guard !files.isEmpty, !allFileAPIs.isEmpty else { return [] }
         #if DEBUG || EDIT_FLOW_PERF

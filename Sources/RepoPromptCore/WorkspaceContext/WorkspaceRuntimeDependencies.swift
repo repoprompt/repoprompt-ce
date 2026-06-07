@@ -1,6 +1,6 @@
 import Foundation
 
-package struct WorkspaceRuntimeConfiguration: Sendable {
+package struct WorkspaceRuntimeConfiguration {
     package let maxPendingWatcherEntries: Int
     package let maxParallelScans: Int?
     package let maxFoldersPerBatch: Int
@@ -8,7 +8,7 @@ package struct WorkspaceRuntimeConfiguration: Sendable {
     package let globalIgnoreDefaults: String
 
     package init(
-        maxPendingWatcherEntries: Int = 50_000,
+        maxPendingWatcherEntries: Int = 50000,
         maxParallelScans: Int? = nil,
         maxFoldersPerBatch: Int = 256,
         agentSupportRoot: URL,
@@ -22,7 +22,7 @@ package struct WorkspaceRuntimeConfiguration: Sendable {
     }
 }
 
-package struct WorkspaceRuntimeDependencies: Sendable {
+package struct WorkspaceRuntimeDependencies {
     package let watcherFactory: any FileSystemWatcherCreating
     package let directoryListingBackend: any WorkspaceDirectoryListingBackend
     package let mutationBackend: (any WorkspaceFileMutationBackend)?

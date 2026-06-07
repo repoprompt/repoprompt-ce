@@ -1,6 +1,6 @@
 import Foundation
 
-package enum BroadSearchAdmissionClass: String, Sendable {
+package enum BroadSearchAdmissionClass: String {
     case unscopedContent
     case unscopedBoth
 }
