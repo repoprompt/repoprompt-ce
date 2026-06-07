@@ -21,6 +21,12 @@ final class TokenProjectionTests: XCTestCase {
             source: .immutableSnapshot,
             basis: .exactRenderedPayload
         )
+        let preflightExport = TokenProjection.Provenance(
+            view: .userConfigured,
+            scope: .export,
+            source: .activeLive,
+            basis: .renderedPayloadEstimate
+        )
 
         XCTAssertNotEqual(normalized, configured)
         XCTAssertEqual(normalized.view, .normalized)
@@ -33,6 +39,8 @@ final class TokenProjectionTests: XCTestCase {
         XCTAssertEqual(snapshotExport.source, .immutableSnapshot)
         XCTAssertEqual(normalized.basis, .componentEstimate)
         XCTAssertEqual(configured.basis, .exactRenderedPayload)
+        XCTAssertEqual(preflightExport.basis, .renderedPayloadEstimate)
+        XCTAssertNotEqual(preflightExport, snapshotExport)
     }
 
     func testComponentEstimatePreservesDuplicatePromptArithmetic() {
@@ -355,6 +363,23 @@ final class TokenProjectionTests: XCTestCase {
         XCTAssertNil(withoutOther.components.other)
         XCTAssertEqual(withOther.total, 141)
         XCTAssertEqual(withOther.components.other, 5)
+    }
+
+    func testRenderedPayloadEstimateUsesCompleteStringWithoutClaimingExactBytes() {
+        let projection = TokenProjectionService.renderedPayloadEstimate(
+            "12345678",
+            view: .userConfigured,
+            source: .activeLive
+        )
+
+        XCTAssertEqual(projection.total, TokenCalculationService.estimateTokens(for: "12345678"))
+        XCTAssertEqual(projection.provenance, .init(
+            view: .userConfigured,
+            scope: .export,
+            source: .activeLive,
+            basis: .renderedPayloadEstimate
+        ))
+        XCTAssertEqual(projection.components, .init())
     }
 
     func testExactRenderedPayloadUsesCompleteStringEstimateWithoutInventingComponents() {

@@ -237,6 +237,85 @@ final class PromptMigrationRemovalTests: XCTestCase {
         XCTAssertFalse(headlessPlanSource.contains("coreStandardChat"))
     }
 
+    func testProviderAwareAccountingFoundationRemainsNeutralAdditiveAndAppOwned() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let coreProjectionSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let coreProjectionServiceSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let projectionSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Models/AIProviderInputProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let aiMessageSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift"),
+            encoding: .utf8
+        )
+        let providerFactorySource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift"
+            ),
+            encoding: .utf8
+        )
+        let providerCapabilitySource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderInputProjectionCapability.swift"
+            ),
+            encoding: .utf8
+        )
+        let queriesSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/AIQueriesService.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(coreProjectionSource.contains("case renderedPayloadEstimate"))
+        XCTAssertTrue(coreProjectionServiceSource.contains("package static func renderedPayloadEstimate"))
+        XCTAssertFalse(coreProjectionSource.contains("AIProviderInputProjection"))
+        XCTAssertFalse(coreProjectionServiceSource.contains("AIProviderInputProjection"))
+
+        for declaration in [
+            "struct AIProviderInputProjection",
+            "struct ChatInputTokenEstimate",
+            "enum AIProviderInputProjectionResolver"
+        ] {
+            XCTAssertTrue(projectionSource.contains(declaration), declaration)
+        }
+        XCTAssertTrue(projectionSource.contains("enum RouteResolution"))
+        XCTAssertTrue(projectionSource.contains("case providerResolved"))
+        XCTAssertTrue(projectionSource.contains("case providerRuntimeConfigurationRequired"))
+        XCTAssertTrue(projectionSource.contains("case providerProjectionUnavailable"))
+        XCTAssertTrue(projectionSource.contains("private init("))
+        XCTAssertTrue(projectionSource.contains("fragments: fragments(for: input)"))
+        XCTAssertTrue(projectionSource.contains("TokenProjectionService.renderedPayloadEstimate"))
+        XCTAssertFalse(projectionSource.contains("TokenProjectionService.exactRenderedPayload"))
+
+        XCTAssertTrue(aiMessageSource.contains("struct PreparedOpenAIChatInput"))
+        XCTAssertTrue(aiMessageSource.contains("struct PreparedOpenAIResponsesInput"))
+        XCTAssertTrue(aiMessageSource.contains("preparedOpenAIChatInput(embedSystemPrompt:"))
+        XCTAssertTrue(aiMessageSource.contains("let prepared = preparedOpenAIResponsesInput()"))
+
+        XCTAssertTrue(providerFactorySource.contains("func streamMessageWithInputProjection("))
+        XCTAssertTrue(providerCapabilitySource.contains("struct AIProviderStreamStart"))
+        XCTAssertEqual(
+            providerCapabilitySource.components(separatedBy: "func streamMessageWithInputProjection(").count - 1,
+            1
+        )
+        XCTAssertTrue(providerCapabilitySource.contains("inputProjection: nil"))
+        XCTAssertFalse(queriesSource.contains("streamMessageWithInputProjection"))
+    }
+
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {
         let presetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000456"))
         let overridesRaw = """

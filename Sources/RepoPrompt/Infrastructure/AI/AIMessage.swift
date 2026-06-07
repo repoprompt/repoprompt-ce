@@ -20,6 +20,20 @@ struct AIMessage {
         case coreStandardChat
     }
 
+    struct PreparedMessage: Equatable {
+        let role: AIProviderInputRole
+        let content: String
+    }
+
+    struct PreparedOpenAIChatInput: Equatable {
+        let messages: [PreparedMessage]
+    }
+
+    struct PreparedOpenAIResponsesInput: Equatable {
+        let instructions: String?
+        let messages: [PreparedMessage]
+    }
+
     /// The main system prompt
     let systemPrompt: String
 
@@ -263,88 +277,87 @@ struct AIMessage {
         return assembled.isEmpty ? userBlock : userBlock + "\n\n" + assembled
     }
 
+    func preparedOpenAIChatInput(embedSystemPrompt: Bool) -> PreparedOpenAIChatInput {
+        let tail = buildTail(embedSystemPrompt: embedSystemPrompt)
+        var messages: [PreparedMessage] = []
+
+        if !embedSystemPrompt, !systemPrompt.isEmpty {
+            messages.append(.init(role: .system, content: systemPrompt))
+        }
+
+        let lastUserIndex = conversationMessages.lastIndex { $0.role == .user }
+        for (index, entry) in conversationMessages.enumerated() {
+            let text = entry.role == .user && index == lastUserIndex && !tail.isEmpty
+                ? tail + "\n" + entry.content
+                : entry.content
+            messages.append(.init(
+                role: entry.role == .user ? .user : .assistant,
+                content: text
+            ))
+        }
+
+        return PreparedOpenAIChatInput(messages: messages)
+    }
+
     /// Generates the full array of `ChatCompletionParameters.Message` objects
     /// that an OpenAI‑style chat endpoint expects.
     ///
     /// Replaces the old `createMessages` helper (which has been removed from
     /// providers).
     func openAIChatMessages(embedSystemPrompt: Bool) -> [ChatCompletionParameters.Message] {
-        let tail = buildTail(embedSystemPrompt: embedSystemPrompt)
-
-        var msgs: [ChatCompletionParameters.Message] = []
-
-        if !embedSystemPrompt, !systemPrompt.isEmpty {
-            msgs.append(.init(role: .system, content: .text(systemPrompt)))
+        preparedOpenAIChatInput(embedSystemPrompt: embedSystemPrompt).messages.map { message in
+            let role: ChatCompletionParameters.Message.Role = switch message.role {
+            case .system: .system
+            case .user: .user
+            case .assistant: .assistant
+            }
+            return .init(role: role, content: .text(message.content))
         }
-
-        let lastUserIndex = conversationMessages.lastIndex { $0.role == .user }
-
-        for (idx, entry) in conversationMessages.enumerated() {
-            let baseText = entry.content
-            let text = (entry.role == .user && idx == lastUserIndex && !tail.isEmpty)
-                ? tail + "\n" + baseText
-                : baseText
-
-            let role: ChatCompletionParameters.Message.Role = (entry.role == .user)
-                ? .user
-                : .assistant
-            msgs.append(.init(role: role, content: .text(text)))
-        }
-
-        return msgs
     }
 
-    /// Generates the full array of `InputItem`s for the Responses-API,
-    /// applying the **same** "tail-on-last-user" logic that
-    /// `openAIChatMessages(_:)` uses.
-    ///
-    /// All assistant turns are encoded as normal `message` objects
-    /// (role = "assistant").  This avoids the need for the `msg_…` ids that
-    /// `output_message` objects require.
-    func openAIResponsesInput() -> SwiftOpenAI.InputType {
-        // 1. Build the XML / meta tail that must be prepended to the *first*
-        //    user message.
+    func preparedOpenAIResponsesInput() -> PreparedOpenAIResponsesInput {
         let tail = buildTail(embedSystemPrompt: false)
         let additions = tail.isEmpty ? "" : tail + "\n\n"
 
-        var items: [SwiftOpenAI.InputItem] = []
+        var messages: [PreparedMessage] = []
         var firstUser = true
-
-        // 2. Walk through the stored conversation.
         for entry in conversationMessages {
             switch entry.role {
             case .user:
-                var text = entry.content
-                if firstUser {
-                    text = additions + text // prepend only once
-                    firstUser = false
-                }
-
-                let msg = SwiftOpenAI.InputMessage(
-                    role: "user",
-                    content: .text(text)
-                )
-                items.append(.message(msg))
-
+                let text = firstUser ? additions + entry.content : entry.content
+                firstUser = false
+                messages.append(.init(role: .user, content: text))
             case .assistant:
-                // Previous assistant reply – send as a plain message.
-                let msg = SwiftOpenAI.InputMessage(
-                    role: "assistant",
-                    content: .text(entry.content)
-                )
-                items.append(.message(msg))
+                messages.append(.init(role: .assistant, content: entry.content))
             }
         }
 
-        // 3. Edge-case: no user message yet but there *is* a tail.
-        if items.isEmpty, !additions.isEmpty {
-            let msg = SwiftOpenAI.InputMessage(
-                role: "user",
-                content: .text(additions)
-            )
-            items.append(.message(msg))
+        if messages.isEmpty, !additions.isEmpty {
+            messages.append(.init(role: .user, content: additions))
         }
 
+        return PreparedOpenAIResponsesInput(
+            instructions: systemPrompt.isEmpty ? nil : systemPrompt,
+            messages: messages
+        )
+    }
+
+    /// Generates the full array of `InputItem`s for the Responses API.
+    /// All assistant turns remain ordinary `message` objects so no provider
+    /// response IDs are required.
+    func openAIResponsesInput() -> SwiftOpenAI.InputType {
+        let prepared = preparedOpenAIResponsesInput()
+        let items = prepared.messages.map { message in
+            let role = switch message.role {
+            case .system: "system"
+            case .user: "user"
+            case .assistant: "assistant"
+            }
+            return SwiftOpenAI.InputItem.message(.init(
+                role: role,
+                content: .text(message.content)
+            ))
+        }
         return .array(items)
     }
 

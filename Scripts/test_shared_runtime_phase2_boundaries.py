@@ -72,6 +72,11 @@ RETIRED_PROMPT_ASSEMBLY_PATHS = (
     "Sources/RepoPrompt/Features/Prompt/Models/PromptAssemblyBuilder.swift",
 )
 
+REQUIRED_PROVIDER_ACCOUNTING_PATHS = (
+    "Sources/RepoPrompt/Infrastructure/AI/Models/AIProviderInputProjection.swift",
+    "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderInputProjectionCapability.swift",
+)
+
 CORE_IMPORTERS = {
     "RepoPromptC": {
         "FileSystem/GitignoreCompiler.swift",
@@ -238,6 +243,9 @@ def main() -> int:
     for relative in RETIRED_PROMPT_ASSEMBLY_PATHS:
         if (ROOT / relative).exists():
             fail(f"Retired app prompt assembly owner still exists: {relative}")
+    for relative in REQUIRED_PROVIDER_ACCOUNTING_PATHS:
+        if not (ROOT / relative).is_file():
+            fail(f"Required provider-aware accounting foundation missing: {relative}")
 
     core_accounting_source = (
         ROOT / "Sources/RepoPromptCore/Prompt/PromptContextAccountingService.swift"
@@ -276,6 +284,19 @@ def main() -> int:
     app_prompt_view_model_source = (
         ROOT / "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
     ).read_text()
+    app_provider_projection_source = (
+        ROOT / "Sources/RepoPrompt/Infrastructure/AI/Models/AIProviderInputProjection.swift"
+    ).read_text()
+    app_provider_factory_source = (
+        ROOT / "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift"
+    ).read_text()
+    app_provider_capability_source = (
+        ROOT
+        / "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderInputProjectionCapability.swift"
+    ).read_text()
+    app_queries_source = (
+        ROOT / "Sources/RepoPrompt/Infrastructure/AI/AIQueriesService.swift"
+    ).read_text()
     for declaration in (
         "package struct PromptRenderingFileValue",
         "package struct PromptRenderingDiffValue",
@@ -311,6 +332,12 @@ def main() -> int:
         )
     for required_ai_message_adapter in (
         "enum TailAssemblyStrategy",
+        "struct PreparedOpenAIChatInput",
+        "struct PreparedOpenAIResponsesInput",
+        "func preparedOpenAIChatInput(embedSystemPrompt: Bool)",
+        "func preparedOpenAIResponsesInput()",
+        "preparedOpenAIChatInput(embedSystemPrompt: embedSystemPrompt).messages.map",
+        "let prepared = preparedOpenAIResponsesInput()",
         "case legacy",
         "case coreStandardChat",
         "envelopePolicy: .chatStyleTree",
@@ -337,6 +364,55 @@ def main() -> int:
         fail("Exactly one standard PromptViewModel packagePromptResult path must opt into Core assembly")
     if "exactChatPayload(for: message, source: tokenSource)" not in app_prompt_view_model_source:
         fail("Standard chat exact accounting must continue to derive from the packaged AIMessage")
+
+    for required_projection_foundation in (
+        "struct AIProviderInputProjection",
+        "struct ChatInputTokenEstimate",
+        "enum AIProviderInputProjectionResolver",
+        "enum RouteResolution",
+        "case unresolved",
+        "case preflightResolved",
+        "case providerResolved",
+        "private init(",
+        "fragments: fragments(for: input)",
+        "TokenProjectionService.renderedPayloadEstimate",
+    ):
+        if required_projection_foundation not in app_provider_projection_source:
+            fail(f"Provider-aware accounting foundation missing: {required_projection_foundation}")
+    if "TokenProjectionService.exactRenderedPayload" in app_provider_projection_source:
+        fail("App-content projections must never claim exact rendered payload provenance")
+    for required_preflight_boundary in (
+        "case .openAI:",
+        "case .openRouter:",
+        "case .azure, .customProvider:",
+        "case .anthropic, .ollama, .gemini, .deepseek,",
+    ):
+        if required_preflight_boundary not in app_provider_projection_source:
+            fail(f"Narrow preflight boundary changed: {required_preflight_boundary}")
+    if "isKnownOpenAITransport" in app_provider_projection_source:
+        fail("Preflight must preserve AIModel.providerType routing for legacy Azure-backed models")
+    if "AIProviderInputProjection" in core_rendering_values_source or "AIProviderInputProjection" in core_rendering_service_source:
+        fail("Provider-aware accounting DTOs must remain app-owned")
+    if "func streamMessageWithInputProjection(" not in app_provider_factory_source:
+        fail("AIProvider protocol projection seam missing")
+    for required_provider_seam in (
+        "struct AIProviderStreamStart",
+        "func streamMessageWithInputProjection(",
+        "inputProjection: nil",
+    ):
+        if required_provider_seam not in app_provider_capability_source:
+            fail(f"Additive provider projection seam missing: {required_provider_seam}")
+    if "streamMessageWithInputProjection" in app_queries_source:
+        fail("Checkpoint 1 must not change AIQueriesService lazy send lifecycle")
+    projection_seam_owners = token_files("streamMessageWithInputProjection", ROOT / "Sources")
+    if projection_seam_owners != [
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderInputProjectionCapability.swift",
+    ]:
+        fail(
+            "Checkpoint 1 must keep the provider projection seam defaulted and unused; "
+            f"found concrete adaptations: {projection_seam_owners}"
+        )
 
     provider_compatibility_tokens = {
         "Sources/RepoPrompt/Infrastructure/AI/Providers/AnthropicProvider.swift": (
@@ -478,6 +554,8 @@ def main() -> int:
         "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
     ]:
         fail("Canonical TokenProjectionService ownership must remain in RepoPromptCore")
+    if "AIProviderInputProjection" in core_token_projection_source + core_token_projection_service_source:
+        fail("Core token projection must remain provider-neutral")
     if "package enum WorkspaceTokenProjectionInput" not in core_context_projection_source:
         fail("Typed workspace token projection input must remain Core-owned")
     if "TokenProjectionService.activeLiveWorkspaceEstimates" not in core_context_projection_service_source:
@@ -498,6 +576,8 @@ def main() -> int:
     for required_core_token in (
         "package struct TokenProjection",
         "package enum TokenProjectionService",
+        "case renderedPayloadEstimate",
+        "package static func renderedPayloadEstimate",
         "activeLiveWorkspaceEstimates",
     ):
         if required_core_token not in core_token_projection_source + core_token_projection_service_source:

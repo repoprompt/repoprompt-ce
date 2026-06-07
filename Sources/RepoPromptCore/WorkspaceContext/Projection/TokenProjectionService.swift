@@ -207,18 +207,46 @@ package enum TokenProjectionService {
         return WorkspaceViews(normalized: normalized, userConfigured: userConfigured)
     }
 
+    /// Estimates a rendered payload whose bytes may still change at a later transport boundary.
+    package static func renderedPayloadEstimate(
+        _ renderedText: String,
+        view: TokenProjection.View,
+        source: TokenProjection.Source
+    ) -> TokenProjection {
+        renderedPayloadProjection(
+            renderedText,
+            view: view,
+            source: source,
+            basis: .renderedPayloadEstimate
+        )
+    }
+
     /// Estimates the complete emitted payload; the basis is exact, while tokenization remains heuristic.
     package static func exactRenderedPayload(
         _ renderedText: String,
         view: TokenProjection.View,
         source: TokenProjection.Source
     ) -> TokenProjection {
+        renderedPayloadProjection(
+            renderedText,
+            view: view,
+            source: source,
+            basis: .exactRenderedPayload
+        )
+    }
+
+    private static func renderedPayloadProjection(
+        _ renderedText: String,
+        view: TokenProjection.View,
+        source: TokenProjection.Source,
+        basis: TokenProjection.Basis
+    ) -> TokenProjection {
         TokenProjection(
             provenance: .init(
                 view: view,
                 scope: .export,
                 source: source,
-                basis: .exactRenderedPayload
+                basis: basis
             ),
             components: .init(),
             total: TokenCalculationService.estimateTokens(for: renderedText)

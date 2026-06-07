@@ -18,6 +18,7 @@ package struct TokenProjection: Equatable {
 
     package enum Basis: Equatable {
         case componentEstimate
+        case renderedPayloadEstimate
         case exactRenderedPayload
     }
 
