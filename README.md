@@ -17,7 +17,24 @@ native macOS interface.
 
 ## Get Started
 
-Choose one of these local setup paths. You do not need to open Xcode.
+Choose one of these setup paths. You do not need to open Xcode.
+
+### Install with Homebrew
+
+For the signed and notarized public app, use the dedicated RepoPrompt CE
+Homebrew tap:
+
+```bash
+brew tap repoprompt/repoprompt-ce
+brew install --cask repoprompt-ce
+```
+
+This installs `/Applications/RepoPrompt CE.app` from the
+[`repoprompt/homebrew-repoprompt-ce`](https://github.com/repoprompt/homebrew-repoprompt-ce)
+tap. The cask consumes the promoted public updater ZIP from
+[`repoprompt/repoprompt-ce-updates`](https://github.com/repoprompt/repoprompt-ce-updates);
+it does not build from source. Source-build paths remain below for contributors
+and local development.
 
 ### Build and launch locally
 
@@ -114,6 +131,8 @@ third-party notices in
   source ownership and placement rules
 - [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):
   Agent Mode provider architecture
+- [`docs/homebrew.md`](docs/homebrew.md): Homebrew tap operating notes and
+  release checks
 - [`docs/releasing.md`](docs/releasing.md): release-candidate and publishing
   workflows
 - [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public

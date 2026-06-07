@@ -412,6 +412,35 @@ The promotion gate confirms:
 - The reviewed external artifact manifest regenerates exactly from both ZIP and
   DMG app contents and is mirrored unchanged to the public updater release.
 
+## Post-promote Homebrew tap checks
+
+RepoPrompt CE is also distributed through the
+[`repoprompt/homebrew-repoprompt-ce`](https://github.com/repoprompt/homebrew-repoprompt-ce)
+tap. After **Promote Release** succeeds, verify the tap before announcing
+Homebrew availability for that version.
+
+1. Confirm the updater release for the promoted tag contains the expected
+   `RepoPrompt-<version>-<build>.zip`, `appcast.xml`, and `SHA256SUMS` assets.
+2. Confirm `Casks/repoprompt-ce.rb` in the tap points at the tag-specific
+   updater ZIP, not a `latest/download` URL.
+3. Confirm the cask version encodes both `MARKETING_VERSION` and `BUILD_NUMBER`
+   as `<version>,<build>`.
+4. Confirm the cask `sha256` matches the promoted ZIP entry in the updater
+   release's `SHA256SUMS`.
+5. Run an install smoke:
+
+   ```bash
+   brew tap repoprompt/repoprompt-ce
+   brew install --cask repoprompt-ce
+   ```
+
+6. Confirm Homebrew installed `/Applications/RepoPrompt CE.app`.
+
+If the tap lags the promoted release, update only the tap repository. The
+source repository's protected `release` environment and release workflows do
+not need Homebrew signing, notarization, or Sparkle secrets. See
+[`docs/homebrew.md`](homebrew.md) for the tap operating boundaries.
+
 ## Recovery
 
 Never overwrite assets on a published release, reuse a public tag, or move an
