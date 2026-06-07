@@ -264,8 +264,17 @@ def main() -> int:
     core_rendering_service_source = (
         ROOT / "Sources/RepoPromptCore/Prompt/PromptRenderingService.swift"
     ).read_text()
+    core_assembly_source = (
+        ROOT / "Sources/RepoPromptCore/Prompt/PromptAssemblyBuilder.swift"
+    ).read_text()
     app_packaging_source = (
         ROOT / "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+    ).read_text()
+    app_ai_message_source = (
+        ROOT / "Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift"
+    ).read_text()
+    app_prompt_view_model_source = (
+        ROOT / "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
     ).read_text()
     for declaration in (
         "package struct PromptRenderingFileValue",
@@ -288,6 +297,88 @@ def main() -> int:
     ):
         if delegation not in app_packaging_source:
             fail(f"App prompt packaging facade must delegate factual rendering: {delegation}")
+    expected_core_standard_chat_owners = [
+        "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift",
+        "Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift",
+    ]
+    actual_core_standard_chat_owners = token_files("coreStandardChat", ROOT / "Sources")
+    if actual_core_standard_chat_owners != expected_core_standard_chat_owners:
+        fail(
+            "Core standard chat opt-in must remain limited to AIMessage and the standard "
+            "PromptViewModel path: "
+            f"expected={expected_core_standard_chat_owners}, "
+            f"actual={actual_core_standard_chat_owners}"
+        )
+    for required_ai_message_adapter in (
+        "enum TailAssemblyStrategy",
+        "case legacy",
+        "case coreStandardChat",
+        "envelopePolicy: .chatStyleTree",
+        "layout: .blankLineSeparatedFragments",
+        "disabledPromptSections.union([.userInstructions])",
+        "duplicateUserInstructionsAtTop: false",
+        'return [tail, "", systemPrompt].joined(separator: "\\n\\n")',
+        "var fileTreeXML: String",
+        "var fileBlocksXML: String",
+        "var gitDiffXML: String",
+        "var combinedXML: String",
+        "private let renderedFactualSnippets: PromptRenderedFactualSnippets",
+    ):
+        if required_ai_message_adapter not in app_ai_message_source:
+            fail(f"AIMessage standard-chat compatibility adapter missing: {required_ai_message_adapter}")
+    for required_packaging_adapter in (
+        "tailAssemblyStrategy: AIMessage.TailAssemblyStrategy = .legacy",
+        "tailAssemblyStrategy: tailAssemblyStrategy",
+        "exactRenderedPayload(renderedChatPayload(for: message)",
+    ):
+        if required_packaging_adapter not in app_packaging_source:
+            fail(f"Prompt packaging standard-chat adapter missing: {required_packaging_adapter}")
+    if app_prompt_view_model_source.count("tailAssemblyStrategy: .coreStandardChat") != 1:
+        fail("Exactly one standard PromptViewModel packagePromptResult path must opt into Core assembly")
+    if "exactChatPayload(for: message, source: tokenSource)" not in app_prompt_view_model_source:
+        fail("Standard chat exact accounting must continue to derive from the packaged AIMessage")
+
+    provider_compatibility_tokens = {
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AnthropicProvider.swift": (
+            "aiMessage.buildTail(embedSystemPrompt: false)",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/AzureOpenAIProvider.swift": (
+            "let embedSystemPrompt = baseModel == .o1Mini || baseModel == .o1Preview",
+            "message.openAIChatMessages(embedSystemPrompt: embedSystemPrompt)",
+            "message.openAIResponsesInput()",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCodeProvider.swift": (
+            "aiMessage.buildTail(embedSystemPrompt: false)",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/CodexCLIProvider.swift": (
+            "aiMessage.buildTail(embedSystemPrompt: false)",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/Cursor/CursorCLIProvider.swift": (
+            "aiMessage.buildTail(embedSystemPrompt: false)",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/CustomOpenai/CustomOpenAIProvider.swift": (
+            "aiMessage.fileTreeXML",
+            "aiMessage.fileBlocksXML",
+            "aiMessage.metaPrompts",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenAIProvider.swift": (
+            "let isO1PreviewOrMini = (effectiveModel == .o1Mini || effectiveModel == .o1Preview)",
+            "aiMessage.openAIChatMessages(embedSystemPrompt: isO1PreviewOrMini)",
+            "aiMessage.openAIResponsesInput()",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenCode/OpenCodeCLIProvider.swift": (
+            "aiMessage.buildTail(embedSystemPrompt: false)",
+        ),
+        "Sources/RepoPrompt/Infrastructure/AI/Providers/OpenRouterProvider.swift": (
+            "aiMessage.openAIChatMessages(embedSystemPrompt: false)",
+        ),
+    }
+    for relative, required_tokens in provider_compatibility_tokens.items():
+        source = (ROOT / relative).read_text()
+        for required_token in required_tokens:
+            if required_token not in source:
+                fail(f"Provider compatibility call changed in {relative}: {required_token}")
+
     for retained_app_token in ("enum PromptGitDiffArtifactClassifier", "_git_data"):
         if retained_app_token not in app_packaging_source:
             fail(f"App prompt packaging policy owner missing: {retained_app_token}")
@@ -302,6 +393,8 @@ def main() -> int:
         "CopyPreset",
         "AIMessage",
         "ConversationEntry",
+        "embedSystemPrompt",
+        "systemPrompt",
         "MCP",
         "Worktree",
         "UserDefaults",
@@ -309,8 +402,15 @@ def main() -> int:
         "DateFormatter",
         "Diagnostics",
     ):
-        if forbidden_core_token in core_rendering_values_source or forbidden_core_token in core_rendering_service_source:
-            fail(f"Core prompt rendering leaks app/product policy: {forbidden_core_token}")
+        if any(
+            forbidden_core_token in source
+            for source in (
+                core_rendering_values_source,
+                core_rendering_service_source,
+                core_assembly_source,
+            )
+        ):
+            fail(f"Core prompt rendering/assembly leaks app/product policy: {forbidden_core_token}")
     core_selection_projection_source = (
         ROOT
         / "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceSelectionProjection.swift"

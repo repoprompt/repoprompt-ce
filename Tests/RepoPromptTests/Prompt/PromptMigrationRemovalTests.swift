@@ -188,6 +188,55 @@ final class PromptMigrationRemovalTests: XCTestCase {
         XCTAssertFalse(adapter.contains("normalizedTotal - normalizedFiles"))
     }
 
+    func testStandardPromptConstructionDelegatesToCoreWithoutMigratingExcludedConsumers() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let aiMessageSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift"),
+            encoding: .utf8
+        )
+        let packagingSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+        let headlessPlanSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel+HeadlessPlan.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(aiMessageSource.contains("enum TailAssemblyStrategy"))
+        XCTAssertTrue(aiMessageSource.contains("case legacy"))
+        XCTAssertTrue(aiMessageSource.contains("case coreStandardChat"))
+        XCTAssertTrue(aiMessageSource.contains("envelopePolicy: .chatStyleTree"))
+        XCTAssertTrue(aiMessageSource.contains("layout: .blankLineSeparatedFragments"))
+        XCTAssertTrue(aiMessageSource.contains("disabledPromptSections.union([.userInstructions])"))
+        XCTAssertTrue(aiMessageSource.contains("duplicateUserInstructionsAtTop: false"))
+        XCTAssertTrue(aiMessageSource.contains("return [tail, \"\", systemPrompt].joined(separator: \"\\n\\n\")"))
+        XCTAssertTrue(aiMessageSource.contains("private let renderedFactualSnippets: PromptRenderedFactualSnippets"))
+        XCTAssertEqual(aiMessageSource.components(separatedBy: "PromptRenderingService.renderFactualSnippets(").count - 1, 1)
+        for legacyProperty in ["systemPromptXML", "metaPromptsXML", "fileTreeXML", "fileBlocksXML", "gitDiffXML", "combinedXML"] {
+            XCTAssertTrue(aiMessageSource.contains("var \(legacyProperty): String"), legacyProperty)
+        }
+
+        XCTAssertTrue(packagingSource.contains("tailAssemblyStrategy: AIMessage.TailAssemblyStrategy = .legacy"))
+        XCTAssertTrue(packagingSource.contains("tailAssemblyStrategy: tailAssemblyStrategy"))
+        XCTAssertTrue(packagingSource.contains("return AIMessage(\n            systemPrompt: systemPrompt,\n            userMessage: userMessage"))
+        XCTAssertTrue(packagingSource.contains("exactRenderedPayload(renderedChatPayload(for: message)"))
+
+        XCTAssertEqual(viewModelSource.components(separatedBy: "tailAssemblyStrategy: .coreStandardChat").count - 1, 1)
+        XCTAssertTrue(viewModelSource.contains("exactChatPayload(for: message, source: tokenSource)"))
+        XCTAssertFalse(headlessPlanSource.contains("coreStandardChat"))
+    }
+
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {
         let presetID = try XCTUnwrap(UUID(uuidString: "00000000-0000-0000-0000-000000000456"))
         let overridesRaw = """

@@ -169,7 +169,8 @@ enum PromptPackagingService {
         temperature: Double?,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
-        duplicateUserInstructionsAtTop: Bool = false
+        duplicateUserInstructionsAtTop: Bool = false,
+        tailAssemblyStrategy: AIMessage.TailAssemblyStrategy = .legacy
     ) -> AIMessage {
         // 1️⃣  Turn meta-instructions into prompt strings
         let metaPrompts: [String] = metaInstructions.map { meta in
@@ -211,7 +212,8 @@ enum PromptPackagingService {
             temperature: temperature,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tailAssemblyStrategy: tailAssemblyStrategy
         )
     }
 

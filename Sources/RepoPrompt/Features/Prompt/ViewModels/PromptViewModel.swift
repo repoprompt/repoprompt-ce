@@ -4803,7 +4803,8 @@ class PromptViewModel: ObservableObject {
             temperature: temperature,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tailAssemblyStrategy: .coreStandardChat
         )
         return PackagedPromptResult(
             message: message,

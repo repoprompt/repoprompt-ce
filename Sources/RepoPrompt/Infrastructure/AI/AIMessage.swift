@@ -15,6 +15,11 @@ struct ConversationEntry {
 
 /// Keep each piece separate. We also provide "XML getters" for certain fields.
 struct AIMessage {
+    enum TailAssemblyStrategy {
+        case legacy
+        case coreStandardChat
+    }
+
     /// The main system prompt
     let systemPrompt: String
 
@@ -45,6 +50,12 @@ struct AIMessage {
     /// Duplicate the user‑instruction block at the very top of the prompt
     let duplicateUserInstructionsAtTop: Bool
 
+    /// Selects the prompt-tail renderer without changing provider role placement.
+    let tailAssemblyStrategy: TailAssemblyStrategy
+
+    /// Immutable Core rendering reused by legacy getters, assembly, and provider adapters.
+    private let renderedFactualSnippets: PromptRenderedFactualSnippets
+
     // MARK: - XML Getter Properties
 
     /// System prompt in XML
@@ -70,33 +81,17 @@ struct AIMessage {
 
     /// File tree in XML
     var fileTreeXML: String {
-        guard !fileTree.isEmpty else { return "" }
-        return """
-        <file_tree>
-        \(fileTree)
-        </file_tree>
-        """
+        renderedFactualSnippets.fileMap ?? ""
     }
 
     /// File blocks in XML
     var fileBlocksXML: String {
-        guard !fileBlocks.isEmpty else { return "" }
-        var result = "<file_contents>\n"
-        for block in fileBlocks {
-            result += block + "\n\n"
-        }
-        result += "</file_contents>"
-        return result
+        renderedFactualSnippets.fileContents ?? ""
     }
 
     /// Git diff in XML
     var gitDiffXML: String {
-        guard let diff = gitDiff, !diff.isEmpty else { return "" }
-        return """
-        <git_diff>
-        \(diff)
-        </git_diff>
-        """
+        renderedFactualSnippets.gitDiff ?? ""
     }
 
     /// Combine the main sections, skipping anything empty
@@ -124,7 +119,8 @@ struct AIMessage {
         disableTemperatureOverrides: Bool = false,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
-        duplicateUserInstructionsAtTop: Bool = false
+        duplicateUserInstructionsAtTop: Bool = false,
+        tailAssemblyStrategy: TailAssemblyStrategy = .legacy
     ) {
         self.systemPrompt = systemPrompt
         self.metaPrompts = metaPrompts
@@ -137,6 +133,12 @@ struct AIMessage {
         self.promptSectionsOrder = promptSectionsOrder
         self.disabledPromptSections = disabledPromptSections
         self.duplicateUserInstructionsAtTop = duplicateUserInstructionsAtTop
+        self.tailAssemblyStrategy = tailAssemblyStrategy
+        renderedFactualSnippets = Self.renderFactualSnippets(
+            fileTree: fileTree,
+            fileBlocks: fileBlocks,
+            gitDiff: gitDiff
+        )
     }
 
     /// Simpler initializer for "system prompt + user message" usage
@@ -157,6 +159,12 @@ struct AIMessage {
         promptSectionsOrder = PromptAssemblyBuilder.defaultSectionOrder
         disabledPromptSections = []
         duplicateUserInstructionsAtTop = false
+        tailAssemblyStrategy = .legacy
+        renderedFactualSnippets = Self.renderFactualSnippets(
+            fileTree: "",
+            fileBlocks: [],
+            gitDiff: nil
+        )
     }
 
     /// Builds the text block that must be *prepended* to the **final** user
@@ -167,9 +175,35 @@ struct AIMessage {
     ///     tail instead of being sent as an independent `.system` role.
     /// - Returns: A single string, without leading / trailing blank lines.
     func buildTail(embedSystemPrompt: Bool) -> String {
+        let tail = switch tailAssemblyStrategy {
+        case .legacy:
+            buildLegacyTail()
+        case .coreStandardChat:
+            buildCoreStandardChatTail()
+        }
+
+        guard embedSystemPrompt, !systemPrompt.isEmpty else { return tail }
+        guard !tail.isEmpty else { return systemPrompt }
+        return [tail, "", systemPrompt].joined(separator: "\n\n")
+    }
+
+    private static func renderFactualSnippets(
+        fileTree: String,
+        fileBlocks: [String],
+        gitDiff: String?
+    ) -> PromptRenderedFactualSnippets {
+        PromptRenderingService.renderFactualSnippets(
+            fileTreeContent: fileTree,
+            codemapBlocks: [],
+            contentBlocks: fileBlocks,
+            gitDiff: gitDiff,
+            envelopePolicy: .chatStyleTree
+        )
+    }
+
+    private func buildLegacyTail() -> String {
         var parts: [String] = []
 
-        // ───── 1)  Optional *top* copy of the user instructions  ─────
         if duplicateUserInstructionsAtTop,
            let userBlock = conversationMessages.last(where: { $0.role == .user })?.content,
            !userBlock.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -177,7 +211,6 @@ struct AIMessage {
             parts.append(userBlock)
         }
 
-        // ───── 2)  Auto‑generated sections in caller‑defined order  ─────
         for section in promptSectionsOrder where !disabledPromptSections.contains(section) {
             switch section {
             case .fileMap:
@@ -193,18 +226,41 @@ struct AIMessage {
                     parts.append(gitDiffXML)
                 }
             case .userInstructions:
-                // User-authored block, never auto-prepended.
                 continue
             }
         }
 
-        // ───── 3)  Inline system prompt (optional)  ─────
-        if embedSystemPrompt, !systemPrompt.isEmpty {
-            if !parts.isEmpty { parts.append("") } // blank line separator
-            parts.append(systemPrompt)
+        return parts.joined(separator: "\n\n")
+    }
+
+    private func buildCoreStandardChatTail() -> String {
+        let factual = renderedFactualSnippets
+        var snippets: [PromptSection: String] = [:]
+        snippets[.fileMap] = factual.fileMap
+        snippets[.fileContents] = factual.fileContents
+        snippets[.gitDiff] = factual.gitDiff
+
+        if !metaPrompts.isEmpty {
+            snippets[.metaPrompts] = metaPrompts.joined(separator: "\n")
         }
 
-        return parts.joined(separator: "\n\n")
+        // Chat treats user instructions as a top-only duplicate. Keep that app policy
+        // outside Core's ordered traversal so repeated/custom orders cannot emit it again,
+        // and preserve prewrapped trailing LF/CRLF bytes without layout normalization.
+        let assembled = PromptAssemblyBuilder.build(
+            order: promptSectionsOrder,
+            disabled: disabledPromptSections.union([.userInstructions]),
+            duplicateUserInstructionsAtTop: false,
+            snippets: snippets,
+            layout: .blankLineSeparatedFragments
+        )
+        guard duplicateUserInstructionsAtTop,
+              let userBlock = conversationMessages.last(where: { $0.role == .user })?.content,
+              !userBlock.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return assembled
+        }
+        return assembled.isEmpty ? userBlock : userBlock + "\n\n" + assembled
     }
 
     /// Generates the full array of `ChatCompletionParameters.Message` objects

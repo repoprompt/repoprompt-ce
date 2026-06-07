@@ -112,7 +112,8 @@ final class PromptTokenEstimateParityTests: XCTestCase {
             temperature: nil,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
-            duplicateUserInstructionsAtTop: true
+            duplicateUserInstructionsAtTop: true,
+            tailAssemblyStrategy: .coreStandardChat
         )
         let payload = PromptPackagingService.exactChatPayload(for: message, source: .activeLive)
 
@@ -139,7 +140,8 @@ final class PromptTokenEstimateParityTests: XCTestCase {
             temperature: nil,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
-            duplicateUserInstructionsAtTop: true
+            duplicateUserInstructionsAtTop: true,
+            tailAssemblyStrategy: .coreStandardChat
         )
         let payload = PromptPackagingService.exactChatPayload(for: message, source: .immutableSnapshot)
 

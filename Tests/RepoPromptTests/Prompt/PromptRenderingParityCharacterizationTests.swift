@@ -391,7 +391,8 @@ final class PromptRenderingParityCharacterizationTests: XCTestCase {
             temperature: nil,
             promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
             disabledPromptSections: [],
-            duplicateUserInstructionsAtTop: false
+            duplicateUserInstructionsAtTop: false,
+            tailAssemblyStrategy: .coreStandardChat
         )
         let expectedTail = """
         <file_tree>
