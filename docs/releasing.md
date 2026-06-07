@@ -438,8 +438,7 @@ Homebrew availability for that version.
 
 If the tap lags the promoted release, update only the tap repository. The
 source repository's protected `release` environment and release workflows do
-not need Homebrew signing, notarization, or Sparkle secrets. See
-[`docs/homebrew.md`](homebrew.md) for the tap operating boundaries.
+not need Homebrew signing, notarization, or Sparkle secrets.
 
 ## Recovery
 

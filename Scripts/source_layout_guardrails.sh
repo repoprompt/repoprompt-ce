@@ -291,7 +291,6 @@ print_matches \
 allowed_tracked_docs=(
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
-  "docs/homebrew.md"
   "docs/open-source-readiness.md"
   "docs/releasing.md"
   "docs/worktrees.md"

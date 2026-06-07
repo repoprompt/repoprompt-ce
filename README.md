@@ -131,8 +131,6 @@ third-party notices in
   source ownership and placement rules
 - [`docs/architecture/provider-plugins.md`](docs/architecture/provider-plugins.md):
   Agent Mode provider architecture
-- [`docs/homebrew.md`](docs/homebrew.md): Homebrew tap operating notes and
-  release checks
 - [`docs/releasing.md`](docs/releasing.md): release-candidate and publishing
   workflows
 - [`docs/open-source-readiness.md`](docs/open-source-readiness.md): public
