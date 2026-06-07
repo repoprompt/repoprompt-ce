@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptShared
 
 @MainActor
 final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
@@ -153,7 +154,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                     scope: approvalScope,
                     path: displayPath,
                     unifiedDiff: reviewUnifiedDiff,
-                    timeoutSeconds: 300
+                    timeoutSeconds: MCPTimeoutPolicy.applyEditsApprovalTimeoutSeconds
                 )
 
                 switch decision {

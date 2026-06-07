@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+import RepoPromptShared
 import XCTest
 
 final class CodexIntegrationConfigurationTests: XCTestCase {
@@ -54,7 +55,13 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(content.contains("command = \"\(serverCommand)\""))
         XCTAssertTrue(content.contains("args = []"))
         XCTAssertTrue(content.contains("tool_timeout_sec = 10000"))
+        XCTAssertTrue(content.contains("supports_parallel_tool_calls = false"))
         XCTAssertTrue(content.contains("enabled = false"))
+        XCTAssertTrue(
+            content.contains(
+                "command = \"\(serverCommand)\"\nargs = []\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = false\nenabled = false"
+            )
+        )
 
         let entry = try XCTUnwrap(CodexIntegrationConfiguration.mcpServerEntries(from: content).first)
         XCTAssertEqual(entry.normalizedName, "RepoPromptCE")
@@ -204,6 +211,117 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertFalse(second.changed)
         XCTAssertEqual(second.content, first.content)
         XCTAssertEqual(occurrences(of: "[mcp_servers.\"RepoPromptCE\"]", in: second.content), 1)
+        XCTAssertEqual(occurrences(of: "tool_timeout_sec = 10000", in: second.content), 1)
+        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls = false", in: second.content), 1)
+    }
+
+    func testV4PolicyConstantsPreserveLongActiveTimeoutAndDisableParallelCalls() {
+        XCTAssertEqual(CodexIntegrationConfiguration.toolTimeoutDefaultsKey, "CodexToolTimeoutMigratedV4")
+        XCTAssertEqual(
+            CodexIntegrationConfiguration.desiredToolTimeoutSeconds,
+            MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
+        )
+        XCTAssertFalse(CodexIntegrationConfiguration.desiredSupportsParallelToolCalls)
+    }
+
+    func testV4MigrationRestoresLongTimeoutAndParallelPolicyTogether() {
+        let input = """
+        tool_output_token_limit = 25_000
+
+        [mcp_servers.RepoPromptCE]
+        command = "\(serverCommand)"
+        args = []
+        tool_timeout_sec = 600
+        supports_parallel_tool_calls = true
+        enabled = true
+        """
+
+        let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
+
+        XCTAssertTrue(result.foundTarget)
+        XCTAssertTrue(result.changed)
+        XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false"))
+        XCTAssertFalse(result.content.contains("tool_timeout_sec = 600"))
+        XCTAssertFalse(result.content.contains("supports_parallel_tool_calls = true"))
+
+        let second = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: result.content)
+        XCTAssertTrue(second.foundTarget)
+        XCTAssertFalse(second.changed)
+        XCTAssertEqual(second.content, result.content)
+    }
+
+    func testV4MigrationCollapsesDuplicatePolicyAssignments() {
+        let input = """
+        tool_output_token_limit = 25_000
+
+        [mcp_servers.RepoPromptCE]
+        command = "\(serverCommand)"
+        args = []
+        tool_timeout_sec = 10000 # keep first equivalent
+        tool_timeout_sec = 600
+        supports_parallel_tool_calls = false # keep first equivalent
+        supports_parallel_tool_calls = true
+        """
+
+        let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
+
+        XCTAssertTrue(result.foundTarget)
+        XCTAssertTrue(result.changed)
+        XCTAssertEqual(occurrences(of: "tool_timeout_sec", in: result.content), 1)
+        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls", in: result.content), 1)
+        XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # keep first equivalent"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # keep first equivalent"))
+    }
+
+    func testV4MigrationPreservesLaterEquivalentDuplicateAssignments() {
+        let input = """
+        tool_output_token_limit = 25_000
+
+        [mcp_servers.RepoPromptCE]
+        command = "\(serverCommand)"
+        args = []
+        tool_timeout_sec = 600
+        tool_timeout_sec = 10000 # preserve compliant timeout
+        supports_parallel_tool_calls = true
+        supports_parallel_tool_calls = false # preserve compliant parallel policy
+        """
+
+        let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
+
+        XCTAssertTrue(result.foundTarget)
+        XCTAssertTrue(result.changed)
+        XCTAssertEqual(occurrences(of: "tool_timeout_sec", in: result.content), 1)
+        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls", in: result.content), 1)
+        XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # preserve compliant timeout"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # preserve compliant parallel policy"))
+    }
+
+    func testV4MigrationLeavesOtherServerPolicyUntouched() {
+        let otherServerBlock = """
+        [mcp_servers.OtherServer]
+        command = "/tmp/other"
+        args = []
+        tool_timeout_sec = 10000
+        supports_parallel_tool_calls = true
+        """
+        let input = """
+        tool_output_token_limit = 25_000
+
+        [mcp_servers.RepoPromptCE]
+        command = "\(serverCommand)"
+        args = []
+        tool_timeout_sec = 600
+        supports_parallel_tool_calls = true
+
+        \(otherServerBlock)
+        """
+
+        let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
+
+        XCTAssertTrue(result.foundTarget)
+        XCTAssertTrue(result.changed)
+        XCTAssertTrue(result.content.contains(otherServerBlock))
     }
 
     func testToolTimeoutMutationHandlesCommandCommentsAndUnderscoredTimeout() {
@@ -213,14 +331,16 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         [mcp_servers."RepoPromptCE"] # managed
         command = "\(serverCommand)" # stable helper
         args = []
-        tool_timeout_sec = 10_000 # already equivalent
+        tool_timeout_sec = 10000 # already equivalent
+        supports_parallel_tool_calls = false # serialized by V4
         """
 
         let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
 
         XCTAssertTrue(result.foundTarget)
         XCTAssertFalse(result.changed)
-        XCTAssertTrue(result.content.contains("tool_timeout_sec = 10_000 # already equivalent"))
+        XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # already equivalent"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # serialized by V4"))
     }
 
     func testToolTimeoutMutationAcceptsIntegerRadixAndSignVariants() {
@@ -239,6 +359,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             command = "\(serverCommand)"
             args = []
             tool_timeout_sec = \(value)
+            supports_parallel_tool_calls = false
             """
 
             let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -257,6 +378,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         command = "\(serverCommand)"
         args = []
         tool_timeout_sec = "10000"
+        supports_parallel_tool_calls = "false"
         """
 
         let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -264,6 +386,8 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(result.foundTarget)
         XCTAssertTrue(result.changed)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false"))
         XCTAssertFalse(result.content.contains("tool_timeout_sec = \"10000\""))
+        XCTAssertFalse(result.content.contains("supports_parallel_tool_calls = \"false\""))
     }
 }

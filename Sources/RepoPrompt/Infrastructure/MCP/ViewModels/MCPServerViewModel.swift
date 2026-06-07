@@ -14,6 +14,19 @@ import MCP
 import Ontology
 import RepoPromptShared
 
+private final class MCPRunToolCleanupClaim: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !claimed else { return false }
+        claimed = true
+        return true
+    }
+}
+
 // MARK: - Selection Debug Logging
 
 #if DEBUG
@@ -491,11 +504,11 @@ final class MCPServerViewModel: ObservableObject {
     @Published var isApprovalOverlayVisible: Bool = false
 
     @MainActor
-    private lazy var windowToolRuntime = MCPWindowToolRuntime(windowID: windowID) { [weak self] name, freshnessPolicy, timeoutSeconds, args, implementation in
+    private lazy var windowToolRuntime = MCPWindowToolRuntime(windowID: windowID) { [weak self] name, freshnessPolicy, args, implementation in
         guard let self else {
             throw MCPError.internalError("Window deallocated while executing \(name)")
         }
-        return try await runTool(name, freshnessPolicy: freshnessPolicy, timeoutSeconds: timeoutSeconds) { [weak self] in
+        return try await runTool(name, freshnessPolicy: freshnessPolicy) { [weak self] in
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
@@ -753,11 +766,11 @@ final class MCPServerViewModel: ObservableObject {
         },
         buildCodeStructureDTO: { [weak self] files, maxResults, includeUnmappedPaths, projection in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
-            return await buildCodeStructureDTO(fromRecords: files, maxResults: maxResults, includeUnmappedPaths: includeUnmappedPaths, projection: projection)
+            return try await buildCodeStructureDTO(fromRecords: files, maxResults: maxResults, includeUnmappedPaths: includeUnmappedPaths, projection: projection)
         },
         resolveFilesForCodeStructure: { [weak self] paths, lookupRootScope in
-            guard let self else { return [] }
-            return await resolveFilesForCodeStructure(paths: paths, lookupRootScope: lookupRootScope)
+            guard let self else { throw MCPError.internalError("Window deallocated while resolving code structure files") }
+            return try await resolveFilesForCodeStructure(paths: paths, lookupRootScope: lookupRootScope)
         },
         buildStoreBackedFileTreeResult: { [weak self] mode, maxDepth, startPath, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building file tree") }
@@ -793,7 +806,7 @@ final class MCPServerViewModel: ObservableObject {
         },
         buildTabWorkspaceContext: { [weak self] context, include, display, copyPresetOverride, activeTabCompatibility in
             guard let self else { throw MCPError.internalError("Window deallocated while building workspace context") }
-            return await buildTabWorkspaceContext(
+            return try await buildTabWorkspaceContext(
                 context: context,
                 include: include,
                 display: display,
@@ -1384,7 +1397,7 @@ final class MCPServerViewModel: ObservableObject {
     func wakeAgentRunWaitersOwnedByActiveRun(
         runID: UUID,
         source: String,
-        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, registration: AgentRunSessionStore.Registration)?
+        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async {
         let sessionIDs = Set(childAgentRunWaitCountsByParentRunID[runID]?.keys.map(\.self) ?? [])
         guard !sessionIDs.isEmpty else {
@@ -1399,7 +1412,7 @@ final class MCPServerViewModel: ObservableObject {
             }
             await AgentRunSessionStore.wakeCurrentWaiters(
                 publication.snapshot,
-                registration: publication.registration,
+                cursor: publication.cursor,
                 reason: .steeringRequested
             )
         }
@@ -1412,7 +1425,7 @@ final class MCPServerViewModel: ObservableObject {
         runID: UUID,
         source: String,
         timeoutSeconds: TimeInterval,
-        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, registration: AgentRunSessionStore.Registration)?
+        publicationForSessionID: (UUID) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)?
     ) async -> Bool {
         guard hasActiveChildAgentRunWaits(runID: runID) else {
             steeringDebugLog("[AgentRunSteeringWake] parent drain fast-idle source=\(source) parentRunID=\(runID)")
@@ -2049,8 +2062,7 @@ final class MCPServerViewModel: ObservableObject {
     private func runTool<T>(
         _ name: String,
         freshnessPolicy: MCPToolFreshnessPolicy,
-        timeoutSeconds: Int = 10000, // Default ~2.7 hour timeout (matches Codex tool_timeout_sec)
-        body: @escaping @Sendable () async throws -> T // ← @escaping added
+        body: @escaping @Sendable () async throws -> T
     ) async throws -> T {
         #if DEBUG || EDIT_FLOW_PERF
             let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
@@ -2218,70 +2230,13 @@ final class MCPServerViewModel: ObservableObject {
             EditFlowPerf.Dimensions(toolName: name)
         )
 
-        do {
-            // Timeout wrapper to prevent stuck tools
-            let timeoutEnvelopeState = EditFlowPerf.begin(
-                EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope,
-                EditFlowPerf.Dimensions(toolName: name)
-            )
-            let result: T
-            do {
-                result = try await withThrowingTaskGroup(of: T.self) { group in
-                    group.addTask { try await task.value }
-                    group.addTask {
-                        try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * UInt64(1_000_000_000))
-                        throw MCPError.internalError("tool '\(name)' timed out after \(timeoutSeconds)s")
-                    }
-                    let value = try await group.next()!
-                    group.cancelAll()
-                    return value
-                }
-                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, timeoutEnvelopeState)
-            } catch {
-                EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, timeoutEnvelopeState)
-                throw error
-            }
-            // Clean up after successful completion (only if this tool execution is still current)
+        let cleanupClaim = MCPRunToolCleanupClaim()
+        let cleanupExecution: @Sendable (String) async -> Void = { [weak self] outcome in
+            guard cleanupClaim.claim(), let self else { return }
             let cleanupState = EditFlowPerf.begin(
                 EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,
                 EditFlowPerf.Dimensions(toolName: name)
             )
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.cleanupScheduled,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-            )
-            await MainActor.run {
-                EditFlowPerf.lifecycleEvent(
-                    EditFlowPerf.Lifecycle.MCPRunTool.cleanupMainActorEntered,
-                    correlation: lifecycleCorrelation,
-                    EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-                )
-                self.unregisterToolExecution(executionID: toolToken)
-                if shouldTrackActiveTool, self.activeToolToken == toolToken {
-                    self.clearActiveToolSlot()
-                }
-            }
-            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup, cleanupState)
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.cleanupEnded,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-            )
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.returned,
-                correlation: lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: name, outcome: "success")
-            )
-            return result
-        } catch let err {
-            task.cancel() // ensure no leak
-            // Clean up after error (only if this tool execution is still current)
-            let cleanupState = EditFlowPerf.begin(
-                EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,
-                EditFlowPerf.Dimensions(toolName: name)
-            )
-            let outcome = err is CancellationError ? "cancelled" : "error"
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPRunTool.cleanupScheduled,
                 correlation: lifecycleCorrelation,
@@ -2304,15 +2259,41 @@ final class MCPServerViewModel: ObservableObject {
                 correlation: lifecycleCorrelation,
                 EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
             )
+        }
+
+        let cancellationEnvelopeState = EditFlowPerf.begin(
+            EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope,
+            EditFlowPerf.Dimensions(toolName: name)
+        )
+        do {
+            let result = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+                Task { await cleanupExecution("cancelled") }
+            }
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, cancellationEnvelopeState)
+            await cleanupExecution("success")
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPRunTool.returned,
+                correlation: lifecycleCorrelation,
+                EditFlowPerf.Dimensions(toolName: name, outcome: "success")
+            )
+            return result
+        } catch {
+            EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolTimeoutEnvelope, cancellationEnvelopeState)
+            task.cancel()
+            let outcome = MCPToolExecutionCancelledError.matches(error) ? "cancelled" : "error"
+            await cleanupExecution(outcome)
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.MCPRunTool.returned,
                 correlation: lifecycleCorrelation,
                 EditFlowPerf.Dimensions(toolName: name, outcome: outcome)
             )
-            if err is CancellationError {
-                throw MCPError.internalError("tool cancelled by user")
+            if error is CancellationError {
+                throw MCPToolExecutionCancelledError()
             }
-            throw err
+            throw error
         }
     }
 
@@ -3316,17 +3297,20 @@ final class MCPServerViewModel: ObservableObject {
     private func resolveFilesForCodeStructure(
         paths: [String],
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
-    ) async -> [WorkspaceFileRecord] {
+    ) async throws -> [WorkspaceFileRecord] {
+        try Task.checkCancellation()
         let directFiles = await promptVM.workspaceFileContextStore.lookupFiles(
             atPaths: paths,
             profile: .mcpRead,
             rootScope: lookupRootScope
         )
+        try Task.checkCancellation()
         let matchedFileInputs = Set(directFiles.keys)
         var resolved: [WorkspaceFileRecord] = []
         var seenPaths = Set<String>()
 
         for path in paths {
+            try Task.checkCancellation()
             if let file = directFiles[path], seenPaths.insert(file.standardizedFullPath).inserted {
                 resolved.append(file)
             }
@@ -3334,9 +3318,12 @@ final class MCPServerViewModel: ObservableObject {
 
         let dirCandidates = paths.filter { !matchedFileInputs.contains($0) }
         for raw in dirCandidates {
+            try Task.checkCancellation()
             let folderResolution = await promptVM.workspaceFileContextStore.expandFolderInputToFiles(raw, rootScope: lookupRootScope, profile: .mcpSelection)
+            try Task.checkCancellation()
             guard folderResolution.handled else { continue }
             for file in folderResolution.files where seenPaths.insert(file.standardizedFullPath).inserted {
+                try Task.checkCancellation()
                 resolved.append(file)
             }
         }
@@ -3349,7 +3336,7 @@ final class MCPServerViewModel: ObservableObject {
         maxResults: Int,
         includeUnmappedPaths: Bool,
         projection: WorkspaceRootBindingProjection? = nil
-    ) async -> ToolResultDTOs.SelectedCodeStructureDTO {
+    ) async throws -> ToolResultDTOs.SelectedCodeStructureDTO {
         struct RenderableCodeStructure {
             let key: String
             let displayPath: String
@@ -3357,14 +3344,18 @@ final class MCPServerViewModel: ObservableObject {
             let estimatedTokens: Int
         }
 
+        try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let snapshots = await store.codemapSnapshotDictionary()
+        try Task.checkCancellation()
         let roots = await store.rootRefs(scope: .allLoaded)
+        try Task.checkCancellation()
         var renderable: [RenderableCodeStructure] = []
         var unmappedPaths: [String] = []
         var seenPaths = Set<String>()
 
         for file in files {
+            try Task.checkCancellation()
             let fullPath = file.standardizedFullPath
             guard seenPaths.insert(fullPath).inserted else { continue }
             let displayPath: String = if let projection,
@@ -3390,6 +3381,7 @@ final class MCPServerViewModel: ObservableObject {
             }
         }
 
+        try Task.checkCancellation()
         renderable.sort { lhs, rhs in
             if lhs.displayPath == rhs.displayPath { return lhs.key < rhs.key }
             return lhs.displayPath < rhs.displayPath
@@ -3402,10 +3394,15 @@ final class MCPServerViewModel: ObservableObject {
             separatorTokens: Self.codeStructureSeparatorTokenCost
         )
         let renderableByKey = Dictionary(uniqueKeysWithValues: renderable.map { ($0.key, $0) })
-        let content = budgetSelection.includedKeys
-            .compactMap { renderableByKey[$0] }
-            .map { $0.api.getFullAPIDescription(displayPath: $0.displayPath) }
-            .joined(separator: "\n\n")
+        var contentParts: [String] = []
+        contentParts.reserveCapacity(budgetSelection.includedKeys.count)
+        for key in budgetSelection.includedKeys {
+            try Task.checkCancellation()
+            guard let item = renderableByKey[key] else { continue }
+            contentParts.append(item.api.getFullAPIDescription(displayPath: item.displayPath))
+        }
+        try Task.checkCancellation()
+        let content = contentParts.joined(separator: "\n\n")
         let sortedUnmapped = includeUnmappedPaths && !unmappedPaths.isEmpty ? unmappedPaths.sorted() : nil
         return ToolResultDTOs.SelectedCodeStructureDTO(
             fileCount: budgetSelection.includedKeys.count,
@@ -3469,12 +3466,15 @@ final class MCPServerViewModel: ObservableObject {
         lineCount: Int? = nil,
         lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool) {
+        try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
         await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)
+        try Task.checkCancellation()
         let (roots, readableFile): ([WorkspaceRootRef], WorkspaceReadableFileHandle?) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
             let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)
             let exactPathIssue = await store.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope)
+            try Task.checkCancellation()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.exactPathIssueDetection,
                 exactPathIssueDetection,
@@ -3486,10 +3486,12 @@ final class MCPServerViewModel: ObservableObject {
 
             let rootRefsLookup = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.rootRefsLookup)
             let roots = await store.rootRefs(scope: lookupRootScope)
+            try Task.checkCancellation()
             EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.rootRefsLookup, rootRefsLookup)
 
             let exactCatalogShortcutState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogShortcut)
             let exactCatalogHit = await readableService.resolveExactWorkspaceCatalogHit(path, rootScope: lookupRootScope)
+            try Task.checkCancellation()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.exactCatalogShortcut,
                 exactCatalogShortcutState,
@@ -3505,6 +3507,7 @@ final class MCPServerViewModel: ObservableObject {
 
             let folderResolutionStage = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.folderResolution)
             let folderResolution = await store.resolveFolderInput(path, rootScope: lookupRootScope, profile: .mcpRead)
+            try Task.checkCancellation()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.folderResolution,
                 folderResolutionStage,
@@ -3532,6 +3535,7 @@ final class MCPServerViewModel: ObservableObject {
 
             let readableServiceResolution = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.readableServiceResolution)
             let readableFile = await readableService.resolveReadableFile(path, profile: .mcpRead, rootScope: lookupRootScope)
+            try Task.checkCancellation()
             EditFlowPerf.end(
                 EditFlowPerf.Stage.ReadFile.readableServiceResolution,
                 readableServiceResolution,
@@ -3561,6 +3565,7 @@ final class MCPServerViewModel: ObservableObject {
             )
             return (roots, readableFile)
         }
+        try Task.checkCancellation()
         let full: String
         let displayPath: String
         let shouldAutoSelect: Bool
@@ -3575,12 +3580,16 @@ final class MCPServerViewModel: ObservableObject {
             }) else {
                 throw MCPError.internalError("content unavailable")
             }
+            try Task.checkCancellation()
             full = workspaceContent
             displayPath = ClientPathFormatter.displayAbsolutePath(fullPath: file.standardizedFullPath, visibleRoots: roots)
             shouldAutoSelect = true
         case let .external(externalFile):
             do {
                 full = try await readableService.readAlwaysReadableExternalFile(externalFile)
+                try Task.checkCancellation()
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw MCPError.invalidParams("Cannot read '\(externalFile.displayPath)': \(error.localizedDescription)")
             }
@@ -3594,6 +3603,7 @@ final class MCPServerViewModel: ObservableObject {
             throw MCPError.invalidParams("Cannot read '\(path)'. \(msg)")
         }
 
+        try Task.checkCancellation()
         // Preserve original line endings and total line count
         let pairs = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.splitPreservingLineEndings) {
             String.splitContentPreservingAllLineEndings(full)
@@ -3645,12 +3655,14 @@ final class MCPServerViewModel: ObservableObject {
             )
         }
 
+        try Task.checkCancellation()
         let contentSlice = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.buildSlice) {
             if total == 0 { return "" }
             let slice = pairs[first ..< lastExclusive]
             return slice.map { $0.line + $0.ending }.joined()
         }
 
+        try Task.checkCancellation()
         // Prepare metadata for the displayed slice
         let shownFirst = total == 0 ? 0 : (first + 1)
         let shownLast = total == 0 ? 0 : lastExclusive

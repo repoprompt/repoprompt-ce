@@ -108,30 +108,40 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: []
             )
         ) { [self] _, args in
+            try Task.checkCancellation()
             if await dependencies.promptVM.codeMapsGloballyDisabled {
                 throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
             }
             let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
             let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
             let metadata = await dependencies.captureRequestMetadata()
+            try Task.checkCancellation()
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+            try Task.checkCancellation()
             _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            try Task.checkCancellation()
 
             switch scope {
             case "selected":
                 await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                try Task.checkCancellation()
                 let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
+                try Task.checkCancellation()
                 var combined: [WorkspaceFileRecord] = []
                 var seenPaths = Set<String>()
                 for entry in collections.selected {
+                    try Task.checkCancellation()
                     let abs = entry.file.standardizedFullPath
                     if seenPaths.insert(abs).inserted { combined.append(entry.file) }
                 }
                 for entry in collections.codemap {
+                    try Task.checkCancellation()
                     let abs = entry.file.standardizedFullPath
                     if seenPaths.insert(abs).inserted { combined.append(entry.file) }
                 }
-                return try await Value(dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext.bindingProjection))
+                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext.bindingProjection)
+                try Task.checkCancellation()
+                return try Value(reply)
             default:
                 guard let rawPaths = args["paths"]?.arrayValue else {
                     throw MCPError.invalidParams("missing paths (required when scope='paths')")
@@ -143,12 +153,17 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 let lookupRootScope = lookupContext.rootScope
                 let resolvedPaths = lookupContext.translateInputPaths(paths)
                 for path in resolvedPaths {
+                    try Task.checkCancellation()
                     if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
                         throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
                     }
                 }
-                let resolvedFiles = await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
-                return try await Value(dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext.bindingProjection))
+                try Task.checkCancellation()
+                let resolvedFiles = try await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
+                try Task.checkCancellation()
+                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext.bindingProjection)
+                try Task.checkCancellation()
+                return try Value(reply)
             }
         }
     }
@@ -287,6 +302,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
+        try Task.checkCancellation()
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.providerTotal, providerTotalState) }
@@ -304,17 +320,21 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
             await dependencies.captureRequestMetadata()
         }
+        try Task.checkCancellation()
         let lookupContext = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerLookupContextResolution) {
             await dependencies.resolveFileToolLookupContext(metadata)
         }
+        try Task.checkCancellation()
         let (worktreeScope, resolvedPath) = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerPathTranslation) {
             let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
             let resolvedPath = lookupContext.translateInputPath(path)
             return (worktreeScope, resolvedPath)
         }
+        try Task.checkCancellation()
         var readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
             try await dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)
         }
+        try Task.checkCancellation()
         readResult = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
             let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
                 lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
@@ -332,6 +352,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 readResult.shouldAutoSelect
             )
         }
+        try Task.checkCancellation()
         await EditFlowPerf.measure(
             EditFlowPerf.Stage.ReadFile.providerAutoSelect,
             EditFlowPerf.Dimensions(outcome: readResult.shouldAutoSelect ? "attempted" : "skipped")
@@ -340,6 +361,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 await dependencies.enqueueReadFileAutoSelection(readResult.reply, path, metadata)
             }
         }
+        try Task.checkCancellation()
         let value = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
             try Value(readResult.reply)
         }
@@ -413,6 +435,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
             let reply = try await executeFileSearch(args: args)
+            try Task.checkCancellation()
             let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
                 try Value(reply)
             }
@@ -422,6 +445,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeFileSearch(args: [String: Value]) async throws -> ToolResultDTOs.SearchResultDTO {
+        try Task.checkCancellation()
         let rawPattern = args["pattern"]?.stringValue ?? ""
         let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !pattern.isEmpty else {
@@ -451,7 +475,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
         let metadata = await dependencies.captureRequestMetadata()
+        try Task.checkCancellation()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
         let lookupRootScope = lookupContext.rootScope
@@ -460,6 +486,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         let results: SearchResults
         do {
+            try Task.checkCancellation()
             results = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
                 EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
@@ -468,6 +495,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
                 )
             }
+            try Task.checkCancellation()
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
                 EditFlowPerf.Dimensions(outcome: "completed", searchMode: mode.rawValue, countOnly: countOnly)
@@ -526,12 +554,14 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         defer { endDTOBuildIfNeeded() }
 
+        try Task.checkCancellation()
         let displayRootRefsSnapshot = await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
             dtoBuildDimensions()
         ) {
             await dependencies.promptVM.workspaceFileContextStore.displayRootRefsSnapshot()
         }
+        try Task.checkCancellation()
         let visibleRootRefs = displayRootRefsSnapshot.visibleRoots
         let allRootRefs = displayRootRefsSnapshot.allRoots
         let (displayPath, pathFilterSuggestion): ((String) -> String, String?) = EditFlowPerf.measure(
@@ -609,6 +639,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         var usedChars = 0
         var includedContentMatches: [SearchMatch] = []
         for match in contentMatchesFull {
+            try Task.checkCancellation()
             let lineStr = "\(match.filePath):\(match.lineNumber + 1): \(match.lineText)"
             let cost = lineStr.count + 3
             if usedChars + cost > budget { break }
@@ -617,6 +648,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         var includedPathLines: [String] = []
         for path in pathMatchesFull {
+            try Task.checkCancellation()
             let cost = path.count + 3
             if usedChars + cost > budget { break }
             includedPathLines.append(path)
@@ -636,7 +668,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             dtoBuildDimensions(outcome: dtoBuildOutcome, limitHit: dtoBuildLimitHit)
         )
 
-        let reply = EditFlowPerf.measure(
+        let reply = try EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.dtoAssembly,
             dtoBuildDimensions(outcome: dtoBuildOutcome, limitHit: dtoBuildLimitHit)
         ) {
@@ -646,17 +678,21 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 .map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
             var perFileCounts: [String: Int] = [:]
             for match in includedContentMatches {
+                try Task.checkCancellation()
                 perFileCounts[match.filePath, default: 0] += 1
             }
             let perFileCountDTOs = perFileCounts.sorted { $0.key < $1.key }.map { ToolResultDTOs.PerFileCount(path: $0.key, count: $0.value) }
             var seenPaths = Set<String>()
             var orderedPaths: [String] = []
             for match in includedContentMatches where seenPaths.insert(match.filePath).inserted {
+                try Task.checkCancellation()
                 orderedPaths.append(match.filePath)
             }
             let groupedMatches = Dictionary(grouping: includedContentMatches, by: { $0.filePath })
-            let contentGroups = orderedPaths.compactMap { path -> ToolResultDTOs.SearchResultDTO.ContentMatchGroup? in
-                guard let matches = groupedMatches[path] else { return nil }
+            var contentGroups: [ToolResultDTOs.SearchResultDTO.ContentMatchGroup] = []
+            for path in orderedPaths {
+                try Task.checkCancellation()
+                guard let matches = groupedMatches[path] else { continue }
                 let lines = matches.sorted { $0.lineNumber < $1.lineNumber }.map { match in
                     let baseLine = match.lineNumber + 1
                     let before = (match.contextBefore ?? []).isEmpty ? nil : (match.contextBefore ?? []).enumerated().map { offset, text in
@@ -667,9 +703,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     }
                     return ToolResultDTOs.SearchResultDTO.ContentMatchGroup.Line(lineNumber: baseLine, lineText: match.lineText, contextBefore: before, contextAfter: after)
                 }
-                return ToolResultDTOs.SearchResultDTO.ContentMatchGroup(path: path, lines: lines)
+                contentGroups.append(ToolResultDTOs.SearchResultDTO.ContentMatchGroup(path: path, lines: lines))
             }
 
+            try Task.checkCancellation()
             return ToolResultDTOs.SearchResultDTO(
                 totalMatches: includedContentMatches.count + includedPathLines.count,
                 totalFiles: Set(includedContentMatches.map(\.filePath)).count,
@@ -696,6 +733,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             EditFlowPerf.Lifecycle.Search.providerDTOReady,
             EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
         )
+        try Task.checkCancellation()
         await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)

@@ -81,6 +81,7 @@ public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
     public let worktreeID: String?
     public let worktreePath: String
     public let worktreeName: String
+    public let isMain: Bool
     public let branch: String?
     public let head: String?
     public let isDetached: Bool
@@ -92,6 +93,7 @@ public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
         worktreeID: String?,
         worktreePath: String,
         worktreeName: String,
+        isMain: Bool,
         branch: String?,
         head: String?,
         isDetached: Bool
@@ -102,6 +104,7 @@ public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
         self.worktreeID = worktreeID
         self.worktreePath = worktreePath
         self.worktreeName = worktreeName
+        self.isMain = isMain
         self.branch = Self.normalizedOptional(branch)
         self.head = Self.normalizedOptional(head)
         self.isDetached = isDetached
@@ -115,6 +118,7 @@ public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
             worktreeID: descriptor.worktreeID,
             worktreePath: descriptor.path,
             worktreeName: descriptor.name ?? Self.fallbackWorktreeName(from: descriptor.path),
+            isMain: descriptor.isMain,
             branch: descriptor.branch,
             head: descriptor.head,
             isDetached: descriptor.isDetached
@@ -141,23 +145,25 @@ public struct GitWorktreeContextSummary: Sendable, Equatable, Hashable {
             .joined(separator: " / ")
     }
 
+    public var checkoutDisplayText: String {
+        isMain ? "main repository checkout" : "linked worktree"
+    }
+
     public var tooltipText: String {
         let branchText = branchDisplayText ?? "unknown branch"
-        var parts = [
+        let parts = [
             "Repository: \(repositoryDisplayName)",
+            "Checkout: \(checkoutDisplayText)",
             "Worktree: \(worktreeName)",
             "Branch: \(branchText)",
             "Path: \(worktreePath)"
         ]
-        if let head {
-            parts.insert("HEAD: \(head)", at: 3)
-        }
         return parts.joined(separator: "\n")
     }
 
     public var accessibilityText: String {
         let branchText = branchDisplayText ?? "unknown branch"
-        return "Git repository \(repositoryDisplayName), worktree \(worktreeName), branch \(branchText)"
+        return "Git repository \(repositoryDisplayName), \(checkoutDisplayText) \(worktreeName), branch \(branchText)"
     }
 
     private var shortHead: String? {

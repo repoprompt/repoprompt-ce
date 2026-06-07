@@ -272,7 +272,7 @@ public actor UnixSocketMCPTransport: Transport {
     public init(
         socketURL: URL,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250,
         receiveBufferCapacity: Int = 1024
     ) {
@@ -295,7 +295,7 @@ public actor UnixSocketMCPTransport: Transport {
     public init(
         connectedFD: Int32,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250,
         receiveBufferCapacity: Int = 1024
     ) throws {
@@ -417,9 +417,35 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         let framed = Self.frameWithNewlineIfNeeded(message)
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: "send_started",
+            frame: framed,
+            direction: .serverToClient,
+            connectionGeneration: fdGeneration
+        )
 
-        try await writeAll(framed)
+        do {
+            try await writeAll(framed)
+        } catch {
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: "send_failed",
+                frame: framed,
+                direction: .serverToClient,
+                connectionGeneration: fdGeneration,
+                terminalReason: "app_uds_send_failed"
+            )
+            throw error
+        }
         lastActivityTime = Date()
+        MCPResponseDeliveryTracer.emitFrame(
+            layer: "app_uds_transport",
+            phase: "send_completed",
+            frame: framed,
+            direction: .serverToClient,
+            connectionGeneration: fdGeneration
+        )
         mcpTransportLog("UnixSocketMCPTransport sent \(framed.count) bytes successfully")
     }
 

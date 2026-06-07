@@ -3,7 +3,7 @@ import Foundation
 import XCTest
 
 final class MCPResolvedToolDispatchSourceGuardTests: XCTestCase {
-    func testOrdinaryCallToolHandlerInvokesResolvedToolDirectlyInBothDispatchBranches() throws {
+    func testOrdinaryCallToolHandlerCentralizesResolvedToolInvocationAcrossBothDispatchBranches() throws {
         let source = try String(
             contentsOf: RepoRoot.url()
                 .appendingPathComponent("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"),
@@ -22,7 +22,9 @@ final class MCPResolvedToolDispatchSourceGuardTests: XCTestCase {
         XCTAssertEqual(callToolHandler.occurrenceCount(of: "capturedArgsForFormatter[\"window_id\"] == nil"), 1)
         XCTAssertEqual(callToolHandler.occurrenceCount(of: "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)"), 1)
         XCTAssertEqual(callToolHandler.occurrenceCount(of: "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID"), 2)
-        XCTAssertEqual(callToolHandler.occurrenceCount(of: "try await toolDef.callAsFunction(effectiveArgs)"), 2)
+        XCTAssertEqual(callToolHandler.occurrenceCount(of: "let resolvedOperation: @Sendable () async throws -> Value ="), 1)
+        XCTAssertEqual(callToolHandler.occurrenceCount(of: "try await toolDef.callAsFunction(effectiveArgs)"), 1)
+        XCTAssertEqual(callToolHandler.occurrenceCount(of: "try await dispatchResolvedProvider(resolvedOperation)"), 2)
         XCTAssertFalse(callToolHandler.contains("service.call("))
         XCTAssertTrue(callToolHandler.contains("if let wsSvc, shouldTrackToolOwnership"))
         XCTAssertTrue(callToolHandler.contains("// Not window-scoped → no ownership tracking needed"))

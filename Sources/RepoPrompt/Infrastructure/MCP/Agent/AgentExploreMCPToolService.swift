@@ -18,6 +18,10 @@ struct AgentExploreMCPToolService {
     var endAgentRunWait: (_ token: UUID, _ completion: AgentRunWaitScopeCompletion) async -> Void = { _, _ in }
     let startRun: StartRun
 
+    static func resolvedStartTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
+        try AgentRunMCPToolService.resolvedStartTimeoutSeconds(value)
+    }
+
     func execute(args: [String: Value]) async throws -> Value {
         guard let op = AgentMCPToolHelpers.normalizedString(args["op"])?.lowercased() else {
             throw MCPError.invalidParams("agent_explore op is required. Use start, poll, wait, or cancel.")
@@ -41,7 +45,7 @@ struct AgentExploreMCPToolService {
         let startMessages = try parseStartMessages(args)
         let messages = startMessages.messages
         let detach = AgentMCPToolHelpers.parseBool(args["detach"]) ?? false
-        let timeoutSeconds = try AgentMCPToolHelpers.parseTimeoutSeconds(args["timeout"]) ?? AgentRunMCPToolService.defaultWaitTimeoutSeconds
+        let timeoutSeconds = try Self.resolvedStartTimeoutSeconds(args["timeout"])
 
         let metadata = await captureRequestMetadata()
         let context = try await resolveStartContext(metadata: metadata)

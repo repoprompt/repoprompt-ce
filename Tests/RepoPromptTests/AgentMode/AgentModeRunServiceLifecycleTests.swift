@@ -468,6 +468,113 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
+    func testDuplicateTerminalBarrierInvocationRetriesUnresolvedPublicationWithoutRecommitting() async throws {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: nil)
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.retryPublication")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.retryPublication",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        )
+
+        let firstRevision = await barrier.commit(request)
+        let first = try XCTUnwrap(firstRevision)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .rejected(reason: "test_transient_rejection"))
+        let duplicateRevision = await barrier.commit(request)
+        let duplicate = try XCTUnwrap(duplicateRevision)
+
+        XCTAssertEqual(first, duplicate)
+        XCTAssertEqual(publicationAttempts, 2)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: nil))
+        XCTAssertEqual(recorder.events.count(where: { $0 == "assistant-flush" }), 1)
+    }
+
+    func testQueuedFollowUpStartsOnlyAfterCanonicalSuccessorPublicationResolves() async {
+        let recorder = LifecycleRecorder()
+        let sessionID = UUID()
+        let activationID = UUID()
+        let registrationGeneration: UInt64 = 7
+        let epoch = AgentRunTurnEpoch(
+            sessionID: sessionID,
+            activationID: activationID,
+            registrationGeneration: registrationGeneration,
+            id: UUID(),
+            ordinal: 1,
+            continuityGeneration: 0,
+            transitionKind: .initial
+        )
+        let successor = AgentRunTurnEpoch(
+            sessionID: sessionID,
+            activationID: activationID,
+            registrationGeneration: registrationGeneration,
+            id: UUID(),
+            ordinal: 2,
+            continuityGeneration: 0,
+            transitionKind: .relatedFollowUp
+        )
+        var publicationAttempts = 0
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                return publicationAttempts == 1
+                    ? .rejected(reason: "test_transient_rejection")
+                    : .accepted(successorEpoch: successor)
+            },
+            makeTerminalPublicationEnvelope: { _, _, _ in
+                .init(epoch: epoch, snapshot: .expired(sessionID: sessionID))
+            },
+            startFollowUpRun: { _, text in recorder.record("follow-up:\(text)") }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["continue"]
+        let ownership = session.beginRunAttempt(source: "test.followUpPublication")
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.followUpPublication",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: true,
+            notifyTurnComplete: false
+        )
+
+        _ = await barrier.commit(request)
+        XCTAssertEqual(session.pendingInstructions, ["continue"])
+        XCTAssertTrue(session.mcpFollowUpRunPending)
+        XCTAssertFalse(recorder.contains("follow-up:continue"))
+
+        _ = await barrier.commit(request)
+        XCTAssertTrue(session.pendingInstructions.isEmpty)
+        XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
+        XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: successor))
+    }
+
     func testConcurrentPublicationOnlyCancellationWaitsForCanonicalPublication() async throws {
         let recorder = LifecycleRecorder()
         let publicationGate = LifecyclePublicationGate()
@@ -883,7 +990,18 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
     private func makeHooks(
         recorder: LifecycleRecorder,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
-        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil
+        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        publishTerminalCommitResult: ((
+            AgentModeViewModel.TabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunEpochTransitionKind?
+        ) async -> AgentRunTerminalPublicationResult)? = nil,
+        makeTerminalPublicationEnvelope: ((
+            AgentModeViewModel.TabSession,
+            AgentRunOwnership,
+            AgentSessionRunState
+        ) -> AgentRunTerminalPublicationEnvelope?)? = nil,
+        startFollowUpRun: ((UUID, String) -> Void)? = nil
     ) -> AgentModeRunService.Hooks {
         let flushPendingAssistantDelta = flushPendingAssistantDelta ?? { _ in
             recorder.record("assistant-flush")
@@ -918,8 +1036,15 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             flushPendingAssistantDelta: flushPendingAssistantDelta,
             clearPendingAssistantDelta: { _ in },
             prepareTerminalPublication: { _ in recorder.record("prepare-publication") },
-            publishTerminalCommit: publishTerminalCommit,
-            startFollowUpRun: { _, _ in },
+            makeTerminalPublicationEnvelope: makeTerminalPublicationEnvelope ?? { _, _, _ in nil },
+            publishTerminalCommit: { session, revision, successorKind in
+                if let publishTerminalCommitResult {
+                    return await publishTerminalCommitResult(session, revision, successorKind)
+                }
+                await publishTerminalCommit(session, revision)
+                return .accepted(successorEpoch: nil)
+            },
+            startFollowUpRun: startFollowUpRun ?? { _, _ in },
             restoreDraftText: { _, text, _, _ in recorder.record("draft:\(text)") },
             augmentUserMessageForProviderSend: { text, _, _, _ in text },
             stageResumeRecoveryHandoffIfNeeded: { _ in },

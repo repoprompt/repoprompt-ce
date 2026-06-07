@@ -26,14 +26,63 @@ struct AgentRunBindingIdentity: Equatable, Hashable {
     }
 }
 
+/// Describes how a newly activated turn relates to the preceding turn in the same session.
+enum AgentRunEpochTransitionKind: String, Equatable, Hashable {
+    case initial
+    case relatedFollowUp
+    case steering
+    case unrelated
+}
+
+struct AgentRunTurnEpoch: Equatable, Hashable {
+    let sessionID: UUID
+    let activationID: UUID
+    let registrationGeneration: UInt64
+    let id: UUID
+    let ordinal: UInt64
+    let continuityGeneration: UInt64
+    let transitionKind: AgentRunEpochTransitionKind
+}
+
+struct AgentRunTerminalPublicationEnvelope: Equatable {
+    let epoch: AgentRunTurnEpoch
+    let snapshot: AgentRunMCPSnapshot
+}
+
+enum AgentRunTerminalPublicationResult: Equatable {
+    case accepted(successorEpoch: AgentRunTurnEpoch?)
+    case stale
+    case rejected(reason: String)
+
+    var successorEpoch: AgentRunTurnEpoch? {
+        guard case let .accepted(successorEpoch) = self else { return nil }
+        return successorEpoch
+    }
+
+    var isResolved: Bool {
+        switch self {
+        case .accepted, .stale:
+            true
+        case .rejected:
+            false
+        }
+    }
+}
+
 /// Provider-neutral ownership token for one logical run attempt.
 struct AgentRunOwnership: Equatable, Hashable {
     let attemptID: UUID
     let binding: AgentRunBindingIdentity
+    let turnEpoch: AgentRunTurnEpoch?
 
-    init(attemptID: UUID = UUID(), binding: AgentRunBindingIdentity) {
+    init(
+        attemptID: UUID = UUID(),
+        binding: AgentRunBindingIdentity,
+        turnEpoch: AgentRunTurnEpoch? = nil
+    ) {
         self.attemptID = attemptID
         self.binding = binding
+        self.turnEpoch = turnEpoch
     }
 }
 
@@ -131,6 +180,7 @@ struct AgentRunLifecycleTracker: Equatable {
         persistentBindingGeneration: UUID? = nil,
         bindingTransitionGeneration: UInt64 = 0,
         attemptID: UUID = UUID(),
+        turnEpoch: AgentRunTurnEpoch? = nil,
         timestampUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> AgentRunOwnership {
         let ownership = AgentRunOwnership(
@@ -140,7 +190,8 @@ struct AgentRunLifecycleTracker: Equatable {
                 persistentSessionID: persistentSessionID,
                 persistentBindingGeneration: persistentBindingGeneration,
                 bindingTransitionGeneration: bindingTransitionGeneration
-            )
+            ),
+            turnEpoch: turnEpoch
         )
         activeOwnership = ownership
         liveness = AgentRunLivenessSnapshot(

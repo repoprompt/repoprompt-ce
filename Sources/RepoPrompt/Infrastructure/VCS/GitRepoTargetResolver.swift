@@ -297,13 +297,17 @@ struct GitRepoTargetResolver {
                 }
                 throw GitRepoTargetResolverError.invalidParams("No worktree found for branch '\(branch)'. Use repo_root=\"@main\" for the main checkout or pass a full worktree path.")
             }
-            if let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL), layout.isWorktree,
-               let mainRoot = Self.resolveMainWorktreeRoot(for: layout)
-            {
-                return GitRepoDescriptor(rootURL: mainRoot)
-            }
-            if GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL) != nil {
-                return repo
+            if let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL) {
+                if !layout.isLinkedWorktree {
+                    return repo
+                }
+                if let mainRoot = Self.resolveMainWorktreeRoot(for: layout) {
+                    return GitRepoDescriptor(rootURL: mainRoot)
+                }
+                if let main = try await mainWorktree(for: repo) {
+                    return GitRepoDescriptor(rootURL: URL(fileURLWithPath: main.path))
+                }
+                throw GitRepoTargetResolverError.invalidParams("The main checkout path could not be resolved for repo: \(repo.rootPath)")
             }
             if let main = try await mainWorktree(for: repo), !samePath(main.path, repo.rootPath) {
                 return GitRepoDescriptor(rootURL: URL(fileURLWithPath: main.path))
@@ -438,12 +442,7 @@ struct GitRepoTargetResolver {
     // MARK: - Legacy worktree layout helpers
 
     static func resolveMainWorktreeRoot(for layout: GitRepositoryLayout) -> URL? {
-        let candidate: URL = if layout.commonDir.lastPathComponent == ".git" {
-            layout.commonDir.deletingLastPathComponent()
-        } else {
-            layout.commonDir
-        }
-        return FileManager.default.fileExists(atPath: candidate.path) ? candidate : nil
+        layout.knownMainWorktreeRoot
     }
 
     private func readHeadRef(from headURL: URL) -> String? {

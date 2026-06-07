@@ -245,8 +245,8 @@ public struct AgentChatItem: Codable, Identifiable, Sendable, Equatable {
         AgentChatItem(kind: .toolCall, text: "Using tool: \(name)", toolName: name, toolInvocationID: invocationID, toolArgsJSON: argsJSON, sequenceIndex: sequenceIndex)
     }
 
-    public static func toolResult(name: String, invocationID: UUID? = nil, resultJSON: String, isError: Bool? = nil, sequenceIndex: Int = 0) -> AgentChatItem {
-        AgentChatItem(kind: .toolResult, text: resultJSON, toolName: name, toolInvocationID: invocationID, toolResultJSON: resultJSON, toolIsError: isError, sequenceIndex: sequenceIndex)
+    public static func toolResult(name: String, invocationID: UUID? = nil, argsJSON: String? = nil, resultJSON: String, isError: Bool? = nil, sequenceIndex: Int = 0) -> AgentChatItem {
+        AgentChatItem(kind: .toolResult, text: resultJSON, toolName: name, toolInvocationID: invocationID, toolArgsJSON: argsJSON, toolResultJSON: resultJSON, toolIsError: isError, sequenceIndex: sequenceIndex)
     }
 
     public static func system(_ text: String, sequenceIndex: Int = 0) -> AgentChatItem {

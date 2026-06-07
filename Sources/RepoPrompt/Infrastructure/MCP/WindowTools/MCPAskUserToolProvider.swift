@@ -48,7 +48,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
             - `questions`: Required array of structured questions. Each question requires stable `id` and `question` fields. Use `allows_multiple` and `allows_custom` for selection/custom-answer behavior.
             - `title`: Optional title for the wizard card.
             - `context`: Optional overall context shown above the questions.
-            - `timeout_seconds`: Optional timeout in seconds for the whole interaction.
+            - `timeout_seconds`: Optional timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting.
 
             **Response:**
             - `answers`: Object keyed by question ID. Each value contains `answers`, `selected_options`, `custom_response`, and `skipped`.
@@ -61,7 +61,7 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
                 properties: [
                     "title": .string(description: "Optional title shown above the question wizard."),
                     "context": .string(description: "Optional overall context shown above the wizard."),
-                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction."),
+                    "timeout_seconds": .integer(description: "Timeout in seconds for the whole interaction. Defaults to the workspace question-timeout setting."),
                     "questions": .array(
                         description: "One or more structured questions to ask as a single wizard.",
                         items: .object(
@@ -154,6 +154,17 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
         return askUserResponseValue(response, includeLegacyResponse: parsed.includeLegacyResponse)
     }
 
+    static func resolvedInteractionTimeoutSeconds(
+        _ value: Value?,
+        defaultTimeout: TimeInterval
+    ) throws -> TimeInterval {
+        guard let value else { return defaultTimeout }
+        guard let timeoutInt = value.intValue, timeoutInt > 0 else {
+            throw MCPError.invalidParams("timeout_seconds must be a positive integer.")
+        }
+        return TimeInterval(timeoutInt)
+    }
+
     private struct ParsedAskUserInteraction {
         let interaction: AgentAskUserInteraction
         let includeLegacyResponse: Bool
@@ -171,15 +182,10 @@ final class MCPAskUserToolProvider: MCPWindowToolProviding {
             throw MCPError.invalidParams("ask_user structured questions must put '\(misplacedKey)' on each question, not at the top level.")
         }
 
-        let timeoutSeconds: TimeInterval
-        if let timeoutValue = args["timeout_seconds"] {
-            guard let timeoutInt = timeoutValue.intValue, timeoutInt > 0 else {
-                throw MCPError.invalidParams("timeout_seconds must be a positive integer.")
-            }
-            timeoutSeconds = TimeInterval(timeoutInt)
-        } else {
-            timeoutSeconds = defaultTimeout
-        }
+        let timeoutSeconds = try resolvedInteractionTimeoutSeconds(
+            args["timeout_seconds"],
+            defaultTimeout: defaultTimeout
+        )
 
         let questions: [AgentAskUserQuestion]
         let includeLegacyResponse: Bool

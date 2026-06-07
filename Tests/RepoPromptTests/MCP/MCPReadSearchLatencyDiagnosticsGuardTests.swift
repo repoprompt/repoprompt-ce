@@ -541,19 +541,33 @@
 
         func testRunToolDecompositionHooksRemainScopedAndProviderExecutionIsDimensioned() throws {
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
+            let runToolStart = try XCTUnwrap(viewModel.range(of: "    private func runTool<T>("))
+            let runToolEnd = try XCTUnwrap(
+                viewModel.range(
+                    of: "    var windowMCPTools: [Tool]",
+                    range: runToolStart.upperBound ..< viewModel.endIndex
+                )
+            )
+            let runTool = String(viewModel[runToolStart.lowerBound ..< runToolEnd.lowerBound])
             for hook in [
                 "runToolSetup",
                 "runToolRegistration",
                 "runToolTimeoutEnvelope",
                 "runToolCompletionCleanup"
             ] {
-                XCTAssertTrue(viewModel.contains(hook), "Missing runTool decomposition hook: \(hook)")
+                XCTAssertTrue(runTool.contains(hook), "Missing runTool decomposition hook: \(hook)")
             }
-            let providerExecution = try XCTUnwrap(viewModel.range(of: "EditFlowPerf.Stage.MCPToolCall.providerExecution,"))
-            let providerInvocation = viewModel[providerExecution.lowerBound...].prefix(180)
+            let providerExecution = try XCTUnwrap(runTool.range(of: "EditFlowPerf.Stage.MCPToolCall.providerExecution,"))
+            let providerInvocation = runTool[providerExecution.lowerBound...].prefix(180)
             XCTAssertTrue(providerInvocation.contains("EditFlowPerf.Dimensions(toolName: name)"))
-            XCTAssertTrue(viewModel.contains("result = try await withThrowingTaskGroup(of: T.self)"))
-            XCTAssertEqual(viewModel.components(separatedBy: "EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,").count - 1, 4)
+            XCTAssertFalse(runTool.contains("withThrowingTaskGroup(of: T.self)"))
+            XCTAssertTrue(runTool.contains("withTaskCancellationHandler"))
+            XCTAssertTrue(runTool.contains("MCPRunToolCleanupClaim"))
+            XCTAssertFalse(runTool.contains("Task {\n                    await cleanupExecution"))
+            XCTAssertTrue(runTool.contains("await cleanupExecution(outcome)"))
+            XCTAssertFalse(runTool.contains("throw MCPError.internalError(\"tool cancelled by user\")"))
+            XCTAssertTrue(runTool.contains("throw MCPToolExecutionCancelledError()"))
+            XCTAssertEqual(runTool.components(separatedBy: "EditFlowPerf.Stage.MCPToolCall.runToolCompletionCleanup,").count - 1, 2)
         }
 
         func testNewReadDispatchStageRecorderCapturesToolDimensionAndFinishes() throws {
@@ -644,7 +658,7 @@
             XCTAssertEqual(lookup.components(separatedBy: "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID").count - 1, 2)
             XCTAssertEqual(lookup.components(separatedBy: "args: capturedArguments").count - 1, 1)
             XCTAssertEqual(lookup.components(separatedBy: "args: capturedArgsForFormatter").count - 1, 1)
-            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 2)
+            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 1)
             XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupServiceToolsAwait").count - 1, 2)
             XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupToolDefinitionScan").count - 1, 3)
             XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupPublicWindowIDInjection").count - 1, 2)
@@ -1913,7 +1927,7 @@
             ] {
                 XCTAssertTrue(manager.contains(hook), "Missing manager attribution hook: \(hook)")
             }
-            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 2)
+            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 1)
             XCTAssertFalse(manager.contains("service.call("))
 
             let readable = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")

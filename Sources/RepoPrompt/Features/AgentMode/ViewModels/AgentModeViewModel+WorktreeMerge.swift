@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptShared
 
 struct WorktreeMergeReviewScope: Hashable {
     let windowID: Int
@@ -395,7 +396,7 @@ extension AgentModeViewModel {
     func requestWorktreeMergeReviewAndApply(
         preview: GitWorktreeMergePreview,
         sessionID: UUID,
-        timeoutSeconds: TimeInterval = 600,
+        timeoutSeconds: TimeInterval = MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds,
         commitMessage: String? = nil
     ) async throws -> GitWorktreeMergeApplyResult {
         let session = try worktreeMergeSession(sessionID: sessionID)
@@ -434,7 +435,7 @@ extension AgentModeViewModel {
     func requestWorktreeMergeReviewAndApply(
         sessionID: UUID,
         operationID: String,
-        timeoutSeconds: TimeInterval = 600,
+        timeoutSeconds: TimeInterval = MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds,
         commitMessage: String? = nil
     ) async throws -> GitWorktreeMergeApplyResult {
         let session = try worktreeMergeSession(sessionID: sessionID)

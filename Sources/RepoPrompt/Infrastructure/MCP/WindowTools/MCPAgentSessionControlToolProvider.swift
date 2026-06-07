@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptShared
 
 @MainActor
 final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
@@ -84,7 +85,8 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
     }
 
     private func waitForNextInstructionTool() -> Tool {
-        runtime.tool(
+        let defaultWaitSeconds = Int(MCPTimeoutPolicy.nextUserInstructionDefaultWaitSeconds)
+        return runtime.tool(
             name: MCPWindowToolName.waitForNextInstruction,
             freshnessPolicy: .none,
             description: """
@@ -96,6 +98,7 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
             **How it works:**
             - The `prompt` you provide IS your message to the user - make it your complete response
             - After you call this, you receive the user's reply as your next turn (like a normal conversation)
+            - The wait defaults to \(defaultWaitSeconds) seconds and honors a caller-supplied `timeout_seconds`; a timeout returns `timed_out: true`
             - Do NOT send a separate text response before calling this tool - the prompt IS your response
 
             **Writing your response (the `prompt` parameter):**
@@ -113,7 +116,8 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
-                    "prompt": .string(description: "Your response to the user - what you want to say before waiting for their next instruction.")
+                    "prompt": .string(description: "Your response to the user - what you want to say before waiting for their next instruction."),
+                    "timeout_seconds": .integer(description: "Optional wait timeout in seconds. Default \(defaultWaitSeconds).")
                 ],
                 required: []
             )
@@ -176,12 +180,20 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
         return .object(result)
     }
 
+    static func resolvedInstructionWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {
+        let timeout = value?.intValue.map(TimeInterval.init) ?? MCPTimeoutPolicy.nextUserInstructionDefaultWaitSeconds
+        guard timeout > 0 else {
+            throw MCPError.invalidParams("timeout_seconds must be a positive integer.")
+        }
+        return timeout
+    }
+
     private static func executeWaitForNextInstruction(
         args: [String: Value],
         dependencies: MCPWindowToolDependencies
     ) async throws -> Value {
         let prompt = args["prompt"]?.stringValue
-        let timeout = args["timeout_seconds"]?.intValue.map { TimeInterval($0) } ?? 600
+        let timeout = try resolvedInstructionWaitTimeoutSeconds(args["timeout_seconds"])
 
         let targetWindow = try dependencies.requireTargetWindow()
         let connectionID = ServerNetworkManager.currentConnectionID

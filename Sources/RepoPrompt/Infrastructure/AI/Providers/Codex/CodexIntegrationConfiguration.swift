@@ -1,12 +1,17 @@
 import Foundation
+import RepoPromptShared
 
 /// Codex-specific integration configuration helpers.
 ///
 /// This namespace owns Codex CLI config.toml parsing/mutation, RepoPrompt MCP
 /// installation/repair, and Codex runtime override construction.
 enum CodexIntegrationConfiguration {
-    private static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV3"
-    private static let desiredToolTimeoutSeconds = 10000
+    static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV4"
+    // Codex applies this timeout to every tool on the MCP server. Preserve the existing
+    // multi-hour budget because Oracle and Context Builder remain synchronous and have no
+    // per-tool timeout exemption.
+    static let desiredToolTimeoutSeconds = MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
+    static let desiredSupportsParallelToolCalls = false
     static let desiredToolOutputTokenLimit = 25000
 
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
@@ -216,8 +221,8 @@ enum CodexIntegrationConfiguration {
             )
             if mutation.changed {
                 try mutation.content.write(to: configURL, atomically: true, encoding: .utf8)
-                UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
             }
+            UserDefaults.standard.set(true, forKey: toolTimeoutDefaultsKey)
 
             return (true, mutation.wasRepoPromptServerPresent)
         } catch {
@@ -279,9 +284,13 @@ enum CodexIntegrationConfiguration {
         }
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt tool timeout override.
+    /// Ensures existing Codex CLI configs include the RepoPrompt MCP policy required by V4:
+    /// the preserved 10,000-active-second server timeout and disabled parallel tool calls.
+    ///
+    /// Codex has no per-tool timeout exemption, so lowering this server-wide value would also
+    /// truncate synchronous Oracle and Context Builder operations that can legitimately run for hours.
     /// - Parameter force: When true, bypasses the once-per-install guard and rechecks the file.
-    /// - Returns: `true` if the RepoPrompt entry was located (and now has the desired timeout).
+    /// - Returns: `true` if the RepoPrompt entry was located and now has the desired policy.
     @discardableResult
     static func ensureToolTimeout(force: Bool = false) -> Bool {
         let defaults = UserDefaults.standard
@@ -316,10 +325,6 @@ enum CodexIntegrationConfiguration {
         var sectionStart: Int?
         var isRepoPromptSection = false
         var commandMatches = false
-        var commandLineIndex: Int?
-        var argsLineIndex: Int?
-        var timeoutLineIndex: Int?
-        var timeoutValue: Int?
         var foundTarget = false
         var needsWrite = false
         var completed = false
@@ -328,26 +333,17 @@ enum CodexIntegrationConfiguration {
             sectionStart = index
             isRepoPromptSection = isRepoPrompt
             commandMatches = false
-            commandLineIndex = nil
-            argsLineIndex = nil
-            timeoutLineIndex = nil
-            timeoutValue = nil
         }
 
         func finalizeSection(before index: Int) {
             guard isRepoPromptSection, commandMatches, !completed else { return }
             foundTarget = true
 
-            if let timeoutIndex = timeoutLineIndex {
-                if timeoutValue != desiredToolTimeoutSeconds {
-                    lines[timeoutIndex] = "tool_timeout_sec = \(desiredToolTimeoutSeconds)"
+            if let sectionStart {
+                var block = BlockRange(start: sectionStart, end: index)
+                if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
                     needsWrite = true
                 }
-            } else {
-                let insertionBase = argsLineIndex ?? commandLineIndex ?? sectionStart ?? max(0, index - 1)
-                let insertionIndex = min(lines.count, insertionBase + 1)
-                lines.insert("tool_timeout_sec = \(desiredToolTimeoutSeconds)", at: insertionIndex)
-                needsWrite = true
             }
 
             completed = true
@@ -365,24 +361,13 @@ enum CodexIntegrationConfiguration {
                 continue
             }
 
-            if isRepoPromptSection, let assignment = parseTOMLAssignment(line) {
-                if assignment.isSingleKey("args") {
-                    argsLineIndex = idx
-                }
-
-                if assignment.isSingleKey("command"),
-                   let value = parseTOMLStringValue(assignment.valueText)
-                {
-                    let candidate = canonicalizedPath(for: value)
-                    if candidate == desiredCommand {
-                        commandMatches = true
-                        commandLineIndex = idx
-                    }
-                }
-
-                if assignment.isSingleKey("tool_timeout_sec") {
-                    timeoutLineIndex = idx
-                    timeoutValue = parseTOMLIntegerValue(assignment.valueText)
+            if isRepoPromptSection,
+               let assignment = parseTOMLAssignment(line),
+               assignment.isSingleKey("command"),
+               let value = parseTOMLStringValue(assignment.valueText)
+            {
+                if canonicalizedPath(for: value) == desiredCommand {
+                    commandMatches = true
                 }
             }
 
@@ -658,6 +643,19 @@ enum CodexIntegrationConfiguration {
         return nil
     }
 
+    private static func parseTOMLBooleanValue(_ valueText: Substring) -> Bool? {
+        let stripped = stripComment(fromValueText: String(valueText))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch stripped {
+        case "true":
+            return true
+        case "false":
+            return false
+        default:
+            return nil
+        }
+    }
+
     private static func parseTOMLIntegerValue(_ valueText: Substring) -> Int? {
         let stripped = stripComment(fromValueText: String(valueText)).trimmingCharacters(in: .whitespacesAndNewlines)
         guard !stripped.isEmpty, !stripped.hasPrefix("\""), !stripped.hasPrefix("'") else { return nil }
@@ -859,14 +857,14 @@ enum CodexIntegrationConfiguration {
         if ensureKey("args", value: "[]", in: &lines, blockRange: &block, afterKey: "command", force: true) {
             changed = true
         }
-        if ensureKey("tool_timeout_sec", value: "\(desiredToolTimeoutSeconds)", in: &lines, blockRange: &block, afterKey: "args", force: true) {
+        if ensureRepoPromptPolicyKeys(in: &lines, blockRange: &block) {
             changed = true
         }
 
         if shouldIncludeEnabledKey {
             let desiredEnabled = (forceEnabled ?? defaultEnabledIfMissing) ? "true" : "false"
             let forceFlag = forceEnabled != nil
-            if ensureKey("enabled", value: desiredEnabled, in: &lines, blockRange: &block, afterKey: "tool_output_token_limit", force: forceFlag) {
+            if ensureKey("enabled", value: desiredEnabled, in: &lines, blockRange: &block, afterKey: "supports_parallel_tool_calls", force: forceFlag) {
                 changed = true
             }
         }
@@ -964,26 +962,74 @@ enum CodexIntegrationConfiguration {
         return changed
     }
 
+    private static func ensureRepoPromptPolicyKeys(
+        in lines: inout [String],
+        blockRange: inout BlockRange
+    ) -> Bool {
+        var changed = false
+        let timeoutInsertionKey = firstIndex(ofKey: "args", in: lines, within: blockRange) == nil
+            ? "command"
+            : "args"
+
+        if ensureKey(
+            "tool_timeout_sec",
+            value: "\(desiredToolTimeoutSeconds)",
+            in: &lines,
+            blockRange: &blockRange,
+            afterKey: timeoutInsertionKey,
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLIntegerValue($0) == desiredToolTimeoutSeconds }
+        ) {
+            changed = true
+        }
+        if ensureKey(
+            "supports_parallel_tool_calls",
+            value: "\(desiredSupportsParallelToolCalls)",
+            in: &lines,
+            blockRange: &blockRange,
+            afterKey: "tool_timeout_sec",
+            force: true,
+            isSemanticallyEquivalent: { parseTOMLBooleanValue($0) == desiredSupportsParallelToolCalls }
+        ) {
+            changed = true
+        }
+
+        return changed
+    }
+
     private static func ensureKey(
         _ key: String,
         value: String,
         in lines: inout [String],
         blockRange: inout BlockRange,
         afterKey: String? = nil,
-        force: Bool = false
+        force: Bool = false,
+        isSemanticallyEquivalent: ((Substring) -> Bool)? = nil
     ) -> Bool {
         var changed = false
         let desiredLine = "\(key) = \(value)"
         let indices = keyLineIndices(for: key, in: lines, within: blockRange)
 
         if let first = indices.first {
-            let trimmed = lines[first].trimmingCharacters(in: .whitespacesAndNewlines)
-            if force, trimmed != desiredLine {
-                lines[first] = desiredLine
+            let preferred = if let isSemanticallyEquivalent {
+                indices.first { index in
+                    parseTOMLAssignment(lines[index]).map { assignment in
+                        isSemanticallyEquivalent(assignment.valueText)
+                    } ?? false
+                } ?? first
+            } else {
+                first
+            }
+            let trimmed = lines[preferred].trimmingCharacters(in: .whitespacesAndNewlines)
+            let equivalent = parseTOMLAssignment(lines[preferred]).map { assignment in
+                isSemanticallyEquivalent?(assignment.valueText) ?? false
+            } ?? false
+            if force, !equivalent, trimmed != desiredLine {
+                lines[preferred] = desiredLine
                 changed = true
             }
 
-            for extra in indices.dropFirst().reversed() {
+            for extra in indices.filter({ $0 != preferred }).reversed() {
                 lines.remove(at: extra)
                 blockRange.end -= 1
                 changed = true
@@ -1033,7 +1079,8 @@ enum CodexIntegrationConfiguration {
             "[mcp_servers.\(cliPathComponent(forNormalizedServerName: repoPromptMCPServerName))]",
             "command = \"\(serverCommand)\"",
             "args = []",
-            "tool_timeout_sec = \(desiredToolTimeoutSeconds)"
+            "tool_timeout_sec = \(desiredToolTimeoutSeconds)",
+            "supports_parallel_tool_calls = \(desiredSupportsParallelToolCalls)"
         ]
         if includeEnabled {
             lines.append("enabled = \(enabled ? "true" : "false")")

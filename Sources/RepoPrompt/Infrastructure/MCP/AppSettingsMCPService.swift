@@ -7,7 +7,7 @@ import MCP
 /// This service intentionally does not expose the raw global settings document. Only
 /// keys present in `AppSettingsMCPRegistry.definitions` are visible to MCP clients.
 final class AppSettingsMCPService: Service {
-    static let toolName = "app_settings"
+    static let toolName = MCPGlobalToolName.appSettings
 
     private let store: GlobalSettingsStore
     private let notificationCenter: NotificationCenter

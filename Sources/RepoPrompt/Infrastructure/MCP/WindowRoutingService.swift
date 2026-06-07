@@ -1953,7 +1953,7 @@ final class WindowRoutingService: Service {
 
         newTools.append(
             Tool(
-                name: "bind_context",
+                name: MCPGlobalToolName.bindContext,
                 description: """
                 List, inspect, and bind sticky RepoPrompt window/tab context for this MCP connection.
 
@@ -2126,7 +2126,7 @@ final class WindowRoutingService: Service {
         newTools.append(
             // 3️⃣ manage_workspaces ---------------------------------------------
             Tool(
-                name: "manage_workspaces",
+                name: MCPGlobalToolName.manageWorkspaces,
                 description: """
                 Manage workspaces and compose-tab lifecycle across RepoPrompt windows.
 

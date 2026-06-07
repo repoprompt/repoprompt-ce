@@ -612,9 +612,12 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.removeInstallEntry()
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt tool timeout override.
+    /// Ensures existing Codex CLI configs include the RepoPrompt V4 MCP policy:
+    /// the preserved 10,000-active-second server timeout and disabled parallel tool calls.
+    /// Codex has no per-tool timeout exemption, so the long timeout protects synchronous
+    /// Oracle and Context Builder operations.
     /// - Parameter force: When true, bypasses the once-per-install guard and rechecks the file.
-    /// - Returns: `true` if the RepoPrompt entry was located (and now has the desired timeout).
+    /// - Returns: `true` if the RepoPrompt entry was located and now has the desired policy.
     @discardableResult
     static func ensureCodexToolTimeout(force: Bool = false) -> Bool {
         CodexIntegrationConfiguration.ensureToolTimeout(force: force)

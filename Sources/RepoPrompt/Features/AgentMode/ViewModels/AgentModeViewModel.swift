@@ -15,6 +15,8 @@ struct AgentContextUsage: Codable, Equatable {
 /// View model for Agent mode - manages per-tab agent chat sessions with long-running agent interactions
 @MainActor
 final class AgentModeViewModel: ObservableObject {
+    @TaskLocal private static var mcpRunEpochTransitionToken: UUID?
+
     nonisolated static func steeringDebugLog(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableSteeringDebugLogging") else { return }
@@ -593,6 +595,7 @@ final class AgentModeViewModel: ObservableObject {
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
+        private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
@@ -639,6 +642,30 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setAllowsScheduledDerivedTranscriptRefreshWithoutPromptManager(_ value: Bool) {
             test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = value
+        }
+
+        func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
+            test_afterMCPStoreEpochBegan = hook
+        }
+
+        func test_makeTerminalPublicationEnvelope(
+            for session: TabSession,
+            ownership: AgentRunOwnership,
+            terminalState: AgentSessionRunState
+        ) -> AgentRunTerminalPublicationEnvelope? {
+            makeTerminalPublicationEnvelope(
+                for: session,
+                ownership: ownership,
+                terminalState: terminalState
+            )
+        }
+
+        func test_publishTerminalCommit(
+            _ revision: AgentRunTerminalCommitRevision,
+            successorKind: AgentRunEpochTransitionKind?,
+            for session: TabSession
+        ) async -> AgentRunTerminalPublicationResult {
+            await publishTerminalCommit(revision, successorKind: successorKind, for: session)
         }
 
         var test_pendingAssistantPresentationCount: Int {
@@ -1955,8 +1982,20 @@ final class AgentModeViewModel: ObservableObject {
             prepareTerminalPublication: { [weak self] session in
                 self?.prepareTerminalPublication(for: session)
             },
-            publishTerminalCommit: { [weak self] session, revision in
-                await self?.publishTerminalCommit(revision, for: session)
+            makeTerminalPublicationEnvelope: { [weak self] session, ownership, terminalState in
+                self?.makeTerminalPublicationEnvelope(
+                    for: session,
+                    ownership: ownership,
+                    terminalState: terminalState
+                )
+            },
+            publishTerminalCommit: { [weak self] session, revision, successorKind in
+                guard let self else { return .rejected(reason: "view_model_deallocated") }
+                return await publishTerminalCommit(
+                    revision,
+                    successorKind: successorKind,
+                    for: session
+                )
             },
             startFollowUpRun: { [weak self] tabID, initialMessage in
                 Task { [weak self] in
@@ -4029,8 +4068,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         let tabID = session.tabID
 
+        let cursor = AgentRunSessionStore.WaitCursor(
+            registration: context.registration,
+            epoch: context.currentEpoch
+        )
         Task { [weak self] in
-            guard await self?.mcpControlContextMatches(
+            guard self?.mcpControlContextMatches(
                 tabID: tabID,
                 sessionID: snapshot.sessionID,
                 activationID: context.activationID,
@@ -4038,7 +4081,7 @@ final class AgentModeViewModel: ObservableObject {
             ) == true else {
                 return
             }
-            await AgentRunSessionStore.signalSnapshot(snapshot, registration: context.registration)
+            await AgentRunSessionStore.signalSnapshot(snapshot, cursor: cursor)
         }
 
         if snapshot.status.isTerminal {
@@ -4061,33 +4104,64 @@ final class AgentModeViewModel: ObservableObject {
         catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
     }
 
+    private func makeTerminalPublicationEnvelope(
+        for session: TabSession,
+        ownership: AgentRunOwnership,
+        terminalState: AgentSessionRunState
+    ) -> AgentRunTerminalPublicationEnvelope? {
+        guard let epoch = ownership.turnEpoch,
+              let context = session.mcpControlContext,
+              context.sessionID == epoch.sessionID,
+              context.activationID == epoch.activationID,
+              context.registration.generation == epoch.registrationGeneration,
+              let snapshot = mcpSnapshot(for: session, canonicalTerminalState: terminalState)
+        else {
+            return nil
+        }
+        return AgentRunTerminalPublicationEnvelope(epoch: epoch, snapshot: snapshot)
+    }
+
     private func publishTerminalCommit(
         _ revision: AgentRunTerminalCommitRevision,
+        successorKind: AgentRunEpochTransitionKind?,
         for session: TabSession
-    ) async {
-        guard session.lastTerminalCommitRevision == revision,
-              session.runState.isTerminalForCommit,
-              session.sourceItemsRevision == revision.sourceItemsRevision,
-              session.assistantDeltaFlushGeneration == revision.assistantDeltaFlushGeneration,
-              let snapshot = mcpSnapshot(for: session),
-              let context = session.mcpControlContext,
-              mcpControlContextMatches(
-                  tabID: session.tabID,
-                  sessionID: snapshot.sessionID,
-                  activationID: context.activationID,
-                  registration: context.registration
-              )
-        else {
-            return
+    ) async -> AgentRunTerminalPublicationResult {
+        guard let envelope = revision.mcpPublicationEnvelope else {
+            return session.mcpControlContext == nil
+                ? .accepted(successorEpoch: nil)
+                : .rejected(reason: "missing_terminal_publication_envelope")
         }
-        await AgentRunSessionStore.signalCommittedSnapshot(
-            snapshot,
+        guard let context = session.mcpControlContext,
+              context.sessionID == envelope.epoch.sessionID,
+              context.activationID == envelope.epoch.activationID,
+              context.registration.generation == envelope.epoch.registrationGeneration
+        else {
+            return .rejected(reason: "activation_replaced")
+        }
+        var result = await AgentRunSessionStore.publishTerminal(
+            envelope,
             registration: context.registration,
-            commitID: revision.commitID
+            commitID: revision.commitID,
+            successorKind: successorKind
         )
-        if session.mcpControlCleanupTask == nil {
+        if successorKind != nil,
+           case .accepted(successorEpoch: nil) = result
+        {
+            result = .rejected(reason: "missing_successor_epoch")
+        }
+        if let successorEpoch = result.successorEpoch,
+           var liveContext = session.mcpControlContext,
+           liveContext.activationID == context.activationID,
+           liveContext.registration == context.registration
+        {
+            liveContext.currentEpoch = successorEpoch
+            liveContext.preparedEpoch = successorEpoch
+            session.mcpControlContext = liveContext
+        }
+        if result.isResolved, session.mcpControlCleanupTask == nil {
             session.mcpControlCleanupTask = Task {}
         }
+        return result
     }
 
     private func signalMCPInstructionDelivered(for session: TabSession) async {
@@ -4109,7 +4183,7 @@ final class AgentModeViewModel: ObservableObject {
         Self.steeringDebugLog("[AgentRunSteeringWake] signal delivered sessionID=\(snapshot.sessionID) tab=\(session.tabID) status=\(snapshot.status.rawValue) runState=\(session.runState.rawValue)")
         await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
             snapshot,
-            registration: context.registration,
+            cursor: .init(registration: context.registration, epoch: context.currentEpoch),
             reason: .instructionDelivered
         )
     }
@@ -4135,7 +4209,7 @@ final class AgentModeViewModel: ObservableObject {
             Self.steeringDebugLog("[AgentRunSteeringWake] fire delivered signal sessionID=\(snapshot.sessionID) tab=\(tabID) status=\(snapshot.status.rawValue)")
             await AgentRunSessionStore.signalSnapshotAndWakeWaiters(
                 snapshot,
-                registration: context.registration,
+                cursor: .init(registration: context.registration, epoch: context.currentEpoch),
                 reason: .instructionDelivered
             )
         }
@@ -4162,7 +4236,7 @@ final class AgentModeViewModel: ObservableObject {
             Self.steeringDebugLog("[AgentRunSteeringWake] fire wake current waiters source=\(source) sessionID=\(snapshot.sessionID) tab=\(tabID) status=\(snapshot.status.rawValue)")
             await AgentRunSessionStore.wakeCurrentWaiters(
                 snapshot,
-                registration: context.registration,
+                cursor: .init(registration: context.registration, epoch: context.currentEpoch),
                 reason: .steeringRequested
             )
             await Task.yield()
@@ -4189,7 +4263,7 @@ final class AgentModeViewModel: ObservableObject {
         Self.steeringDebugLog("[AgentRunSteeringWake] waking current agent_run waiters reason=steering_requested sessionID=\(snapshot.sessionID) tab=\(session.tabID) status=\(snapshot.status.rawValue) runState=\(session.runState.rawValue)")
         await AgentRunSessionStore.wakeCurrentWaiters(
             snapshot,
-            registration: context.registration,
+            cursor: .init(registration: context.registration, epoch: context.currentEpoch),
             reason: .steeringRequested
         )
     }
@@ -4244,6 +4318,11 @@ final class AgentModeViewModel: ObservableObject {
         mcpControlledSession(sessionID: sessionID)?.mcpControlContext?.registration
     }
 
+    func mcpWaitCursor(sessionID: UUID) -> AgentRunSessionStore.WaitCursor? {
+        guard let context = mcpControlledSession(sessionID: sessionID)?.mcpControlContext else { return nil }
+        return .init(registration: context.registration, epoch: context.currentEpoch)
+    }
+
     /// Marks a controlled session as having a follow-up run pending so that
     /// `mcpSnapshot(for:)` returns `.running` during the async gap before the
     /// new run actually starts. Cleared automatically by `startAgentRun`.
@@ -4255,29 +4334,101 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
-    func rotateMCPWaitRegistrationForNewTurn(sessionID: UUID) async -> AgentRunSessionStore.Registration? {
+    func stageMCPRunEpochTransition(
+        sessionID: UUID,
+        kind: AgentRunEpochTransitionKind
+    ) -> UUID? {
+        guard let session = mcpControlledSession(sessionID: sessionID),
+              var context = session.mcpControlContext
+        else { return nil }
+        let token = UUID()
+        context.pendingEpochTransition = AgentRunEpochTransitionIntent(
+            token: token,
+            kind: kind,
+            expectedCurrentEpoch: context.currentEpoch
+        )
+        session.mcpControlContext = context
+        return token
+    }
+
+    func clearStagedMCPRunEpochTransition(sessionID: UUID, token: UUID) {
         guard let session = mcpControlledSession(sessionID: sessionID),
               var context = session.mcpControlContext,
-              context.sessionID == sessionID,
-              let replacement = await AgentRunSessionStore.resetSnapshotForNewTurn(
-                  registration: context.registration
-              )
-        else {
-            return nil
-        }
-        guard session.mcpControlContext == context else {
-            await AgentRunSessionStore.cleanup(registration: replacement)
-            return nil
-        }
-        context.registration = replacement
+              context.preparedEpoch == nil,
+              context.pendingEpochTransition?.token == token
+        else { return }
+        context.pendingEpochTransition = nil
         session.mcpControlContext = context
-        return replacement
+    }
+
+    func withMCPRunEpochTransition<T>(
+        sessionID: UUID,
+        kind: AgentRunEpochTransitionKind,
+        operation: () async throws -> T
+    ) async throws -> T {
+        guard let token = stageMCPRunEpochTransition(sessionID: sessionID, kind: kind) else {
+            throw MCPError.invalidParams("The requested agent run is no longer active.")
+        }
+        do {
+            return try await Self.$mcpRunEpochTransitionToken.withValue(token) {
+                try await operation()
+            }
+        } catch {
+            clearStagedMCPRunEpochTransition(sessionID: sessionID, token: token)
+            throw error
+        }
     }
 
     func prepareMCPWaitTrackingForRunStart(session: TabSession) async {
-        guard let sessionID = session.mcpControlContext?.sessionID else { return }
-        guard !session.runState.isActive else { return }
-        guard await rotateMCPWaitRegistrationForNewTurn(sessionID: sessionID) != nil else { return }
+        guard !session.runState.isActive,
+              let originalContext = session.mcpControlContext
+        else { return }
+        if originalContext.preparedEpoch != nil {
+            return
+        }
+        let scopedTransitionIntent = originalContext.pendingEpochTransition.flatMap { intent -> AgentRunEpochTransitionIntent? in
+            guard intent.token == Self.mcpRunEpochTransitionToken,
+                  intent.expectedCurrentEpoch == originalContext.currentEpoch
+            else { return nil }
+            return intent
+        }
+        let transitionKind: AgentRunEpochTransitionKind = if originalContext.currentEpoch == nil {
+            .initial
+        } else if let scopedTransitionIntent {
+            scopedTransitionIntent.kind
+        } else if originalContext.pendingEpochTransition != nil {
+            .unrelated
+        } else if session.mcpFollowUpRunPending {
+            .relatedFollowUp
+        } else {
+            .unrelated
+        }
+        let result = await AgentRunSessionStore.beginEpoch(
+            registration: originalContext.registration,
+            activationID: originalContext.activationID,
+            expectedCurrentEpoch: originalContext.currentEpoch,
+            transitionKind: transitionKind
+        )
+        #if DEBUG
+            await test_afterMCPStoreEpochBegan?()
+        #endif
+        guard case let .accepted(epoch) = result,
+              var context = session.mcpControlContext,
+              context.activationID == originalContext.activationID,
+              context.registration == originalContext.registration,
+              context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
+        else {
+            return
+        }
+        context.currentEpoch = epoch
+        context.preparedEpoch = epoch
+        let pendingTransitionToken = context.pendingEpochTransition?.token
+        let shouldClearPendingTransition = pendingTransitionToken == scopedTransitionIntent?.token
+            || pendingTransitionToken == Self.mcpRunEpochTransitionToken
+        if shouldClearPendingTransition {
+            context.pendingEpochTransition = nil
+        }
+        session.mcpControlContext = context
         if !session.mcpFollowUpRunPending {
             session.mcpFollowUpRunPending = true
             handleObservedMCPStateChange(for: session)
@@ -4290,8 +4441,19 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func mcpSnapshot(registration: AgentRunSessionStore.Registration) -> AgentRunMCPSnapshot? {
-        guard let session = mcpControlledSession(sessionID: registration.sessionID),
-              session.mcpControlContext?.registration == registration
+        guard let cursor = mcpWaitCursor(sessionID: registration.sessionID),
+              cursor.registration == registration
+        else {
+            return nil
+        }
+        return mcpSnapshot(cursor: cursor)
+    }
+
+    func mcpSnapshot(cursor: AgentRunSessionStore.WaitCursor) -> AgentRunMCPSnapshot? {
+        guard let session = mcpControlledSession(sessionID: cursor.registration.sessionID),
+              let context = session.mcpControlContext,
+              context.registration == cursor.registration,
+              context.currentEpoch == cursor.epoch
         else {
             return nil
         }
@@ -4300,19 +4462,34 @@ final class AgentModeViewModel: ObservableObject {
 
     func mcpWaitPublication(
         sessionID: UUID
-    ) -> (snapshot: AgentRunMCPSnapshot, registration: AgentRunSessionStore.Registration)? {
-        guard let registration = mcpRegistration(sessionID: sessionID),
-              let snapshot = mcpSnapshot(registration: registration)
+    ) -> (snapshot: AgentRunMCPSnapshot, cursor: AgentRunSessionStore.WaitCursor)? {
+        guard let cursor = mcpWaitCursor(sessionID: sessionID),
+              let snapshot = mcpSnapshot(cursor: cursor)
         else {
             return nil
         }
-        return (snapshot, registration)
+        return (snapshot, cursor)
     }
 
-    func mcpSnapshot(for session: TabSession) -> AgentRunMCPSnapshot? {
+    func mcpSnapshot(
+        for session: TabSession,
+        canonicalTerminalState: AgentSessionRunState? = nil
+    ) -> AgentRunMCPSnapshot? {
         guard let context = session.mcpControlContext else { return nil }
-        let interaction = mcpPendingInteraction(for: session)
+        let interaction = canonicalTerminalState == nil ? mcpPendingInteraction(for: session) : nil
         let status: AgentRunMCPSnapshot.Status = {
+            if let canonicalTerminalState {
+                switch canonicalTerminalState {
+                case .completed:
+                    return .completed
+                case .failed:
+                    return .failed
+                case .cancelled:
+                    return .cancelled
+                case .idle, .running, .waitingForUser, .waitingForQuestion, .waitingForApproval:
+                    return .completed
+                }
+            }
             if interaction != nil {
                 return .waitingForInput
             }
@@ -4381,10 +4558,13 @@ final class AgentModeViewModel: ObservableObject {
             session.items.count
         )
         let resolvedStatusText: String? = {
-            if let existing = session.runningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines), !existing.isEmpty {
+            if canonicalTerminalState == nil,
+               let existing = session.runningStatusText?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !existing.isEmpty
+            {
                 return existing
             }
-            if session.mcpFollowUpRunPending {
+            if canonicalTerminalState == nil, session.mcpFollowUpRunPending {
                 return "Queued to start"
             }
             switch status {
@@ -5483,6 +5663,9 @@ final class AgentModeViewModel: ObservableObject {
             sessionID: sessionID,
             activationID: activationID,
             registration: registration,
+            currentEpoch: nil,
+            preparedEpoch: nil,
+            pendingEpochTransition: nil,
             originatingConnectionID: originatingConnectionID,
             interactionTransport: .mcp(
                 sessionID: sessionID,

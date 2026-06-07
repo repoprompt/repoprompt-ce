@@ -174,7 +174,7 @@ struct MCPWindowToolDependencies {
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupRootScope: WorkspaceLookupRootScope) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> Void
     typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ projection: WorkspaceRootBindingProjection?) async throws -> ToolResultDTOs.SelectedCodeStructureDTO
-    typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async -> [WorkspaceFileRecord]
+    typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
     typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)
     typealias EnqueueReadFileAutoSelection = @MainActor @Sendable (_ reply: ToolResultDTOs.ReadFileReply, _ requestedPath: String, _ metadata: MCPServerViewModel.RequestMetadata) async -> Void

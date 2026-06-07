@@ -549,10 +549,10 @@ public extension VCSService {
         guard let layout = gitRepositoryLayout(forRepoRoot: repoURL) else {
             return nil
         }
-        let mainWorktreeRoot = layout.commonDir.deletingLastPathComponent()
+        let isMain = !layout.isLinkedWorktree
         let identity = GitWorktreeIdentity.repositoryIdentity(
             commonGitDir: layout.commonDir,
-            mainWorktreeRoot: mainWorktreeRoot
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
         )
         let branch = try? await gitBackend().getCurrentBranch(at: repoURL)
         let head = try? await gitBackend().getHeadID(at: repoURL)
@@ -560,7 +560,7 @@ public extension VCSService {
         let worktreeID = GitWorktreeIdentity.worktreeID(
             repositoryID: identity.repositoryID,
             gitDir: layout.gitDir,
-            isMain: !layout.isWorktree,
+            isMain: isMain,
             path: layout.workTreeRoot
         )
         return GitWorktreeContextSummary(
@@ -570,6 +570,7 @@ public extension VCSService {
             worktreeID: worktreeID,
             worktreePath: repoRootPath,
             worktreeName: worktreeName,
+            isMain: isMain,
             branch: branch,
             head: head,
             isDetached: branch == nil && head != nil

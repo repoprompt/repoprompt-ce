@@ -71,7 +71,16 @@ final class AgentModeRunService {
         let flushPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
         let clearPendingAssistantDelta: (AgentModeViewModel.TabSession) -> Void
         let prepareTerminalPublication: (AgentModeViewModel.TabSession) -> Void
-        let publishTerminalCommit: (AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void
+        let makeTerminalPublicationEnvelope: (
+            AgentModeViewModel.TabSession,
+            AgentRunOwnership,
+            AgentSessionRunState
+        ) -> AgentRunTerminalPublicationEnvelope?
+        let publishTerminalCommit: (
+            AgentModeViewModel.TabSession,
+            AgentRunTerminalCommitRevision,
+            AgentRunEpochTransitionKind?
+        ) async -> AgentRunTerminalPublicationResult
         let startFollowUpRun: (UUID, String) -> Void
         /// Restore queued steering draft text back to the composer.
         let restoreDraftText: (_ tabID: UUID, _ text: String, _ message: String, _ strategy: DraftRestorationStrategy) -> Void

@@ -344,6 +344,7 @@ extension AgentModeViewModel {
         var providerTerminalDrainGeneration: UInt64 = 0
         var terminalCommitInProgress: Bool = false
         var lastTerminalCommitRevision: AgentRunTerminalCommitRevision?
+        var lastTerminalPublicationResult: AgentRunTerminalPublicationResult?
         var runAttemptTerminalResources: AgentRunAttemptTerminalResources?
         var codexCurrentTurnID: String?
         var codexCurrentTurnKind: CodexTurnKind?
@@ -504,15 +505,25 @@ extension AgentModeViewModel {
             runAttemptTerminalResources = nil
             terminalCommitInProgress = false
             lastTerminalCommitRevision = nil
+            lastTerminalPublicationResult = nil
             providerTerminalDrainGeneration = 0
             codexCurrentTurnID = nil
             codexCurrentTurnKind = nil
+            var turnEpoch: AgentRunTurnEpoch?
+            if var context = mcpControlContext {
+                turnEpoch = context.preparedEpoch ?? context.currentEpoch
+                if context.preparedEpoch != nil {
+                    context.preparedEpoch = nil
+                    mcpControlContext = context
+                }
+            }
             let ownership = runLifecycleTracker.begin(
                 tabID: tabID,
                 persistentSessionID: activeAgentSessionID,
                 persistentBindingGeneration: persistentSessionBindingIdentity?.generation,
                 bindingTransitionGeneration: bindingTransitionGeneration,
-                attemptID: attemptID
+                attemptID: attemptID,
+                turnEpoch: turnEpoch
             )
             #if DEBUG
                 AgentModePerfDiagnostics.increment("run.lifecycle.attempt.started")

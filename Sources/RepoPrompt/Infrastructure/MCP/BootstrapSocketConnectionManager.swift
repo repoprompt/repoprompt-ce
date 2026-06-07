@@ -108,6 +108,9 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
                 prompts: .init(listChanged: false),
                 resources: .init(subscribe: false, listChanged: false),
                 tools: .init(listChanged: true)
+            ),
+            configuration: MCP.Server.Configuration(
+                responseSendTimeout: MCPTimeoutPolicy.responseSendDeadline
             )
         )
     }
@@ -246,6 +249,23 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         await server.stop()
         await transport.disconnect()
         updateState(.cancelled)
+    }
+
+    func abortForExecutionWatchdog() async {
+        if !isClosing {
+            mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
+            isClosing = true
+            healthMonitoringTask?.cancel()
+            healthMonitoringTask = nil
+            closeWatchTask?.cancel()
+            closeWatchTask = nil
+        }
+
+        // Delivery must stop immediately even if ordinary shutdown has already
+        // started and is blocked on the uncooperative handler.
+        await transport.disconnect()
+        updateState(.cancelled)
+        Task { await server.stop() }
     }
 
     func connectionState() -> ConnectionStateSnapshot {

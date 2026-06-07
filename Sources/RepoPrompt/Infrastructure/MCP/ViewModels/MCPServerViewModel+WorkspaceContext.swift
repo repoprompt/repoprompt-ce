@@ -8,7 +8,7 @@ extension MCPServerViewModel {
         display: FilePathDisplay,
         copyPresetOverride: CopyPreset? = nil,
         activeTabCompatibility: Bool = false
-    ) async -> ToolResultDTOs.PromptContextDTO {
+    ) async throws -> ToolResultDTOs.PromptContextDTO {
         let includeSelection = include.contains("selection")
         let requireSelectionData = includeSelection
             || include.contains("files")
@@ -90,7 +90,7 @@ extension MCPServerViewModel {
         if include.contains("code"), !promptVM.codeMapsGloballyDisabled, let coll = collections {
             let builder = CodeStructureBuilder(owner: self, projection: lookupContext.bindingProjection)
             let combined = coll.selected.map(\.file) + coll.codemap.map(\.file)
-            codeStructDTO = await builder.build(for: combined)
+            codeStructDTO = try await builder.build(for: combined)
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil

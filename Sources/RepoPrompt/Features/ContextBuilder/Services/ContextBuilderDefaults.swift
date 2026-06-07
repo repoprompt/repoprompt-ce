@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 /// Controls how Context Builder handles the user's original prompt
 enum PromptEnhancementMode: String, Codable, CaseIterable {
@@ -32,7 +33,7 @@ enum ContextBuilderDefaults {
     static let allowClarifyingQuestionsForMCP: Bool = false
 
     /// Default timeout (in seconds) for user responses to clarifying questions
-    static let questionTimeoutSeconds: TimeInterval = 300
+    static let questionTimeoutSeconds = MCPTimeoutPolicy.askUserDefaultTimeoutSeconds
 
     // MARK: - Plan Generation
 

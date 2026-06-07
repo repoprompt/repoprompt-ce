@@ -9,6 +9,21 @@ import SwiftUI
 
 // MARK: - Agent Onboarding Wizard View
 
+enum AgentOnboardingWizardExitPolicy {
+    static func perform(
+        markOnboardingSeen: () -> Void,
+        onContinueToMain: (() -> Void)?,
+        onDismiss: (() -> Void)?
+    ) {
+        markOnboardingSeen()
+        if let onContinueToMain {
+            onContinueToMain()
+        } else {
+            onDismiss?()
+        }
+    }
+}
+
 struct AgentOnboardingWizardView: View {
     @ObservedObject var viewModel: AgentOnboardingWizardViewModel
     var windowID: Int?
@@ -124,7 +139,8 @@ struct AgentOnboardingWizardView: View {
                     CompletionStepView(
                         viewModel: viewModel,
                         windowID: windowID,
-                        onContinueToMain: onContinueToMain
+                        canContinueToMain: onContinueToMain != nil,
+                        onExit: exitWizard
                     )
                 case .none:
                     EmptyView()
@@ -158,7 +174,7 @@ struct AgentOnboardingWizardView: View {
             Spacer()
 
             if viewModel.currentStep == .completion {
-                Button(action: { dismissWizard() }) {
+                Button(action: { exitWizard() }) {
                     HStack(spacing: 8) {
                         Text("Get Started")
                         Image(systemName: "arrow.right")
@@ -204,19 +220,17 @@ struct AgentOnboardingWizardView: View {
         }
     }
 
-    private func dismissWizard() {
-        viewModel.markOnboardingSeen()
-        onDismiss?()
+    private func exitWizard() {
+        AgentOnboardingWizardExitPolicy.perform(
+            markOnboardingSeen: { viewModel.markOnboardingSeen() },
+            onContinueToMain: onContinueToMain,
+            onDismiss: onDismiss
+        )
     }
 
     /// "Skip All" mid-wizard continues into the main app when available, otherwise dismisses.
     private func skipAll() {
-        viewModel.markOnboardingSeen()
-        if let onContinueToMain {
-            onContinueToMain()
-        } else {
-            onDismiss?()
-        }
+        exitWizard()
     }
 }
 
@@ -1121,7 +1135,8 @@ private struct ProvidersStepView: View {
 private struct CompletionStepView: View {
     @ObservedObject var viewModel: AgentOnboardingWizardViewModel
     let windowID: Int?
-    var onContinueToMain: (() -> Void)?
+    let canContinueToMain: Bool
+    let onExit: () -> Void
 
     @State private var showCheckmark = false
     @State private var showActions = false
@@ -1160,13 +1175,13 @@ private struct CompletionStepView: View {
 
             VStack(spacing: 14) {
                 // Continue into the main app
-                if let onContinueToMain {
+                if canContinueToMain {
                     QuickActionRow(
                         icon: "terminal",
                         title: "Start using Agent sessions",
                         description: "Open the main Agent workspace"
                     ) {
-                        onContinueToMain()
+                        onExit()
                     }
                 }
 

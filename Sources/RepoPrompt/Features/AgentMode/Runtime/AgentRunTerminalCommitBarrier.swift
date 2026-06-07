@@ -13,6 +13,8 @@ struct AgentRunTerminalCommitRevision: Equatable {
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
+    let mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?
+    let successorKind: AgentRunEpochTransitionKind?
 }
 
 @MainActor
@@ -89,17 +91,33 @@ final class AgentRunTerminalCommitBarrier {
             assertionFailure("Terminal commit requires a terminal run state")
             return nil
         }
-        guard validatesOwnership(request) else {
-            recordRejection("stale_ownership", request: request)
-            return nil
-        }
         guard !session.terminalCommitInProgress else {
             recordRejection("commit_in_progress", request: request)
             return nil
         }
-        guard session.lastTerminalCommitRevision?.ownership != request.ownership else {
+        if let existingRevision = session.lastTerminalCommitRevision,
+           existingRevision.ownership == request.ownership
+        {
             recordRejection("duplicate_commit", request: request)
-            return session.lastTerminalCommitRevision
+            if session.lastTerminalPublicationResult?.isResolved != true {
+                session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+                    session,
+                    existingRevision,
+                    existingRevision.successorKind
+                )
+            }
+            if let followUpInstruction = takeQueuedFollowUpIfReady(
+                session: session,
+                revision: existingRevision,
+                publicationResult: session.lastTerminalPublicationResult
+            ) {
+                hooks.startFollowUpRun(session.tabID, followUpInstruction)
+            }
+            return existingRevision
+        }
+        guard validatesOwnership(request) else {
+            recordRejection("stale_ownership", request: request)
+            return nil
         }
         guard session.providerTerminalDrainGeneration == request.providerDrainGeneration else {
             recordRejection("stale_provider_drain_generation", request: request)
@@ -130,7 +148,6 @@ final class AgentRunTerminalCommitBarrier {
             : nil
         if queuedInstruction != nil {
             session.mcpFollowUpRunPending = true
-            session.pendingInstructions.removeFirst()
         }
 
         hooks.cancelPendingQuestion(session)
@@ -190,22 +207,39 @@ final class AgentRunTerminalCommitBarrier {
         hooks.setAgentRunActive(session.tabID, false)
         hooks.prepareTerminalPublication(session)
 
+        let successorKind: AgentRunEpochTransitionKind? = queuedInstruction == nil ? nil : .relatedFollowUp
         let revision = AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: request.ownership,
             terminalState: request.terminalState,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
-            providerDrainGeneration: request.providerDrainGeneration
+            providerDrainGeneration: request.providerDrainGeneration,
+            mcpPublicationEnvelope: hooks.makeTerminalPublicationEnvelope(
+                session,
+                request.ownership,
+                request.terminalState
+            ),
+            successorKind: successorKind
         )
         session.lastTerminalCommitRevision = revision
+        session.lastTerminalPublicationResult = nil
 
         hooks.updateBindings(session)
         if request.notifyTurnComplete {
             hooks.notifyAgentTurnComplete(session)
         }
         hooks.scheduleSave(session.tabID)
-        await hooks.publishTerminalCommit(session, revision)
+        session.lastTerminalPublicationResult = await hooks.publishTerminalCommit(
+            session,
+            revision,
+            successorKind
+        )
+        let followUpInstruction = takeQueuedFollowUpIfReady(
+            session: session,
+            revision: revision,
+            publicationResult: session.lastTerminalPublicationResult
+        )
         let teardownTask = registerTerminalTeardown(
             teardown,
             ownership: request.ownership,
@@ -214,8 +248,8 @@ final class AgentRunTerminalCommitBarrier {
         session.terminalCommitInProgress = false
         request.postCommit()
 
-        if let queuedInstruction {
-            hooks.startFollowUpRun(session.tabID, queuedInstruction)
+        if let followUpInstruction {
+            hooks.startFollowUpRun(session.tabID, followUpInstruction)
         }
         if request.completion == .terminalTeardownCompleted {
             await teardownTask?.value
@@ -229,6 +263,35 @@ final class AgentRunTerminalCommitBarrier {
             )
         #endif
         return revision
+    }
+
+    private func takeQueuedFollowUpIfReady(
+        session: AgentModeViewModel.TabSession,
+        revision: AgentRunTerminalCommitRevision,
+        publicationResult: AgentRunTerminalPublicationResult?
+    ) -> String? {
+        guard revision.successorKind != nil,
+              let publicationResult
+        else { return nil }
+        switch publicationResult {
+        case let .accepted(successorEpoch):
+            if revision.mcpPublicationEnvelope != nil, successorEpoch == nil {
+                return nil
+            }
+        case .rejected:
+            return nil
+        case .stale:
+            if !session.pendingInstructions.isEmpty {
+                session.pendingInstructions.removeFirst()
+            }
+            session.mcpFollowUpRunPending = false
+            return nil
+        }
+        guard !session.pendingInstructions.isEmpty else {
+            session.mcpFollowUpRunPending = false
+            return nil
+        }
+        return session.pendingInstructions.removeFirst()
     }
 
     func awaitTerminalPublication(

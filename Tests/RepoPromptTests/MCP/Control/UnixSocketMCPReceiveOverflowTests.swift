@@ -58,18 +58,11 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
                 sessionToken: "overflow-test-session",
                 snapshot: snapshot
             )
-            let didRetainDiagnostics = await Self.waitUntil {
-                let payload = await manager.debugTransportIngressSnapshotPayload(
-                    currentConnectionID: connectionID,
-                    requestedConnectionID: connectionID
-                )
-                return payload["present"] as? Bool == true
-            }
-            XCTAssertTrue(didRetainDiagnostics)
             let payload = await manager.debugTransportIngressSnapshotPayload(
                 currentConnectionID: connectionID,
                 requestedConnectionID: connectionID
             )
+            XCTAssertEqual(payload["present"] as? Bool, true)
             XCTAssertEqual(payload["active"] as? Bool, false)
             let ingress = try XCTUnwrap(payload["ingress"] as? [String: Any])
             XCTAssertEqual(ingress["terminal_cause"] as? String, MCPTransportTerminalCause.receiveBufferOverflow.rawValue)
@@ -95,13 +88,18 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
                     && cleanup.pendingReaderCancellationCount == 0
                     && cleanup.earlyReaderCancellationCount == 0
                     && !cleanup.readerIsRetained
-                    && cleanup.terminalCallbackCount == 0
                     && cleanup.cancellationCallbackCount == 1
                     && cleanup.finalizationCount == 1
                     && cleanup.descriptorCloseCount == 1
                     && !cleanup.socketIsOwned
             }
             XCTAssertTrue(cleanupCompleted)
+            let settledCleanup = await transport.debugCleanupSnapshot()
+            XCTAssertEqual(settledCleanup.cancellationCallbackCount, 1)
+            XCTAssertEqual(settledCleanup.finalizationCount, 1)
+            XCTAssertEqual(settledCleanup.descriptorCloseCount, 1)
+            XCTAssertFalse(settledCleanup.socketIsOwned)
+
             await transport.disconnect()
             await transport.disconnect()
         #else

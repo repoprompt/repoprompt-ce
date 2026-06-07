@@ -2,6 +2,16 @@
 import XCTest
 
 final class GitRepoTargetResolverTests: XCTestCase {
+    private var temporaryRoots: [URL] = []
+
+    override func tearDownWithError() throws {
+        for root in temporaryRoots {
+            try? FileManager.default.removeItem(at: root)
+        }
+        temporaryRoots = []
+        try super.tearDownWithError()
+    }
+
     func testResolvesSupportedRepositorySelectorSyntax() async throws {
         let fixture = ResolverFixture()
         let scenarios = [
@@ -92,6 +102,42 @@ final class GitRepoTargetResolverTests: XCTestCase {
         XCTAssertEqual(repos.map(\.rootPath), [fixture.repoA.mainRepo.rootPath])
     }
 
+    func testSeparateGitDirPrimaryMainSpecifierKeepsCheckoutRoot() async throws {
+        let fixture = try makeSeparateGitDirFixture(addLinkedWorktree: false)
+        let resolver = makeLiveFixtureResolver(repo: fixture.repo, linked: nil)
+        let repo = GitRepoDescriptor(rootURL: fixture.repo)
+
+        let resolved = try await resolver.resolveRepoRoots(
+            explicitRootTokens: ["@main"],
+            allRepos: [repo],
+            visibleRoots: [WorkspaceRootRef(id: UUID(), name: "repo", fullPath: repo.rootPath)],
+            defaultRepo: repo
+        )
+
+        XCTAssertEqual(resolved.map(\.rootPath), [fixture.repo.standardizedFileURL.path])
+        XCTAssertNotEqual(resolved.first?.rootPath, fixture.gitDir.standardizedFileURL.path)
+    }
+
+    func testExternalCommonDirLinkedMainSpecifierFailsInsteadOfReturningGitDirectory() async throws {
+        let fixture = try makeSeparateGitDirFixture(addLinkedWorktree: true)
+        let linked = try XCTUnwrap(fixture.linked)
+        let resolver = makeLiveFixtureResolver(repo: fixture.repo, linked: linked)
+        let linkedRepo = GitRepoDescriptor(rootURL: linked)
+
+        do {
+            _ = try await resolver.resolveRepoRoots(
+                explicitRootTokens: ["@main"],
+                allRepos: [linkedRepo],
+                visibleRoots: [WorkspaceRootRef(id: UUID(), name: "linked", fullPath: linkedRepo.rootPath)],
+                defaultRepo: linkedRepo
+            )
+            XCTFail("Expected unresolved external main checkout to fail safely")
+        } catch let error as GitRepoTargetResolverError {
+            XCTAssertTrue(error.message.contains("main checkout path could not be resolved"))
+            XCTAssertFalse(error.message.contains(fixture.gitDir.standardizedFileURL.path))
+        }
+    }
+
     func testDuplicateWorktreeIDsAcrossReposRemainAmbiguous() async throws {
         let fixture = MultiRepoResolverFixture(duplicateLinkedWorktreeID: true)
 
@@ -105,6 +151,66 @@ final class GitRepoTargetResolverTests: XCTestCase {
             XCTFail("Expected duplicate cross-repo worktree IDs to be ambiguous")
         } catch let error as GitRepoTargetResolverError {
             XCTAssertTrue(error.message.contains("Ambiguous worktree selector"))
+        }
+    }
+
+    private func makeSeparateGitDirFixture(addLinkedWorktree: Bool) throws -> (repo: URL, gitDir: URL, linked: URL?) {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("GitRepoTargetResolverSeparateGitDirTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        temporaryRoots.append(root)
+
+        let repo = root.appendingPathComponent("repo", isDirectory: true)
+        let gitDir = root.appendingPathComponent("repo-git", isDirectory: true)
+        try runGit(["init", "-b", "main", "--separate-git-dir", gitDir.path, repo.path], cwd: root)
+        try runGit(["config", "user.email", "test@example.com"], cwd: repo)
+        try runGit(["config", "user.name", "Test User"], cwd: repo)
+        try "hello\n".write(to: repo.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
+        try runGit(["add", "."], cwd: repo)
+        try runGit(["commit", "-m", "Initial commit"], cwd: repo)
+
+        guard addLinkedWorktree else {
+            return (repo, gitDir, nil)
+        }
+        let linked = root.appendingPathComponent("repo-linked", isDirectory: true)
+        try runGit(["worktree", "add", "-b", "feature/linked", linked.path], cwd: repo)
+        return (repo, gitDir, linked)
+    }
+
+    private func makeLiveFixtureResolver(repo: URL, linked: URL?) -> GitRepoTargetResolver {
+        let service = VCSService()
+        let roots = [repo, linked].compactMap(\.self).map(\.standardizedFileURL)
+        return GitRepoTargetResolver(dependencies: .init(
+            resolveRepo: { url in
+                let path = url.standardizedFileURL.path
+                guard let root = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") }) else {
+                    return nil
+                }
+                return GitRepoDescriptor(rootURL: root)
+            },
+            listWorktrees: { descriptor in
+                try await service.listGitWorktrees(at: descriptor.rootURL)
+            }
+        ))
+    }
+
+    private func runGit(_ arguments: [String], cwd: URL) throws {
+        var environment = ProcessInfo.processInfo.environment
+        environment["GIT_CONFIG_NOSYSTEM"] = "1"
+        environment["GIT_CONFIG_GLOBAL"] = "/dev/null"
+        environment["GIT_TERMINAL_PROMPT"] = "0"
+        let result = try TestProcessRunner.run(
+            executableURL: URL(fileURLWithPath: "/usr/bin/git"),
+            arguments: arguments,
+            currentDirectoryURL: cwd,
+            environment: environment
+        )
+        guard result.terminationStatus == 0 else {
+            throw NSError(
+                domain: "GitRepoTargetResolverTests",
+                code: Int(result.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: result.outputText]
+            )
         }
     }
 }

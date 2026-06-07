@@ -16,7 +16,6 @@ final class MCPWindowToolRuntime {
     typealias ExecuteTool = @Sendable (
         _ name: String,
         _ freshnessPolicy: MCPToolFreshnessPolicy,
-        _ timeoutSeconds: Int,
         _ arguments: [String: Value],
         _ implementation: @escaping ProviderImplementation
     ) async throws -> Value
@@ -35,7 +34,6 @@ final class MCPWindowToolRuntime {
         description: String,
         annotations: MCP.Tool.Annotations = .init(),
         inputSchema: JSONSchema,
-        timeoutSeconds: Int = 10000,
         isEnabledByDefault: Bool = true,
         implementation: @escaping ProviderImplementation
     ) -> Tool {
@@ -49,7 +47,7 @@ final class MCPWindowToolRuntime {
                 guard let self else {
                     throw MCPError.internalError("Window tool runtime deallocated while executing \(name)")
                 }
-                return try await executeTool(name, freshnessPolicy, timeoutSeconds, args, implementation)
+                return try await executeTool(name, freshnessPolicy, args, implementation)
             }
         )
     }

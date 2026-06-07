@@ -124,6 +124,24 @@ class ContentViewModel: ObservableObject {
         }
     }
 
+    /// Completes onboarding from either first launch or the manually opened setup guide.
+    ///
+    /// First launch starts in the system fallback workspace, so there is no main workspace
+    /// to continue into yet. In that case, leave the setup guide and show the workspace
+    /// chooser. If a real workspace is already active, return to the main app.
+    func continueFromOnboarding() {
+        if AppLaunchConfiguration.current.forcedRootRoute == .main {
+            rootRoute = .main
+            return
+        }
+        if isInSystemFallback {
+            rootRoute = .workspaceEntry
+            workspaceEntryTab = .workspaces
+        } else {
+            rootRoute = .main
+        }
+    }
+
     /// Lazily creates the onboarding view model if needed.
     func ensureOnboardingViewModel() {
         guard onboardingViewModel == nil else { return }

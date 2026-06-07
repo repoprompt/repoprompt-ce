@@ -56,7 +56,7 @@ enum ClusterToolCategory {
         let entries = toolNames.map {
             ToolEntry(
                 rawName: $0,
-                normalizedName: $0.lowercased(),
+                normalizedName: normalizedToolCardName($0)?.lowercased() ?? $0.lowercased(),
                 count: counts[$0] ?? counts[$0.lowercased()] ?? 1
             )
         }
@@ -181,7 +181,8 @@ enum ClusterToolCategory {
         var hasExecution = false
         var hasAgentControl = false
         for toolName in sourceNames {
-            switch classification(forNormalizedToolName: toolName).summaryTitleSignal {
+            let normalizedToolName = normalizedToolCardName(toolName)?.lowercased() ?? toolName.lowercased()
+            switch classification(forNormalizedToolName: normalizedToolName).summaryTitleSignal {
             case .navigation:
                 hasNavigation = true
             case .edit:
@@ -218,10 +219,10 @@ enum ClusterToolCategory {
     // MARK: - Tool categories
 
     private static let navigationTools: Set<String> = [
-        "get_file_tree", "read_file", "read", "file_search", "search", "get_code_structure"
+        "get_file_tree", "read_file", "read", "file_search", "search", "web_read", "get_code_structure"
     ]
     private static let summaryTitleNavigationTools: Set<String> = [
-        "get_file_tree", "read_file", "read", "file_search", "search", "get_code_structure"
+        "get_file_tree", "read_file", "read", "file_search", "search", "web_read", "get_code_structure"
     ]
     private static let editTools: Set<String> = [
         "apply_edits", "apply_patch", "edit", "file_actions"

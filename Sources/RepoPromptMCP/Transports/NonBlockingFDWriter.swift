@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import RepoPromptShared
 
 #if canImport(Darwin)
     import Darwin
@@ -87,7 +88,7 @@ enum NonBlockingFDWriter {
     static func writeAll(
         _ data: Data,
         to fd: Int32,
-        stallTimeout: TimeInterval = 30.0,
+        stallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         pollIntervalMilliseconds: Int32 = 250,
         setNonBlocking: Bool = true
     ) throws {

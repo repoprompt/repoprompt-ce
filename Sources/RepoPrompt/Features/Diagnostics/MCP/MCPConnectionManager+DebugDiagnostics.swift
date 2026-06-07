@@ -131,6 +131,8 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_capture_snapshot` is only available in DEBUG builds.")
                 #endif
+            case "mcp_tool_duration_inventory":
+                return debugMCPToolDurationInventoryPayload(op: op)
             case "mcp_read_search_admission_snapshot":
                 #if DEBUG
                     return await debugMCPReadSearchAdmissionSnapshotPayload(op: op)

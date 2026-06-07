@@ -285,7 +285,17 @@ class WindowState: ObservableObject {
 
     // MARK: - Initialization
 
-    init() {
+    convenience init() {
+        self.init(contextBuilderProviderFactory: nil)
+    }
+
+    #if DEBUG
+        convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
+            self.init(contextBuilderProviderFactory: Optional(contextBuilderProviderFactory))
+        }
+    #endif
+
+    private init(contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
         windowID = WindowState.windowCounter
@@ -302,7 +312,8 @@ class WindowState: ObservableObject {
         let composition = WindowStateCompositionFactory.make(
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
-            sharedMCPService: Self.sharedMCPService
+            sharedMCPService: Self.sharedMCPService,
+            contextBuilderProviderFactory: contextBuilderProviderFactory
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore

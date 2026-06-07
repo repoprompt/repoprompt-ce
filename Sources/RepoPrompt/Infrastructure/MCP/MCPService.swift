@@ -174,8 +174,18 @@ actor MCPService: Sendable {
 
     func fullShutdown() async {
         mcpServiceLog("Performing full MCP server shutdown")
-        await controller.fullShutdown()
+        participatingWindows.removeAll()
         state.isRunning = false
+        updates.continuation.yield(state)
+
+        await controller.fullShutdown()
+
+        // Preserve participation registered while the controller shutdown was suspended.
+        // Such a join represents a newer lifecycle and must be made ready again.
+        if !participatingWindows.isEmpty {
+            await controller.startServer()
+            state.isRunning = true
+        }
         updates.continuation.yield(state)
     }
 

@@ -186,10 +186,19 @@ extension AgentModeViewModel {
     /// provider binding layer's top-level permission profile model.
     typealias AgentPermissionProfile = AgentProviderPermissionProfile
 
+    struct AgentRunEpochTransitionIntent: Equatable {
+        let token: UUID
+        let kind: AgentRunEpochTransitionKind
+        let expectedCurrentEpoch: AgentRunTurnEpoch?
+    }
+
     struct AgentMCPControlContext: Equatable {
         let sessionID: UUID
         let activationID: UUID
-        var registration: AgentRunSessionStore.Registration
+        let registration: AgentRunSessionStore.Registration
+        var currentEpoch: AgentRunTurnEpoch?
+        var preparedEpoch: AgentRunTurnEpoch?
+        var pendingEpochTransition: AgentRunEpochTransitionIntent?
         let originatingConnectionID: UUID?
         let interactionTransport: AgentInteractionTransport
         let suppressUserNotifications: Bool

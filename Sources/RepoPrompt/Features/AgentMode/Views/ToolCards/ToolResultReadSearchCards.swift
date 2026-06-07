@@ -141,28 +141,23 @@ struct FileSearchResultCard: View {
 
 struct WebSearchResultCard: View {
     let item: AgentChatItem
+    let normalizedToolName: String
     @State private var isExpanded = false
 
-    private var presentation: AgentToolCardRenderSummary? {
-        NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: "search")
-    }
-
-    private var summary: String? {
-        presentation?.inlineSummaryText ?? storageStatusSubtitle(for: item)
-    }
-
-    private var status: ToolCardStatus {
-        if let presentation {
-            return ToolCardStatus.fromRenderStatus(presentation.status)
-        }
-        return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
+    init(item: AgentChatItem, normalizedToolName: String = "search") {
+        self.item = item
+        self.normalizedToolName = normalizedToolName
     }
 
     var body: some View {
-        ToolCardContainer(
-            iconName: toolIcon(for: "search"),
-            iconColor: ToolCardAccentResolver.color(for: "search"),
-            title: "Web Search",
+        let presentation = NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
+        let summary = presentation?.inlineSummaryText ?? storageStatusSubtitle(for: item)
+        let status = presentation.map { ToolCardStatus.fromRenderStatus($0.status) }
+            ?? ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
+        return ToolCardContainer(
+            iconName: toolIcon(for: normalizedToolName),
+            iconColor: ToolCardAccentResolver.color(for: normalizedToolName),
+            title: presentation?.title ?? toolDisplayName(for: normalizedToolName),
             subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
             status: status,
             timestamp: item.timestamp,
@@ -179,12 +174,9 @@ struct NativeToolResultCard: View {
     let normalizedToolName: String?
     @State private var isExpanded = false
 
-    private var presentation: AgentToolCardRenderSummary? {
-        NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
-    }
-
     var body: some View {
-        ToolCardContainer(
+        let presentation = NativeToolCardPresentationBuilder.build(item: item, normalizedToolName: normalizedToolName)
+        return ToolCardContainer(
             iconName: toolIcon(for: normalizedToolName ?? item.toolName),
             iconColor: ToolCardAccentResolver.color(for: normalizedToolName ?? item.toolName),
             title: presentation?.title ?? toolDisplayName(for: normalizedToolName ?? item.toolName),
@@ -214,6 +206,7 @@ enum NativeToolCardPresentationBuilder {
         let statusWord = statusWord(for: item)
         return AgentToolCardRenderSummaryBuilder.build(
             normalizedToolName: normalizedToolName,
+            rawToolName: item.toolName,
             statusWord: statusWord,
             rawObject: rawObject,
             argsObject: argsObject,
@@ -225,9 +218,17 @@ enum NativeToolCardPresentationBuilder {
         _ renderSummary: AgentToolCardRenderSummary,
         normalizedToolName: String?
     ) -> Bool {
-        guard let normalizedToolName, renderSummary.toolName == normalizedToolName else { return false }
-        if normalizedToolName == "search" { return true }
-        return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(normalizedToolName)
+        guard let normalizedToolName else { return false }
+        let storedName = summaryToolNameKey(renderSummary.toolName)
+        let currentName = summaryToolNameKey(normalizedToolName)
+        guard storedName == currentName else { return false }
+        if currentName == "search" { return true }
+        return AgentToolCardRenderSummaryBuilder.isSafeNativeFallbackToolName(currentName)
+    }
+
+    private static func summaryToolNameKey(_ raw: String) -> String {
+        let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return AgentWebToolCanonicalNames.canonicalToolCardName(normalized) ?? normalized
     }
 
     private static func statusWord(for item: AgentChatItem) -> String {

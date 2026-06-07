@@ -18,6 +18,7 @@ import SwiftUI
 class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     /// Prevents re-entrant termination (Cmd+Q twice, menu + dock quit, etc.)
     private var terminationInProgress = false
+    private let dockMenuController = DockMenuController()
 
     // New global routing/settings services (kept alive by the AppDelegate)
     private var windowRoutingService: WindowRoutingService?
@@ -120,6 +121,10 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
     }
 
     // MARK: - Application Lifecycle
+
+    func applicationDockMenu(_ sender: NSApplication) -> NSMenu? {
+        dockMenuController.makeMenu()
+    }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         // Keep the app running if we intentionally backgrounded the last window.

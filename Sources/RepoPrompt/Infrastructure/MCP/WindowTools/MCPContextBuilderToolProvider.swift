@@ -487,13 +487,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             return try await operation()
         }
 
-        return try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask {
-                try await operation()
-            }
-            group.addTask {
+        let heartbeatTask = Task {
+            do {
                 while !Task.isCancelled {
                     try await Task.sleep(for: interval)
+                    try Task.checkCancellation()
                     await ServerNetworkManager.shared.sendProgress(
                         for: connectionID,
                         tool: tool,
@@ -502,11 +500,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         message: message
                     )
                 }
-                throw CancellationError()
+            } catch {
+                // Cancellation is the expected completion path.
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
         }
+        defer { heartbeatTask.cancel() }
+        return try await operation()
     }
 }

@@ -3586,14 +3586,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             updated.text = resultJSON
             session.replaceItem(at: index, with: updated)
         } else {
-            var toolResultItem = AgentChatItem.toolResult(
+            let toolResultItem = AgentChatItem.toolResult(
                 name: toolName,
                 invocationID: invocationID,
+                argsJSON: argsJSON,
                 resultJSON: resultJSON,
                 isError: isError,
                 sequenceIndex: session.nextSequenceIndex
             )
-            toolResultItem.toolArgsJSON = argsJSON
             session.appendItem(toolResultItem)
         }
         reconcileCodexCommandExecutionRunningUpdate(
@@ -4431,6 +4431,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 let toolResultItem = AgentChatItem.toolResult(
                     name: toolName,
                     invocationID: invocationID,
+                    argsJSON: argsJSON,
                     resultJSON: resultJSON,
                     isError: isError,
                     sequenceIndex: session.nextSequenceIndex
@@ -4646,14 +4647,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private static func normalizedExternalToolName(_ raw: String?) -> String? {
         guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
         let lowered = raw.lowercased()
+        if let webCanonical = AgentWebToolCanonicalNames.canonicalToolCardName(lowered) {
+            return webCanonical
+        }
         let suffix = lowered.split(separator: ".").last.map(String.init) ?? lowered
         switch suffix {
         case "local_shell", "shell", "unified_exec", "exec_command", "run_shell_command":
             return "bash"
-        case "web_search", "web_search_request", "google_web_search", "search_web":
-            return "search"
         default:
-            return suffix
+            return AgentWebToolCanonicalNames.canonicalToolCardName(suffix) ?? suffix
         }
     }
 
@@ -5086,14 +5088,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             }
         } else {
             let runningJSON = Self.initialRunningCommandExecutionJSON(argsJSON: argsJSON)
-            var runningItem = AgentChatItem.toolResult(
+            let runningItem = AgentChatItem.toolResult(
                 name: toolName,
                 invocationID: invocationID,
+                argsJSON: argsJSON,
                 resultJSON: runningJSON,
                 isError: false,
                 sequenceIndex: session.nextSequenceIndex
             )
-            runningItem.toolArgsJSON = argsJSON
             session.appendItem(runningItem)
             itemIndex = session.items.count - 1
         }

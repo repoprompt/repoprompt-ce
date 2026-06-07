@@ -8,9 +8,22 @@ actor AgentRunSessionStore {
         let generation: UInt64
     }
 
+    struct WaitCursor: Equatable, Hashable {
+        let registration: Registration
+        let epoch: AgentRunTurnEpoch?
+    }
+
+    enum EpochBeginResult: Equatable {
+        case accepted(AgentRunTurnEpoch)
+        case stale(currentEpoch: AgentRunTurnEpoch?)
+        case rejected(reason: String)
+    }
+
     enum WaitDisposition: Equatable {
         case snapshotReady(AgentRunMCPSnapshot)
         case noteworthySnapshot(AgentRunMCPSnapshot, WakeReason)
+        case epochAdvanced(AgentRunTurnEpoch, AgentRunEpochTransitionKind)
+        case terminalPublicationRejected(epoch: AgentRunTurnEpoch, reason: String)
         case timedOut
         case expired
         case cancelled
@@ -18,28 +31,44 @@ actor AgentRunSessionStore {
 
     enum WakeReason: String, Equatable {
         case instructionDelivered = "instruction_delivered"
-        /// A steering request was accepted locally. This wakes only currently-blocked
-        /// waits so the caller can issue a fresh wait for post-steer progress.
         case steeringRequested = "steering_requested"
     }
 
     private struct Waiter {
         let id: UUID
+        let cursor: WaitCursor
         let continuation: CheckedContinuation<WaitDisposition, Never>
         let timeoutTask: Task<Void, Never>?
     }
 
-    private struct Record {
-        var registration: Registration
+    private struct EpochState {
+        let epoch: AgentRunTurnEpoch?
         var latestSnapshot: AgentRunMCPSnapshot?
         var pendingNoteworthySnapshot: AgentRunMCPSnapshot?
         var pendingWakeReason: WakeReason?
-        var lastCommittedPublicationID: UUID?
+        var terminalCommitID: UUID?
+        var terminalSnapshot: AgentRunMCPSnapshot?
+        var successorEpoch: AgentRunTurnEpoch?
+        var terminalPublicationFailure: String?
+
+        init(epoch: AgentRunTurnEpoch?) {
+            self.epoch = epoch
+        }
+    }
+
+    private struct Record {
+        let registration: Registration
+        var currentEpoch: AgentRunTurnEpoch?
+        var preEpochState = EpochState(epoch: nil)
+        var epochStates: [UUID: EpochState] = [:]
         var waiters: [Waiter] = []
         var expiryTask: Task<Void, Never>?
+        var nextEpochOrdinal: UInt64 = 1
+        var continuityGeneration: UInt64 = 0
     }
 
     private static let terminalSnapshotTTL: TimeInterval = 300
+    private static let retainedCommittedEpochLimit = 32
 
     private var records: [UUID: Record] = [:]
     private var nextGeneration: UInt64 = 1
@@ -60,186 +89,343 @@ actor AgentRunSessionStore {
         return registration
     }
 
-    /// Clears the stored snapshot for a freshly dispatched turn and rotates the
-    /// publication generation. Already-parked waiters remain attached to the new turn.
-    @discardableResult
-    func resetSnapshotForNewTurn(registration: Registration) -> Registration? {
-        guard var record = currentRecord(for: registration, operation: "reset_new_turn") else { return nil }
+    func beginEpoch(
+        registration: Registration,
+        activationID: UUID,
+        expectedCurrentEpoch: AgentRunTurnEpoch?,
+        transitionKind: AgentRunEpochTransitionKind,
+        seedSnapshot: AgentRunMCPSnapshot? = nil
+    ) -> EpochBeginResult {
+        guard var record = currentRecord(for: registration, operation: "begin_epoch") else {
+            return .rejected(reason: "stale_activation")
+        }
+        guard record.currentEpoch == expectedCurrentEpoch else {
+            recordRejectedOperation(
+                "begin_epoch",
+                supplied: registration,
+                current: record.registration,
+                reason: "unexpected_current_epoch"
+            )
+            return .stale(currentEpoch: record.currentEpoch)
+        }
+
+        if transitionKind == .unrelated {
+            record.continuityGeneration &+= 1
+        }
+        let epoch = AgentRunTurnEpoch(
+            sessionID: registration.sessionID,
+            activationID: activationID,
+            registrationGeneration: registration.generation,
+            id: UUID(),
+            ordinal: record.nextEpochOrdinal,
+            continuityGeneration: record.continuityGeneration,
+            transitionKind: transitionKind
+        )
+        record.nextEpochOrdinal &+= 1
+        var state = EpochState(epoch: epoch)
+        state.latestSnapshot = seedSnapshot
+        record.epochStates[epoch.id] = state
+        record.currentEpoch = epoch
+        pruneCommittedEpochStates(in: &record)
         record.expiryTask?.cancel()
         record.expiryTask = nil
-        record.registration = makeRegistration(sessionID: registration.sessionID)
-        record.latestSnapshot = nil
-        record.pendingNoteworthySnapshot = nil
-        record.pendingWakeReason = nil
-        record.lastCommittedPublicationID = nil
+        let waiters = takeWaiters(from: &record) { $0.cursor.epoch != epoch }
         records[registration.sessionID] = record
-        return record.registration
+        resume(waiters, with: .epochAdvanced(epoch, transitionKind))
+        return .accepted(epoch)
     }
 
-    func noteSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) {
-        ingestSnapshot(snapshot, registration: registration, wakeReason: nil)
+    func noteSnapshot(_ snapshot: AgentRunMCPSnapshot, cursor: WaitCursor) {
+        ingestSnapshot(snapshot, cursor: cursor, wakeReason: nil)
     }
 
     func noteSnapshotAndWakeWaiters(
         _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
+        cursor: WaitCursor,
         reason: WakeReason
     ) {
-        ingestSnapshot(snapshot, registration: registration, wakeReason: reason)
+        ingestSnapshot(snapshot, cursor: cursor, wakeReason: reason)
     }
 
-    func signalCommittedSnapshot(
-        _ snapshot: AgentRunMCPSnapshot,
+    func publishTerminal(
+        _ envelope: AgentRunTerminalPublicationEnvelope,
         registration: Registration,
-        commitID: UUID
-    ) {
-        guard snapshot.sessionID == registration.sessionID else {
+        commitID: UUID,
+        successorKind: AgentRunEpochTransitionKind?
+    ) -> AgentRunTerminalPublicationResult {
+        guard envelope.snapshot.sessionID == registration.sessionID,
+              envelope.epoch.sessionID == registration.sessionID,
+              envelope.epoch.registrationGeneration == registration.generation
+        else {
             recordRejectedOperation(
                 "publish_terminal_commit",
                 supplied: registration,
                 current: records[registration.sessionID]?.registration,
-                reason: "session_mismatch"
+                reason: "session_or_activation_mismatch"
             )
-            return
+            return .rejected(reason: "session_or_activation_mismatch")
         }
-        guard var record = currentRecord(for: registration, operation: "publish_terminal_commit") else { return }
-        if record.lastCommittedPublicationID == commitID {
-            #if DEBUG
-                AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.duplicate")
-            #endif
-            return
+        guard var record = currentRecord(for: registration, operation: "publish_terminal_commit") else {
+            return .rejected(reason: "stale_activation")
         }
-        guard record.lastCommittedPublicationID == nil else {
+        guard var state = record.epochStates[envelope.epoch.id], state.epoch == envelope.epoch else {
             recordRejectedOperation(
                 "publish_terminal_commit",
                 supplied: registration,
                 current: record.registration,
-                reason: "different_commit_already_published"
+                reason: "unknown_epoch"
             )
-            return
+            return .rejected(reason: "unknown_epoch")
         }
-        record.lastCommittedPublicationID = commitID
+        if state.terminalCommitID == commitID {
+            if let successorEpoch = state.successorEpoch {
+                return .accepted(successorEpoch: successorEpoch)
+            }
+            return record.currentEpoch == envelope.epoch
+                ? .accepted(successorEpoch: nil)
+                : .stale
+        }
+        if state.terminalCommitID != nil {
+            let reason = "different_commit_already_published"
+            state.terminalPublicationFailure = reason
+            record.epochStates[envelope.epoch.id] = state
+            let waiters = record.currentEpoch == envelope.epoch
+                ? takeWaiters(from: &record) { $0.cursor.epoch == envelope.epoch }
+                : []
+            records[registration.sessionID] = record
+            resume(waiters, with: .terminalPublicationRejected(epoch: envelope.epoch, reason: reason))
+            recordRejectedOperation(
+                "publish_terminal_commit",
+                supplied: registration,
+                current: record.registration,
+                reason: reason
+            )
+            return .rejected(reason: reason)
+        }
+
+        state.terminalCommitID = commitID
+        state.terminalSnapshot = envelope.snapshot
+        state.latestSnapshot = envelope.snapshot
+        state.pendingNoteworthySnapshot = nil
+        state.pendingWakeReason = nil
+
+        guard record.currentEpoch == envelope.epoch else {
+            record.epochStates[envelope.epoch.id] = state
+            pruneCommittedEpochStates(in: &record)
+            records[registration.sessionID] = record
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.staleAccepted")
+            #endif
+            return .stale
+        }
+
+        if let successorKind {
+            let successor: AgentRunTurnEpoch
+            if let existing = state.successorEpoch {
+                successor = existing
+            } else {
+                if successorKind == .unrelated {
+                    record.continuityGeneration &+= 1
+                }
+                successor = AgentRunTurnEpoch(
+                    sessionID: registration.sessionID,
+                    activationID: envelope.epoch.activationID,
+                    registrationGeneration: registration.generation,
+                    id: UUID(),
+                    ordinal: record.nextEpochOrdinal,
+                    continuityGeneration: record.continuityGeneration,
+                    transitionKind: successorKind
+                )
+                record.nextEpochOrdinal &+= 1
+                state.successorEpoch = successor
+                record.epochStates[successor.id] = EpochState(epoch: successor)
+            }
+            record.epochStates[envelope.epoch.id] = state
+            record.currentEpoch = successor
+            pruneCommittedEpochStates(in: &record)
+            record.expiryTask?.cancel()
+            record.expiryTask = nil
+            let waiters = takeWaiters(from: &record) { $0.cursor.epoch == envelope.epoch }
+            records[registration.sessionID] = record
+            resume(waiters, with: .epochAdvanced(successor, successorKind))
+            #if DEBUG
+                AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.acceptedWithSuccessor")
+            #endif
+            return .accepted(successorEpoch: successor)
+        }
+
+        record.epochStates[envelope.epoch.id] = state
+        let waiters = takeWaiters(from: &record) { $0.cursor.epoch == envelope.epoch }
+        scheduleExpiry(for: &record, cursor: WaitCursor(registration: registration, epoch: envelope.epoch))
         records[registration.sessionID] = record
-        ingestSnapshot(snapshot, registration: registration, wakeReason: nil)
+        resume(waiters, with: .snapshotReady(envelope.snapshot))
         #if DEBUG
             AgentModePerfDiagnostics.increment("mcp.waitStore.terminalCommit.accepted")
         #endif
+        return .accepted(successorEpoch: nil)
     }
 
     func wakeCurrentWaiters(
         _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
+        cursor: WaitCursor,
         reason: WakeReason
     ) {
-        guard snapshot.sessionID == registration.sessionID else {
-            recordRejectedOperation("wake", supplied: registration, current: records[registration.sessionID]?.registration, reason: "session_mismatch")
-            return
+        guard snapshot.sessionID == cursor.registration.sessionID else { return }
+        guard var record = currentRecord(for: cursor.registration, operation: "wake") else { return }
+        guard cursor.epoch == record.currentEpoch else { return }
+        let acceptedSnapshot = acceptedSnapshot(snapshot, existing: latestSnapshot(in: record, cursor: cursor))
+        if acceptedSnapshot == snapshot {
+            updateLatestSnapshot(snapshot, in: &record, cursor: cursor)
         }
-        guard var record = currentRecord(for: registration, operation: "wake") else { return }
-        print("[AgentRunSteeringWake] store wake requested sessionID=\(snapshot.sessionID) generation=\(registration.generation) reason=\(reason.rawValue) status=\(snapshot.status.rawValue) waiters=\(record.waiters.count) pending=\(record.pendingWakeReason?.rawValue ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none")")
-        if let latestSnapshot = record.latestSnapshot {
-            if latestSnapshot.status.isTerminal {
-                print("[AgentRunSteeringWake] store wake ignored terminal latest sessionID=\(snapshot.sessionID) latest=\(latestSnapshot.status.rawValue)")
-                return
-            }
-            if !snapshot.status.isTerminal, latestSnapshot.updatedAt > snapshot.updatedAt {
-                record.latestSnapshot = latestSnapshot
-            } else {
-                record.latestSnapshot = snapshot
-            }
-        } else {
-            record.latestSnapshot = snapshot
+        let waiters = takeWaiters(from: &record) { $0.cursor == cursor }
+        if acceptedSnapshot.isActionableForMCPWait {
+            clearPendingWake(in: &record, cursor: cursor)
+        } else if waiters.isEmpty {
+            setPendingWake(snapshot: acceptedSnapshot, reason: reason, in: &record, cursor: cursor)
         }
-        let waiters = record.waiters
-        guard !waiters.isEmpty else {
-            records[snapshot.sessionID] = record
-            print("[AgentRunSteeringWake] store wake no current waiters sessionID=\(snapshot.sessionID) reason=\(reason.rawValue)")
-            return
-        }
-        record.waiters.removeAll()
         records[snapshot.sessionID] = record
-        let returnedSnapshot = record.latestSnapshot ?? snapshot
-        print("[AgentRunSteeringWake] store wake resuming waiters sessionID=\(snapshot.sessionID) reason=\(reason.rawValue) count=\(waiters.count) returnedStatus=\(returnedSnapshot.status.rawValue)")
-        for waiter in waiters {
-            waiter.timeoutTask?.cancel()
-            waiter.continuation.resume(returning: .noteworthySnapshot(returnedSnapshot, reason))
-        }
+        guard !waiters.isEmpty else { return }
+        let disposition: WaitDisposition = acceptedSnapshot.isActionableForMCPWait
+            ? .snapshotReady(acceptedSnapshot)
+            : .noteworthySnapshot(acceptedSnapshot, reason)
+        resume(waiters, with: disposition)
     }
 
     private func ingestSnapshot(
         _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
+        cursor: WaitCursor,
         wakeReason: WakeReason?
     ) {
-        guard snapshot.sessionID == registration.sessionID else {
-            recordRejectedOperation("publish", supplied: registration, current: records[registration.sessionID]?.registration, reason: "session_mismatch")
+        guard snapshot.sessionID == cursor.registration.sessionID else {
+            recordRejectedOperation(
+                "publish",
+                supplied: cursor.registration,
+                current: records[cursor.registration.sessionID]?.registration,
+                reason: "session_mismatch"
+            )
             return
         }
-        guard var record = currentRecord(for: registration, operation: "publish") else { return }
-        var acceptedSnapshot = snapshot
-        var shouldStoreIncomingSnapshot = true
-        if let latestSnapshot = record.latestSnapshot {
-            if latestSnapshot.status.isTerminal {
-                // Terminal snapshots block later non-terminal regressions.
-                // Allow newer terminal snapshots to refine status text / counts.
-                if !(snapshot.status.isTerminal && snapshot.updatedAt >= latestSnapshot.updatedAt) {
-                    acceptedSnapshot = latestSnapshot
-                    shouldStoreIncomingSnapshot = false
-                }
-            } else if !snapshot.status.isTerminal, latestSnapshot.updatedAt > snapshot.updatedAt {
-                // Non-terminal: reject older non-terminal snapshots (terminal always wins).
-                acceptedSnapshot = latestSnapshot
-                shouldStoreIncomingSnapshot = false
-            }
+        guard var record = currentRecord(for: cursor.registration, operation: "publish") else { return }
+        guard cursor.epoch == record.currentEpoch else {
+            recordRejectedOperation(
+                "publish",
+                supplied: cursor.registration,
+                current: record.registration,
+                reason: "stale_epoch"
+            )
+            return
         }
-        if shouldStoreIncomingSnapshot {
-            record.latestSnapshot = snapshot
+
+        let acceptedSnapshot = acceptedSnapshot(snapshot, existing: latestSnapshot(in: record, cursor: cursor))
+        if acceptedSnapshot == snapshot {
+            updateLatestSnapshot(snapshot, in: &record, cursor: cursor)
             if snapshot.isActionableForMCPWait {
-                record.pendingNoteworthySnapshot = nil
-                record.pendingWakeReason = nil
+                clearPendingWake(in: &record, cursor: cursor)
             }
         }
 
-        let waiterDisposition: WaitDisposition? = {
-            if acceptedSnapshot.isActionableForMCPWait {
-                return .snapshotReady(acceptedSnapshot)
-            }
-            if let wakeReason {
-                return .noteworthySnapshot(acceptedSnapshot, wakeReason)
-            }
-            return nil
-        }()
-        let waiters = waiterDisposition == nil ? [] : record.waiters
-        if waiterDisposition != nil {
-            record.waiters.removeAll()
+        let disposition: WaitDisposition? = if acceptedSnapshot.isActionableForMCPWait {
+            .snapshotReady(acceptedSnapshot)
+        } else if let wakeReason {
+            .noteworthySnapshot(acceptedSnapshot, wakeReason)
+        } else {
+            nil
         }
-        if case .noteworthySnapshot = waiterDisposition, waiters.isEmpty {
-            record.pendingNoteworthySnapshot = acceptedSnapshot
-            record.pendingWakeReason = wakeReason
-        } else if waiterDisposition != nil {
-            record.pendingNoteworthySnapshot = nil
-            record.pendingWakeReason = nil
+        let waiters = disposition == nil ? [] : takeWaiters(from: &record) { $0.cursor == cursor }
+        if case .noteworthySnapshot = disposition, waiters.isEmpty {
+            setPendingWake(snapshot: acceptedSnapshot, reason: wakeReason, in: &record, cursor: cursor)
+        } else if disposition != nil {
+            clearPendingWake(in: &record, cursor: cursor)
         }
-
-        if shouldStoreIncomingSnapshot, snapshot.status.isTerminal {
-            record.expiryTask?.cancel()
-            record.expiryTask = Task { [registration] in
-                do {
-                    try await Task.sleep(nanoseconds: UInt64(Self.terminalSnapshotTTL * 1_000_000_000))
-                    await Self.shared.expire(registration: registration)
-                } catch {
-                    // Ignore cancellation.
-                }
-            }
+        if snapshot.status.isTerminal {
+            scheduleExpiry(for: &record, cursor: cursor)
         }
-
         records[snapshot.sessionID] = record
+        if let disposition {
+            resume(waiters, with: disposition)
+        }
+    }
 
-        if let waiterDisposition {
-            for waiter in waiters {
-                waiter.timeoutTask?.cancel()
-                waiter.continuation.resume(returning: waiterDisposition)
+    func waitUntilInteresting(
+        cursor: WaitCursor,
+        timeoutSeconds: TimeInterval? = nil
+    ) async -> WaitDisposition {
+        guard let record = currentRecord(for: cursor.registration, operation: "wait") else {
+            return .expired
+        }
+        if cursor.epoch != record.currentEpoch {
+            guard let currentEpoch = record.currentEpoch else { return .expired }
+            return .epochAdvanced(currentEpoch, transitionKind(from: cursor.epoch, to: currentEpoch))
+        }
+        if let failure = terminalPublicationFailure(in: record, cursor: cursor), let epoch = cursor.epoch {
+            return .terminalPublicationRejected(epoch: epoch, reason: failure)
+        }
+        if let snapshot = latestSnapshot(in: record, cursor: cursor), snapshot.isActionableForMCPWait {
+            return .snapshotReady(snapshot)
+        }
+        if let pending = pendingWake(in: record, cursor: cursor) {
+            var updated = record
+            clearPendingWake(in: &updated, cursor: cursor)
+            records[cursor.registration.sessionID] = updated
+            return .noteworthySnapshot(latestSnapshot(in: updated, cursor: cursor) ?? pending.snapshot, pending.reason)
+        }
+        if let timeoutSeconds, timeoutSeconds <= 0 {
+            return .timedOut
+        }
+
+        let waiterID = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                guard var current = currentRecord(for: cursor.registration, operation: "wait_park") else {
+                    continuation.resume(returning: .expired)
+                    return
+                }
+                if cursor.epoch != current.currentEpoch {
+                    guard let currentEpoch = current.currentEpoch else {
+                        continuation.resume(returning: .expired)
+                        return
+                    }
+                    continuation.resume(returning: .epochAdvanced(
+                        currentEpoch,
+                        transitionKind(from: cursor.epoch, to: currentEpoch)
+                    ))
+                    return
+                }
+                if let failure = terminalPublicationFailure(in: current, cursor: cursor), let epoch = cursor.epoch {
+                    continuation.resume(returning: .terminalPublicationRejected(epoch: epoch, reason: failure))
+                    return
+                }
+                if let snapshot = latestSnapshot(in: current, cursor: cursor), snapshot.isActionableForMCPWait {
+                    continuation.resume(returning: .snapshotReady(snapshot))
+                    return
+                }
+                if let pending = pendingWake(in: current, cursor: cursor) {
+                    clearPendingWake(in: &current, cursor: cursor)
+                    records[cursor.registration.sessionID] = current
+                    continuation.resume(returning: .noteworthySnapshot(
+                        latestSnapshot(in: current, cursor: cursor) ?? pending.snapshot,
+                        pending.reason
+                    ))
+                    return
+                }
+                let timeoutTask: Task<Void, Never>? = timeoutSeconds.map { timeout in
+                    Task { [weak self] in
+                        do {
+                            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                            await self?.timeoutWaiter(sessionID: cursor.registration.sessionID, waiterID: waiterID)
+                        } catch {}
+                    }
+                }
+                current.waiters.append(Waiter(
+                    id: waiterID,
+                    cursor: cursor,
+                    continuation: continuation,
+                    timeoutTask: timeoutTask
+                ))
+                records[cursor.registration.sessionID] = current
             }
+        } onCancel: {
+            Task { await self.cancelWaiter(sessionID: cursor.registration.sessionID, waiterID: waiterID) }
         }
     }
 
@@ -247,85 +433,31 @@ actor AgentRunSessionStore {
         registration: Registration,
         timeoutSeconds: TimeInterval? = nil
     ) async -> WaitDisposition {
-        guard let record = currentRecord(for: registration, operation: "wait") else {
-            print("[AgentRunSteeringWake] store wait expired missing or stale registration sessionID=\(registration.sessionID) generation=\(registration.generation)")
-            return .expired
-        }
-        if let snapshot = record.latestSnapshot,
-           snapshot.isActionableForMCPWait
-        {
-            print("[AgentRunSteeringWake] store wait immediate snapshot sessionID=\(registration.sessionID) status=\(snapshot.status.rawValue) interaction=\(snapshot.interaction != nil)")
-            return .snapshotReady(snapshot)
-        }
-        if let snapshot = record.pendingNoteworthySnapshot,
-           let reason = record.pendingWakeReason
-        {
-            let returnedSnapshot = record.latestSnapshot ?? snapshot
-            var updated = record
-            updated.pendingNoteworthySnapshot = nil
-            updated.pendingWakeReason = nil
-            records[registration.sessionID] = updated
-            print("[AgentRunSteeringWake] store wait consumed pending wake sessionID=\(registration.sessionID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
-            return .noteworthySnapshot(returnedSnapshot, reason)
-        }
-        if let timeout = timeoutSeconds, timeout <= 0 {
-            print("[AgentRunSteeringWake] store wait timed out immediately sessionID=\(registration.sessionID)")
-            return .timedOut
-        }
+        guard let cursor = currentCursor(for: registration) else { return .expired }
+        return await waitUntilInteresting(cursor: cursor, timeoutSeconds: timeoutSeconds)
+    }
 
-        let waiterID = UUID()
-        print("[AgentRunSteeringWake] store wait registering waiter sessionID=\(registration.sessionID) generation=\(registration.generation) waiterID=\(waiterID) timeout=\(timeoutSeconds.map { String($0) } ?? "none") latest=\(record.latestSnapshot?.status.rawValue ?? "none") existingWaiters=\(record.waiters.count)")
-        return await withTaskCancellationHandler {
-            await withCheckedContinuation { (continuation: CheckedContinuation<WaitDisposition, Never>) in
-                guard var current = currentRecord(for: registration, operation: "wait_park") else {
-                    print("[AgentRunSteeringWake] store wait continuation expired stale registration sessionID=\(registration.sessionID) waiterID=\(waiterID)")
-                    continuation.resume(returning: .expired)
-                    return
-                }
-                if let snapshot = current.latestSnapshot,
-                   snapshot.isActionableForMCPWait
-                {
-                    print("[AgentRunSteeringWake] store wait continuation immediate snapshot sessionID=\(registration.sessionID) waiterID=\(waiterID) status=\(snapshot.status.rawValue)")
-                    continuation.resume(returning: .snapshotReady(snapshot))
-                    return
-                }
-                if let snapshot = current.pendingNoteworthySnapshot,
-                   let reason = current.pendingWakeReason
-                {
-                    let returnedSnapshot = current.latestSnapshot ?? snapshot
-                    current.pendingNoteworthySnapshot = nil
-                    current.pendingWakeReason = nil
-                    records[registration.sessionID] = current
-                    print("[AgentRunSteeringWake] store wait continuation consumed pending wake sessionID=\(registration.sessionID) waiterID=\(waiterID) reason=\(reason.rawValue) returnedStatus=\(returnedSnapshot.status.rawValue)")
-                    continuation.resume(returning: .noteworthySnapshot(returnedSnapshot, reason))
-                    return
-                }
-                var timeoutTask: Task<Void, Never>?
-                if let timeout = timeoutSeconds {
-                    timeoutTask = Task { [weak self] in
-                        do {
-                            try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                            await self?.timeoutWaiter(sessionID: registration.sessionID, waiterID: waiterID)
-                        } catch {
-                            // Cancelled — snapshot or cleanup woke the waiter first.
-                        }
-                    }
-                }
-                current.waiters.append(Waiter(id: waiterID, continuation: continuation, timeoutTask: timeoutTask))
-                print("[AgentRunSteeringWake] store wait waiter parked sessionID=\(registration.sessionID) waiterID=\(waiterID) waiters=\(current.waiters.count)")
-                records[registration.sessionID] = current
-            }
-        } onCancel: {
-            Task { await self.cancelWaiter(sessionID: registration.sessionID, waiterID: waiterID) }
-        }
+    func snapshot(for cursor: WaitCursor) -> AgentRunMCPSnapshot? {
+        guard let record = currentRecord(for: cursor.registration, operation: "snapshot") else { return nil }
+        return latestSnapshot(in: record, cursor: cursor)
     }
 
     func snapshot(for registration: Registration) -> AgentRunMCPSnapshot? {
-        currentRecord(for: registration, operation: "snapshot")?.latestSnapshot
+        guard let cursor = currentCursor(for: registration) else { return nil }
+        return snapshot(for: cursor)
+    }
+
+    func currentCursor(for registration: Registration) -> WaitCursor? {
+        guard let record = currentRecord(for: registration, operation: "current_cursor") else { return nil }
+        return WaitCursor(registration: registration, epoch: record.currentEpoch)
     }
 
     func currentRegistration(for sessionID: UUID) -> Registration? {
         records[sessionID]?.registration
+    }
+
+    func currentEpoch(for registration: Registration) -> AgentRunTurnEpoch? {
+        currentRecord(for: registration, operation: "current_epoch")?.currentEpoch
     }
 
     func hasActiveRegistration(sessionID: UUID) -> Bool {
@@ -339,36 +471,174 @@ actor AgentRunSessionStore {
         expireWaiters(record.waiters)
     }
 
+    private func transitionKind(
+        from previousEpoch: AgentRunTurnEpoch?,
+        to currentEpoch: AgentRunTurnEpoch
+    ) -> AgentRunEpochTransitionKind {
+        guard let previousEpoch else { return currentEpoch.transitionKind }
+        guard previousEpoch.continuityGeneration == currentEpoch.continuityGeneration else {
+            return .unrelated
+        }
+        return currentEpoch.transitionKind
+    }
+
+    private func pruneCommittedEpochStates(in record: inout Record) {
+        var protectedEpochIDs = Set(record.waiters.compactMap { $0.cursor.epoch?.id })
+        if let currentEpochID = record.currentEpoch?.id {
+            protectedEpochIDs.insert(currentEpochID)
+        }
+        let removableEpochIDs = record.epochStates.values
+            .filter { state in
+                guard let epoch = state.epoch else { return false }
+                return state.terminalCommitID != nil && !protectedEpochIDs.contains(epoch.id)
+            }
+            .sorted { lhs, rhs in
+                (lhs.epoch?.ordinal ?? 0) > (rhs.epoch?.ordinal ?? 0)
+            }
+            .dropFirst(Self.retainedCommittedEpochLimit)
+            .compactMap { $0.epoch?.id }
+        for epochID in removableEpochIDs {
+            record.epochStates.removeValue(forKey: epochID)
+        }
+    }
+
+    private func acceptedSnapshot(
+        _ snapshot: AgentRunMCPSnapshot,
+        existing: AgentRunMCPSnapshot?
+    ) -> AgentRunMCPSnapshot {
+        guard let existing else { return snapshot }
+        if existing.status.isTerminal {
+            if snapshot.status.isTerminal, snapshot.updatedAt >= existing.updatedAt {
+                return snapshot
+            }
+            return existing
+        }
+        if !snapshot.status.isTerminal, existing.updatedAt > snapshot.updatedAt {
+            return existing
+        }
+        return snapshot
+    }
+
+    private func updateLatestSnapshot(_ snapshot: AgentRunMCPSnapshot, in record: inout Record, cursor: WaitCursor) {
+        if let epoch = cursor.epoch {
+            guard var state = record.epochStates[epoch.id], state.epoch == epoch else { return }
+            state.latestSnapshot = snapshot
+            record.epochStates[epoch.id] = state
+        } else {
+            record.preEpochState.latestSnapshot = snapshot
+        }
+    }
+
+    private func latestSnapshot(in record: Record, cursor: WaitCursor) -> AgentRunMCPSnapshot? {
+        if let epoch = cursor.epoch {
+            return record.epochStates[epoch.id]?.latestSnapshot
+        }
+        return record.preEpochState.latestSnapshot
+    }
+
+    private func terminalPublicationFailure(in record: Record, cursor: WaitCursor) -> String? {
+        guard let epoch = cursor.epoch else { return nil }
+        return record.epochStates[epoch.id]?.terminalPublicationFailure
+    }
+
+    private func pendingWake(in record: Record, cursor: WaitCursor) -> (snapshot: AgentRunMCPSnapshot, reason: WakeReason)? {
+        let state: EpochState? = if let epoch = cursor.epoch {
+            record.epochStates[epoch.id]
+        } else {
+            record.preEpochState
+        }
+        guard let snapshot = state?.pendingNoteworthySnapshot,
+              let reason = state?.pendingWakeReason
+        else {
+            return nil
+        }
+        return (snapshot, reason)
+    }
+
+    private func setPendingWake(
+        snapshot: AgentRunMCPSnapshot,
+        reason: WakeReason?,
+        in record: inout Record,
+        cursor: WaitCursor
+    ) {
+        guard let reason else { return }
+        if let epoch = cursor.epoch {
+            guard var state = record.epochStates[epoch.id] else { return }
+            state.pendingNoteworthySnapshot = snapshot
+            state.pendingWakeReason = reason
+            record.epochStates[epoch.id] = state
+        } else {
+            record.preEpochState.pendingNoteworthySnapshot = snapshot
+            record.preEpochState.pendingWakeReason = reason
+        }
+    }
+
+    private func clearPendingWake(in record: inout Record, cursor: WaitCursor) {
+        if let epoch = cursor.epoch {
+            guard var state = record.epochStates[epoch.id] else { return }
+            state.pendingNoteworthySnapshot = nil
+            state.pendingWakeReason = nil
+            record.epochStates[epoch.id] = state
+        } else {
+            record.preEpochState.pendingNoteworthySnapshot = nil
+            record.preEpochState.pendingWakeReason = nil
+        }
+    }
+
+    private func takeWaiters(
+        from record: inout Record,
+        matching predicate: (Waiter) -> Bool
+    ) -> [Waiter] {
+        var selected: [Waiter] = []
+        record.waiters.removeAll { waiter in
+            guard predicate(waiter) else { return false }
+            selected.append(waiter)
+            return true
+        }
+        return selected
+    }
+
+    private func resume(_ waiters: [Waiter], with disposition: WaitDisposition) {
+        for waiter in waiters {
+            waiter.timeoutTask?.cancel()
+            waiter.continuation.resume(returning: disposition)
+        }
+    }
+
     private func cancelWaiter(sessionID: UUID, waiterID: UUID) {
         guard var record = records[sessionID],
               let index = record.waiters.firstIndex(where: { $0.id == waiterID })
-        else {
-            print("[AgentRunSteeringWake] store wait cancel ignored sessionID=\(sessionID) waiterID=\(waiterID)")
-            return
-        }
+        else { return }
         let waiter = record.waiters.remove(at: index)
         records[sessionID] = record
         waiter.timeoutTask?.cancel()
-        print("[AgentRunSteeringWake] store wait cancelled sessionID=\(sessionID) waiterID=\(waiterID) remaining=\(record.waiters.count)")
         waiter.continuation.resume(returning: .cancelled)
     }
 
     private func timeoutWaiter(sessionID: UUID, waiterID: UUID) {
         guard var record = records[sessionID],
               let index = record.waiters.firstIndex(where: { $0.id == waiterID })
-        else {
-            print("[AgentRunSteeringWake] store wait timeout ignored sessionID=\(sessionID) waiterID=\(waiterID)")
-            return
-        }
+        else { return }
         let waiter = record.waiters.remove(at: index)
         records[sessionID] = record
-        print("[AgentRunSteeringWake] store wait timed out sessionID=\(sessionID) waiterID=\(waiterID) remaining=\(record.waiters.count)")
         waiter.continuation.resume(returning: .timedOut)
     }
 
-    private func expire(registration: Registration) {
-        guard let record = currentRecord(for: registration, operation: "expire") else { return }
-        records.removeValue(forKey: registration.sessionID)
+    private func scheduleExpiry(for record: inout Record, cursor: WaitCursor) {
+        record.expiryTask?.cancel()
+        record.expiryTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: UInt64(Self.terminalSnapshotTTL * 1_000_000_000))
+                await self?.expire(cursor: cursor)
+            } catch {}
+        }
+    }
+
+    private func expire(cursor: WaitCursor) {
+        guard let record = currentRecord(for: cursor.registration, operation: "expire"),
+              record.currentEpoch == cursor.epoch
+        else { return }
+        records.removeValue(forKey: cursor.registration.sessionID)
         expireWaiters(record.waiters)
     }
 
@@ -391,19 +661,15 @@ actor AgentRunSessionStore {
     }
 
     private func expireWaiters(_ waiters: [Waiter]) {
-        for waiter in waiters {
-            waiter.timeoutTask?.cancel()
-            waiter.continuation.resume(returning: .expired)
-        }
+        resume(waiters, with: .expired)
     }
 
     private func recordRejectedOperation(
         _ operation: String,
-        supplied: Registration,
-        current: Registration?,
+        supplied _: Registration,
+        current _: Registration?,
         reason: String
     ) {
-        print("[AgentRunSessionStore] ignored operation=\(operation) sessionID=\(supplied.sessionID) suppliedGeneration=\(supplied.generation) currentGeneration=\(current.map { String($0.generation) } ?? "none") reason=\(reason)")
         #if DEBUG
             AgentModePerfDiagnostics.increment("mcp.waitStore.rejected.\(operation).\(reason)")
         #endif
@@ -415,6 +681,29 @@ extension AgentRunSessionStore {
         await shared.register(sessionID: sessionID)
     }
 
+    static func beginEpoch(
+        registration: Registration,
+        activationID: UUID,
+        expectedCurrentEpoch: AgentRunTurnEpoch?,
+        transitionKind: AgentRunEpochTransitionKind,
+        seedSnapshot: AgentRunMCPSnapshot? = nil
+    ) async -> EpochBeginResult {
+        await shared.beginEpoch(
+            registration: registration,
+            activationID: activationID,
+            expectedCurrentEpoch: expectedCurrentEpoch,
+            transitionKind: transitionKind,
+            seedSnapshot: seedSnapshot
+        )
+    }
+
+    static func waitUntilInteresting(
+        cursor: WaitCursor,
+        timeoutSeconds: TimeInterval? = nil
+    ) async -> WaitDisposition {
+        await shared.waitUntilInteresting(cursor: cursor, timeoutSeconds: timeoutSeconds)
+    }
+
     static func waitUntilInteresting(
         registration: Registration,
         timeoutSeconds: TimeInterval? = nil
@@ -422,12 +711,24 @@ extension AgentRunSessionStore {
         await shared.waitUntilInteresting(registration: registration, timeoutSeconds: timeoutSeconds)
     }
 
+    static func snapshot(for cursor: WaitCursor) async -> AgentRunMCPSnapshot? {
+        await shared.snapshot(for: cursor)
+    }
+
     static func snapshot(for registration: Registration) async -> AgentRunMCPSnapshot? {
         await shared.snapshot(for: registration)
     }
 
+    static func currentCursor(for registration: Registration) async -> WaitCursor? {
+        await shared.currentCursor(for: registration)
+    }
+
     static func currentRegistration(for sessionID: UUID) async -> Registration? {
         await shared.currentRegistration(for: sessionID)
+    }
+
+    static func currentEpoch(for registration: Registration) async -> AgentRunTurnEpoch? {
+        await shared.currentEpoch(for: registration)
     }
 
     static func hasActiveRegistration(sessionID: UUID) async -> Bool {
@@ -438,37 +739,38 @@ extension AgentRunSessionStore {
         await shared.cleanup(registration: registration)
     }
 
-    static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, registration: Registration) async {
-        await shared.noteSnapshot(snapshot, registration: registration)
+    static func signalSnapshot(_ snapshot: AgentRunMCPSnapshot, cursor: WaitCursor) async {
+        await shared.noteSnapshot(snapshot, cursor: cursor)
     }
 
-    static func signalCommittedSnapshot(
-        _ snapshot: AgentRunMCPSnapshot,
+    static func publishTerminal(
+        _ envelope: AgentRunTerminalPublicationEnvelope,
         registration: Registration,
-        commitID: UUID
-    ) async {
-        await shared.signalCommittedSnapshot(snapshot, registration: registration, commitID: commitID)
+        commitID: UUID,
+        successorKind: AgentRunEpochTransitionKind?
+    ) async -> AgentRunTerminalPublicationResult {
+        await shared.publishTerminal(
+            envelope,
+            registration: registration,
+            commitID: commitID,
+            successorKind: successorKind
+        )
     }
 
     static func signalSnapshotAndWakeWaiters(
         _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
+        cursor: WaitCursor,
         reason: WakeReason
     ) async {
-        await shared.noteSnapshotAndWakeWaiters(snapshot, registration: registration, reason: reason)
+        await shared.noteSnapshotAndWakeWaiters(snapshot, cursor: cursor, reason: reason)
     }
 
     static func wakeCurrentWaiters(
         _ snapshot: AgentRunMCPSnapshot,
-        registration: Registration,
+        cursor: WaitCursor,
         reason: WakeReason
     ) async {
-        await shared.wakeCurrentWaiters(snapshot, registration: registration, reason: reason)
-    }
-
-    @discardableResult
-    static func resetSnapshotForNewTurn(registration: Registration) async -> Registration? {
-        await shared.resetSnapshotForNewTurn(registration: registration)
+        await shared.wakeCurrentWaiters(snapshot, cursor: cursor, reason: reason)
     }
 }
 
@@ -479,8 +781,19 @@ extension AgentRunSessionStore {
             return records[registration.sessionID]?.waiters.count ?? 0
         }
 
-        func test_expire(registration: Registration) {
-            expire(registration: registration)
+        func test_expire(cursor: WaitCursor) {
+            expire(cursor: cursor)
+        }
+
+        func test_setTerminalCommitID(_ commitID: UUID, cursor: WaitCursor) {
+            guard var record = records[cursor.registration.sessionID],
+                  record.registration == cursor.registration,
+                  let epoch = cursor.epoch,
+                  var state = record.epochStates[epoch.id]
+            else { return }
+            state.terminalCommitID = commitID
+            record.epochStates[epoch.id] = state
+            records[cursor.registration.sessionID] = record
         }
     }
 #endif

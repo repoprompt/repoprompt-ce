@@ -8,6 +8,7 @@
 
 import Foundation
 import MCP
+import RepoPromptShared
 
 /// Reusable command execution engine that works with both REPL and exec mode.
 actor MCPCommandRunner {
@@ -678,14 +679,14 @@ actor MCPCommandRunner {
             op=poll session_ids=["<uuid1>","<uuid2>"]
                                           Poll multiple snapshots immediately
             op=wait session_id="..." [timeout=N]
-                                          Block until input needed or terminal (default 300s)
+                                          Block until input needed or terminal (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
             op=wait session_ids=["<uuid1>","<uuid2>"] [timeout=N]
                                           Wait until first session needs input or terminates
             op=cancel session_id="..."    Request run cancellation
             op=steer session_id="..." message="..."
                                           Inject follow-up instruction mid-run
             op=steer session_id="..." message="..." wait=true [timeout_seconds=N]
-                                          Steer and wait for result (default 300s)
+                                          Steer and wait for result (default \(Int(MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds))s)
             op=respond session_id="..." interaction_id="..." response="..."
                                           Resolve a pending interaction (approval, question, etc)
             session_id lifecycle: start returns it; all other ops require it.

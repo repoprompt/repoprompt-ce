@@ -16,7 +16,7 @@ let package = Package(
         .package(url: "https://github.com/SwiftyJSON/SwiftyJSON", exact: "5.0.2"),
         .package(url: "https://github.com/swift-server/swift-service-lifecycle.git", exact: "2.8.0"),
         .package(url: "https://github.com/apple/swift-system.git", exact: "1.6.4"),
-        .package(url: "https://github.com/provencher/swift-sdk.git", revision: "cb6a62f7c266ed535792b3e9e6e05dc3f0dac8e4"),
+        .package(url: "https://github.com/provencher/swift-sdk.git", revision: "85dec2fc7a27252bc33dc7728be6af6b3bd398c0"),
         .package(url: "https://github.com/ChimeHQ/SwiftTreeSitter.git", exact: "0.8.0"),
         .package(url: "https://github.com/tree-sitter/tree-sitter-c", revision: "3efee11f784605d44623d7dadd6cd12a0f73ea92"),
         .package(url: "https://github.com/UserNobody14/tree-sitter-dart", revision: "80e23c07b64494f7e21090bb3450223ef0b192f4"),
@@ -100,7 +100,7 @@ let package = Package(
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
         .testTarget(
             name: "RepoPromptTests",
-            dependencies: ["RepoPrompt", "RepoPromptShared"],
+            dependencies: ["RepoPrompt", "RepoPromptMCP", "RepoPromptShared"],
             path: "Tests/RepoPromptTests",
             resources: [
                 .copy("CodeMap/Fixtures"),

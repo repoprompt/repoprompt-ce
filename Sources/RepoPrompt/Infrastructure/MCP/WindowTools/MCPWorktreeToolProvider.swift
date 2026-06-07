@@ -101,8 +101,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
                     "confirm": .boolean(description: "Merge continue/abort: plain MCP confirmation. Required true outside routed UI flows.")
                 ],
                 required: ["op"]
-            ),
-            timeoutSeconds: 10000
+            )
         ) { [self] _, args in
             try await Value(executeManageWorktree(args: args))
         }

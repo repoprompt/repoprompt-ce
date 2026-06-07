@@ -735,12 +735,12 @@ extension MCPServerViewModel {
         unowned let owner: MCPServerViewModel
         let projection: WorkspaceRootBindingProjection?
 
-        func build(for files: [WorkspaceFileRecord]) async -> ToolResultDTOs.SelectedCodeStructureDTO? {
+        func build(for files: [WorkspaceFileRecord]) async throws -> ToolResultDTOs.SelectedCodeStructureDTO? {
             guard !files.isEmpty else { return nil }
             let disabled = await MainActor.run { owner.promptVM.codeMapsGloballyDisabled }
             guard !disabled else { return nil }
 
-            return await owner.buildCodeStructureDTO(
+            return try await owner.buildCodeStructureDTO(
                 fromRecords: files,
                 maxResults: 25,
                 includeUnmappedPaths: true,

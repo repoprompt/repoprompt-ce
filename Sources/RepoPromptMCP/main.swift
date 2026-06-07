@@ -42,10 +42,10 @@ private let debugLogURL: URL = {
     return url
 }()
 
-func debugLog(_ message: String) {
+func debugLog(_ message: @autoclosure () -> String) {
     guard enableSocketDebugLog else { return }
     let timestamp = ISO8601DateFormatter().string(from: Date())
-    let line = "[\(timestamp)] \(message)\n"
+    let line = "[\(timestamp)] \(message())\n"
     if let data = line.data(using: .utf8),
        let handle = try? FileHandle(forWritingTo: debugLogURL)
     {
@@ -409,23 +409,30 @@ actor BootstrapSocketProxy {
     private let sessionToken: String
     private let clientName: String?
     private let identityCache: ClientIdentityCache
-    private var isRunning = false
+    private let bridgeLedger: JSONRPCBridgeLedger
+    private let faultRule: JSONRPCBridgeFaultRule?
     private var socketFD: Int32 = -1
 
-    init(sessionToken: String, clientName: String?, identityCache: ClientIdentityCache) {
+    init(
+        sessionToken: String,
+        clientName: String?,
+        identityCache: ClientIdentityCache,
+        bridgeLedger: JSONRPCBridgeLedger,
+        faultRule: JSONRPCBridgeFaultRule?
+    ) {
         socketURL = MCPFilesystemConstants.bootstrapSocketURL()
         self.sessionToken = sessionToken
         self.clientName = clientName
         self.identityCache = identityCache
+        self.bridgeLedger = bridgeLedger
+        self.faultRule = faultRule
     }
 
     func start() async throws {
         // Connect to app's bootstrap socket
         try connectToSocket()
-        isRunning = true
 
         defer {
-            isRunning = false
             closeSocket()
         }
 
@@ -464,42 +471,17 @@ actor BootstrapSocketProxy {
         // preventing stdin→socket from ever running again.
         let fd = socketFD
         let cache = identityCache
-        let drainState = BridgeDrainState()
-        try await withThrowingTaskGroup(of: BridgeTaskExit.self) { group in
-            group.addTask {
-                try await Self.pumpStdinToSocket(socketFD: fd, identityCache: cache)
-                await drainState.markStdinClosed()
-                return .stdinClosed
-            }
-            group.addTask {
-                try await Self.pumpSocketToStdout(socketFD: fd, drainState: drainState)
-                return .socketClosed
-            }
-
-            var stdinClosed = false
-            do {
-                while let exit = try await group.next() {
-                    switch exit {
-                    case .stdinClosed:
-                        stdinClosed = true
-                    case .socketClosed:
-                        group.cancelAll()
-                        if stdinClosed {
-                            return
-                        }
-                        throw SocketProxyError.serverClosed
-                    }
-                }
-            } catch {
-                log.error("BootstrapSocketProxy: Bridge task failed: \(error)")
-                group.cancelAll()
-                throw error
-            }
-        }
+        let ledger = bridgeLedger
+        let faultRule = faultRule
+        try await Self.runBridge(
+            socketFD: fd,
+            identityCache: cache,
+            bridgeLedger: ledger,
+            faultRule: faultRule
+        )
     }
 
     func stop() async {
-        isRunning = false
         closeSocket()
     }
 
@@ -675,27 +657,103 @@ private enum BridgeTaskExit {
     case socketClosed
 }
 
+enum BridgeSocketPollResult {
+    case timedOut
+    case events(Int16)
+}
+
+typealias BridgeSocketPoller = @Sendable (Int32) async throws -> BridgeSocketPollResult
+
 private actor BridgeDrainState {
-    private static let stdoutDrainGraceAfterStdinClose: TimeInterval = 1.0
-    private var stdinClosedAt: Date?
+    typealias Clock = @Sendable () -> TimeInterval
+
+    private let clock: Clock
+    private var stdinClosedAt: TimeInterval?
+
+    init(clock: @escaping Clock) {
+        self.clock = clock
+    }
 
     func markStdinClosed() {
         if stdinClosedAt == nil {
-            stdinClosedAt = Date()
+            stdinClosedAt = clock()
         }
     }
 
-    func shouldStopSocketPump() -> Bool {
-        guard let stdinClosedAt else { return false }
-        return Date().timeIntervalSince(stdinClosedAt) >= Self.stdoutDrainGraceAfterStdinClose
+    func isStdinClosed() -> Bool {
+        stdinClosedAt != nil
     }
 }
 
-private extension BootstrapSocketProxy {
+extension BootstrapSocketProxy {
+    static func runBridge(
+        socketFD: Int32,
+        stdinFD: Int32 = STDIN_FILENO,
+        stdoutFD: Int32 = STDOUT_FILENO,
+        identityCache: ClientIdentityCache,
+        bridgeLedger: JSONRPCBridgeLedger,
+        faultRule: JSONRPCBridgeFaultRule?,
+        socketPoller: BridgeSocketPoller? = nil,
+        drainClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        onStdinClosed: @escaping @Sendable () async -> Void = {}
+    ) async throws {
+        let drainState = BridgeDrainState(clock: drainClock)
+        try await withThrowingTaskGroup(of: BridgeTaskExit.self) { group in
+            group.addTask {
+                try await Self.pumpStdinToSocket(
+                    socketFD: socketFD,
+                    stdinFD: stdinFD,
+                    identityCache: identityCache,
+                    bridgeLedger: bridgeLedger,
+                    faultRule: faultRule
+                )
+                await drainState.markStdinClosed()
+                await onStdinClosed()
+                return .stdinClosed
+            }
+            group.addTask {
+                try await Self.pumpSocketToStdout(
+                    socketFD: socketFD,
+                    stdoutFD: stdoutFD,
+                    drainState: drainState,
+                    bridgeLedger: bridgeLedger,
+                    faultRule: faultRule,
+                    socketPoller: socketPoller
+                )
+                return .socketClosed
+            }
+
+            var stdinClosed = false
+            do {
+                while let exit = try await group.next() {
+                    switch exit {
+                    case .stdinClosed:
+                        stdinClosed = true
+                    case .socketClosed:
+                        group.cancelAll()
+                        if stdinClosed {
+                            return
+                        }
+                        throw SocketProxyError.serverClosed
+                    }
+                }
+            } catch {
+                log.error("BootstrapSocketProxy: Bridge task failed: \(error)")
+                group.cancelAll()
+                throw error
+            }
+        }
+    }
+
     /// Pumps stdin to socket. Static to run outside actor isolation.
     /// Also parses MCP initialize requests to cache the client name for reconnects.
-    static func pumpStdinToSocket(socketFD: Int32, identityCache: ClientIdentityCache) async throws {
-        let stdinFD = STDIN_FILENO
+    private static func pumpStdinToSocket(
+        socketFD: Int32,
+        stdinFD: Int32 = STDIN_FILENO,
+        identityCache: ClientIdentityCache,
+        bridgeLedger: JSONRPCBridgeLedger,
+        faultRule: JSONRPCBridgeFaultRule?
+    ) async throws {
         let flags = fcntl(stdinFD, F_GETFL)
         if flags >= 0 {
             _ = fcntl(stdinFD, F_SETFL, flags | O_NONBLOCK)
@@ -725,6 +783,12 @@ private extension BootstrapSocketProxy {
             if revents & POLLIN == 0 {
                 if sawHangup {
                     debugLog("BootstrapSocketProxy: stdin hangup after draining input")
+                    try await requireCleanBridgeStop(
+                        ledger: bridgeLedger,
+                        direction: .clientToServer,
+                        pendingByteCount: pending.count,
+                        reason: "stdin_hangup"
+                    )
                     return
                 }
                 continue
@@ -740,6 +804,12 @@ private extension BootstrapSocketProxy {
             }
             if bytesRead == 0 {
                 debugLog("BootstrapSocketProxy: stdin EOF after draining input")
+                try await requireCleanBridgeStop(
+                    ledger: bridgeLedger,
+                    direction: .clientToServer,
+                    pendingByteCount: pending.count,
+                    reason: "stdin_eof"
+                )
                 return
             }
 
@@ -758,13 +828,34 @@ private extension BootstrapSocketProxy {
 
                 var payload = Data(message)
                 payload.append(UInt8(ascii: "\n"))
-                let preview = String(data: payload.prefix(200), encoding: .utf8) ?? "<binary>"
-                debugLog("BootstrapSocketProxy: → socket (\(payload.count) bytes): \(preview)")
-                try writeToSocket(payload, socketFD: socketFD)
+                debugLog("BootstrapSocketProxy: → socket bytes=\(payload.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(payload))")
+                let prepared = try await JSONRPCBridgeDelivery.forward(
+                    frame: payload,
+                    direction: .clientToServer,
+                    ledger: bridgeLedger,
+                    faultRule: faultRule
+                ) { framed in
+                    try writeToSocket(framed, socketFD: socketFD)
+                }
+                if let delivered = prepared.deliveryFrame {
+                    MCPResponseDeliveryTracer.emitFrame(
+                        layer: "proxy_app_uds",
+                        phase: "socket_write_completed",
+                        frame: delivered,
+                        direction: .clientToServer,
+                        connectionGeneration: prepared.connectionGeneration
+                    )
+                }
             }
 
             if sawHangup {
                 debugLog("BootstrapSocketProxy: stdin hangup after forwarding complete frames")
+                try await requireCleanBridgeStop(
+                    ledger: bridgeLedger,
+                    direction: .clientToServer,
+                    pendingByteCount: pending.count,
+                    reason: "stdin_hangup"
+                )
                 return
             }
         }
@@ -797,7 +888,7 @@ private extension BootstrapSocketProxy {
 
     /// Extracts a human-readable message from a progress notification.
     /// Returns nil if not a progress notification.
-    static func extractProgressMessage(from jsonLine: Data) -> String? {
+    private static func extractProgressMessage(from jsonLine: Data) -> String? {
         // Fast check: look for progress method marker
         guard let str = String(data: jsonLine, encoding: .utf8),
               str.contains("repoprompt/control/progress")
@@ -848,47 +939,71 @@ private extension BootstrapSocketProxy {
     #endif
 
     /// Pumps socket to stdout. Static to run outside actor isolation.
-    static func pumpSocketToStdout(socketFD: Int32, drainState: BridgeDrainState) async throws {
+    private static func pumpSocketToStdout(
+        socketFD: Int32,
+        stdoutFD: Int32 = STDOUT_FILENO,
+        drainState: BridgeDrainState,
+        bridgeLedger: JSONRPCBridgeLedger,
+        faultRule: JSONRPCBridgeFaultRule?,
+        socketPoller: BridgeSocketPoller? = nil
+    ) async throws {
         var buffer = [UInt8](repeating: 0, count: 8192)
         var pending = Data()
         debugLog("BootstrapSocketProxy: pumpSocketToStdout started")
         let originalStdoutFlags: Int32
         do {
-            originalStdoutFlags = try NonBlockingFDWriter.setNonBlocking(fd: STDOUT_FILENO)
+            originalStdoutFlags = try NonBlockingFDWriter.setNonBlocking(fd: stdoutFD)
         } catch let writeError as NonBlockingFDWriteError {
             throw mapStdoutWriteError(writeError)
         }
         defer {
             do {
-                try NonBlockingFDWriter.restoreFlags(fd: STDOUT_FILENO, flags: originalStdoutFlags)
+                try NonBlockingFDWriter.restoreFlags(fd: stdoutFD, flags: originalStdoutFlags)
             } catch {
                 debugLog("BootstrapSocketProxy: failed to restore stdout flags: \(error)")
             }
         }
 
         while !Task.isCancelled {
-            var pfd = pollfd(fd: socketFD, events: Int16(POLLIN), revents: 0)
-            let pollResult = poll(&pfd, 1, 1000)
+            let readiness: BridgeSocketPollResult
+            if let socketPoller {
+                readiness = try await socketPoller(socketFD)
+            } else {
+                var pfd = pollfd(fd: socketFD, events: Int16(POLLIN), revents: 0)
+                let pollResult = poll(&pfd, 1, 1000)
 
-            if pollResult < 0 {
-                if errno == EINTR { continue }
-                throw SocketProxyError.pollFailed(errno: errno)
+                if pollResult < 0 {
+                    if errno == EINTR { continue }
+                    throw SocketProxyError.pollFailed(errno: errno)
+                }
+                readiness = pollResult == 0 ? .timedOut : .events(pfd.revents)
             }
-            if pollResult == 0 {
-                if await drainState.shouldStopSocketPump() {
-                    debugLog("BootstrapSocketProxy: socket→stdout drain grace elapsed after stdin close")
+
+            guard case let .events(rawEvents) = readiness else {
+                if await shouldFinishSocketDrain(
+                    drainState: drainState,
+                    ledger: bridgeLedger,
+                    pendingByteCount: pending.count
+                ) {
+                    debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                     return
                 }
                 continue
             }
 
-            let revents = Int32(pfd.revents)
+            let revents = Int32(rawEvents)
             if revents & (POLLERR | POLLNVAL) != 0 {
                 throw SocketProxyError.connectionReset
             }
             let sawHangup = revents & POLLHUP != 0
             if revents & POLLIN == 0 {
                 if sawHangup {
+                    try await requireCleanBridgeStop(
+                        ledger: bridgeLedger,
+                        direction: .serverToClient,
+                        pendingByteCount: pending.count,
+                        reason: "socket_hangup"
+                    )
                     return
                 }
                 continue
@@ -903,6 +1018,12 @@ private extension BootstrapSocketProxy {
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
+                try await requireCleanBridgeStop(
+                    ledger: bridgeLedger,
+                    direction: .serverToClient,
+                    pendingByteCount: pending.count,
+                    reason: "socket_eof"
+                )
                 return
             }
 
@@ -910,40 +1031,94 @@ private extension BootstrapSocketProxy {
             debugLog("BootstrapSocketProxy: read \(bytesRead) bytes from socket, pending=\(pending.count)")
 
             while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
-                let message = pending[...newline]
+                let data = Data(pending[...newline])
                 pending = Data(pending[(newline + 1)...])
-                let preview = String(data: Data(message).prefix(200), encoding: .utf8) ?? "<binary>"
-                debugLog("BootstrapSocketProxy: ← stdout (\(message.count) bytes): \(preview)")
+                debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
 
-                let data = Data(message)
-
-                // Check for progress notifications - intercept and write to stderr, don't forward to stdout
-                if let progressMessage = Self.extractProgressMessage(from: data) {
-                    FileHandle.standardError.write("[progress] \(progressMessage)\n".data(using: .utf8)!)
-                    continue // Don't forward to stdout
+                let prepared = try await JSONRPCBridgeDelivery.forward(
+                    frame: data,
+                    direction: .serverToClient,
+                    ledger: bridgeLedger,
+                    faultRule: faultRule
+                ) { framed in
+                    // Progress notifications are an intentional stderr-only control surface.
+                    if let progressMessage = Self.extractProgressMessage(from: framed) {
+                        FileHandle.standardError.write("[progress] \(progressMessage)\n".data(using: .utf8)!)
+                        return
+                    }
+                    do {
+                        try NonBlockingFDWriter.writeAll(
+                            framed,
+                            to: stdoutFD,
+                            stallTimeout: stdoutWriteStallTimeout,
+                            pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
+                            setNonBlocking: false
+                        )
+                    } catch let writeError as NonBlockingFDWriteError {
+                        debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance)")
+                        throw mapStdoutWriteError(writeError)
+                    }
                 }
-
-                do {
-                    try NonBlockingFDWriter.writeAll(
-                        data,
-                        to: STDOUT_FILENO,
-                        stallTimeout: stdoutWriteStallTimeout,
-                        pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
-                        setNonBlocking: false
+                if let delivered = prepared.deliveryFrame,
+                   Self.extractProgressMessage(from: delivered) == nil
+                {
+                    MCPResponseDeliveryTracer.emitFrame(
+                        layer: "proxy_stdout",
+                        phase: "stdout_write_completed",
+                        frame: delivered,
+                        direction: .serverToClient,
+                        connectionGeneration: prepared.connectionGeneration
                     )
-                } catch let writeError as NonBlockingFDWriteError {
-                    debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance) error=\(writeError)")
-                    throw mapStdoutWriteError(writeError)
                 }
             }
 
             if sawHangup {
+                try await requireCleanBridgeStop(
+                    ledger: bridgeLedger,
+                    direction: .serverToClient,
+                    pendingByteCount: pending.count,
+                    reason: "socket_hangup"
+                )
                 return
             }
-            if await drainState.shouldStopSocketPump() {
-                debugLog("BootstrapSocketProxy: socket→stdout drain grace elapsed after stdin close")
+            if await shouldFinishSocketDrain(
+                drainState: drainState,
+                ledger: bridgeLedger,
+                pendingByteCount: pending.count
+            ) {
+                debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                 return
             }
+        }
+    }
+
+    private static func shouldFinishSocketDrain(
+        drainState: BridgeDrainState,
+        ledger: JSONRPCBridgeLedger,
+        pendingByteCount: Int
+    ) async -> Bool {
+        guard pendingByteCount == 0, await drainState.isStdinClosed() else { return false }
+        let snapshot = await ledger.snapshot()
+        return snapshot.terminalReason == nil
+            && snapshot.activeRequestCount == 0
+            && snapshot.pendingTransactionCount == 0
+    }
+
+    private static func requireCleanBridgeStop(
+        ledger: JSONRPCBridgeLedger,
+        direction: JSONRPCBridgeDirection,
+        pendingByteCount: Int,
+        reason: String
+    ) async throws {
+        switch await ledger.noteEOF(
+            direction: direction,
+            pendingByteCount: pendingByteCount,
+            reason: reason
+        ) {
+        case .clean:
+            return
+        case let .terminal(terminalReason):
+            throw JSONRPCBridgeLedgerError.terminal(terminalReason)
         }
     }
 
@@ -968,7 +1143,7 @@ private extension BootstrapSocketProxy {
 
     /// Writes data to socket. Static helper.
     /// Uses poll with a 10 second deadline to avoid blocking forever if server stops reading.
-    static func writeToSocket(_ data: Data, socketFD: Int32) throws {
+    private static func writeToSocket(_ data: Data, socketFD: Int32) throws {
         var totalWritten = 0
         let deadline = Date().addingTimeInterval(10.0)
 
@@ -1036,11 +1211,15 @@ private extension BootstrapSocketProxy {
 actor MCPService: Service {
     /// Stable session token for this CLI process instance.
     /// Used by the app to identify this CLI across bootstrap-socket reconnections.
-    private let sessionToken: String = UUID().uuidString
+    private let sessionToken: String
 
     /// Cache for MCP client identity (extracted from initialize request).
-    /// Persists across reconnects so the app sees the correct client name.
+    /// Persists across startup-only reconnects so the app sees the correct client name.
     private let identityCache = ClientIdentityCache()
+
+    /// Process-lifetime correlation ledger. It deliberately survives startup reconnect attempts
+    /// so a protocol-active bridge can never be silently replaced.
+    private let bridgeLedger: JSONRPCBridgeLedger
 
     // Kill signal watcher state
     private var killSignalFD: Int32 = -1
@@ -1048,6 +1227,10 @@ actor MCPService: Service {
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
     init() {
+        sessionToken = UUID().uuidString
+        bridgeLedger = JSONRPCBridgeLedger(traceSink: { event in
+            MCPResponseDeliveryTracer.emit(event)
+        })
         // No TCP/Bonjour transport – bootstrap socket only
     }
 
@@ -1265,6 +1448,66 @@ actor MCPService: Service {
         }
     }
 
+    private func transportFailureReason(for error: CLIRuntimeError) -> String {
+        switch error {
+        case .approvalDenied:
+            return "approval_denied"
+        case .hostDisconnected:
+            return "host_disconnected"
+        case .terminatedByServer:
+            return "terminated_by_server"
+        case let .connectionFailed(underlying):
+            if underlying is JSONRPCBridgeLedgerError {
+                return "jsonrpc_bridge_terminal"
+            }
+            if let socketError = underlying as? SocketProxyError {
+                switch socketError {
+                case .stdoutWriteTimeout: return "stdout_write_timeout"
+                case .stdoutBrokenPipe: return "stdout_broken_pipe"
+                case .serverClosed: return "app_socket_closed"
+                case .connectionReset: return "app_socket_reset"
+                case .connectionTimeout: return "app_socket_write_timeout"
+                default: return "bootstrap_transport_failure"
+                }
+            }
+            return "transport_failure"
+        }
+    }
+
+    private static func responseDeliveryFaultRuleFromEnvironment() -> JSONRPCBridgeFaultRule? {
+        #if DEBUG
+            let environment = ProcessInfo.processInfo.environment
+            guard environment["RP_MCP_FAULT_ACTION"] == JSONRPCBridgeFaultRule.Action.failDestinationWrite.rawValue,
+                  let rawDirection = environment["RP_MCP_FAULT_DIRECTION"],
+                  let direction = JSONRPCBridgeDirection(rawValue: rawDirection)
+            else {
+                return nil
+            }
+
+            let id = environment["RP_MCP_FAULT_ID"].flatMap(JSONRPCBridgeID.parseFaultSelector)
+            let allowOrdinal = environment["RP_MCP_FAULT_ALLOW_ORDINAL"] == "1"
+            let ordinal = allowOrdinal
+                ? environment["RP_MCP_FAULT_ORDINAL"].flatMap(UInt64.init)
+                : nil
+            guard id != nil || ordinal != nil else { return nil }
+
+            let rule = JSONRPCBridgeFaultRule(
+                direction: direction,
+                id: id,
+                method: environment["RP_MCP_FAULT_METHOD"],
+                tool: environment["RP_MCP_FAULT_TOOL"],
+                requestOrdinal: ordinal
+            )
+            debugLog(
+                "Configured response fault direction=\(direction.rawValue) id=\(id?.description ?? "none") " +
+                    "method=\(rule.method ?? "none") tool=\(rule.tool ?? "none") ordinal=\(ordinal.map(String.init) ?? "none")"
+            )
+            return rule
+        #else
+            return nil
+        #endif
+    }
+
     private func isTransientBootstrapRejection(_ code: String?) -> Bool {
         guard let code else { return false }
         switch code {
@@ -1303,8 +1546,13 @@ actor MCPService: Service {
                 // If runSocketLoop() returns without throwing, treat as clean exit
                 return
             } catch let err as CLIRuntimeError {
-                // Decide whether to retry or bubble out
-                guard shouldRetry(after: err) else {
+                // Reconnection is legal only while the process is still in startup state.
+                // Once any complete protocol frame has committed—or delivery is uncertain—
+                // preserve JSON-RPC correlation by failing the stdio session closed.
+                let protocolActiveFailure = await bridgeLedger.recordConnectionFailure(
+                    transportFailureReason(for: err)
+                )
+                guard !protocolActiveFailure, shouldRetry(after: err) else {
                     throw err
                 }
 
@@ -1349,6 +1597,8 @@ actor MCPService: Service {
 
     /// Single connection attempt to the bootstrap socket.
     private func runSocketLoop() async throws {
+        _ = try await bridgeLedger.beginConnection()
+
         // Build the best available client name for the handshake:
         // 1. Cached MCP clientInfo.name (from previous initialize)
         // 2. Parent process executable name
@@ -1362,7 +1612,9 @@ actor MCPService: Service {
         let proxy = BootstrapSocketProxy(
             sessionToken: sessionToken,
             clientName: displayName,
-            identityCache: identityCache
+            identityCache: identityCache,
+            bridgeLedger: bridgeLedger,
+            faultRule: Self.responseDeliveryFaultRuleFromEnvironment()
         )
 
         do {

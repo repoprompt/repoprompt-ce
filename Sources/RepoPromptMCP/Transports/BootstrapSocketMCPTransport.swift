@@ -121,7 +121,7 @@ public actor BootstrapSocketMCPTransport: Transport {
     public init(
         connectedFD: Int32,
         logger: Logger? = nil,
-        writeStallTimeout: TimeInterval = 30.0,
+        writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250
     ) throws {
         do {
@@ -194,12 +194,10 @@ public actor BootstrapSocketMCPTransport: Transport {
             throw MCPError.transportError(Errno(rawValue: ENOTCONN))
         }
 
-        // Log what we're sending (debug only)
-        if let jsonStr = String(data: message, encoding: .utf8) {
-            logger.trace("send: \(String(jsonStr.prefix(200)))")
-        }
-
         let framed = Self.frameWithNewlineIfNeeded(message)
+        logger.trace(
+            "send bytes=\(framed.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(framed))"
+        )
 
         try writeAll(framed)
 

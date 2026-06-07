@@ -15,6 +15,28 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         self.dependencies = dependencies
     }
 
+    nonisolated static func worktreeWarning(from worktree: ToolResultDTOs.GitToolReplyDTO.WorktreeDTO?) -> String? {
+        guard let worktree, worktree.isWorktree else { return nil }
+        var parts: [String] = []
+        parts.append("[Worktree] Git operations are scoped to this checkout.")
+        if let branch = worktree.worktreeBranch {
+            let head = worktree.worktreeHead.map { "@\($0)" } ?? ""
+            parts.append("This: \(branch)\(head).")
+        }
+        if let mainRoot = worktree.mainWorktreeRoot {
+            var mainLabel = "Main: \(mainRoot)"
+            if let mainBranch = worktree.mainBranch {
+                let head = worktree.mainHead.map { "@\($0)" } ?? ""
+                mainLabel += " (\(mainBranch)\(head))"
+            }
+            parts.append(mainLabel + ".")
+            parts.append("Use repo_root=\"@main\" for main checkout, repo_root=\"@main:<branch>\" to target a worktree by branch, or compare=\"main\" for trunk diff.")
+        } else {
+            parts.append("The primary checkout path could not be resolved. Pass its full path as repo_root to target it; compare=\"main\" still selects the trunk comparison base.")
+        }
+        return parts.joined(separator: " ")
+    }
+
     func buildTools() -> [Tool] {
         [gitTool()]
     }
@@ -266,12 +288,15 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         func buildWorktreeDTO(for repoURL: URL) async -> Reply.WorktreeDTO? {
             let backend = await vcsService.backend(forRepoRoot: repoURL)
             guard backend.kind == .git else { return nil }
-            guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repoURL), layout.isWorktree else { return nil }
+            guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repoURL), layout.isLinkedWorktree else { return nil }
 
             let worktreeRoot = layout.workTreeRoot.path
             let worktreeName = layout.gitDir.lastPathComponent.isEmpty ? nil : layout.gitDir.lastPathComponent
             let commonGitDir = layout.commonDir.path
-            let mainRoot = GitRepoTargetResolver.resolveMainWorktreeRoot(for: layout)
+            let listedMainRoot = try? await vcsService.listGitWorktrees(at: repoURL)
+                .first(where: \.isMain)
+                .map { URL(fileURLWithPath: $0.path).standardizedFileURL }
+            let mainRoot = listedMainRoot ?? GitRepoTargetResolver.resolveMainWorktreeRoot(for: layout)
 
             let wtBranch = try? await backend.getCurrentBranch(at: repoURL)
             let wtHead = await (try? backend.getHeadID(at: repoURL)).map { String($0.prefix(7)) }
@@ -298,23 +323,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         }
 
         func buildWorktreeWarning(from worktree: Reply.WorktreeDTO?) -> String? {
-            guard let worktree, worktree.isWorktree else { return nil }
-            var parts: [String] = []
-            parts.append("[Worktree] Git operations are scoped to this checkout.")
-            if let branch = worktree.worktreeBranch {
-                let head = worktree.worktreeHead.map { "@\($0)" } ?? ""
-                parts.append("This: \(branch)\(head).")
-            }
-            if let mainRoot = worktree.mainWorktreeRoot {
-                var mainLabel = "Main: \(mainRoot)"
-                if let mainBranch = worktree.mainBranch {
-                    let head = worktree.mainHead.map { "@\($0)" } ?? ""
-                    mainLabel += " (\(mainBranch)\(head))"
-                }
-                parts.append(mainLabel + ".")
-            }
-            parts.append("Use repo_root=\"@main\" for main checkout, repo_root=\"@main:<branch>\" to target a worktree by branch, or compare=\"main\" for trunk diff.")
-            return parts.joined(separator: " ")
+            Self.worktreeWarning(from: worktree)
         }
 
         func combineWarnings(_ warnings: [String?]) -> String? {

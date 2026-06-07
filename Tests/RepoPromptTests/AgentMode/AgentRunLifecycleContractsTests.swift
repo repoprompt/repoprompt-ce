@@ -8,6 +8,8 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
     func testLifecycleContractsAreSendable() {
         requireSendable(AgentRunBindingIdentity.self)
         requireSendable(AgentRunOwnership.self)
+        requireSendable(AgentRunTurnEpoch.self)
+        requireSendable(AgentRunEpochTransitionKind.self)
         requireSendable(AgentRunLifecycleStage.self)
         requireSendable(AgentRunLivenessSignalKind.self)
         requireSendable(AgentRunRetryIntent.self)
@@ -16,6 +18,27 @@ final class AgentRunLifecycleContractsTests: XCTestCase {
         requireSendable(AgentRunProgressRejection.self)
         requireSendable(AgentRunProgressAcceptance.self)
         requireSendable(AgentRunLifecycleTracker.self)
+    }
+
+    func testOwnershipCapturesImmutableTurnEpoch() {
+        let sessionID = UUID()
+        let epoch = AgentRunTurnEpoch(
+            sessionID: sessionID,
+            activationID: UUID(),
+            registrationGeneration: 7,
+            id: UUID(),
+            ordinal: 3,
+            continuityGeneration: 1,
+            transitionKind: .relatedFollowUp
+        )
+        var tracker = AgentRunLifecycleTracker()
+        let ownership = tracker.begin(
+            tabID: UUID(),
+            persistentSessionID: sessionID,
+            turnEpoch: epoch
+        )
+        XCTAssertEqual(ownership.turnEpoch, epoch)
+        XCTAssertEqual(tracker.activeOwnership?.turnEpoch, epoch)
     }
 
     func testOwnershipRejectsStaleSignalsAndDuplicateOrOutOfOrderSequences() {
