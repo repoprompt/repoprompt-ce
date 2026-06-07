@@ -159,7 +159,7 @@ struct GitContextBranchSwitchCapsule: View {
         }
         .buttonStyle(.plain)
         .disabled(isSwitching)
-        .hoverTooltip(context.tooltipText + "\nClick to switch local branches in this checkout.", .top)
+        .hoverTooltip(context.tooltipText, .top)
         .accessibilityLabel(context.accessibilityText)
         .popover(isPresented: $showPopover, arrowEdge: .trailing) {
             popoverContent

@@ -54,6 +54,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertNil(rows[0].gitContext)
         XCTAssertEqual(rows[1].gitContext, contextB)
         XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
+        XCTAssertTrue(rows[1].gitContext?.isMain == true)
     }
 
     // MARK: - Worktree indicators (Item 10)
@@ -212,7 +213,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
     private func makeGitContext(
         repository: String,
         worktree: String,
-        branch: String?
+        branch: String?,
+        isMain: Bool = true
     ) -> GitWorktreeContextSummary {
         GitWorktreeContextSummary(
             repositoryID: "gitrepo-test",
@@ -221,6 +223,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             worktreeID: "wt-test",
             worktreePath: "/tmp/\(worktree)",
             worktreeName: worktree,
+            isMain: isMain,
             branch: branch,
             head: "1234567890abcdef",
             isDetached: false

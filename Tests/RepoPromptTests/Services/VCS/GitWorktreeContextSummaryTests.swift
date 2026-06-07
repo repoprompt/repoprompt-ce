@@ -33,7 +33,39 @@ final class GitWorktreeContextResolverTests: XCTestCase {
         XCTAssertEqual(context.worktreeName, "repo")
         XCTAssertEqual(context.branchDisplayText, "main")
         XCTAssertEqual(context.breadcrumbText, "repo / repo / main")
+        XCTAssertTrue(context.isMain)
+        XCTAssertEqual(context.checkoutDisplayText, "main repository checkout")
         XCTAssertEqual(URL(fileURLWithPath: context.worktreePath).standardizedFileURL.path, repo.standardizedFileURL.path)
+    }
+
+    func testFallbackContextMarksMainRepositoryCheckout() async throws {
+        let repo = try makeGitFixture()
+        let service = VCSService()
+        let resolved = VCSResolvedRepo(rootURL: repo, backendKind: .git)
+
+        let resolvedContext = await service.gitWorktreeContext(for: repo, resolved: resolved, worktrees: nil)
+        let context = try XCTUnwrap(resolvedContext)
+
+        XCTAssertTrue(context.isMain)
+        XCTAssertEqual(context.checkoutDisplayText, "main repository checkout")
+        XCTAssertTrue(context.tooltipText.contains("Checkout: main repository checkout"))
+    }
+
+    func testFallbackContextMarksLinkedWorktree() async throws {
+        let root = try makeTemporaryDirectory()
+        let repo = try makeGitFixture(in: root)
+        let linkedWorktree = root.appendingPathComponent("repo-linked", isDirectory: true)
+        try runGit(["worktree", "add", "-b", "feature/linked", linkedWorktree.path], cwd: repo)
+        let service = VCSService()
+        let resolved = VCSResolvedRepo(rootURL: linkedWorktree, backendKind: .git)
+
+        let resolvedContext = await service.gitWorktreeContext(for: linkedWorktree, resolved: resolved, worktrees: nil)
+        let context = try XCTUnwrap(resolvedContext)
+
+        XCTAssertFalse(context.isMain)
+        XCTAssertEqual(context.checkoutDisplayText, "linked worktree")
+        XCTAssertEqual(context.branchDisplayText, "feature/linked")
+        XCTAssertTrue(context.tooltipText.contains("Checkout: linked worktree"))
     }
 
     func testGitStatusActorRefreshesCachedContextForUnchangedRootList() async throws {
@@ -135,7 +167,18 @@ final class GitWorktreeContextSummaryTests: XCTestCase {
 
         XCTAssertEqual(summary.branchDisplayText, "main")
         XCTAssertEqual(summary.breadcrumbText, "Repo / repo / main")
-        XCTAssertTrue(summary.tooltipText.contains("Branch: main"))
+        XCTAssertEqual(summary.checkoutDisplayText, "main repository checkout")
+        XCTAssertEqual(summary.tooltipText, """
+        Repository: Repo
+        Checkout: main repository checkout
+        Worktree: repo
+        Branch: main
+        Path: /tmp/repo
+        """)
+        XCTAssertFalse(summary.tooltipText.contains("HEAD:"))
+        XCTAssertFalse(summary.tooltipText.contains("1234567890abcdef"))
+        XCTAssertFalse(summary.tooltipText.contains("Click to switch local branches"))
+        XCTAssertTrue(summary.accessibilityText.contains("main repository checkout repo"))
         XCTAssertTrue(summary.accessibilityText.contains("branch main"))
     }
 
@@ -145,6 +188,8 @@ final class GitWorktreeContextSummaryTests: XCTestCase {
         XCTAssertEqual(summary.branchDisplayText, "detached @ abcdef1")
         XCTAssertEqual(summary.breadcrumbText, "Repo / repo / detached @ abcdef1")
         XCTAssertTrue(summary.tooltipText.contains("Branch: detached @ abcdef1"))
+        XCTAssertFalse(summary.tooltipText.contains("HEAD:"))
+        XCTAssertFalse(summary.tooltipText.contains("abcdef1234567890"))
     }
 
     func testMissingBranchWithKnownHeadUsesHeadFallback() {
@@ -153,6 +198,8 @@ final class GitWorktreeContextSummaryTests: XCTestCase {
         XCTAssertEqual(summary.branchDisplayText, "HEAD @ fedcba9")
         XCTAssertEqual(summary.breadcrumbText, "Repo / repo / HEAD @ fedcba9")
         XCTAssertTrue(summary.tooltipText.contains("Branch: HEAD @ fedcba9"))
+        XCTAssertFalse(summary.tooltipText.contains("HEAD:"))
+        XCTAssertFalse(summary.tooltipText.contains("fedcba9876543210"))
     }
 
     func testUnknownBranchIsOnlySurfacedInTooltipAndAccessibility() {
@@ -160,11 +207,34 @@ final class GitWorktreeContextSummaryTests: XCTestCase {
 
         XCTAssertNil(summary.branchDisplayText)
         XCTAssertEqual(summary.breadcrumbText, "Repo / repo")
+        XCTAssertTrue(summary.tooltipText.contains("Checkout: main repository checkout"))
         XCTAssertTrue(summary.tooltipText.contains("Branch: unknown branch"))
         XCTAssertTrue(summary.accessibilityText.contains("branch unknown branch"))
     }
 
+    func testLinkedWorktreeCheckoutTextIsSurfacedInTooltipAndAccessibility() {
+        let summary = makeSummary(isMain: false, branch: "feature/x", head: "1234567890abcdef", isDetached: false)
+
+        XCTAssertFalse(summary.isMain)
+        XCTAssertEqual(summary.checkoutDisplayText, "linked worktree")
+        XCTAssertTrue(summary.tooltipText.contains("Checkout: linked worktree"))
+        XCTAssertTrue(summary.accessibilityText.contains("linked worktree repo"))
+    }
+
+    func testDescriptorConversionPreservesMainAndLinkedWorktreeStatus() {
+        let mainSummary = GitWorktreeContextSummary(descriptor: makeDescriptor(isMain: true, name: "repo", branch: "main"))
+        let linkedSummary = GitWorktreeContextSummary(descriptor: makeDescriptor(isMain: false, name: "repo-feature", branch: "feature/x"))
+
+        XCTAssertTrue(mainSummary.isMain)
+        XCTAssertEqual(mainSummary.checkoutDisplayText, "main repository checkout")
+        XCTAssertTrue(mainSummary.tooltipText.contains("Checkout: main repository checkout"))
+        XCTAssertFalse(linkedSummary.isMain)
+        XCTAssertEqual(linkedSummary.checkoutDisplayText, "linked worktree")
+        XCTAssertTrue(linkedSummary.tooltipText.contains("Checkout: linked worktree"))
+    }
+
     private func makeSummary(
+        isMain: Bool = true,
         branch: String?,
         head: String?,
         isDetached: Bool
@@ -176,9 +246,40 @@ final class GitWorktreeContextSummaryTests: XCTestCase {
             worktreeID: "wt-test",
             worktreePath: "/tmp/repo",
             worktreeName: "repo",
+            isMain: isMain,
             branch: branch,
             head: head,
             isDetached: isDetached
+        )
+    }
+
+    private func makeDescriptor(
+        isMain: Bool,
+        name: String,
+        branch: String?
+    ) -> GitWorktreeDescriptor {
+        let repository = GitWorktreeRepositoryIdentity(
+            repositoryID: "gitrepo-test",
+            repoKey: "repo-test",
+            displayName: "Repo",
+            commonGitDir: "/tmp/repo/.git",
+            mainWorktreeRoot: "/tmp/repo"
+        )
+        return GitWorktreeDescriptor(
+            worktreeID: isMain ? "wt-main" : "wt-linked",
+            repository: repository,
+            path: isMain ? "/tmp/repo" : "/tmp/repo-feature",
+            gitDir: isMain ? "/tmp/repo/.git" : "/tmp/repo/.git/worktrees/repo-feature",
+            name: name,
+            branch: branch,
+            head: "1234567890abcdef",
+            isMain: isMain,
+            isCurrent: true,
+            isDetached: false,
+            isLocked: false,
+            lockReason: nil,
+            isPrunable: false,
+            prunableReason: nil
         )
     }
 }
