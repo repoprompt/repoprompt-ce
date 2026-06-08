@@ -63,6 +63,17 @@ class ReleaseToolingTests(unittest.TestCase):
             policy,
         )
 
+    def test_info_plist_registers_canonical_ce_url_scheme_only(self) -> None:
+        info_plist = plistlib.loads((SCRIPT_DIR.parent / "AppBundle" / "Info.plist.template").read_bytes())
+        url_types = info_plist.get("CFBundleURLTypes", [])
+        registered_schemes = [
+            scheme
+            for url_type in url_types
+            for scheme in url_type.get("CFBundleURLSchemes", [])
+        ]
+
+        self.assertEqual(registered_schemes, ["repoprompt-ce"])
+
     def test_local_self_signed_outer_codesign_uses_equals_requirement_argv(self) -> None:
         package_script = (SCRIPT_DIR / "package_app.sh").read_text(encoding="utf-8")
         sign_path_body = package_script.split("sign_path(){", 1)[1].split("\n}\nsign_sparkle_framework(){", 1)[0]
