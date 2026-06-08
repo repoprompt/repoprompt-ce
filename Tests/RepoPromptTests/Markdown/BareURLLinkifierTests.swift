@@ -20,6 +20,19 @@ final class BareURLLinkifierTests: XCTestCase {
         XCTAssertEqual(firstURL.absoluteString, "http://example.com")
     }
 
+    func testBareURLReceivesPositiveMarkerAndVisualLinkStyling() throws {
+        let attributed = linkified("Visit https://example.com then stop", policy: .httpHTTPSOnly)
+        let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
+
+        XCTAssertEqual(
+            attributed.attribute(.repoPromptBareURLLink, at: linkRange.location, effectiveRange: nil) as? Bool,
+            true
+        )
+        XCTAssertEqual(attributed.attribute(.underlineStyle, at: linkRange.location, effectiveRange: nil) as? Int, NSUnderlineStyle.single.rawValue)
+        let foregroundColor = try XCTUnwrap(attributed.attribute(.foregroundColor, at: linkRange.location, effectiveRange: nil) as? NSColor)
+        XCTAssertTrue(foregroundColor.isEqual(NSColor.linkColor))
+    }
+
     func testTrailingSentencePunctuationAndWrappingParensAreExcludedFromLinkRange() {
         let attributed = linkified("See https://example.com. Also (https://example.org/docs).", policy: .httpHTTPSOnly)
 
@@ -58,6 +71,8 @@ final class BareURLLinkifierTests: XCTestCase {
             suppressLinksTouchingEndBoundary: true
         )
         XCTAssertTrue(linkedSubstrings(in: touchingBoundary).isEmpty)
+
+        assertSuppressedBareURLIsNotVisuallyMarked(touchingBoundary, urlText: "https://example.com")
     }
 
     func testBareURLDoesNotReceiveMarkdownRawLinkAttribute() throws {
@@ -65,6 +80,14 @@ final class BareURLLinkifierTests: XCTestCase {
         let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
 
         XCTAssertNil(attributed.attribute(.markdownRawLink, at: linkRange.location, effectiveRange: nil))
+    }
+
+    func testHTTPHTTPSURLSignalPreflightIsCheapAndCaseInsensitive() {
+        XCTAssertTrue(BareURLLinkifier.containsHTTPHTTPSURLSignal(in: "Visit http://example.com"))
+        XCTAssertTrue(BareURLLinkifier.containsHTTPHTTPSURLSignal(in: "Visit HTTPS://EXAMPLE.COM"))
+        XCTAssertFalse(BareURLLinkifier.containsHTTPHTTPSURLSignal(in: "Visit www.example.com"))
+        XCTAssertFalse(BareURLLinkifier.containsHTTPHTTPSURLSignal(in: "Email mailto:me@example.com"))
+        XCTAssertFalse(BareURLLinkifier.containsHTTPHTTPSURLSignal(in: "No URL here"))
     }
 
     @MainActor
@@ -76,6 +99,23 @@ final class BareURLLinkifierTests: XCTestCase {
         let coordinator = MarkdownTextViewCoordinator()
 
         XCTAssertFalse(try coordinator.textView(textView, clickedOnLink: XCTUnwrap(URL(string: "https://example.com")), at: linkRange.location))
+    }
+
+    private func assertSuppressedBareURLIsNotVisuallyMarked(
+        _ attributed: NSAttributedString,
+        urlText: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let range = (attributed.string as NSString).range(of: urlText)
+        XCTAssertNotEqual(range.location, NSNotFound, file: file, line: line)
+        guard range.location != NSNotFound else { return }
+
+        XCTAssertNil(attributed.attribute(.link, at: range.location, effectiveRange: nil), file: file, line: line)
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: range.location, effectiveRange: nil), file: file, line: line)
+        XCTAssertNil(attributed.attribute(.underlineStyle, at: range.location, effectiveRange: nil), file: file, line: line)
+        let foregroundColor = attributed.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor
+        XCTAssertFalse(foregroundColor?.isEqual(NSColor.linkColor) ?? false, file: file, line: line)
     }
 
     private func linkified(
