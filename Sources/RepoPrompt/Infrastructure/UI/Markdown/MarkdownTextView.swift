@@ -375,6 +375,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
     let forceTextColor: Color?
     let useMonospaced: Bool
     let bareURLLinkificationPolicy: BareURLLinkificationPolicy
+    let suppressBareLinksTouchingEndBoundary: Bool
     let initialBoundary: MarkdownStreamingFreezeBoundary
 
     @State private var frozenBoundaryUTF16Offset: Int?
@@ -391,6 +392,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                             forceTextColor: forceTextColor,
                             useMonospaced: useMonospaced,
                             bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                            suppressBareLinksTouchingEndBoundary: false,
                             renderCadence: .immediate,
                             allowsStreamingSegmentation: false
                         )
@@ -402,6 +404,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                         forceTextColor: forceTextColor,
                         useMonospaced: useMonospaced,
                         bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                        suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                         renderCadence: .streamingCoalesced,
                         allowsStreamingSegmentation: false
                     )
@@ -414,6 +417,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
                     forceTextColor: forceTextColor,
                     useMonospaced: useMonospaced,
                     bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                    suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                     renderCadence: .streamingCoalesced,
                     allowsStreamingSegmentation: false
                 )
@@ -430,6 +434,7 @@ private struct SegmentedStreamingMarkdownTextView: View, Equatable {
             lhs.forceTextColor == rhs.forceTextColor &&
             lhs.useMonospaced == rhs.useMonospaced &&
             lhs.bareURLLinkificationPolicy == rhs.bareURLLinkificationPolicy &&
+            lhs.suppressBareLinksTouchingEndBoundary == rhs.suppressBareLinksTouchingEndBoundary &&
             lhs.initialBoundary == rhs.initialBoundary
     }
 
@@ -538,6 +543,7 @@ struct MarkdownTextView: View, Equatable {
                 forceTextColor: forceTextColor,
                 useMonospaced: useMonospaced,
                 bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                suppressBareLinksTouchingEndBoundary: suppressBareLinksTouchingEndBoundary,
                 initialBoundary: segmentedBoundary
             )
         } else {

@@ -64,20 +64,17 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     private func removeBareLinksTouchingEndBoundary(from result: NSMutableAttributedString) {
         guard result.length > 0 else { return }
-        let fullRange = NSRange(location: 0, length: result.length)
-        var rangesToRemove: [NSRange] = []
-        result.enumerateAttribute(.link, in: fullRange, options: []) { value, range, _ in
-            guard value != nil,
-                  NSMaxRange(range) >= result.length,
-                  result.attribute(.markdownRawLink, at: range.location, effectiveRange: nil) == nil
-            else {
-                return
-            }
-            rangesToRemove.append(range)
+
+        var range = NSRange(location: 0, length: 0)
+        guard result.attribute(.repoPromptBareURLLink, at: result.length - 1, effectiveRange: &range) != nil else {
+            return
         }
-        for range in rangesToRemove {
-            result.removeAttribute(.link, range: range)
-        }
+
+        let normalTextColor = NSColor(forceTextColor ?? Color.primary)
+        result.removeAttribute(.link, range: range)
+        result.removeAttribute(.underlineStyle, range: range)
+        result.removeAttribute(.repoPromptBareURLLink, range: range)
+        result.addAttribute(.foregroundColor, value: normalTextColor, range: range)
     }
 
     private func attributes(
@@ -260,6 +257,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         }
 
         let fullRange = NSRange(location: 0, length: result.length)
+        result.removeAttribute(.repoPromptBareURLLink, range: fullRange)
         result.addAttribute(.markdownRawLink, value: destination, range: fullRange)
         if let url = URL(string: destination),
            let scheme = url.scheme?.lowercased(),

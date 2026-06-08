@@ -17,6 +17,11 @@ enum BareURLLinkificationPolicy: Equatable {
 enum BareURLLinkifier {
     private static let linkDetector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue)
 
+    static func containsHTTPHTTPSURLSignal(in text: String) -> Bool {
+        text.range(of: "http://", options: [.caseInsensitive]) != nil ||
+            text.range(of: "https://", options: [.caseInsensitive]) != nil
+    }
+
     private static let leadingBoundaryScalars: Set<UnicodeScalar> = ["(", "[", "{", "<", "\"", "'", "“", "‘"]
     private static let alwaysTrimmedTrailingScalars: Set<UnicodeScalar> = [".", ",", ";", ":", "!", "?", "\"", "'", "”", "’"]
 
@@ -56,7 +61,7 @@ enum BareURLLinkifier {
                 return
             }
 
-            attributedString.addRepoPromptLink(candidate.url, range: candidate.range)
+            attributedString.addRepoPromptBareURLLink(candidate.url, range: candidate.range)
         }
     }
 
@@ -164,11 +169,20 @@ enum BareURLLinkifier {
     }
 }
 
+extension NSAttributedString.Key {
+    static let repoPromptBareURLLink = NSAttributedString.Key("RepoPromptBareURLLink")
+}
+
 extension NSMutableAttributedString {
     func addRepoPromptLink(_ value: Any, range: NSRange) {
         addAttribute(.link, value: value, range: range)
         addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
         addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: range)
+    }
+
+    func addRepoPromptBareURLLink(_ value: Any, range: NSRange) {
+        addRepoPromptLink(value, range: range)
+        addAttribute(.repoPromptBareURLLink, value: true, range: range)
     }
 
     func applyForegroundColor(_ color: NSColor, preservingLinkRanges: Bool) {

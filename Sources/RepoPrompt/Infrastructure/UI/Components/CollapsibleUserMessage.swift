@@ -91,26 +91,32 @@ struct CollapsibleUserMessage: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            // Keep the original SwiftUI Text path unless a caller explicitly opts
-            // into attributed prose links. Agent Mode opts in; shared Chat does not.
-            if bareURLLinkificationPolicy.isEnabled {
+        let shouldCollapse = needsCollapse
+        let visibleText = displayText
+        let visibleTextMightContainBareWebURL = bareURLLinkificationPolicy.isEnabled &&
+            BareURLLinkifier.containsHTTPHTTPSURLSignal(in: visibleText)
+
+        return VStack(alignment: .leading, spacing: 6) {
+            // Keep the original SwiftUI Text path unless the displayed text has a
+            // cheap http/https signal. If it does, route through PlainProseTextView
+            // so the accurate detector can decide which ranges are real URLs.
+            if visibleTextMightContainBareWebURL {
                 PlainProseTextView(
-                    text: displayText,
+                    text: visibleText,
                     font: fontPreset.nsFont,
                     fallbackMeasurementWidth: lastKnownContentWidth,
                     bareURLLinkificationPolicy: bareURLLinkificationPolicy,
-                    suppressLinksTouchingEndBoundary: needsCollapse && isCollapsed
+                    suppressLinksTouchingEndBoundary: shouldCollapse && isCollapsed
                 )
                 .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
-            } else if !needsCollapse || isCollapsed {
-                Text(displayText)
+            } else if !shouldCollapse || isCollapsed {
+                Text(visibleText)
                     .font(fontPreset.font)
                     .textSelection(.enabled)
                     .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             } else {
                 PlainProseTextView(
-                    text: displayText,
+                    text: visibleText,
                     font: fontPreset.nsFont,
                     fallbackMeasurementWidth: lastKnownContentWidth,
                     bareURLLinkificationPolicy: .disabled
@@ -118,7 +124,7 @@ struct CollapsibleUserMessage: View {
                 .recordCollapsibleUserMessageContentWidth(updateLastKnownContentWidth)
             }
 
-            if needsCollapse {
+            if shouldCollapse {
                 Button {
                     withAnimation(.easeInOut(duration: 0.3)) {
                         isCollapsed.toggle()

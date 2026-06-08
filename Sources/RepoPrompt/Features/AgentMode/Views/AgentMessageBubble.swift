@@ -461,6 +461,7 @@ struct AgentMessageBubble: View {
                 isMarkdown: true,
                 allowInteraction: true,
                 bareURLLinkificationPolicy: .httpHTTPSOnly,
+                suppressBareLinksTouchingEndBoundary: item.isStreaming,
                 renderCadence: item.isStreaming ? .streamingCoalesced : .immediate
             )
         }
@@ -1454,11 +1455,6 @@ private struct CollapsibleAssistantTranscriptContent: View {
         return max(lineHeight, 1) * CGFloat(previewLineCount)
     }
 
-    private func containsBareWebURL(_ text: String) -> Bool {
-        let lowercased = text.lowercased()
-        return lowercased.contains("http://") || lowercased.contains("https://")
-    }
-
     private var lineSummary: AgentAssistantLineDerivation.PreviewSummary {
         #if DEBUG
             let diagnosticsStartMS = AgentTextDerivationPerfDiagnostics.start()
@@ -1494,7 +1490,7 @@ private struct CollapsibleAssistantTranscriptContent: View {
                     allowInteraction: true,
                     bareURLLinkificationPolicy: bareURLLinkificationPolicy
                 )
-            } else if bareURLLinkificationPolicy.isEnabled, containsBareWebURL(summary.previewText) {
+            } else if bareURLLinkificationPolicy.isEnabled, BareURLLinkifier.containsHTTPHTTPSURLSignal(in: summary.previewText) {
                 MarkdownTextView(
                     text: summary.previewText,
                     isMarkdown: true,

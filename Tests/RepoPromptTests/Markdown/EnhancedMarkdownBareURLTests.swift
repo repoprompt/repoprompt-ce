@@ -71,6 +71,65 @@ final class EnhancedMarkdownBareURLTests: XCTestCase {
             suppressBareLinksTouchingEndBoundary: true
         )
         XCTAssertTrue(linkedSubstrings(in: touchingBoundary).isEmpty)
+
+        assertSuppressedBareURLIsNotVisuallyMarked(touchingBoundary, urlText: "https://example.com")
+    }
+
+    func testExplicitMarkdownLinkAtDocumentEndSurvivesBoundarySuppression() throws {
+        let attributed = compile(
+            "Visit [the docs](https://example.com/docs)",
+            policy: .httpHTTPSOnly,
+            suppressBareLinksTouchingEndBoundary: true
+        )
+        let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
+
+        XCTAssertEqual(linkedSubstrings(in: attributed), ["the docs"])
+        XCTAssertEqual(
+            attributed.attribute(.markdownRawLink, at: linkRange.location, effectiveRange: nil) as? String,
+            "https://example.com/docs"
+        )
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: linkRange.location, effectiveRange: nil))
+    }
+
+    func testExplicitMarkdownLinkWithURLLabelSurvivesBoundarySuppression() throws {
+        let attributed = compile(
+            "[https://example.com](https://example.com/docs)",
+            policy: .httpHTTPSOnly,
+            suppressBareLinksTouchingEndBoundary: true
+        )
+        let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
+
+        XCTAssertEqual(linkedSubstrings(in: attributed), ["https://example.com"])
+        XCTAssertEqual(
+            attributed.attribute(.markdownRawLink, at: linkRange.location, effectiveRange: nil) as? String,
+            "https://example.com/docs"
+        )
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: linkRange.location, effectiveRange: nil))
+    }
+
+    func testImageGeneratedLinkAtDocumentEndSurvivesBoundarySuppression() throws {
+        let attributed = compile(
+            "![Diagram](https://example.com/image.png)",
+            policy: .httpHTTPSOnly,
+            suppressBareLinksTouchingEndBoundary: true
+        )
+        let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
+
+        XCTAssertEqual(linkedSubstrings(in: attributed), ["Diagram (example.com)"])
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: linkRange.location, effectiveRange: nil))
+    }
+
+    func testSymbolGeneratedLinkDoesNotReceiveBareURLMarker() throws {
+        let attributed = compile(
+            "``https://example.com/symbol``",
+            policy: .httpHTTPSOnly,
+            suppressBareLinksTouchingEndBoundary: true,
+            options: .parseSymbolLinks
+        )
+        let linkRange = try XCTUnwrap(linkRanges(in: attributed).first)
+
+        XCTAssertEqual(linkedSubstrings(in: attributed), ["https://example.com/symbol"])
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: linkRange.location, effectiveRange: nil))
     }
 
     @MainActor
@@ -127,15 +186,33 @@ final class EnhancedMarkdownBareURLTests: XCTestCase {
         XCTAssertNil(MarkdownStreamingAppendDelta.between(previous: ordinary, requested: preview))
     }
 
+    private func assertSuppressedBareURLIsNotVisuallyMarked(
+        _ attributed: NSAttributedString,
+        urlText: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let range = (attributed.string as NSString).range(of: urlText)
+        XCTAssertNotEqual(range.location, NSNotFound, file: file, line: line)
+        guard range.location != NSNotFound else { return }
+
+        XCTAssertNil(attributed.attribute(.link, at: range.location, effectiveRange: nil), file: file, line: line)
+        XCTAssertNil(attributed.attribute(.repoPromptBareURLLink, at: range.location, effectiveRange: nil), file: file, line: line)
+        XCTAssertNil(attributed.attribute(.underlineStyle, at: range.location, effectiveRange: nil), file: file, line: line)
+        let foregroundColor = attributed.attribute(.foregroundColor, at: range.location, effectiveRange: nil) as? NSColor
+        XCTAssertFalse(foregroundColor?.isEqual(NSColor.linkColor) ?? false, file: file, line: line)
+    }
+
     private func compile(
         _ markdown: String,
         policy: BareURLLinkificationPolicy,
-        suppressBareLinksTouchingEndBoundary: Bool = false
+        suppressBareLinksTouchingEndBoundary: Bool = false,
+        options: ParseOptions = []
     ) -> NSAttributedString {
         var compiler = EnhancedMarkdownCompiler()
         compiler.fontSize = 13
         compiler.bareURLLinkificationPolicy = policy
         compiler.suppressBareLinksTouchingEndBoundary = suppressBareLinksTouchingEndBoundary
-        return compiler.attributedString(from: Document(parsing: markdown))
+        return compiler.attributedString(from: Document(parsing: markdown, options: options))
     }
 }
