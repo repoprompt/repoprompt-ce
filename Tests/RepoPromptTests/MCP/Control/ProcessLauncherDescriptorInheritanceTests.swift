@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
+@testable import RepoPromptCoreMacOS
 import XCTest
 
 final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
@@ -199,7 +201,7 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
     func testLauncherSourcesCheckSpawnFileActionAndAttributeInitializationResults() throws {
         let root = try RepoRoot.url()
         let launcher = try String(
-            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/Process/ProcessLauncher.swift"),
+            contentsOf: root.appendingPathComponent("Sources/RepoPromptCoreMacOS/Process/POSIXProcessLauncher.swift"),
             encoding: .utf8
         )
         let runner = try String(

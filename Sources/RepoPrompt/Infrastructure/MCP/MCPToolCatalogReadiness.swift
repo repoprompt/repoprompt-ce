@@ -25,9 +25,19 @@ private let log = Logger(label: "com.repoprompt.mcp.readiness")
 /// Ensures that before a connection can list tools, all required services
 /// are registered and their tools are built.
 actor MCPToolCatalogReadiness {
-    static let shared = MCPToolCatalogReadiness()
+    private let runtimeSessionRegistry: MCPRuntimeSessionRegistry
+    private let serviceRegistry: MCPServiceRegistry
+    private let appSessionAdapters: RepoPromptAppSessionAdapterRegistry
 
-    private init() {}
+    init(
+        runtimeSessionRegistry: MCPRuntimeSessionRegistry,
+        serviceRegistry: MCPServiceRegistry,
+        appSessionAdapters: RepoPromptAppSessionAdapterRegistry
+    ) {
+        self.runtimeSessionRegistry = runtimeSessionRegistry
+        self.serviceRegistry = serviceRegistry
+        self.appSessionAdapters = appSessionAdapters
+    }
 
     /// Default timeout for readiness wait
     static let defaultTimeout: TimeInterval = 5.0
@@ -71,7 +81,7 @@ actor MCPToolCatalogReadiness {
     func warmToolCache(windowID: Int) async {
         // Get the MCPServerViewModel on MainActor
         let mcpServer: MCPServerViewModel? = await MainActor.run {
-            WindowStatesManager.shared.window(withID: windowID)?.mcpServer
+            appSessionAdapters.window(withID: windowID)?.mcpServer
         }
 
         guard let mcpServer else {
@@ -96,7 +106,9 @@ actor MCPToolCatalogReadiness {
     private func checkServicesReady(windowID: Int?) -> Bool {
         if let windowID {
             // Check if the window exists
-            guard let window = WindowStatesManager.shared.window(withID: windowID) else {
+            guard runtimeSessionRegistry.hasActiveWindow(id: windowID),
+                  let window = appSessionAdapters.window(withID: windowID)
+            else {
                 mcpToolCatalogReadinessLog("Window \(windowID) not found during readiness check")
                 return false
             }
@@ -108,9 +120,11 @@ actor MCPToolCatalogReadiness {
             }
         }
 
-        // Always require WindowRoutingService to be registered (provides routing tools)
-        let hasRoutingService = ServiceRegistry.services.contains { service in
-            service is WindowRoutingService
+        // Always require WindowRoutingService to be committed in the indexed catalog (provides routing tools).
+        let indexedToolSnapshot = serviceRegistry.routeSnapshot()
+        let hasRoutingService = indexedToolSnapshot.orderedRoutes.contains { route in
+            if case .contextRouting = route.role { return true }
+            return false
         }
 
         if !hasRoutingService {
@@ -123,14 +137,15 @@ actor MCPToolCatalogReadiness {
             return true
         }
 
-        // Check if the window's catalog service is registered.
-        let catalogService = WindowStatesManager.shared.window(withID: windowID)?.mcpServer.windowMCPToolCatalogService
-        let isWindowServiceRegistered = ServiceRegistry.services.contains { service in
-            guard let catalogService else { return false }
-            return (service as AnyObject) === (catalogService as AnyObject)
+        // Check if the window's catalog service is committed in the indexed catalog.
+        let catalogService = appSessionAdapters.window(withID: windowID)?.mcpServer.windowMCPToolCatalogService
+        let isWindowServiceCommitted: Bool = if let catalogService {
+            serviceRegistry.committedSnapshotContains(catalogService)
+        } else {
+            false
         }
 
-        if !isWindowServiceRegistered {
+        if !isWindowServiceCommitted {
             mcpToolCatalogReadinessLog("MCPWindowToolCatalogService for window \(windowID) not yet registered")
             return false
         }

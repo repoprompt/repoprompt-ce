@@ -16,7 +16,11 @@ struct WindowContentView: View {
     @Environment(\.openWindow) private var openWindow
 
     /// The WindowState itself (your big manager of fileManager, promptManager, etc.)
-    @StateObject private var windowState = WindowState()
+    @StateObject private var windowState: WindowState
+
+    init(coreContainer: RepoPromptAppCoreContainer) {
+        _windowState = StateObject(wrappedValue: WindowState(coreContainer: coreContainer))
+    }
 
     var body: some View {
         ContentView(windowState: windowState)
@@ -58,7 +62,6 @@ struct WindowContentView: View {
                 }
 
                 windowStatesManager.unregisterWindowState(windowState)
-                Task { await windowState.tearDown() }
             }
             // Example sheets or popups
             .sheet(isPresented: $versionManager.shouldShowWelcomeView) {

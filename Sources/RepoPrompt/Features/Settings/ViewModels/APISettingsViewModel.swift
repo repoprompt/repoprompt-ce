@@ -1,4 +1,5 @@
 import Combine
+import RepoPromptCore
 import SwiftUI
 
 #if DEBUG
@@ -446,7 +447,7 @@ public class APISettingsViewModel: ObservableObject {
     /// the published dictionaries. Safe to call from any context; publishes on the main actor.
     @MainActor
     func loadCompatibleBackendState(
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
     ) async {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         let previousActiveBackends = Set(ClaudeCodeCompatibleBackendID.allCases.filter { compatibleBackendIsActive($0) })
@@ -914,7 +915,7 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadStoredData(
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         await loadAllKeys(accessMode: accessMode) // returns immediately; fetch tasks run in background
         hasLoadedStoredData = true
@@ -924,7 +925,7 @@ public class APISettingsViewModel: ObservableObject {
     /// Loads stored data and calls the completion handler after models are fully updated
     @MainActor
     func loadStoredData(
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad),
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .bulkSettingsLoad),
         _ completion: @escaping () -> Void
     ) async {
         await loadAllKeys(accessMode: accessMode)
@@ -935,7 +936,7 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadStoredDataIfNeeded(
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         guard !hasLoadedStoredData, !isLoadingStoredData else { return }
         isLoadingStoredData = true
@@ -943,7 +944,7 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
-        guard let keychainError = error as? KeychainService.KeychainError else {
+        guard let keychainError = error as? SecureStorageError else {
             return .unexpectedError
         }
         switch keychainError {
@@ -974,7 +975,7 @@ public class APISettingsViewModel: ObservableObject {
     @MainActor
     private func loadStoredAPIKey(
         for provider: AIProviderType,
-        accessMode: KeychainAccessMode,
+        accessMode: SecureStorageAccessMode,
         currentValue: String = "",
         preserveExistingValueOnFailure: Bool = true
     ) async -> String {
@@ -991,7 +992,7 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     func loadAllKeys(
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .bulkSettingsLoad)
     ) async {
         // ── 0. Cancel previous background fetches ───────────────────────────────
         openAIModelsTask?.cancel()

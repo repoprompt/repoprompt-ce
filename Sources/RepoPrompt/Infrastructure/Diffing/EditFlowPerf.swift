@@ -38,6 +38,15 @@ enum EditFlowPerf {
         struct IntervalState {}
     #endif
 
+    struct ExternalIntervalState {
+        #if DEBUG
+            let captureEpoch: UInt64
+            let startNanoseconds: UInt64
+            let stageName: String
+            let sanitizedDimensions: String
+        #endif
+    }
+
     struct Dimensions {
         var toolName: String?
         var runPurpose: String?
@@ -1393,4 +1402,53 @@ enum EditFlowPerf {
             try await operation()
         }
     #endif
+
+    static func beginExternalInterval(
+        stageName: String,
+        sanitizedDimensions: String
+    ) -> ExternalIntervalState? {
+        #if DEBUG
+            guard let start = debugCaptureRecorder.startTimestampIfActive() else { return nil }
+            return ExternalIntervalState(
+                captureEpoch: start.epoch,
+                startNanoseconds: start.startNanoseconds,
+                stageName: stageName,
+                sanitizedDimensions: sanitizedDimensions
+            )
+        #else
+            return nil
+        #endif
+    }
+
+    static func endExternalInterval(
+        _ state: ExternalIntervalState?,
+        sanitizedDimensions: String
+    ) {
+        #if DEBUG
+            guard let state else { return }
+            debugCaptureRecorder.record(
+                stageName: state.stageName,
+                sanitizedDimensions: sanitizedDimensions.isEmpty ? state.sanitizedDimensions : sanitizedDimensions,
+                captureEpoch: state.captureEpoch,
+                startNanoseconds: state.startNanoseconds
+            )
+        #endif
+    }
+
+    static func recordExternalLifecycleEvent(
+        eventName: String,
+        correlationID: UUID?,
+        sanitizedDimensions: String
+    ) {
+        #if DEBUG
+            guard let correlationID,
+                  let captureEpoch = debugCaptureRecorder.activeEpochIfActive()
+            else { return }
+            debugCaptureRecorder.recordLifecycleEvent(
+                eventName: eventName,
+                correlation: LifecycleCorrelation(id: correlationID, captureEpoch: captureEpoch),
+                sanitizedDimensions: sanitizedDimensions
+            )
+        #endif
+    }
 }

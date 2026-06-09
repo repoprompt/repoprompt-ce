@@ -36,38 +36,69 @@ final class MCPResponseSendDeadlineConfigurationTests: XCTestCase {
         )
 
         let root = try RepoRoot.url()
+        let appSourceRoot = root.appendingPathComponent("Sources/RepoPrompt")
+        let cliSourceRoot = root.appendingPathComponent("Sources/RepoPromptMCP")
+
         let server = try source(
-            root: root,
-            path: "Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketConnectionManager.swift"
+            declaring: "BootstrapSocketConnectionManager",
+            under: appSourceRoot
         )
         XCTAssertTrue(server.contains("responseSendTimeout: MCPTimeoutPolicy.responseSendDeadline"))
 
         let appTransport = try source(
-            root: root,
-            path: "Sources/RepoPrompt/Infrastructure/MCP/UnixSocketMCPTransport.swift"
+            declaring: "UnixSocketMCPTransport",
+            under: appSourceRoot
         )
         XCTAssertTrue(appTransport.contains(
             "writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds"
         ))
 
         let cliTransport = try source(
-            root: root,
-            path: "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift"
+            declaring: "BootstrapSocketMCPTransport",
+            under: cliSourceRoot
         )
         XCTAssertTrue(cliTransport.contains(
             "writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds"
         ))
 
         let cliWriter = try source(
-            root: root,
-            path: "Sources/RepoPromptMCP/Transports/NonBlockingFDWriter.swift"
+            declaring: "NonBlockingFDWriter",
+            under: cliSourceRoot
         )
         XCTAssertTrue(cliWriter.contains(
             "stallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds"
         ))
     }
 
-    private func source(root: URL, path: String) throws -> String {
-        try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+    private func source(declaring declarationName: String, under sourceRoot: URL) throws -> String {
+        let escapedName = NSRegularExpression.escapedPattern(for: declarationName)
+        let declaration = try NSRegularExpression(
+            pattern: #"(?m)^\s*(?:(?:public|package|internal|private|fileprivate|open|final|indirect|nonisolated)\s+)*(?:actor|class|struct|enum|protocol)\s+"#
+                + escapedName
+                + #"\b"#
+        )
+        let swiftFiles = try XCTUnwrap(
+            FileManager.default.enumerator(
+                at: sourceRoot,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        )
+
+        var owners: [(url: URL, source: String)] = []
+        for case let fileURL as URL in swiftFiles where fileURL.pathExtension == "swift" {
+            let source = try String(contentsOf: fileURL, encoding: .utf8)
+            let range = NSRange(source.startIndex..., in: source)
+            if declaration.firstMatch(in: source, range: range) != nil {
+                owners.append((fileURL, source))
+            }
+        }
+
+        XCTAssertEqual(
+            owners.count,
+            1,
+            "Expected exactly one Swift declaration owner for \(declarationName) under \(sourceRoot.path); found \(owners.map(\.url.path))"
+        )
+        return try XCTUnwrap(owners.first?.source)
     }
 }

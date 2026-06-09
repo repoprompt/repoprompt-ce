@@ -112,6 +112,97 @@ final class TabContextRoutingTests: XCTestCase {
         }
     }
 
+    func testBindingResolverPreservesRequestedMappingReuseLivePersistedAndSingleHostPriority() async throws {
+        let contextID = UUID()
+        let workspaceID = UUID()
+        let matches = (1 ... 6).map { windowID in
+            match(windowID: windowID, tabID: contextID, workspaceID: workspaceID)
+        }
+
+        func resolvedWindowID(
+            requestedWindowID: Int? = nil,
+            existingWindowID: Int? = nil,
+            reusableWindowID: Int? = nil,
+            preferredLiveRunWindowID: Int? = nil,
+            preferredWindowID: Int? = nil
+        ) async throws -> Int? {
+            let resolver = makeResolver(
+                matchesByContextID: [contextID: matches],
+                existingWindowID: existingWindowID,
+                reusableWindowID: reusableWindowID,
+                preferredLiveRunWindowID: preferredLiveRunWindowID,
+                preferredWindowID: preferredWindowID
+            )
+            return try await resolver.resolveLogicalContextBinding(
+                connectionID: UUID(),
+                explicitContextID: contextID,
+                legacyTabID: nil,
+                workingDirs: [],
+                requestedWindowID: requestedWindowID
+            )?.windowID
+        }
+
+        let requested = try await resolvedWindowID(
+            requestedWindowID: 1,
+            existingWindowID: 2,
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(requested, 1)
+
+        let existing = try await resolvedWindowID(
+            existingWindowID: 2,
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(existing, 2)
+
+        let reused = try await resolvedWindowID(
+            reusableWindowID: 3,
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(reused, 3)
+
+        let live = try await resolvedWindowID(
+            preferredLiveRunWindowID: 4,
+            preferredWindowID: 5
+        )
+        XCTAssertEqual(live, 4)
+
+        let persisted = try await resolvedWindowID(preferredWindowID: 5)
+        XCTAssertEqual(persisted, 5)
+
+        let invalidImplicitCandidatesSkipped = try await resolvedWindowID(
+            existingWindowID: 99,
+            reusableWindowID: 98,
+            preferredLiveRunWindowID: 97,
+            preferredWindowID: 6
+        )
+        XCTAssertEqual(invalidImplicitCandidatesSkipped, 6)
+
+        let singleHostContextID = UUID()
+        let singleHostResolver = makeResolver(
+            matchesByContextID: [
+                singleHostContextID: [match(windowID: 9, tabID: singleHostContextID, workspaceID: workspaceID)]
+            ],
+            existingWindowID: 99,
+            reusableWindowID: 98,
+            preferredLiveRunWindowID: 97,
+            preferredWindowID: 96
+        )
+        let singleHostResolution = try await singleHostResolver.resolveLogicalContextBinding(
+            connectionID: UUID(),
+            explicitContextID: singleHostContextID,
+            legacyTabID: nil,
+            workingDirs: [],
+            requestedWindowID: nil
+        )
+        XCTAssertEqual(singleHostResolution?.windowID, 9)
+    }
+
     @MainActor
     func testPendingRunScopedStoreRequiresExactRunHint() {
         var store = MCPServerViewModel.PendingRunScopedContextStore()
@@ -343,14 +434,19 @@ final class TabContextRoutingTests: XCTestCase {
             ephemeral: true
         )
         await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "persistResolvedTabContextSnapshotTest")
-        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
-        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-            ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
-            ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveInitialSelection)
-        ]
-        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
+        let workspaceWithTabs = try XCTUnwrap(window.workspaceManager.mutateWorkspace(
+            id: workspace.id,
+            touchDateModified: false,
+            markDirty: false
+        ) { workspace in
+            workspace.composeTabs = [
+                ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
+                ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveInitialSelection)
+            ]
+            workspace.activeComposeTabID = activeTabID
+        })
         await window.workspaceManager.switchWorkspace(
-            to: window.workspaceManager.workspaces[workspaceIndex],
+            to: workspaceWithTabs,
             saveState: false,
             reason: "persistResolvedTabContextSnapshotTestTabs"
         )
@@ -425,17 +521,16 @@ final class TabContextRoutingTests: XCTestCase {
             selectedPaths: ["/tmp/new-agent.swift"],
             codemapAutoEnabled: false
         )
-        let manager = FakeMCPSelectionManager(
+        let window = await makeSelectionTestWindow(
             tabs: [
                 ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
                 ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveSelection)
             ],
             activeTabID: activeTabID
         )
-        let coordinator = WorkspaceSelectionCoordinator(
-            workspaceManager: manager,
-            store: WorkspaceFileContextStore()
-        )
+        defer { window.beginClose() }
+        let manager = window.workspaceManager
+        let coordinator = window.selectionCoordinator
         var changes: [WorkspaceSelectionCoordinator.Change] = []
         coordinator.changes
             .sink { changes.append($0) }
@@ -459,17 +554,16 @@ final class TabContextRoutingTests: XCTestCase {
         let inactiveTabID = UUID()
         let activeSelection = StoredSelection(selectedPaths: ["/tmp/active.swift"])
         let inactiveSelection = StoredSelection(selectedPaths: ["/tmp/agent.swift"], codemapAutoEnabled: false)
-        let manager = FakeMCPSelectionManager(
+        let window = await makeSelectionTestWindow(
             tabs: [
                 ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
                 ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveSelection)
             ],
             activeTabID: activeTabID
         )
-        let coordinator = WorkspaceSelectionCoordinator(
-            workspaceManager: manager,
-            store: WorkspaceFileContextStore()
-        )
+        defer { window.beginClose() }
+        let manager = window.workspaceManager
+        let coordinator = window.selectionCoordinator
         var changes: [WorkspaceSelectionCoordinator.Change] = []
         coordinator.changes
             .sink { changes.append($0) }
@@ -677,6 +771,23 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    private func makeSelectionTestWindow(tabs: [ComposeTabState], activeTabID: UUID) async -> WindowState {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        await window.workspaceManager.awaitInitialized()
+        let workspace = WorkspaceModel(
+            name: "Test Workspace",
+            repoPaths: [],
+            composeTabs: tabs,
+            activeComposeTabID: activeTabID
+        )
+        window.workspaceManager.replaceWorkspaceInventory([workspace], activeWorkspaceID: workspace.id)
+        return window
+    }
+
+    @MainActor
     private func makeTabContext(runID: UUID?, windowID: Int) -> MCPServerViewModel.TabContextSnapshot {
         MCPServerViewModel.TabContextSnapshot(
             tabID: UUID(),
@@ -689,34 +800,6 @@ final class TabContextRoutingTests: XCTestCase {
             runID: runID,
             explicitlyBound: false
         )
-    }
-}
-
-@MainActor
-private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
-    var activeWorkspace: WorkspaceModel?
-
-    init(tabs: [ComposeTabState], activeTabID: UUID) {
-        activeWorkspace = WorkspaceModel(
-            name: "Test Workspace",
-            repoPaths: [],
-            composeTabs: tabs,
-            activeComposeTabID: activeTabID
-        )
-    }
-
-    func composeTab(with id: UUID) -> ComposeTabState? {
-        activeWorkspace?.composeTabs.first(where: { $0.id == id })
-    }
-
-    func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
-
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
-        guard var workspace = activeWorkspace,
-              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
-        else { return }
-        workspace.composeTabs[index] = tab
-        activeWorkspace = workspace
     }
 }
 

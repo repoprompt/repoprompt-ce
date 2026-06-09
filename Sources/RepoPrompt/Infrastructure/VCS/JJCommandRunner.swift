@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptCoreMacOS
 
 // MARK: - JJ Command Runner
 

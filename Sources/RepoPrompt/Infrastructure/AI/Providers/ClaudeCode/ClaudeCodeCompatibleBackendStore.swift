@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     static let shared = ClaudeCodeCompatibleBackendStore()
@@ -16,7 +17,9 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
 
     init(
         defaults: UserDefaults = .standard,
-        secureService: SecureKeysService = SecureKeysService()
+        secureService: SecureKeysService = SecureKeysService(
+            secureStorage: SecureKeyValueStorageFactory.defaultBackend()
+        )
     ) {
         self.defaults = defaults
         self.secureService = secureService
@@ -66,7 +69,7 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
 
     func hasSecret(
         for id: ClaudeCodeCompatibleBackendID,
-        accessMode: KeychainAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
+        accessMode: SecureStorageAccessMode = .nonInteractive(reason: .backgroundAvailabilityCheck)
     ) async -> Bool {
         do {
             guard let rawSecret = try await secret(for: id, accessMode: accessMode) else { return false }
@@ -79,7 +82,7 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
 
     func secret(
         for id: ClaudeCodeCompatibleBackendID,
-        accessMode: KeychainAccessMode = .interactive
+        accessMode: SecureStorageAccessMode = .interactive
     ) async throws -> String? {
         try await secureService.getAPIKey(for: id.secureStorageAccount, accessMode: accessMode)
     }

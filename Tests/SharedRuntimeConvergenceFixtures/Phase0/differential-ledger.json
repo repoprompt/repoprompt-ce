@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "allowed_product_differences": [
+    "initialize and product/profile metadata",
+    "profile and state-root paths",
+    "unsupported capability omissions",
+    "standalone initialization and configuration instructions"
+  ],
+  "tools": [
+    {"name":"bind_context","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"manage_workspaces","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"manage_selection","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"workspace_context","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"get_file_tree","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"get_code_structure","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"read_file","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"file_search","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]},
+    {"name":"prompt","descriptor":"phase_1_blocker","arguments":"phase_1_blocker","structured_text_response":"phase_1_blocker","allowed":[]}
+  ]
+}

@@ -59,7 +59,7 @@ SwiftPM’s architecture-specific build output is usually under:
 
 ## Debug CLI / MCP
 
-Use the CE-specific debug CLI when testing this app. The production `rp-cli` / `rp-cli-debug` connection is only an analogue and may talk to the non-CE app.
+Use the CE-specific debug CLI when testing this app. The production `rp-cli` / `rp-cli-debug` connection is only an analogue and may talk to the non-CE app. `rpce-cli[-debug]` is the **app proxy** command family: it talks to the running app through the bundled `repoprompt-mcp` helper. Use `rpce-headless[-debug]` for the standalone direct-stdio host instead.
 
 Install or inspect the debug CLI:
 
@@ -111,11 +111,56 @@ rpce-cli-debug -w 1 -c app_settings -j '{"op":"set","key":"agent_mode.perf_diagn
 
 These settings are intentionally DEBUG-only. If a key is unavailable, confirm `rpce-cli-debug --version` is resolving to the current CE debug build before falling back to lower-level defaults.
 
+## Headless CLI / MCP
+
+`rpce-headless[-debug]` is the standalone direct-stdio MCP host. It does **not** launch `RepoPrompt.app`, does not connect to the app-proxy socket, and uses separate headless state and secure storage:
+
+```text
+~/Library/Application Support/RepoPrompt CE/Headless/
+```
+
+Package, install, inspect, and smoke the debug standalone host with:
+
+```bash
+make package-headless                    # stages HeadlessTools/Debug/repoprompt-headless
+make headless-debug-status
+make install-debug-headless              # installs /usr/local/bin/rpce-headless-debug when writable/sudo is available
+make headless-smoke                      # direct stdio initialize/tools/list/read/search/permission/shutdown smoke
+
+# coordinated equivalents:
+make dev-package-headless
+make dev-headless-debug-status
+make dev-install-debug-headless
+make dev-headless-smoke
+```
+
+Managed links are intentionally separate from the app proxy:
+
+```text
+/usr/local/bin/rpce-headless-debug
+  -> ~/Library/Application Support/RepoPrompt CE/repoprompt_headless_debug
+  -> ~/Library/Application Support/RepoPrompt CE/HeadlessTools/Debug/repoprompt-headless
+
+/usr/local/bin/rpce-headless
+  -> ~/Library/Application Support/RepoPrompt CE/repoprompt_headless
+  -> ~/Library/Application Support/RepoPrompt CE/HeadlessTools/Release/repoprompt-headless
+```
+
+Standalone usage starts fail-closed until roots are configured:
+
+```bash
+rpce-headless-debug --state-dir /tmp/rpce-headless-demo config roots add /path/to/repo --name Repo
+rpce-headless-debug --state-dir /tmp/rpce-headless-demo doctor
+rpce-headless-debug --state-dir /tmp/rpce-headless-demo serve
+```
+
+Do not use `rpce-cli[-debug]` as evidence for standalone behavior; it validates the app-bundled proxy. Do not use `rpce-headless[-debug]` as evidence for live app/window/Agent Mode behavior; the first standalone profile is read-oriented and omits app-only, write, VCS, oracle, Context Builder, Agent Mode, and settings tools.
+
 ## Developer daemon / coordinated validation
 
 Prefer the developer daemon as the default way to build, run, and validate. Two properties are the whole reason it exists — and the reason to reach for it instead of a bare `swift build` / `swift test`:
 
-- **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, launching, or running style tooling over each other and corrupting `.build` or the live app.
+- **Lane-serialized job queue** — every job claims named lanes (`build`, `debugArtifact`, `headlessArtifact`, `headlessSmoke`, `liveApp`, `release`, `style`); the daemon runs jobs that share a lane one at a time while letting unrelated lanes proceed concurrently. That serial queue is what stops multiple agents from building, packaging headless tools, launching, or running style tooling over each other and corrupting `.build`, managed artifacts, or the live app.
 - **Tickets + async jobs** — every job gets a ticket and can run detached (`--async`). Fire a build, keep working, and query or wait on it later (`job status` / `job wait`) instead of blocking on a long compile. Jobs survive reconnects and are reusable by `--request-key`.
 
 `conductor` is repo-internal developer tooling for this checkout; the daemon auto-starts on first use.
@@ -125,13 +170,14 @@ Happy path — daemon aliases:
 ```bash
 make dev-status
 make dev-build
-make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|all, default all)
+make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|repoprompt-headless|all, default all)
 make dev-run
 make dev-test                                       # full coordinated test suite
 make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
 make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
 make dev-smoke          # non-disruptive: requires an already-running CE debug app and installed debug CLI
 make dev-smoke-launch   # builds/launches the debug app, then runs the smoke flow
+make dev-headless-smoke  # packages repoprompt-headless and runs direct-stdio smoke without app launch
 make dev-format-check   # non-mutating coordinated SwiftFormat check
 make dev-lint           # non-mutating coordinated format-check + SwiftLint strict
 make dev-format         # mutates first-party Swift files; run only when intended
@@ -163,6 +209,7 @@ Behavior notes:
 - `make dev-smoke` is the non-disruptive live-only check: it assumes the CE debug app is already running and the debug CLI is installed/resolvable.
 - `make dev-smoke-launch` (or `./conductor smoke --launch`) builds/packages and launches the debug app before smoke validation.
 - `./conductor smoke --agent-run` is opt-in, for when provider credentials and model access are available.
+- `make dev-headless-smoke` / `./conductor headless-smoke` packages `repoprompt-headless` and runs only the standalone direct-stdio smoke; it does not claim `liveApp` and must not be used as app-proxy evidence.
 - Style checks (`make dev-format-check`, `make dev-lint`) are non-mutating and do not auto-install tools; `make dev-install-format-tools` is the explicit install path.
 - Do not run `make dev-format` unless formatting mutation is intended. If a format job is canceled after starting, inspect `git diff` and rerun format or restore files as needed.
 
@@ -244,13 +291,15 @@ make dev-test FILTER=CodexIntegrationConfigurationTests
 make dev-test FILTER=WorkspaceFileContextStoreTests
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
+make dev-swift-build PRODUCT=repoprompt-headless
+make dev-headless-smoke
 make dev-provider-test
 make guardrails
 make doctor
 make dev-build
 ```
 
-Run the smallest relevant daemon build/test command above to validate a change. If the change affects packaging, the MCP server, the MCP CLI, Agent Mode, or any feature that depends on the running app, follow it with the live CE MCP smoke flow above.
+Run the smallest relevant daemon build/test command above to validate a change. If the change affects standalone headless packaging or safe read-oriented tools, run `make dev-headless-smoke`. If the change affects app packaging, the app-proxy MCP server, the app-proxy MCP CLI, Agent Mode, or any feature that depends on the running app, follow it with the live CE MCP smoke flow above.
 
 Direct `swift test --filter <name>` and `swift build --product <name>` still work and produce the same result, but they are uncoordinated — use them only when the daemon is unavailable (for example, no `python3`), and avoid them when other agents may be building.
 

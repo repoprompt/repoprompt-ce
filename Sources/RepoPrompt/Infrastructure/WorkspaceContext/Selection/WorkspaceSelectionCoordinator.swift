@@ -1,18 +1,8 @@
 import Combine
 import Foundation
+import RepoPromptCore
 
-@MainActor
-protocol WorkspaceSelectionHost: AnyObject {
-    var activeWorkspace: WorkspaceModel? { get }
-    func composeTab(with id: UUID) -> ComposeTabState?
-    func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool)
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState)
-}
-
-extension WorkspaceManagerViewModel: WorkspaceSelectionHost {}
-
-/// Window-scoped coordinator that makes compose-tab `StoredSelection` the runtime
-/// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
+/// App-only UI bridge over the canonical Core selection controller.
 @MainActor
 final class WorkspaceSelectionCoordinator {
     struct Snapshot: Equatable {
@@ -35,11 +25,13 @@ final class WorkspaceSelectionCoordinator {
         case mirror
     }
 
-    private weak var workspaceManager: (any WorkspaceSelectionHost)?
+    private weak var workspaceManager: WorkspaceManagerViewModel?
     let store: WorkspaceFileContextStore
     let mutationService: WorkspaceSelectionMutationService
+    let controller: WorkspaceSelectionController
     private let changeSubject = PassthroughSubject<Change, Never>()
     private var applyingSelectionMirrorDepth = 0
+    private var observationToken: WorkspaceSelectionObservationToken?
 
     var changes: AnyPublisher<Change, Never> {
         changeSubject.eraseToAnyPublisher()
@@ -50,41 +42,40 @@ final class WorkspaceSelectionCoordinator {
     }
 
     init(
-        workspaceManager: (any WorkspaceSelectionHost)? = nil,
-        store: WorkspaceFileContextStore,
-        mutationService: WorkspaceSelectionMutationService? = nil
+        controller: WorkspaceSelectionController,
+        store: WorkspaceFileContextStore
     ) {
-        self.workspaceManager = workspaceManager
+        self.controller = controller
         self.store = store
-        self.mutationService = mutationService ?? WorkspaceSelectionMutationService(store: store)
+        mutationService = controller.mutationService
+        observationToken = controller.observe { [weak self] change in
+            self?.changeSubject.send(Change(
+                tabID: change.tabID,
+                selection: change.selection,
+                source: Source(rawValue: change.source.rawValue) ?? .runtimeMutation
+            ))
+        }
     }
 
-    func attachWorkspaceManager(_ workspaceManager: any WorkspaceSelectionHost) {
+    func attachWorkspaceManager(_ workspaceManager: WorkspaceManagerViewModel) {
         self.workspaceManager = workspaceManager
     }
 
     func activeTabID() -> UUID? {
-        guard let workspaceManager else { return nil }
-        return workspaceManager.activeWorkspace?.activeComposeTabID
-            ?? workspaceManager.activeWorkspace?.composeTabs.first?.id
+        controller.activeTabID()
     }
 
     func activeSelectionSnapshot(flushPendingUI: Bool = true) -> Snapshot {
         if flushPendingUI {
             flushPendingUISelectionToActiveTab()
         }
-        guard let workspaceManager, let tabID = activeTabID() else {
-            return Snapshot(tabID: nil, selection: StoredSelection(), isVirtual: false)
-        }
-        return Snapshot(
-            tabID: tabID,
-            selection: workspaceManager.composeTab(with: tabID)?.selection ?? StoredSelection(),
-            isVirtual: false
-        )
+        let snapshot = controller.activeSelectionSnapshot()
+        return Snapshot(tabID: snapshot.tabID, selection: snapshot.selection, isVirtual: snapshot.isVirtual)
     }
 
     func virtualSelectionSnapshot(tabID: UUID, selection: StoredSelection) -> Snapshot {
-        Snapshot(tabID: tabID, selection: selection, isVirtual: true)
+        let snapshot = controller.virtualSelectionSnapshot(tabID: tabID, selection: selection)
+        return Snapshot(tabID: snapshot.tabID, selection: snapshot.selection, isVirtual: snapshot.isVirtual)
     }
 
     func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
@@ -96,13 +87,12 @@ final class WorkspaceSelectionCoordinator {
     }
 
     func flushPendingUISelectionToActiveTab() {
-        guard !isApplyingSelectionMirror, let workspaceManager else { return }
-        let previousTabID = activeTabID()
-        let previousSelection = previousTabID.flatMap { workspaceManager.composeTab(with: $0)?.selection } ?? StoredSelection()
+        guard !isApplyingSelectionMirror,
+              let workspaceManager,
+              let pending = controller.beginExternallyCommittedSelection(source: .uiFlush)
+        else { return }
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
-        let snapshot = activeSelectionSnapshot(flushPendingUI: false)
-        guard snapshot.tabID != previousTabID || snapshot.selection != previousSelection else { return }
-        changeSubject.send(Change(tabID: snapshot.tabID, selection: snapshot.selection, source: .uiFlush))
+        controller.finishExternallyCommittedSelection(target: pending.target, previous: pending.previous)
     }
 
     @discardableResult
@@ -111,17 +101,20 @@ final class WorkspaceSelectionCoordinator {
         source: Source = .runtimeMutation,
         mirrorToUI: Bool = true
     ) async -> StoredSelection {
-        guard workspaceManager != nil, let tabID = activeTabID() else { return selection }
-        guard persist(selection, for: tabID, markDirty: true) else { return selection }
-        let change = Change(tabID: tabID, selection: selection, source: source)
+        let target = controller.activeTarget()
+        let coreSource = WorkspaceSelectionController.Source(rawValue: source.rawValue) ?? .runtimeMutation
+        let result = controller.persistActiveSelection(selection, source: coreSource, publishChange: false)
+        guard let target,
+              controller.selectionSnapshot(for: target) == result
+        else { return result }
+
+        let change = Change(tabID: target.tabID, selection: result, source: source)
         if mirrorToUI {
-            await applySelectionMirror {
-                changeSubject.send(change)
-            }
+            await deliverMirrored(change)
         } else {
             changeSubject.send(change)
         }
-        return selection
+        return result
     }
 
     @discardableResult
@@ -143,9 +136,14 @@ final class WorkspaceSelectionCoordinator {
         for tabID: UUID,
         source: Source = .virtual
     ) -> StoredSelection {
-        guard persist(selection, for: tabID, markDirty: true) else { return selection }
-        changeSubject.send(Change(tabID: tabID, selection: selection, source: source))
-        return selection
+        let target = controller.target(forTabID: tabID)
+        let result = controller.persistVirtualSelection(selection, for: tabID, publishChange: false)
+        if let target,
+           controller.selectionSnapshot(for: target) == result
+        {
+            changeSubject.send(Change(tabID: target.tabID, selection: result, source: source))
+        }
+        return result
     }
 
     @discardableResult
@@ -159,16 +157,23 @@ final class WorkspaceSelectionCoordinator {
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceAddSelectionResult {
-        let current = activeSelectionSnapshot(flushPendingUI: true).selection
-        let result = await mutationService.addPaths(
-            existing: current,
+        flushPendingUISelectionToActiveTab()
+        let target = controller.activeTarget()
+        let result = await controller.addPathsToActiveSelection(
             paths: paths,
-            rawPaths: paths,
             mode: mode,
-            rootScope: rootScope
+            rootScope: rootScope,
+            publishChange: false
         )
-        if result.mutated {
-            _ = await persistActiveSelection(result.selection, source: .runtimeMutation)
+        if result.mutated,
+           let target,
+           controller.selectionSnapshot(for: target) == result.selection
+        {
+            await deliverMirrored(Change(
+                tabID: target.tabID,
+                selection: result.selection,
+                source: .runtimeMutation
+            ))
         }
         return result
     }
@@ -179,16 +184,23 @@ final class WorkspaceSelectionCoordinator {
         mode: String = "full",
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceRemoveSelectionResult {
-        let current = activeSelectionSnapshot(flushPendingUI: true).selection
-        let result = await mutationService.removePaths(
-            existing: current,
+        flushPendingUISelectionToActiveTab()
+        let target = controller.activeTarget()
+        let result = await controller.removePathsFromActiveSelection(
             paths: paths,
-            rawPaths: paths,
             mode: mode,
-            rootScope: rootScope
+            rootScope: rootScope,
+            publishChange: false
         )
-        if result.mutated {
-            _ = await persistActiveSelection(result.selection, source: .runtimeMutation)
+        if result.mutated,
+           let target,
+           controller.selectionSnapshot(for: target) == result.selection
+        {
+            await deliverMirrored(Change(
+                tabID: target.tabID,
+                selection: result.selection,
+                source: .runtimeMutation
+            ))
         }
         return result
     }
@@ -199,18 +211,9 @@ final class WorkspaceSelectionCoordinator {
         return try await operation()
     }
 
-    private func applySelectionMirror(_ operation: () async -> Void) async {
+    private func deliverMirrored(_ change: Change) async {
         await withApplyingSelectionMirror {
-            await operation()
+            changeSubject.send(change)
         }
-    }
-
-    private func persist(_ selection: StoredSelection, for tabID: UUID, markDirty: Bool) -> Bool {
-        guard let workspaceManager, var tab = workspaceManager.composeTab(with: tabID) else { return false }
-        guard tab.selection != selection else { return false }
-        tab.selection = selection
-        tab.lastModified = Date()
-        workspaceManager.updateComposeTabStoredOnly(tab)
-        return true
     }
 }

@@ -15,6 +15,10 @@
 extern "C" {
 #endif
 
+/* Narrow allocation wrappers for Swift consumers that should not import Darwin. */
+char* repo_strdup(const char *text);
+void repo_free(void *pointer);
+
 /* Levenshtein distance calculation with optional cap
  * Returns actual distance if <= maxDist, or maxDist + 1 if greater
  * Pass maxDist = -1 for uncapped calculation

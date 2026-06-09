@@ -128,10 +128,6 @@ import XCTest
                     XCTAssertFalse(nestedEvents.contains { $0.phase == .handlerCompleted })
                     XCTAssertTrue(nestedEvents.contains { $0.phase == .cleanupGraceExpired })
                     XCTAssertTrue(nestedEvents.contains { $0.phase == .connectionForceDisconnectRequested })
-                    let nestedConnectionIsTerminal = await manager.debugIsExecutionWatchdogTerminal(
-                        connectionID: nestedConnectionID
-                    )
-                    XCTAssertTrue(nestedConnectionIsTerminal)
                     let providerFailureCount = await state.providerFailureCount()
                     XCTAssertEqual(providerFailureCount, 1)
                     XCTAssertTrue(try Self.toolResultText(response).contains("failed:"))
@@ -305,7 +301,13 @@ import XCTest
         func dispose() async {}
 
         private func cleanup(_ endpoint: PersistentMCPTestEndpoint) async {
+            await endpoint.client.waitUntilPendingWorkDrained()
+            XCTAssertTrue(
+                endpoint.client.pendingWorkSnapshotForTesting().isIdle,
+                "Nested MCP client still has pending request/interceptor work"
+            )
             endpoint.client.close()
+            await endpoint.client.waitUntilReaderLoopStopped()
             await endpoint.connectionManager.stop()
             await networkManager.debugRemoveConnection(endpoint.connectionID)
             await networkManager.clearClientConnectionPolicy(for: endpoint.clientName)

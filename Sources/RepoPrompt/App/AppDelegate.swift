@@ -78,14 +78,17 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
 
         // ───────────────────────────────────────────────────
         // Register global MCP app-wide helpers
+        let networkManager = ServerNetworkManager.shared
         let appSettingsMCPService = AppSettingsMCPService()
-        ServiceRegistry.register(appSettingsMCPService)
+        networkManager.serviceRegistry.register(appSettingsMCPService)
         self.appSettingsMCPService = appSettingsMCPService
 
         // Register global MCP window-routing helpers
         windowRoutingService = WindowRoutingService(
             windowStates: WindowStatesManager.shared,
-            networkMgr: ServerNetworkManager.shared
+            networkMgr: networkManager,
+            serviceRegistry: networkManager.serviceRegistry,
+            workspaceRepository: RepoPromptAppCoreContainer.shared.workspaceRepository
         )
         if !launchConfiguration.suppressesNonessentialLaunchSideEffects {
             // Request notification authorization
@@ -163,6 +166,8 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await WindowStatesManager.shared.awaitDrainingWindowFinalizers()
+            RepoPromptAppCoreContainer.shared.shutdownForAppTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 
@@ -177,6 +182,7 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
         MCPBackgroundModeCoordinator.shared.resetForTermination()
         WindowStatesManager.shared.signalTermination()
         ProcessTermination.beginAppTerminationFastPath()
+        RepoPromptAppCoreContainer.shared.shutdownForAppTermination()
         if !AppLaunchConfiguration.current.suppressesWindowPersistence {
             WindowStatesManager.shared.persistWindowSession(reason: "appWillTerminate")
         }

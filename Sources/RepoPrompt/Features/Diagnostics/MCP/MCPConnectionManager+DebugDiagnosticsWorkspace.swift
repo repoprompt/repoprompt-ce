@@ -175,7 +175,7 @@ import MCP
                         fields: WorkspaceSelectionDebugSignature.unprefixedFields(for: window.workspaceManager.composeTab(with: flushed.tabID ?? UUID())?.selection ?? flushed.selection)
                     )
                     let finalURL = try await window.workspaceManager.saveWorkspaceToFileAsync(activeWorkspace, source: .debugWorkspaceSelectionFixtureApply)
-                    await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: finalURL)
+                    await window.workspaceManager.sessionController.persistenceWriter.flush(url: finalURL)
                     extra["workspaceSaveFlushed"] = true
                     if let diskSelection = Self.debugDiskActiveComposeTabSelection(window: window) {
                         WorkspaceRestorePerfLog.event(

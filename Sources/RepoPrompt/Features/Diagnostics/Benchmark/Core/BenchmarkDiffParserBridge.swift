@@ -7,7 +7,11 @@ final class BenchmarkWorkspaceFilesViewModel: WorkspaceFilesViewModel {
 
     init(baseline: BenchmarkMockFileSystemSnapshot) {
         self.baseline = baseline
-        super.init(workspaceFileContextStore: WorkspaceFileContextStore())
+        let runtime = RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
+        super.init(
+            workspaceFileContextStore: runtime.workspaceFileContextStore,
+            selectionSliceCoordinator: runtime.selectionSliceCoordinator
+        )
     }
 
     override func pathLocation(

@@ -1,0 +1,36 @@
+{
+  "id": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+  "schemaVersion": 1,
+  "dateModified": 0,
+  "isSystemWorkspace": false,
+  "isHiddenInMenus": false,
+  "name": "Phase 0 App V1",
+  "repoPaths": ["__APP_FIXTURE_ROOT__"],
+  "presets": [],
+  "lastUsed": 0,
+  "currentPromptText": "phase zero app prompt",
+  "selectedMetaPromptIDs": [],
+  "composeTabs": [
+    {
+      "id": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+      "name": "T1",
+      "lastModified": 0,
+      "isPinned": false,
+      "selection": {
+        "selectedPaths": ["__APP_FIXTURE_ROOT__/Sources/Full.swift","__APP_FIXTURE_ROOT__/Sources/Sliced.swift"],
+        "autoCodemapPaths": ["__APP_FIXTURE_ROOT__/Sources/Structure.swift"],
+        "slices": {
+          "__APP_FIXTURE_ROOT__/Sources/Sliced.swift": [{"start": 2,"end": 4,"description": "phase zero slice"}]
+        },
+        "codemapAutoEnabled": false
+      },
+      "expandedFolders": ["__APP_FIXTURE_ROOT__/Sources"],
+      "promptText": "phase zero app prompt",
+      "selectedMetaPromptIDs": [],
+      "contextOverrides": {"useOverridePrompt": false,"overridePromptText": ""},
+      "discover": {"instructions": "","selectedContextBuilderPromptIDs": []}
+    }
+  ],
+  "activeComposeTabID": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+  "stashedTabs": []
+}

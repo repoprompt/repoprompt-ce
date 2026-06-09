@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class SecureStorageRepairServiceTests: XCTestCase {
@@ -133,13 +134,13 @@ private final class FakeSecureStorageBackend: SecureKeyValueStorageBackend, @unc
     struct Call: Equatable {
         let operation: Operation
         let account: SecureStorageAccount
-        let accessMode: KeychainAccessMode
+        let accessMode: SecureStorageAccessMode
     }
 
     let persistsValuesAcrossLaunches = true
-    var getErrors: [SecureStorageAccount: KeychainService.KeychainError] = [:]
-    var saveErrors: [SecureStorageAccount: KeychainService.KeychainError] = [:]
-    var deleteErrors: [SecureStorageAccount: KeychainService.KeychainError] = [:]
+    var getErrors: [SecureStorageAccount: SecureStorageError] = [:]
+    var saveErrors: [SecureStorageAccount: SecureStorageError] = [:]
+    var deleteErrors: [SecureStorageAccount: SecureStorageError] = [:]
     var savedValueOverride: String?
 
     private var values: [String: String]
@@ -150,7 +151,7 @@ private final class FakeSecureStorageBackend: SecureKeyValueStorageBackend, @unc
         self.values = Dictionary(uniqueKeysWithValues: values.map { ($0.key.identifier, $0.value) })
     }
 
-    func save(_ value: String, for key: String, accessMode: KeychainAccessMode) throws {
+    func save(_ value: String, for key: String, accessMode: SecureStorageAccessMode) throws {
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .save, account: account, accessMode: accessMode))
@@ -159,17 +160,17 @@ private final class FakeSecureStorageBackend: SecureKeyValueStorageBackend, @unc
         }
     }
 
-    func get(for key: String, accessMode: KeychainAccessMode) throws -> String {
+    func get(for key: String, accessMode: SecureStorageAccessMode) throws -> String {
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .get, account: account, accessMode: accessMode))
             if let error = getErrors[account] { throw error }
-            guard let value = values[key] else { throw KeychainService.KeychainError.itemNotFound }
+            guard let value = values[key] else { throw SecureStorageError.itemNotFound }
             return value
         }
     }
 
-    func delete(for key: String, accessMode: KeychainAccessMode) throws {
+    func delete(for key: String, accessMode: SecureStorageAccessMode) throws {
         try withLock {
             let account = try account(for: key)
             calls.append(Call(operation: .delete, account: account, accessMode: accessMode))
@@ -184,7 +185,7 @@ private final class FakeSecureStorageBackend: SecureKeyValueStorageBackend, @unc
 
     private func account(for key: String) throws -> SecureStorageAccount {
         guard let account = SecureStorageAccountCatalog.allAccounts.first(where: { $0.identifier == key }) else {
-            throw KeychainService.KeychainError.itemNotFound
+            throw SecureStorageError.itemNotFound
         }
         return account
     }

@@ -1,6 +1,8 @@
 import Foundation
 
 enum AgentProviderContextBuilder {
+    typealias AccountingOperation = (PromptContextAccountingRequest, WorkspaceFileContextStore) async throws -> PromptContextAccountingResult
+
     static func initialFileTree(
         selection logicalSelection: StoredSelection,
         store: WorkspaceFileContextStore,
@@ -31,10 +33,10 @@ enum AgentProviderContextBuilder {
         tokenCap: Int,
         store: WorkspaceFileContextStore,
         lookupContext: WorkspaceLookupContext,
+        accountingOperation: AccountingOperation? = nil,
         overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext) async -> String?)? = nil
     ) async -> String {
         let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
-        let accountingService = PromptContextAccountingService()
         let request = PromptContextAccountingRequest(
             selection: physicalSelection,
             codeMapUsage: .auto,
@@ -42,7 +44,18 @@ enum AgentProviderContextBuilder {
             rootScope: lookupContext.rootScope,
             pathLocateProfile: .uiAssisted
         )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
+        let accounting: PromptContextAccountingResult
+        do {
+            if let accountingOperation {
+                accounting = try await accountingOperation(request, store)
+            } else {
+                let accountingService = PromptContextAccountingService()
+                accounting = try await accountingService.calculatePromptStats(request: request, store: store)
+            }
+        } catch {
+            return ""
+        }
+
         let entries = accounting.resolvedEntries
         let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
         let codemapSnapshots = await store.codemapSnapshotDictionary()

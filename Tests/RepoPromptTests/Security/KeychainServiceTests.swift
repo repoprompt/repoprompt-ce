@@ -1,5 +1,7 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
+@testable import RepoPromptCoreMacOS
 import Security
 import XCTest
 
@@ -34,7 +36,7 @@ final class KeychainServiceTests: XCTestCase {
     }
 
     func testReadMapsSecurityStatusesToSanitizedErrors() {
-        let scenarios: [(OSStatus, KeychainService.KeychainError)] = [
+        let scenarios: [(OSStatus, SecureStorageError)] = [
             (errSecItemNotFound, .itemNotFound),
             (errSecInteractionNotAllowed, .interactionNotAllowed),
             (errSecUserCanceled, .userInteractionCancelled),
@@ -48,7 +50,7 @@ final class KeychainServiceTests: XCTestCase {
                 try service.get(for: "api-key", accessMode: .nonInteractive(reason: .test)),
                 "status=\(status)"
             ) { error in
-                XCTAssertEqual(error as? KeychainService.KeychainError, expectedError, "status=\(status)")
+                XCTAssertEqual(error as? SecureStorageError, expectedError, "status=\(status)")
             }
         }
     }
@@ -63,7 +65,7 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertThrowsError(
             try service.get(for: "api-key", accessMode: .nonInteractive(reason: .test))
         ) { error in
-            XCTAssertEqual(error as? KeychainService.KeychainError, .itemNotFound)
+            XCTAssertEqual(error as? SecureStorageError, .itemNotFound)
         }
 
         XCTAssertEqual(fake.copyQueries.map { $0.stringValue(for: kSecAttrService) }, [canonicalService])
@@ -87,7 +89,7 @@ final class KeychainServiceTests: XCTestCase {
         XCTAssertThrowsError(
             try service.get(for: "api-key", accessMode: .nonInteractive(reason: .test))
         ) { error in
-            XCTAssertEqual(error as? KeychainService.KeychainError, .interactionNotAllowed)
+            XCTAssertEqual(error as? SecureStorageError, .interactionNotAllowed)
         }
 
         XCTAssertEqual(fake.copyQueries.map { $0.stringValue(for: kSecAttrService) }, [canonicalService])

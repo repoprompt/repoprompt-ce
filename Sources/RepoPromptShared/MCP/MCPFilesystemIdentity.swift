@@ -1,4 +1,3 @@
-import Darwin
 import Foundation
 
 /// Shared filesystem and stable-name authority for RepoPrompt MCP products.
@@ -130,11 +129,11 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
         }
     }
 
-    public func socketDirectoryURL(userID: uid_t = getuid()) -> URL {
+    public func socketDirectoryURL(userID: UInt32) -> URL {
         URL(fileURLWithPath: "/tmp/\(socketDirectoryName)-\(userID)", isDirectory: true)
     }
 
-    public func bootstrapSocketURL(userID: uid_t = getuid()) -> URL {
+    public func bootstrapSocketURL(userID: UInt32) -> URL {
         socketDirectoryURL(userID: userID).appendingPathComponent(bootstrapSocketName, isDirectory: false)
     }
 

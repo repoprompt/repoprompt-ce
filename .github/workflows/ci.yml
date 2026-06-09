@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Run repository guardrails
         run: make guardrails
@@ -41,6 +43,12 @@ jobs:
 
       - name: Build MCP product
         run: swift build --product repoprompt-mcp
+
+      - name: Build headless MCP product
+        run: swift build --product repoprompt-headless
+
+      - name: Run headless MCP smoke
+        run: ./Scripts/smoke_headless_mcp.sh --skip-package
 
       - name: Run app tests
         run: swift test

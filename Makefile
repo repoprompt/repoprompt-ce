@@ -1,6 +1,7 @@
-.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production dev-status dev-build dev-swift-build dev-run dev-test dev-provider-test dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status package-headless install-debug-headless uninstall-debug-headless headless-debug-status headless-smoke resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production dev-status dev-guardrails dev-build dev-swift-build dev-run dev-test dev-provider-test dev-smoke dev-smoke-launch dev-package-headless dev-install-debug-headless dev-headless-debug-status dev-headless-smoke dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
+HEADLESS_CONFIGURATION ?= debug
 
 doctor:
 	./Scripts/doctor.sh
@@ -34,6 +35,21 @@ uninstall-debug-cli:
 debug-cli-status:
 	./Scripts/install_debug_cli.sh status
 
+package-headless:
+	./Scripts/package_headless.sh $(HEADLESS_CONFIGURATION)
+
+install-debug-headless:
+	./Scripts/install_headless_cli.sh install --configuration debug --build
+
+uninstall-debug-headless:
+	./Scripts/install_headless_cli.sh uninstall --configuration debug
+
+headless-debug-status:
+	./Scripts/install_headless_cli.sh status --configuration debug
+
+headless-smoke:
+	./Scripts/smoke_headless_mcp.sh --configuration $(HEADLESS_CONFIGURATION)
+
 resolve:
 	swift package resolve
 
@@ -48,6 +64,10 @@ test:
 
 guardrails:
 	./Scripts/source_layout_guardrails.sh
+	bash ./Scripts/core_boundary_guardrails.sh
+	python3 ./Scripts/test_core_boundary_guardrails.py
+	python3 ./Scripts/test_shared_runtime_headless_baseline.py
+	python3 ./Scripts/test_shared_runtime_phase2_boundaries.py
 	./Scripts/contributor_allowlist_guardrails.sh
 	./Scripts/swiftpm_notice_guardrails.sh
 
@@ -76,6 +96,9 @@ install-local-production:
 dev-status:
 	./conductor status
 
+dev-guardrails:
+	./conductor guardrails
+
 dev-build:
 	./conductor build
 
@@ -96,6 +119,18 @@ dev-smoke:
 
 dev-smoke-launch:
 	./conductor smoke --launch
+
+dev-package-headless:
+	./conductor package-headless $(HEADLESS_CONFIGURATION)
+
+dev-install-debug-headless:
+	./conductor install-headless-debug
+
+dev-headless-debug-status:
+	./conductor headless-debug-status
+
+dev-headless-smoke:
+	./conductor headless-smoke --configuration $(HEADLESS_CONFIGURATION)
 
 dev-format:
 	./conductor format

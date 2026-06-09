@@ -7,6 +7,7 @@ import contextlib
 import io
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -199,6 +200,15 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_guardrails_delegate_to_make_aggregate_without_claiming_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            argv, lanes, _cwd, _env, timeout = registry.prepare({"operation": "guardrails"})
+
+        self.assertEqual(argv, ["make", "guardrails"])
+        self.assertEqual(lanes, [])
+        self.assertEqual(timeout, conductor.SHORT_TIMEOUT_SECONDS)
+
     def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -279,8 +289,8 @@ class LifecycleQueueTests(LifecycleTestCase):
         fake_process.wait.return_value = 0
 
         with mock.patch.object(conductor.subprocess, "Popen", return_value=fake_process) as popen, mock.patch.object(
-            state, "_schedule_locked"
-        ), mock.patch.object(state, "_refresh_output_summary"):
+            conductor, "process_snapshot", return_value=None
+        ), mock.patch.object(state, "_schedule_locked"), mock.patch.object(state, "_refresh_output_summary"):
             state._run_job(job.ticket)
 
         self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
@@ -374,6 +384,57 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("CLOSED_FD_REGRESSION_OK", result.stdout)
 
+    def test_headless_operations_delegate_without_live_app_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            package_argv, package_lanes, _cwd, _env, package_timeout = registry.prepare(
+                {"operation": "package-headless", "args": {"config": "debug"}}
+            )
+            install_argv, install_lanes, _cwd, _env, _install_timeout = registry.prepare(
+                {"operation": "install-headless-debug"}
+            )
+            status_argv, status_lanes, _cwd, _env, status_timeout = registry.prepare(
+                {"operation": "headless-debug-status"}
+            )
+            smoke_argv, smoke_lanes, _cwd, _env, _smoke_timeout = registry.prepare(
+                {"operation": "headless-smoke", "args": {"config": "release"}}
+            )
+
+        self.assertEqual(Path(package_argv[0]).name, "package_headless.sh")
+        self.assertEqual(package_argv[1], "debug")
+        self.assertEqual(package_lanes, ["build", "headlessArtifact"])
+        self.assertEqual(Path(install_argv[0]).name, "install_headless_cli.sh")
+        self.assertEqual(install_argv[1:], ["install", "--configuration", "debug", "--build"])
+        self.assertEqual(install_lanes, ["build", "headlessArtifact"])
+        self.assertEqual(Path(status_argv[0]).name, "install_headless_cli.sh")
+        self.assertEqual(status_argv[1:], ["status", "--configuration", "debug"])
+        self.assertEqual(status_lanes, [])
+        self.assertEqual(status_timeout, conductor.SHORT_TIMEOUT_SECONDS)
+        self.assertEqual(Path(smoke_argv[0]).name, "smoke_headless_mcp.sh")
+        self.assertEqual(smoke_argv[1:], ["--configuration", "release"])
+        self.assertEqual(smoke_lanes, ["build", "headlessArtifact", "headlessSmoke"])
+        for lane_set in (package_lanes, install_lanes, status_lanes, smoke_lanes):
+            self.assertNotIn("liveApp", lane_set)
+        self.assertEqual(package_timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+
+    def test_swift_build_accepts_headless_product_choice(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "swift-build", ["--product", "repoprompt-headless"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"product": "repoprompt-headless"})
+
+    def test_headless_smoke_cli_accepts_configuration(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            code = conductor.handle_real_operation(state.paths, "headless-smoke", ["--configuration", "release"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(enqueue.call_args.args[2], {"config": "release"})
+
     def test_app_stop_supersedes_queued_live_app_but_not_build_only_work(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -435,7 +496,9 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         with mock.patch.object(state, "_terminate_process_group_locked") as terminate, mock.patch.object(
             state, "_kill_process_group_locked"
-        ) as kill, mock.patch.object(state, "_schedule_locked"), mock.patch.object(
+        ) as kill, mock.patch.object(
+            state, "_process_tree_alive_locked", side_effect=[True, True, False]
+        ), mock.patch.object(state, "_schedule_locked"), mock.patch.object(
             conductor, "TERMINATE_GRACE_SECONDS", 0.01
         ), mock.patch.object(conductor.threading, "Thread") as thread_factory:
             state.enqueue({"operation": "app", "args": {"subcommand": "stop"}})
@@ -548,6 +611,136 @@ class LifecycleQueueTests(LifecycleTestCase):
 
         self.assertEqual(payload["blockedBy"][0]["ticket"], active.ticket)
         self.assertEqual(payload["blockedBy"][0]["conflictingLanes"], ["build"])
+
+
+class ProcessTreeTerminationTests(LifecycleTestCase):
+    def test_process_group_signal_is_supplemented_by_identity_checked_descendants(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_job(state, "tree", "sleep", {}, ["build"], "running")
+        job.process_pid = 100
+        job.process_pgid = 100
+        job.process_identity = "root-start"
+        snapshot = {
+            100: (1, "root-start"),
+            200: (100, "child-start"),
+            201: (100, "reused-start"),
+            300: (1, "unrelated-start"),
+        }
+        events: list[str] = []
+
+        def snapshot_processes() -> conductor.ProcessSnapshot:
+            events.append("snapshot")
+            return snapshot
+
+        def signal_group(pgid: int, process_signal: signal.Signals) -> None:
+            events.append(f"group:{pgid}:{process_signal.value}")
+
+        def current_identity(pid: int) -> str | None:
+            events.append(f"identity:{pid}")
+            return {200: "child-start", 201: "replacement-start"}.get(pid)
+
+        with mock.patch.object(conductor, "process_snapshot", side_effect=snapshot_processes), mock.patch.object(
+            conductor.os, "killpg", side_effect=signal_group
+        ), mock.patch.object(conductor, "process_start_token", side_effect=current_identity), mock.patch.object(
+            conductor.os, "kill"
+        ) as signal_pid:
+            state._signal_process_tree_locked(job, signal.SIGTERM)
+
+        self.assertEqual(events[0], "snapshot")
+        self.assertEqual(events[1], f"group:100:{signal.SIGTERM.value}")
+        signal_pid.assert_called_once_with(200, signal.SIGTERM)
+
+    @staticmethod
+    def tree_command(pid_path: Path) -> list[str]:
+        code = (
+            "import subprocess,sys,time\n"
+            "child=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)'],"
+            "start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+            "with open(sys.argv[1],'w',encoding='utf-8') as handle:\n"
+            "    handle.write(str(child.pid))\n"
+            "while True: time.sleep(1)\n"
+        )
+        return [sys.executable, "-u", "-c", code, str(pid_path)]
+
+    @staticmethod
+    def wait_for_child_pid(pid_path: Path) -> int:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                return int(pid_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                time.sleep(0.02)
+        raise AssertionError("separate-process-group child PID was not written")
+
+    @staticmethod
+    def wait_for_pid_exit(pid: int) -> None:
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if not conductor.pid_alive(pid):
+                return
+            time.sleep(0.02)
+        raise AssertionError(f"descendant process {pid} survived conductor termination")
+
+    @staticmethod
+    def stop_process(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=1.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1.0)
+
+    @staticmethod
+    def kill_pid(pid: int, identity: str | None) -> None:
+        if identity is None or conductor.process_start_token(pid) != identity:
+            return
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, 9)
+
+    def run_separate_group_job(self, *, cancel: bool) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        child_pid_path = state.paths.state_dir / "separate-group-child.pid"
+        unrelated = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self.addCleanup(self.stop_process, unrelated)
+        timeout = 30.0 if cancel else 0.2
+        prepared = (
+            self.tree_command(child_pid_path),
+            ["build"],
+            state.paths.repo_root,
+            os.environ.copy(),
+            timeout,
+        )
+
+        with mock.patch.object(state.registry, "prepare", return_value=prepared):
+            payload = state.enqueue({"operation": "sleep", "args": {"seconds": 60}, "timeout": timeout})
+            child_pid = self.wait_for_child_pid(child_pid_path)
+            child_identity = conductor.process_start_token(child_pid)
+            self.addCleanup(self.kill_pid, child_pid, child_identity)
+            self.assertEqual(os.getpgid(child_pid), child_pid)
+            self.assertNotEqual(os.getpgid(child_pid), state.jobs[payload["ticket"]].process_pgid)
+            if cancel:
+                state.job_cancel(payload["ticket"], None)
+            result = state.job_wait(payload["ticket"], None, 10.0)
+
+        self.assertEqual(result["state"], "canceled" if cancel else "failed")
+        self.assertEqual(result["exitCode"], 130 if cancel else 124)
+        self.wait_for_pid_exit(child_pid)
+        self.assertIsNone(unrelated.poll())
+
+    def test_cancellation_terminates_descendant_in_separate_process_group(self) -> None:
+        self.run_separate_group_job(cancel=True)
+
+    def test_timeout_terminates_descendant_in_separate_process_group(self) -> None:
+        self.run_separate_group_job(cancel=False)
 
 
 class SmokeOperationTests(unittest.TestCase):

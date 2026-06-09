@@ -2,10 +2,90 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
 final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
+    func testBootstrapStopCompletesForPartiallyInitializedBoundConnection() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                _ = lease
+                let networkManager = ServerNetworkManager.shared
+                await networkManager.setEnabled(true)
+
+                var socketFDs = [Int32](repeating: -1, count: 2)
+                guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
+                    throw PersistentMCPTestSocketClient.ClientError.posix(operation: "socketpair", code: errno)
+                }
+                var clientFD = socketFDs[0]
+                defer {
+                    if clientFD >= 0 {
+                        Darwin.close(clientFD)
+                    }
+                }
+
+                let connectionID = UUID()
+                let sessionToken = "persistent-mcp-partial-stop-\(UUID().uuidString)"
+                let clientName = "persistent-mcp-partial-stop-\(UUID().uuidString)"
+                let manager = try BootstrapSocketConnectionManager(
+                    connectionID: connectionID,
+                    sessionToken: sessionToken,
+                    peerIdentity: MCPPeerIdentity(
+                        socketObservedPID: Int(getpid()),
+                        handshakeClaimedPID: Int(getpid())
+                    ),
+                    clientName: clientName,
+                    purpose: .unknown,
+                    codeMapsDisabled: false,
+                    connectedFD: socketFDs[1],
+                    parentManager: networkManager
+                )
+                await networkManager.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: manager,
+                    clientName: clientName,
+                    sessionToken: sessionToken
+                )
+
+                let startTask = Task {
+                    try await manager.start { _ in true }
+                }
+                while await !(manager.debugTransportCleanupSnapshot()).hasActiveReader {
+                    await Task.yield()
+                }
+
+                await withTaskGroup(of: Void.self) { group in
+                    group.addTask { await manager.stop() }
+                    group.addTask { await manager.stop() }
+                }
+                _ = try? await startTask.value
+
+                Darwin.close(clientFD)
+                clientFD = -1
+
+                while true {
+                    let snapshot = await manager.debugTransportCleanupSnapshot()
+                    if !snapshot.hasActiveReader,
+                       snapshot.pendingReaderCancellationCount == 0,
+                       !snapshot.readerIsRetained,
+                       !snapshot.socketIsOwned
+                    {
+                        break
+                    }
+                    await Task.yield()
+                }
+
+                await networkManager.debugRemoveConnection(connectionID)
+                await networkManager.debugClearPersistedRoutingState(for: clientName)
+                let finalState = await manager.connectionState()
+                XCTAssertEqual(finalState, .cancelled)
+            }
+        #else
+            throw XCTSkip("Bootstrap socket shutdown regression requires DEBUG transport diagnostics.")
+        #endif
+    }
+
     func testDistinctConnectionsOverlapWithoutCrossRoutingReadOrSearchResults() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
@@ -29,7 +109,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(
                     lease: lease,
-                    contextASearchFileCount: 12
+                    contextASearchFileCount: 12,
+                    includeStandardAuxiliaryEndpoints: false
                 )
                 do {
                     try await runK12SharedWindowSearchCheckpoint(fixture: fixture)
@@ -59,6 +140,27 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             }
         #else
             throw XCTSkip("Exact persisted routing session cleanup diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testQueuedCallRejectsRouteInvalidatedWhileWaitingForConnectionPermit() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    includeStandardAuxiliaryEndpoints: false
+                )
+                do {
+                    try await runQueuedCatalogInvalidationCheckpoint(fixture: fixture)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        #else
+            throw XCTSkip("Queued MCP dispatch regression requires DEBUG limiter observation.")
         #endif
     }
 
@@ -113,51 +215,75 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
             }
-            let broadTask = Task {
-                try await primary.callTool(
-                    name: MCPWindowToolName.search,
-                    arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
-                )
-            }
-            var scopedTasks: [Task<(URL, PersistentMCPTestRPCResponse), Error>] = []
             do {
-                let broadStarted = await gate.waitUntilStarted()
-                XCTAssertTrue(broadStarted)
-                scopedTasks = zip(endpoints.dropFirst(), searchFiles.dropFirst()).map { endpoint, fileURL in
-                    Task {
-                        let response = try await endpoint.callTool(
-                            name: MCPWindowToolName.search,
-                            arguments: Self.sharedWindowScopedSearchArguments(path: fileURL.path)
-                        )
-                        return (fileURL, response)
-                    }
-                }
-                for task in scopedTasks {
-                    let (fileURL, response) = try await task.value
-                    let text = try Self.toolText(from: response)
-                    Self.assertHealthySearchText(text)
-                    XCTAssertTrue(text.contains(fileURL.lastPathComponent), text)
-                    for otherFileURL in searchFiles where otherFileURL != fileURL {
-                        XCTAssertFalse(text.contains(otherFileURL.lastPathComponent), text)
-                    }
-                    XCTAssertFalse(text.contains(fixture.contextB.fileURL.lastPathComponent), text)
-                }
+                try await withThrowingTaskGroup(
+                    of: (K12ScopedSearchOperation, PersistentMCPTestRPCResponse).self
+                ) { group in
+                    do {
+                        group.addTask {
+                            let response = try await primary.callTool(
+                                name: MCPWindowToolName.search,
+                                arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
+                            )
+                            return (.broad, response)
+                        }
+                        let broadStarted = await gate.waitUntilStarted()
+                        XCTAssertTrue(broadStarted)
 
-                await gate.release()
-                let broadResponse = try await broadTask.value
-                let broadText = try Self.toolText(from: broadResponse)
-                Self.assertHealthySearchText(broadText)
-                for fileURL in searchFiles {
-                    XCTAssertTrue(broadText.contains(fileURL.lastPathComponent), broadText)
+                        for (index, endpoint) in endpoints.dropFirst().enumerated() {
+                            let fileURL = searchFiles[index + 1]
+                            group.addTask {
+                                let response = try await endpoint.callTool(
+                                    name: MCPWindowToolName.search,
+                                    arguments: Self.sharedWindowScopedSearchArguments(path: fileURL.path)
+                                )
+                                return (.scoped(index), response)
+                            }
+                        }
+
+                        var broadResponse: PersistentMCPTestRPCResponse?
+                        var scopedResponseCount = 0
+                        while scopedResponseCount < endpoints.count - 1,
+                              let (operation, response) = try await group.next()
+                        {
+                            switch operation {
+                            case .broad:
+                                broadResponse = response
+                            case let .scoped(index):
+                                let fileURL = searchFiles[index + 1]
+                                let text = try Self.toolText(from: response)
+                                Self.assertHealthySearchText(text)
+                                XCTAssertTrue(text.contains(fileURL.lastPathComponent), text)
+                                for otherFileURL in searchFiles where otherFileURL != fileURL {
+                                    XCTAssertFalse(text.contains(otherFileURL.lastPathComponent), text)
+                                }
+                                XCTAssertFalse(text.contains(fixture.contextB.fileURL.lastPathComponent), text)
+                                scopedResponseCount += 1
+                            }
+                        }
+                        XCTAssertEqual(scopedResponseCount, endpoints.count - 1)
+
+                        await gate.release()
+                        while let (operation, response) = try await group.next() {
+                            switch operation {
+                            case .broad:
+                                broadResponse = response
+                            case .scoped:
+                                XCTFail("Scoped K12 response was returned more than once")
+                            }
+                        }
+                        let broadText = try Self.toolText(from: XCTUnwrap(broadResponse))
+                        Self.assertHealthySearchText(broadText)
+                        for fileURL in searchFiles {
+                            XCTAssertTrue(broadText.contains(fileURL.lastPathComponent), broadText)
+                        }
+                    } catch {
+                        await gate.release()
+                        group.cancelAll()
+                        throw error
+                    }
                 }
             } catch {
-                broadTask.cancel()
-                scopedTasks.forEach { $0.cancel() }
-                await gate.release()
-                _ = try? await broadTask.value
-                for task in scopedTasks {
-                    _ = try? await task.value
-                }
                 await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
                 throw error
             }
@@ -237,56 +363,96 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
             }
-            let active = Task {
-                try await endpoints[0].callTool(
-                    name: MCPWindowToolName.search,
-                    arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
-                )
-            }
-            var queued: Task<PersistentMCPTestRPCResponse, Error>?
-            var excess: [Task<PersistentMCPTestRPCResponse, Error>] = []
             do {
-                guard await gate.waitUntilStarted() else {
-                    XCTFail("The first K12 broad search did not acquire the shared lane")
-                    throw ClientFixtureError.broadSearchDidNotStart
-                }
-                queued = Task {
-                    try await endpoints[1].callTool(
-                        name: MCPWindowToolName.search,
-                        arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
-                    )
-                }
-                await Self.waitForSearchLaneWaiter(store: store, expectedCount: 1)
-                let saturated = await store.searchLaneSnapshotForTesting()
-                XCTAssertEqual(saturated.activePermitCount, 1)
-                XCTAssertEqual(saturated.waiterCount, 1)
-                XCTAssertEqual(saturated.maximumActivePermitCount, 1)
-                XCTAssertEqual(saturated.maximumWaiterCount, 1)
+                try await withThrowingTaskGroup(
+                    of: (K12BurstOperation, PersistentMCPTestRPCResponse).self
+                ) { group in
+                    do {
+                        group.addTask {
+                            let response = try await endpoints[0].callTool(
+                                name: MCPWindowToolName.search,
+                                arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
+                            )
+                            return (.active, response)
+                        }
+                        guard await gate.waitUntilStarted() else {
+                            XCTFail("The first K12 broad search did not acquire the shared lane")
+                            throw ClientFixtureError.broadSearchDidNotStart
+                        }
+                        group.addTask {
+                            let response = try await endpoints[1].callTool(
+                                name: MCPWindowToolName.search,
+                                arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
+                            )
+                            return (.queued, response)
+                        }
+                        await Self.waitForSearchLaneWaiter(store: store, expectedCount: 1)
+                        let saturated = await store.searchLaneSnapshotForTesting()
+                        XCTAssertEqual(saturated.activePermitCount, 1)
+                        XCTAssertEqual(saturated.waiterCount, 1)
+                        XCTAssertEqual(saturated.maximumActivePermitCount, 1)
+                        XCTAssertEqual(saturated.maximumWaiterCount, 1)
 
-                excess = endpoints.dropFirst(2).map { endpoint in
-                    Task {
-                        try await endpoint.callTool(
-                            name: MCPWindowToolName.search,
-                            arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
+                        for (index, endpoint) in endpoints.dropFirst(2).enumerated() {
+                            group.addTask {
+                                let response = try await endpoint.callTool(
+                                    name: MCPWindowToolName.search,
+                                    arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
+                                )
+                                return (.excess(index), response)
+                            }
+                        }
+
+                        var activeResponse: PersistentMCPTestRPCResponse?
+                        var queuedResponse: PersistentMCPTestRPCResponse?
+                        var excessResponseCount = 0
+                        while excessResponseCount < endpoints.count - 2,
+                              let (operation, response) = try await group.next()
+                        {
+                            switch operation {
+                            case .active:
+                                activeResponse = response
+                            case .queued:
+                                queuedResponse = response
+                            case .excess:
+                                try Self.assertSearchBackpressureResult(response)
+                                excessResponseCount += 1
+                            }
+                        }
+                        XCTAssertEqual(excessResponseCount, endpoints.count - 2)
+                        let overloaded = await store.searchLaneSnapshotForTesting()
+                        XCTAssertEqual(overloaded.activePermitCount, 1)
+                        XCTAssertEqual(overloaded.waiterCount, 1)
+                        XCTAssertEqual(overloaded.overloadCount, endpoints.count - 2)
+
+                        await gate.release()
+                        while let (operation, response) = try await group.next() {
+                            switch operation {
+                            case .active:
+                                activeResponse = response
+                            case .queued:
+                                queuedResponse = response
+                            case .excess:
+                                XCTFail("K12 excess response was returned more than once")
+                            }
+                        }
+                        try Self.assertSharedWindowBroadSearchResult(
+                            XCTUnwrap(activeResponse),
+                            searchFiles: searchFiles
                         )
+                        try Self.assertSharedWindowBroadSearchResult(
+                            XCTUnwrap(queuedResponse),
+                            searchFiles: searchFiles
+                        )
+                    } catch {
+                        await gate.release()
+                        group.cancelAll()
+                        throw error
                     }
                 }
-                for task in excess {
-                    try await Self.assertSearchBackpressureResult(task.value)
-                }
-                let overloaded = await store.searchLaneSnapshotForTesting()
-                XCTAssertEqual(overloaded.activePermitCount, 1)
-                XCTAssertEqual(overloaded.waiterCount, 1)
-                XCTAssertEqual(overloaded.overloadCount, endpoints.count - 2)
-
-                await gate.release()
-                let activeResponse = try await active.value
-                let queuedResponse = try await XCTUnwrap(queued).value
-                try Self.assertSharedWindowBroadSearchResult(activeResponse, searchFiles: searchFiles)
-                try Self.assertSharedWindowBroadSearchResult(queuedResponse, searchFiles: searchFiles)
                 await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
 
-                for endpoint in endpoints.dropFirst(2) {
+                for (index, endpoint) in endpoints.dropFirst(2).enumerated() {
                     let retry = try await endpoint.callTool(
                         name: MCPWindowToolName.search,
                         arguments: Self.sharedWindowBroadSearchArguments(countOnly: false)
@@ -301,18 +467,96 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 XCTAssertEqual(settled.grantCount, endpoints.count)
                 await restoreBroadSearchAdmissionConfiguration(baselineConfiguration, store: store)
             } catch {
-                active.cancel()
-                queued?.cancel()
-                excess.forEach { $0.cancel() }
                 await gate.release()
-                _ = try? await active.value
-                if let queued {
-                    _ = try? await queued.value
-                }
-                for task in excess {
-                    _ = try? await task.value
-                }
                 await restoreBroadSearchAdmissionConfiguration(baselineConfiguration, store: store)
+                throw error
+            }
+        }
+
+        func runQueuedCatalogInvalidationCheckpoint(fixture: PersistentMCPTestFixture) async throws {
+            let endpoint = try fixture.endpointA()
+            try await Self.bind(endpoint, to: fixture.contextA.tabID)
+            let probe = RouteInvocationProbe()
+            let service = fixture.contextA.catalogService
+            await fixture.networkManager.debugSetResolvedToolOperationOverride(
+                toolName: MCPWindowToolName.readFile
+            ) {
+                await probe.invokeOld()
+                return .object(["revision": .string("old")])
+            }
+
+            do {
+                try await withThrowingTaskGroup(
+                    of: (QueuedCatalogOperation, PersistentMCPTestRPCResponse).self
+                ) { group in
+                    do {
+                        group.addTask {
+                            do {
+                                let response = try await endpoint.callTool(
+                                    name: MCPWindowToolName.readFile,
+                                    arguments: ["path": fixture.contextA.fileURL.path]
+                                )
+                                await probe.failOldInvocationStartIfNeeded()
+                                return (.first, response)
+                            } catch {
+                                await probe.failOldInvocationStartIfNeeded()
+                                throw error
+                            }
+                        }
+                        try await probe.waitUntilOldInvocationStarted()
+
+                        group.addTask {
+                            let response = try await endpoint.callTool(
+                                name: MCPWindowToolName.readFile,
+                                arguments: ["path": fixture.contextA.fileURL.path]
+                            )
+                            return (.queued, response)
+                        }
+                        await fixture.networkManager.debugWaitForLimiterWaiter(for: endpoint.connectionID)
+
+                        fixture.networkManager.serviceRegistry.invalidateCatalog(for: service)
+                        _ = await fixture.networkManager.serviceRegistry.awaitCurrentSnapshot()
+                        await probe.releaseOldInvocation()
+
+                        var responses: [QueuedCatalogOperation: PersistentMCPTestRPCResponse] = [:]
+                        while let (operation, response) = try await group.next() {
+                            responses[operation] = response
+                        }
+                        let firstResponse = try XCTUnwrap(responses[.first])
+                        let queuedResponse = try XCTUnwrap(responses[.queued])
+                        XCTAssertTrue(try Self.toolText(from: firstResponse).contains("old"))
+                        let queuedError = try Self.toolErrorText(from: queuedResponse)
+                        XCTAssertTrue(queuedError.contains("catalog changed while this call was queued"), queuedError)
+                    } catch {
+                        await probe.failOldInvocationStartIfNeeded()
+                        await probe.releaseOldInvocation()
+                        group.cancelAll()
+                        throw error
+                    }
+                }
+                await fixture.networkManager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.readFile,
+                    operation: nil
+                )
+
+                let freshResponse = try await endpoint.callTool(
+                    name: MCPWindowToolName.readFile,
+                    arguments: ["path": fixture.contextA.fileURL.path]
+                )
+                try Self.assertReadResult(
+                    freshResponse,
+                    contains: fixture.contextA.sentinel,
+                    excludes: fixture.contextB.sentinel
+                )
+                let oldCount = await probe.oldInvocationCount()
+                XCTAssertEqual(oldCount, 1)
+            } catch {
+                await probe.failOldInvocationStartIfNeeded()
+                await probe.releaseOldInvocation()
+                await fixture.networkManager.debugSetResolvedToolOperationOverride(
+                    toolName: MCPWindowToolName.readFile,
+                    operation: nil
+                )
                 throw error
             }
         }
@@ -454,97 +698,124 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 await gate.markStartedAndWaitForRelease()
             }
             do {
-                let firstHeldSearch = Task {
-                    try await endpointA.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
-                }
-                await fulfillment(of: [heldSearchStarted], timeout: 1)
-                let secondHeldSearch = Task {
-                    try await endpointAQueued.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
-                }
-                await Self.waitForSearchLaneWaiter(store: heldStore, expectedCount: 1)
-                let heldSearchStartedCount = await gate.startedCountSnapshot()
-                XCTAssertEqual(heldSearchStartedCount, 1)
-                let heldSnapshot = await heldStore.searchLaneSnapshotForTesting()
-                XCTAssertEqual(heldSnapshot.activePermitCount, 1)
-                XCTAssertEqual(heldSnapshot.waiterCount, 1)
+                try await withThrowingTaskGroup(
+                    of: (BroadSearchAdmissionOperation, PersistentMCPTestRPCResponse).self
+                ) { group in
+                    do {
+                        group.addTask {
+                            let response = try await endpointA.callTool(
+                                name: MCPWindowToolName.search,
+                                arguments: Self.searchArguments
+                            )
+                            return (.heldSearch, response)
+                        }
+                        await fulfillment(of: [heldSearchStarted], timeout: 1)
+                        group.addTask {
+                            let response = try await endpointAQueued.callTool(
+                                name: MCPWindowToolName.search,
+                                arguments: Self.searchArguments
+                            )
+                            return (.queuedSearch, response)
+                        }
+                        await Self.waitForSearchLaneWaiter(store: heldStore, expectedCount: 1)
+                        let heldSearchStartedCount = await gate.startedCountSnapshot()
+                        XCTAssertEqual(heldSearchStartedCount, 1)
+                        let heldSnapshot = await heldStore.searchLaneSnapshotForTesting()
+                        XCTAssertEqual(heldSnapshot.activePermitCount, 1)
+                        XCTAssertEqual(heldSnapshot.waiterCount, 1)
 
-                let overflow = try await endpointAOverflow.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
-                try Self.assertSearchBackpressureResult(overflow)
+                        let overflow = try await endpointAOverflow.callTool(
+                            name: MCPWindowToolName.search,
+                            arguments: Self.searchArguments
+                        )
+                        try Self.assertSearchBackpressureResult(overflow)
 
-                let sameConnectionReadQueued = expectation(description: "same-connection read queued in limiter")
-                let observerInstalled = await fixture.networkManager.setConnectionLimiterStateObserverForTesting(
-                    connectionID: endpointA.connectionID
-                ) { snapshot in
-                    if snapshot.permits == 0,
-                       snapshot.waiterCount == 1,
-                       snapshot.inFlight == 2
-                    {
-                        sameConnectionReadQueued.fulfill()
+                        let sameConnectionReadQueued = expectation(description: "same-connection read queued in limiter")
+                        let observerInstalled = await fixture.networkManager.setConnectionLimiterStateObserverForTesting(
+                            connectionID: endpointA.connectionID
+                        ) { snapshot in
+                            if snapshot.permits == 0,
+                               snapshot.waiterCount == 1,
+                               snapshot.inFlight == 2
+                            {
+                                sameConnectionReadQueued.fulfill()
+                            }
+                        }
+                        XCTAssertTrue(observerInstalled)
+                        group.addTask {
+                            let response = try await endpointA.callTool(
+                                name: MCPWindowToolName.readFile,
+                                arguments: ["path": fixture.contextA.fileURL.path]
+                            )
+                            return (.serializedRead, response)
+                        }
+                        await fulfillment(of: [sameConnectionReadQueued], timeout: 1)
+                        _ = await fixture.networkManager.setConnectionLimiterStateObserverForTesting(
+                            connectionID: endpointA.connectionID,
+                            observer: nil
+                        )
+                        let queuedLimiterState = await fixture.networkManager.connectionLimiterSnapshotForTesting(
+                            connectionID: endpointA.connectionID
+                        )
+                        XCTAssertEqual(queuedLimiterState?.permits, 0)
+                        XCTAssertEqual(queuedLimiterState?.waiterCount, 1)
+                        XCTAssertEqual(queuedLimiterState?.inFlight, 2)
+
+                        let exactRead = try await endpointARead.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: ["path": fixture.contextA.fileURL.path]
+                        )
+                        try Self.assertReadResult(exactRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
+                        try await Self.assertRetainedReadSpellings(endpointARead, context: fixture.contextA)
+                        let sameStorePathControl = try await endpointARead.callTool(
+                            name: MCPWindowToolName.search,
+                            arguments: Self.pathSearchArguments
+                        )
+                        try Self.assertSearchResult(sameStorePathControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                        let sameStoreScopedContentControl = try await endpointARead.callTool(
+                            name: MCPWindowToolName.search,
+                            arguments: Self.scopedSearchArguments(path: fixture.contextA.fileURL.path)
+                        )
+                        try Self.assertSearchResult(sameStoreScopedContentControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+
+                        let peerRead = try await endpointB.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: ["path": fixture.contextB.fileURL.path]
+                        )
+                        try Self.assertReadResult(peerRead, contains: fixture.contextB.sentinel, excludes: fixture.contextA.sentinel)
+                        let peerPathControl = try await endpointB.callTool(
+                            name: MCPWindowToolName.search,
+                            arguments: Self.pathSearchArguments
+                        )
+                        try Self.assertSearchResult(peerPathControl, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
+                        let peerSearch = try await endpointB.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
+                        try Self.assertSearchResult(peerSearch, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
+
+                        let limiterStateAfterPeerCalls = await fixture.networkManager.connectionLimiterSnapshotForTesting(
+                            connectionID: endpointA.connectionID
+                        )
+                        XCTAssertEqual(limiterStateAfterPeerCalls?.permits, 0)
+                        XCTAssertEqual(limiterStateAfterPeerCalls?.waiterCount, 1)
+                        XCTAssertEqual(limiterStateAfterPeerCalls?.inFlight, 2)
+
+                        await gate.release()
+                        var responses: [BroadSearchAdmissionOperation: PersistentMCPTestRPCResponse] = [:]
+                        while let (operation, response) = try await group.next() {
+                            responses[operation] = response
+                        }
+                        let firstHeld = try XCTUnwrap(responses[.heldSearch])
+                        let secondHeld = try XCTUnwrap(responses[.queuedSearch])
+                        let serializedRead = try XCTUnwrap(responses[.serializedRead])
+                        try Self.assertSearchResult(firstHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                        try Self.assertSearchResult(secondHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
+                        try Self.assertReadResult(serializedRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
+                    } catch {
+                        await gate.release()
+                        group.cancelAll()
+                        throw error
                     }
                 }
-                XCTAssertTrue(observerInstalled)
-                let sameConnectionRead = Task {
-                    try await endpointA.callTool(
-                        name: MCPWindowToolName.readFile,
-                        arguments: ["path": fixture.contextA.fileURL.path]
-                    )
-                }
-                await fulfillment(of: [sameConnectionReadQueued], timeout: 1)
-                _ = await fixture.networkManager.setConnectionLimiterStateObserverForTesting(
-                    connectionID: endpointA.connectionID,
-                    observer: nil
-                )
-                let queuedLimiterState = await fixture.networkManager.connectionLimiterSnapshotForTesting(
-                    connectionID: endpointA.connectionID
-                )
-                XCTAssertEqual(queuedLimiterState?.permits, 0)
-                XCTAssertEqual(queuedLimiterState?.waiterCount, 1)
-                XCTAssertEqual(queuedLimiterState?.inFlight, 2)
 
-                let exactRead = try await endpointARead.callTool(
-                    name: MCPWindowToolName.readFile,
-                    arguments: ["path": fixture.contextA.fileURL.path]
-                )
-                try Self.assertReadResult(exactRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
-                try await Self.assertRetainedReadSpellings(endpointARead, context: fixture.contextA)
-                let sameStorePathControl = try await endpointARead.callTool(
-                    name: MCPWindowToolName.search,
-                    arguments: Self.pathSearchArguments
-                )
-                try Self.assertSearchResult(sameStorePathControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
-                let sameStoreScopedContentControl = try await endpointARead.callTool(
-                    name: MCPWindowToolName.search,
-                    arguments: Self.scopedSearchArguments(path: fixture.contextA.fileURL.path)
-                )
-                try Self.assertSearchResult(sameStoreScopedContentControl, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
-
-                let peerRead = try await endpointB.callTool(
-                    name: MCPWindowToolName.readFile,
-                    arguments: ["path": fixture.contextB.fileURL.path]
-                )
-                try Self.assertReadResult(peerRead, contains: fixture.contextB.sentinel, excludes: fixture.contextA.sentinel)
-                let peerPathControl = try await endpointB.callTool(
-                    name: MCPWindowToolName.search,
-                    arguments: Self.pathSearchArguments
-                )
-                try Self.assertSearchResult(peerPathControl, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
-                let peerSearch = try await endpointB.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
-                try Self.assertSearchResult(peerSearch, contains: fixture.contextB.fileURL.lastPathComponent, excludes: fixture.contextA.fileURL.lastPathComponent)
-
-                let limiterStateAfterPeerCalls = await fixture.networkManager.connectionLimiterSnapshotForTesting(
-                    connectionID: endpointA.connectionID
-                )
-                XCTAssertEqual(limiterStateAfterPeerCalls?.permits, 0)
-                XCTAssertEqual(limiterStateAfterPeerCalls?.waiterCount, 1)
-                XCTAssertEqual(limiterStateAfterPeerCalls?.inFlight, 2)
-
-                await gate.release()
-                let firstHeld = try await firstHeldSearch.value
-                let secondHeld = try await secondHeldSearch.value
-                let serializedRead = try await sameConnectionRead.value
-                try Self.assertSearchResult(firstHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
-                try Self.assertSearchResult(secondHeld, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
-                try Self.assertReadResult(serializedRead, contains: fixture.contextA.sentinel, excludes: fixture.contextB.sentinel)
                 let settledLimiterState = await fixture.networkManager.connectionLimiterSnapshotForTesting(
                     connectionID: endpointA.connectionID
                 )
@@ -552,7 +823,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 XCTAssertEqual(settledLimiterState?.waiterCount, 0)
                 XCTAssertEqual(settledLimiterState?.inFlight, 0)
 
-                let settledRetry = try await endpointAOverflow.callTool(name: MCPWindowToolName.search, arguments: Self.searchArguments)
+                let settledRetry = try await endpointAOverflow.callTool(
+                    name: MCPWindowToolName.search,
+                    arguments: Self.searchArguments
+                )
                 try Self.assertSearchResult(settledRetry, contains: fixture.contextA.fileURL.lastPathComponent, excludes: fixture.contextB.fileURL.lastPathComponent)
                 let snapshot = await heldStore.searchLaneSnapshotForTesting()
                 XCTAssertTrue(snapshot.isIdle)
@@ -1047,6 +1321,14 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             return text
         }
 
+        static func toolErrorText(from response: PersistentMCPTestRPCResponse) throws -> String {
+            let object = try responseObject(from: response)
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+            XCTAssertEqual(result["isError"] as? Bool, true)
+            return content.compactMap { $0["text"] as? String }.joined()
+        }
+
         nonisolated static func responseObject(from response: PersistentMCPTestRPCResponse) throws -> [String: Any] {
             let data = try XCTUnwrap(response.rawJSON.data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -1105,13 +1387,15 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         static func make(
             lease: MCPSharedServerTestLease.Ownership,
             contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
-            contextASearchFileCount: Int = 1
+            contextASearchFileCount: Int = 1,
+            includeStandardAuxiliaryEndpoints: Bool = true
         ) async throws -> PersistentMCPTestFixture {
             _ = lease
             let rootURL = FileManager.default.temporaryDirectory
                 .appendingPathComponent("PersistentMCPDistinctConnectionConcurrencyTests", isDirectory: true)
                 .appendingPathComponent(UUID().uuidString, isDirectory: true)
             try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+            await ServerNetworkManager.shared.setEnabled(true)
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -1160,10 +1444,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 )
                 constructedFixture = fixture
                 fixture.firstPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a", networkManager: fixture.networkManager)
-                fixture.secondPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "b", networkManager: fixture.networkManager)
-                fixture.queuedSearchPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-queued-search", networkManager: fixture.networkManager)
-                fixture.overflowSearchPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-overflow-search", networkManager: fixture.networkManager)
-                fixture.exactReadPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-exact-read", networkManager: fixture.networkManager)
+                if includeStandardAuxiliaryEndpoints {
+                    fixture.secondPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "b", networkManager: fixture.networkManager)
+                    fixture.queuedSearchPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-queued-search", networkManager: fixture.networkManager)
+                    fixture.overflowSearchPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-overflow-search", networkManager: fixture.networkManager)
+                    fixture.exactReadPersistentMCPTestEndpoint = try await PersistentMCPTestEndpoint.make(label: "a-exact-read", networkManager: fixture.networkManager)
+                }
                 return fixture
             } catch {
                 if let constructedFixture {
@@ -1172,8 +1458,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     if let contextB { await cleanupContext(contextB) }
                     if let contextA { await cleanupContext(contextA) }
                     if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
-                    WindowStatesManager.shared.unregisterWindowState(windowB)
-                    WindowStatesManager.shared.unregisterWindowState(windowA)
+                    await WindowStatesManager.shared.unregisterWindowStateAndWait(windowB)
+                    await WindowStatesManager.shared.unregisterWindowStateAndWait(windowA)
                     try? FileManager.default.removeItem(at: rootURL)
                 }
                 throw error
@@ -1252,17 +1538,24 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         func cleanup() async {
             guard !cleanedUp else { return }
             cleanedUp = true
-            let fixedEndpoints = [
-                firstPersistentMCPTestEndpoint,
-                secondPersistentMCPTestEndpoint,
-                queuedSearchPersistentMCPTestEndpoint,
-                overflowSearchPersistentMCPTestEndpoint,
-                exactReadPersistentMCPTestEndpoint
-            ].compactMap(\.self)
-            for endpoint in fixedEndpoints + additionalPersistentMCPTestEndpoints {
+            let allEndpoints = createdEndpoints()
+            for endpoint in allEndpoints {
+                await endpoint.client.waitUntilPendingWorkDrained()
+            }
+            await assertNoPendingWork()
+            for endpoint in allEndpoints {
                 endpoint.client.close()
-                await endpoint.connectionManager.stop()
+            }
+            for endpoint in allEndpoints {
+                await endpoint.client.waitUntilReaderLoopStopped()
+            }
+            for endpoint in allEndpoints {
                 await networkManager.debugRemoveConnection(endpoint.connectionID)
+            }
+            for endpoint in allEndpoints {
+                await waitForTransportCleanup(endpoint)
+            }
+            for endpoint in allEndpoints {
                 await networkManager.clearClientConnectionPolicy(for: endpoint.clientName)
                 await networkManager.debugClearPersistedRoutingState(for: endpoint.clientName)
                 contextA.window.mcpServer.removeTabContext(
@@ -1278,25 +1571,62 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     runID: nil
                 )
             }
-            await contextA.window.mcpServer.shutdownListener()
             ServiceRegistry.unregister(contextB.catalogService)
             ServiceRegistry.unregister(contextA.catalogService)
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
-            contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
-            contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
-            WindowStatesManager.shared.unregisterWindowState(contextB.window)
-            WindowStatesManager.shared.unregisterWindowState(contextA.window)
+            contextB.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == contextB.workspaceID }
+            }
+            contextA.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == contextA.workspaceID }
+            }
+            await WindowStatesManager.shared.unregisterWindowStateAndWait(contextB.window)
+            await WindowStatesManager.shared.unregisterWindowStateAndWait(contextA.window)
             if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
             try? FileManager.default.removeItem(at: rootURL)
         }
 
+        func assertNoPendingWork() async {
+            for endpoint in createdEndpoints() {
+                let clientWork = endpoint.client.pendingWorkSnapshotForTesting()
+                XCTAssertTrue(clientWork.isIdle, "Pending client work for \(endpoint.connectionID): \(clientWork)")
+                let hasInFlightCalls = await networkManager.hasInFlightCalls(for: endpoint.connectionID)
+                XCTAssertFalse(hasInFlightCalls, "Pending server work for \(endpoint.connectionID)")
+                if let limiter = await networkManager.connectionLimiterSnapshotForTesting(
+                    connectionID: endpoint.connectionID
+                ) {
+                    XCTAssertEqual(limiter.waiterCount, 0)
+                    XCTAssertEqual(limiter.inFlight, 0)
+                }
+            }
+
+            let contentReadLimiter = await PersistentMCPDistinctConnectionConcurrencyTests
+                .waitForContentReadLimiterIdle()
+            XCTAssertTrue(contentReadLimiter.isIdle, "Pending content-read work: \(contentReadLimiter)")
+
+            for context in [contextA, contextB] {
+                let searchLane = await context.window.workspaceFileContextStore.searchLaneSnapshotForTesting()
+                let searchCache = await context.window.workspaceFileContextStore
+                    .searchDecodedContentCacheSnapshotForTesting()
+                XCTAssertTrue(searchLane.isIdle, "Pending search-lane work for context \(context.tabID): \(searchLane)")
+                XCTAssertEqual(searchCache.activeFlightCount, 0)
+                XCTAssertEqual(searchCache.waiterCount, 0)
+            }
+        }
+
         func assertCleanedUp() async throws {
-            for endpoint in try endpoints() {
+            for endpoint in createdEndpoints() {
                 let hasInFlightCalls = await networkManager.hasInFlightCalls(for: endpoint.connectionID)
                 let selectedWindow = await networkManager.selectedWindow(for: endpoint.connectionID)
                 XCTAssertFalse(hasInFlightCalls)
                 XCTAssertNil(selectedWindow)
+                let cleanupState = await networkManager.debugConnectionCleanupState(for: endpoint.connectionID)
+                XCTAssertFalse(cleanupState.hasLimiter)
+                XCTAssertFalse(cleanupState.hasRoutingMetadata)
+                XCTAssertFalse(cleanupState.hasExecutionPolicyMetadata)
+                XCTAssertFalse(cleanupState.hasSessionMetadata)
+                XCTAssertFalse(cleanupState.hasWatchdogMetadata)
                 let policy = await networkManager.debugConnectionPolicyState(for: endpoint.connectionID)
                 XCTAssertTrue(policy.restrictedTools.isEmpty)
                 XCTAssertTrue(policy.additionalTools.isEmpty)
@@ -1306,6 +1636,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 XCTAssertTrue(pendingPolicies.isEmpty)
                 XCTAssertEqual(contextA.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
                 XCTAssertEqual(contextB.window.mcpServer.connectionBindingSnapshot(forConnection: endpoint.connectionID).bindingKind, .unbound)
+                XCTAssertTrue(endpoint.client.readerLoopStoppedForTesting())
                 do {
                     _ = try await endpoint.client.request(method: "tools/list", params: [:])
                     XCTFail("closed socket unexpectedly accepted a request")
@@ -1315,6 +1646,30 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                     XCTFail("closed socket failed with unexpected error: \(error)")
                 }
             }
+        }
+
+        private func waitForTransportCleanup(_ endpoint: PersistentMCPTestEndpoint) async {
+            while true {
+                let snapshot = await endpoint.connectionManager.debugTransportCleanupSnapshot()
+                if !snapshot.hasActiveReader,
+                   snapshot.pendingReaderCancellationCount == 0,
+                   !snapshot.readerIsRetained,
+                   !snapshot.socketIsOwned
+                {
+                    return
+                }
+                await Task.yield()
+            }
+        }
+
+        private func createdEndpoints() -> [PersistentMCPTestEndpoint] {
+            [
+                firstPersistentMCPTestEndpoint,
+                secondPersistentMCPTestEndpoint,
+                queuedSearchPersistentMCPTestEndpoint,
+                overflowSearchPersistentMCPTestEndpoint,
+                exactReadPersistentMCPTestEndpoint
+            ].compactMap(\.self) + additionalPersistentMCPTestEndpoints
         }
 
         private static func makeContext(
@@ -1353,7 +1708,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]
             configuredWorkspace.activeComposeTabID = tabID
-            window.workspaceManager.workspaces.append(configuredWorkspace)
+            window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.append(configuredWorkspace)
+            }
             let rootRecord = try await window.workspaceFileContextStore.loadRoot(path: rootURL.path)
             let exactHit = await WorkspaceReadableFileService(store: window.workspaceFileContextStore)
                 .resolveExactAbsoluteWorkspaceCatalogHit(fileURL.path, rootScope: .visibleWorkspace)
@@ -1361,6 +1718,13 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 throw ClientFixtureError.exactAbsoluteCatalogMiss
             }
             let catalogService = window.mcpServer.windowMCPToolCatalogService
+            guard ServerNetworkManager.shared.runtimeSessionRegistry.setMCPEnabled(
+                windowID: window.windowID,
+                expectedSessionID: window.coreSessionHandle.sessionID,
+                enabled: true
+            ) else {
+                throw ClientFixtureError.runtimeSessionEnablementFailed
+            }
             ServiceRegistry.register(catalogService)
             return PersistentMCPTestContext(
                 rootURL: rootURL,
@@ -1379,7 +1743,11 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             if let existing = ServiceRegistry.services.first(where: { $0 is WindowRoutingService }) as? WindowRoutingService {
                 return (existing, false)
             }
-            let service = WindowRoutingService(windowStates: .shared, networkMgr: .shared)
+            let service = WindowRoutingService(
+                windowStates: .shared,
+                networkMgr: .shared,
+                workspaceRepository: RepoPromptAppCoreContainer.shared.workspaceRepository
+            )
             for _ in 0 ..< 100 {
                 let registered = ServiceRegistry.services.contains { $0 as AnyObject === service as AnyObject }
                 let names = await service.tools.map(\.name)
@@ -1395,7 +1763,9 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {
             ServiceRegistry.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
-            context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
+            context.window.workspaceManager.workspaceTransaction { transaction in
+                transaction.workspaces.removeAll { $0.id == context.workspaceID }
+            }
             try? FileManager.default.removeItem(at: context.rootURL)
         }
     }
@@ -1504,7 +1874,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             let manager = try BootstrapSocketConnectionManager(
                 connectionID: connectionID,
                 sessionToken: sessionToken,
-                clientPid: Int(getpid()),
+                peerIdentity: MCPPeerIdentity(
+                    socketObservedPID: Int(getpid()),
+                    handshakeClaimedPID: Int(getpid())
+                ),
                 clientName: clientName,
                 purpose: .unknown,
                 codeMapsDisabled: false,
@@ -1559,7 +1932,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 return endpoint
             } catch {
                 startTask.cancel()
+                await client.waitUntilPendingWorkDrained()
+                XCTAssertTrue(client.pendingWorkSnapshotForTesting().isIdle)
                 client.close()
+                await client.waitUntilReaderLoopStopped()
                 await manager.stop()
                 await networkManager.debugRemoveConnection(connectionID)
                 await networkManager.debugClearPersistedRoutingState(for: clientName)
@@ -1591,6 +1967,28 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
     }
 
+    private enum BroadSearchAdmissionOperation: Hashable {
+        case heldSearch
+        case queuedSearch
+        case serializedRead
+    }
+
+    private enum K12ScopedSearchOperation: Hashable {
+        case broad
+        case scoped(Int)
+    }
+
+    private enum K12BurstOperation: Hashable {
+        case active
+        case queued
+        case excess(Int)
+    }
+
+    private enum QueuedCatalogOperation: Hashable {
+        case first
+        case queued
+    }
+
     struct PersistentMCPTestRPCResponse {
         let id: Int
         let rawJSON: String
@@ -1607,7 +2005,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private let writeQueue = DispatchQueue(label: "PersistentMCPDistinctConnectionConcurrencyTests.write")
-        private let readQueue = DispatchQueue(label: "PersistentMCPDistinctConnectionConcurrencyTests.read")
         private let stateLock = NSLock()
         private var fd: Int32
         private var nextRequestID = 1
@@ -1615,12 +2012,26 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private var responseInterceptors: [Int: @Sendable (String) async throws -> String] = [:]
         private var notifications: [String] = []
         private var isClosed = false
+        private var readerLoopStopped = false
+        private var responseTasks: [UUID: TrackedResponseTask] = [:]
+        private var pendingWorkWaiters: [CheckedContinuation<Void, Never>] = []
+        private let readerCompletion = DispatchGroup()
+        private var readerThread: Thread?
 
         init(fd: Int32) {
             self.fd = fd
-            readQueue.async { [weak self] in
-                self?.readerLoop()
+            readerCompletion.enter()
+            let completion = readerCompletion
+            let thread = Thread { [self, completion] in
+                defer {
+                    markReaderLoopStopped()
+                    completion.leave()
+                }
+                readerLoop()
             }
+            thread.name = "PersistentMCPDistinctConnectionConcurrencyTests.read"
+            readerThread = thread
+            thread.start()
         }
 
         deinit {
@@ -1629,6 +2040,52 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         func close() {
             close(with: ClientError.closed)
+        }
+
+        func waitUntilReaderLoopStopped() async {
+            await withCheckedContinuation { continuation in
+                readerCompletion.notify(queue: .global(qos: .utility)) {
+                    continuation.resume()
+                }
+            }
+        }
+
+        func readerLoopStoppedForTesting() -> Bool {
+            withStateLock { readerLoopStopped }
+        }
+
+        func waitUntilPendingWorkDrained() async {
+            while true {
+                let joinableTasks: [(UUID, Task<Void, Never>)]? = withStateLock {
+                    guard pendingWorkIsJoinable else { return nil }
+                    return responseTasks.compactMap { taskID, trackedTask in
+                        trackedTask.task.map { (taskID, $0) }
+                    }
+                }
+                guard let joinableTasks else {
+                    await waitUntilPendingWorkIsJoinable()
+                    continue
+                }
+                guard !joinableTasks.isEmpty else { return }
+                for (_, task) in joinableTasks {
+                    await task.value
+                }
+                withStateLock {
+                    for (taskID, _) in joinableTasks {
+                        responseTasks.removeValue(forKey: taskID)
+                    }
+                }
+            }
+        }
+
+        func pendingWorkSnapshotForTesting() -> PendingWorkSnapshot {
+            withStateLock {
+                PendingWorkSnapshot(
+                    pendingRequestCount: pending.count,
+                    responseInterceptorCount: responseInterceptors.count,
+                    activeResponseTaskCount: responseTasks.count
+                )
+            }
         }
 
         func nextRequestIDForTesting() -> Int {
@@ -1654,20 +2111,31 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
         func request(method: String, params: [String: Any], timeoutSeconds: Int = 10) async throws -> PersistentMCPTestRPCResponse {
             let id = allocateRequestID()
-            let rawJSON = try await withTaskCancellationHandler {
+            let requestData = try encodeJSON([
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            ])
+            let timeout = RequestTimeout(seconds: timeoutSeconds) { [self] in
+                _ = failPending(id: id, error: ClientError.timedOut(id))
+            }
+            do {
+                let rawJSON = try await waitForResponse(id: id, requestData: requestData)
+                await timeout.cancelAndWait()
+                return PersistentMCPTestRPCResponse(id: id, rawJSON: rawJSON)
+            } catch {
+                await timeout.cancelAndWait()
+                throw error
+            }
+        }
+
+        private func waitForResponse(id: Int, requestData: Data) async throws -> String {
+            try await withTaskCancellationHandler {
                 try await withCheckedThrowingContinuation { continuation in
                     do {
                         try register(continuation, for: id)
-                        try sendJSON([
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "method": method,
-                            "params": params
-                        ])
-                        Task { [weak self] in
-                            try? await Task.sleep(for: .seconds(timeoutSeconds))
-                            self?.failPending(id: id, error: ClientError.timedOut(id))
-                        }
+                        try sendData(requestData)
                     } catch {
                         if !failPending(id: id, error: error) {
                             continuation.resume(throwing: error)
@@ -1677,7 +2145,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             } onCancel: {
                 self.failPending(id: id, error: CancellationError())
             }
-            return PersistentMCPTestRPCResponse(id: id, rawJSON: rawJSON)
         }
 
         private func allocateRequestID() -> Int {
@@ -1696,8 +2163,16 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private func sendJSON(_ object: [String: Any]) throws {
+            try sendData(encodeJSON(object))
+        }
+
+        private func encodeJSON(_ object: [String: Any]) throws -> Data {
             var line = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
             line.append(0x0A)
+            return line
+        }
+
+        private func sendData(_ line: Data) throws {
             try writeQueue.sync {
                 var written = 0
                 while written < line.count {
@@ -1771,16 +2246,20 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                         throw ClientError.unexpectedResponseID(id)
                     }
                     guard let rawJSON = String(data: line, encoding: .utf8) else { throw ClientError.invalidResponse }
-                    guard let interceptor = pendingResponse.interceptor else {
+                    guard let interceptor = pendingResponse.interceptor,
+                          let responseTaskID = pendingResponse.responseTaskID
+                    else {
                         continuation.resume(returning: rawJSON)
+                        resumePendingWorkWaitersIfJoinable()
                         return true
                     }
-                    Task { [weak self] in
+                    startResponseTask(id: responseTaskID) { [self] in
                         do {
-                            try await continuation.resume(returning: interceptor(rawJSON))
+                            let intercepted = try await interceptor(rawJSON)
+                            continuation.resume(returning: intercepted)
                         } catch {
                             continuation.resume(throwing: error)
-                            self?.close(with: error)
+                            close(with: error)
                         }
                     }
                     return true
@@ -1799,20 +2278,29 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         }
 
         private func takePending(id: Int) -> CheckedContinuation<String, Error>? {
-            withStateLock {
+            let continuation = withStateLock {
                 responseInterceptors.removeValue(forKey: id)
                 return pending.removeValue(forKey: id)
             }
+            resumePendingWorkWaitersIfJoinable()
+            return continuation
         }
 
         private func takePendingResponse(
             id: Int
         ) -> (
             continuation: CheckedContinuation<String, Error>?,
-            interceptor: (@Sendable (String) async throws -> String)?
+            interceptor: (@Sendable (String) async throws -> String)?,
+            responseTaskID: UUID?
         ) {
             withStateLock {
-                (pending.removeValue(forKey: id), responseInterceptors.removeValue(forKey: id))
+                let continuation = pending.removeValue(forKey: id)
+                let interceptor = responseInterceptors.removeValue(forKey: id)
+                let responseTaskID = interceptor.map { _ in UUID() }
+                if let responseTaskID {
+                    responseTasks[responseTaskID] = TrackedResponseTask(task: nil)
+                }
+                return (continuation, interceptor, responseTaskID)
             }
         }
 
@@ -1821,6 +2309,58 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             guard let continuation = takePending(id: id) else { return false }
             continuation.resume(throwing: error)
             return true
+        }
+
+        private func markReaderLoopStopped() {
+            withStateLock {
+                readerLoopStopped = true
+                readerThread = nil
+            }
+        }
+
+        private func startResponseTask(
+            id taskID: UUID,
+            operation: @escaping @Sendable () async -> Void
+        ) {
+            let task = Task {
+                await operation()
+            }
+            withStateLock {
+                precondition(responseTasks[taskID] != nil)
+                responseTasks[taskID]?.task = task
+            }
+            resumePendingWorkWaitersIfJoinable()
+        }
+
+        private var pendingWorkIsJoinable: Bool {
+            pending.isEmpty
+                && responseInterceptors.isEmpty
+                && responseTasks.values.allSatisfy { $0.task != nil }
+        }
+
+        private func waitUntilPendingWorkIsJoinable() async {
+            await withCheckedContinuation { continuation in
+                let resumeImmediately = withStateLock {
+                    guard !pendingWorkIsJoinable else { return true }
+                    pendingWorkWaiters.append(continuation)
+                    return false
+                }
+                if resumeImmediately {
+                    continuation.resume()
+                }
+            }
+        }
+
+        private func resumePendingWorkWaitersIfJoinable() {
+            let waiters: [CheckedContinuation<Void, Never>] = withStateLock {
+                guard pendingWorkIsJoinable else { return [] }
+                let waiters = pendingWorkWaiters
+                pendingWorkWaiters.removeAll()
+                return waiters
+            }
+            for waiter in waiters {
+                waiter.resume()
+            }
         }
 
         private func close(with error: Error) {
@@ -1838,12 +2378,116 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             for continuation in snapshot.1 {
                 continuation.resume(throwing: error)
             }
+            resumePendingWorkWaitersIfJoinable()
         }
 
         private func withStateLock<T>(_ operation: () throws -> T) rethrows -> T {
             stateLock.lock()
             defer { stateLock.unlock() }
             return try operation()
+        }
+    }
+
+    private final class RequestTimeout: @unchecked Sendable {
+        private let source: DispatchSourceTimer
+        private let completion = DispatchGroup()
+
+        init(seconds: Int, operation: @escaping @Sendable () -> Void) {
+            source = DispatchSource.makeTimerSource(
+                queue: DispatchQueue.global(qos: .userInitiated)
+            )
+            completion.enter()
+            source.setEventHandler { [weak self] in
+                operation()
+                self?.source.cancel()
+            }
+            source.setCancelHandler { [completion] in
+                completion.leave()
+            }
+            source.schedule(deadline: .now() + .seconds(seconds))
+            source.resume()
+        }
+
+        func cancelAndWait() async {
+            source.cancel()
+            await withCheckedContinuation { continuation in
+                completion.notify(queue: .global(qos: .utility)) {
+                    continuation.resume()
+                }
+            }
+        }
+    }
+
+    private struct TrackedResponseTask {
+        var task: Task<Void, Never>?
+    }
+
+    struct PendingWorkSnapshot: Equatable {
+        let pendingRequestCount: Int
+        let responseInterceptorCount: Int
+        let activeResponseTaskCount: Int
+
+        var isIdle: Bool {
+            pendingRequestCount == 0
+                && responseInterceptorCount == 0
+                && activeResponseTaskCount == 0
+        }
+    }
+
+    private actor CompletionSignal {
+        private var marked = false
+
+        func mark() {
+            marked = true
+        }
+
+        func isMarked() -> Bool {
+            marked
+        }
+    }
+
+    private actor RouteInvocationProbe {
+        enum ProbeError: Error {
+            case oldInvocationDidNotStart
+        }
+
+        private var oldCount = 0
+        private var oldStarted = false
+        private var oldStartFailed = false
+        private var oldReleased = false
+        private var oldStartWaiters: [CheckedContinuation<Void, Error>] = []
+        private var oldReleaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func invokeOld() async {
+            oldCount += 1
+            oldStarted = true
+            oldStartWaiters.forEach { $0.resume() }
+            oldStartWaiters.removeAll()
+            guard !oldReleased else { return }
+            await withCheckedContinuation { oldReleaseWaiters.append($0) }
+        }
+
+        func waitUntilOldInvocationStarted() async throws {
+            guard !oldStarted else { return }
+            guard !oldStartFailed else { throw ProbeError.oldInvocationDidNotStart }
+            try await withCheckedThrowingContinuation { oldStartWaiters.append($0) }
+        }
+
+        func failOldInvocationStartIfNeeded() {
+            guard !oldStarted, !oldStartFailed else { return }
+            oldStartFailed = true
+            oldStartWaiters.forEach { $0.resume(throwing: ProbeError.oldInvocationDidNotStart) }
+            oldStartWaiters.removeAll()
+        }
+
+        func releaseOldInvocation() {
+            oldReleased = true
+            oldReleaseWaiters.forEach { $0.resume() }
+            oldReleaseWaiters.removeAll()
+        }
+
+        func oldInvocationCount() -> Int {
+            oldCount
         }
     }
 
@@ -1892,6 +2536,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         case broadSearchDidNotStart
         case exactAbsoluteCatalogMiss
         case routingServiceUnavailable
+        case runtimeSessionEnablementFailed
         case toolReturnedError(String)
     }
 #endif

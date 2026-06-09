@@ -133,11 +133,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         let previousMCPAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let testMCPService = MCPService()
         let composition = WindowStateCompositionFactory.make(
             windowID: -74,
             deferredInitialAgentSystemWorkspaceRefresh: true,
-            sharedMCPService: testMCPService,
+            coreContainer: RepoPromptAppCoreContainer.shared,
             contextBuilderProviderFactory: { _, _, _ in providers.next() }
         )
         GlobalSettingsStore.shared.setMCPAutoStart(previousMCPAutoStart, commit: false)

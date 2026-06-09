@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 /// Centralised constants used by the MCP layer.
 /// TCP/Bonjour transport has been removed – only the UNIX bootstrap socket is used.
@@ -24,7 +25,7 @@ enum MCPConstants {
 
     /// Bootstrap socket protocol version number.
     /// CLI sends this in handshake; app can reject incompatible versions.
-    static let bootstrapProtocolVersion = 2
+    static let bootstrapProtocolVersion = MCPBootstrapProtocol.currentVersion
 
     /// Content context identifier for heartbeat frames.
     static let hbContextID = "com.repoprompt.mcp.heartbeat"

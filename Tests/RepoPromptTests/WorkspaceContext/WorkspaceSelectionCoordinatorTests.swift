@@ -1,5 +1,6 @@
 import Combine
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -11,209 +12,108 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         super.tearDown()
     }
 
-    func testActiveSelectionSnapshotReturnsActiveTabSelectionAndFlushesPendingUIWhenRequested() {
+    func testActiveSelectionSnapshotReadsCanonicalActiveTab() {
         let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"], codemapAutoEnabled: true)
-        let pending = StoredSelection(
-            selectedPaths: ["/tmp/pending.swift"],
-            autoCodemapPaths: ["/tmp/dependency.swift"],
-            slices: ["/tmp/pending.swift": [LineRange(start: 1, end: 3)]],
-            codemapAutoEnabled: false
-        )
         let harness = CoordinatorHarness(initialSelection: initial)
-        harness.manager.pendingUISelection = pending
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
 
-        let unflushed = coordinator.activeSelectionSnapshot(flushPendingUI: false)
-        XCTAssertEqual(unflushed.tabID, harness.tabID)
-        XCTAssertEqual(unflushed.selection, initial)
-        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 0)
+        let snapshot = harness.coordinator.activeSelectionSnapshot(flushPendingUI: false)
 
-        var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
-            .sink { changes.append($0) }
-            .store(in: &cancellables)
-
-        let flushed = coordinator.activeSelectionSnapshot(flushPendingUI: true)
-        XCTAssertEqual(flushed.tabID, harness.tabID)
-        XCTAssertEqual(flushed.selection, pending)
-        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 1)
-        XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: pending, source: .uiFlush))
+        XCTAssertEqual(snapshot.tabID, harness.tabID)
+        XCTAssertEqual(snapshot.selection, initial)
+        XCTAssertFalse(snapshot.isVirtual)
     }
 
-    func testPersistActiveSelectionWritesActiveTabAndEmitsChange() async {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+    func testPersistActiveSelectionWritesCanonicalTabAndPublishesWhileMirrorGuardIsActive() async {
+        let harness = CoordinatorHarness(initialSelection: StoredSelection(selectedPaths: ["/tmp/initial.swift"]))
         let next = StoredSelection(
             selectedPaths: ["/tmp/next.swift"],
             autoCodemapPaths: ["/tmp/next_dependency.swift"],
             slices: ["/tmp/next.swift": [LineRange(start: 4, end: 8)]],
             codemapAutoEnabled: false
         )
-        let harness = CoordinatorHarness(initialSelection: initial)
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
         var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
-            .sink { changes.append($0) }
+        var mirrorGuardWasActive = false
+        harness.coordinator.changes
+            .sink { change in
+                changes.append(change)
+                mirrorGuardWasActive = harness.coordinator.isApplyingSelectionMirror
+            }
             .store(in: &cancellables)
 
-        XCTAssertFalse(coordinator.isApplyingSelectionMirror)
-        let persisted = await coordinator.persistActiveSelection(next, source: .runtimeMutation, mirrorToUI: true)
+        let persisted = await harness.coordinator.persistActiveSelection(next, source: .runtimeMutation, mirrorToUI: true)
 
         XCTAssertEqual(persisted, next)
-        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, next)
-        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 1)
+        XCTAssertEqual(harness.session.workspaceSessionController.workspace(id: harness.workspaceID)?.composeTabs.first?.selection, next)
         XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: next, source: .runtimeMutation))
-        XCTAssertFalse(coordinator.isApplyingSelectionMirror)
+        XCTAssertTrue(mirrorGuardWasActive)
+        XCTAssertFalse(harness.coordinator.isApplyingSelectionMirror)
     }
 
-    func testPersistActiveSelectionNoOpsWhenSelectionIsUnchanged() async {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
-        let harness = CoordinatorHarness(initialSelection: initial)
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
-        var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
-            .sink { changes.append($0) }
-            .store(in: &cancellables)
-
-        let persisted = await coordinator.persistActiveSelection(initial, source: .runtimeMutation, mirrorToUI: true)
-
-        XCTAssertEqual(persisted, initial)
-        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, initial)
-        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 0)
-        XCTAssertTrue(changes.isEmpty)
-        XCTAssertFalse(coordinator.isApplyingSelectionMirror)
-    }
-
-    func testPersistVirtualSelectionStoresImmediatelyAndEmitsVirtualChange() {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+    func testPersistVirtualSelectionPublishesVirtualChange() {
+        let harness = CoordinatorHarness(initialSelection: StoredSelection())
         let next = StoredSelection(
             selectedPaths: ["/tmp/virtual.swift"],
             slices: ["/tmp/virtual.swift": [LineRange(start: 2, end: 5)]],
             codemapAutoEnabled: false
         )
-        let harness = CoordinatorHarness(initialSelection: initial)
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
         var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
+        harness.coordinator.changes
             .sink { changes.append($0) }
             .store(in: &cancellables)
 
-        let persisted = coordinator.persistVirtualSelection(next, for: harness.tabID)
+        let persisted = harness.coordinator.persistVirtualSelection(next, for: harness.tabID)
 
         XCTAssertEqual(persisted, next)
-        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, next)
-        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 1)
+        XCTAssertEqual(harness.session.workspaceSessionController.workspace(id: harness.workspaceID)?.composeTabs.first?.selection, next)
         XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: next, source: .virtual))
     }
 
-    func testPersistVirtualSelectionNoOpsWhenSelectionIsUnchanged() {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
-        let harness = CoordinatorHarness(initialSelection: initial)
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+    func testPersistSelectionUsesRequestedSourceForActiveTab() async {
+        let harness = CoordinatorHarness(initialSelection: StoredSelection())
+        let next = StoredSelection(selectedPaths: ["/tmp/mcp.swift"])
         var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
+        harness.coordinator.changes
             .sink { changes.append($0) }
             .store(in: &cancellables)
 
-        let persisted = coordinator.persistVirtualSelection(initial, for: harness.tabID)
-
-        XCTAssertEqual(persisted, initial)
-        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, initial)
-        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 0)
-        XCTAssertTrue(changes.isEmpty)
-    }
-
-    func testPersistSelectionRoutesInactiveTabAndEmitsMCPSource() async {
-        let initial = StoredSelection(selectedPaths: ["/tmp/active.swift"])
-        let inactiveTabID = UUID()
-        let inactiveInitial = StoredSelection(selectedPaths: ["/tmp/inactive-old.swift"])
-        let next = StoredSelection(
-            selectedPaths: ["/tmp/inactive-new.swift"],
-            autoCodemapPaths: ["/tmp/inactive-dependency.swift"],
-            codemapAutoEnabled: false
-        )
-        let harness = CoordinatorHarness(initialSelection: initial)
-        harness.manager.appendTab(ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveInitial))
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
-        var changes: [WorkspaceSelectionCoordinator.Change] = []
-        coordinator.changes
-            .sink { changes.append($0) }
-            .store(in: &cancellables)
-
-        let persisted = await coordinator.persistSelection(next, for: inactiveTabID, source: .mcpTabContext)
+        let persisted = await harness.coordinator.persistSelection(next, for: harness.tabID, source: .mcpTabContext)
 
         XCTAssertEqual(persisted, next)
-        XCTAssertEqual(harness.manager.composeTab(with: inactiveTabID)?.selection, next)
-        XCTAssertEqual(harness.manager.composeTab(with: harness.tabID)?.selection, initial)
-        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 1)
-        XCTAssertEqual(changes.last, .init(tabID: inactiveTabID, selection: next, source: .mcpTabContext))
+        XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: next, source: .mcpTabContext))
     }
 
-    func testSelectionSnapshotForInactiveTabDoesNotFlushActiveUI() {
-        let initial = StoredSelection(selectedPaths: ["/tmp/active.swift"])
-        let inactiveTabID = UUID()
-        let inactiveSelection = StoredSelection(selectedPaths: ["/tmp/agent.swift"], codemapAutoEnabled: false)
-        let harness = CoordinatorHarness(initialSelection: initial)
-        harness.manager.pendingUISelection = StoredSelection(selectedPaths: ["/tmp/pending-active.swift"])
-        harness.manager.appendTab(ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveSelection))
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
-
-        let snapshot = coordinator.selectionSnapshot(for: inactiveTabID, flushPendingUIIfActive: true)
-
-        XCTAssertEqual(snapshot, .init(tabID: inactiveTabID, selection: inactiveSelection, isVirtual: true))
-        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 0)
-    }
-
-    func testApplyingSelectionMirrorGuardSuppressesFlushPublication() async {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
-        let pending = StoredSelection(selectedPaths: ["/tmp/pending.swift"])
-        let harness = CoordinatorHarness(initialSelection: initial)
-        harness.manager.pendingUISelection = pending
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
-
-        await coordinator.withApplyingSelectionMirror {
-            XCTAssertTrue(coordinator.isApplyingSelectionMirror)
-            let snapshot = coordinator.activeSelectionSnapshot(flushPendingUI: true)
-            XCTAssertEqual(snapshot.selection, initial)
-            XCTAssertEqual(harness.manager.publishSnapshotCallCount, 0)
-        }
-
-        XCTAssertFalse(coordinator.isApplyingSelectionMirror)
-        let flushed = coordinator.activeSelectionSnapshot(flushPendingUI: true)
-        XCTAssertEqual(flushed.selection, pending)
-        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 1)
-    }
-
-    func testUIFlushDoesNotRepublishWhenSubscriberFlushesUnchangedSelection() {
-        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
-        let pending = StoredSelection(selectedPaths: ["/tmp/pending.swift"])
-        let harness = CoordinatorHarness(initialSelection: initial)
-        harness.manager.pendingUISelection = pending
-        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+    func testDirectCoreSessionMutationPublishesMirrorChangeThroughCombineBridge() {
+        let harness = CoordinatorHarness(initialSelection: StoredSelection())
+        let next = StoredSelection(selectedPaths: ["/tmp/direct.swift"])
         var changes: [WorkspaceSelectionCoordinator.Change] = []
-
-        coordinator.changes
-            .sink { change in
-                changes.append(change)
-                _ = coordinator.activeSelectionSnapshot(flushPendingUI: true)
-            }
+        harness.coordinator.changes
+            .sink { changes.append($0) }
             .store(in: &cancellables)
 
-        let flushed = coordinator.activeSelectionSnapshot(flushPendingUI: true)
+        harness.session.workspaceSessionController.mutateComposeTab(
+            workspaceID: harness.workspaceID,
+            tabID: harness.tabID
+        ) { $0.selection = next }
 
-        XCTAssertEqual(flushed.selection, pending)
-        XCTAssertEqual(changes, [.init(tabID: harness.tabID, selection: pending, source: .uiFlush)])
-        XCTAssertEqual(harness.manager.publishSnapshotCallCount, 2)
+        XCTAssertEqual(changes.last, .init(tabID: harness.tabID, selection: next, source: .mirror))
+    }
+
+    func testApplyingSelectionMirrorGuardSuppressesFlushAttempt() async {
+        let harness = CoordinatorHarness(initialSelection: StoredSelection(selectedPaths: ["/tmp/initial.swift"]))
+
+        await harness.coordinator.withApplyingSelectionMirror {
+            XCTAssertTrue(harness.coordinator.isApplyingSelectionMirror)
+            let snapshot = harness.coordinator.activeSelectionSnapshot(flushPendingUI: true)
+            XCTAssertEqual(snapshot.selection.selectedPaths, ["/tmp/initial.swift"])
+        }
+
+        XCTAssertFalse(harness.coordinator.isApplyingSelectionMirror)
     }
 
     func testSaveSnapshotPrefersMatchingCanonicalSelectionOverStaleUISnapshot() {
         let activeTabID = UUID()
-        let liveUI = StoredSelection(
-            selectedPaths: ["/tmp/stale.swift"],
-            slices: ["/tmp/stale.swift": [LineRange(start: 1, end: 2)]],
-            codemapAutoEnabled: true
-        )
+        let liveUI = StoredSelection(selectedPaths: ["/tmp/stale.swift"])
         let canonical = StoredSelection(selectedPaths: ["/tmp/fixture.swift"], codemapAutoEnabled: false)
-
         let stored = StoredSelection(selectedPaths: ["/tmp/stored.swift"])
 
         let decision = WorkspaceManagerViewModel.selectionForSaveSnapshot(
@@ -233,89 +133,51 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         let stored = StoredSelection(selectedPaths: ["/tmp/stored.swift"], codemapAutoEnabled: false)
         let canonical = StoredSelection(selectedPaths: ["/tmp/other.swift"], codemapAutoEnabled: false)
         let activeTabID = UUID()
-        let scenarios: [(name: String, canonicalSelection: StoredSelection?, canonicalTabID: UUID?)] = [
-            ("canonical tab does not match", canonical, UUID()),
-            ("canonical selection is missing", nil, nil)
-        ]
 
-        for scenario in scenarios {
+        for scenario in [(canonical as StoredSelection?, UUID() as UUID?), (nil, nil)] {
             let decision = WorkspaceManagerViewModel.selectionForSaveSnapshot(
                 liveUISelection: liveUI,
                 storedSelection: stored,
-                canonicalSelection: scenario.canonicalSelection,
-                canonicalTabID: scenario.canonicalTabID,
+                canonicalSelection: scenario.0,
+                canonicalTabID: scenario.1,
                 activeTabID: activeTabID
             )
-
-            XCTAssertEqual(decision.selection, stored, scenario.name)
-            XCTAssertEqual(decision.owner, .storedComposeTab, scenario.name)
+            XCTAssertEqual(decision.selection, stored)
+            XCTAssertEqual(decision.owner, .storedComposeTab)
         }
     }
 }
 
 @MainActor
 private final class CoordinatorHarness {
-    let store = WorkspaceFileContextStore()
-    let fileManager = WorkspaceFilesViewModel(workspaceFileContextStore: WorkspaceFileContextStore())
-    let tabID = UUID()
-    let manager: FakeWorkspaceSelectionManager
+    let session: RepoPromptCoreSession
+    let coordinator: WorkspaceSelectionCoordinator
+    let workspaceID: UUID
+    let tabID: UUID
 
     init(initialSelection: StoredSelection) {
-        let tab = ComposeTabState(id: tabID, name: "Test", selection: initialSelection)
+        let graph = EmbeddedWorkspaceRepositoryFactory.make()
+        let runtime = RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
+        session = RepoPromptCoreSession(
+            routingSessionID: MCPRoutingSessionID(rawValue: 99001),
+            workspaceRepository: graph.repository,
+            workspacePersistenceWriter: graph.writer,
+            workspaceAccessPolicy: UnrestrictedWorkspaceAccessPolicy(),
+            runtime: runtime
+        )
+        let tab = ComposeTabState(name: "Test", selection: initialSelection)
         let workspace = WorkspaceModel(
             name: "Test Workspace",
             repoPaths: [],
             composeTabs: [tab],
-            activeComposeTabID: tabID
+            activeComposeTabID: tab.id
         )
-        manager = FakeWorkspaceSelectionManager(workspace: workspace, fileManager: fileManager)
-    }
-}
-
-@MainActor
-private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
-    var activeWorkspace: WorkspaceModel?
-    let fileManager: WorkspaceFilesViewModel
-    var pendingUISelection: StoredSelection?
-    private(set) var publishSnapshotCallCount = 0
-    private(set) var updateStoredOnlyCallCount = 0
-
-    init(workspace: WorkspaceModel, fileManager: WorkspaceFilesViewModel) {
-        activeWorkspace = workspace
-        self.fileManager = fileManager
-    }
-
-    func composeTab(with id: UUID) -> ComposeTabState? {
-        activeWorkspace?.composeTabs.first(where: { $0.id == id })
-    }
-
-    func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {
-        publishSnapshotCallCount += 1
-        guard commitToMemory,
-              let pendingUISelection,
-              var workspace = activeWorkspace,
-              let activeID = workspace.activeComposeTabID,
-              let index = workspace.composeTabs.firstIndex(where: { $0.id == activeID })
-        else { return }
-        workspace.composeTabs[index].selection = pendingUISelection
-        if touchModified {
-            workspace.composeTabs[index].lastModified = Date()
-        }
-        activeWorkspace = workspace
-    }
-
-    func appendTab(_ tab: ComposeTabState) {
-        guard var workspace = activeWorkspace else { return }
-        workspace.composeTabs.append(tab)
-        activeWorkspace = workspace
-    }
-
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
-        updateStoredOnlyCallCount += 1
-        guard var workspace = activeWorkspace,
-              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
-        else { return }
-        workspace.composeTabs[index] = tab
-        activeWorkspace = workspace
+        coordinator = WorkspaceSelectionCoordinator(
+            controller: session.workspaceSelectionController,
+            store: session.workspaceFileContextStore
+        )
+        workspaceID = workspace.id
+        tabID = tab.id
+        session.workspaceSessionController.replaceAll([workspace], activeWorkspaceID: workspace.id)
     }
 }

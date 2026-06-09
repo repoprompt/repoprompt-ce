@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 actor ACPAgentSessionController {
     struct RequestTimeouts {

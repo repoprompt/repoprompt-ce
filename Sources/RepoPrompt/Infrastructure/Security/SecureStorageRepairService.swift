@@ -1,4 +1,6 @@
 import Foundation
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 enum SecureStorageRepairFailure: Equatable {
     case authenticationFailed
@@ -85,7 +87,7 @@ actor SecureStorageRepairService {
             guard resolution == .replaceTarget else {
                 return SecureStorageRepairRecord(account: account, state: .conflict, targetVerified: false)
             }
-        } catch KeychainService.KeychainError.itemNotFound {
+        } catch SecureStorageError.itemNotFound {
             // The target will be created below.
         } catch {
             return record(account, for: error)
@@ -129,7 +131,7 @@ actor SecureStorageRepairService {
             do {
                 _ = try legacyStore.get(for: account.identifier, accessMode: .interactive)
                 return failedRecord(account, .verificationFailed)
-            } catch KeychainService.KeychainError.itemNotFound {
+            } catch SecureStorageError.itemNotFound {
                 return SecureStorageRepairRecord(account: account, state: .absent, targetVerified: true)
             } catch {
                 return record(account, for: error)
@@ -140,7 +142,7 @@ actor SecureStorageRepairService {
     }
 
     private func scanAccount(_ account: SecureStorageAccount) -> SecureStorageRepairRecord {
-        let accessMode = KeychainAccessMode.nonInteractive(reason: .backgroundAvailabilityCheck)
+        let accessMode = SecureStorageAccessMode.nonInteractive(reason: .backgroundAvailabilityCheck)
         let legacyValue: String
         do {
             legacyValue = try legacyStore.get(for: account.identifier, accessMode: accessMode)
@@ -154,7 +156,7 @@ actor SecureStorageRepairService {
                 return importedRecord(account)
             }
             return SecureStorageRepairRecord(account: account, state: .conflict, targetVerified: false)
-        } catch KeychainService.KeychainError.itemNotFound {
+        } catch SecureStorageError.itemNotFound {
             return SecureStorageRepairRecord(account: account, state: .importable, targetVerified: false)
         } catch {
             return record(account, for: error)
@@ -163,15 +165,15 @@ actor SecureStorageRepairService {
 
     private func record(_ account: SecureStorageAccount, for error: Error) -> SecureStorageRepairRecord {
         let state: SecureStorageRepairState = switch error {
-        case KeychainService.KeychainError.itemNotFound:
+        case SecureStorageError.itemNotFound:
             .absent
-        case KeychainService.KeychainError.interactionNotAllowed:
+        case SecureStorageError.interactionNotAllowed:
             .interactionRequired
-        case KeychainService.KeychainError.userInteractionCancelled:
+        case SecureStorageError.userInteractionCancelled:
             .cancelled
-        case KeychainService.KeychainError.authenticationFailed:
+        case SecureStorageError.authenticationFailed:
             .failed(.authenticationFailed)
-        case KeychainService.KeychainError.invalidData:
+        case SecureStorageError.invalidData:
             .failed(.invalidData)
         default:
             .failed(.keychainFailure)

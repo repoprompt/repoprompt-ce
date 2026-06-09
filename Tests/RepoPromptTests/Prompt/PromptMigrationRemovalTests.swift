@@ -1,4 +1,5 @@
 @testable import RepoPrompt
+import RepoPromptCore
 import XCTest
 
 final class PromptMigrationRemovalTests: XCTestCase {
@@ -54,6 +55,265 @@ final class PromptMigrationRemovalTests: XCTestCase {
         XCTAssertFalse(encoded.contains("xmlFormat"))
         XCTAssertFalse(encoded.contains("systemPromptFlavor"))
         XCTAssertFalse(encoded.contains("includeMCPMetadata"))
+    }
+
+    func testPromptSnapshotProjectionDelegatesReconstructionAndGuardsAsyncPublication() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let snapshotSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel+PromptSnapshotEntries.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+        let adapterSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/WorkspacePromptProjectionAdapter.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(snapshotSource.contains("WorkspacePromptProjectionAdapter(store: workspaceFileContextStore)"))
+        XCTAssertTrue(snapshotSource.contains("chatPromptEntriesProjectionGeneration == generation"))
+        XCTAssertTrue(snapshotSource.contains("chatPromptEntriesRequest().key == request.key"))
+        XCTAssertTrue(adapterSource.contains("captureWorkspaceFileContext"))
+        XCTAssertTrue(adapterSource.contains("WorkspaceContextProjectionService"))
+        XCTAssertTrue(adapterSource.contains("sections: [.selection]"))
+
+        for removedReconstruction in [
+            "buildPromptSnapshotEntriesForCurrentChatProjection",
+            "fileManager.selectedFiles",
+            "fileManager.autoCodemapFiles",
+            "selectionSlicesByFileID",
+            "validatedCurrentFileAPIs",
+            "switch codeMapUsage"
+        ] {
+            XCTAssertFalse(snapshotSource.contains(removedReconstruction), removedReconstruction)
+        }
+        XCTAssertFalse(viewModelSource.contains("chatCodemapFileAPIs"))
+        XCTAssertFalse(viewModelSource.contains("refreshChatCodemapFileAPIsFromStore"))
+        XCTAssertFalse(adapterSource.contains("switch codeMapUsage"))
+    }
+
+    func testPromptTokenEstimatesUseExactRenderedPayloadAndRemovedArithmeticCannotReturn() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let packagingSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(packagingSource.contains("TokenProjectionService.exactRenderedPayload"))
+        XCTAssertTrue(packagingSource.contains("PromptGitDiffArtifactClassifier"))
+        XCTAssertTrue(packagingSource.contains("exactChatPayload"))
+        XCTAssertEqual(packagingSource.components(separatedBy: "rootFolderName = \"_git_data\"").count - 1, 1)
+        XCTAssertTrue(viewModelSource.contains("buildClipboardPayload"))
+        XCTAssertTrue(viewModelSource.contains("packagePromptResult"))
+        XCTAssertTrue(viewModelSource.contains("exactPayload.projection.total"))
+
+        for removedTokenPath in [
+            "Int(Double(text.count) / 4.0)",
+            "ChatContextTokenBaselineCache",
+            "baseTokensWithoutPromptText",
+            "supportsPromptTextDeltas",
+            "promptTextDuplicateFactor",
+            "chatContextTokenBaselineCacheKey"
+        ] {
+            XCTAssertFalse(viewModelSource.contains(removedTokenPath), removedTokenPath)
+        }
+    }
+
+    func testCanonicalTokenProjectionOwnershipAndRecountDelegationCannotRegress() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let coreProjection = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let coreService = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let contextRequest = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let contextService = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/WorkspaceContextProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let adapter = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/WorkspacePromptProjectionAdapter.swift"
+            ),
+            encoding: .utf8
+        )
+        let recount = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/TokenCountingViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(coreProjection.contains("package struct TokenProjection"))
+        XCTAssertTrue(coreService.contains("package enum TokenProjectionService"))
+        XCTAssertTrue(coreService.contains("activeLiveWorkspaceEstimates"))
+        XCTAssertTrue(contextRequest.contains("package enum WorkspaceTokenProjectionInput"))
+        XCTAssertTrue(contextService.contains("case let .activeLive(input)"))
+        XCTAssertTrue(contextService.contains("TokenProjectionService.activeLiveWorkspaceEstimates"))
+        XCTAssertTrue(adapter.contains("tokenProjectionInput: WorkspaceTokenProjectionInput"))
+        XCTAssertTrue(recount.contains("tokenProjectionInput: .activeLive"))
+        XCTAssertTrue(recount.contains(".virtualRecomputed"))
+        XCTAssertFalse(recount.contains("private let tokenCalculationService"))
+        XCTAssertFalse(recount.contains("normalizedTotal - normalizedFiles"))
+        XCTAssertFalse(adapter.contains("normalizedTotal - normalizedFiles"))
+    }
+
+    func testStandardPromptConstructionDelegatesToCoreWithoutMigratingExcludedConsumers() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let aiMessageSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift"),
+            encoding: .utf8
+        )
+        let packagingSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+            ),
+            encoding: .utf8
+        )
+        let viewModelSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
+            ),
+            encoding: .utf8
+        )
+        let headlessPlanSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel+HeadlessPlan.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(aiMessageSource.contains("enum TailAssemblyStrategy"))
+        XCTAssertTrue(aiMessageSource.contains("case legacy"))
+        XCTAssertTrue(aiMessageSource.contains("case coreStandardChat"))
+        XCTAssertTrue(aiMessageSource.contains("envelopePolicy: .chatStyleTree"))
+        XCTAssertTrue(aiMessageSource.contains("layout: .blankLineSeparatedFragments"))
+        XCTAssertTrue(aiMessageSource.contains("disabledPromptSections.union([.userInstructions])"))
+        XCTAssertTrue(aiMessageSource.contains("duplicateUserInstructionsAtTop: false"))
+        XCTAssertTrue(aiMessageSource.contains("return [tail, \"\", systemPrompt].joined(separator: \"\\n\\n\")"))
+        XCTAssertTrue(aiMessageSource.contains("private let renderedFactualSnippets: PromptRenderedFactualSnippets"))
+        XCTAssertEqual(aiMessageSource.components(separatedBy: "PromptRenderingService.renderFactualSnippets(").count - 1, 1)
+        for legacyProperty in ["systemPromptXML", "metaPromptsXML", "fileTreeXML", "fileBlocksXML", "gitDiffXML", "combinedXML"] {
+            XCTAssertTrue(aiMessageSource.contains("var \(legacyProperty): String"), legacyProperty)
+        }
+
+        XCTAssertTrue(packagingSource.contains("tailAssemblyStrategy: AIMessage.TailAssemblyStrategy = .legacy"))
+        XCTAssertTrue(packagingSource.contains("tailAssemblyStrategy: tailAssemblyStrategy"))
+        XCTAssertTrue(packagingSource.contains("return AIMessage(\n            systemPrompt: systemPrompt,\n            userMessage: userMessage"))
+        XCTAssertTrue(packagingSource.contains("exactRenderedPayload(renderedChatPayload(for: message)"))
+
+        XCTAssertEqual(viewModelSource.components(separatedBy: "tailAssemblyStrategy: .coreStandardChat").count - 1, 1)
+        XCTAssertTrue(viewModelSource.contains("exactChatPayload(for: message, source: tokenSource)"))
+        XCTAssertFalse(headlessPlanSource.contains("coreStandardChat"))
+    }
+
+    func testProviderAwareAccountingFoundationRemainsNeutralAdditiveAndAppOwned() throws {
+        let root = try RepoRoot.url(filePath: #filePath)
+        let coreProjectionSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let coreProjectionServiceSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPromptCore/WorkspaceContext/Projection/TokenProjectionService.swift"
+            ),
+            encoding: .utf8
+        )
+        let projectionSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Models/AIProviderInputProjection.swift"
+            ),
+            encoding: .utf8
+        )
+        let aiMessageSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/AIMessage.swift"),
+            encoding: .utf8
+        )
+        let providerFactorySource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderFactory.swift"
+            ),
+            encoding: .utf8
+        )
+        let providerCapabilitySource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/Providers/AIProviderInputProjectionCapability.swift"
+            ),
+            encoding: .utf8
+        )
+        let queriesSource = try String(
+            contentsOf: root.appendingPathComponent(
+                "Sources/RepoPrompt/Infrastructure/AI/AIQueriesService.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertTrue(coreProjectionSource.contains("case renderedPayloadEstimate"))
+        XCTAssertTrue(coreProjectionServiceSource.contains("package static func renderedPayloadEstimate"))
+        XCTAssertFalse(coreProjectionSource.contains("AIProviderInputProjection"))
+        XCTAssertFalse(coreProjectionServiceSource.contains("AIProviderInputProjection"))
+
+        for declaration in [
+            "struct AIProviderInputProjection",
+            "struct ChatInputTokenEstimate",
+            "enum AIProviderInputProjectionResolver"
+        ] {
+            XCTAssertTrue(projectionSource.contains(declaration), declaration)
+        }
+        XCTAssertTrue(projectionSource.contains("enum RouteResolution"))
+        XCTAssertTrue(projectionSource.contains("case providerResolved"))
+        XCTAssertTrue(projectionSource.contains("case providerRuntimeConfigurationRequired"))
+        XCTAssertTrue(projectionSource.contains("case providerProjectionUnavailable"))
+        XCTAssertTrue(projectionSource.contains("private init("))
+        XCTAssertTrue(projectionSource.contains("fragments: fragments(for: input)"))
+        XCTAssertTrue(projectionSource.contains("TokenProjectionService.renderedPayloadEstimate"))
+        XCTAssertFalse(projectionSource.contains("TokenProjectionService.exactRenderedPayload"))
+
+        XCTAssertTrue(aiMessageSource.contains("struct PreparedOpenAIChatInput"))
+        XCTAssertTrue(aiMessageSource.contains("struct PreparedOpenAIResponsesInput"))
+        XCTAssertTrue(aiMessageSource.contains("preparedOpenAIChatInput(embedSystemPrompt:"))
+        XCTAssertTrue(aiMessageSource.contains("let prepared = preparedOpenAIResponsesInput()"))
+
+        XCTAssertTrue(providerFactorySource.contains("func streamMessageWithInputProjection("))
+        XCTAssertTrue(providerCapabilitySource.contains("struct AIProviderStreamStart"))
+        XCTAssertEqual(
+            providerCapabilitySource.components(separatedBy: "func streamMessageWithInputProjection(").count - 1,
+            1
+        )
+        XCTAssertTrue(providerCapabilitySource.contains("inputProjection: nil"))
+        XCTAssertFalse(queriesSource.contains("streamMessageWithInputProjection"))
     }
 
     func testLegacyCopyOverridesAndCustomizationsIgnoreRemovedFields() throws {

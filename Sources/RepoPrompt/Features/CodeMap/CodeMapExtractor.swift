@@ -1,16 +1,6 @@
 import Foundation
 import SwiftUI
 
-/// Determines how CodeMap definitions are inserted.
-enum CodeMapUsage: String, CaseIterable, Codable {
-    case auto
-    case complete
-    /// Include code-map for selected files only (handled at injection sites;
-    /// returning it here would duplicate).
-    case selected
-    case none
-}
-
 /// A small struct returning code-map text + the number of files included in that text.
 struct DefinitionBlockResult {
     let text: String
@@ -638,6 +628,7 @@ enum CodeMapExtractor {
         }
     }
 
+    /// Slice 3 keeps definition-block rendering app-owned, including this record-to-render-input projection.
     private static func acceptedFileAPIs(from files: [WorkspaceFileRecord], allFileAPIs: [FileAPI]) -> [FileAPI] {
         guard !files.isEmpty, !allFileAPIs.isEmpty else { return [] }
         #if DEBUG || EDIT_FLOW_PERF
@@ -838,56 +829,6 @@ enum CodeMapExtractor {
             }
         }
 
-        return ordered
-    }
-
-    static func resolveReferencedFilePaths(
-        from selectedFiles: [WorkspaceFileRecord],
-        among allFileAPIs: [FileAPI]
-    ) -> [String] {
-        guard !selectedFiles.isEmpty else { return [] }
-        let acceptedFileAPIFilter = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter)
-        let selectedAPIs = acceptedFileAPIs(from: selectedFiles, allFileAPIs: allFileAPIs)
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter, acceptedFileAPIFilter)
-        return resolveReferencedFilePaths(from: selectedFiles, selectedAPIs: selectedAPIs, among: allFileAPIs)
-    }
-
-    static func resolveReferencedFilePaths(
-        from selectedFiles: [WorkspaceFileRecord],
-        among allFileAPIs: [FileAPI],
-        firstFileAPIByStandardizedNestedPath: [String: FileAPI]
-    ) -> [String] {
-        guard !selectedFiles.isEmpty else { return [] }
-        let acceptedFileAPIFilter = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter)
-        let selectedAPIs = acceptedFileAPIs(
-            from: selectedFiles,
-            firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath
-        )
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter, acceptedFileAPIFilter)
-        return resolveReferencedFilePaths(from: selectedFiles, selectedAPIs: selectedAPIs, among: allFileAPIs)
-    }
-
-    private static func resolveReferencedFilePaths(
-        from selectedFiles: [WorkspaceFileRecord],
-        selectedAPIs: [FileAPI],
-        among allFileAPIs: [FileAPI]
-    ) -> [String] {
-        guard !selectedAPIs.isEmpty else { return [] }
-
-        let selectedPaths = Set(selectedFiles.map(\.standardizedFullPath))
-        let unselectedAPIs = allFileAPIs.filter { !selectedPaths.contains(standardizedAPIFilePath($0)) }
-        let autoReferencedAPIComputation = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.autoReferencedAPIComputation)
-        let referencedAPIs = getAutoReferencedAPIs(selectedAPIs: selectedAPIs, unselectedAPIs: unselectedAPIs)
-        EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.autoReferencedAPIComputation, autoReferencedAPIComputation)
-
-        var seen = Set<String>()
-        var ordered: [String] = []
-        for api in referencedAPIs {
-            let standardized = standardizedAPIFilePath(api)
-            if seen.insert(standardized).inserted {
-                ordered.append(standardized)
-            }
-        }
         return ordered
     }
 

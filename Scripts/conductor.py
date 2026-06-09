@@ -2,7 +2,7 @@
 """RepoPrompt CE developer daemon.
 
 Implements repo-internal daemon/job mechanics, fake sleep validation support,
-and delegated build/package/test/debug-app/live-smoke/release operation
+and delegated build/package/test/debug-app/live-smoke/headless-smoke/release operation
 families. Synchronous jobs print concise summaries by default and preserve raw
 logs under the daemon jobs directory.
 """
@@ -31,9 +31,11 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
+ProcessSnapshot = Dict[int, Tuple[int, str]]
+
 PROTOCOL_VERSION = 4
 TERMINAL_STATES = {"completed", "failed", "canceled"}
-LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
+LANE_NAMES = {"build", "debugArtifact", "headlessArtifact", "headlessSmoke", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
@@ -77,6 +79,10 @@ IMPLEMENTED_OPERATIONS = {
     "provider-test",
     "install-debug-cli",
     "debug-cli-status",
+    "package-headless",
+    "install-headless-debug",
+    "headless-debug-status",
+    "headless-smoke",
     "run",
     "app",
     "smoke",
@@ -114,13 +120,17 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-headless|all
   ./conductor build
   ./conductor package debug|release
+  ./conductor package-headless [debug|release]
   ./conductor test [--filter <filter>]
   ./conductor provider-test [--filter <filter>]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
+  ./conductor install-headless-debug
+  ./conductor headless-debug-status
+  ./conductor headless-smoke [--configuration debug|release]  # standalone direct-stdio MCP smoke; no app launch
   ./conductor run [-- <app args...>]                  # FIFO coordinated run
   ./conductor app status
   ./conductor app stop                                 # latest interactive stop intent
@@ -133,7 +143,7 @@ Operation commands:
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
   ./conductor fake-sleep <seconds> [same options]
-  valid lanes: build, debugArtifact, liveApp, release, style
+  valid lanes: build, debugArtifact, headlessArtifact, headlessSmoke, liveApp, release, style
 
 Global operation flags:
   --async              enqueue and return a ticket immediately
@@ -314,6 +324,44 @@ def process_command(pid: int) -> str:
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip()
+
+
+def process_snapshot() -> Optional[ProcessSnapshot]:
+    try:
+        completed = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,lstart="],
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if completed.returncode != 0:
+        return None
+    snapshot: ProcessSnapshot = {}
+    for line in completed.stdout.splitlines():
+        fields = line.strip().split(maxsplit=2)
+        if len(fields) != 3:
+            continue
+        try:
+            pid = int(fields[0])
+            ppid = int(fields[1])
+        except ValueError:
+            continue
+        snapshot[pid] = (ppid, fields[2])
+    return snapshot
+
+
+def descendant_process_ids(root_pids: Sequence[int], snapshot: ProcessSnapshot) -> set[int]:
+    descendants = set(root_pids)
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, _identity) in snapshot.items():
+            if pid not in descendants and ppid in descendants:
+                descendants.add(pid)
+                changed = True
+    return descendants
 
 
 def write_daemon_metadata(paths: Paths) -> None:
@@ -714,6 +762,9 @@ class Job:
     finished_at: Optional[float] = None
     process_pid: Optional[int] = None
     process_pgid: Optional[int] = None
+    process_identity: Optional[str] = None
+    descendant_process_identities: Dict[int, str] = dataclasses.field(default_factory=dict)
+    termination_requested_at: Optional[float] = None
     exit_code: Optional[int] = None
     error: Optional[str] = None
     result_summary: Optional[str] = None
@@ -781,6 +832,13 @@ class OperationRegistry:
         "REPOPROMPT_DEBUG_APP_BUNDLE",
         "REPOPROMPT_DEBUG_CLI_INSTALL_PATH",
     ]
+    HEADLESS_ENV_KEYS = [
+        "REPOPROMPT_HEADLESS_TOOLS_ROOT",
+        "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_BINARY",
+        "REPOPROMPT_HEADLESS_STATE_DIR",
+    ]
     BUILD_ENV_KEYS = [
         "PATH",
         "DEVELOPER_DIR",
@@ -805,7 +863,7 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + HEADLESS_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -860,7 +918,7 @@ class OperationRegistry:
         if operation == "doctor":
             return [script("doctor.sh")], lanes, cwd, env, effective_timeout
         if operation == "guardrails":
-            return [script("source_layout_guardrails.sh")], lanes, cwd, env, effective_timeout
+            return ["make", "guardrails"], lanes, cwd, env, effective_timeout
         if operation == "format":
             return [script("swift_style.sh"), "format"], ["style", "build"], cwd, env, effective_timeout
         if operation == "format-check":
@@ -899,6 +957,14 @@ class OperationRegistry:
             return [script("install_debug_cli.sh"), "install", "--build"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "debug-cli-status":
             return [script("install_debug_cli.sh"), "status"], lanes, cwd, env, effective_timeout
+        if operation == "package-headless":
+            return [script("package_headless.sh"), str(args.get("config") or "debug")], ["build", "headlessArtifact"], cwd, env, effective_timeout
+        if operation == "install-headless-debug":
+            return [script("install_headless_cli.sh"), "install", "--configuration", "debug", "--build"], ["build", "headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-debug-status":
+            return [script("install_headless_cli.sh"), "status", "--configuration", "debug"], lanes, cwd, env, effective_timeout
+        if operation == "headless-smoke":
+            return [script("smoke_headless_mcp.sh"), "--configuration", str(args.get("config") or "debug")], ["build", "headlessArtifact", "headlessSmoke"], cwd, env, effective_timeout
         if operation == "run":
             return [script("run.sh"), *[str(arg) for arg in args.get("appArgs") or []]], ["build", "debugArtifact", "liveApp"], cwd, env, effective_timeout
         if operation == "app":
@@ -980,7 +1046,7 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {"doctor", "guardrails", "debug-cli-status", "headless-debug-status", "format-tools-status", "check-format-tools"}:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
@@ -1209,12 +1275,8 @@ class DaemonState:
                 return
             if not termination_sent:
                 self._terminate_process_group_locked(job, reason=reason)
-            deadline = now() + TERMINATE_GRACE_SECONDS
-            while job.state == "running" and now() < deadline:
-                self.condition.wait(timeout=min(0.1, max(0.0, deadline - now())))
-            if job.state == "running":
-                self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
-                self.condition.notify_all()
+            self._finish_process_tree_termination_locked(job, reason=f"{reason}; SIGKILL after grace period")
+            self.condition.notify_all()
 
     def list_jobs(self, state_filter: Optional[str]) -> Dict[str, Any]:
         with self.lock:
@@ -1336,7 +1398,7 @@ class DaemonState:
         with self.condition:
             for ticket in tickets:
                 job = self.jobs.get(ticket)
-                if job and job.state == "running":
+                if job and self._process_tree_alive_locked(job):
                     self._kill_process_group_locked(job, reason="daemon stop --force; SIGKILL after grace period")
             self.condition.notify_all()
         time.sleep(0.2)
@@ -1410,6 +1472,11 @@ class DaemonState:
                 )
                 with self.condition:
                     job.process_pid = process.pid
+                    snapshot = process_snapshot()
+                    if snapshot is not None:
+                        process_info = snapshot.get(process.pid)
+                        if process_info is not None:
+                            job.process_identity = process_info[1]
                     with contextlib.suppress(OSError):
                         job.process_pgid = os.getpgid(process.pid)
                     self._write_running_processes_locked()
@@ -1437,8 +1504,13 @@ class DaemonState:
                         with self.condition:
                             self._kill_process_group_locked(job, reason="SIGKILL after timeout grace period")
                         exit_code = process.wait()
+                    with self.condition:
+                        self._finish_process_tree_termination_locked(job, reason="SIGKILL after timeout grace period")
                     if exit_code == 0:
                         exit_code = 124
+                if job.cancel_requested:
+                    with self.condition:
+                        self._finish_process_tree_termination_locked(job, reason="SIGKILL after cancellation grace period")
                 reader.join(timeout=2.0)
                 with self.condition:
                     if job.cancel_requested:
@@ -1555,29 +1627,89 @@ class DaemonState:
         if job.state != "running":
             return
         self._terminate_process_group_locked(job, reason=reason)
-        term_deadline = now() + TERMINATE_GRACE_SECONDS
-        while job.state == "running" and now() < term_deadline:
-            self.condition.wait(timeout=0.1)
-        if job.state != "running":
-            return
-        self._kill_process_group_locked(job, reason=f"{reason}; SIGKILL after grace period")
-        kill_deadline = now() + 2.0
-        while job.state == "running" and now() < kill_deadline:
-            self.condition.wait(timeout=0.1)
+        self._finish_process_tree_termination_locked(job, reason=f"{reason}; SIGKILL after grace period")
 
     def _terminate_process_group_locked(self, job: Job, reason: str) -> None:
         self._append_system_line_locked(job, f"terminating process group: {reason}\n")
-        pgid = job.process_pgid or job.process_pid
-        if pgid:
-            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.killpg(pgid, signal.SIGTERM)
+        if job.termination_requested_at is None:
+            job.termination_requested_at = now()
+        self._signal_process_tree_locked(job, signal.SIGTERM)
 
     def _kill_process_group_locked(self, job: Job, reason: str) -> None:
         self._append_system_line_locked(job, f"killing process group: {reason}\n")
+        self._signal_process_tree_locked(job, signal.SIGKILL)
+
+    def _finish_process_tree_termination_locked(self, job: Job, reason: str) -> None:
+        deadline = (job.termination_requested_at or now()) + TERMINATE_GRACE_SECONDS
+        process_tree_alive = self._process_tree_alive_locked(job)
+        while process_tree_alive and now() < deadline:
+            self.condition.wait(timeout=min(0.1, max(0.0, deadline - now())))
+            process_tree_alive = self._process_tree_alive_locked(job)
+        if not process_tree_alive:
+            return
+        self._kill_process_group_locked(job, reason=reason)
+        kill_deadline = now() + 2.0
+        while now() < kill_deadline:
+            if not self._process_tree_alive_locked(job):
+                break
+            self.condition.wait(timeout=0.05)
+
+    def _signal_process_tree_locked(self, job: Job, process_signal: signal.Signals) -> None:
+        snapshot = process_snapshot()
+        descendant_identities: Dict[int, str] = {}
+        if snapshot is not None:
+            self._capture_descendants_locked(job, snapshot)
+            descendant_identities = {
+                pid: identity
+                for pid, identity in job.descendant_process_identities.items()
+                if snapshot.get(pid) is not None and snapshot[pid][1] == identity
+            }
+
         pgid = job.process_pgid or job.process_pid
         if pgid:
             with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-                os.killpg(pgid, signal.SIGKILL)
+                os.killpg(pgid, process_signal)
+
+        for pid, identity in descendant_identities.items():
+            if pid == job.process_pid or process_start_token(pid) != identity:
+                continue
+            with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+                os.kill(pid, process_signal)
+
+    def _process_tree_alive_locked(self, job: Job) -> bool:
+        snapshot = process_snapshot()
+        if snapshot is None:
+            return job.state == "running"
+        root_matches = self._capture_descendants_locked(job, snapshot)
+        if root_matches:
+            return True
+        return any(
+            snapshot.get(pid) is not None and snapshot[pid][1] == identity
+            for pid, identity in job.descendant_process_identities.items()
+        )
+
+    def _capture_descendants_locked(self, job: Job, snapshot: ProcessSnapshot) -> bool:
+        root_pid = job.process_pid
+        if root_pid is None:
+            return False
+        root_info = snapshot.get(root_pid)
+        root_matches = root_info is not None
+        if root_matches and job.process_identity is None:
+            job.process_identity = root_info[1]
+        if root_matches and root_info[1] != job.process_identity:
+            root_matches = False
+        tracked_roots = [
+            pid
+            for pid, identity in job.descendant_process_identities.items()
+            if snapshot.get(pid) is not None and snapshot[pid][1] == identity
+        ]
+        if root_matches:
+            tracked_roots.append(root_pid)
+        for pid in descendant_process_ids(tracked_roots, snapshot):
+            process_info = snapshot.get(pid)
+            if process_info is not None:
+                job.descendant_process_identities[pid] = process_info[1]
+        return root_matches
 
     def _retention_pass_locked(self) -> None:
         cutoff = now() - TERMINAL_RETENTION_SECONDS
@@ -2652,7 +2784,7 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
+    for product in ["RepoPrompt", "repoprompt-mcp", "repoprompt-headless"]:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
         if code != 0:
             return code
@@ -2887,6 +3019,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "build",
         "install-debug-cli",
         "debug-cli-status",
+        "install-headless-debug",
+        "headless-debug-status",
         "format",
         "format-check",
         "lint",
@@ -2897,7 +3031,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
-        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "repoprompt-headless", "all"])
         ns = parser.parse_args(rest)
         args["product"] = ns.product
     elif operation == "package":
@@ -2905,6 +3039,16 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
+    elif operation == "package-headless":
+        parser = argparse.ArgumentParser(prog="conductor package-headless")
+        parser.add_argument("config", nargs="?", default="debug", choices=["debug", "release"])
+        ns = parser.parse_args(rest)
+        args["config"] = ns.config
+    elif operation == "headless-smoke":
+        parser = argparse.ArgumentParser(prog="conductor headless-smoke")
+        parser.add_argument("--configuration", default="debug", choices=["debug", "release"])
+        ns = parser.parse_args(rest)
+        args["config"] = ns.configuration
     elif operation == "test":
         parser = argparse.ArgumentParser(prog="conductor test")
         parser.add_argument("--filter")

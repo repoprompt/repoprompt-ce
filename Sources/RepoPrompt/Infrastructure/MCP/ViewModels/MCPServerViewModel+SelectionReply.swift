@@ -79,7 +79,9 @@ extension MCPServerViewModel {
             rootScope: .allLoaded,
             pathLocateProfile: .uiAssisted
         )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
+        guard let accounting = try? await accountingService.calculatePromptStats(request: request, store: store) else {
+            return .empty
+        }
         let service = TokenCalculationService()
         return await service.evaluatePromptEntries(accounting.promptFileEntrySnapshots)
     }

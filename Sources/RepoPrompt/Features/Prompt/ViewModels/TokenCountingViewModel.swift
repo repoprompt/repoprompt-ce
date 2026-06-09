@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
 
 @MainActor
@@ -61,31 +62,48 @@ class TokenCountingViewModel: ObservableObject {
     private let heavyDirtyKinds: DirtyKind = [.selection, .fileTree, .codeMap, .settings]
     private var pendingDirty: DirtyKind = []
 
-    /// Cached components to support light, incremental recomputation.
+    /// Accepted projection state used by light, incremental recomputation.
     private var didComputeBaseline: Bool = false
-    private var lastBaseWithoutUserText: Int = 0 // Everything except user prompt/instructions
-    private var lastPromptTokens: Int = 0 // Tokens for prompt text only
-    private var lastDuplicatePromptTokens: Int = 0 // Duplicate prompt tokens (if setting is on)
-    private var lastInstructionsTokens: Int = 0 // Tokens for meta/stored instructions
-    private var lastGitDiffTokens: Int = 0
+    private var acceptedSelectionProjection: WorkspaceSelectionProjection?
+    private var acceptedWorkspaceTokenViews: TokenProjectionService.WorkspaceViews?
+    private var publishedWorkspaceTokenProjection: TokenProjection?
+    private var acceptedHasSelectedArtifacts: Bool = false
     private var lastFileTreeTokens: Int = 0
+    private var lastGitDiffText: String?
 
     // MARK: - Private Properties
 
     private static let tokenUpdateDebounceNanoseconds: UInt64 = 500_000_000
 
-    private let tokenCalculationService = TokenCalculationService()
+    typealias ProjectionAdapterFactory = @MainActor (WorkspaceFileContextStore) -> WorkspacePromptProjectionAdapter
+    typealias AccountingOperation = (
+        PromptContextAccountingRequest,
+        WorkspaceFileContextStore,
+        WorkspaceFileContextCapture
+    ) async throws -> PromptContextAccountingResult
+    typealias LightProjectionOperation = (
+        WorkspaceSelectionProjection,
+        TokenProjection.Source,
+        TokenProjectionService.WorkspaceNonFileComponents
+    ) async throws -> TokenProjectionService.WorkspaceViews
+
     private let promptContextAccountingService = PromptContextAccountingService()
+    private let projectionAdapterFactory: ProjectionAdapterFactory
+    private let accountingOperation: AccountingOperation?
+    private let lightProjectionOperation: LightProjectionOperation
     private var tokenUpdateDebounceTask: Task<Void, Never>?
     private var updateTokenCountTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
     private var isTokenCountSchedulerActive = false
     private var isImmediateRecountInProgress = false
     private var tokenCountSchedulerGeneration: UInt64 = 0
+    private var inputRevision: UInt64 = 0
+    private var nextRecountRunID: UInt64 = 0
+    private var activeRecountRunID: UInt64?
     private var selectionObservationRevision: UInt64 = 0
     private var lastObservedSelectionObservationRevision: UInt64 = 0
-    private var lastPredominantLanguage: String = "Swift"
     private var automaticRecountSuspendDepth: Int = 0
+    private var heavyRecoveryAttempted = false
 
     // MARK: - Dependencies
 
@@ -135,8 +153,22 @@ class TokenCountingViewModel: ObservableObject {
 
     // MARK: - Initialization
 
-    init() {
-        // Initialize with empty state
+    init(
+        projectionAdapterFactory: @escaping ProjectionAdapterFactory = { store in
+            WorkspacePromptProjectionAdapter(store: store)
+        },
+        accountingOperation: AccountingOperation? = nil,
+        lightProjectionOperation: @escaping LightProjectionOperation = { selection, source, nonFile in
+            TokenProjectionService.workspaceComponentEstimates(
+                from: selection,
+                source: source,
+                nonFile: nonFile
+            )
+        }
+    ) {
+        self.projectionAdapterFactory = projectionAdapterFactory
+        self.accountingOperation = accountingOperation
+        self.lightProjectionOperation = lightProjectionOperation
     }
 
     func configure(
@@ -250,7 +282,6 @@ class TokenCountingViewModel: ObservableObject {
         tokenUpdateDebounceTask = nil
         updateTokenCountTask?.cancel()
         updateTokenCountTask = nil
-        await tokenCalculationService.shutdown()
     }
 
     private func scheduleTokenCountUpdateIfNeeded() {
@@ -319,7 +350,14 @@ class TokenCountingViewModel: ObservableObject {
     }
 
     func markDirty(_ kind: DirtyKind) {
+        guard !kind.isEmpty else { return }
+        inputRevision &+= 1
         pendingDirty.formUnion(kind)
+
+        if !kind.intersection(heavyDirtyKinds).isEmpty {
+            heavyRecoveryAttempted = false
+            invalidateAcceptedSelectionProjection()
+        }
 
         let currentSelectionRevision = selectionObservationRevision
         if kind.contains(.selection),
@@ -371,6 +409,9 @@ class TokenCountingViewModel: ObservableObject {
                 "updatePending": "\(updateTokenCountTask != nil)",
                 "immediateInProgress": "\(isImmediateRecountInProgress)",
                 "didComputeBaseline": "\(didComputeBaseline)",
+                "inputRevision": "\(inputRevision)",
+                "activeRunID": activeRecountRunID.map(String.init) ?? "none",
+                "acceptedSelection": "\(acceptedSelectionProjection != nil)",
                 "totalTokens": "\(totalTokenCount)",
                 "fileTokens": "\(totalTokenCountFilesOnly)",
                 "codeMapTokens": "\(codeMapTokenCount)",
@@ -381,6 +422,24 @@ class TokenCountingViewModel: ObservableObject {
 
         private func debugSelectionFields(_ selection: StoredSelection) -> [String: String] {
             PromptTokenRecountDiagnostics.selectionFields(selection)
+        }
+
+        func processPendingRecountForTesting() async {
+            let kinds = pendingDirty
+            pendingDirty = []
+            if !kinds.intersection(heavyDirtyKinds).isEmpty {
+                await performTokenCountOffMainThread()
+            } else {
+                await recalculateLight(kinds: kinds)
+            }
+        }
+
+        var hasAcceptedSelectionProjectionForTesting: Bool {
+            acceptedSelectionProjection != nil
+        }
+
+        var publishedTokenProjectionForTesting: TokenProjection? {
+            publishedWorkspaceTokenProjection
         }
     #endif
 
@@ -440,6 +499,93 @@ class TokenCountingViewModel: ObservableObject {
         return fileManager?.snapshotSelection() ?? StoredSelection()
     }
 
+    private struct RecountRun {
+        let id: UInt64
+        let inputRevision: UInt64
+    }
+
+    private func beginRecountRun() -> RecountRun {
+        nextRecountRunID &+= 1
+        let run = RecountRun(id: nextRecountRunID, inputRevision: inputRevision)
+        activeRecountRunID = run.id
+        return run
+    }
+
+    private func isCurrent(_ run: RecountRun) -> Bool {
+        !Task.isCancelled
+            && activeRecountRunID == run.id
+            && inputRevision == run.inputRevision
+    }
+
+    private func finishRecountRun(_ run: RecountRun) {
+        if activeRecountRunID == run.id {
+            activeRecountRunID = nil
+        }
+    }
+
+    private func invalidateAcceptedSelectionProjection() {
+        acceptedSelectionProjection = nil
+        acceptedWorkspaceTokenViews = nil
+        acceptedHasSelectedArtifacts = false
+        didComputeBaseline = false
+    }
+
+    private func selectedTokenProjection(
+        from views: TokenProjectionService.WorkspaceViews
+    ) -> TokenProjection {
+        views.userConfigured ?? views.normalized
+    }
+
+    private func selectedIncludedFiles(
+        from selection: WorkspaceSelectionProjection
+    ) -> [WorkspaceSelectionProjection.IncludedFile] {
+        selection.alternate?.includedFiles ?? selection.normalizedFiles
+    }
+
+    private func retryHeavyImmediatelyAfterRecoverableError(
+        _ error: Error,
+        run: RecountRun
+    ) async -> Bool {
+        guard isCurrent(run), !(error is CancellationError), !Task.isCancelled else { return false }
+        guard isRecoverableHeavyError(error), !heavyRecoveryAttempted else { return false }
+        heavyRecoveryAttempted = true
+        await performTokenCountOffMainThread(isRetry: true)
+        return true
+    }
+
+    private func isRecoverableHeavyError(_ error: Error) -> Bool {
+        if let adapterError = error as? WorkspacePromptProjectionAdapter.Error {
+            switch adapterError {
+            case .missingTokenFacts, .unusedTokenFacts, .projectionProvenanceMismatch:
+                return true
+            case .missingSelectionProjection, .missingTokenProjection:
+                return false
+            }
+        }
+        if let projectionError = error as? WorkspaceContextProjectionError {
+            switch projectionError {
+            case .captureProvenanceMismatch,
+                 .recordAssociationMismatch,
+                 .codemapAssociationMismatch,
+                 .materializationProvenanceMismatch,
+                 .missingOccurrenceIDs,
+                 .missingTokenFacts:
+                return true
+            case .duplicateRootID,
+                 .rootAssociationMismatch,
+                 .duplicateCodemapFileID,
+                 .duplicateOccurrenceID,
+                 .unexpectedOccurrenceIDs,
+                 .invalidTokenFacts:
+                return false
+            }
+        }
+        if error is PromptContextAccountingError {
+            return true
+        }
+        return true
+    }
+
     private func allStoreFileRecords(from store: WorkspaceFileContextStore) async -> [WorkspaceFileRecord] {
         let roots = await store.roots()
         var records: [WorkspaceFileRecord] = []
@@ -449,41 +595,21 @@ class TokenCountingViewModel: ObservableObject {
         return records
     }
 
-    private func predominantLanguage(
-        from entries: [ResolvedPromptFileEntry],
-        includeFiles: Bool,
-        codeMapUsage: CodeMapUsage
-    ) -> String {
-        guard includeFiles else { return "Swift" }
-        let languageFiles: [WorkspaceFileRecord] = if codeMapUsage == .selected {
-            // `.selected` renders explicitly selected files as codemap entries, so they
-            // should still participate in language inference like live selectedFiles did.
-            deduplicatedFilesPreservingOrder(entries.map(\.file))
-        } else {
-            // For `.auto` and `.complete`, codemap entries can include unselected files;
-            // prefer full/sliced selected files to avoid workspace-wide language bias.
-            deduplicatedFilesPreservingOrder(entries.filter { !$0.isCodemap }.map(\.file))
-        }
-        guard !languageFiles.isEmpty else { return "Swift" }
-        return SystemPromptService.predominantLanguage(from: languageFiles)
-    }
-
-    private func deduplicatedFilesPreservingOrder(_ files: [WorkspaceFileRecord]) -> [WorkspaceFileRecord] {
-        var seen = Set<UUID>()
-        var result: [WorkspaceFileRecord] = []
-        for file in files where seen.insert(file.id).inserted {
-            result.append(file)
-        }
-        return result
-    }
-
     // MARK: - Token Calculation
 
     /// Heavy path (rebuild baseline and everything else).
-    private func performTokenCountOffMainThread() async {
+    private func performTokenCountOffMainThread(isRetry: Bool = false) async {
+        if !isRetry {
+            heavyRecoveryAttempted = false
+        }
+        let run = beginRecountRun()
+        defer { finishRecountRun(run) }
         #if DEBUG
             let calculateStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.begin", fields: debugTokenRecountStateFields())
+            var beginFields = debugTokenRecountStateFields()
+            beginFields["runID"] = "\(run.id)"
+            beginFields["runInputRevision"] = "\(run.inputRevision)"
+            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.begin", fields: beginFields)
         #endif
         guard let fileManager,
               let promptSource = getPromptText?(),
@@ -504,149 +630,139 @@ class TokenCountingViewModel: ObservableObject {
 
         let copySnapshot = resolveCopyContextSnapshot()
         let includeFiles = copySnapshot.includeFiles
-        #if DEBUG
-            let selectionSnapshotStartMS = PromptTokenRecountDiagnostics.start()
-        #endif
-        let selectionAtStart = includeFiles ? currentStoredSelection(includeFiles: true) : StoredSelection()
+        let selectionAtStart = currentStoredSelection(includeFiles: true)
         #if DEBUG
             var selectionFields = debugSelectionFields(selectionAtStart)
             selectionFields["includeFiles"] = "\(includeFiles)"
-            selectionFields["duration"] = selectionSnapshotStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
             PromptTokenRecountDiagnostics.event("tokenRecount.calculate.selectionSnapshot", fields: selectionFields)
         #endif
-        let includeUserPrompt = copySnapshot.includeUserPrompt
-        let includeMetaPrompts = copySnapshot.includeMetaPrompts
-        let includeFileTree = copySnapshot.includeFileTree
 
-        let promptText = includeUserPrompt ? promptSource : ""
-        // For MCP system prompts, always include them even if includeMetaPrompts is false
-        // (e.g., MCP Discover has includeMetaPrompts=false but still needs system prompt counted)
-        let selectedInstructionsText = includeMetaPrompts ? instructionsSource : ""
-        let duplicatePromptAtTop = includeUserPrompt ? copySnapshot.duplicateUserInstructionsAtTop : false
-
+        let promptText = copySnapshot.includeUserPrompt ? promptSource : ""
+        let selectedInstructionsText = copySnapshot.includeMetaPrompts ? instructionsSource : ""
+        let duplicatePromptAtTop = copySnapshot.includeUserPrompt
+            ? copySnapshot.duplicateUserInstructionsAtTop
+            : false
         let store = fileManager.workspaceFileContextStore
-        #if DEBUG
-            let allFilesStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.allFiles.begin")
-        #endif
+
         let allFileRecords = await allStoreFileRecords(from: store)
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.allFiles.end",
-                fields: [
-                    "files": "\(allFileRecords.count)",
-                    "duration": allFilesStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
-        guard !Task.isCancelled else {
-            #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "allFiles", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
-            #endif
-            return
-        }
-        #if DEBUG
-            let codemapAPIsStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.codemapAPIs.begin")
-        #endif
+        guard isCurrent(run) else { return }
         let storeFileAPIs = await store.allCodemapFileAPIs()
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.codemapAPIs.end",
-                fields: [
-                    "fileAPIs": "\(storeFileAPIs.count)",
-                    "duration": codemapAPIsStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
-        guard !Task.isCancelled else {
-            #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "codemapAPIs", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
-            #endif
-            return
-        }
+        guard isCurrent(run) else { return }
 
-        // Cache the store-owned file APIs for reuse by legacy UI surfaces.
-        cachedFileAPIs = storeFileAPIs
-
-        // Derive and publish the set of detected languages from store-owned file records.
         let detectedExts = allFileRecords.map { (($0.name as NSString).pathExtension).lowercased() }
-        let detectedLangs = detectedExts.compactMap { SyntaxManager.shared.extensionToLanguage[$0] }
-        scannedLanguages = Set(detectedLangs)
-
-        let effectiveCodeMapUsage = copySnapshot.codeMapUsage
-        let accountingCodeMapUsage: CodeMapUsage = includeFiles ? effectiveCodeMapUsage : .none
-        let accountingSelection = includeFiles ? selectionAtStart : StoredSelection()
-
-        let effectiveFileTreeOption: FileTreeOption = includeFileTree ? copySnapshot.fileTreeMode : .none
+        let detectedLanguages = Set(detectedExts.compactMap { SyntaxManager.shared.extensionToLanguage[$0] })
+        let normalizedCodeMapUsage: CodeMapUsage = settings.codeMapsGloballyDisabled ? .none : .auto
+        let configuredCodeMapUsage: CodeMapUsage = settings.codeMapsGloballyDisabled
+            ? .none
+            : copySnapshot.codeMapUsage
+        let effectiveFileTreeOption: FileTreeOption = copySnapshot.includeFileTree
+            ? copySnapshot.fileTreeMode
+            : .none
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.context",
                 fields: [
                     "includeFiles": "\(includeFiles)",
-                    "includeFileTree": "\(includeFileTree)",
+                    "includeFileTree": "\(copySnapshot.includeFileTree)",
                     "fileTreeMode": "\(effectiveFileTreeOption)",
-                    "codeMapUsage": "\(accountingCodeMapUsage)",
+                    "normalizedCodeMapUsage": "\(normalizedCodeMapUsage)",
+                    "configuredCodeMapUsage": "\(configuredCodeMapUsage)",
                     "gitInclusion": "\(copySnapshot.gitInclusion)"
                 ]
             )
         #endif
-        let fileTreeInput: TokenCalculationFileTreeInput
-        if includeFileTree, effectiveFileTreeOption != .none {
-            #if DEBUG
-                let fileTreeStartMS = PromptTokenRecountDiagnostics.start()
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.fileTree.begin")
-            #endif
-            let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
-                selection: accountingSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: effectiveFileTreeOption),
-                    filePathDisplay: settings.filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: settings.onlyIncludeRootsWithSelectedFiles,
-                    includeLegend: true,
-                    showCodeMapMarkers: !settings.codeMapsGloballyDisabled,
-                    rootScope: .allLoaded
-                ),
-                profile: .uiAssisted
+
+        let alternatePolicy = WorkspaceSelectionProjectionRequest.AlternatePolicy(
+            includeFiles: includeFiles,
+            codeMapUsage: configuredCodeMapUsage
+        )
+        let fileTreeRequest = WorkspaceFileTreeSnapshotRequest(
+            mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: effectiveFileTreeOption),
+            filePathDisplay: settings.filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: settings.onlyIncludeRootsWithSelectedFiles,
+            includeLegend: copySnapshot.includeFileTree,
+            showCodeMapMarkers: copySnapshot.includeFileTree && !settings.codeMapsGloballyDisabled,
+            rootScope: .allLoaded
+        )
+        let adapter = projectionAdapterFactory(store)
+        let workspaceCapture: WorkspaceFileContextCapture
+        do {
+            workspaceCapture = try await adapter.captureWorkspaceContext(
+                selection: selectionAtStart,
+                codeMapUsage: normalizedCodeMapUsage,
+                filePathDisplay: settings.filePathDisplayOption,
+                alternatePolicy: alternatePolicy,
+                fileTreeRequest: fileTreeRequest
             )
+        } catch {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event(
-                    "tokenRecount.calculate.fileTree.end",
+                    "tokenRecount.calculate.error",
                     fields: [
-                        "roots": "\(fileTreeSnapshot.roots.count)",
-                        "duration": fileTreeStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                        "reason": "capture",
+                        "error": "\(error)",
+                        "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )
             #endif
-            fileTreeInput = .snapshot(fileTreeSnapshot)
-        } else {
-            fileTreeInput = .none
-        }
-        guard !Task.isCancelled else {
-            #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "fileTree", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
-            #endif
+            _ = await retryHeavyImmediatelyAfterRecoverableError(error, run: run)
             return
         }
+        guard isCurrent(run) else { return }
+
+        let fileTreeInput: TokenCalculationFileTreeInput = if copySnapshot.includeFileTree,
+                                                              effectiveFileTreeOption != .none
+        {
+            .snapshot(workspaceCapture.fileTree)
+        } else {
+            .none
+        }
+
         let accountingRequest = PromptContextAccountingRequest(
-            selection: accountingSelection,
+            selection: selectionAtStart,
             promptText: promptText,
             selectedInstructionsText: selectedInstructionsText,
             duplicateUserInstructionsAtTop: duplicatePromptAtTop,
             fileTree: fileTreeInput,
-            codeMapUsage: accountingCodeMapUsage,
+            codeMapUsage: normalizedCodeMapUsage,
             filePathDisplay: settings.filePathDisplayOption,
             rootScope: .allLoaded,
             pathLocateProfile: .uiAssisted
         )
-        #if DEBUG
-            let accountingStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.accounting.begin")
-        #endif
-        let accountingResult = await promptContextAccountingService.calculatePromptStats(
-            request: accountingRequest,
-            store: store
-        )
+        let accountingResult: PromptContextAccountingResult
+        do {
+            if let accountingOperation {
+                accountingResult = try await accountingOperation(
+                    accountingRequest,
+                    store,
+                    workspaceCapture
+                )
+            } else {
+                accountingResult = try await promptContextAccountingService.calculatePromptStats(
+                    request: accountingRequest,
+                    store: store,
+                    capture: workspaceCapture
+                )
+            }
+            guard accountingResult.captureProvenance == workspaceCapture.provenance else {
+                throw WorkspacePromptProjectionAdapter.Error.projectionProvenanceMismatch
+            }
+        } catch {
+            #if DEBUG
+                PromptTokenRecountDiagnostics.event(
+                    "tokenRecount.calculate.error",
+                    fields: [
+                        "reason": "accounting",
+                        "error": "\(error)",
+                        "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    ]
+                )
+            #endif
+            _ = await retryHeavyImmediatelyAfterRecoverableError(error, run: run)
+            return
+        }
+        guard isCurrent(run) else { return }
+
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.calculate.accounting.end",
@@ -655,188 +771,220 @@ class TokenCountingViewModel: ObservableObject {
                     "promptEntries": "\(accountingResult.promptFileEntrySnapshots.count)",
                     "missingPaths": "\(accountingResult.missingPaths.count)",
                     "invalidPaths": "\(accountingResult.invalidPaths.count)",
-                    "codemapsUsed": "\(accountingResult.codemapSnapshotsUsed.count)",
-                    "duration": accountingStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    "codemapsUsed": "\(accountingResult.codemapSnapshotsUsed.count)"
                 ]
             )
         #endif
-        guard !Task.isCancelled else {
-            #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "accounting", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
-            #endif
-            return
-        }
 
-        let predominantLanguage = predominantLanguage(
-            from: accountingResult.resolvedEntries,
-            includeFiles: includeFiles,
-            codeMapUsage: accountingCodeMapUsage
-        )
-        let result = accountingResult.tokenResult
-
-        // Git diff tokens: only count generated diffs from GitViewModel when no artifact files are selected.
-        // Artifact files (_git_data/*.diff/*.patch) are already counted as normal files in calculatePromptStats,
-        // so we don't double-count them here. gitDiffTokenCount represents ONLY generated diffs.
+        let detailResult = accountingResult.tokenResult
         let resolvedFileEntries = includeFiles ? accountingResult.resolvedEntries : []
         let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(resolvedFileEntries)
         let hasSelectedArtifacts = !diffEntries.isEmpty
 
-        var gitDiffTokens = 0
-        #if DEBUG
-            let gitDiffStartMS = PromptTokenRecountDiagnostics.start()
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.gitDiff.begin",
-                fields: [
-                    "hasSelectedArtifacts": "\(hasSelectedArtifacts)",
-                    "gitInclusion": "\(copySnapshot.gitInclusion)"
-                ]
-            )
-        #endif
-        if !hasSelectedArtifacts, let gitViewModel {
-            // No artifact files selected - use GitViewModel to generate diff if git inclusion is enabled
+        let gitDiffText: String? = if hasSelectedArtifacts || copySnapshot.gitInclusion == .none || gitViewModel == nil {
+            nil
+        } else {
             switch copySnapshot.gitInclusion {
             case .none:
-                break
+                nil
             case .selected:
-                if let diff = await gitViewModel.getDiffUsing(inclusionMode: .selectedFiles) {
-                    gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                }
+                await gitViewModel?.getDiffUsing(inclusionMode: .selectedFiles)
             case .complete:
-                if let diff = await gitViewModel.getDiffUsing(inclusionMode: .all) {
-                    gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                }
+                await gitViewModel?.getDiffUsing(inclusionMode: .all)
             }
         }
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.gitDiff.end",
-                fields: [
-                    "gitDiffTokens": "\(gitDiffTokens)",
-                    "duration": gitDiffStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
+        guard isCurrent(run) else { return }
+
+        let componentBreakdown = TokenCalculationService.calculateComponentBreakdown(
+            promptText: promptText,
+            selectedInstructionsText: selectedInstructionsText,
+            fileTreeText: detailResult.fileTreeContent,
+            gitDiffText: gitDiffText,
+            metadataText: nil,
+            duplicateUserInstructionsAtTop: duplicatePromptAtTop
+        )
+        let adapterProjection: WorkspacePromptProjectionAdapter.TokenAwareProjection
+        do {
+            adapterProjection = try await adapter.projectTokens(
+                capture: workspaceCapture,
+                codeMapUsage: normalizedCodeMapUsage,
+                filePathDisplay: settings.filePathDisplayOption,
+                alternatePolicy: alternatePolicy,
+                resolvedEntries: accountingResult.resolvedEntries,
+                promptFileEntrySnapshots: accountingResult.promptFileEntrySnapshots,
+                tokenProjectionInput: .activeLive(.init(
+                    reportedTotal: detailResult.totalTokenCount + componentBreakdown.gitDiff,
+                    prompt: componentBreakdown.promptDisplay,
+                    fileTree: componentBreakdown.fileTree,
+                    meta: componentBreakdown.instructions,
+                    git: componentBreakdown.gitDiff,
+                    requestedFileTreeEstimate: detailResult.fileTreeTokenCountRaw
+                ))
             )
-        #endif
-        // When artifact files ARE selected, gitDiffTokens stays 0 - those files are counted as normal files in calculatePromptStats
-        guard !Task.isCancelled else {
-            #if DEBUG
-                PromptTokenRecountDiagnostics.event("tokenRecount.calculate.cancelled", fields: ["phase": "gitDiff", "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"])
-            #endif
-            return
-        }
-        #if DEBUG
-            let consistencyStartMS = PromptTokenRecountDiagnostics.start()
-        #endif
-        if includeFiles, currentStoredSelection(includeFiles: true) != selectionAtStart {
+        } catch {
             #if DEBUG
                 PromptTokenRecountDiagnostics.event(
-                    "tokenRecount.calculate.selectionChanged",
-                    fields: ["duration": consistencyStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"]
+                    "tokenRecount.calculate.error",
+                    fields: [
+                        "reason": "projection",
+                        "error": "\(error)",
+                        "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+                    ]
                 )
             #endif
+            _ = await retryHeavyImmediatelyAfterRecoverableError(error, run: run)
+            return
+        }
+        guard isCurrent(run) else { return }
+
+        if currentStoredSelection(includeFiles: true) != selectionAtStart {
             markDirty(.selection)
             return
         }
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.selectionConsistent",
-                fields: ["duration": consistencyStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"]
-            )
-        #endif
+        guard isCurrent(run) else { return }
 
-        let copyTotal = result.totalTokenCount + gitDiffTokens
-        let copyTokenString = String(format: "%.2fk", Double(copyTotal) / 1000.0)
+        let workspaceViews = TokenProjectionService.WorkspaceViews(
+            normalized: adapterProjection.tokens.normalized,
+            userConfigured: adapterProjection.tokens.userConfigured
+        )
+        let selectedProjection = selectedTokenProjection(from: workspaceViews)
+        let components = selectedProjection.components
+        let filesContentTokens = components.filesContent ?? 0
+        let codemapTokens = components.codemaps ?? 0
+        let gitTokens = components.git ?? 0
+        let fileTreeTokens = components.fileTree ?? 0
+        let totalTokens = selectedProjection.total
+        let totalTokenString = String(format: "%.2fk", Double(totalTokens) / 1000.0)
+        let filesContentString = String(format: "%.2fk", Double(filesContentTokens) / 1000.0)
+        let gitTokenString = String(format: "%.2fk", Double(gitTokens) / 1000.0)
+        let projectionDetails = projectionDetailData(
+            selection: adapterProjection.selection,
+            totalFileTokens: components.files ?? 0
+        )
+        let selectedCharCount = includeFiles
+            ? detailResult.charCount
+            : promptText.count
+            + (duplicatePromptAtTop ? promptText.count : 0)
+            + selectedInstructionsText.count
 
         #if DEBUG
-            let publishStartMS = PromptTokenRecountDiagnostics.start()
             PromptTokenRecountDiagnostics.event(
                 "tokenRecount.publish.begin",
                 fields: [
+                    "runID": "\(run.id)",
                     "resolvedEntries": "\(accountingResult.resolvedEntries.count)",
-                    "fileTokenInfos": "\(result.fileTokenInfo.count)",
-                    "folderTokenInfos": "\(result.folderTokenInfo.count)",
-                    "totalTokens": "\(copyTotal)",
-                    "fileTokens": "\(result.totalTokenCountFilesOnly)",
-                    "codeMapTokens": "\(result.codeMapTokenCount)",
-                    "fileTreeTokens": "\(result.fileTreeTokenCountRaw)"
+                    "fileTokenInfos": "\(projectionDetails.fileTokenInfo.count)",
+                    "folderTokenInfos": "\(projectionDetails.folderTokenInfo.count)",
+                    "totalTokens": "\(totalTokens)",
+                    "fileTokens": "\(filesContentTokens)",
+                    "codeMapTokens": "\(codemapTokens)",
+                    "fileTreeTokens": "\(fileTreeTokens)"
                 ]
             )
         #endif
-        fileTokenInfo = remapStoreFileTokenInfo(
-            result.fileTokenInfo,
-            resolvedEntries: accountingResult.resolvedEntries,
-            fileManager: fileManager
-        )
-        folderTokenInfo = result.folderTokenInfo
-        fileTreeContent = result.fileTreeContent
-        codeMapContent = result.codeMapContent
-        lastFileTreeTokens = result.fileTreeTokenCountRaw
-        charCount = result.charCount
-        totalTokenCount = copyTotal
-        tokenCount = copyTokenString
-        tokenCountFilesOnly = result.tokenCountFilesOnlyString
-        totalTokenCountFilesOnly = result.totalTokenCountFilesOnly
-        codeMapFileCount = result.codeMapFileCount
-        codeMapTokenCount = result.codeMapTokenCount
-        lastPredominantLanguage = predominantLanguage
 
-        gitDiffTokenCount = gitDiffTokens
-        gitDiffTokenCountString = String(format: "%.2fk", Double(gitDiffTokens) / 1000.0)
-
-        let promptTokensLocal = TokenCalculationService.estimateTokens(for: promptText)
-        let instructionsTokensLocal = TokenCalculationService.estimateTokens(for: selectedInstructionsText)
-        let duplicatePromptTokensLocal = duplicatePromptAtTop ? promptTokensLocal : 0
-
-        lastBaseWithoutUserText = max(
-            0,
-            result.totalTokenCount - promptTokensLocal - duplicatePromptTokensLocal - instructionsTokensLocal
-        )
-        lastPromptTokens = promptTokensLocal
-        lastDuplicatePromptTokens = duplicatePromptTokensLocal
-        lastInstructionsTokens = instructionsTokensLocal
-        lastGitDiffTokens = gitDiffTokens
-        copyContextTotalTokens = copyTotal
-        copyContextTokenCountString = copyTokenString
+        cachedFileAPIs = storeFileAPIs
+        scannedLanguages = detectedLanguages
+        fileTokenInfo = projectionDetails.fileTokenInfo
+        folderTokenInfo = projectionDetails.folderTokenInfo
+        fileTreeContent = detailResult.fileTreeContent
+        codeMapContent = projectionDetails.codeMapContent
+        lastFileTreeTokens = fileTreeTokens
+        charCount = selectedCharCount
+        totalTokenCount = totalTokens
+        tokenCount = totalTokenString
+        tokenCountFilesOnly = filesContentString
+        totalTokenCountFilesOnly = filesContentTokens
+        codeMapFileCount = projectionDetails.codeMapFileCount
+        codeMapTokenCount = codemapTokens
+        gitDiffTokenCount = gitTokens
+        gitDiffTokenCountString = gitTokenString
+        lastGitDiffText = gitDiffText
+        copyContextTotalTokens = totalTokens
+        copyContextTokenCountString = totalTokenString
+        acceptedSelectionProjection = adapterProjection.selection
+        acceptedWorkspaceTokenViews = workspaceViews
+        publishedWorkspaceTokenProjection = selectedProjection
+        acceptedHasSelectedArtifacts = hasSelectedArtifacts
         didComputeBaseline = true
-        #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.publish.apply.end",
-                fields: [
-                    "mappedFileTokenInfos": "\(fileTokenInfo.count)",
-                    "duration": publishStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
-        #endif
+        heavyRecoveryAttempted = false
 
         tokenCalculationCompletedPublisher.send()
         #if DEBUG
-            PromptTokenRecountDiagnostics.event(
-                "tokenRecount.calculate.end",
-                fields: [
-                    "outcome": Task.isCancelled ? "cancelled" : "completed",
-                    "duration": calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
-                ]
-            )
+            var endFields = debugTokenRecountStateFields()
+            endFields["runID"] = "\(run.id)"
+            endFields["duration"] = calculateStartMS.map { PromptTokenRecountDiagnostics.formatElapsedMS(since: $0) } ?? "notMeasured"
+            PromptTokenRecountDiagnostics.event("tokenRecount.calculate.end", fields: endFields)
         #endif
     }
 
-    private func remapStoreFileTokenInfo(
-        _ storeFileTokenInfo: [UUID: TokenInfo],
-        resolvedEntries: [ResolvedPromptFileEntry],
-        fileManager: WorkspaceFilesViewModel
-    ) -> [UUID: TokenInfo] {
-        var mapped: [UUID: TokenInfo] = [:]
-        for entry in resolvedEntries {
-            guard let tokenInfo = storeFileTokenInfo[entry.file.id],
-                  let liveFile = fileManager.findFileByFullPath(entry.file.standardizedFullPath)
-            else { continue }
-            mapped[liveFile.id] = tokenInfo
+    private struct ProjectionDetailData {
+        let fileTokenInfo: [UUID: TokenInfo]
+        let folderTokenInfo: [String: TokenInfo]
+        let codeMapFileCount: Int
+        let codeMapContent: String
+    }
+
+    private func projectionDetailData(
+        selection: WorkspaceSelectionProjection,
+        totalFileTokens: Int
+    ) -> ProjectionDetailData {
+        let includedFiles = selectedIncludedFiles(from: selection)
+        var fileCounts: [UUID: Int] = [:]
+        var fullCounts: [UUID: Int] = [:]
+        var codemapCounts: [UUID: Int] = [:]
+        var folderTokens: [String: Int] = [:]
+        var codemapContents: [String] = []
+        var codeMapFileCount = 0
+
+        for file in includedFiles {
+            fileCounts[file.file.id, default: 0] += file.tokens
+            if let fullTokens = file.fullTokens {
+                if let existing = fullCounts[file.file.id] {
+                    assert(existing == fullTokens, "Duplicate occurrences disagree on full token facts")
+                }
+                fullCounts[file.file.id] = max(fullCounts[file.file.id] ?? 0, fullTokens)
+            }
+            codemapCounts[file.file.id] = max(codemapCounts[file.file.id] ?? 0, file.codemapTokens)
+
+            if file.mode == .codemap {
+                codeMapFileCount += 1
+                if let content = file.codemapContent, !content.isEmpty {
+                    codemapContents.append(content)
+                }
+            }
+
+            let folderPath = (file.metadata.pathWithinRoot as NSString).deletingLastPathComponent
+            folderTokens[folderPath == "." ? "" : folderPath, default: 0] += file.tokens
         }
-        return mapped
+
+        assert(fileCounts.values.reduce(0, +) == totalFileTokens, "Projection details must match aggregate file tokens")
+        var mappedFiles: [UUID: TokenInfo] = [:]
+        for (fileID, count) in fileCounts {
+            mappedFiles[fileID] = TokenInfo(
+                count: count,
+                fullCount: fullCounts[fileID] ?? 0,
+                codemapCount: codemapCounts[fileID] ?? 0,
+                totalTokens: totalFileTokens
+            )
+        }
+
+        let mappedFolders = folderTokens.reduce(into: [String: TokenInfo]()) { result, item in
+            result[item.key] = TokenInfo(count: item.value, totalTokens: totalFileTokens)
+        }
+        return ProjectionDetailData(
+            fileTokenInfo: mappedFiles,
+            folderTokenInfo: mappedFolders,
+            codeMapFileCount: codeMapFileCount,
+            codeMapContent: TokenCalculationService.composeCodemapContent(codemapContents)
+        )
     }
 
     /// Light path (prompt text and/or meta instructions and/or git diff only).
     private func recalculateLight(kinds: DirtyKind) async {
         guard didComputeBaseline,
+              let acceptedSelectionProjection,
+              let acceptedViews = acceptedWorkspaceTokenViews,
               let promptSource = getPromptText?(),
               let instructionsSource = getSelectedInstructionsText?()
         else {
@@ -844,82 +992,72 @@ class TokenCountingViewModel: ObservableObject {
             return
         }
 
+        let run = beginRecountRun()
+        defer { finishRecountRun(run) }
         let copySnapshot = resolveCopyContextSnapshot()
-        let includeUserPrompt = copySnapshot.includeUserPrompt
-        let includeMetaPrompts = copySnapshot.includeMetaPrompts
-        let promptText = includeUserPrompt ? promptSource : ""
-        let selectedInstructionsText = includeMetaPrompts ? instructionsSource : ""
-        let duplicatePrompt = includeUserPrompt ? copySnapshot.duplicateUserInstructionsAtTop : false
+        let promptText = copySnapshot.includeUserPrompt ? promptSource : ""
+        let selectedInstructionsText = copySnapshot.includeMetaPrompts ? instructionsSource : ""
+        let duplicatePrompt = copySnapshot.includeUserPrompt
+            ? copySnapshot.duplicateUserInstructionsAtTop
+            : false
 
-        let promptTokens = TokenCalculationService.estimateTokens(for: promptText)
-        let duplicatePromptTokens = duplicatePrompt ? promptTokens : 0
-        let instructionsTokens = TokenCalculationService.estimateTokens(for: selectedInstructionsText)
-
-        var gitDiffTokens = gitDiffTokenCount
+        var gitDiffText = lastGitDiffText
         if kinds.contains(.gitDiff) {
-            if let fileManager {
-                // Check if artifact files are selected - if so, they're already counted as normal files.
-                let hasSelectedArtifacts: Bool
-                if copySnapshot.includeFiles {
-                    let store = fileManager.workspaceFileContextStore
-                    let selection = currentStoredSelection(includeFiles: true)
-                    let resolution = await promptContextAccountingService.resolveEntries(
-                        selection: selection,
-                        store: store,
-                        rootScope: .allLoaded,
-                        profile: .uiAssisted,
-                        codeMapUsage: copySnapshot.includeFiles ? copySnapshot.codeMapUsage : .none
-                    )
-                    let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(resolution.entries)
-                    hasSelectedArtifacts = !diffEntries.isEmpty
-                } else {
-                    hasSelectedArtifacts = false
-                }
-
-                if hasSelectedArtifacts {
-                    // Artifact files are selected - they're counted as normal files, not as gitDiffTokens
-                    gitDiffTokens = 0
-                } else if let gitViewModel {
-                    // No artifact files - use GitViewModel to generate diff if git inclusion is enabled
-                    switch copySnapshot.gitInclusion {
-                    case .none:
-                        gitDiffTokens = 0
-                    case .selected:
-                        if let diff = await gitViewModel.getDiffUsing(inclusionMode: .selectedFiles) {
-                            gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                        } else {
-                            gitDiffTokens = 0
-                        }
-                    case .complete:
-                        if let diff = await gitViewModel.getDiffUsing(inclusionMode: .all) {
-                            gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                        } else {
-                            gitDiffTokens = 0
-                        }
-                    }
-                } else {
-                    gitDiffTokens = 0
-                }
+            if acceptedHasSelectedArtifacts || copySnapshot.gitInclusion == .none || gitViewModel == nil {
+                gitDiffText = nil
             } else {
-                gitDiffTokens = 0
+                switch copySnapshot.gitInclusion {
+                case .none:
+                    gitDiffText = nil
+                case .selected:
+                    gitDiffText = await gitViewModel?.getDiffUsing(inclusionMode: .selectedFiles)
+                case .complete:
+                    gitDiffText = await gitViewModel?.getDiffUsing(inclusionMode: .all)
+                }
             }
-            gitDiffTokenCount = gitDiffTokens
-            gitDiffTokenCountString = String(format: "%.2fk", Double(gitDiffTokens) / 1000.0)
-            lastGitDiffTokens = gitDiffTokens
         }
+        guard isCurrent(run) else { return }
 
-        let mainTotal = lastBaseWithoutUserText + promptTokens + duplicatePromptTokens + instructionsTokens
-        let totalWithGit = mainTotal + gitDiffTokens
+        let componentBreakdown = TokenCalculationService.calculateComponentBreakdown(
+            promptText: promptText,
+            selectedInstructionsText: selectedInstructionsText,
+            fileTreeText: "",
+            gitDiffText: gitDiffText,
+            metadataText: nil,
+            duplicateUserInstructionsAtTop: duplicatePrompt
+        )
+        let nonFile = TokenProjectionService.WorkspaceNonFileComponents(
+            prompt: componentBreakdown.promptDisplay,
+            fileTree: acceptedViews.normalized.components.fileTree ?? 0,
+            meta: componentBreakdown.instructions,
+            git: componentBreakdown.gitDiff,
+            other: acceptedViews.normalized.components.other ?? 0
+        )
+        let workspaceViews: TokenProjectionService.WorkspaceViews
+        do {
+            workspaceViews = try await lightProjectionOperation(
+                acceptedSelectionProjection,
+                .virtualRecomputed,
+                nonFile
+            )
+        } catch {
+            return
+        }
+        let selectedProjection = selectedTokenProjection(from: workspaceViews)
+        let gitTokens = selectedProjection.components.git ?? 0
+        let totalTokens = selectedProjection.total
+        let tokenString = String(format: "%.2fk", Double(totalTokens) / 1000.0)
+        guard isCurrent(run) else { return }
 
-        let copyTokenString = String(format: "%.2fk", Double(totalWithGit) / 1000.0)
-        totalTokenCount = totalWithGit
-        tokenCount = copyTokenString
-        copyContextTotalTokens = totalWithGit
-        copyContextTokenCountString = copyTokenString
-
-        lastPromptTokens = promptTokens
-        lastDuplicatePromptTokens = duplicatePromptTokens
-        lastInstructionsTokens = instructionsTokens
+        totalTokenCount = totalTokens
+        tokenCount = tokenString
+        copyContextTotalTokens = totalTokens
+        copyContextTokenCountString = tokenString
+        gitDiffTokenCount = gitTokens
+        gitDiffTokenCountString = String(format: "%.2fk", Double(gitTokens) / 1000.0)
+        lastGitDiffText = gitDiffText
+        acceptedWorkspaceTokenViews = workspaceViews
+        publishedWorkspaceTokenProjection = selectedProjection
 
         tokenCalculationCompletedPublisher.send()
     }
@@ -945,31 +1083,33 @@ class TokenCountingViewModel: ObservableObject {
     }
 
     func latestTokenBreakdown() -> TokenBreakdown {
+        if let projection = publishedWorkspaceTokenProjection {
+            return TokenBreakdown(
+                total: projection.total,
+                files: projection.components.files ?? 0,
+                prompt: projection.components.prompt ?? 0,
+                meta: projection.components.meta ?? 0,
+                fileTree: projection.components.fileTree ?? 0,
+                git: projection.components.git ?? 0,
+                other: projection.components.other ?? 0
+            )
+        }
+
         let promptSource = getPromptText?() ?? ""
         let instructionsSource = getSelectedInstructionsText?() ?? ""
-        let promptTokens = didComputeBaseline
-            ? (lastPromptTokens + lastDuplicatePromptTokens)
-            : (promptSource.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: promptSource))
-        let metaTokens = didComputeBaseline
-            ? lastInstructionsTokens
-            : (instructionsSource.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: instructionsSource))
-        let gitTokens = didComputeBaseline ? lastGitDiffTokens : 0
-        let fileTreeTokens = didComputeBaseline
-            ? lastFileTreeTokens
-            : (fileTreeContent.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: fileTreeContent))
-        let filesTokens = totalTokenCountFilesOnly
-        let total = didComputeBaseline
-            ? totalTokenCount
-            : (promptTokens + filesTokens + metaTokens + gitTokens + fileTreeTokens)
-        let otherTokens = max(total - (filesTokens + promptTokens + metaTokens + gitTokens + fileTreeTokens), 0)
+        let promptTokens = promptSource.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: promptSource)
+        let metaTokens = instructionsSource.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: instructionsSource)
+        let fileTreeTokens = fileTreeContent.isEmpty ? 0 : TokenCalculationService.estimateTokens(for: fileTreeContent)
+        let filesTokens = totalFileTokensDisplay
+        let total = promptTokens + filesTokens + metaTokens + fileTreeTokens
         return TokenBreakdown(
             total: total,
             files: filesTokens,
             prompt: promptTokens,
             meta: metaTokens,
             fileTree: fileTreeTokens,
-            git: gitTokens,
-            other: otherTokens
+            git: 0,
+            other: 0
         )
     }
 

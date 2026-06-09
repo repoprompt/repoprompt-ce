@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -35,14 +36,14 @@ private final class CountingSecureStorageBackend: SecureKeyValueStorageBackend, 
     private(set) var getCount = 0
     private let lock = NSLock()
 
-    func save(_ value: String, for key: String, accessMode: KeychainAccessMode) throws {}
+    func save(_ value: String, for key: String, accessMode: SecureStorageAccessMode) throws {}
 
-    func get(for key: String, accessMode: KeychainAccessMode) throws -> String {
+    func get(for key: String, accessMode: SecureStorageAccessMode) throws -> String {
         lock.lock()
         getCount += 1
         lock.unlock()
-        throw KeychainService.KeychainError.itemNotFound
+        throw SecureStorageError.itemNotFound
     }
 
-    func delete(for key: String, accessMode: KeychainAccessMode) throws {}
+    func delete(for key: String, accessMode: SecureStorageAccessMode) throws {}
 }

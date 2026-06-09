@@ -124,11 +124,11 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
     func testSameFlavorDuplicateServerCannotDeleteFirstListener() async throws {
         let socketURL = temporaryDirectory.appendingPathComponent("server.sock")
         let first = BootstrapSocketServer(socketURL: socketURL)
-        try await first.start { _, _, _, _ in .reject() }
+        try await first.start { _, _, _ in .reject() }
         let second = BootstrapSocketServer(socketURL: socketURL)
 
         do {
-            try await second.start { _, _, _, _ in .reject() }
+            try await second.start { _, _, _ in .reject() }
             XCTFail("Expected duplicate ownership failure")
         } catch {
             guard case BootstrapSocketOwnership.OwnershipError.lockUnavailable = error else {
@@ -151,8 +151,8 @@ final class BootstrapSocketOwnershipTests: XCTestCase {
         let releaseURL = temporaryDirectory.appendingPathComponent("repoprompt-ce-7.sock")
         let debugServer = BootstrapSocketServer(socketURL: debugURL)
         let releaseServer = BootstrapSocketServer(socketURL: releaseURL)
-        try await debugServer.start { _, _, _, _ in .reject() }
-        try await releaseServer.start { _, _, _, _ in .reject() }
+        try await debugServer.start { _, _, _ in .reject() }
+        try await releaseServer.start { _, _, _ in .reject() }
 
         await releaseServer.stop()
         XCTAssertNotNil(BootstrapSocketOwnership.identity(atPath: debugURL.path))

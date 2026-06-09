@@ -49,7 +49,7 @@ class ContentViewModel: ObservableObject {
         self.state = state
 
         // Sync workspace changes to drive routing
-        state.workspaceManager.$activeWorkspaceID
+        state.workspaceManager.workspaceObservation.$activeWorkspaceID
             .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 self?.syncRouteWithWorkspaceState()

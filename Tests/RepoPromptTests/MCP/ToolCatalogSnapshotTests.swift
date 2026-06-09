@@ -185,6 +185,8 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { _ in
                 let window = Self.makeWindowWithoutAutoStart()
+                WindowStatesManager.shared.registerWindowState(window)
+                defer { WindowStatesManager.shared.unregisterWindowState(window) }
                 let catalogService = window.mcpServer.windowMCPToolCatalogService
 
                 try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
@@ -196,6 +198,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
                         (service as AnyObject) === (window.mcpServer as AnyObject)
                     })
 
+                    try await Self.waitForSocket(at: socketURL)
                     let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
                     XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
 
@@ -420,6 +423,14 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
         }
     #endif
+
+    private static func waitForSocket(at socketURL: URL) async throws {
+        for _ in 0 ..< 200 {
+            if FileManager.default.fileExists(atPath: socketURL.path) { return }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: socketURL.path])
+    }
 
     private static func schemaProperties(for tool: RepoPrompt.Tool) throws -> [String: Value] {
         let schema = try XCTUnwrap(Value(tool.inputSchema).objectValue)

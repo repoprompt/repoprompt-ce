@@ -557,7 +557,7 @@
             XCTAssertTrue(snapshot.stages.allSatisfy { $0.sampleCount == 1 })
         }
 
-        func testServiceToolLookupInnerAttributionHooksRemainCompileGatedAndOwnMeasuredOperations() throws {
+        func testServiceToolLookupInnerAttributionHooksRemainCompileGatedOwnedAndReleaseEquivalent() throws {
             func assertCompileGated(
                 _ marker: Range<String.Index>,
                 in source: String,
@@ -598,6 +598,51 @@
                 return String(source[start.lowerBound ..< end.lowerBound])
             }
 
+            let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
+            let lookupBegin = try XCTUnwrap(manager.range(of: "let serviceToolLookupState = EditFlowPerf.begin("))
+            let directInvocation = try XCTUnwrap(manager.range(of: "try await toolDef.callAsFunction(effectiveArgs)", range: lookupBegin.upperBound ..< manager.endIndex))
+            let lookup = String(manager[lookupBegin.lowerBound ..< directInvocation.lowerBound])
+
+            var searchStart = lookup.startIndex
+            for hook in [
+                "for indexedRoute in indexedTools.routes(forCanonicalName: toolName)",
+                "let toolDef = indexedRoute.tool",
+                "runtimeSessionRegistry.isInvocationAllowed(windowID: routeWindowID)",
+                "let publicWindowIDInjectionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection)",
+                "let routingWindowID: Int? = {",
+                "let selectedSchemaDeclaresWindowID =",
+                "routingWindowID != nil",
+                "capturedArguments[\"window_id\"] == nil",
+                "capturedArgsForFormatter[\"window_id\"] == nil",
+                "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)",
+                "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID",
+                "args: capturedArguments",
+                "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID",
+                "args: capturedArgsForFormatter",
+                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookupPublicWindowIDInjection, publicWindowIDInjectionState)",
+                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)"
+            ] {
+                let match = try XCTUnwrap(
+                    lookup.range(of: hook, range: searchStart ..< lookup.endIndex),
+                    "Missing or out-of-order ServiceToolLookup attribution hook: \(hook)"
+                )
+                searchStart = match.upperBound
+            }
+
+            XCTAssertEqual(manager.components(separatedBy: "let serviceTools = await service.tools").count - 1, 0)
+            XCTAssertEqual(manager.components(separatedBy: "guard let toolDef = serviceTools.first(where: { $0.name == toolName })").count - 1, 0)
+            XCTAssertEqual(lookup.components(separatedBy: "self.schemaDeclaresWindowID(schema: toolDef.inputSchema)").count - 1, 1)
+            XCTAssertEqual(lookup.components(separatedBy: "schemaDeclaresWindowID: selectedSchemaDeclaresWindowID").count - 1, 2)
+            XCTAssertEqual(lookup.components(separatedBy: "args: capturedArguments").count - 1, 1)
+            XCTAssertEqual(lookup.components(separatedBy: "args: capturedArgsForFormatter").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "let resolvedOperation: @Sendable () async throws -> Value =").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "try await ensureIndexedRouteStillInvocable()").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 1)
+            XCTAssertEqual(manager.components(separatedBy: "try await dispatchResolvedProvider(resolvedOperation)").count - 1, 2)
+            XCTAssertEqual(lookup.components(separatedBy: "serviceToolLookupPublicWindowIDInjection").count - 1, 2)
+            XCTAssertGreaterThanOrEqual(lookup.components(separatedBy: "#if DEBUG || EDIT_FLOW_PERF").count - 1, 1)
+            XCTAssertFalse(manager.contains("service.call("))
+
             func measuredRegion(
                 stage: String,
                 in source: String,
@@ -617,16 +662,6 @@
                 try assertCompileGated(begin, in: source, context: "\(context) begin")
                 try assertCompileGated(end, in: source, context: "\(context) end")
                 return String(source[begin.lowerBound ..< end.upperBound])
-            }
-
-            func assertMeasured(
-                stage: String,
-                operation: String,
-                in source: String,
-                context: String
-            ) throws {
-                let region = try measuredRegion(stage: stage, in: source, context: context)
-                XCTAssertTrue(region.contains(operation), "\(context) no longer owns \(operation)")
             }
 
             func assertDeferredMeasurement(
@@ -668,19 +703,7 @@
 
             // Structural exception: recorder tests prove the stage inventory. These checks retain
             // only telemetry ownership and DEBUG-gating facts that runtime tests cannot observe.
-            let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
-            try assertMeasured(
-                stage: "serviceToolLookupServiceToolsAwait",
-                operation: "await service.tools",
-                in: manager,
-                context: "service-tools await"
-            )
-            try assertMeasured(
-                stage: "serviceToolLookupToolDefinitionScan",
-                operation: ".first(where:",
-                in: manager,
-                context: "tool-definition scan"
-            )
+            // Indexed route lookup replaces the former per-call service tools await and definition scan.
             let injectionRegion = try measuredRegion(
                 stage: "serviceToolLookupPublicWindowIDInjection",
                 in: manager,
@@ -820,8 +843,8 @@
             XCTAssertTrue(viewModel.contains("#else\n                Task { await updateToolRegistration() }"))
             XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration()").count - 1, 2)
             XCTAssertTrue(viewModel.contains("private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {"))
-            XCTAssertTrue(viewModel.contains("let invalidateCatalogBeforeUpdate = !windowToolsEnabled\n            || !ServiceRegistry.services.contains { service in\n                (service as AnyObject) === (windowToolCatalogService as AnyObject)\n            }"))
-            XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration(invalidateCatalogBeforeUpdate:").count - 1, 1)
+            XCTAssertTrue(viewModel.contains("let invalidateCatalogBeforeUpdate = !windowToolsEnabled\n            || !serviceRegistry.contains(windowToolCatalogService)"))
+            XCTAssertEqual(viewModel.components(separatedBy: "await updateToolRegistration(invalidateCatalogBeforeUpdate:").count - 1, 2)
             XCTAssertTrue(viewModel.contains("await updateToolRegistration(invalidateCatalogBeforeUpdate: invalidateCatalogBeforeUpdate)\n        #if DEBUG || EDIT_FLOW_PERF\n            EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.registrationUpdateAgentBootstrap"))
 
             let bootstrapStart = try XCTUnwrap(viewModel.range(of: "func ensureServerReadyForAgentBootstrap() async {"))
@@ -837,11 +860,14 @@
             let helperStart = try XCTUnwrap(viewModel.range(of: "private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {"))
             let policy = try XCTUnwrap(viewModel.range(of: "if invalidateCatalogBeforeUpdate {", range: helperStart.upperBound ..< viewModel.endIndex))
             let invalidate = try XCTUnwrap(viewModel.range(of: "invalidateToolsCache()", range: policy.upperBound ..< viewModel.endIndex))
-            let enabled = try XCTUnwrap(viewModel.range(of: "if windowToolsEnabled {", range: invalidate.upperBound ..< viewModel.endIndex))
-            let register = try XCTUnwrap(viewModel.range(of: "ServiceRegistry.register(windowToolCatalogService)", range: enabled.upperBound ..< viewModel.endIndex))
+            let enabled = try XCTUnwrap(viewModel.range(
+                of: "if windowToolsEnabled,\n           runtimeSessionRegistry.hasActiveSession(",
+                range: invalidate.upperBound ..< viewModel.endIndex
+            ))
+            let register = try XCTUnwrap(viewModel.range(of: "serviceRegistry.register(windowToolCatalogService)", range: enabled.upperBound ..< viewModel.endIndex))
             let join = try XCTUnwrap(viewModel.range(of: "try await service.join(windowID: windowID)", range: register.upperBound ..< viewModel.endIndex))
             let enabledRefresh = try XCTUnwrap(viewModel.range(of: "await service.refreshState()", range: join.upperBound ..< viewModel.endIndex))
-            let unregister = try XCTUnwrap(viewModel.range(of: "ServiceRegistry.unregister(windowToolCatalogService)", range: enabledRefresh.upperBound ..< viewModel.endIndex))
+            let unregister = try XCTUnwrap(viewModel.range(of: "serviceRegistry.unregister(windowToolCatalogService)", range: enabledRefresh.upperBound ..< viewModel.endIndex))
             let leave = try XCTUnwrap(viewModel.range(of: "await service.leave(windowID: windowID)", range: unregister.upperBound ..< viewModel.endIndex))
             let disabledRefresh = try XCTUnwrap(viewModel.range(of: "await service.refreshState()", range: leave.upperBound ..< viewModel.endIndex))
             XCTAssertLessThan(policy.lowerBound, invalidate.lowerBound)
@@ -856,15 +882,17 @@
             XCTAssertEqual(readiness.components(separatedBy: "MCPWindowToolCatalog.readinessWarmAccess").count - 1, 2)
             XCTAssertTrue(readiness.contains("_ = await mcpServer.windowMCPTools"))
 
-            let dedupe = try XCTUnwrap(registry.range(of: "if _services.contains(where:"))
-            let append = try XCTUnwrap(registry.range(of: "_services.append(service)", range: dedupe.upperBound ..< registry.endIndex))
+            let dedupe = try XCTUnwrap(registry.range(of: "guard !contains(service) else { return }"))
+            let invalidation = try XCTUnwrap(registry.range(of: "invalidateSnapshot()", range: dedupe.upperBound ..< registry.endIndex))
+            let append = try XCTUnwrap(registry.range(of: "registeredServices.append(RegisteredService(", range: invalidation.upperBound ..< registry.endIndex))
             let publication = try XCTUnwrap(registry.range(of: "MCPWindowToolCatalog.serviceRegistryToolsPublication", range: append.upperBound ..< registry.endIndex))
-            let broadcast = try XCTUnwrap(registry.range(of: "await ServerNetworkManager.shared.broadcastToolListChanged()", range: publication.upperBound ..< registry.endIndex))
-            XCTAssertLessThan(dedupe.lowerBound, append.lowerBound)
+            XCTAssertLessThan(invalidation.lowerBound, publication.lowerBound)
+            XCTAssertLessThan(dedupe.lowerBound, invalidation.lowerBound)
+            XCTAssertLessThan(invalidation.lowerBound, append.lowerBound)
             XCTAssertLessThan(append.lowerBound, publication.lowerBound)
-            XCTAssertLessThan(publication.lowerBound, broadcast.lowerBound)
             XCTAssertEqual(registry.components(separatedBy: "MCPWindowToolCatalog.serviceRegistryToolsPublication").count - 1, 1)
-            XCTAssertTrue(registry.contains("#else\n                await ToolAvailabilityStore.shared.registerTools(service.tools)"))
+            XCTAssertTrue(registry.contains("guard boundary.generation == requestedGeneration"))
+            XCTAssertTrue(registry.contains("routesByCanonicalName[canonicalName, default: []].append(route)"))
 
             let enable = try XCTUnwrap(codexRunner.range(of: "await mcpServerEnabler()"))
             let send = try XCTUnwrap(codexRunner.range(of: "let outcome = await codexCoordinator.sendCodexNativeMessage(", range: enable.upperBound ..< codexRunner.endIndex))
@@ -1047,7 +1075,7 @@
                 XCTAssertTrue(viewModel.contains("Stage.ReadFile.AutoSelect.\(hook)"), "Missing view-model nested auto-select hook: \(hook)")
             }
 
-            let mutations = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
+            let mutations = try source("Sources/RepoPromptCore/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
             for hook in [
                 "candidateResolutionTotal",
                 "structuralMerge",
@@ -1059,15 +1087,15 @@
                 XCTAssertTrue(mutations.contains("Stage.ReadFile.AutoSelect.\(hook)"), "Missing mutation-service nested auto-select hook: \(hook)")
             }
 
-            let extractor = try source("Sources/RepoPrompt/Features/CodeMap/CodeMapExtractor.swift")
-            let workspaceOverloadStart = try XCTUnwrap(extractor.range(of: "static func resolveReferencedFilePaths(\n        from selectedFiles: [WorkspaceFileRecord]"))
-            let workspaceOverloadEnd = try XCTUnwrap(extractor.range(of: "/// Returns the list of file paths", range: workspaceOverloadStart.upperBound ..< extractor.endIndex))
-            let workspaceOverload = String(extractor[workspaceOverloadStart.lowerBound ..< workspaceOverloadEnd.lowerBound])
-            XCTAssertTrue(workspaceOverload.contains("Stage.ReadFile.AutoSelect.acceptedFileAPIFilter"))
-            XCTAssertTrue(workspaceOverload.contains("Stage.ReadFile.AutoSelect.autoReferencedAPIComputation"))
+            let extractor = try source("Sources/RepoPromptCore/CodeMap/CodeMapExtractor.swift")
+            XCTAssertTrue(extractor.contains("package static func resolveReferencedFilePaths(\n        from selectedFiles: [WorkspaceFileRecord]"))
+            XCTAssertTrue(extractor.contains("WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter"))
+            XCTAssertTrue(extractor.contains("WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.autoReferencedAPIComputation"))
 
-            let fileViewModelOverloadStart = try XCTUnwrap(extractor.range(of: "static func resolveReferencedFilePaths(\n        from selectedFiles: [FileViewModel]"))
-            let fileViewModelOverload = String(extractor[fileViewModelOverloadStart.lowerBound ..< workspaceOverloadStart.lowerBound])
+            let appExtractor = try source("Sources/RepoPrompt/Features/CodeMap/CodeMapExtractor.swift")
+            let fileViewModelOverloadStart = try XCTUnwrap(appExtractor.range(of: "static func resolveReferencedFilePaths(\n        from selectedFiles: [FileViewModel]"))
+            let fileViewModelOverloadEnd = try XCTUnwrap(appExtractor.range(of: "/// Returns the list of file paths", range: fileViewModelOverloadStart.upperBound ..< appExtractor.endIndex))
+            let fileViewModelOverload = String(appExtractor[fileViewModelOverloadStart.lowerBound ..< fileViewModelOverloadEnd.lowerBound])
             XCTAssertFalse(fileViewModelOverload.contains("Stage.ReadFile.AutoSelect"))
 
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
@@ -1088,7 +1116,7 @@
             XCTAssertLessThan(dependencyAwait.lowerBound, valueEncoding.lowerBound)
 
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
-            let mutations = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
+            let mutations = try source("Sources/RepoPromptCore/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
             let nestedSources = viewModel + mutations
             for outcome in [
                 "eligible",
@@ -1140,7 +1168,7 @@
             })
         }
 
-        func testReadFileAutoSelectionQueueAndDurabilityHooksRemainOwnedByCoordinatorAndDiskWriter() throws {
+        func testReadFileAutoSelectionQueueAndDurabilityHooksRemainOwnedByCoordinatorCoreWriterAndAppAdapter() throws {
             let coordinator = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPReadFileAutoSelectionCoordinator.swift")
             for hook in [
                 "responseEnqueue",
@@ -1156,11 +1184,23 @@
             let viewModel = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TabContext.swift")
             XCTAssertTrue(viewModel.contains("Stage.ReadFile.AutoSelect.canonicalStoredCommit"))
 
-            let workspaceManager = try source("Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift")
-            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.flushWait"))
-            XCTAssertTrue(workspaceManager.contains("Stage.WorkspaceDurability.atomicWrite"))
+            let coreWriter = try source("Sources/RepoPromptCore/Workspaces/WorkspacePersistenceWriter.swift")
+            for event in [
+                "workspaceSave.flush.begin",
+                "workspaceSave.flush.end",
+                "workspaceSave.write.begin",
+                "workspaceSave.write.end"
+            ] {
+                XCTAssertTrue(coreWriter.contains(event), "Missing neutral Core durability event: \(event)")
+            }
+            let diagnosticsAdapter = try source(
+                "Sources/RepoPrompt/App/CoreAdapters/EmbeddedWorkspaceRepositoryDiagnosticsAdapter.swift"
+            )
+            XCTAssertTrue(diagnosticsAdapter.contains("Stage.WorkspaceDurability.flushWait"))
+            XCTAssertTrue(diagnosticsAdapter.contains("Stage.WorkspaceDurability.atomicWrite"))
             XCTAssertFalse(coordinator.contains("EditFlowPerf.Dimensions(path:"))
-            XCTAssertFalse(workspaceManager.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(coreWriter.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(diagnosticsAdapter.contains("EditFlowPerf.Dimensions(path:"))
         }
 
         func testReadFileAutoSelectionQueueRecorderCapturesSanitizedStagesAndLifecycle() throws {
@@ -1201,28 +1241,19 @@
         }
 
         func testAcceptedFileAPIFilterInnerAttributionRemainsBehaviorNeutralScopedAndOrdered() throws {
-            let extractor = try source("Sources/RepoPrompt/Features/CodeMap/CodeMapExtractor.swift")
-            let helperStart = try XCTUnwrap(extractor.range(of: "    private static func acceptedFileAPIs(from files: [WorkspaceFileRecord], allFileAPIs: [FileAPI]) -> [FileAPI] {"))
-            let helperEnd = try XCTUnwrap(extractor.range(of: "    private static func isUnderCurrentRoots", range: helperStart.upperBound ..< extractor.endIndex))
+            let extractor = try source("Sources/RepoPromptCore/CodeMap/CodeMapExtractor.swift")
+            let helperStart = try XCTUnwrap(extractor.range(of: "    private static func acceptedFileAPIs(\n        from files: [WorkspaceFileRecord],\n        allFileAPIs: [FileAPI]"))
+            let helperEnd = try XCTUnwrap(extractor.range(of: "    package static func getAutoReferencedAPIs(", range: helperStart.upperBound ..< extractor.endIndex))
             let helper = String(extractor[helperStart.lowerBound ..< helperEnd.lowerBound])
 
             var searchStart = helper.startIndex
             for hook in [
                 "guard !files.isEmpty, !allFileAPIs.isEmpty else { return [] }",
-                "#if DEBUG || EDIT_FLOW_PERF",
-                "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.pathGrouping)",
-                "let apisByPath = Dictionary(grouping: allFileAPIs, by: { standardizedAPIFilePath($0) })",
-                "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.pathGrouping, pathGrouping)",
-                "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection)",
-                "let selectedAPIs = files.compactMap { file in",
-                "apisByPath[file.standardizedFullPath]?.first",
-                "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection, selectedRecordProjection)",
-                "return selectedAPIs",
-                "#else",
-                "let apisByPath = Dictionary(grouping: allFileAPIs, by: { standardizedAPIFilePath($0) })",
-                "return files.compactMap { file in",
-                "apisByPath[file.standardizedFullPath]?.first",
-                "#endif"
+                "WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.pathGrouping",
+                "let apisByPath = Dictionary(grouping: allFileAPIs, by: standardizedAPIFilePath)",
+                "WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection",
+                "let selectedAPIs = files.compactMap { apisByPath[$0.standardizedFullPath]?.first }",
+                "return selectedAPIs"
             ] {
                 let match = try XCTUnwrap(helper.range(of: hook, range: searchStart ..< helper.endIndex), "Missing or out-of-order accepted-file attribution hook: \(hook)")
                 searchStart = match.upperBound
@@ -1235,7 +1266,7 @@
                 "UserDefaults",
                 "app_settings",
                 "nonisolated",
-                "EditFlowPerf.Dimensions",
+                "WorkspaceRuntimePerf.Dimensions",
                 "print(",
                 "Logger",
                 "os_log",
@@ -1248,33 +1279,34 @@
             }
 
             let indexedHelperStart = try XCTUnwrap(extractor.range(of: "    private static func acceptedFileAPIs(\n        from files: [WorkspaceFileRecord],\n        firstFileAPIByStandardizedNestedPath: [String: FileAPI]"))
-            let indexedHelperEnd = try XCTUnwrap(extractor.range(of: "    private static func isUnderCurrentRoots", range: indexedHelperStart.upperBound ..< extractor.endIndex))
+            let indexedHelperEnd = try XCTUnwrap(extractor.range(of: "    package static func getAutoReferencedAPIs(", range: indexedHelperStart.upperBound ..< extractor.endIndex))
             let indexedHelper = String(extractor[indexedHelperStart.lowerBound ..< indexedHelperEnd.lowerBound])
             XCTAssertTrue(indexedHelper.contains("guard !files.isEmpty, !firstFileAPIByStandardizedNestedPath.isEmpty else { return [] }"))
-            XCTAssertTrue(indexedHelper.contains("EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection)"))
-            XCTAssertTrue(indexedHelper.contains("firstFileAPIByStandardizedNestedPath[file.standardizedFullPath]"))
-            XCTAssertTrue(indexedHelper.contains("EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection, selectedRecordProjection)"))
+            XCTAssertTrue(indexedHelper.contains("WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AcceptedFileAPIFilter.selectedRecordProjection"))
+            XCTAssertTrue(indexedHelper.contains("firstFileAPIByStandardizedNestedPath[$0.standardizedFullPath]"))
             XCTAssertFalse(indexedHelper.contains("pathGrouping"))
             XCTAssertFalse(indexedHelper.contains("Dictionary(grouping:"))
 
-            let fileViewModelHelperStart = try XCTUnwrap(extractor.range(of: "    private static func acceptedFileAPIs(from files: [FileViewModel]) -> [FileAPI] {"))
-            let fileViewModelHelper = String(extractor[fileViewModelHelperStart.lowerBound ..< helperStart.lowerBound])
+            let appExtractor = try source("Sources/RepoPrompt/Features/CodeMap/CodeMapExtractor.swift")
+            let fileViewModelHelperStart = try XCTUnwrap(appExtractor.range(of: "    private static func acceptedFileAPIs(from files: [FileViewModel]) -> [FileAPI] {"))
+            let fileViewModelHelperEnd = try XCTUnwrap(appExtractor.range(of: "    private static func acceptedFileAPIs(from files: [WorkspaceFileRecord]", range: fileViewModelHelperStart.upperBound ..< appExtractor.endIndex))
+            let fileViewModelHelper = String(appExtractor[fileViewModelHelperStart.lowerBound ..< fileViewModelHelperEnd.lowerBound])
             XCTAssertFalse(fileViewModelHelper.contains("AcceptedFileAPIFilter"))
 
-            let resolverStart = try XCTUnwrap(extractor.range(of: "static func resolveReferencedFilePaths(\n        from selectedFiles: [WorkspaceFileRecord]"))
-            let resolverEnd = try XCTUnwrap(extractor.range(of: "/// Returns the list of file paths", range: resolverStart.upperBound ..< extractor.endIndex))
+            let resolverStart = try XCTUnwrap(extractor.range(of: "package static func resolveReferencedFilePaths(\n        from selectedFiles: [WorkspaceFileRecord]"))
+            let resolverEnd = try XCTUnwrap(extractor.range(of: "    private static func resolveReferencedFilePaths(", range: resolverStart.upperBound ..< extractor.endIndex))
             let resolver = String(extractor[resolverStart.lowerBound ..< resolverEnd.lowerBound])
-            let outerBegin = try XCTUnwrap(resolver.range(of: "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter)"))
+            let outerBegin = try XCTUnwrap(resolver.range(of: "WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter"))
             let helperCall = try XCTUnwrap(resolver.range(of: "acceptedFileAPIs(from: selectedFiles, allFileAPIs: allFileAPIs)", range: outerBegin.upperBound ..< resolver.endIndex))
-            let outerEnd = try XCTUnwrap(resolver.range(of: "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.acceptedFileAPIFilter, acceptedFileAPIFilter)", range: helperCall.upperBound ..< resolver.endIndex))
+            let outerEnd = try XCTUnwrap(resolver.range(of: "acceptedFileAPIFilter\n        )", range: helperCall.upperBound ..< resolver.endIndex))
             let indexedResolver = try XCTUnwrap(resolver.range(of: "firstFileAPIByStandardizedNestedPath: [String: FileAPI]"))
             let indexedHelperCall = try XCTUnwrap(resolver.range(of: "firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath", range: indexedResolver.upperBound ..< resolver.endIndex))
-            let lowerComputation = try XCTUnwrap(resolver.range(of: "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.autoReferencedAPIComputation)", range: indexedHelperCall.upperBound ..< resolver.endIndex))
+            let lowerComputation = try XCTUnwrap(extractor.range(of: "WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.autoReferencedAPIComputation", range: resolverEnd.upperBound ..< extractor.endIndex))
             XCTAssertLessThan(outerBegin.lowerBound, helperCall.lowerBound)
             XCTAssertLessThan(helperCall.lowerBound, outerEnd.lowerBound)
             XCTAssertLessThan(outerEnd.lowerBound, indexedResolver.lowerBound)
             XCTAssertLessThan(indexedResolver.lowerBound, indexedHelperCall.lowerBound)
-            XCTAssertLessThan(indexedHelperCall.lowerBound, lowerComputation.lowerBound)
+            XCTAssertLessThan(resolverEnd.lowerBound, lowerComputation.lowerBound)
         }
 
         func testAcceptedFileAPIFilterInnerAttributionRecorderCapturesEmptyDimensions() throws {
@@ -1300,7 +1332,7 @@
         }
 
         func testAllCodemapFileAPIsActorOwnedCacheHooksRemainScopedAndExhaustivelyInvalidated() throws {
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             XCTAssertTrue(store.contains("private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?"))
             XCTAssertFalse(store.contains("private var cachedAllCodemapFileAPIs: [FileAPI]?"))
             XCTAssertEqual(store.components(separatedBy: "invalidateAllCodemapFileAPIsCache").count - 1, 9)
@@ -1313,24 +1345,24 @@
                 XCTAssertFalse(invalidator.contains(forbidden), "Forbidden aggregate-cache invalidator semantic: \(forbidden)")
             }
 
-            let compatibilityAccessorStart = try XCTUnwrap(store.range(of: "    func allCodemapFileAPIs() -> [FileAPI] {"))
-            let accessorStart = try XCTUnwrap(store.range(of: "    func codemapFileAPIAggregate() -> WorkspaceCodemapFileAPIAggregate {", range: compatibilityAccessorStart.upperBound ..< store.endIndex))
+            let compatibilityAccessorStart = try XCTUnwrap(store.range(of: "    package func allCodemapFileAPIs() -> [FileAPI] {"))
+            let accessorStart = try XCTUnwrap(store.range(of: "    package func codemapFileAPIAggregate() -> WorkspaceCodemapFileAPIAggregate {", range: compatibilityAccessorStart.upperBound ..< store.endIndex))
             let compatibilityAccessor = String(store[compatibilityAccessorStart.lowerBound ..< accessorStart.lowerBound])
             XCTAssertTrue(compatibilityAccessor.contains("codemapFileAPIAggregate().orderedFileAPIs"))
-            let accessorEnd = try XCTUnwrap(store.range(of: "    func codemapSnapshotDictionary()", range: accessorStart.upperBound ..< store.endIndex))
+            let accessorEnd = try XCTUnwrap(store.range(of: "    package func codemapSnapshotDictionary()", range: accessorStart.upperBound ..< store.endIndex))
             let accessor = String(store[accessorStart.lowerBound ..< accessorEnd.lowerBound])
             var searchStart = accessor.startIndex
             for hook in [
-                "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal)",
-                "defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal, actorBodyTotal) }",
+                "WorkspaceRuntimePerf.begin(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal)",
+                "defer { WorkspaceRuntimePerf.end(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.actorBodyTotal, actorBodyTotal) }",
                 "if let cachedCodemapFileAPIAggregate {",
                 "return cachedCodemapFileAPIAggregate",
                 "#if DEBUG || EDIT_FLOW_PERF",
-                "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot)",
+                "WorkspaceRuntimePerf.begin(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot)",
                 "codemapSnapshotsByFileID.values",
                 ".filter { isDiscoverableFileID($0.fileID) }",
-                "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot, stateSnapshot)",
-                "EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization)",
+                "WorkspaceRuntimePerf.end(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.stateSnapshot, stateSnapshot)",
+                "WorkspaceRuntimePerf.begin(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization)",
                 ".sorted { $0.fullPath < $1.fullPath }",
                 ".compactMap(\\.fileAPI)",
                 "#else",
@@ -1345,7 +1377,7 @@
                 "let aggregate = WorkspaceCodemapFileAPIAggregate(",
                 "orderedFileAPIs: APIs,",
                 "firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath",
-                "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)",
+                "WorkspaceRuntimePerf.end(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)",
                 "cachedCodemapFileAPIAggregate = aggregate",
                 "return aggregate"
             ] {
@@ -1360,7 +1392,7 @@
                 "UserDefaults",
                 "app_settings",
                 "nonisolated",
-                "EditFlowPerf.Dimensions",
+                "WorkspaceRuntimePerf.Dimensions",
                 "print(",
                 "Logger",
                 "os_log",
@@ -1384,11 +1416,11 @@
                 XCTAssertTrue(store.contains(requiredInvalidationWiring), "Missing aggregate-cache invalidation wiring: \(requiredInvalidationWiring)")
             }
 
-            let unloadStart = try XCTUnwrap(store.range(of: "    func unloadRoots(ids rootIDs: [UUID]) async {"))
-            let unloadEnd = try XCTUnwrap(store.range(of: "    func file(rootID: UUID, relativePath: String)", range: unloadStart.upperBound ..< store.endIndex))
+            let unloadStart = try XCTUnwrap(store.range(of: "    package func unloadRoots(ids rootIDs: [UUID]) async {"))
+            let unloadEnd = try XCTUnwrap(store.range(of: "    package func file(rootID: UUID, relativePath: String)", range: unloadStart.upperBound ..< store.endIndex))
             let unload = String(store[unloadStart.lowerBound ..< unloadEnd.lowerBound])
+            let stopWatching = try XCTUnwrap(unload.range(of: "await stopWatchingRoot(id: entry.rootID, service: entry.state.service)"))
             let rootDetach = try XCTUnwrap(unload.range(of: "rootStatesByID.removeValue(forKey: rootID)"))
-            let stopWatching = try XCTUnwrap(unload.range(of: "await reconcileWatcherServiceState(entry.state.service, rootID: entry.rootID)"))
             let managedOnlyCleanup = try XCTUnwrap(unload.range(of: "managedOnlyFileIDs.remove(fileID)"))
             let rootSnapshotCleanup = try XCTUnwrap(unload.range(of: "removeCodemapSnapshots(forRootID: rootID)"))
             XCTAssertLessThan(rootDetach.lowerBound, stopWatching.lowerBound)
@@ -1398,8 +1430,8 @@
             XCTAssertFalse(String(unload[managedOnlyCleanup.lowerBound ..< rootSnapshotCleanup.lowerBound]).contains("await"))
 
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-            let mutations = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
-            let extractor = try source("Sources/RepoPrompt/Features/CodeMap/CodeMapExtractor.swift")
+            let mutations = try source("Sources/RepoPromptCore/WorkspaceContext/Selection/WorkspaceSelectionMutationService.swift")
+            let extractor = try source("Sources/RepoPromptCore/CodeMap/CodeMapExtractor.swift")
             let diagnostics = try diagnosticsSource() + source("Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnosticsReadSearchLatency.swift")
             for forbiddenOwner in [provider, mutations, extractor, diagnostics] {
                 XCTAssertFalse(forbiddenOwner.contains("AllCodemapFileAPIs"))
@@ -1408,15 +1440,15 @@
                 XCTAssertFalse(forbiddenOwner.contains("invalidateAllCodemapFileAPIsCache"))
             }
 
-            let recomputeStart = try XCTUnwrap(mutations.range(of: "    func recomputeAutoCodemaps("))
+            let recomputeStart = try XCTUnwrap(mutations.range(of: "    package func recomputeAutoCodemaps("))
             let recompute = String(mutations[recomputeStart.lowerBound ..< mutations.endIndex])
-            let outerBegin = try XCTUnwrap(recompute.range(of: "let codemapAPILoad = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad)"))
+            let outerBegin = try XCTUnwrap(recompute.range(of: "let codemapAPILoad = WorkspaceRuntimePerf.begin(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.codemapAPILoad)"))
             let outerAwait = try XCTUnwrap(recompute.range(of: "let aggregate = await store.codemapFileAPIAggregate()", range: outerBegin.upperBound ..< recompute.endIndex))
             XCTAssertEqual(recompute.components(separatedBy: "await store.codemapFileAPIAggregate()").count - 1, 1)
             XCTAssertFalse(recompute.contains("await store.allCodemapFileAPIs()"))
             XCTAssertTrue(recompute.contains("among: aggregate.orderedFileAPIs"))
             XCTAssertTrue(recompute.contains("firstFileAPIByStandardizedNestedPath: aggregate.firstFileAPIByStandardizedNestedPath"))
-            let outerEnd = try XCTUnwrap(recompute.range(of: "EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad, codemapAPILoad)", range: outerAwait.upperBound ..< recompute.endIndex))
+            let outerEnd = try XCTUnwrap(recompute.range(of: "WorkspaceRuntimePerf.end(WorkspaceRuntimePerf.Stage.ReadFile.AutoSelect.codemapAPILoad, codemapAPILoad)", range: outerAwait.upperBound ..< recompute.endIndex))
             XCTAssertLessThan(outerBegin.lowerBound, outerAwait.lowerBound)
             XCTAssertLessThan(outerAwait.lowerBound, outerEnd.lowerBound)
         }
@@ -1457,7 +1489,7 @@
                 XCTAssertTrue(viewModel.contains(hook), "Missing view-model read-resolution hook: \(hook)")
             }
 
-            let readableService = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            let readableService = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceReadableFileService.swift")
             for hook in [
                 "exactCatalogLookupAwait",
                 "explicitMaterialization",
@@ -1467,7 +1499,7 @@
                 XCTAssertTrue(readableService.contains(hook), "Missing readable-service resolution hook: \(hook)")
             }
 
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             XCTAssertTrue(store.contains("exactCatalogLookupActorBody"))
             XCTAssertTrue(store.contains("exactCatalogLookupRoute"))
             XCTAssertTrue(store.contains("Dimensions(status: exactCatalogLookupRoute, outcome: exactCatalogLookupOutcome)"))
@@ -1480,13 +1512,13 @@
             XCTAssertFalse(viewModel.contains("let readableServiceOutcome ="))
             XCTAssertTrue(viewModel.contains("Dimensions(outcome: {\n                    switch readableFile"))
 
-            let readableService = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
+            let readableService = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceReadableFileService.swift")
             XCTAssertFalse(readableService.contains("let exactCatalogLookupOutcome ="))
             XCTAssertFalse(readableService.contains("let explicitMaterializationOutcome ="))
             XCTAssertTrue(readableService.contains("Dimensions(outcome: {\n                switch exactCatalogLookup"))
             XCTAssertTrue(readableService.contains("Dimensions(outcome: {\n                switch materialization"))
 
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             XCTAssertTrue(store.contains("#if DEBUG || EDIT_FLOW_PERF\n            var exactCatalogLookupOutcome"))
             XCTAssertTrue(store.contains("var exactCatalogLookupRoute = \"empty\""))
             XCTAssertTrue(store.contains("exactCatalogLookupRoute = \"absolute\""))
@@ -1497,7 +1529,7 @@
         }
 
         func testSearchCatalogSnapshotCacheRemainsBoundedGenerationKeyedAndCoarselyDiagnosed() throws {
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             XCTAssertTrue(store.contains("private static let maxCachedSearchCatalogSnapshotScopes = 16"))
             XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
             XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
@@ -1509,7 +1541,8 @@
                     "guard !statesToUnload.isEmpty else { return }",
                     "clearSearchCatalogSnapshotCache()",
                     "await searchDecodedContentCache.invalidate(rootID: entry.rootID)",
-                    "#if DEBUG"
+                    "#if DEBUG",
+                    "if let rootUnloadDidDetachHandler"
                 ]
             )
             XCTAssertTrue(store.contains("bumpCatalogGenerations(affectedRootKinds: affectedRootKinds)\n        clearSearchCatalogSnapshotCache()\n        invalidatePathMatchCache()"))
@@ -1903,56 +1936,56 @@
         }
 
         func testContentReadWorkerPermitAndBroadSearchAdmissionHooksRemainOwnedSanitizedAndOrdered() throws {
-            let contentLoading = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+ContentLoading.swift")
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait"))
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan"))
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitAcquired"))
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitCancelled"))
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerOverloaded"))
+            let contentLoading = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+ContentLoading.swift")
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Stage.FileSystem.contentReadWorkerPermitWait"))
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan"))
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadWorkerPermitAcquired"))
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadWorkerPermitCancelled"))
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadWorkerOverloaded"))
             XCTAssertTrue(contentLoading.contains("maxQueuedWaiterCount: 512"))
             XCTAssertTrue(contentLoading.contains("ownerID: request.schedulerOwnerID"))
             XCTAssertTrue(contentLoading.contains("agePromotionNanoseconds"))
             XCTAssertTrue(contentLoading.contains("maxConsecutiveInteractiveGrants"))
-            XCTAssertTrue(contentLoading.contains("EditFlowPerf.Stage.FileSystem.contentReadWorkerBody"))
-            XCTAssertTrue(contentLoading.contains("workloadClass: request.workloadClass"))
+            XCTAssertTrue(contentLoading.contains("WorkspaceRuntimePerf.Stage.FileSystem.contentReadWorkerBody"))
+            XCTAssertTrue(contentLoading.contains("workloadClass: request.workloadClass.rawValue"))
             XCTAssertTrue(contentLoading.contains("contentSource: \"disk\""))
             XCTAssertTrue(contentLoading.contains("workerBodyFileBytes = telemetryFileBytes(validated.fileSize)"))
-            XCTAssertFalse(contentLoading.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(contentLoading.contains("WorkspaceRuntimePerf.Dimensions(path:"))
             assertSourceOrder(
                 in: contentLoading,
                 hooks: [
-                    "let permitWaitState = EditFlowPerf.begin(",
+                    "let permitWaitState = WorkspaceRuntimePerf.begin(",
                     "let acquisition: PermitAcquisition",
                     "acquisition = try await acquire(",
-                    "EditFlowPerf.end(\n                EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait",
+                    "WorkspaceRuntimePerf.end(\n                WorkspaceRuntimePerf.Stage.FileSystem.contentReadWorkerPermitWait",
                     "defer { release(acquisition) }",
                     "return try await body()"
                 ]
             )
 
-            let coordinator = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearchLane.swift")
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Stage.Search.broadAdmissionWait"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionWaitBegan"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitAcquired"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitCancelled"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionPermitReleased"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionOverloaded"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionWaitExpired"))
-            XCTAssertTrue(coordinator.contains("EditFlowPerf.Stage.Search.broadAdmissionLeaseHold"))
+            let coordinator = try source("Sources/RepoPromptCore/WorkspaceContext/Search/StoreBackedWorkspaceSearchLane.swift")
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Stage.Search.broadAdmissionWait"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionWaitBegan"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionPermitAcquired"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionPermitCancelled"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionPermitReleased"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionOverloaded"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Lifecycle.Search.broadAdmissionWaitExpired"))
+            XCTAssertTrue(coordinator.contains("WorkspaceRuntimePerf.Stage.Search.broadAdmissionLeaseHold"))
             XCTAssertTrue(coordinator.contains("storeCapacity: 1"))
             XCTAssertTrue(coordinator.contains("globalCapacity: 0"))
             XCTAssertTrue(coordinator.contains("storeQueueDepth: metrics.queueDepth"))
             XCTAssertTrue(coordinator.contains("globalQueueDepth: 0"))
             XCTAssertTrue(coordinator.contains("queueAgeBucket: queueAgeBucket"))
-            XCTAssertFalse(coordinator.contains("EditFlowPerf.Dimensions(path:"))
+            XCTAssertFalse(coordinator.contains("WorkspaceRuntimePerf.Dimensions(path:"))
             assertSourceOrder(
                 in: coordinator,
                 hooks: [
-                    "let waitState = EditFlowPerf.begin(",
+                    "let waitState = WorkspaceRuntimePerf.begin(",
                     "acquisition = try await acquire(",
-                    "let leaseHoldState = EditFlowPerf.begin(",
+                    "let leaseHoldState = WorkspaceRuntimePerf.begin(",
                     "defer {",
-                    "EditFlowPerf.Stage.Search.broadAdmissionLeaseHold",
+                    "WorkspaceRuntimePerf.Stage.Search.broadAdmissionLeaseHold",
                     "release(acquisition)",
                     "return try await operation(fileSearchActor)"
                 ]
@@ -1976,10 +2009,10 @@
             XCTAssertEqual(manager.components(separatedBy: "try await toolDef.callAsFunction(effectiveArgs)").count - 1, 1)
             XCTAssertFalse(manager.contains("service.call("))
 
-            let readable = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceReadableFileService.swift")
-            XCTAssertTrue(readable.contains("EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait"))
-            XCTAssertTrue(readable.contains("EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessBegan"))
-            XCTAssertTrue(readable.contains("EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessEnded"))
+            let readable = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceReadableFileService.swift")
+            XCTAssertTrue(readable.contains("WorkspaceRuntimePerf.Stage.ReadFile.explicitIngressFreshnessWait"))
+            XCTAssertTrue(readable.contains("WorkspaceRuntimePerf.Lifecycle.ReadFile.explicitFreshnessBegan"))
+            XCTAssertTrue(readable.contains("WorkspaceRuntimePerf.Lifecycle.ReadFile.explicitFreshnessEnded"))
 
             let server = try source("Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel.swift")
             assertSourceOrder(
@@ -2003,40 +2036,40 @@
                 ]
             )
 
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             for hook in [
-                "EditFlowPerf.Stage.ReadFile.storeReadContentForwardAwait",
-                "EditFlowPerf.Lifecycle.ReadFile.storeReadContentEntered",
-                "EditFlowPerf.Lifecycle.ReadFile.storeReadContentReturned",
-                "EditFlowPerf.Stage.ReadFile.folderResolutionGeneralLookupFallback",
-                "EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild",
-                "EditFlowPerf.Stage.Search.contentFreshnessValidationStoreActorBody",
-                "EditFlowPerf.Lifecycle.Search.contentFreshnessStoreEntered",
-                "EditFlowPerf.Lifecycle.Search.contentFreshnessStoreReturned"
+                "WorkspaceRuntimePerf.Stage.ReadFile.storeReadContentForwardAwait",
+                "WorkspaceRuntimePerf.Lifecycle.ReadFile.storeReadContentEntered",
+                "WorkspaceRuntimePerf.Lifecycle.ReadFile.storeReadContentReturned",
+                "WorkspaceRuntimePerf.Stage.ReadFile.folderResolutionGeneralLookupFallback",
+                "WorkspaceRuntimePerf.Stage.ReadFile.pathLookupStaticSnapshotBuild",
+                "WorkspaceRuntimePerf.Stage.Search.contentFreshnessValidationStoreActorBody",
+                "WorkspaceRuntimePerf.Lifecycle.Search.contentFreshnessStoreEntered",
+                "WorkspaceRuntimePerf.Lifecycle.Search.contentFreshnessStoreReturned"
             ] {
                 XCTAssertTrue(store.contains(hook), "Missing store attribution hook: \(hook)")
             }
 
-            let fileSystem = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+ContentLoading.swift")
+            let fileSystem = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+ContentLoading.swift")
             for hook in [
-                "EditFlowPerf.Stage.FileSystem.contentLoadTotal",
-                "EditFlowPerf.Stage.FileSystem.contentReadRequestPreparation",
-                "EditFlowPerf.Stage.FileSystem.contentReadOffActorAwait",
-                "EditFlowPerf.Lifecycle.FileSystem.contentLoadEntered",
-                "EditFlowPerf.Lifecycle.FileSystem.contentReadRequestPrepared",
-                "EditFlowPerf.Lifecycle.FileSystem.contentReadOffActorScheduled",
-                "EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerReturned",
-                "EditFlowPerf.Lifecycle.FileSystem.contentLoadReturned"
+                "WorkspaceRuntimePerf.Stage.FileSystem.contentLoadTotal",
+                "WorkspaceRuntimePerf.Stage.FileSystem.contentReadRequestPreparation",
+                "WorkspaceRuntimePerf.Stage.FileSystem.contentReadOffActorAwait",
+                "WorkspaceRuntimePerf.Lifecycle.FileSystem.contentLoadEntered",
+                "WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadRequestPrepared",
+                "WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadOffActorScheduled",
+                "WorkspaceRuntimePerf.Lifecycle.FileSystem.contentReadWorkerReturned",
+                "WorkspaceRuntimePerf.Lifecycle.FileSystem.contentLoadReturned"
             ] {
                 XCTAssertTrue(fileSystem.contains(hook), "Missing filesystem attribution hook: \(hook)")
             }
 
-            let fileEvents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
-            XCTAssertTrue(fileEvents.contains("EditFlowPerf.Stage.Search.contentFreshnessValidationRootActorBody"))
-            XCTAssertTrue(fileEvents.contains("EditFlowPerf.Lifecycle.Search.contentFreshnessRootEntered"))
-            XCTAssertTrue(fileEvents.contains("EditFlowPerf.Lifecycle.Search.contentFreshnessRootReturned"))
+            let fileEvents = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+Watching.swift")
+            XCTAssertTrue(fileEvents.contains("WorkspaceRuntimePerf.Stage.Search.contentFreshnessValidationRootActorBody"))
+            XCTAssertTrue(fileEvents.contains("WorkspaceRuntimePerf.Lifecycle.Search.contentFreshnessRootEntered"))
+            XCTAssertTrue(fileEvents.contains("WorkspaceRuntimePerf.Lifecycle.Search.contentFreshnessRootReturned"))
 
-            let bootstrap = try source("Sources/RepoPrompt/Infrastructure/MCP/BootstrapSocketServer.swift")
+            let bootstrap = try source("Sources/RepoPrompt/Infrastructure/MCP/AppProxy/MacOSBootstrapSocketServer.swift")
             for hook in [
                 "EditFlowPerf.Lifecycle.Bootstrap.socketAccepted",
                 "EditFlowPerf.Lifecycle.Bootstrap.handshakeIOQueued",
@@ -2050,19 +2083,25 @@
             ] {
                 XCTAssertTrue(bootstrap.contains(hook), "Missing bootstrap attribution hook: \(hook)")
             }
+            XCTAssertTrue(bootstrap.contains("""
+            defer {
+                        handshakeSocket.rollback()
+                        inFlightHandshakeSockets.removeValue(forKey: handshakeID)
+            """))
             assertSourceOrder(
                 in: bootstrap,
                 hooks: [
                     "EditFlowPerf.Lifecycle.Bootstrap.acceptedResponseSent",
-                    "handshakeSocket.transferOwnershipIfOpen(",
+                    "guard handshakeSocket.transfer(",
+                    "publish: publishTransferredTransport",
                     "EditFlowPerf.Lifecycle.Bootstrap.ownershipTransferred",
                     "await postAccept()"
                 ]
             )
 
             for privacySafeSource in [manager, readable, server, provider, store, fileSystem, fileEvents, bootstrap] {
-                XCTAssertFalse(privacySafeSource.contains("EditFlowPerf.Dimensions(path:"))
-                XCTAssertFalse(privacySafeSource.contains("EditFlowPerf.Dimensions(payload:"))
+                XCTAssertFalse(privacySafeSource.contains("Dimensions(path:"))
+                XCTAssertFalse(privacySafeSource.contains("Dimensions(payload:"))
             }
             XCTAssertFalse(bootstrap.contains("EditFlowPerf.Dimensions(client"))
             XCTAssertFalse(bootstrap.contains("EditFlowPerf.Dimensions(session"))
@@ -2070,11 +2109,11 @@
         }
 
         func testSearchTailTelemetryRemainsCoarseAndPrivacySafe() throws {
-            let searchMatch = try source("Sources/RepoPrompt/Features/Search/SearchMatch.swift")
+            let searchMatch = try source("Sources/RepoPromptCore/WorkspaceContext/Search/SearchMatch.swift")
             for hook in [
-                "EditFlowPerf.Stage.Search.contentFreshnessValidation",
-                "EditFlowPerf.Stage.Search.contentScanTotal",
-                "EditFlowPerf.Stage.Search.resultConstruction",
+                "WorkspaceRuntimePerf.Stage.Search.contentFreshnessValidation",
+                "WorkspaceRuntimePerf.Stage.Search.contentScanTotal",
+                "WorkspaceRuntimePerf.Stage.Search.resultConstruction",
                 "admittedFileCount:",
                 "scannedFileCount:",
                 "batchSize:",
@@ -2086,8 +2125,8 @@
             ] {
                 XCTAssertTrue(searchMatch.contains(hook), "Missing coarse search-tail telemetry hook: \(hook)")
             }
-            XCTAssertFalse(searchMatch.contains("EditFlowPerf.Dimensions(path:"))
-            XCTAssertFalse(searchMatch.contains("EditFlowPerf.Dimensions(pattern:"))
+            XCTAssertFalse(searchMatch.contains("WorkspaceRuntimePerf.Dimensions(path:"))
+            XCTAssertFalse(searchMatch.contains("WorkspaceRuntimePerf.Dimensions(pattern:"))
             XCTAssertFalse(searchMatch.contains("workspaceName:"))
             assertSourceOrder(
                 in: searchMatch,
@@ -2106,7 +2145,7 @@
         }
 
         func testAdmissionDebugControlsRemainIdleOnlyAggregateBoundedAndPrivacySafe() throws {
-            let coordinator = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearchLane.swift")
+            let coordinator = try source("Sources/RepoPromptCore/WorkspaceContext/Search/StoreBackedWorkspaceSearchLane.swift")
             XCTAssertTrue(coordinator.contains("snapshotForTesting"))
             XCTAssertTrue(coordinator.contains("configureForTesting"))
             XCTAssertTrue(coordinator.contains("resetConfigurationForTesting"))
@@ -2127,7 +2166,7 @@
             XCTAssertFalse(sibling.contains("store_identifier"))
             XCTAssertFalse(sibling.contains("workspace_name"))
 
-            let contentLoading = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+ContentLoading.swift")
+            let contentLoading = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+ContentLoading.swift")
             XCTAssertTrue(contentLoading.contains("struct Snapshot: Equatable"))
             XCTAssertTrue(contentLoading.contains("activePermitCount == 0 && queuedWaiterCount == 0 && ownerLaneCount == 0"))
             XCTAssertTrue(contentLoading.contains("maxQueuedWaiterCount: 512"))
@@ -2174,32 +2213,35 @@
             XCTAssertTrue(viewModel.contains("EditFlowPerf.Lifecycle.MCPRunTool.unregister"))
             XCTAssertTrue(viewModel.contains("EditFlowPerf.Lifecycle.MCPRunTool.idleWaitersResumed"))
 
-            let fileSystemService = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
-            let fileSystem = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
+            let fileSystemService = try source("Sources/RepoPromptCore/FileSystem/FileSystemService.swift")
+            let fileSystem = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+Watching.swift")
             assertSourceOrder(
                 in: fileSystem,
                 hooks: [
                     "watcherIngressMailbox.accept(",
-                    "EditFlowPerf.Lifecycle.FileSystem.callbackAccepted",
+                    "WorkspaceRuntimePerf.Lifecycle.FileSystem.callbackAccepted",
                     "func drainAcceptedWatcherIngressMailbox()",
-                    "EditFlowPerf.Lifecycle.FileSystem.serviceEnqueueEntered",
+                    "WorkspaceRuntimePerf.Lifecycle.FileSystem.serviceEnqueueEntered",
                     "watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"
                 ]
             )
 
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             assertSourceOrder(
                 in: store,
                 hooks: [
-                    "EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkScheduled",
+                    "openPublisherIngress(",
+                    "WorkspaceRuntimePerf.Lifecycle.WorkspaceIngress.storeSinkBegan",
+                    "handleObservedPublisherFileSystemPublication(",
+                    "subscribeToChanges",
                     "publisherIngressCoordinator.accept("
                 ]
             )
-            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkBegan"))
-            XCTAssertTrue(store.contains("handleObservedFileSystemDeltas("))
-            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted"))
-            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushBegan"))
-            XCTAssertTrue(store.contains("EditFlowPerf.Lifecycle.WorkspaceIngress.rootFlushEnded"))
+            XCTAssertTrue(store.contains("WorkspaceRuntimePerf.Lifecycle.WorkspaceIngress.storeSinkBegan"))
+            XCTAssertTrue(store.contains("handleObservedPublisherFileSystemPublication("))
+            XCTAssertTrue(store.contains("WorkspaceRuntimePerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted"))
+            XCTAssertTrue(store.contains("WorkspaceRuntimePerf.Lifecycle.WorkspaceIngress.rootFlushBegan"))
+            XCTAssertTrue(store.contains("WorkspaceRuntimePerf.Lifecycle.WorkspaceIngress.rootFlushEnded"))
             XCTAssertTrue(store.contains("ingressSequence: publication.watcherAcceptedWatermark?.rawValue"))
             XCTAssertTrue(store.contains("barrierSequence: publication.servicePublicationSequence"))
             XCTAssertTrue(fileSystemService.contains("ingressSequence: watcherAcceptedWatermark?.rawValue"))
@@ -2242,7 +2284,7 @@
                     "let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)"
                 ]
             )
-            let search = try source("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift")
+            let search = try source("Sources/RepoPromptCore/WorkspaceContext/Search/StoreBackedWorkspaceSearch.swift")
             assertSourceOrder(
                 in: search,
                 hooks: [
@@ -2255,14 +2297,14 @@
         }
 
         func testFileSystemChangePublisherSendsRemainCentralized() throws {
-            let service = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService.swift")
-            let fsevents = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FSEvents.swift")
-            let operations = try source("Sources/RepoPrompt/Infrastructure/FileSystem/FileSystemService+FileOperations.swift")
+            let service = try source("Sources/RepoPromptCore/FileSystem/FileSystemService.swift")
+            let fsevents = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+Watching.swift")
+            let operations = try source("Sources/RepoPromptCore/FileSystem/FileSystemService+MutationCoherence.swift")
 
             XCTAssertTrue(service.contains("source: FileSystemDeltaPublicationSource"))
-            XCTAssertEqual(service.components(separatedBy: "changePublisher.send(publication)").count - 1, 3)
-            XCTAssertFalse(fsevents.contains("changePublisher.send"))
-            XCTAssertFalse(operations.contains("changePublisher.send"))
+            XCTAssertEqual(service.components(separatedBy: "publicationHub.publish(publication)").count - 1, 1)
+            XCTAssertFalse(fsevents.contains("publicationHub.publish"))
+            XCTAssertFalse(operations.contains("publicationHub.publish"))
             XCTAssertTrue(fsevents.contains("source: .watcherBarrierNoop"))
             XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"))
             XCTAssertEqual(operations.components(separatedBy: "source: .syntheticMutation").count - 1, 5)

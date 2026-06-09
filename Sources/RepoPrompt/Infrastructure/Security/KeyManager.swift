@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 actor KeyManager {
     private let secureService: SecureKeysService
@@ -6,14 +7,18 @@ actor KeyManager {
     /// Simple in-memory store of keys
     private var cache = [AIProviderType: String]()
 
-    init(secureService: SecureKeysService = SecureKeysService()) {
+    init(
+        secureService: SecureKeysService = SecureKeysService(
+            secureStorage: SecureKeyValueStorageFactory.defaultBackend()
+        )
+    ) {
         self.secureService = secureService
     }
 
     /// Lazily loads the key from disk only if not already in the `cache`.
     func getAPIKey(
         for provider: AIProviderType,
-        accessMode: KeychainAccessMode = .interactive
+        accessMode: SecureStorageAccessMode = .interactive
     ) async throws -> String? {
         if let cached = cache[provider] {
             return cached
@@ -33,7 +38,7 @@ actor KeyManager {
     func saveAPIKey(
         _ key: String,
         for provider: AIProviderType,
-        accessMode: KeychainAccessMode = .interactive
+        accessMode: SecureStorageAccessMode = .interactive
     ) throws {
         cache[provider] = key
         let account = provider.secureStorageAccount
@@ -43,7 +48,7 @@ actor KeyManager {
     /// Deletes from both in-memory cache and disk.
     func deleteAPIKey(
         for provider: AIProviderType,
-        accessMode: KeychainAccessMode = .interactive
+        accessMode: SecureStorageAccessMode = .interactive
     ) throws {
         cache.removeValue(forKey: provider)
         let account = provider.secureStorageAccount

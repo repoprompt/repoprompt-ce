@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -167,6 +168,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await startTask.value
             } catch {
                 startTask.cancel()
+                fixture.socketClient.close()
                 await manager.stop()
                 _ = try? await startTask.value
                 throw error
@@ -649,6 +651,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
             }
+            await ServerNetworkManager.shared.setEnabled(true)
 
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
@@ -659,6 +662,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             // earlier tests are filtered by window ID instead of relying on singleton cleanliness.
             WindowStatesManager.shared.registerWindowState(routingGuardWindow)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            await window.workspaceManager.awaitInitialized()
+            await routingGuardWindow.workspaceManager.awaitInitialized()
 
             var rootID: UUID?
             var catalogService: MCPWindowToolCatalogService?
@@ -672,14 +677,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     repoPaths: [rootURL.path],
                     ephemeral: true
                 )
-                let workspaceIndex = try XCTUnwrap(
-                    window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+                let configuredWorkspace = try XCTUnwrap(
+                    window.workspaceManager.mutateWorkspace(id: workspace.id) { workspace in
+                        workspace.composeTabs = [
+                            ComposeTabState(id: tabID, name: "Persistent Agent Mode MCP Read")
+                        ]
+                        workspace.activeComposeTabID = tabID
+                    }
                 )
-                window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                    ComposeTabState(id: tabID, name: "Persistent Agent Mode MCP Read")
-                ]
-                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
-                let configuredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
                 await window.workspaceManager.switchWorkspace(
                     to: configuredWorkspace,
                     saveState: false,
@@ -697,6 +702,13 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
                 let resolvedCatalogService = window.mcpServer.windowMCPToolCatalogService
                 catalogService = resolvedCatalogService
+                guard ServerNetworkManager.shared.runtimeSessionRegistry.setMCPEnabled(
+                    windowID: window.windowID,
+                    expectedSessionID: window.coreSessionHandle.sessionID,
+                    enabled: true
+                ) else {
+                    throw ClientFixtureError.runtimeSessionEnablementFailed
+                }
                 ServiceRegistry.register(resolvedCatalogService)
 
                 var socketFDs = [Int32](repeating: -1, count: 2)
@@ -721,7 +733,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 let resolvedConnectionManager = try BootstrapSocketConnectionManager(
                     connectionID: connectionID,
                     sessionToken: sessionToken,
-                    clientPid: Int(getpid()),
+                    peerIdentity: MCPPeerIdentity(
+                        socketObservedPID: Int(getpid()),
+                        handshakeClaimedPID: Int(getpid())
+                    ),
                     clientName: AgentProviderKind.codexMCPClientID,
                     purpose: .agentModeRun,
                     codeMapsDisabled: false,
@@ -761,8 +776,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     lease: resolvedLease
                 )
             } catch {
-                await connectionManager?.stop()
                 socketClient?.close()
+                await connectionManager?.stop()
                 await ServerNetworkManager.shared.removeConnection(connectionID)
                 await ServerNetworkManager.shared.clearExpectedAgentPID(
                     getpid(),
@@ -788,8 +803,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 if let rootID {
                     await window.workspaceFileContextStore.unloadRoot(id: rootID)
                 }
-                WindowStatesManager.shared.unregisterWindowState(routingGuardWindow)
-                WindowStatesManager.shared.unregisterWindowState(window)
+                await WindowStatesManager.shared.unregisterWindowStateAndWait(routingGuardWindow)
+                await WindowStatesManager.shared.unregisterWindowStateAndWait(window)
                 try? FileManager.default.removeItem(at: rootURL)
                 throw error
             }
@@ -835,8 +850,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             guard !cleanedUp else { return }
             cleanedUp = true
 
-            await connectionManager.stop()
             socketClient.close()
+            await connectionManager.stop()
             await networkManager.removeConnection(Self.connectionID)
             await networkManager.clearExpectedAgentPID(
                 getpid(),
@@ -858,8 +873,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             ServiceRegistry.unregister(catalogService)
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
-            WindowStatesManager.shared.unregisterWindowState(routingGuardWindow)
-            WindowStatesManager.shared.unregisterWindowState(window)
+            await WindowStatesManager.shared.unregisterWindowStateAndWait(routingGuardWindow)
+            await WindowStatesManager.shared.unregisterWindowStateAndWait(window)
             try? FileManager.default.removeItem(at: rootURL)
         }
     }
@@ -867,6 +882,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     private enum ClientFixtureError: Error {
         case exactAbsoluteCatalogMiss
         case leaseAcquisitionFailed
+        case runtimeSessionEnablementFailed
     }
 
     private struct RetainedConnectionSnapshot: Equatable {

@@ -22,6 +22,18 @@ import SwiftUI
 /// Background actor that manages the single MCP server instance and handles all networking/file I/O operations.
 /// This actor ensures that no long-running network or file-system work ever executes on @MainActor.
 actor MCPService: Sendable {
+    struct ListenerOperations: @unchecked Sendable {
+        let start: @Sendable () async throws -> Void
+        let stop: @Sendable () async -> Void
+        let fullShutdown: @Sendable () async -> Void
+
+        static let live = ListenerOperations(
+            start: { await ServerController.shared.startServer() },
+            stop: { await ServerController.shared.stopServer() },
+            fullShutdown: { await ServerController.shared.fullShutdown() }
+        )
+    }
+
     // ──────────────────────────────────────────────
     // MARK: - Public state that the UI may query
 
@@ -77,22 +89,51 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     private let controller = ServerController.shared
+    private let listenerOperations: ListenerOperations
+    private let participationEligibility: @Sendable (Int) async -> Bool
+    nonisolated let networkManager: ServerNetworkManager
 
-    /// Tracks which windows are participating in MCP
-    private var participatingWindows = Set<Int>()
+    nonisolated var runtimeSessionRegistry: MCPRuntimeSessionRegistry {
+        networkManager.runtimeSessionRegistry
+    }
+
+    nonisolated var serviceRegistry: MCPServiceRegistry {
+        networkManager.serviceRegistry
+    }
+
+    /// Desired participation is authoritative; actual listener state is reconciled serially.
+    private var desiredParticipatingWindows = Set<Int>()
+    private var participationRequestGeneration: UInt64 = 0
+    private var latestParticipationRequestByWindow: [Int: UInt64] = [:]
+    private var listenerReconciliation: (id: UUID, task: Task<Void, Error>)?
+    private var terminalShutdown = false
 
     // ──────────────────────────────────────────────
     // MARK: - Initialization
 
     /// ──────────────────────────────────────────────
-    init() {
+    init(
+        networkManager: ServerNetworkManager = .shared,
+        listenerOperations: ListenerOperations = .live,
+        participationEligibility: (@Sendable (Int) async -> Bool)? = nil,
+        configureControllerCallbacks: Bool = true
+    ) {
+        self.networkManager = networkManager
+        self.listenerOperations = listenerOperations
+        let runtimeSessionRegistry = networkManager.runtimeSessionRegistry
+        self.participationEligibility = participationEligibility ?? { windowID in
+            await MainActor.run {
+                runtimeSessionRegistry.hasMCPEnabledWindow(id: windowID)
+            }
+        }
+        guard configureControllerCallbacks else { return }
         // Set up the approval request callback
         Task {
             await controller.setMCPService(self)
             await controller.setApprovalCallback { [weak self] clientID in
                 await self?.setPendingApproval(clientID)
             }
-            await ServerNetworkManager.shared.setDashboardDidChangeHook { [weak self] in
+            await networkManager.setDashboardDidChangeHook { [weak self] in
                 Task { await self?.notifyDashboardUpdate() }
             }
         }
@@ -103,11 +144,11 @@ actor MCPService: Sendable {
 
     /// ──────────────────────────────────────────────
     func start() async throws {
-        guard !state.isRunning else { return }
+        guard !terminalShutdown, !state.isRunning else { return }
         // One-time Codex migration: no-op when the RepoPrompt entry or config file is missing.
         _ = MCPIntegrationHelper.ensureCodexToolTimeout()
         mcpServiceLog("Starting MCP listener")
-        await controller.startServer()
+        try await listenerOperations.start()
         state.isRunning = true
         updates.continuation.yield(state)
     }
@@ -115,33 +156,104 @@ actor MCPService: Sendable {
     func stop() async {
         guard state.isRunning else { return }
         mcpServiceLog("Stopping MCP listener")
-        await controller.stopServer()
+        await listenerOperations.stop()
         state.isRunning = false
         updates.continuation.yield(state)
     }
 
     func join(windowID: Int) async throws {
-        let inserted = participatingWindows.insert(windowID).inserted
-        mcpServiceLog("Window \(windowID) joining MCP (new: \(inserted), total: \(participatingWindows.count))")
-
-        if inserted, participatingWindows.count == 1 {
-            try await start() // start() already yields
-        }
-
-        // Always re-broadcast so newly-joined windows get an up-to-date snapshot
-        updates.continuation.yield(state)
+        try await reconcileParticipation(windowID: windowID, propagatesStartFailure: true)
     }
 
     func leave(windowID: Int) async {
-        let removed = participatingWindows.remove(windowID) != nil
-        mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
+        do {
+            try await reconcileParticipation(windowID: windowID, propagatesStartFailure: false)
+        } catch {
+            mcpServiceLog("Failed to reconcile MCP leave for window \(windowID): \(error)")
+        }
+    }
 
-        if participatingWindows.isEmpty {
-            await stop() // stop() already yields
+    private func reconcileParticipation(windowID: Int, propagatesStartFailure: Bool) async throws {
+        participationRequestGeneration &+= 1
+        let requestGeneration = participationRequestGeneration
+        latestParticipationRequestByWindow[windowID] = requestGeneration
+
+        let isEligible = await participationEligibility(windowID)
+        guard !terminalShutdown,
+              latestParticipationRequestByWindow[windowID] == requestGeneration
+        else {
+            mcpServiceLog("Ignoring stale MCP participation request for window \(windowID)")
+            updates.continuation.yield(state)
+            return
         }
 
-        // Broadcast even if nothing else changed so UI stays in sync
+        if isEligible {
+            desiredParticipatingWindows.insert(windowID)
+        } else {
+            desiredParticipatingWindows.remove(windowID)
+        }
+        mcpServiceLog(
+            "Window \(windowID) participation reconciled (eligible: \(isEligible), desired total: \(desiredParticipatingWindows.count))"
+        )
+
+        do {
+            try await settleListenerState()
+        } catch {
+            updates.continuation.yield(state)
+            if propagatesStartFailure { throw error }
+        }
+
+        // Always re-broadcast so callers receive an up-to-date snapshot even for idempotent work.
         updates.continuation.yield(state)
+    }
+
+    private func settleListenerState() async throws {
+        while true {
+            let reconciliation: (id: UUID, task: Task<Void, Error>)
+            if let existing = listenerReconciliation {
+                reconciliation = existing
+            } else {
+                guard state.isRunning != (!desiredParticipatingWindows.isEmpty && !terminalShutdown) else {
+                    return
+                }
+                let id = UUID()
+                let task = Task { [weak self] in
+                    guard let self else { return }
+                    try await performNextListenerTransition()
+                }
+                reconciliation = (id, task)
+                listenerReconciliation = reconciliation
+            }
+
+            do {
+                try await reconciliation.task.value
+            } catch {
+                if listenerReconciliation?.id == reconciliation.id {
+                    listenerReconciliation = nil
+                }
+                if desiredParticipatingWindows.isEmpty || terminalShutdown {
+                    continue
+                }
+                throw error
+            }
+            if listenerReconciliation?.id == reconciliation.id {
+                listenerReconciliation = nil
+            }
+        }
+    }
+
+    private func performNextListenerTransition() async throws {
+        let shouldRun = !desiredParticipatingWindows.isEmpty && !terminalShutdown
+        if shouldRun, !state.isRunning {
+            do {
+                try await start()
+            } catch {
+                guard !desiredParticipatingWindows.isEmpty, !terminalShutdown else { return }
+                throw error
+            }
+        } else if !shouldRun, state.isRunning {
+            await stop()
+        }
     }
 
     /// Force a state refresh (useful when UI needs immediate update)
@@ -174,18 +286,14 @@ actor MCPService: Sendable {
 
     func fullShutdown() async {
         mcpServiceLog("Performing full MCP server shutdown")
-        participatingWindows.removeAll()
+        terminalShutdown = true
+        desiredParticipatingWindows.removeAll()
+        participationRequestGeneration &+= 1
+        latestParticipationRequestByWindow.removeAll()
+        try? await settleListenerState()
+        await listenerOperations.fullShutdown()
         state.isRunning = false
-        updates.continuation.yield(state)
-
-        await controller.fullShutdown()
-
-        // Preserve participation registered while the controller shutdown was suspended.
-        // Such a join represents a newer lifecycle and must be made ready again.
-        if !participatingWindows.isEmpty {
-            await controller.startServer()
-            state.isRunning = true
-        }
+        terminalShutdown = false
         updates.continuation.yield(state)
     }
 

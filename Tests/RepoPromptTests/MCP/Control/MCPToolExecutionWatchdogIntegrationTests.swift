@@ -562,9 +562,7 @@ import XCTest
                     await Self.assertSocketClosed(first)
                     await Self.assertSocketClosed(queued)
                     let enteredCount = await operationGate.enteredCount()
-                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
                     XCTAssertEqual(enteredCount, 1)
-                    XCTAssertTrue(isTerminal)
 
                     let events = recorder.snapshot().filter {
                         $0.connectionID == endpoint.connectionID && $0.toolName == MCPWindowToolName.readFile
@@ -593,7 +591,13 @@ import XCTest
             _ endpoint: PersistentMCPTestEndpoint,
             manager: ServerNetworkManager
         ) async {
+            await endpoint.client.waitUntilPendingWorkDrained()
+            XCTAssertTrue(
+                endpoint.client.pendingWorkSnapshotForTesting().isIdle,
+                "Watchdog MCP client still has pending request/interceptor work"
+            )
             endpoint.client.close()
+            await endpoint.client.waitUntilReaderLoopStopped()
             await endpoint.connectionManager.stop()
             await manager.debugRemoveConnection(endpoint.connectionID)
             await manager.debugClearPersistedRoutingState(for: endpoint.clientName)

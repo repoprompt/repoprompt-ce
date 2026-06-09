@@ -9,6 +9,7 @@
 import Foundation
 import Logging
 import MCP
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 
 // MARK: - Progress Notification (CLI-side)

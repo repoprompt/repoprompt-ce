@@ -1,4 +1,5 @@
 @testable import RepoPrompt
+import RepoPromptCore
 import XCTest
 
 final class PromptContextPreAssemblyServiceTests: XCTestCase {
@@ -124,7 +125,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeUserPrompt: false,
             filePathDisplay: .relative,
             codemapSnapshots: includeResult.codemapSnapshots,
-            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            promptSectionsOrder: PromptSection.allCases,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
         )
@@ -139,7 +140,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             includeUserPrompt: false,
             filePathDisplay: .relative,
             codemapSnapshots: respectResult.codemapSnapshots,
-            promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
+            promptSectionsOrder: PromptSection.allCases,
             disabledPromptSections: [],
             duplicateUserInstructionsAtTop: false
         )

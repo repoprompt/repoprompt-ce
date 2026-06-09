@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 @testable import RepoPrompt
 import RepoPromptShared
@@ -39,6 +40,13 @@ final class MCPFilesystemIdentityTests: XCTestCase {
         XCTAssertEqual(release.claudeWrapperCommandName, "claude-rpce")
     }
 
+    func testSocketPathsUseExplicitPlatformNeutralUserID() {
+        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+
+        XCTAssertEqual(identity.socketDirectoryURL(userID: 501).path, "/tmp/repoprompt-ce-mcp-501")
+        XCTAssertEqual(identity.bootstrapSocketURL(userID: 501).path, "/tmp/repoprompt-ce-mcp-501/repoprompt-ce-D-7.sock")
+    }
+
     func testAppConstantsDelegateToSharedIdentity() {
         #if DEBUG
             let expected = MCPFilesystemIdentity.repoPromptCE(.debug)
@@ -47,7 +55,10 @@ final class MCPFilesystemIdentityTests: XCTestCase {
         #endif
 
         XCTAssertEqual(MCPFilesystemConstants.identity, expected)
-        XCTAssertEqual(MCPFilesystemConstants.bootstrapSocketURL(), expected.bootstrapSocketURL())
+        XCTAssertEqual(
+            MCPFilesystemConstants.bootstrapSocketURL(),
+            expected.bootstrapSocketURL(userID: UInt32(getuid()))
+        )
         XCTAssertEqual(MCPFilesystemConstants.eventsDirectoryURL(), expected.externalEventsDirectoryURL())
     }
 
@@ -61,7 +72,15 @@ final class MCPFilesystemIdentityTests: XCTestCase {
         for path in paths {
             let source = try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
             XCTAssertTrue(source.contains("MCPFilesystemIdentity.repoPromptCE"), path)
+            XCTAssertTrue(source.contains("getuid()"), path)
             XCTAssertFalse(source.contains("socketVersion = 6"), path)
         }
+
+        let sharedSource = try String(
+            contentsOf: root.appendingPathComponent("Sources/RepoPromptShared/MCP/MCPFilesystemIdentity.swift"),
+            encoding: .utf8
+        )
+        XCTAssertFalse(sharedSource.contains("import Darwin"))
+        XCTAssertFalse(sharedSource.contains("getuid()"))
     }
 }

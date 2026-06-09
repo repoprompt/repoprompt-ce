@@ -1,5 +1,7 @@
 import Darwin
 import Foundation
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 /// Separate diagnostic logger for deadlock debugging (independent of config.enableDebugLogging)
 enum ProcessDiagnostics {
@@ -710,8 +712,8 @@ final class CLIProcessRunner {
         switch error {
         case let .pipeCreationFailed(pipe):
             return .spawnFailed("Failed to create \(pipe) pipe for process startup")
-        case let .descriptorConfigurationFailed(label, fd, underlying):
-            let message = String(cString: strerror(underlying.errnoValue))
+        case let .descriptorConfigurationFailed(_, label, fd, errnoValue):
+            let message = String(cString: strerror(errnoValue))
             return .spawnFailed("Failed to configure \(label) pipe descriptor \(fd) for process startup: \(message)")
         case let .spawnFileActionsFailed(operation, errnoValue):
             let message = String(cString: strerror(errnoValue))

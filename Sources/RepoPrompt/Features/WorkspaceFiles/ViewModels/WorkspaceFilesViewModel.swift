@@ -603,7 +603,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var fileSystemSettingsCancellable: AnyCancellable?
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
-    private let selectionSliceCoordinator = SelectionSliceCoordinator()
+    private let selectionSliceCoordinator: SelectionSliceCoordinator
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
     @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:]
     private var sliceSnapshotRebuildDeferralDepth = 0
@@ -935,14 +935,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
     private var workspaceStoreCodemapBridgeTask: Task<Void, Never>?
-    private let alwaysReadableHomeDirectoryURL: URL
 
     init(
-        alwaysReadableHomeDirectoryURL: URL? = nil,
-        workspaceFileContextStore: WorkspaceFileContextStore
+        workspaceFileContextStore: WorkspaceFileContextStore,
+        selectionSliceCoordinator: SelectionSliceCoordinator
     ) {
-        self.alwaysReadableHomeDirectoryURL = (alwaysReadableHomeDirectoryURL ?? FileManager.default.homeDirectoryForCurrentUser).standardizedFileURL
         self.workspaceFileContextStore = workspaceFileContextStore
+        self.selectionSliceCoordinator = selectionSliceCoordinator
         // If you store sortMethod in user defaults, do that here
         if let loaded = SortMethod(rawValue: storedSortMethod) {
             currentSortMethod = loaded
@@ -962,10 +961,11 @@ class WorkspaceFilesViewModel: ObservableObject {
     }
 
     #if DEBUG
-        convenience init(alwaysReadableHomeDirectoryURL: URL? = nil) {
+        convenience init() {
+            let runtime = RepoPromptEmbeddedWorkspaceRuntimeFactory().makeRuntime()
             self.init(
-                alwaysReadableHomeDirectoryURL: alwaysReadableHomeDirectoryURL,
-                workspaceFileContextStore: WorkspaceFileContextStore()
+                workspaceFileContextStore: runtime.workspaceFileContextStore,
+                selectionSliceCoordinator: runtime.selectionSliceCoordinator
             )
         }
     #endif
@@ -6831,20 +6831,10 @@ class WorkspaceFilesViewModel: ObservableObject {
         let issue: PathResolutionIssue?
     }
 
-    struct ExternalReadableFile: Equatable {
-        let absolutePath: String
-        let displayPath: String
-    }
-
     private struct ExplicitSystemPathResolution {
         let root: FolderViewModel
         let standardizedAbsolutePath: String
         let standardizedRelativePath: String
-    }
-
-    enum ReadableFileHandle {
-        case workspace(FileViewModel)
-        case external(ExternalReadableFile)
     }
 
     enum RootAliasPrefixCheck {
@@ -9548,25 +9538,27 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(msg)
         }
 
-        return try await StoreBackedWorkspaceSearch.search(
-            pattern: pattern,
-            mode: mode,
-            isRegex: isRegex,
-            caseInsensitive: caseInsensitive,
-            maxPaths: maxPaths,
-            maxMatches: maxMatches,
-            paths: paths,
-            includeExtensions: includeExtensions,
-            excludePatterns: excludePatterns,
-            contextLines: contextLines,
-            wholeWord: wholeWord,
-            countOnly: countOnly,
-            fuzzySpaceMatching: fuzzySpaceMatching,
-            allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
-            rootScope: rootScope,
-            store: workspaceFileContextStore,
-            workspaceManager: workspaceManager
-        )
+        return try await withEmbeddedWorkspaceRuntimeDiagnostics {
+            try await StoreBackedWorkspaceSearch.search(
+                pattern: pattern,
+                mode: mode,
+                isRegex: isRegex,
+                caseInsensitive: caseInsensitive,
+                maxPaths: maxPaths,
+                maxMatches: maxMatches,
+                paths: paths,
+                includeExtensions: includeExtensions,
+                excludePatterns: excludePatterns,
+                contextLines: contextLines,
+                wholeWord: wholeWord,
+                countOnly: countOnly,
+                fuzzySpaceMatching: fuzzySpaceMatching,
+                allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
+                rootScope: rootScope,
+                store: workspaceFileContextStore,
+                readinessSource: workspaceManager.map(WorkspaceManagerSearchReadinessSource.init)
+            )
+        }
     }
 }
 
@@ -10696,117 +10688,6 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    func resolveReadableFileForUserInput(
-        _ userPath: String,
-        profile: PathLocateProfile = .mcpRead,
-        rootScopeOverride: LookupRootScope? = nil
-    ) async -> ReadableFileHandle? {
-        let trimmed = normalizeUserInputPath(userPath)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        if profile == .mcpRead, let explicitSystemFile = resolveExplicitSystemFile(trimmed) {
-            return .workspace(explicitSystemFile)
-        }
-
-        if let workspaceFile = await resolveFileForUserInput(
-            trimmed,
-            profile: profile,
-            rootScopeOverride: rootScopeOverride
-        ) {
-            return .workspace(workspaceFile)
-        }
-
-        guard trimmed.hasPrefix("/") else { return nil }
-        return resolveAlwaysReadableExternalFile(atAbsolutePath: trimmed).map { .external($0) }
-    }
-
-    @MainActor
-    func resolveAlwaysReadableExternalFolderDisplayPath(_ userPath: String) -> String? {
-        let normalized = normalizeUserInputPath(userPath).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.hasPrefix("/") else { return nil }
-        guard isAlwaysReadableExternalPath(normalized) else { return nil }
-
-        let absolutePath = normalizedAlwaysReadableAbsolutePath(for: normalized)
-        guard isAlwaysReadableExternalPath(absolutePath) else { return nil }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: absolutePath, isDirectory: &isDirectory), isDirectory.boolValue else {
-            return nil
-        }
-        return AgentSupportDirectoryCatalog.displayPath(
-            for: absolutePath,
-            homeDirectoryURL: alwaysReadableHomeDirectoryURL
-        )
-    }
-
-    @MainActor
-    func displayPath(forExternalPath userPath: String) -> String {
-        AgentSupportDirectoryCatalog.displayPath(
-            for: normalizeUserInputPath(userPath),
-            homeDirectoryURL: alwaysReadableHomeDirectoryURL
-        )
-    }
-
-    @MainActor
-    func isAlwaysReadableExternalPath(_ userPath: String) -> Bool {
-        let normalized = normalizeUserInputPath(userPath).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard normalized.hasPrefix("/") else { return false }
-        let directories = AgentSupportDirectoryCatalog.effectiveAlwaysReadableDirectories(
-            homeDirectoryURL: alwaysReadableHomeDirectoryURL
-        )
-        return directories.contains {
-            AgentSupportDirectoryCatalog.contains(
-                absolutePath: normalized,
-                in: $0
-            )
-        }
-    }
-
-    func readAlwaysReadableExternalFile(_ file: ExternalReadableFile) async throws -> String {
-        let path = file.absolutePath
-        return try await Task.detached(priority: .userInitiated) {
-            let url = URL(fileURLWithPath: path)
-            let data = try Data(contentsOf: url)
-            if let decoded = String(data: data, encoding: .utf8) {
-                return decoded
-            }
-            if let decoded = String(data: data, encoding: .unicode) {
-                return decoded
-            }
-            return String(decoding: data, as: UTF8.self)
-        }.value
-    }
-
-    @MainActor
-    private func resolveAlwaysReadableExternalFile(atAbsolutePath path: String) -> ExternalReadableFile? {
-        guard isAlwaysReadableExternalPath(path) else { return nil }
-        let absolutePath = normalizedAlwaysReadableAbsolutePath(for: path)
-        guard isAlwaysReadableExternalPath(absolutePath) else { return nil }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: absolutePath, isDirectory: &isDirectory), !isDirectory.boolValue else {
-            return nil
-        }
-        return ExternalReadableFile(
-            absolutePath: absolutePath,
-            displayPath: AgentSupportDirectoryCatalog.displayPath(
-                for: absolutePath,
-                homeDirectoryURL: alwaysReadableHomeDirectoryURL
-            )
-        )
-    }
-
-    @MainActor
-    private func normalizedAlwaysReadableAbsolutePath(for path: String) -> String {
-        let normalized = AgentSupportDirectoryCatalog.normalizedPath(for: path)
-        if FileManager.default.fileExists(atPath: normalized) {
-            return AgentSupportDirectoryCatalog.normalizedPath(
-                for: URL(fileURLWithPath: normalized).resolvingSymlinksInPath().standardizedFileURL.path
-            )
-        }
-        return normalized
-    }
-
-    @MainActor
     func openFileForMarkdownLink(_ target: MarkdownFileLinkTarget) async -> Bool {
         if let file = await resolveFileForMarkdownLink(target) {
             file.openInDefaultApp()
@@ -11150,30 +11031,6 @@ extension WorkspaceFilesViewModel {
             } catch {
                 continue
             }
-        }
-    }
-}
-
-enum FileManagerError: Error, LocalizedError {
-    case failedToLoadFolder(Error)
-    case failedToLoadFile(Error)
-    case fileSystemServiceNotFound
-    case failedToLoadContent
-    // New: richer, contextual variant used by MCP tools and FS ops
-    case fileSystemServiceNotFoundWithContext(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .failedToLoadFolder(err):
-            "Failed to load folder: \(err.localizedDescription)"
-        case let .failedToLoadFile(err):
-            "Failed to load file: \(err.localizedDescription)"
-        case .fileSystemServiceNotFound:
-            "No matching workspace folder for the requested path."
-        case .failedToLoadContent:
-            "Failed to load content."
-        case let .fileSystemServiceNotFoundWithContext(context):
-            context
         }
     }
 }
@@ -11602,32 +11459,32 @@ extension WorkspaceFilesViewModel {
 
     private func subscribeToPartitionStoreSaves() {
         partitionStoreSaveCancellable = NotificationCenter.default
-            .publisher(for: PartitionStore.didSaveNotification)
+            .publisher(for: EmbeddedPartitionStoreEventAdapter.didSaveNotification)
             .sink { [weak self] note in
                 guard let self else { return }
                 Task { @MainActor in
                     // Workspace must match
-                    guard let wsAny = note.userInfo?[PartitionStore.notifWorkspaceIDKey],
+                    guard let wsAny = note.userInfo?[EmbeddedPartitionStoreEventAdapter.workspaceIDKey],
                           let ws = wsAny as? UUID else { return }
                     guard ws == self.currentWorkspaceID else { return }
                     self.partitionSliceSaveRevision &+= 1
 
                     // Ignore our own writes to avoid redundant reload churn in this VM.
-                    if let sourceAny = note.userInfo?[PartitionStore.notifSourceIDKey],
+                    if let sourceAny = note.userInfo?[EmbeddedPartitionStoreEventAdapter.sourceIDKey],
                        let sourceID = sourceAny as? UUID,
                        sourceID == self.selectionSliceCoordinator.notificationSourceID
                     {
                         return
                     }
 
-                    guard let rootAny = note.userInfo?[PartitionStore.notifRootPathKey],
+                    guard let rootAny = note.userInfo?[EmbeddedPartitionStoreEventAdapter.rootPathKey],
                           let nsRoot = rootAny as? String else { return }
                     let stdRoot = (nsRoot as NSString).standardizingPath
                     // Only refresh if this root folder is actually loaded in this window
                     guard self.isRootFolderLoaded(stdRoot) else { return }
 
                     // Tab must match (nil == nil is fine)
-                    let tabAny = note.userInfo?[PartitionStore.notifTabIDKey]
+                    let tabAny = note.userInfo?[EmbeddedPartitionStoreEventAdapter.tabIDKey]
                     let eventTab = tabAny as? UUID
                     guard eventTab == self.currentTabID else { return }
 

@@ -1,6 +1,8 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 enum CodexJSONValue {
     case string(String)

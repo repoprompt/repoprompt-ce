@@ -9,88 +9,96 @@ extension PromptViewModel {
     }
 
     @MainActor
-    func hasPromptSnapshotEntriesForChat() -> Bool {
-        let selectionCount = fileManager.selectedFiles.count
+    private func chatPromptEntriesRequest() -> (
+        key: ChatPromptEntriesCacheKey,
+        selection: StoredSelection,
+        codeMapUsage: CodeMapUsage,
+        filePathDisplay: FilePathDisplay
+    ) {
+        let selection = activeComposeTabStoredSelectionForPromptProjection()
         let codeMapUsage = effectiveCodeMapUsageForChatPromptEntries()
-
-        switch codeMapUsage {
-        case .none, .selected:
-            return selectionCount > 0
-        case .auto:
-            return selectionCount > 0 || !fileManager.autoCodemapFiles.isEmpty
-        case .complete:
-            return selectionCount > 0 || !chatCodemapFileAPIs.isEmpty
-        }
-    }
-
-    @MainActor
-    func promptSnapshotEntriesForChatCached() -> [PromptFileEntry] {
-        let codeMapUsage = effectiveCodeMapUsageForChatPromptEntries()
+        let filePathDisplay = filePathDisplayOption
         let key = ChatPromptEntriesCacheKey(
+            selection: selection,
             codeMapUsage: codeMapUsage,
+            filePathDisplay: filePathDisplay,
             selectionVersion: chatSelectionVersion,
             slicesVersion: chatSlicesVersion,
             autoCodemapVersion: chatAutoCodemapVersion,
             fileAPIsVersion: chatFileAPIsVersion
         )
-
-        if let cache = chatPromptEntriesCache, cache.key == key {
-            return cache.entries
-        }
-
-        let entries = buildPromptSnapshotEntriesForCurrentChatProjection(codeMapUsage: codeMapUsage)
-        chatPromptEntriesCache = (key: key, entries: entries)
-        return entries
+        return (key, selection, codeMapUsage, filePathDisplay)
     }
 
     @MainActor
-    private func buildPromptSnapshotEntriesForCurrentChatProjection(codeMapUsage: CodeMapUsage) -> [PromptFileEntry] {
-        let selectedFiles = fileManager.selectedFiles
-        let selectedIDs = Set(selectedFiles.map(\.id))
-        var entries: [PromptFileEntry] = selectedFiles.map { file in
-            PromptFileEntry(
-                file: file,
-                isCodemap: false,
-                ranges: fileManager.selectionSlicesByFileID[file.id]
-            )
+    func hasPromptSnapshotEntriesForChat() -> Bool {
+        !promptSnapshotEntriesForChatCached().isEmpty
+    }
+
+    @MainActor
+    func promptSnapshotEntriesForChatCached() -> [PromptFileEntry] {
+        let request = chatPromptEntriesRequest()
+        if let cache = chatPromptEntriesCache, cache.key == request.key {
+            return cache.entries
         }
 
-        for file in fileManager.autoCodemapFiles where !selectedIDs.contains(file.id) {
-            entries.append(PromptFileEntry(file: file, isCodemap: true, ranges: nil))
-        }
+        refreshPromptSnapshotEntriesForChatIfNeeded(request)
+        return []
+    }
 
-        switch codeMapUsage {
-        case .none:
-            entries.removeAll { $0.isCodemap }
-        case .auto:
-            break
-        case .selected:
-            entries = entries.compactMap { entry in
-                guard selectedIDs.contains(entry.file.id) else { return nil }
-                let canCodemap = fileManager.validatedFileAPI(for: entry.file) != nil
-                return PromptFileEntry(
-                    file: entry.file,
-                    isCodemap: canCodemap,
-                    ranges: canCodemap ? nil : entry.ranges
+    @MainActor
+    private func refreshPromptSnapshotEntriesForChatIfNeeded(
+        _ request: (
+            key: ChatPromptEntriesCacheKey,
+            selection: StoredSelection,
+            codeMapUsage: CodeMapUsage,
+            filePathDisplay: FilePathDisplay
+        )
+    ) {
+        guard chatPromptEntriesProjectionKey != request.key else { return }
+
+        chatPromptEntriesProjectionGeneration &+= 1
+        let generation = chatPromptEntriesProjectionGeneration
+        chatPromptEntriesProjectionTask?.cancel()
+        chatPromptEntriesProjectionKey = request.key
+
+        let adapter = WorkspacePromptProjectionAdapter(store: workspaceFileContextStore)
+        chatPromptEntriesProjectionTask = Task { [weak self] in
+            do {
+                let projection = try await adapter.project(
+                    selection: request.selection,
+                    codeMapUsage: request.codeMapUsage,
+                    filePathDisplay: request.filePathDisplay
                 )
-            }
-        case .complete:
-            var existingPaths = Set(entries.map(\.file.standardizedFullPath))
-            let selectedPaths = Set(selectedFiles.map(\.standardizedFullPath))
+                try Task.checkCancellation()
+                guard let self,
+                      chatPromptEntriesProjectionGeneration == generation,
+                      chatPromptEntriesProjectionKey == request.key,
+                      chatPromptEntriesRequest().key == request.key
+                else { return }
 
-            for api in fileManager.validatedCurrentFileAPIs(from: chatCodemapFileAPIs) {
-                let standardizedPath = StandardizedPath.absolute(api.filePath)
-                guard !selectedPaths.contains(standardizedPath),
-                      !existingPaths.contains(standardizedPath),
-                      let file = fileManager.findFileByFullPath(standardizedPath)
-                else { continue }
-
-                entries.append(PromptFileEntry(file: file, isCodemap: true, ranges: nil))
-                existingPaths.insert(standardizedPath)
+                let entries = adapter.mapToLivePromptEntries(projection) { projectedFile in
+                    self.fileManager.findFileByFullPath(projectedFile.standardizedFullPath)
+                }
+                objectWillChange.send()
+                chatPromptEntriesCache = (
+                    key: request.key,
+                    projection: projection,
+                    entries: entries
+                )
+                chatPromptEntriesProjectionTask = nil
+                chatPromptEntriesProjectionKey = nil
+            } catch is CancellationError {
+                return
+            } catch {
+                guard let self,
+                      chatPromptEntriesProjectionGeneration == generation,
+                      chatPromptEntriesProjectionKey == request.key
+                else { return }
+                chatPromptEntriesProjectionTask = nil
+                chatPromptEntriesProjectionKey = nil
             }
         }
-
-        return entries
     }
 
     @MainActor

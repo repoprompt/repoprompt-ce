@@ -1,10 +1,13 @@
 import Foundation
+import RepoPromptCore
 
 @MainActor
 struct WindowStateComposition {
+    let coreSessionHandle: RepoPromptCoreSessionHandle
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
+    let workspaceObservation: WorkspaceSessionObservationBridge
     let workspaceFilesViewModel: WorkspaceFilesViewModel
     let settingsManager: WindowSettingsManager
     let promptManager: PromptViewModel
@@ -28,13 +31,20 @@ enum WindowStateCompositionFactory {
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
-        sharedMCPService: MCPService,
+        coreContainer: RepoPromptAppCoreContainer,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
     ) -> WindowStateComposition {
-        // 1) Workspace file context store + visible file-tree UI adapter
-        let workspaceFileContextStore = WorkspaceFileContextStore()
-        let workspaceSearchService = WorkspaceSearchService()
-        let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
+        // 1) Reusable session graph + visible file-tree UI adapter
+        let coreSessionHandle = coreContainer.coreHost.makeEmbeddedSession(
+            routingSessionID: MCPRoutingSessionID(rawValue: windowID)
+        )
+        let coreSession = coreSessionHandle.session
+        let workspaceFileContextStore = coreSession.workspaceFileContextStore
+        let workspaceSearchService = coreSession.workspaceSearchService
+        let workspaceFilesViewModel = WorkspaceFilesViewModel(
+            workspaceFileContextStore: workspaceFileContextStore,
+            selectionSliceCoordinator: coreSession.selectionSliceCoordinator
+        )
 
         // 2) AI queries
         let keyManager = KeyManager()
@@ -55,16 +65,24 @@ enum WindowStateCompositionFactory {
             settingsManager: settingsManager
         )
 
-        // 7) Create the workspace manager
+        // 7) Create the workspace adapter over the authoritative Core session controller.
+        let workspaceObservation = WorkspaceSessionObservationBridge(
+            controller: coreSession.workspaceSessionController
+        )
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            workspaceSearchService: workspaceSearchService
+            workspaceSearchService: workspaceSearchService,
+            workspaceRepository: coreContainer.workspaceRepository,
+            sessionController: coreSession.workspaceSessionController,
+            workspaceObservation: workspaceObservation
         )
+        let searchReadinessSource = WorkspaceManagerSearchReadinessSource(workspaceManager)
         let selectionCoordinator = WorkspaceSelectionCoordinator(
-            workspaceManager: workspaceManager,
+            controller: coreSession.workspaceSelectionController,
             store: workspaceFileContextStore
         )
+        selectionCoordinator.attachWorkspaceManager(workspaceManager)
         workspaceFilesViewModel.attachSelectionCoordinator(selectionCoordinator)
         workspaceManager.attachSelectionCoordinator(selectionCoordinator)
         promptManager.attachSelectionCoordinator(selectionCoordinator)
@@ -81,31 +99,35 @@ enum WindowStateCompositionFactory {
         // 11) MCP server (one listener app-wide, this window may be owner)
         let applyEditsApprovalStore = ApplyEditsApprovalStore.shared
         let mcpServer = MCPServerViewModel(
-            service: sharedMCPService,
+            service: coreContainer.mcpService,
             promptVM: promptManager,
             oracleVM: oracleViewModel,
             workspaceManager: workspaceManager,
             selectionCoordinator: selectionCoordinator,
+            coreSessionHandle: coreSessionHandle,
+            appSessionAdapters: coreContainer.appSessionAdapters,
             windowID: windowID,
-            workspaceSearch: { [store = workspaceFileContextStore, workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
-                try await StoreBackedWorkspaceSearch.search(
-                    pattern: pattern,
-                    mode: mode,
-                    isRegex: isRegex,
-                    caseInsensitive: caseInsensitive,
-                    maxPaths: maxPaths,
-                    maxMatches: maxMatches,
-                    paths: paths,
-                    includeExtensions: includeExtensions,
-                    excludePatterns: excludePatterns,
-                    contextLines: contextLines,
-                    wholeWord: wholeWord,
-                    countOnly: countOnly,
-                    fuzzySpaceMatching: fuzzySpaceMatching,
-                    rootScope: rootScope,
-                    store: store,
-                    workspaceManager: workspaceManager
-                )
+            workspaceSearch: { [store = workspaceFileContextStore, searchReadinessSource] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
+                try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: pattern,
+                        mode: mode,
+                        isRegex: isRegex,
+                        caseInsensitive: caseInsensitive,
+                        maxPaths: maxPaths,
+                        maxMatches: maxMatches,
+                        paths: paths,
+                        includeExtensions: includeExtensions,
+                        excludePatterns: excludePatterns,
+                        contextLines: contextLines,
+                        wholeWord: wholeWord,
+                        countOnly: countOnly,
+                        fuzzySpaceMatching: fuzzySpaceMatching,
+                        rootScope: rootScope,
+                        store: store,
+                        readinessSource: searchReadinessSource
+                    )
+                }
             },
             ensureGitDataRootLoaded: { [fileManager = workspaceFilesViewModel] workspace, workspaceManager in
                 guard let workspace, let workspaceManager else { return }
@@ -171,9 +193,11 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                coreSessionHandle: coreSessionHandle,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
+                workspaceObservation: workspaceObservation,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,
@@ -191,9 +215,11 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                coreSessionHandle: coreSessionHandle,
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
+                workspaceObservation: workspaceObservation,
                 workspaceFilesViewModel: workspaceFilesViewModel,
                 settingsManager: settingsManager,
                 promptManager: promptManager,

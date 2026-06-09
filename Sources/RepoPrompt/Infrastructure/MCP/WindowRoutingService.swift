@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptCore
 import SwiftUI
 
 #if DEBUG
@@ -321,6 +322,8 @@ final class WindowRoutingService: Service {
     // ---------------------------------------------------------------------
     private let windowStates: WindowStatesManager
     private let networkMgr: ServerNetworkManager
+    private let serviceRegistry: MCPServiceRegistry
+    private let workspaceRepository: WorkspaceRepository
     private var previousDisabledTools: Set<String>
 
     /// Thread-safe tools storage
@@ -336,10 +339,14 @@ final class WindowRoutingService: Service {
     /// ---------------------------------------------------------------------
     init(
         windowStates: WindowStatesManager,
-        networkMgr: ServerNetworkManager
+        networkMgr: ServerNetworkManager,
+        serviceRegistry: MCPServiceRegistry? = nil,
+        workspaceRepository: WorkspaceRepository
     ) {
         self.windowStates = windowStates
         self.networkMgr = networkMgr
+        self.serviceRegistry = serviceRegistry ?? networkMgr.serviceRegistry
+        self.workspaceRepository = workspaceRepository
         previousDisabledTools = Set(UserDefaults.standard.stringArray(forKey: "mcp.disabledTools") ?? [])
 
         // Initialize cached tools and register service
@@ -347,7 +354,7 @@ final class WindowRoutingService: Service {
             await updateCachedTools()
 
             // Register only after tools are cached
-            ServiceRegistry.register(self)
+            self.serviceRegistry.register(self)
         }
 
         // Listen for changes to relevant MCP settings
@@ -381,8 +388,6 @@ final class WindowRoutingService: Service {
                 if !removedToolNames.isEmpty {
                     ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
                 }
-
-                await networkMgr.broadcastToolListChanged()
             }
         }
 
@@ -416,9 +421,6 @@ final class WindowRoutingService: Service {
                 if !removedToolNames.isEmpty {
                     ToolAvailabilityStore.shared.unregisterTools(Array(removedToolNames))
                 }
-
-                // Notify connected clients that the tool list has changed
-                await networkMgr.broadcastToolListChanged()
             }
         }
     }
@@ -449,12 +451,10 @@ final class WindowRoutingService: Service {
     }
 
     private func loadWorkspaceDiskSnapshot() async throws -> [WorkspaceModel] {
-        guard let referenceManager = await MainActor.run(body: {
-            self.windowStates.allWindows.first?.workspaceManager
-        }) else {
+        guard networkMgr.runtimeSessionRegistry.routingSnapshot().activeWindowCount > 0 else {
             throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
         }
-        return await referenceManager.loadWorkspaceSnapshotFromDisk()
+        return await workspaceRepository.loadWorkspaceSnapshotFromDisk()
     }
 
     private nonisolated static func availableWorkspaceSuggestion(_ workspaces: [WorkspaceModel], includeHidden: Bool) -> String {
@@ -1169,11 +1169,8 @@ final class WindowRoutingService: Service {
         kind: WorkingDirsWorkspaceMatchKind
     ) async throws -> [WorkspaceMatch] {
         let windows = windowStates.allWindows
-        guard let inventoryWindow = windows.first else {
-            throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
-        }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await inventoryWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -1189,11 +1186,8 @@ final class WindowRoutingService: Service {
         kind: WorkingDirsWorkspaceMatchKind
     ) async throws -> [WorkspaceMatch] {
         let windows = windowStates.allWindows
-        guard let inventoryWindow = windows.first else {
-            throw MCPError.invalidParams("No windows available to load workspace list. Open at least one window first.")
-        }
         let activeWindowSnapshots = Self.activeWorkspaceSnapshots(from: windows)
-        let diskWorkspaces = await inventoryWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let diskWorkspaces = try await loadWorkspaceDiskSnapshot()
         return Self.collapsedWorkspaceMatches(
             normalizedWorkingDirs: normalizedWorkingDirs,
             kind: kind,
@@ -1731,7 +1725,9 @@ final class WindowRoutingService: Service {
 
         let matches = windows.compactMap { window -> ResolvedBindTarget? in
             guard windowID == nil || window.windowID == windowID else { return nil }
-            guard let candidate = window.workspaceManager.bindingCandidate(forContextID: contextID) else { return nil }
+            guard let candidate = window.coreSessionHandle.session.workspaceSessionController
+                .bindingCandidate(forContextID: contextID)
+            else { return nil }
             let tabName = window.workspaceManager.composeTabName(with: candidate.tabID) ?? contextID.uuidString
             return ResolvedBindTarget(
                 windowID: window.windowID,
@@ -1803,7 +1799,7 @@ final class WindowRoutingService: Service {
         }
 
         let approvalWindow = try await resolveWorkspaceApprovalWindow(requestedWindowID: windowID, openInNewWindow: true)
-        let existingWorkspaces = await approvalWindow.workspaceManager.loadWorkspaceSnapshotFromDisk()
+        let existingWorkspaces = await workspaceRepository.loadWorkspaceSnapshotFromDisk()
         let workspaceName = derivedWorkspaceName(
             normalizedWorkingDirs: normalizedWorkingDirs,
             creationNameHint: tabName,
@@ -2210,15 +2206,14 @@ final class WindowRoutingService: Service {
                     // Load fresh workspace data from disk to ensure accurate repoPaths
                     // Then overlay window visibility information from in-memory state
 
-                    // Get a workspace manager to load disk snapshot
-                    guard let referenceManager = await MainActor.run(body: {
-                        self.windowStates.allWindows.first?.workspaceManager
+                    guard await MainActor.run(body: {
+                        self.networkMgr.runtimeSessionRegistry.routingSnapshot().activeWindowCount > 0
                     }) else {
                         return ManageWorkspacesResponse(action: "list", workspaces: [], status: "ok")
                     }
 
                     // Load authoritative workspace data from disk
-                    let diskWorkspaces = await referenceManager.loadWorkspaceSnapshotFromDisk()
+                    let diskWorkspaces = await workspaceRepository.loadWorkspaceSnapshotFromDisk()
 
                     // Build map of which windows are showing each workspace
                     let windowsByWorkspaceID: [UUID: Set<Int>] = await MainActor.run {
@@ -3096,6 +3091,7 @@ final class WindowRoutingService: Service {
 
         // Update the cache with the new tools
         await toolsCache.update(newTools)
+        serviceRegistry.invalidateCatalog(for: self)
     }
 
     // ---------------------------------------------------------------------

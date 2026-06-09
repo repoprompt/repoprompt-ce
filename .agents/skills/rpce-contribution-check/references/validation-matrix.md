@@ -11,6 +11,8 @@ Use this after the scripted preflight when the touched boundary needs focused ev
 | Provider package source or tests | `make dev-provider-test` |
 | `Sources/RepoPrompt/**` | `make dev-swift-build PRODUCT=RepoPrompt` |
 | `Sources/RepoPromptMCP/**` or `Sources/RepoPromptShared/**` | `make dev-swift-build PRODUCT=repoprompt-mcp` |
+| `Sources/RepoPromptCore/**`, `Sources/RepoPromptCoreMacOS/**`, or `Sources/RepoPromptPOSIXSupport/**` | Build the affected target(s) and run the smallest focused Core test target(s) |
+| `Sources/RepoPromptHeadless/**` or headless packaging/install/smoke scripts | `make dev-swift-build PRODUCT=repoprompt-headless` plus the non-visible headless smoke lane when available |
 | Packaging, MCP CLI/server, Agent Mode, or running-app-sensitive paths | Record non-disruptive `make dev-smoke`; request approval before `make dev-smoke-launch`, `make dev-run`, or relaunching the visible app |
 | History rewrite, branch deletion, fork deletion, force-push, credential rotation, other GitHub-visible destructive mutation, visible app launch/relaunch, or visible app stop | Obtain explicit user approval immediately before the destructive command; redact secret values from output |
 

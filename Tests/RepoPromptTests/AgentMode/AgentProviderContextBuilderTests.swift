@@ -2,6 +2,28 @@
 import XCTest
 
 final class AgentProviderContextBuilderTests: XCTestCase {
+    private enum AccountingTestError: Error {
+        case failed
+    }
+
+    private actor AccountingCancellationGate {
+        private var started = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStarted() {
+            started = true
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+
+        func waitUntilStarted() async {
+            guard !started else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+    }
+
     private var temporaryRoots: [URL] = []
 
     override func tearDownWithError() throws {
@@ -57,6 +79,43 @@ final class AgentProviderContextBuilderTests: XCTestCase {
 
         XCTAssertTrue(block.contains("let origin = \"base\""), block)
         XCTAssertFalse(block.contains("let origin = \"worktree\""), block)
+    }
+
+    func testForkFileContentsBlockFailsClosedWhenAccountingThrows() async {
+        let block = await AgentProviderContextBuilder.forkFileContentsBlock(
+            selection: StoredSelection(selectedPaths: ["Sources/Oversized.swift"], codemapAutoEnabled: false),
+            tokenCap: 1,
+            store: WorkspaceFileContextStore(),
+            lookupContext: .visibleWorkspace,
+            accountingOperation: { _, _ in throw AccountingTestError.failed },
+            overTokenCapSummaryProvider: { _, _ in "unsafe fallback summary" }
+        )
+
+        XCTAssertEqual(block, "")
+    }
+
+    func testForkFileContentsBlockFailsClosedWhenAccountingIsCancelled() async {
+        let gate = AccountingCancellationGate()
+        let task = Task {
+            await AgentProviderContextBuilder.forkFileContentsBlock(
+                selection: StoredSelection(selectedPaths: ["Sources/Oversized.swift"], codemapAutoEnabled: false),
+                tokenCap: 1,
+                store: WorkspaceFileContextStore(),
+                lookupContext: .visibleWorkspace,
+                accountingOperation: { _, _ in
+                    await gate.markStarted()
+                    try await Task.sleep(nanoseconds: 60_000_000_000)
+                    throw AccountingTestError.failed
+                },
+                overTokenCapSummaryProvider: { _, _ in "unsafe fallback summary" }
+            )
+        }
+        await gate.waitUntilStarted()
+
+        task.cancel()
+        let block = await task.value
+
+        XCTAssertEqual(block, "")
     }
 
     private func makeBoundFixture() async throws -> (

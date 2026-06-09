@@ -55,9 +55,18 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
     func testWarmSwitchNotificationIsWindowScoped() async throws {
         try await withFixture { fixtureA in
-            let initialPresentation = fixtureA.viewModel.activeTranscriptPresentation
-
             try await withFixture { fixtureB in
+                // Creating another full window fixture can legitimately refresh shared app-shell
+                // workspace state. Re-establish A's active binding before isolating B's tab switch.
+                XCTAssertTrue(fixtureA.viewModel.test_publishTranscriptPresentation(tabID: fixtureA.tabAID))
+                let initialPresentation = fixtureA.viewModel.activeTranscriptPresentation
+                assertPresentation(
+                    initialPresentation,
+                    tabID: fixtureA.tabAID,
+                    sessionID: fixtureA.sessionAID,
+                    session: fixtureA.sessionA,
+                    expectedTexts: fixtureA.tabATexts
+                )
                 XCTAssertEqual(fixtureA.viewModel.activeTranscriptPresentation, initialPresentation)
 
                 await fixtureB.window.promptManager.switchComposeTab(fixtureB.tabBID)
@@ -121,15 +130,15 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             let tabA = ComposeTabState(id: tabAID, name: "A", activeAgentSessionID: sessionAID)
             let tabB = ComposeTabState(id: tabBID, name: "B", activeAgentSessionID: sessionBID)
 
-            let workspaceIndex = try XCTUnwrap(
-                window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id })
-            )
-            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [tabA, tabB]
-            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabAID
-            window.promptManager.loadComposeTabsFromWorkspace(
-                window.workspaceManager.workspaces[workspaceIndex],
-                syncPromptText: true
-            )
+            let workspaceWithTabs = try XCTUnwrap(window.workspaceManager.mutateWorkspace(
+                id: workspace.id,
+                touchDateModified: false,
+                markDirty: false
+            ) { workspace in
+                workspace.composeTabs = [tabA, tabB]
+                workspace.activeComposeTabID = tabAID
+            })
+            window.promptManager.loadComposeTabsFromWorkspace(workspaceWithTabs, syncPromptText: true)
 
             let viewModel = window.agentModeViewModel
             let sessionA = viewModel.session(for: tabAID)
@@ -178,8 +187,7 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             )
         } catch {
             window.beginClose()
-            await window.tearDown()
-            WindowStatesManager.shared.unregisterWindowState(window)
+            await WindowStatesManager.shared.unregisterWindowStateAndWait(window)
             try? FileManager.default.removeItem(at: rootURL)
             throw error
         }
@@ -187,8 +195,7 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
 
     private func cleanup(_ fixture: Fixture) async {
         fixture.window.beginClose()
-        await fixture.window.tearDown()
-        WindowStatesManager.shared.unregisterWindowState(fixture.window)
+        await WindowStatesManager.shared.unregisterWindowStateAndWait(fixture.window)
         try? FileManager.default.removeItem(at: fixture.rootURL)
     }
 

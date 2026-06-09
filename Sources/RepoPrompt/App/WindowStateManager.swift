@@ -184,6 +184,9 @@ class WindowStatesManager: ObservableObject {
     /// We keep references to the focus-change cancellables (if we needed direct Combine usage),
     /// but in this example we rely on a callback approach from each WindowState.
     private var focusCancellables = Set<AnyCancellable>()
+    private var closeFinalizerTasks: [Int: Task<Void, Never>] = [:]
+    private var drainingWindowStates: [Int: WindowState] = [:]
+    private var retiredWindowIDs: Set<Int> = []
 
     private static let autoRestoreDefaultsKey = "autoRestoreWorkspacesEnabled_v2"
 
@@ -539,13 +542,20 @@ class WindowStatesManager: ObservableObject {
     }
 
     func registerWindowState(_ state: WindowState) {
-        // Prevent duplicate registration
-        guard !allWindows.contains(where: { $0 === state }) else { return }
+        // Prevent duplicate registration and stale SwiftUI reappearance after drain/removal.
+        guard !allWindows.contains(where: { $0 === state }),
+              closeFinalizerTasks[state.windowID] == nil,
+              !retiredWindowIDs.contains(state.windowID),
+              state.coreSessionHandle.snapshot.lifecycle == .created
+        else { return }
 
         #if DEBUG
             let registerStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         allWindows.append(state)
+        state.coreContainer.appSessionAdapters.register(windowState: state)
+        state.coreContainer.coreHost.activate(state.coreSessionHandle)
+        state.mcpServer.windowDidRegister()
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "restore.window registered windowID=\(state.windowID) registeredWindows=\(allWindows.count) pendingRestoreEntries=\(restoreQueue.count)"
@@ -609,28 +619,52 @@ class WindowStatesManager: ObservableObject {
     }
 
     func unregisterWindowState(_ state: WindowState) {
+        guard closeFinalizerTasks[state.windowID] == nil,
+              !retiredWindowIDs.contains(state.windowID)
+        else { return }
+
+        drainingWindowStates[state.windowID] = state
+        state.coreContainer.coreHost.beginDraining(state.coreSessionHandle)
+        state.coreContainer.appSessionAdapters.beginDraining(windowID: state.windowID)
+        state.mcpServer.windowWillUnregister()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
         }
         explicitlyClosingWindowIDs.remove(state.windowID)
 
-        // Skip notifications and updates during termination to prevent observation crashes
-        guard !isTerminating else { return }
+        if !isTerminating {
+            // Notify that window count changed
+            NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
 
-        // Notify that window count changed
-        NotificationCenter.default.post(name: .windowCountDidChange, object: nil)
+            // Then update shortcuts in case we lost a focused window
+            updateKeyboardShortcutsState()
 
-        // Inform the network manager that this window is gone
-        Task { await ServerNetworkManager.shared.clearWindowSelectionIfClosed(state.windowID) }
+            // Clear instance assignment for this window without reusing numbers
+            clearInstanceAssignment(forWindowID: state.windowID)
 
-        // Then update shortcuts in case we lost a focused window
-        updateKeyboardShortcutsState()
+            Task { @MainActor in
+                await self.persistWindowSessionImmediately(reason: "unregisterWindow:\(state.windowID)")
+            }
+        }
 
-        // Clear instance assignment for this window without reusing numbers
-        clearInstanceAssignment(forWindowID: state.windowID)
+        // Keep the draining app adapter alive for cleanup paths, then retire the
+        // reusable session only after both network affinity cleanup and teardown finish.
+        closeFinalizerTasks[state.windowID] = Task { @MainActor [weak self, state] in
+            async let networkCleanup: Void = ServerNetworkManager.shared.clearWindowSelectionIfClosed(state.windowID)
+            async let teardown: Void = state.tearDown()
+            _ = await (networkCleanup, teardown)
+            state.coreContainer.coreHost.remove(state.coreSessionHandle)
+            state.coreContainer.appSessionAdapters.remove(windowID: state.windowID)
+            self?.drainingWindowStates.removeValue(forKey: state.windowID)
+            self?.retiredWindowIDs.insert(state.windowID)
+            self?.closeFinalizerTasks.removeValue(forKey: state.windowID)
+        }
+    }
 
-        Task { @MainActor in
-            await self.persistWindowSessionImmediately(reason: "unregisterWindow:\(state.windowID)")
+    func unregisterWindowStateAndWait(_ state: WindowState) async {
+        unregisterWindowState(state)
+        if let task = closeFinalizerTasks[state.windowID] {
+            await task.value
         }
     }
 
@@ -771,15 +805,21 @@ class WindowStatesManager: ObservableObject {
 
     // MARK: - MCP Server Coordination
 
-    /// Stops MCP servers in **all** windows (unconditionally).
+    private func lifecycleWindowStates() -> [WindowState] {
+        var seenWindowIDs: Set<Int> = []
+        return (allWindows + Array(drainingWindowStates.values)).filter { state in
+            seenWindowIDs.insert(state.windowID).inserted
+        }
+    }
+
+    /// Stops MCP servers in **all** active or draining windows (unconditionally).
     /// During teardown, "running" state can be stale; we just want tools off.
     func stopAllServers() async {
-        let windowIDs = allWindows.map(\.windowID)
+        let windows = lifecycleWindowStates()
         await withTaskGroup(of: Void.self) { group in
-            for windowID in windowIDs {
-                group.addTask { @MainActor [weak self] in
-                    guard let self, let ws = window(withID: windowID) else { return }
-                    await ws.mcpServer.stopServer()
+            for window in windows {
+                group.addTask { @MainActor [weak window] in
+                    await window?.mcpServer.stopServer()
                 }
             }
         }
@@ -790,12 +830,11 @@ class WindowStatesManager: ObservableObject {
     /// Safe to call after `signalTermination()` — only performs cancellation and process teardown,
     /// no UI-observed state mutations.
     func shutdownAllAgentSessions() async {
-        let windowIDs = allWindows.map(\.windowID)
+        let windows = lifecycleWindowStates()
         await withTaskGroup(of: Void.self) { group in
-            for windowID in windowIDs {
-                group.addTask { @MainActor [weak self] in
-                    guard let self, let ws = window(withID: windowID) else { return }
-                    await ws.agentModeViewModel.prepareForWindowClose()
+            for window in windows {
+                group.addTask { @MainActor [weak window] in
+                    await window?.agentModeViewModel.prepareForWindowClose()
                 }
             }
         }
@@ -803,6 +842,15 @@ class WindowStatesManager: ObservableObject {
         await CodexModelPollingService.shared.shutdown()
         await OpenCodeACPModelPollingService.shared.shutdown()
         await CursorACPModelPollingService.shared.shutdown()
+    }
+
+    /// Waits for windows that began a normal close before termination to complete
+    /// their safety-critical teardown before the host removes remaining sessions.
+    func awaitDrainingWindowFinalizers() async {
+        let tasks = Array(closeFinalizerTasks.values)
+        for task in tasks {
+            await task.value
+        }
     }
 
     // MARK: - Instance Number Management

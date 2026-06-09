@@ -338,6 +338,11 @@ struct AICompletionResult {
 
 protocol AIProvider {
     func streamMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AsyncThrowingStream<AIStreamResult, Error>
+    func streamMessageWithInputProjection(
+        _ aiMessage: AIMessage,
+        model: AIModel,
+        maxTokens: Int?
+    ) async throws -> AIProviderStreamStart
     func completeMessage(_ aiMessage: AIMessage, model: AIModel, maxTokens: Int?) async throws -> AICompletionResult
     func dispose() async
 }

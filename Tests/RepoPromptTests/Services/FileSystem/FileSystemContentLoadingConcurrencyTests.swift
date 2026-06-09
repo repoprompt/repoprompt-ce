@@ -1,5 +1,5 @@
-import CoreServices
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
@@ -311,10 +311,12 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
 
             let queued = Task {
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
-                    try await service.loadContent(
-                        ofRelativePath: queuedPath,
-                        workloadClass: .interactiveRead
-                    )
+                    try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                        try await service.loadContent(
+                            ofRelativePath: queuedPath,
+                            workloadClass: .interactiveRead
+                        )
+                    }
                 }
             }
             let waitBegan = await waitForLifecycleEvent(
@@ -376,10 +378,12 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
 
             let cancelled = Task {
                 try await EditFlowPerf.$currentLifecycleCorrelation.withValue(correlation) {
-                    try await service.loadContent(
-                        ofRelativePath: "Cancelled.txt",
-                        workloadClass: .interactiveRead
-                    )
+                    try await withEmbeddedWorkspaceRuntimeDiagnostics {
+                        try await service.loadContent(
+                            ofRelativePath: "Cancelled.txt",
+                            workloadClass: .interactiveRead
+                        )
+                    }
                 }
             }
             let waitBegan = await waitForLifecycleEvent(
@@ -705,8 +709,8 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
     #endif
 
-    private var createdFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+    private var createdFileFlags: FileSystemWatchEventFlags {
+        [.itemCreated, .itemIsFile]
     }
 
     private func makeService(root: URL, skipSymlinks: Bool = true) async throws -> FileSystemService {

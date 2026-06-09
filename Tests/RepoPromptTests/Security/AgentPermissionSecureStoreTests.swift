@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class AgentPermissionSecureStoreTests: XCTestCase {
@@ -90,7 +91,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
 
     @MainActor
     func testCodexPermissionReadInteractionDeniedFailsClosedAndMarksDiagnosticsDegraded() throws {
-        let secureStrings = FakeSecurePlainStringStore(plainGetError: KeychainService.KeychainError.interactionNotAllowed)
+        let secureStrings = FakeSecurePlainStringStore(plainGetError: SecureStorageError.interactionNotAllowed)
         let store = makeStore(secureStrings: secureStrings)
 
         let permissions = store.codexPermissions()
@@ -196,9 +197,9 @@ private final class FakeSecurePlainStringStore: SecurePlainStringStoring {
     var saveError: Error?
     var failSaveKeys: Set<String> = []
 
-    private(set) var plainGetAccessModes: [KeychainAccessMode] = []
-    private(set) var plainSaveAccessModes: [KeychainAccessMode] = []
-    private(set) var plainDeleteAccessModes: [KeychainAccessMode] = []
+    private(set) var plainGetAccessModes: [SecureStorageAccessMode] = []
+    private(set) var plainSaveAccessModes: [SecureStorageAccessMode] = []
+    private(set) var plainDeleteAccessModes: [SecureStorageAccessMode] = []
     private(set) var savedPlainValues: [(key: String, value: String)] = []
 
     init(
@@ -215,32 +216,32 @@ private final class FakeSecurePlainStringStore: SecurePlainStringStoring {
         self.persistsValuesAcrossLaunches = persistsValuesAcrossLaunches
     }
 
-    func getPlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws -> String? {
+    func getPlainValue(for key: String, accessMode: SecureStorageAccessMode) throws -> String? {
         plainGetAccessModes.append(accessMode)
         if let plainGetError {
             throw plainGetError
         }
-        return plainValues[account.identifier]
+        return plainValues[key]
     }
 
     func savePlainValue(
         _ value: String,
-        for account: SecureStorageAccount,
-        accessMode: KeychainAccessMode
+        for key: String,
+        accessMode: SecureStorageAccessMode
     ) throws {
         plainSaveAccessModes.append(accessMode)
         if let saveError {
             throw saveError
         }
-        if failSaveKeys.contains(account.identifier) {
-            throw KeychainService.KeychainError.invalidData
+        if failSaveKeys.contains(key) {
+            throw SecureStorageError.invalidData
         }
-        plainValues[account.identifier] = value
-        savedPlainValues.append((key: account.identifier, value: value))
+        plainValues[key] = value
+        savedPlainValues.append((key: key, value: value))
     }
 
-    func deletePlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws {
+    func deletePlainValue(for key: String, accessMode: SecureStorageAccessMode) throws {
         plainDeleteAccessModes.append(accessMode)
-        plainValues.removeValue(forKey: account.identifier)
+        plainValues.removeValue(forKey: key)
     }
 }

@@ -99,13 +99,15 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
 
     func testSecureStorageBackendBoundaryRemainsCentralized() throws {
         let root = try RepoRoot.url()
-        let sourceRoot = root.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
+        let sourceRoot = root.appendingPathComponent("Sources", isDirectory: true)
         let allowedFiles: Set = [
-            "Sources/RepoPrompt/Infrastructure/Security/EphemeralSecureKeyValueStore.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/KeychainService.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureKeyService.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureKeyValueStorageBackend.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift"
+            "Sources/RepoPrompt/Infrastructure/Security/MacOS/AppSecureKeyValueStorageFactory.swift",
+            "Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift",
+            "Sources/RepoPromptCore/Platform/RepoPromptCorePlatformDependencies.swift",
+            "Sources/RepoPromptCore/Platform/SecureKeyValueStorageBackend.swift",
+            "Sources/RepoPromptCore/Security/EphemeralSecureKeyValueStore.swift",
+            "Sources/RepoPromptCore/Security/SecureKeyService.swift",
+            "Sources/RepoPromptCoreMacOS/Security/KeychainService.swift"
         ]
 
         var filesUsingBackend: Set<String> = []

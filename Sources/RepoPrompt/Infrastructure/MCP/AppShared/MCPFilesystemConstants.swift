@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import RepoPromptShared
 
@@ -66,6 +67,8 @@ func mcpRoutingDebugLog(_ message: @autoclosure () -> String) {
 }
 
 enum MCPFilesystemConstants {
+    private static let userID = UInt32(getuid())
+
     #if DEBUG
         static let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
     #else
@@ -85,7 +88,7 @@ enum MCPFilesystemConstants {
     }
 
     static func socketDirectoryURL() -> URL {
-        identity.socketDirectoryURL()
+        identity.socketDirectoryURL(userID: userID)
     }
 
     @discardableResult
@@ -111,7 +114,7 @@ enum MCPFilesystemConstants {
     }
 
     static func bootstrapSocketURL() -> URL {
-        identity.bootstrapSocketURL()
+        identity.bootstrapSocketURL(userID: userID)
     }
 
     static func eventsDirectoryURL() -> URL {

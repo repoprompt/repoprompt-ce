@@ -394,6 +394,19 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     /// Owns active and terminal-cleanup Context Builder attempts.
     private let runRegistry = ContextBuilderRunRegistry()
 
+    struct UserMessageInput: Equatable {
+        let promptText: String
+        let selection: StoredSelection
+        let contextBuilderPromptIDs: Set<UUID>
+    }
+
+    enum UserMessageSource: Equatable {
+        case captured(UserMessageInput)
+        case workspace(UserMessageInput)
+        case live(contextBuilderPromptIDs: Set<UUID>)
+        case unavailable(contextBuilderPromptIDs: Set<UUID>)
+    }
+
     #if DEBUG
         struct RunTestHooks {
             let beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?
@@ -2560,40 +2573,47 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func buildAgentUserMessage(for session: TabSession, adjustedBudget: Int) async -> String {
-        // Context builder prompt IDs captured at run start from viewmodel (always set by captureRunStartState)
-        let contextBuilderPromptIDs = session.runStartContextBuilderPromptIDs ?? []
+        let source = Self.resolveUserMessageSource(
+            for: session,
+            workspaceSnapshot: { self.snapshotForTab(session.tabID) },
+            isCurrentTab: session.tabID == currentTabID
+        )
 
-        // PRIORITY 1: Use run-start captured state (prevents tab bleed)
-        if let promptText = session.runStartPromptText,
-           let selection = session.runStartSelection
-        {
-            let fileTree = await buildFileTree(from: selection)
-            debugLog("Using run-start captured state for tab=\(session.tabID)")
+        switch source {
+        case let .captured(input):
+            return await renderUserMessage(
+                input: input,
+                session: session,
+                adjustedBudget: adjustedBudget,
+                fileTreeDidRender: {
+                    self.debugLog("Using run-start captured state for tab=\(session.tabID)")
+                }
+            )
+
+        case let .workspace(input):
+            return await renderUserMessage(
+                input: input,
+                session: session,
+                adjustedBudget: adjustedBudget,
+                fileTreeDidRender: {
+                    self.debugLog("Using workspace snapshot for tab=\(session.tabID)")
+                }
+            )
+
+        case let .live(contextBuilderPromptIDs):
+            debugLog("Using live UI state (tab still active) for tab=\(session.tabID)")
+            workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
+            let liveSelection = snapshotForTab(session.tabID)?.selection ?? StoredSelection()
+            let fileTree = await buildFileTree(from: liveSelection)
             return makeUserMessage(
                 fileTree: fileTree,
-                userPrompt: promptText,
+                userPrompt: promptManager.promptText,
                 discoverInstructions: session.contextBuilderInstructions,
                 adjustedBudget: adjustedBudget,
                 contextBuilderPromptIDs: contextBuilderPromptIDs
             )
-        }
 
-        // PRIORITY 2: Workspace snapshot (fallback, may be slightly stale)
-        if let snapshot = snapshotForTab(session.tabID) {
-            let fileTree = await buildFileTree(from: snapshot.selection)
-            debugLog("Using workspace snapshot for tab=\(session.tabID)")
-            return makeUserMessage(
-                fileTree: fileTree,
-                userPrompt: snapshot.promptText,
-                discoverInstructions: session.contextBuilderInstructions,
-                adjustedBudget: adjustedBudget,
-                contextBuilderPromptIDs: contextBuilderPromptIDs
-            )
-        }
-
-        // PRIORITY 3: Live UI state ONLY if still on correct tab
-        // If the tab is no longer active and we have no captured state, something went wrong.
-        guard session.tabID == currentTabID else {
+        case let .unavailable(contextBuilderPromptIDs):
             debugLog("ERROR: Tab context unavailable - tab switched before state was captured")
             return makeUserMessage(
                 fileTree: "",
@@ -2603,17 +2623,78 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 contextBuilderPromptIDs: contextBuilderPromptIDs
             )
         }
+    }
 
-        debugLog("Using live UI state (tab still active) for tab=\(session.tabID)")
-        workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
-        let liveSelection = snapshotForTab(session.tabID)?.selection ?? StoredSelection()
-        let fileTree = await buildFileTree(from: liveSelection)
-        return makeUserMessage(
-            fileTree: fileTree,
-            userPrompt: promptManager.promptText,
-            discoverInstructions: session.contextBuilderInstructions,
+    static func resolveUserMessageSource(
+        for session: TabSession,
+        workspaceSnapshot: () -> ComposeTabState?,
+        isCurrentTab: Bool
+    ) -> UserMessageSource {
+        let contextBuilderPromptIDs = session.runStartContextBuilderPromptIDs ?? []
+
+        if let promptText = session.runStartPromptText,
+           let selection = session.runStartSelection
+        {
+            return .captured(UserMessageInput(
+                promptText: promptText,
+                selection: selection,
+                contextBuilderPromptIDs: contextBuilderPromptIDs
+            ))
+        }
+
+        if let snapshot = workspaceSnapshot() {
+            return .workspace(UserMessageInput(
+                promptText: snapshot.promptText,
+                selection: snapshot.selection,
+                contextBuilderPromptIDs: contextBuilderPromptIDs
+            ))
+        }
+
+        if isCurrentTab {
+            return .live(contextBuilderPromptIDs: contextBuilderPromptIDs)
+        }
+
+        return .unavailable(contextBuilderPromptIDs: contextBuilderPromptIDs)
+    }
+
+    private func renderUserMessage(
+        input: UserMessageInput,
+        session: TabSession,
+        adjustedBudget: Int,
+        fileTreeDidRender: () -> Void
+    ) async -> String {
+        await Self.renderUserMessage(
+            input: input,
             adjustedBudget: adjustedBudget,
-            contextBuilderPromptIDs: contextBuilderPromptIDs
+            fileTreeRenderer: { selection in
+                await self.buildFileTree(from: selection)
+            },
+            fileTreeDidRender: fileTreeDidRender,
+            discoverInstructions: { session.contextBuilderInstructions },
+            customPromptRenderer: { contextBuilderPromptIDs in
+                ContextBuilderPromptStorage.shared.promptText(for: contextBuilderPromptIDs)
+            }
+        )
+    }
+
+    static func renderUserMessage(
+        input: UserMessageInput,
+        adjustedBudget: Int,
+        fileTreeRenderer: (StoredSelection) async -> String,
+        fileTreeDidRender: () -> Void = {},
+        discoverInstructions: () -> String,
+        customPromptRenderer: (Set<UUID>) -> String?
+    ) async -> String {
+        let fileTree = await fileTreeRenderer(input.selection)
+        fileTreeDidRender()
+        let instructions = discoverInstructions()
+        let customPromptText = customPromptRenderer(input.contextBuilderPromptIDs)
+        return renderUserMessageEnvelope(
+            fileTree: fileTree,
+            userPrompt: input.promptText,
+            customPromptText: customPromptText,
+            discoverInstructions: instructions,
+            adjustedBudget: adjustedBudget
         )
     }
 
@@ -2623,6 +2704,23 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         discoverInstructions: String,
         adjustedBudget: Int,
         contextBuilderPromptIDs: Set<UUID> = []
+    ) -> String {
+        let customPromptText = ContextBuilderPromptStorage.shared.promptText(for: contextBuilderPromptIDs)
+        return Self.renderUserMessageEnvelope(
+            fileTree: fileTree,
+            userPrompt: userPrompt,
+            customPromptText: customPromptText,
+            discoverInstructions: discoverInstructions,
+            adjustedBudget: adjustedBudget
+        )
+    }
+
+    static func renderUserMessageEnvelope(
+        fileTree: String,
+        userPrompt: String,
+        customPromptText: String?,
+        discoverInstructions: String,
+        adjustedBudget: Int
     ) -> String {
         var message = ""
 
@@ -2647,12 +2745,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
 
         // Include context builder custom prompts (meta prompts) before user instructions
-        if let metaPromptText = ContextBuilderPromptStorage.shared.promptText(for: contextBuilderPromptIDs) {
+        if let customPromptText {
             message += """
-            \(metaPromptText)
+            \(customPromptText)
 
             """
-            print(metaPromptText)
+            print(customPromptText)
         }
 
         if !discoverInstructions.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2716,33 +2814,52 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     /// Captures the tab's prompt and selection state at discovery run start.
     /// This prevents tab bleed when user switches tabs during a run.
     private func captureRunStartState(for session: TabSession) {
-        // Capture context builder prompt IDs from the viewmodel (current UI state)
-        session.runStartContextBuilderPromptIDs = selectedContextBuilderPromptIDs
-
-        // First try: workspace snapshot (most reliable source)
-        if session.tabID == currentTabID {
+        let capturedContextBuilderPromptIDs = selectedContextBuilderPromptIDs
+        let isCurrentTab = session.tabID == currentTabID
+        if isCurrentTab {
             workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
         }
-        if let snapshot = workspaceManager?.composeTab(with: session.tabID) {
-            session.runStartPromptText = snapshot.promptText
-            session.runStartSelection = snapshot.selection
+        let workspaceSnapshot = workspaceManager?.composeTab(with: session.tabID)
+        Self.captureRunStartState(
+            for: session,
+            selectedContextBuilderPromptIDs: capturedContextBuilderPromptIDs,
+            workspaceSnapshot: workspaceSnapshot,
+            isCurrentTab: isCurrentTab,
+            livePromptText: { self.promptManager.promptText }
+        )
+
+        if workspaceSnapshot != nil {
             debugLog("Captured run-start state from workspace snapshot for tab=\(session.tabID)")
+        } else if isCurrentTab {
+            debugLog("Captured run-start prompt from live UI for tab=\(session.tabID); compose selection snapshot unavailable")
+        } else {
+            debugLog("WARNING: No snapshot and tab not active; run may have stale context")
+        }
+    }
+
+    static func captureRunStartState(
+        for session: TabSession,
+        selectedContextBuilderPromptIDs: Set<UUID>,
+        workspaceSnapshot: ComposeTabState?,
+        isCurrentTab: Bool,
+        livePromptText: () -> String
+    ) {
+        session.runStartContextBuilderPromptIDs = selectedContextBuilderPromptIDs
+
+        if let workspaceSnapshot {
+            session.runStartPromptText = workspaceSnapshot.promptText
+            session.runStartSelection = workspaceSnapshot.selection
             return
         }
 
-        // Fallback: Only use live UI if this is still the active tab
-        // (safe because we haven't yielded yet, so no tab switch could have occurred)
-        guard session.tabID == currentTabID else {
-            debugLog("WARNING: No snapshot and tab not active; run may have stale context")
+        guard isCurrentTab else {
             session.runStartPromptText = ""
             session.runStartSelection = StoredSelection()
             return
         }
 
-        // Capture from live UI prompt text with an empty selection if no compose snapshot exists.
-        session.runStartPromptText = promptManager.promptText
+        session.runStartPromptText = livePromptText()
         session.runStartSelection = StoredSelection()
-        debugLog("Captured run-start prompt from live UI for tab=\(session.tabID); compose selection snapshot unavailable")
     }
 
     /// Clears the captured run-start state after a run completes or is cancelled.

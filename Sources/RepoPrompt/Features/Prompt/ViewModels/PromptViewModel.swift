@@ -1,17 +1,7 @@
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
-
-enum FileTreeOption: String, CaseIterable, Identifiable, Codable {
-    case auto = "Auto"
-    case files = "Full"
-    case selected = "Selected"
-    case none = "None"
-
-    var id: String {
-        rawValue
-    }
-}
 
 /// Errors that can occur when publishing git diff artifacts
 enum GitArtifactPublishError: LocalizedError {
@@ -1095,97 +1085,53 @@ class PromptViewModel: ObservableObject {
     @Published private var isApplyingPresetOverrides = false
     private var isApplyingChatPreset = false
 
-    struct ChatPromptEntriesCacheKey: Hashable {
+    struct ChatPromptEntriesCacheKey: Equatable {
+        let selection: StoredSelection
         let codeMapUsage: CodeMapUsage
+        let filePathDisplay: FilePathDisplay
         let selectionVersion: UInt64
         let slicesVersion: UInt64
         let autoCodemapVersion: UInt64
         let fileAPIsVersion: UInt64
     }
 
-    private struct ChatPresetTokenBaselineKey: Equatable {
-        let id: UUID
-        let mode: ChatPresetMode
-        let modelPresetName: String?
-        let fileTreeMode: FileTreeOption?
-        let codeMapUsage: CodeMapUsage?
-        let gitInclusion: GitInclusion?
-        let storedPromptIds: [UUID]
-        let useStoredPromptsAsSystem: Bool
+    struct PackagedPromptResult {
+        let message: AIMessage
+        let exactPayload: PromptPackagingService.ExactRenderedPayload
     }
 
-    private struct PromptContextTokenBaselineKey: Equatable {
+    private struct ClipboardPackagingRequest {
+        let config: PromptContextResolved
+        let selection: StoredSelection
+        let promptText: String
+        let metaInstructions: [MetaInstruction]
+        let includeSavedPrompts: Bool
         let includeFiles: Bool
         let includeUserPrompt: Bool
-        let includeMetaPrompts: Bool
-        let includeFileTree: Bool
-        let fileTreeMode: FileTreeOption
-        let codeMapUsage: CodeMapUsage
-        let gitInclusion: GitInclusion
-        let storedPromptIds: [UUID]
-    }
-
-    private struct StoredPromptTokenBaselineKey: Equatable {
-        let id: UUID
-        let title: String
-        let content: String
-        let isUserEdited: Bool
-    }
-
-    private struct RootTokenBaselineKey: Equatable {
-        let id: UUID
-        let fullPath: String
-        let name: String
-        let isSystemRoot: Bool
-    }
-
-    private struct ChatContextTokenBaselineCacheKey: Equatable {
-        let workspaceID: UUID?
-        let selectedChatPresetID: UUID?
-        let chatPreset: ChatPresetTokenBaselineKey
-        let resolvedContext: PromptContextTokenBaselineKey
-        let fileTreeOptionForChat: FileTreeOption
-        let codeMapUsageForChat: CodeMapUsage
-        let gitDiffInclusionModeForChat: GitDiffInclusionMode
-        let codeMapsGloballyDisabled: Bool
-        let filePathDisplayOption: FilePathDisplay
-        let selectedFilesSortMethod: SortMethod
-        let fileTreeSortMethod: SortMethod
+        let includeLocalDefinitionsInFileTree: Bool
+        let filePathDisplay: FilePathDisplay
         let onlyIncludeRootsWithSelectedFiles: Bool
+        let showCodeMapMarkers: Bool
         let includeDatetimeInUserInstructions: Bool
         let promptSectionsOrder: [PromptSection]
-        let disabledPromptSections: [PromptSection]
+        let disabledPromptSections: Set<PromptSection>
         let duplicateUserInstructionsAtTop: Bool
-        let selectedPromptIDsForChat: [UUID]
-        let hasManualChatPromptSelection: Bool
-        let storedPrompts: [StoredPromptTokenBaselineKey]
-        let hierarchyGenerationSignature: UInt64
-        let rootOrder: [RootTokenBaselineKey]
-        let selectionVersion: UInt64
-        let slicesVersion: UInt64
-        let autoCodemapVersion: UInt64
-        let fileAPIsVersion: UInt64
-        let fileSystemDeltaVersion: UInt64
+        let tabTitle: String?
+        let renderingDate: Date
     }
 
-    private struct ChatContextTokenBaselineCache {
-        let key: ChatContextTokenBaselineCacheKey
-        let baseTokensWithoutPromptText: Int
-        /// The base token value only safely supports prompt deltas if it was derived
-        /// from a payload that actually contained a user-instructions prompt block.
-        let supportsPromptTextDeltas: Bool
-        /// Exact value for the empty-prompt shape when the cold miss observed it.
-        let emptyPromptTokenCount: Int?
-    }
-
-    var chatPromptEntriesCache: (key: ChatPromptEntriesCacheKey, entries: [PromptFileEntry])?
-    var chatCodemapFileAPIs: [FileAPI] = []
+    var chatPromptEntriesCache: (
+        key: ChatPromptEntriesCacheKey,
+        projection: WorkspacePromptProjectionAdapter.Projection,
+        entries: [PromptFileEntry]
+    )?
+    var chatPromptEntriesProjectionTask: Task<Void, Never>?
+    var chatPromptEntriesProjectionKey: ChatPromptEntriesCacheKey?
+    var chatPromptEntriesProjectionGeneration: UInt64 = 0
     var chatSelectionVersion: UInt64 = 0
     var chatSlicesVersion: UInt64 = 0
     var chatAutoCodemapVersion: UInt64 = 0
     var chatFileAPIsVersion: UInt64 = 0
-    private var chatFileSystemDeltaVersion: UInt64 = 0
-    private var chatContextTokenBaselineCache: ChatContextTokenBaselineCache?
 
     // MARK: - Computed Properties for Token Counting (Legacy Support)
 
@@ -2135,20 +2081,17 @@ class PromptViewModel: ObservableObject {
                 self?.tokenCountingViewModel.markDirty(.codeMap)
                 self?.workspaceManager?.markWorkspaceDirty()
                 self?.updateActiveTabDirtyState()
-                self?.refreshChatCodemapFileAPIsFromStore()
+                self?.bumpChatPromptEntriesFileAPIsVersion()
             }
             .store(in: &cancellables)
-
-        refreshChatCodemapFileAPIsFromStore()
 
         fileManager.fileSystemDeltasAppliedPublisher
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                // File content changes alter full-file prompt blocks even when selection and topology are unchanged.
-                // Track them in the cache key so an in-flight cold rebuild cannot re-store stale content.
+                // File changes can replace live view models even when selection is unchanged.
+                // Invalidate and cancel so an in-flight projection cannot publish stale identities.
                 guard let self else { return }
-                chatFileSystemDeltaVersion &+= 1
-                chatContextTokenBaselineCache = nil
+                invalidateChatPromptEntriesCache()
             }
             .store(in: &cancellables)
 
@@ -2207,8 +2150,11 @@ class PromptViewModel: ObservableObject {
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
+        chatPromptEntriesProjectionGeneration &+= 1
+        chatPromptEntriesProjectionTask?.cancel()
+        chatPromptEntriesProjectionTask = nil
+        chatPromptEntriesProjectionKey = nil
         chatPromptEntriesCache = nil
-        chatContextTokenBaselineCache = nil
     }
 
     private func bumpChatPromptEntriesSelectionVersion() {
@@ -2229,18 +2175,6 @@ class PromptViewModel: ObservableObject {
     private func bumpChatPromptEntriesFileAPIsVersion() {
         chatFileAPIsVersion &+= 1
         invalidateChatPromptEntriesCache()
-    }
-
-    private func refreshChatCodemapFileAPIsFromStore() {
-        Task { [weak self] in
-            guard let self else { return }
-            let apis = await workspaceFileContextStore.allCodemapFileAPIs()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                chatCodemapFileAPIs = apis
-                bumpChatPromptEntriesFileAPIsVersion()
-            }
-        }
     }
 
     // MARK: - Compose Tab Management
@@ -2327,17 +2261,17 @@ class PromptViewModel: ObservableObject {
         in manager: WorkspaceManagerViewModel,
         workspaceIndex index: Int
     ) {
-        guard
-            let activeID = manager.workspaces[index].activeComposeTabID,
-            let activeIdx = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == activeID })
-        else { return }
+        guard manager.workspaces.indices.contains(index) else { return }
+        let workspace = manager.workspaces[index]
+        guard let activeID = workspace.activeComposeTabID,
+              let activeTab = workspace.composeTabs.first(where: { $0.id == activeID }) else { return }
 
-        let currentName = manager.workspaces[index].composeTabs[activeIdx].name
-        let snapshot = manager.collectComposeTabSnapshot(
-            name: currentName,
-            base: manager.workspaces[index].composeTabs[activeIdx]
-        )
-        manager.workspaces[index].composeTabs[activeIdx] = snapshot
+        let snapshot = manager.collectComposeTabSnapshot(name: activeTab.name, base: activeTab)
+        manager.mutateComposeTab(
+            workspaceID: workspace.id,
+            tabID: activeID,
+            touchDateModified: false
+        ) { $0 = snapshot }
     }
 
     /// Flush pending editor state and snapshot the active tab before transitioning away.
@@ -2522,14 +2456,14 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        manager.workspaces[index].composeTabs.append(newTab)
-        manager.workspaces[index].activeComposeTabID = newTab.id
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, { workspace in
+            workspace.composeTabs.append(newTab)
+            workspace.activeComposeTabID = newTab.id
+        }) else { return }
         activeComposeTabID = newTab.id
         dirtyTabIDs.remove(newTab.id)
 
-        manager.markWorkspaceDirty()
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         await withComposeTabSwitching(targetTabID: newTab.id) {
             await manager.applyComposeTabState(newTab)
         }
@@ -2616,12 +2550,11 @@ class PromptViewModel: ObservableObject {
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
 
-        // Append but do NOT change activeComposeTabID
-        manager.workspaces[index].composeTabs.append(newTab)
-        // Keep existing active tab; just sync lists
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-
-        manager.markWorkspaceDirty()
+        // Append but do NOT change activeComposeTabID.
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.composeTabs.append(newTab)
+        }) else { return nil }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
         return newTab
     }
@@ -2639,11 +2572,12 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
-        manager.workspaces[index].activeComposeTabID = id
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.activeComposeTabID = id
+        }), let target = updatedWorkspace.composeTabs.first(where: { $0.id == id }) else { return }
         activeComposeTabID = id
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
 
         activeTabApplyTask?.cancel()
 
@@ -2663,14 +2597,13 @@ class PromptViewModel: ObservableObject {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty,
               let manager = workspaceManager,
-              let workspace = manager.activeWorkspace,
-              let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-              let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == id }) else { return }
-        manager.workspaces[index].composeTabs[tabIndex].name = trimmed
-        manager.workspaces[index].composeTabs[tabIndex].lastModified = Date()
-        manager.markWorkspaceDirty()
+              let workspace = manager.activeWorkspace else { return }
+        guard manager.mutateComposeTab(workspaceID: workspace.id, tabID: id, {
+            $0.name = trimmed
+            $0.lastModified = Date()
+        }) != nil, let updatedWorkspace = manager.workspace(withID: workspace.id) else { return }
         manager.pollAndSaveState()
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
     }
 
     @MainActor
@@ -2715,16 +2648,12 @@ class PromptViewModel: ObservableObject {
         reason: ComposeTabRemovalReason = .close,
         expandCascade: Bool = true
     ) async {
-        guard !ids.isEmpty else { return }
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard !ids.isEmpty,
+              let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace
         else { return }
+        let workspaceID = initialWorkspace.id
 
-        var tabs = manager.workspaces[index].composeTabs
-        let tabsBeforeClose = tabs
-        let originalCount = tabs.count
         var resolvedIDs = ids
         var stashedTabIDsToDelete: Set<UUID> = []
         if expandCascade, let composeTabCascadeResolver {
@@ -2735,8 +2664,9 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Identify which tabs will actually be removed
-        let tabsBeingClosed = resolvedIDs.intersection(Set(tabs.map(\.id)))
+        guard let workspaceBeforeClose = manager.workspace(withID: workspaceID) else { return }
+        let tabsBeforeClose = workspaceBeforeClose.composeTabs
+        let tabsBeingClosed = resolvedIDs.intersection(Set(tabsBeforeClose.map(\.id)))
         guard !tabsBeingClosed.isEmpty else {
             if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
                 await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
@@ -2744,13 +2674,6 @@ class PromptViewModel: ObservableObject {
             return
         }
 
-        let fallbackActiveID: UUID? = {
-            guard let previousActiveID = manager.workspaces[index].activeComposeTabID,
-                  tabsBeingClosed.contains(previousActiveID) else { return nil }
-            return adjacentTabID(afterClosing: previousActiveID, tabs: tabsBeforeClose, closingIDs: tabsBeingClosed)
-        }()
-
-        // Notify listeners BEFORE mutation so they can cancel running tasks
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
         #if DEBUG
@@ -2762,63 +2685,53 @@ class PromptViewModel: ObservableObject {
                 )
             }
         #endif
-
         if reason == .close {
             deleteGitDataForClosingTabs(tabIDs: tabsBeingClosed)
         }
 
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+        let refreshedTabs = refreshedWorkspace.composeTabs
+        let actualClosingIDs = resolvedIDs.intersection(Set(refreshedTabs.map(\.id)))
+        guard !actualClosingIDs.isEmpty else { return }
+        let previousActiveID = refreshedWorkspace.activeComposeTabID
+        let fallbackActiveID: UUID? = {
+            guard let previousActiveID, actualClosingIDs.contains(previousActiveID) else { return nil }
+            return adjacentTabID(
+                afterClosing: previousActiveID,
+                tabs: refreshedTabs,
+                closingIDs: actualClosingIDs
+            )
+        }()
+
+        var tabs = refreshedTabs.filter { !actualClosingIDs.contains($0.id) }
+        var stashedTabs = refreshedWorkspace.stashedTabs
         if reason == .stash {
-            let refreshedTabs = manager.workspaces[index].composeTabs
-            for tabID in tabsBeingClosed {
-                guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
-                let stashedTab = StashedTab(tab: refreshedTab)
-                if let existingIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
-                    manager.workspaces[index].stashedTabs[existingIndex] = stashedTab
+            for tab in refreshedTabs where actualClosingIDs.contains(tab.id) {
+                let stashed = StashedTab(tab: tab)
+                if let index = stashedTabs.firstIndex(where: { $0.tab.id == tab.id }) {
+                    stashedTabs[index] = stashed
                 } else {
-                    manager.workspaces[index].stashedTabs.append(stashedTab)
+                    stashedTabs.append(stashed)
                 }
             }
-            tabs = refreshedTabs
         }
-
-        tabs.removeAll { resolvedIDs.contains($0.id) }
-        guard tabs.count != originalCount else {
-            if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
-                await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
-            }
-            return
-        }
-
-        dirtyTabIDs.subtract(resolvedIDs)
-
-        let previousActiveID = manager.workspaces[index].activeComposeTabID
-        manager.workspaces[index].composeTabs = tabs
-
-        if tabs.isEmpty {
-            manager.workspaces[index].activeComposeTabID = nil
-            await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-            loadComposeTabsFromWorkspace(manager.workspaces[index])
-            #if DEBUG
-                for tabID in tabsBeingClosed {
-                    AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
-                        tabID: tabID,
-                        source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
-                        fields: ["reason": String(describing: reason)]
-                    )
-                }
-            #endif
-            manager.markWorkspaceDirty()
-            manager.pollAndSaveState()
-            if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
-                await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
-            }
-            return
-        }
+        dirtyTabIDs.subtract(actualClosingIDs)
 
         var newActiveID = previousActiveID
-        if let preferred = preferredActiveID, tabs.contains(where: { $0.id == preferred }) {
-            newActiveID = preferred
-        } else if let previousActiveID, resolvedIDs.contains(previousActiveID) {
+        if tabs.isEmpty {
+            guard let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                  let blankTab = makeComposeTab(
+                      for: .blank,
+                      explicitName: nil,
+                      workspaceIndex: workspaceIndex,
+                      manager: manager
+                  ) else { return }
+            tabs = [blankTab]
+            newActiveID = blankTab.id
+            dirtyTabIDs.remove(blankTab.id)
+        } else if let preferredActiveID, tabs.contains(where: { $0.id == preferredActiveID }) {
+            newActiveID = preferredActiveID
+        } else if let previousActiveID, actualClosingIDs.contains(previousActiveID) {
             if let fallbackActiveID, tabs.contains(where: { $0.id == fallbackActiveID }) {
                 newActiveID = fallbackActiveID
             } else {
@@ -2828,21 +2741,24 @@ class PromptViewModel: ObservableObject {
             newActiveID = tabs.first?.id
         }
 
-        manager.workspaces[index].activeComposeTabID = newActiveID
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.composeTabs = tabs
+            workspace.stashedTabs = stashedTabs
+            workspace.activeComposeTabID = newActiveID
+        }) else { return }
         activeComposeTabID = newActiveID
 
-        if newActiveID != previousActiveID,
-           let newActiveID,
+        if let newActiveID,
+           newActiveID != previousActiveID,
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
             await withComposeTabSwitching(targetTabID: newActiveID) {
                 await manager.applyComposeTabState(tab)
             }
         }
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         #if DEBUG
-            for tabID in tabsBeingClosed {
+            for tabID in actualClosingIDs {
                 AgentModePerfDiagnostics.markSidebarDeleteVisibleRemoved(
                     tabID: tabID,
                     source: "PromptViewModel.closeComposeTabs.currentComposeTabs",
@@ -2850,7 +2766,6 @@ class PromptViewModel: ObservableObject {
                 )
             }
         #endif
-        manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         if reason == .close, expandCascade, !stashedTabIDsToDelete.isEmpty {
             await deleteStashedTabs(withIDs: stashedTabIDsToDelete, expandCascade: false)
@@ -2885,27 +2800,6 @@ class PromptViewModel: ObservableObject {
         return nil
     }
 
-    @MainActor
-    private func appendReplacementBlankComposeTabIfNeeded(
-        manager: WorkspaceManagerViewModel,
-        workspaceIndex: Int
-    ) async {
-        guard manager.workspaces[workspaceIndex].composeTabs.isEmpty else { return }
-        guard let blankTab = makeComposeTab(
-            for: .blank,
-            explicitName: nil,
-            workspaceIndex: workspaceIndex,
-            manager: manager
-        ) else { return }
-        manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
-        activeComposeTabID = blankTab.id
-        dirtyTabIDs.remove(blankTab.id)
-        await withComposeTabSwitching(targetTabID: blankTab.id) {
-            await manager.applyComposeTabState(blankTab)
-        }
-    }
-
     /// Deletes git diff snapshots associated with closing tabs (fire-and-forget to avoid UI blocking).
     /// Uses a single batch scan instead of per-tab scans for efficiency.
     @MainActor
@@ -2937,9 +2831,10 @@ class PromptViewModel: ObservableObject {
         let clamped = max(0, min(destinationIndex, tabs.count - 1))
         let item = tabs.remove(at: sourceIndex)
         tabs.insert(item, at: clamped)
-        manager.workspaces[index].composeTabs = tabs
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspace.id, {
+            $0.composeTabs = tabs
+        }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3096,48 +2991,41 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     func unstashTab(_ stashedTabID: UUID) async {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace,
+              initialWorkspace.stashedTabs.contains(where: { $0.id == stashedTabID }),
+              let initialIndex = manager.workspaces.firstIndex(where: { $0.id == initialWorkspace.id })
         else { return }
-
-        // Find the stashed tab
-        guard let stashIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.id == stashedTabID }) else { return }
+        let workspaceID = initialWorkspace.id
 
         guard await ensureCapacityForNewComposeTab(
             in: manager,
-            workspaceIndex: index,
+            workspaceIndex: initialIndex,
             policy: .uiInteractive,
-            excluding: manager.workspaces[index].activeComposeTabID
+            excluding: initialWorkspace.activeComposeTabID
         ) else { return }
+        guard let refreshedIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }) else { return }
+        flushAndSnapshotActiveTab(in: manager, workspaceIndex: refreshedIndex)
 
-        // Flush and snapshot current state before switching
-        flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
-
-        let stashedTab = manager.workspaces[index].stashedTabs[stashIndex]
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID),
+              let stashedTab = refreshedWorkspace.stashedTabs.first(where: { $0.id == stashedTabID })
+        else { return }
         var restoredTab = stashedTab.tab
-        guard !manager.workspaces[index].composeTabs.contains(where: { $0.id == restoredTab.id }) else {
-            return
-        }
+        guard !refreshedWorkspace.composeTabs.contains(where: { $0.id == restoredTab.id }) else { return }
         restoredTab.lastModified = Date()
 
-        // Remove from stashed tabs
-        manager.workspaces[index].stashedTabs.remove(at: stashIndex)
-
-        // Add to compose tabs
-        manager.workspaces[index].composeTabs.append(restoredTab)
-        manager.workspaces[index].activeComposeTabID = restoredTab.id
-        manager.workspaces[index].dateModified = Date()
-
-        // Reload state
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        currentStashedTabs = manager.workspaces[index].stashedTabs
-
-        // Switch to the restored tab
-        await switchComposeTab(restoredTab.id)
-
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.stashedTabs.removeAll { $0.id == stashedTabID }
+            workspace.composeTabs.append(restoredTab)
+            workspace.activeComposeTabID = restoredTab.id
+        }) else { return }
+        activeComposeTabID = restoredTab.id
+        dirtyTabIDs.remove(restoredTab.id)
+        loadComposeTabsFromWorkspace(updatedWorkspace)
+        currentStashedTabs = updatedWorkspace.stashedTabs
+        await withComposeTabSwitching(targetTabID: restoredTab.id) {
+            await manager.applyComposeTabState(restoredTab)
+        }
         manager.pollAndSaveState()
     }
 
@@ -3153,12 +3041,11 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     private func deleteStashedTabs(withIDs stashedTabIDs: Set<UUID>, expandCascade: Bool) async {
-        guard !stashedTabIDs.isEmpty else { return }
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
+        guard !stashedTabIDs.isEmpty,
+              let manager = workspaceManager,
+              let initialWorkspace = manager.activeWorkspace
         else { return }
+        let workspaceID = initialWorkspace.id
 
         var resolvedStashedTabIDs = stashedTabIDs
         var composeTabIDsToDelete: Set<UUID> = []
@@ -3167,71 +3054,80 @@ class PromptViewModel: ObservableObject {
             resolvedStashedTabIDs.formUnion(cascadePlan.stashedTabIDs)
             composeTabIDsToDelete.formUnion(cascadePlan.composeTabIDs)
         }
-        if !composeTabIDsToDelete.isEmpty {
-            let composeTabsBeforeDelete = manager.workspaces[index].composeTabs
-            let composeTabIDsBeingDeleted = composeTabIDsToDelete.intersection(Set(composeTabsBeforeDelete.map(\.id)))
+
+        if !composeTabIDsToDelete.isEmpty,
+           let workspaceBeforeDelete = manager.workspace(withID: workspaceID)
+        {
+            let tabsBeforeDelete = workspaceBeforeDelete.composeTabs
+            let composeTabIDsBeingDeleted = composeTabIDsToDelete.intersection(Set(tabsBeforeDelete.map(\.id)))
             if !composeTabIDsBeingDeleted.isEmpty {
-                let previousActiveID = manager.workspaces[index].activeComposeTabID
-                let fallbackActiveID: UUID? = {
-                    guard let previousActiveID,
-                          composeTabIDsBeingDeleted.contains(previousActiveID)
-                    else {
-                        return nil
-                    }
-                    return adjacentTabID(
-                        afterClosing: previousActiveID,
-                        tabs: composeTabsBeforeDelete,
-                        closingIDs: composeTabIDsBeingDeleted
-                    )
-                }()
                 await notifyComposeTabsWillClose(composeTabIDsBeingDeleted, reason: .close)
                 await cleanupMCPStateForClosingTabs(composeTabIDsBeingDeleted)
                 deleteGitDataForClosingTabs(tabIDs: composeTabIDsBeingDeleted)
-                var remainingComposeTabs = composeTabsBeforeDelete
-                remainingComposeTabs.removeAll { composeTabIDsBeingDeleted.contains($0.id) }
-                dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
-                manager.workspaces[index].composeTabs = remainingComposeTabs
-                if remainingComposeTabs.isEmpty {
-                    manager.workspaces[index].activeComposeTabID = nil
-                    await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
-                } else {
-                    var newActiveID = previousActiveID
-                    if let previousActiveID,
-                       composeTabIDsBeingDeleted.contains(previousActiveID)
-                    {
-                        if let fallbackActiveID,
-                           remainingComposeTabs.contains(where: { $0.id == fallbackActiveID })
-                        {
-                            newActiveID = fallbackActiveID
-                        } else {
-                            newActiveID = remainingComposeTabs.last?.id ?? remainingComposeTabs.first?.id
-                        }
-                    } else if newActiveID == nil {
-                        newActiveID = remainingComposeTabs.first?.id
+
+                guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+                let actualIDs = composeTabIDsToDelete.intersection(Set(refreshedWorkspace.composeTabs.map(\.id)))
+                let previousActiveID = refreshedWorkspace.activeComposeTabID
+                let fallbackActiveID = previousActiveID.flatMap { activeID in
+                    actualIDs.contains(activeID)
+                        ? adjacentTabID(afterClosing: activeID, tabs: refreshedWorkspace.composeTabs, closingIDs: actualIDs)
+                        : nil
+                }
+                var remainingTabs = refreshedWorkspace.composeTabs.filter { !actualIDs.contains($0.id) }
+                dirtyTabIDs.subtract(actualIDs)
+                var newActiveID = previousActiveID
+                if remainingTabs.isEmpty {
+                    guard let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspaceID }),
+                          let blankTab = makeComposeTab(
+                              for: .blank,
+                              explicitName: nil,
+                              workspaceIndex: workspaceIndex,
+                              manager: manager
+                          ) else { return }
+                    remainingTabs = [blankTab]
+                    newActiveID = blankTab.id
+                    dirtyTabIDs.remove(blankTab.id)
+                } else if let previousActiveID, actualIDs.contains(previousActiveID) {
+                    if let fallbackActiveID, remainingTabs.contains(where: { $0.id == fallbackActiveID }) {
+                        newActiveID = fallbackActiveID
+                    } else {
+                        newActiveID = remainingTabs.last?.id ?? remainingTabs.first?.id
                     }
-                    manager.workspaces[index].activeComposeTabID = newActiveID
-                    activeComposeTabID = newActiveID
-                    if newActiveID != previousActiveID,
-                       let newActiveID,
-                       let tab = remainingComposeTabs.first(where: { $0.id == newActiveID })
-                    {
-                        await withComposeTabSwitching(targetTabID: newActiveID) {
-                            await manager.applyComposeTabState(tab)
-                        }
+                } else if newActiveID == nil {
+                    newActiveID = remainingTabs.first?.id
+                }
+                guard manager.mutateWorkspace(id: workspaceID, { workspace in
+                    workspace.composeTabs = remainingTabs
+                    workspace.activeComposeTabID = newActiveID
+                }) != nil else { return }
+                activeComposeTabID = newActiveID
+                if let newActiveID,
+                   newActiveID != previousActiveID,
+                   let tab = remainingTabs.first(where: { $0.id == newActiveID })
+                {
+                    await withComposeTabSwitching(targetTabID: newActiveID) {
+                        await manager.applyComposeTabState(tab)
                     }
                 }
             }
         }
 
-        let stashedTabsToDelete = manager.workspaces[index].stashedTabs.filter { resolvedStashedTabIDs.contains($0.id) }
-        guard !stashedTabsToDelete.isEmpty else { return }
-
+        guard let refreshedWorkspace = manager.workspace(withID: workspaceID) else { return }
+        let stashedTabsToDelete = refreshedWorkspace.stashedTabs.filter { resolvedStashedTabIDs.contains($0.id) }
+        guard !stashedTabsToDelete.isEmpty else {
+            if let updatedWorkspace = manager.workspace(withID: workspaceID) {
+                loadComposeTabsFromWorkspace(updatedWorkspace)
+                manager.pollAndSaveState()
+            }
+            return
+        }
         let tabIDs = Set(stashedTabsToDelete.map(\.tab.id))
         await notifyComposeTabsWillClose(tabIDs, reason: .deleteStashed)
         deleteGitDataForClosingTabs(tabIDs: tabIDs)
-        manager.workspaces[index].stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.mutateWorkspace(id: workspaceID, { workspace in
+            workspace.stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
+        }) else { return }
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3265,17 +3161,14 @@ class PromptViewModel: ObservableObject {
 
     @MainActor
     func setComposeTabPinned(_ pinned: Bool, for tabID: UUID) {
-        guard
-            let manager = workspaceManager,
-            let workspace = manager.activeWorkspace,
-            let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
-            let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == tabID })
-        else { return }
-        guard manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { return }
+        guard let manager = workspaceManager,
+              let workspace = manager.activeWorkspace,
+              workspace.composeTabs.first(where: { $0.id == tabID })?.isPinned != pinned else { return }
+        guard manager.mutateComposeTab(workspaceID: workspace.id, tabID: tabID, {
+            $0.isPinned = pinned
+        }) != nil, let updatedWorkspace = manager.workspace(withID: workspace.id) else { return }
 
-        manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        manager.markWorkspaceDirty()
+        loadComposeTabsFromWorkspace(updatedWorkspace)
         manager.pollAndSaveState()
     }
 
@@ -3320,18 +3213,12 @@ class PromptViewModel: ObservableObject {
     func applyContextBuilderOverrides(_ overrides: ContextBuilderOverrides) async {
         guard let manager = workspaceManager,
               let workspace = manager.activeWorkspace,
-              let workspaceIndex = manager.workspaces.firstIndex(where: { $0.id == workspace.id }) else { return }
-        let activeTabID = manager.workspaces[workspaceIndex].activeComposeTabID ?? manager.workspaces[workspaceIndex].composeTabs.first?.id
-        guard
-            let tabID = activeTabID,
-            let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tabID })
+              let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id,
+              workspace.composeTabs.first(where: { $0.id == tabID })?.contextOverrides != overrides
         else { return }
-
-        guard manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides != overrides else { return }
-
-        manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides = overrides
-        manager.workspaces[workspaceIndex].dateModified = Date()
-        manager.markWorkspaceDirty()
+        manager.mutateComposeTab(workspaceID: workspace.id, tabID: tabID) {
+            $0.contextOverrides = overrides
+        }
     }
 
     @MainActor
@@ -3359,15 +3246,18 @@ class PromptViewModel: ObservableObject {
 
         await manager.createPreset(for: workspace, name: tab.name)
 
-        guard let presetIndex = manager.workspaces[index].presets.firstIndex(where: { $0.id == manager.workspaces[index].activePresetID }) else { return }
-        manager.workspaces[index].presets[presetIndex].capturesFileSelection = true
-        manager.workspaces[index].presets[presetIndex].capturesFileTreeExpansion = true
-        manager.workspaces[index].presets[presetIndex].capturesSelectedPrompts = true
-        manager.workspaces[index].presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
-        manager.workspaces[index].presets[presetIndex].expandedFolders = tab.expandedFolders
-        manager.workspaces[index].presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
-        manager.workspaces[index].presets[presetIndex].lastUpdated = Date()
-        manager.markWorkspaceDirty()
+        guard let updatedWorkspace = manager.workspace(withID: workspace.id),
+              let activePresetID = updatedWorkspace.activePresetID else { return }
+        manager.mutateWorkspace(id: workspace.id) { workspace in
+            guard let presetIndex = workspace.presets.firstIndex(where: { $0.id == activePresetID }) else { return }
+            workspace.presets[presetIndex].capturesFileSelection = true
+            workspace.presets[presetIndex].capturesFileTreeExpansion = true
+            workspace.presets[presetIndex].capturesSelectedPrompts = true
+            workspace.presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
+            workspace.presets[presetIndex].expandedFolders = tab.expandedFolders
+            workspace.presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
+            workspace.presets[presetIndex].lastUpdated = Date()
+        }
         manager.pollAndSaveState()
     }
 
@@ -3882,6 +3772,10 @@ class PromptViewModel: ObservableObject {
         return workspaceManager.composeTab(with: activeTabID)?.selection
     }
 
+    func activeComposeTabStoredSelectionForPromptProjection() -> StoredSelection {
+        activeComposeTabStoredSelectionSnapshot() ?? StoredSelection()
+    }
+
     private func legacyRFMSnapshotSelectionForPromptPackaging() -> StoredSelection {
         // Legacy/test-only fallback for PromptViewModel instances that are not bound
         // to a WorkspaceManager/compose tab. Normal active copy/chat packaging reads
@@ -3930,11 +3824,6 @@ class PromptViewModel: ObservableObject {
         }
     }
 
-    private func estimateTokens(for text: String) -> Int {
-        // This is a simple estimation. For more accurate results, you might want to use a proper tokenizer.
-        Int(Double(text.count) / 4.0)
-    }
-
     // MARK: - Prompt Section Order Methods
 
     static func resolvedPromptSectionOrder(raw: String) -> [PromptSection] {
@@ -3966,62 +3855,11 @@ class PromptViewModel: ObservableObject {
     // MARK: - Clipboard Operations
 
     func copyToClipboard() {
-        _ = true
-        // Capture all necessary properties before Task to minimize actor hopping
-        let promptContext = resolvePromptContext()
-        let selectionSnapshot = activeComposeTabStoredSelectionForPromptPackaging()
-        let metaInstructions = metaInstructions
-        let promptText = promptText
-        let filePathDisplayOption = filePathDisplayOption
-        let includeSavedPrompts = includeSavedPromptsInClipboard
-        let includeUserPrompt = includeUserPromptInClipboard
-        let includeDatetime = includeDatetimeInUserInstructions
-        let promptSectionsOrder = promptSectionsOrder
-        let disabledPromptSections = disabledPromptSections
-        let duplicateUserInstructions = duplicateUserInstructionsAtTop
-        let includeFilesInClipboard = includeFilesInClipboard
-
-        // NEW: Determine active compose tab title (fallback to empty if unavailable)
-        let tabTitleForClipboard: String = {
-            if let tabID = self.activeComposeTabID,
-               let snapshot = self.workspaceManager?.composeTabSnapshot(for: tabID)
-            {
-                return snapshot.name
-            }
-            return ""
-        }()
-
+        let request = currentClipboardPackagingRequest()
         Task {
-            let preAssembly = await self.preAssemblePromptContext(
-                cfg: promptContext,
-                selection: selectionSnapshot,
-                lookupContext: self.allLoadedWorkspaceLookupContext()
-            )
-            let includeFiles = includeFilesInClipboard && !preAssembly.entries.isEmpty
-
-            // Use captured values inside the Task
-            let clipboardContent = await PromptPackagingService.generateClipboardContent(
-                metaInstructions: metaInstructions,
-                userInstructions: promptText,
-                files: preAssembly.entries,
-                fileTreeContent: preAssembly.fileTreeContent,
-                gitDiff: preAssembly.gitDiff,
-                includeSavedPrompts: includeSavedPrompts,
-                includeFiles: includeFiles,
-                includeUserPrompt: includeUserPrompt,
-                filePathDisplay: filePathDisplayOption,
-                codemapSnapshots: preAssembly.codemapSnapshots,
-                includeDatetimeInUserInstructions: includeDatetime,
-                promptSectionsOrder: promptSectionsOrder,
-                disabledPromptSections: disabledPromptSections,
-                duplicateUserInstructionsAtTop: duplicateUserInstructions,
-                tabTitle: tabTitleForClipboard
-            )
-
-            await MainActor.run {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(clipboardContent, forType: .string)
-            }
+            let payload = await buildClipboardPayload(for: request, source: .activeLive)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(payload.text, forType: .string)
         }
     }
 
@@ -4758,6 +4596,44 @@ class PromptViewModel: ObservableObject {
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil
     ) async -> AIMessage {
+        let source: TokenProjection.Source = if overridePromptConfig == nil,
+                                                overrideChatPreset == nil,
+                                                overrideMode == nil,
+                                                gitInclusionOverride == nil,
+                                                gitBaseOverride == nil,
+                                                selectionOverride == nil,
+                                                lookupContextOverride == nil
+        {
+            .activeLive
+        } else {
+            .virtualRecomputed
+        }
+        return await packagePromptResult(
+            conversation: conversation,
+            overrideModel: overrideModel,
+            overridePromptConfig: overridePromptConfig,
+            overrideChatPreset: overrideChatPreset,
+            overrideMode: overrideMode,
+            gitInclusionOverride: gitInclusionOverride,
+            gitBaseOverride: gitBaseOverride,
+            selectionOverride: selectionOverride,
+            lookupContextOverride: lookupContextOverride,
+            tokenSource: source
+        ).message
+    }
+
+    func packagePromptResult(
+        conversation: [ConversationEntry],
+        overrideModel: AIModel? = nil,
+        overridePromptConfig: PromptContextResolved? = nil,
+        overrideChatPreset: ChatPreset? = nil,
+        overrideMode: PlanActMode? = nil,
+        gitInclusionOverride: GitInclusion? = nil,
+        gitBaseOverride: String? = nil,
+        selectionOverride: StoredSelection? = nil,
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        tokenSource: TokenProjection.Source
+    ) async -> PackagedPromptResult {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
@@ -4860,7 +4736,7 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
+        let message = PromptPackagingService.buildAIMessage(
             systemPrompt: systemPrompt,
             metaInstructions: metaForThisChat,
             fileTree: fileTreeString,
@@ -4870,7 +4746,12 @@ class PromptViewModel: ObservableObject {
             temperature: temperature,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tailAssemblyStrategy: .coreStandardChat
+        )
+        return PackagedPromptResult(
+            message: message,
+            exactPayload: PromptPackagingService.exactChatPayload(for: message, source: tokenSource)
         )
     }
 
@@ -5149,6 +5030,7 @@ class PromptViewModel: ObservableObject {
     private func handleCodeMapsGloballyDisabledChanged(_ disabled: Bool) {
         guard codeMapsGloballyDisabled != disabled else { return }
         codeMapsGloballyDisabled = disabled
+        invalidateChatPromptEntriesCache()
         tokenCountingViewModel.markDirty(.codeMap.union(.fileTree))
         isDirty = true
         Task {
@@ -5186,6 +5068,7 @@ class PromptViewModel: ObservableObject {
 
     deinit {
         activeTabApplyTask?.cancel()
+        chatPromptEntriesProjectionTask?.cancel()
         cancellables.removeAll()
         /*
          // Stop any background timer/work owned by the token counter.
@@ -5400,6 +5283,171 @@ extension PromptViewModel {
         )
     }
 
+    private func activeComposeTabTitleForPromptPackaging() -> String? {
+        guard let tabID = activeComposeTabID,
+              let snapshot = workspaceManager?.composeTabSnapshot(for: tabID)
+        else { return nil }
+        return snapshot.name
+    }
+
+    private func currentClipboardPackagingRequest() -> ClipboardPackagingRequest {
+        ClipboardPackagingRequest(
+            config: applyingGlobalCodeMapOverride(resolvePromptContext()),
+            selection: activeComposeTabStoredSelectionForPromptPackaging(),
+            promptText: promptText,
+            metaInstructions: metaInstructions,
+            includeSavedPrompts: includeSavedPromptsInClipboard,
+            includeFiles: includeFilesInClipboard,
+            includeUserPrompt: includeUserPromptInClipboard,
+            includeLocalDefinitionsInFileTree: false,
+            filePathDisplay: filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !codeMapsGloballyDisabled,
+            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tabTitle: activeComposeTabTitleForPromptPackaging(),
+            renderingDate: Date()
+        )
+    }
+
+    private func clipboardPackagingRequest(
+        for inputConfig: PromptContextResolved,
+        promptTextOverride: String?,
+        selectionOverride: StoredSelection?,
+        includeLocalDefinitionsInFileTree: Bool,
+        tabTitle: String?,
+        renderingDate: Date
+    ) -> ClipboardPackagingRequest {
+        let config = applyingGlobalCodeMapOverride(inputConfig)
+        let combinedMeta = metaInstructions(for: config)
+        return ClipboardPackagingRequest(
+            config: config,
+            selection: selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging(),
+            promptText: promptTextOverride ?? promptText,
+            metaInstructions: combinedMeta,
+            includeSavedPrompts: !combinedMeta.isEmpty,
+            includeFiles: config.includeFiles,
+            includeUserPrompt: config.includeUserPrompt,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            filePathDisplay: filePathDisplayOption,
+            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+            showCodeMapMarkers: !codeMapsGloballyDisabled,
+            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
+            promptSectionsOrder: promptSectionsOrder,
+            disabledPromptSections: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            tabTitle: tabTitle,
+            renderingDate: renderingDate
+        )
+    }
+
+    private func buildClipboardPayload(
+        for request: ClipboardPackagingRequest,
+        source: TokenProjection.Source
+    ) async -> PromptPackagingService.ExactRenderedPayload {
+        let store = workspaceFileContextStore
+        let accountingService = PromptContextAccountingService()
+        let resolution = await accountingService.resolveEntries(
+            selection: request.selection,
+            store: store,
+            rootScope: .allLoaded,
+            profile: .uiAssisted,
+            codeMapUsage: request.config.codeMapUsage
+        )
+        let fileEntries = resolution.entries
+        let codemapSnapshots = await store.codemapSnapshotDictionary()
+        let (diffEntries, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(fileEntries)
+
+        let combinedTreeAndMap: String?
+        if request.config.rendersFileTree {
+            let fileTreeSnapshot = await store.makeFileTreeSelectionSnapshot(
+                selection: request.selection,
+                request: WorkspaceFileTreeSnapshotRequest(
+                    mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: request.config.effectiveFileTreeMode),
+                    filePathDisplay: request.filePathDisplay,
+                    onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+                    includeLegend: true,
+                    showCodeMapMarkers: request.showCodeMapMarkers,
+                    rootScope: .allLoaded
+                ),
+                profile: .uiAssisted
+            )
+            let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
+            let defBlock: String
+            if request.includeLocalDefinitionsInFileTree {
+                let hasCodemapEntries = codeEntries.contains {
+                    $0.isCodemap && codemapSnapshots[$0.file.id]?.fileAPI != nil
+                }
+                if hasCodemapEntries {
+                    defBlock = ""
+                } else {
+                    let rootInfos = fileTreeSnapshot.roots.map {
+                        CodeMapExtractor.RootInfo(
+                            standardizedRootFullPath: $0.standardizedRootPath,
+                            displayName: $0.name
+                        )
+                    }
+                    let allFileAPIs = await store.allCodemapFileAPIs()
+                    defBlock = CodeMapExtractor.buildLocalDefinitionBlockIfNeeded(
+                        codeMapUsage: request.config.codeMapUsage,
+                        selectedFiles: codeEntries.filter { !$0.isCodemap }.map(\.file),
+                        allFileAPIs: allFileAPIs,
+                        filePathDisplay: request.filePathDisplay,
+                        roots: rootInfos
+                    ).text
+                }
+            } else {
+                defBlock = ""
+            }
+            let combined = [tree, defBlock].filter { !$0.isEmpty }.joined(separator: "\n\n")
+            combinedTreeAndMap = combined.isEmpty ? nil : combined
+        } else {
+            combinedTreeAndMap = nil
+        }
+
+        let gitDiff: String? = await {
+            guard diffEntries.isEmpty else { return nil }
+            switch request.config.gitInclusion {
+            case .none:
+                return nil
+            case .selected:
+                let selectedPaths = await WorkspaceGitDiffSelectionResolver.selectedGitDiffPaths(
+                    for: request.selection,
+                    store: store,
+                    rootScope: .allLoaded,
+                    folderPolicy: .expandFolders,
+                    profile: .uiAssisted,
+                    allowFilesystemFallback: WorkspaceLookupRootScope.allLoaded.allowsSelectedGitDiffFilesystemFallback
+                )
+                return await gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
+            case .complete:
+                return await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
+            }
+        }()
+
+        let text = await PromptPackagingService.generateClipboardContent(
+            metaInstructions: request.metaInstructions,
+            userInstructions: request.includeUserPrompt ? request.promptText : "",
+            files: fileEntries,
+            fileTreeContent: combinedTreeAndMap,
+            gitDiff: gitDiff,
+            includeSavedPrompts: request.includeSavedPrompts,
+            includeFiles: request.includeFiles && !fileEntries.isEmpty,
+            includeUserPrompt: request.includeUserPrompt,
+            filePathDisplay: request.filePathDisplay,
+            codemapSnapshots: codemapSnapshots,
+            includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
+            renderingDate: request.renderingDate,
+            promptSectionsOrder: request.promptSectionsOrder,
+            disabledPromptSections: request.disabledPromptSections,
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
+            tabTitle: request.tabTitle
+        )
+        return PromptPackagingService.exactRenderedPayload(text, source: source)
+    }
+
     /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
     func buildClipboard(
         for inputConfig: PromptContextResolved,
@@ -5407,186 +5455,49 @@ extension PromptViewModel {
         selectionOverride: StoredSelection? = nil,
         includeLocalDefinitionsInFileTree: Bool = false
     ) async -> String {
-        let cfg = applyingGlobalCodeMapOverride(inputConfig)
-        let promptText = promptTextOverride ?? promptText
-        let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
-        let preAssembly = await preAssemblePromptContext(
-            cfg: cfg,
-            selection: effectiveSelection,
-            lookupContext: allLoadedWorkspaceLookupContext(),
-            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree
+        let request = clipboardPackagingRequest(
+            for: inputConfig,
+            promptTextOverride: promptTextOverride,
+            selectionOverride: selectionOverride,
+            includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
+            tabTitle: nil,
+            renderingDate: Date()
         )
-
-        // 2.5) Meta prompts assembly.
-        let combinedMeta = metaInstructions(for: cfg)
-        let includeMetaBlock = !combinedMeta.isEmpty
-
-        // 3) Generate clipboard string via existing packaging service
-        return await PromptPackagingService.generateClipboardContent(
-            metaInstructions: combinedMeta,
-            userInstructions: cfg.includeUserPrompt ? promptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
-            gitDiff: preAssembly.gitDiff,
-            includeSavedPrompts: includeMetaBlock,
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledPromptSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
-        )
+        return await buildClipboardPayload(for: request, source: .virtualRecomputed).text
     }
 
-    /// Estimates the token count for the current Copy context (what would be copied now)
-    /// Uses the resolved copy preset (including manual overrides) and builds the exact clipboard payload.
+    /// Estimates the exact rendered token count for the current Copy context.
     func calculateTokensForCopyContext() async -> Int {
-        await calculateTokensForCopyContext(using: currentCopyPreset())
+        let request = currentClipboardPackagingRequest()
+        return await buildClipboardPayload(for: request, source: .activeLive).projection.total
     }
 
-    /// Estimates the token count for a specific Copy preset without mutating UI state.
+    /// Estimates the exact rendered token count for a specific Copy preset without mutating UI state.
     func calculateTokensForCopyContext(using preset: CopyPreset, promptTextOverride: String? = nil) async -> Int {
-        let cfg = resolvePromptContext(preset, custom: workingCopyCustomizations)
-        let text = await buildClipboard(for: cfg, promptTextOverride: promptTextOverride)
-        return estimateTokens(for: text)
-    }
-
-    private func chatPresetTokenBaselineKey(_ preset: ChatPreset) -> ChatPresetTokenBaselineKey {
-        ChatPresetTokenBaselineKey(
-            id: preset.id,
-            mode: preset.mode,
-            modelPresetName: preset.modelPresetName,
-            fileTreeMode: preset.fileTreeMode,
-            codeMapUsage: preset.codeMapUsage,
-            gitInclusion: preset.gitInclusion,
-            storedPromptIds: preset.storedPromptIds ?? [],
-            useStoredPromptsAsSystem: preset.useStoredPromptsAsSystem ?? false
+        let config = resolvePromptContext(preset, custom: workingCopyCustomizations)
+        let request = clipboardPackagingRequest(
+            for: config,
+            promptTextOverride: promptTextOverride,
+            selectionOverride: nil,
+            includeLocalDefinitionsInFileTree: false,
+            tabTitle: nil,
+            renderingDate: Date()
         )
+        return await buildClipboardPayload(for: request, source: .virtualRecomputed).projection.total
     }
 
-    private func promptContextTokenBaselineKey(_ cfg: PromptContextResolved) -> PromptContextTokenBaselineKey {
-        PromptContextTokenBaselineKey(
-            includeFiles: cfg.includeFiles,
-            includeUserPrompt: cfg.includeUserPrompt,
-            includeMetaPrompts: cfg.includeMetaPrompts,
-            includeFileTree: cfg.includeFileTree,
-            fileTreeMode: cfg.fileTreeMode,
-            codeMapUsage: cfg.codeMapUsage,
-            gitInclusion: cfg.gitInclusion,
-            storedPromptIds: cfg.storedPromptIds ?? []
-        )
-    }
-
-    private func chatContextTokenBaselineCacheKey(
-        chatPreset: ChatPreset,
-        config cfg: PromptContextResolved
-    ) -> ChatContextTokenBaselineCacheKey {
-        let disabledSections = disabledPromptSections.sorted { $0.rawValue < $1.rawValue }
-        let selectedPromptIDs = selectedPromptIDsForChat.sorted { $0.uuidString < $1.uuidString }
-        let storedPromptKeys = storedPrompts.map {
-            StoredPromptTokenBaselineKey(
-                id: $0.id,
-                title: $0.title,
-                content: $0.content,
-                isUserEdited: $0.isUserEdited
-            )
-        }
-        let rootOrder = fileManager.visibleRootFolders.map {
-            RootTokenBaselineKey(
-                id: $0.id,
-                fullPath: $0.fullPath,
-                name: $0.name,
-                isSystemRoot: $0.isSystemRoot
-            )
-        }
-
-        return ChatContextTokenBaselineCacheKey(
-            workspaceID: currentWorkspaceID,
-            selectedChatPresetID: selectedChatPresetID,
-            chatPreset: chatPresetTokenBaselineKey(chatPreset),
-            resolvedContext: promptContextTokenBaselineKey(cfg),
-            fileTreeOptionForChat: fileTreeOptionForChat,
-            codeMapUsageForChat: codeMapUsageForChat,
-            gitDiffInclusionModeForChat: gitDiffInclusionModeForChat,
-            codeMapsGloballyDisabled: codeMapsGloballyDisabled,
-            filePathDisplayOption: filePathDisplayOption,
-            selectedFilesSortMethod: selectedFilesSortMethod,
-            fileTreeSortMethod: fileManager.currentSortMethod,
-            onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
-            includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
-            promptSectionsOrder: promptSectionsOrder,
-            disabledPromptSections: disabledSections,
-            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
-            selectedPromptIDsForChat: selectedPromptIDs,
-            hasManualChatPromptSelection: hasManualChatPromptSelection,
-            storedPrompts: storedPromptKeys,
-            hierarchyGenerationSignature: fileManager.currentHierarchyGenerationSignature(),
-            rootOrder: rootOrder,
-            selectionVersion: chatSelectionVersion,
-            slicesVersion: chatSlicesVersion,
-            autoCodemapVersion: chatAutoCodemapVersion,
-            fileAPIsVersion: chatFileAPIsVersion,
-            fileSystemDeltaVersion: chatFileSystemDeltaVersion
-        )
-    }
-
-    private func promptTextDuplicateFactor(for cfg: PromptContextResolved) -> Int {
-        guard cfg.includeUserPrompt else { return 0 }
-        var factor = disabledPromptSections.contains(.userInstructions) ? 0 : 1
-        if duplicateUserInstructionsAtTop {
-            factor += 1
-        }
-        return factor
-    }
-
-    /// Estimates the token count for the current Chat context.
-    /// If the chat preset references a specific copy preset, that configuration is used; otherwise falls back to current state.
+    /// Estimates the exact package-level chat payload for the current Chat context.
     func calculateTokensForChatContext() async -> Int {
         let chatPreset = currentChatPreset()
-        // Prefer the chat preset's resolved configuration (includes git/meta/system flavor overrides),
-        // falling back to the current copy configuration only if unavailable.
-        let cfg: PromptContextResolved = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
-        guard cfg.gitInclusion == .none else {
-            let text = await buildClipboard(for: cfg, includeLocalDefinitionsInFileTree: true)
-            return estimateTokens(for: text)
-        }
-        let cacheKey = chatContextTokenBaselineCacheKey(chatPreset: chatPreset, config: cfg)
+        let config = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
         let promptTextSnapshot = promptText
-        let promptTextTokens = estimateTokens(for: promptTextSnapshot)
-        let duplicateFactor = promptTextDuplicateFactor(for: cfg)
-        let hasPromptText = !promptTextSnapshot.isEmpty
-
-        if let cache = chatContextTokenBaselineCache, cache.key == cacheKey {
-            if hasPromptText, cache.supportsPromptTextDeltas {
-                return cache.baseTokensWithoutPromptText + (promptTextTokens * duplicateFactor)
-            }
-            if !hasPromptText, let emptyPromptTokenCount = cache.emptyPromptTokenCount {
-                return emptyPromptTokenCount
-            }
-        }
-
-        let text = await buildClipboard(
-            for: cfg,
-            promptTextOverride: promptTextSnapshot,
-            includeLocalDefinitionsInFileTree: true
+        let result = await packagePromptResult(
+            conversation: [ConversationEntry(role: .user, content: promptTextSnapshot)],
+            overridePromptConfig: config,
+            overrideChatPreset: chatPreset,
+            tokenSource: .activeLive
         )
-        let tokenCount = estimateTokens(for: text)
-
-        let currentChatPreset = currentChatPreset()
-        let currentCfg: PromptContextResolved = resolvedPromptContext(from: currentChatPreset) ?? resolvePromptContext()
-        let currentCacheKey = chatContextTokenBaselineCacheKey(chatPreset: currentChatPreset, config: currentCfg)
-        if currentCacheKey == cacheKey {
-            chatContextTokenBaselineCache = ChatContextTokenBaselineCache(
-                key: cacheKey,
-                baseTokensWithoutPromptText: max(0, tokenCount - (promptTextTokens * duplicateFactor)),
-                supportsPromptTextDeltas: hasPromptText && duplicateFactor > 0,
-                emptyPromptTokenCount: hasPromptText ? nil : tokenCount
-            )
-        }
-
-        return tokenCount
+        return result.exactPayload.projection.total
     }
 
     /// Resolve, build and place the clipboard content for a specific copy preset without mutating UI state.
@@ -5794,9 +5705,4 @@ enum PromptError: Error {
 
 enum AIResponseError: Error {
     case invalidData
-}
-
-enum FilePathDisplay: String, CaseIterable {
-    case full = "Full"
-    case relative = "Relative"
 }
