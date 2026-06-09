@@ -149,20 +149,7 @@ final class AgentWorkflowStore: ObservableObject {
         return url
     }
 
-    /// One-time migration: move workflow files from the legacy `RepoPrompt/Workflows/`
-    /// path to the CE-branded `RepoPrompt CE/Workflows/` path.
-    ///
-    /// Idempotent — safe to call on every refresh. Skips if already migrated or
-    /// if the legacy directory doesn't exist.
-    private static let legacyMigrationKey = "AgentWorkflowStore.legacyPathMigrated"
 
-    private func migrateFromLegacyPathIfNeeded() {
-        AppSupportDirectoryMigration.migrate(
-            legacySubdirectory: "Workflows",
-            migrationKey: Self.legacyMigrationKey,
-            identity: Self.filesystemIdentity
-        )
-    }
 
     // MARK: Init
 
@@ -188,8 +175,6 @@ final class AgentWorkflowStore: ObservableObject {
     // MARK: Loading
 
     func refresh() {
-        migrateFromLegacyPathIfNeeded()
-
         let dir = Self.workflowsDirectoryURL
         let fm = FileManager.default
 

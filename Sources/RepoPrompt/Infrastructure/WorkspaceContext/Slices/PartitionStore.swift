@@ -56,17 +56,7 @@ actor PartitionStore {
     private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
     #endif
 
-    private static let legacyMigrationKey = "PartitionStore.legacyPathMigrated"
 
-    /// One-time migration: move partition data from the legacy `RepoPrompt/Partitions/`
-    /// path to the CE-branded `RepoPrompt CE/Partitions/` path.
-    private static func migrateFromLegacyPathIfNeeded() {
-        AppSupportDirectoryMigration.migrate(
-            legacySubdirectory: "Partitions",
-            migrationKey: legacyMigrationKey,
-            identity: Self.filesystemIdentity
-        )
-    }
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
     private func repoKey(forRoot rootPath: String) -> String {
@@ -157,7 +147,6 @@ actor PartitionStore {
     private let dateFormatter = ISO8601DateFormatter()
 
     init(baseURL: URL? = nil) {
-        Self.migrateFromLegacyPathIfNeeded()
         self.baseURL = baseURL ?? Self.partitionsBaseURL()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

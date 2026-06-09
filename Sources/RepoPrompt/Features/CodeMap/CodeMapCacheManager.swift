@@ -316,9 +316,6 @@ class CodeMapCacheManager {
 
     /// Returns the base directory: ~/Library/Application Support/RepoPrompt CE/CodeMapCaches
     private func baseCacheDirectory() -> URL {
-        // Migration runs once; the guard exits immediately on subsequent calls.
-        Self.migrateFromLegacyPathIfNeeded()
-
         let codeMapDir = Self.filesystemIdentity.applicationSupportRootURL()
             .appendingPathComponent("CodeMapCaches", isDirectory: true)
         try? FileManager.default.createDirectory(at: codeMapDir, withIntermediateDirectories: true)
@@ -331,17 +328,7 @@ class CodeMapCacheManager {
     private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
     #endif
 
-    private static let legacyMigrationKey = "CodeMapCacheManager.legacyPathMigrated"
 
-    /// One-time migration: move cache files from the legacy `RepoPrompt/CodeMapCaches/`
-    /// path to the CE-branded `RepoPrompt CE/CodeMapCaches/` path.
-    private static func migrateFromLegacyPathIfNeeded() {
-        AppSupportDirectoryMigration.migrate(
-            legacySubdirectory: "CodeMapCaches",
-            migrationKey: legacyMigrationKey,
-            identity: Self.filesystemIdentity
-        )
-    }
 
     /// Returns an SHA-256 hash for the given string, used as a unique filename.
     private func hashedFilename(forRootFolderPath rootFolderPath: String) -> String {
