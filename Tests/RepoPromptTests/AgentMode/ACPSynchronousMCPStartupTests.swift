@@ -116,7 +116,9 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
                 "ACP_STARTUP_STYLE": "cursor",
                 "ACP_RECORD_PATH": recordURL.path,
                 "ACP_CURSOR_APPROVAL_PATH": approvalURL.path,
-                "ACP_CURSOR_PROJECT_ROOT": workspace.path
+                "ACP_CURSOR_PROJECT_ROOT": CursorIntegrationConfiguration.projectRootURL(
+                    workingDirectory: workspace.path
+                ).path
             ],
             mcpServer: mcpConfiguration,
             cleanupArtifact: artifact

@@ -98,7 +98,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             JSONSerialization.jsonObject(with: approvalsData) as? [String]
         )
         let expectedApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: workspace.path,
+            projectRoot: CursorIntegrationConfiguration.projectRootURL(
+                workingDirectory: workspace.path
+            ).path,
             repoPromptMCPConfiguration: mcpConfiguration
         )
         let session = try provider.makeSessionConfiguration(
@@ -159,6 +161,68 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         )
     }
 
+    func testTmpAliasUsesCursorPhysicalProjectPathForApprovalDirectoryAndHash() throws {
+        let workspaceName = "CursorACPLaunchResolverTests-\(UUID().uuidString)"
+        let aliasWorkspace = URL(fileURLWithPath: "/tmp", isDirectory: true)
+            .appendingPathComponent(workspaceName, isDirectory: true)
+        let physicalWorkspace = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent(workspaceName, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: aliasWorkspace,
+            withIntermediateDirectories: true
+        )
+        addTeardownBlock {
+            try? FileManager.default.removeItem(at: physicalWorkspace)
+        }
+        XCTAssertNotEqual(aliasWorkspace.path, physicalWorkspace.path)
+
+        let cursorDataDirectory = try makeTemporaryDirectory()
+        let configuration = RepoPromptMCPServerConfiguration(command: "/tmp/repoprompt-mcp")
+        let aliasProjectRoot = CursorIntegrationConfiguration.projectRootURL(
+            workingDirectory: aliasWorkspace.path
+        )
+        let physicalProjectRoot = CursorIntegrationConfiguration.projectRootURL(
+            workingDirectory: physicalWorkspace.path
+        )
+        let aliasApprovalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: aliasWorkspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+        let physicalApprovalURL = CursorIntegrationConfiguration.projectMCPApprovalURL(
+            workingDirectory: physicalWorkspace.path,
+            cursorDataDirectory: cursorDataDirectory
+        )
+
+        XCTAssertEqual(aliasProjectRoot, physicalWorkspace)
+        XCTAssertEqual(aliasProjectRoot, physicalProjectRoot)
+        XCTAssertEqual(aliasApprovalURL, physicalApprovalURL)
+        XCTAssertEqual(
+            aliasApprovalURL.deletingLastPathComponent().lastPathComponent,
+            "private-tmp-\(workspaceName)"
+        )
+
+        try CursorIntegrationConfiguration.prepareProjectMCPApproval(
+            workingDirectory: aliasWorkspace.path,
+            cursorDataDirectory: cursorDataDirectory,
+            repoPromptMCPConfiguration: configuration,
+            cleanupAfterRun: false
+        )
+
+        let approvals = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: aliasApprovalURL)) as? [String]
+        )
+        let physicalApproval = try CursorIntegrationConfiguration.approvalIdentifier(
+            projectRoot: physicalWorkspace.path,
+            repoPromptMCPConfiguration: configuration
+        )
+        let aliasApproval = try CursorIntegrationConfiguration.approvalIdentifier(
+            projectRoot: aliasWorkspace.path,
+            repoPromptMCPConfiguration: configuration
+        )
+        XCTAssertNotEqual(aliasApproval, physicalApproval)
+        XCTAssertEqual(approvals, [physicalApproval])
+    }
+
     func testApprovalCleanupPreservesConcurrentEntriesAndRemovesTemporaryApproval() throws {
         let workspace = try makeTemporaryDirectory()
         let cursorDataDirectory = try makeTemporaryDirectory()
@@ -180,7 +244,9 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             )
         )
         let temporaryApproval = try CursorIntegrationConfiguration.approvalIdentifier(
-            projectRoot: workspace.path,
+            projectRoot: CursorIntegrationConfiguration.projectRootURL(
+                workingDirectory: workspace.path
+            ).path,
             repoPromptMCPConfiguration: configuration
         )
         let concurrentData = try JSONSerialization.data(

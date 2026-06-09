@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Cursor-specific MCP integration helpers.
@@ -381,7 +382,14 @@ enum CursorIntegrationConfiguration {
     private static func standardizedWorkingDirectoryURL(_ workingDirectory: String) -> URL {
         let trimmed = workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines)
         let path = trimmed.isEmpty ? FileManager.default.temporaryDirectory.path : trimmed
-        return URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        let standardizedURL = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        let physicalPath = standardizedURL.path.withCString { cPath -> String? in
+            guard let resolved = realpath(cPath, nil) else { return nil }
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        return physicalPath.map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? standardizedURL
     }
 }
 
