@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptShared
 
 public enum SliceMutationMode: Sendable {
     case add
@@ -43,10 +44,44 @@ actor PartitionStore {
     static let notifSourceIDKey = "sourceID"
     nonisolated let notificationSourceID = UUID()
 
-    /// <AppSupport>/RepoPrompt/Partitions
+    /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("RepoPrompt/Partitions", isDirectory: true)
+        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        return identity.applicationSupportRootURL()
+            .appendingPathComponent("Partitions", isDirectory: true)
+    }
+
+    private static let legacyMigrationKey = "PartitionStore.legacyPathMigrated"
+
+    /// One-time migration: move partition data from the legacy `RepoPrompt/Partitions/`
+    /// path to the CE-branded `RepoPrompt CE/Partitions/` path.
+    private static func migrateFromLegacyPathIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: legacyMigrationKey) else { return }
+        defer { UserDefaults.standard.set(true, forKey: legacyMigrationKey) }
+
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let legacyDir = appSupport
+            .appendingPathComponent("RepoPrompt", isDirectory: true)
+            .appendingPathComponent("Partitions", isDirectory: true)
+
+        guard fm.fileExists(atPath: legacyDir.path) else { return }
+
+        let newDir = partitionsBaseURL()
+        try? fm.createDirectory(at: newDir, withIntermediateDirectories: true)
+
+        let items = (try? fm.contentsOfDirectory(at: legacyDir,
+            includingPropertiesForKeys: nil,
+            options: .skipsHiddenFiles)) ?? []
+
+        for item in items {
+            let dest = newDir.appendingPathComponent(item.lastPathComponent)
+            if !fm.fileExists(atPath: dest.path) {
+                try? fm.moveItem(at: item, to: dest)
+            }
+        }
+
+        try? fm.removeItem(at: legacyDir)
     }
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
@@ -138,6 +173,7 @@ actor PartitionStore {
     private let dateFormatter = ISO8601DateFormatter()
 
     init(baseURL: URL? = nil) {
+        Self.migrateFromLegacyPathIfNeeded()
         self.baseURL = baseURL ?? Self.partitionsBaseURL()
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

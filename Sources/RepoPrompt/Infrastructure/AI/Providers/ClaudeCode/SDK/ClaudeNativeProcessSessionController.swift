@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"
@@ -2187,7 +2188,7 @@ final actor ClaudeNativeProcessSessionController {
                 return URL(fileURLWithPath: expanded, isDirectory: true)
             }
             return FileManager.default.temporaryDirectory
-                .appendingPathComponent("RepoPrompt", isDirectory: true)
+                .appendingPathComponent("RepoPrompt CE", isDirectory: true)
                 .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
         }()
         do {

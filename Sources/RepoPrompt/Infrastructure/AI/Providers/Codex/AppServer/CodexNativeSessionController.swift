@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
@@ -710,7 +711,7 @@ final class CodexNativeSessionController {
                     .appendingPathComponent(".codexlogs", isDirectory: true)
             }
             return FileManager.default.temporaryDirectory
-                .appendingPathComponent("RepoPrompt/.codexlogs", isDirectory: true)
+                .appendingPathComponent("RepoPrompt CE/.codexlogs", isDirectory: true)
         }()
         do {
             try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)

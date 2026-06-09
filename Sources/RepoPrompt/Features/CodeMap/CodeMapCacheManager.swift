@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import RepoPromptShared
 
 // ============ The Cache Data Structures ============
 
@@ -313,15 +314,54 @@ class CodeMapCacheManager {
 
     // MARK: - Private Helpers
 
-    /// Returns the base directory: ~/Library/Application Support/RepoPrompt/CodeMapCaches
+    /// Returns the base directory: ~/Library/Application Support/RepoPrompt CE/CodeMapCaches
     private func baseCacheDirectory() -> URL {
+        Self.migrateFromLegacyPathIfNeeded()
+
         guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             // Fallback to home directory if something unexpected
             return FileManager.default.homeDirectoryForCurrentUser
         }
-        let codeMapDir = appSupport.appendingPathComponent("RepoPrompt/CodeMapCaches", isDirectory: true)
+        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        let codeMapDir = identity.applicationSupportRootURL()
+            .appendingPathComponent("CodeMapCaches", isDirectory: true)
         try? FileManager.default.createDirectory(at: codeMapDir, withIntermediateDirectories: true)
         return codeMapDir
+    }
+
+    private static let legacyMigrationKey = "CodeMapCacheManager.legacyPathMigrated"
+
+    /// One-time migration: move cache files from the legacy `RepoPrompt/CodeMapCaches/`
+    /// path to the CE-branded `RepoPrompt CE/CodeMapCaches/` path.
+    private static func migrateFromLegacyPathIfNeeded() {
+        guard !UserDefaults.standard.bool(forKey: legacyMigrationKey) else { return }
+        defer { UserDefaults.standard.set(true, forKey: legacyMigrationKey) }
+
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let legacyDir = appSupport
+            .appendingPathComponent("RepoPrompt", isDirectory: true)
+            .appendingPathComponent("CodeMapCaches", isDirectory: true)
+
+        guard fm.fileExists(atPath: legacyDir.path) else { return }
+
+        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        let newDir = identity.applicationSupportRootURL()
+            .appendingPathComponent("CodeMapCaches", isDirectory: true)
+        try? fm.createDirectory(at: newDir, withIntermediateDirectories: true)
+
+        let items = (try? fm.contentsOfDirectory(at: legacyDir,
+            includingPropertiesForKeys: nil,
+            options: .skipsHiddenFiles)) ?? []
+
+        for item in items {
+            let dest = newDir.appendingPathComponent(item.lastPathComponent)
+            if !fm.fileExists(atPath: dest.path) {
+                try? fm.moveItem(at: item, to: dest)
+            }
+        }
+
+        try? fm.removeItem(at: legacyDir)
     }
 
     /// Returns an SHA-256 hash for the given string, used as a unique filename.
