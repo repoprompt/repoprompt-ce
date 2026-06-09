@@ -96,6 +96,54 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         XCTAssertEqual(recordedSessionLoadIDs(at: recordURL), ["stale-session-id"])
     }
 
+    func testBootstrapSendsInitializedNotificationBeforeSessionNew() async throws {
+        let workspace = try makeTemporaryDirectory()
+        let scriptURL = try makeStrictACPInitServerScript()
+        let recordURL = try makeTemporaryDirectory().appendingPathComponent("record.jsonl")
+        let request = makeRunRequest(agentKind: .openCode, workspacePath: workspace.path)
+        let provider = FakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path]
+        )
+        let controller = try ACPAgentSessionController(provider: provider, runRequest: request)
+
+        let bootstrap = try await controller.bootstrap()
+        await controller.shutdown()
+
+        // The strict server only responds to session/new AFTER receiving
+        // notifications/initialized. If bootstrap succeeds, the notification
+        // was sent correctly.
+        XCTAssertEqual(bootstrap.sessionID, "strict-runtime-id")
+
+        // Verify the recorded method sequence includes notifications/initialized
+        let methods = recordedMethods(at: recordURL)
+        XCTAssertTrue(
+            methods.contains("notifications/initialized"),
+            "Expected notifications/initialized in recorded methods: \(methods)"
+        )
+
+        // Verify it was sent between initialize and session/new
+        let initializedIndex = methods.firstIndex(of: "notifications/initialized")
+        let initIndex = methods.firstIndex(of: "initialize")
+        let sessionNewIndex = methods.firstIndex(of: "session/new")
+        XCTAssertNotNil(initializedIndex, "notifications/initialized should be recorded")
+        XCTAssertNotNil(initIndex, "initialize should be recorded")
+        XCTAssertNotNil(sessionNewIndex, "session/new should be recorded")
+        if let initializedIndex, let initIndex, let sessionNewIndex {
+            XCTAssertLessThan(
+                initIndex,
+                initializedIndex,
+                "initialize should come before notifications/initialized"
+            )
+            XCTAssertLessThan(
+                initializedIndex,
+                sessionNewIndex,
+                "notifications/initialized should come before session/new"
+            )
+        }
+    }
+
     func testProviderSessionIdentityNormalizesEmptyIDs() {
         let identity = ACPProviderSessionIdentity(
             providerID: .cursor,
@@ -130,6 +178,80 @@ final class ACPProviderSessionIdentityTests: XCTestCase {
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         temporaryURLs.append(url)
         return url
+    }
+
+    /// A strict ACP server that only responds to `session/new` AFTER receiving
+    /// a `notifications/initialized` notification. This mirrors real OpenCode behavior
+    /// where the server expects the MCP-style initialized handshake.
+    private func makeStrictACPInitServerScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("strict_acp_server.py")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import os
+        import sys
+
+        record_path = os.environ.get("ACP_RECORD_PATH")
+        runtime_session_id = "strict-runtime-id"
+        initialized_received = False
+
+        def record(method, params):
+            if not record_path:
+                return
+            with open(record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"method": method, "params": params}) + "\n")
+
+        def respond(request_id, result=None, error=None):
+            payload = {"jsonrpc": "2.0", "id": request_id}
+            if error is not None:
+                payload["error"] = error
+            else:
+                payload["result"] = result or {}
+            print(json.dumps(payload), flush=True)
+
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except Exception:
+                continue
+            method = request.get("method")
+            params = request.get("params") or {}
+            has_id = "id" in request
+            record(method, params)
+            if method == "initialize" and has_id:
+                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": [], "protocolVersion": 1})
+            elif method == "notifications/initialized" and not has_id:
+                initialized_received = True
+            elif method == "session/new" and has_id:
+                if not initialized_received:
+                    respond(request.get("id"), error={"code": -32002, "message": "Server not initialized: missing notifications/initialized"})
+                else:
+                    respond(request.get("id"), {"sessionId": runtime_session_id})
+            elif method == "session/load" and has_id:
+                session_id = params.get("sessionId")
+                respond(request.get("id"), {"sessionId": session_id})
+            elif method == "session/prompt" and has_id:
+                respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 2}})
+            elif has_id:
+                respond(request.get("id"), {})
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
+    private func recordedMethods(at url: URL) -> [String] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8) else { return [] }
+        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                return nil
+            }
+            return object["method"] as? String
+        }
     }
 
     private func makeFakeACPServerScript() throws -> URL {

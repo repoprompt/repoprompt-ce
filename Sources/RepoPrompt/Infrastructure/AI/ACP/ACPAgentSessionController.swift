@@ -471,6 +471,12 @@ actor ACPAgentSessionController {
         diagnose(.phaseCompleted("initialize"))
         state = .initialized
 
+        // Send the MCP-style initialized notification so the ACP server transitions
+        // out of the initialization phase and begins processing session requests.
+        // OpenCode (and other MCP-derived ACP servers) require this notification
+        // after the initialize response before accepting session/new or session/load.
+        try sendInitializedNotification()
+
         let authMethods = initializeResponse["authMethods"] as? [[String: Any]] ?? []
         let authContext = ACPAuthenticationContext(
             authMethodIDs: Self.authMethodIDs(from: authMethods),
@@ -857,6 +863,14 @@ actor ACPAgentSessionController {
             log("ACP steering interrupt skipped; controller already sessionOpen")
         }
         resetPerTurnStateForSteeringPrompt()
+    }
+
+    private func sendInitializedNotification() throws {
+        try sendJSONLine([
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        ])
+        log("Sent ACP notifications/initialized")
     }
 
     private func sendSessionCancelNotification() throws {
