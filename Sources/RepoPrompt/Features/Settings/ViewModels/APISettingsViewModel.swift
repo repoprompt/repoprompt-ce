@@ -431,9 +431,12 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     private func publishClaudeCodeGLMAvailability() {
-        let didChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
+        _ = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
         compatibleBackendSecretPresence[.glmZAI] = hasStoredZAIKey
-        guard didChange else { return }
+        // Always publish after recomputing the in-memory GLM/Z.ai secret state.
+        // Startup loads can leave the persisted configured mirror unchanged while
+        // still transitioning the live availability context from unavailable to
+        // available, and IDE model pickers rely on this notification to refresh.
         NotificationCenter.default.post(name: .claudeCodeGLMAvailabilityChanged, object: nil)
     }
 
