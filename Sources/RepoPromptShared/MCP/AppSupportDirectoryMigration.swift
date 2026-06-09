@@ -51,6 +51,10 @@ public enum AppSupportDirectoryMigration {
             }
         }
 
+        // Note: if individual file moves fail (permissions, locks), the migration
+        // flag is still set and those files remain orphaned in the legacy directory.
+        // This is intentional — the migration is one-time and the legacy dir will be
+        // cleaned up on the next launch if it becomes empty.
         try? fm.removeItem(at: legacyDir)
     }
 }

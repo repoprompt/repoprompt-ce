@@ -316,6 +316,7 @@ class CodeMapCacheManager {
 
     /// Returns the base directory: ~/Library/Application Support/RepoPrompt CE/CodeMapCaches
     private func baseCacheDirectory() -> URL {
+        // Migration runs once; the guard exits immediately on subsequent calls.
         Self.migrateFromLegacyPathIfNeeded()
 
         let codeMapDir = Self.filesystemIdentity.applicationSupportRootURL()
