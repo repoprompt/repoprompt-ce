@@ -11,6 +11,25 @@ import MCP
 #endif
 
 extension MCPServerViewModel {
+    struct PendingPolicyRunIDMappingToken {
+        let id: UUID
+        let connectionID: UUID
+        let runID: UUID
+        let displacedConnectionID: UUID?
+        let displacedConnectionRunID: UUID?
+        let displacedPendingPolicyTokenID: UUID?
+        let previousRunID: UUID?
+        let previousRunPrimaryConnectionID: UUID?
+        let previousPendingPolicyTokenID: UUID?
+        let previousWindowID: Int?
+    }
+
+    enum PendingPolicyRunIDMappingRollbackResult: Equatable {
+        case restored
+        case supersededBySameConnection
+        case supersededByOtherConnection
+    }
+
     /// Value snapshot of a compose tab plus MCP routing metadata.
     ///
     /// This is the tab-first runtime model for MCP/Agent work. It intentionally
@@ -897,14 +916,17 @@ extension MCPServerViewModel {
     }
 
     @MainActor
+    @discardableResult
     func installTabContext(
         clientID: String?,
         clientName: String?,
         windowID: Int,
         workspaceID providedWorkspaceID: UUID? = nil,
         snapshot: ComposeTabState,
-        runID: UUID? = nil
-    ) {
+        runID: UUID? = nil,
+        signalRouting: Bool = true,
+        deferRunIDReplacementForPendingPolicy: Bool = false
+    ) -> PendingPolicyRunIDMappingToken? {
         tabContextLog("installTabContext tab=\(snapshot.id) window=\(windowID) clientID=\(clientID ?? "nil") clientName=\(clientName ?? "nil") runID=\(runID?.uuidString ?? "nil")")
         let resolvedWorkspaceID: UUID? = {
             if let providedWorkspaceID {
@@ -939,7 +961,11 @@ extension MCPServerViewModel {
                 } else {
                     tabContextLog("[warning] installTabContext conflict but no clientName provided; cannot queue")
                 }
-                return
+                return nil
+            }
+            if deferRunIDReplacementForPendingPolicy, tabContextByConnectionID[uuid] != nil {
+                tabContextLog("installTabContext declined pending-policy overwrite of existing context connectionID=\(uuid)")
+                return nil
             }
 
             tabContextLog("installTabContext immediate bind connectionID=\(uuid)")
@@ -950,8 +976,22 @@ extension MCPServerViewModel {
             activateReadFileAutoSelection(&context)
             tabContextByConnectionID[uuid] = context
             windowIDByConnection[uuid] = context.windowID
+            var pendingPolicyToken: PendingPolicyRunIDMappingToken?
             if let runID = context.runID {
-                _ = registerRunIDMapping(connectionID: uuid, runID: runID, windowID: context.windowID)
+                if deferRunIDReplacementForPendingPolicy {
+                    pendingPolicyToken = registerPendingPolicyRunIDMapping(
+                        connectionID: uuid,
+                        runID: runID,
+                        windowID: context.windowID
+                    )
+                } else {
+                    _ = registerRunIDMapping(
+                        connectionID: uuid,
+                        runID: runID,
+                        windowID: context.windowID,
+                        signalRouting: signalRouting
+                    )
+                }
                 // Consume any queued intent for this exact run after direct installation.
                 if let clientName {
                     let popped = pendingRunScopedTabContexts.popByRunID(clientName: clientName, runID: runID)
@@ -964,15 +1004,16 @@ extension MCPServerViewModel {
                 recordLastContext(clientName: clientName, context: context)
             }
             beginMirroringForConnection(uuid, context: context)
-            return
+            return pendingPolicyToken
         }
 
         guard let clientName else {
             tabContextLog("[warning] installTabContext missing client identifier; context cannot be queued.")
-            return
+            return nil
         }
 
         enqueuePendingContext(context, clientName: clientName, windowID: windowID)
+        return nil
     }
 
     @MainActor
@@ -1901,28 +1942,45 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    func cleanupRunIDMapping(runID: UUID, connectionID: UUID) {
-        connectionIDByRunID.removeValue(forKey: runID)
-        connectionIDToRunID.removeValue(forKey: connectionID)
+    func cleanupRunIDMapping(
+        runID: UUID,
+        connectionID: UUID,
+        signalRoutingFailure: Bool = true
+    ) {
+        if connectionIDByRunID[runID] == connectionID {
+            connectionIDByRunID.removeValue(forKey: runID)
+            pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
+        }
+        if connectionIDToRunID[connectionID] == runID {
+            connectionIDToRunID.removeValue(forKey: connectionID)
+        }
         tabContextLog("cleanupRunIDMapping removed runID=\(runID) connectionID=\(connectionID)")
 
-        // Notify routing waiter that this runID will never route (enables early exit from wait)
-        MCPRoutingWaiter.signalFailed(runID)
+        // A stale generation must not fail routing for a newer replacement connection.
+        if signalRoutingFailure, liveConnectionID(forRunID: runID) == nil {
+            MCPRoutingWaiter.signalFailed(runID)
+        }
     }
 
     @MainActor
     @discardableResult
-    func registerRunIDMapping(connectionID: UUID, runID: UUID, windowID: Int) -> Bool {
+    func registerRunIDMapping(
+        connectionID: UUID,
+        runID: UUID,
+        windowID: Int,
+        signalRouting: Bool = true
+    ) -> Bool {
         // Fast path: already mapped to this exact run/connection.
         if connectionIDByRunID[runID] == connectionID,
            connectionIDToRunID[connectionID] == runID
         {
+            pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
             windowIDByConnection[connectionID] = windowID
-            MCPRoutingWaiter.signalRouted(runID)
+            if signalRouting {
+                MCPRoutingWaiter.signalRouted(runID)
+            }
             return true
         }
-
-        windowIDByConnection[connectionID] = windowID
 
         // If this connection is already bound to a different run, refuse remap
         if let bound = tabContextByConnectionID[connectionID],
@@ -1958,14 +2016,166 @@ extension MCPServerViewModel {
             // Avoid dangling reverse mapping for stale run
             connectionIDByRunID.removeValue(forKey: previous)
         }
+        windowIDByConnection[connectionID] = windowID
         connectionIDByRunID[runID] = connectionID
         connectionIDToRunID[connectionID] = runID
+        pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         tabContextLog("registerRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
 
-        // Notify routing waiter that this runID is now routed
-        MCPRoutingWaiter.signalRouted(runID)
+        if signalRouting {
+            MCPRoutingWaiter.signalRouted(runID)
+        }
 
         return true
+    }
+
+    @MainActor
+    func registerPendingPolicyRunIDMapping(
+        connectionID: UUID,
+        runID: UUID,
+        windowID: Int
+    ) -> PendingPolicyRunIDMappingToken? {
+        if let bound = tabContextByConnectionID[connectionID],
+           let boundRun = bound.runID,
+           boundRun != runID
+        {
+            tabContextLog("registerPendingPolicyRunIDMapping refused: connectionID=\(connectionID) already bound to runID=\(boundRun), new=\(runID)")
+            return nil
+        }
+
+        let displacedConnectionID = connectionIDByRunID[runID]
+        if let displacedConnectionID,
+           displacedConnectionID != connectionID,
+           let existingWindow = windowIDByConnection[displacedConnectionID],
+           existingWindow != windowID
+        {
+            tabContextLog("registerPendingPolicyRunIDMapping refused window mismatch runID=\(runID) existingWindow=\(existingWindow) newWindow=\(windowID)")
+            return nil
+        }
+
+        let previousRunID = connectionIDToRunID[connectionID]
+        let token = PendingPolicyRunIDMappingToken(
+            id: UUID(),
+            connectionID: connectionID,
+            runID: runID,
+            displacedConnectionID: displacedConnectionID == connectionID ? nil : displacedConnectionID,
+            displacedConnectionRunID: displacedConnectionID.flatMap { connectionIDToRunID[$0] },
+            displacedPendingPolicyTokenID: pendingPolicyRunIDMappingTokenIDByRunID[runID],
+            previousRunID: previousRunID,
+            previousRunPrimaryConnectionID: previousRunID.flatMap { connectionIDByRunID[$0] },
+            previousPendingPolicyTokenID: previousRunID.flatMap { pendingPolicyRunIDMappingTokenIDByRunID[$0] },
+            previousWindowID: windowIDByConnection[connectionID]
+        )
+
+        if let displacedConnectionID = token.displacedConnectionID,
+           connectionIDToRunID[displacedConnectionID] == runID
+        {
+            connectionIDToRunID.removeValue(forKey: displacedConnectionID)
+        }
+        if let previousRunID, previousRunID != runID,
+           connectionIDByRunID[previousRunID] == connectionID
+        {
+            connectionIDByRunID.removeValue(forKey: previousRunID)
+            pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: previousRunID)
+        }
+        windowIDByConnection[connectionID] = windowID
+        connectionIDByRunID[runID] = connectionID
+        connectionIDToRunID[connectionID] = runID
+        pendingPolicyRunIDMappingTokenIDByRunID[runID] = token.id
+        tabContextLog("registerPendingPolicyRunIDMapping connectionID=\(connectionID) runID=\(runID) windowID=\(windowID)")
+        return token
+    }
+
+    @MainActor
+    func isCurrentPendingPolicyRunIDMapping(_ token: PendingPolicyRunIDMappingToken) -> Bool {
+        pendingPolicyRunIDMappingTokenIDByRunID[token.runID] == token.id
+            && connectionIDByRunID[token.runID] == token.connectionID
+            && connectionIDToRunID[token.connectionID] == token.runID
+    }
+
+    @MainActor
+    func rollbackPendingPolicyRunIDMapping(
+        _ token: PendingPolicyRunIDMappingToken,
+        clientName: String?,
+        windowID: Int?,
+        signalRoutingFailure: Bool
+    ) -> PendingPolicyRunIDMappingRollbackResult {
+        guard isCurrentPendingPolicyRunIDMapping(token) else {
+            let supersededBySameConnection = connectionIDByRunID[token.runID] == token.connectionID
+            if connectionIDToRunID[token.connectionID] != token.runID {
+                removeTabContext(
+                    forConnectionID: token.connectionID,
+                    clientName: clientName,
+                    windowID: windowID,
+                    runID: token.runID,
+                    removeQueuedPendingContext: false
+                )
+            }
+            if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
+                MCPRoutingWaiter.signalFailed(token.runID)
+            }
+            return supersededBySameConnection
+                ? .supersededBySameConnection
+                : .supersededByOtherConnection
+        }
+
+        pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: token.runID)
+        removeTabContext(
+            forConnectionID: token.connectionID,
+            clientName: clientName,
+            windowID: windowID,
+            runID: token.runID,
+            removeQueuedPendingContext: false
+        )
+        if connectionIDByRunID[token.runID] == token.connectionID {
+            connectionIDByRunID.removeValue(forKey: token.runID)
+        }
+        if connectionIDToRunID[token.connectionID] == token.runID {
+            connectionIDToRunID.removeValue(forKey: token.connectionID)
+        }
+
+        if let displacedConnectionID = token.displacedConnectionID,
+           token.displacedPendingPolicyTokenID == nil,
+           token.displacedConnectionRunID == token.runID,
+           connectionIDByRunID[token.runID] == nil,
+           connectionIDToRunID[displacedConnectionID] == nil
+        {
+            connectionIDByRunID[token.runID] = displacedConnectionID
+            connectionIDToRunID[displacedConnectionID] = token.runID
+        } else if token.displacedConnectionID == nil {
+            connectionIDByRunID.removeValue(forKey: token.runID)
+        }
+
+        if let previousRunID = token.previousRunID,
+           token.previousPendingPolicyTokenID == nil
+        {
+            let currentPrimaryConnectionID = connectionIDByRunID[previousRunID]
+            let previousPrimaryIsUnchanged = currentPrimaryConnectionID == token.previousRunPrimaryConnectionID
+            let canRestorePreviousPrimary = token.previousRunPrimaryConnectionID == token.connectionID
+                && currentPrimaryConnectionID == nil
+            if previousPrimaryIsUnchanged || canRestorePreviousPrimary {
+                connectionIDToRunID[token.connectionID] = previousRunID
+                if canRestorePreviousPrimary {
+                    connectionIDByRunID[previousRunID] = token.connectionID
+                }
+            }
+        } else {
+            connectionIDToRunID.removeValue(forKey: token.connectionID)
+        }
+
+        let restoredPreviousRun = token.previousRunID.map {
+            connectionIDToRunID[token.connectionID] == $0
+        } ?? true
+        if restoredPreviousRun, let previousWindowID = token.previousWindowID {
+            windowIDByConnection[token.connectionID] = previousWindowID
+        } else {
+            windowIDByConnection.removeValue(forKey: token.connectionID)
+        }
+
+        if signalRoutingFailure, liveConnectionID(forRunID: token.runID) == nil {
+            MCPRoutingWaiter.signalFailed(token.runID)
+        }
+        return .restored
     }
 
     @MainActor
@@ -2143,7 +2353,8 @@ extension MCPServerViewModel {
         forConnectionID connectionID: UUID?,
         clientName: String?,
         windowID: Int?,
-        runID: UUID? = nil
+        runID: UUID? = nil,
+        removeQueuedPendingContext: Bool = true
     ) {
         if let connectionID,
            let context = tabContextByConnectionID[connectionID]
@@ -2154,10 +2365,15 @@ extension MCPServerViewModel {
                 tabContextByConnectionID.removeValue(forKey: connectionID)
                 windowIDByConnection.removeValue(forKey: connectionID)
 
-                if let boundRunID = context.runID {
+                if let boundRunID = context.runID,
+                   connectionIDByRunID[boundRunID] == connectionID
+                {
                     connectionIDByRunID.removeValue(forKey: boundRunID)
+                    pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: boundRunID)
                 }
-                connectionIDToRunID.removeValue(forKey: connectionID)
+                if connectionIDToRunID[connectionID] == context.runID {
+                    connectionIDToRunID.removeValue(forKey: connectionID)
+                }
 
                 tabContextLog("removeTabContext removed bound context connectionID=\(connectionID) runID=\(runID?.uuidString ?? "nil") tab=\(context.tabID)")
             }
@@ -2170,10 +2386,12 @@ extension MCPServerViewModel {
                 windowIDByConnection.removeValue(forKey: mappedConnection)
             }
             connectionIDByRunID.removeValue(forKey: runID)
+            pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
         }
 
-        // CHANGE: only remove pending contexts when a specific runID is provided
-        if let clientName, let runID {
+        // Only explicit run cleanup owns queued intent. Mapping rollback must not
+        // consume a newer pending context for the same client/run generation.
+        if removeQueuedPendingContext, let clientName, let runID {
             removePendingContext(clientName: clientName, windowID: windowID, runID: runID)
         }
     }

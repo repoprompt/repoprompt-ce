@@ -897,6 +897,8 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var connectionIDToRunID: [UUID: UUID] = [:]
     @MainActor
+    var pendingPolicyRunIDMappingTokenIDByRunID: [UUID: UUID] = [:]
+    @MainActor
     var windowIDByConnection: [UUID: Int] = [:]
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]

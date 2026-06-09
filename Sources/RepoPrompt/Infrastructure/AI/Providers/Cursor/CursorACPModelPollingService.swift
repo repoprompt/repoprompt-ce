@@ -19,7 +19,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
                         enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
                         modelString: modelString,
                         includeRepoPromptMCPServer: false,
-                        cleanupProjectMCPConfig: false
+                        cleanupProjectMCPApproval: false
                     )
                 )
             }
@@ -44,7 +44,7 @@ struct CursorACPControllerModelDiscoveryClient: CursorACPModelDiscoveryClient {
             taskLabelKind: nil
         )
         guard let provider = providerFactory(.cursor, preferredModel) else { return nil }
-        let support = await provider.support(for: request)
+        let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
                 detail: support.reason ?? "Cursor ACP is not available."

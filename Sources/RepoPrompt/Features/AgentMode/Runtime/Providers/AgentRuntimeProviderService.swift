@@ -275,7 +275,7 @@ final class AgentRuntimeProviderService {
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,
                 includeRepoPromptMCPServer: true,
-                cleanupProjectMCPConfig: true
+                cleanupProjectMCPApproval: true
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")

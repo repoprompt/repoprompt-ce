@@ -136,7 +136,8 @@ final class CLIProcessRunner {
         outputMode: OutputFlagMode = .auto(.json),
         timeout: TimeInterval?,
         additionalEnvironment: [String: String] = [:],
-        additionalRemovedKeys: Set<String> = []
+        additionalRemovedKeys: Set<String> = [],
+        cancelChildOnTaskCancellation: Bool = false
     ) async throws -> Result {
         try await gate.withPermit { [self] in
             let environment = await resolvedEnvironment(
@@ -302,7 +303,20 @@ final class CLIProcessRunner {
                 let status: Int32
                 let timedOut: Bool
                 do {
-                    (status, timedOut) = try await waitTask.value
+                    let termination: (Int32, Bool) = if cancelChildOnTaskCancellation {
+                        try await withTaskCancellationHandler {
+                            let result = try await waitTask.value
+                            try Task.checkCancellation()
+                            return result
+                        } onCancel: {
+                            spawned.stdin?.closeFile()
+                            kill(spawned.pid, SIGTERM)
+                            waitTask.cancel()
+                        }
+                    } else {
+                        try await waitTask.value
+                    }
+                    (status, timedOut) = termination
                 } catch {
                     spawned.stdout.closeFile()
                     spawned.stderr.closeFile()

@@ -166,6 +166,40 @@ final class ACPIntegratedAgentModeRunner {
             )
             return
         }
+        let support: ACPSupportResult
+        do {
+            support = try await provider.support(for: freshRunRequest)
+        } catch is CancellationError {
+            await cancelBeforeProviderSend(
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID
+            )
+            return
+        } catch {
+            await failBeforeProviderSend(
+                tabID: tabID,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID,
+                errorText: "ACP support preflight failed: \(error.localizedDescription)"
+            )
+            return
+        }
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
+        guard support == .supported else {
+            await failBeforeProviderSend(
+                tabID: tabID,
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID,
+                attachmentReservationID: attachmentReservationID,
+                errorText: support.reason ?? "\(runRequest.agentKind.displayName) ACP is not available."
+            )
+            return
+        }
         let controller: ACPAgentSessionController
         do {
             controller = try controllerFactory(provider, freshRunRequest)
@@ -358,6 +392,36 @@ final class ACPIntegratedAgentModeRunner {
         ))
     }
 
+    private func cancelBeforeProviderSend(
+        session: AgentModeViewModel.TabSession,
+        runID: UUID,
+        runAttemptID: UUID,
+        attachmentReservationID: UUID?
+    ) async {
+        guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID),
+              let ownership = session.activeRunOwnership,
+              ownership.attemptID == runAttemptID
+        else { return }
+        hooks.recordPendingHandoffSendOutcome(session, false)
+        await terminalCommitBarrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: runID,
+            terminalState: .cancelled,
+            source: "acp.startupCancelled",
+            attachmentReservationID: attachmentReservationID,
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false,
+            prepareProviderState: {
+                session.acpController = nil
+                AgentModeProcessRunIdentity.clearProcessRunID(for: session)
+                return nil
+            }
+        ))
+    }
+
     private func startFreshRun(
         tabID: UUID,
         session: AgentModeViewModel.TabSession,
@@ -414,9 +478,9 @@ final class ACPIntegratedAgentModeRunner {
             hooks.scheduleSave(session.tabID)
             hooks.updateBindings(session)
 
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
-            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
+            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
             setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
             let routed = await lease.releaseWhenRouted()
@@ -505,9 +569,9 @@ final class ACPIntegratedAgentModeRunner {
                 return
             }
 
-            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
-            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
+            await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
+            try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
 
             await runPromptTurn(
                 session: session,

@@ -95,7 +95,7 @@ final class ACPHeadlessAgentProviderBridge: HeadlessAgentProvider {
         defer { lifecycle.clearStreamTask(generation: generation) }
 
         do {
-            let support = await provider.support(for: request)
+            let support = try await provider.support(for: request)
             guard support == .supported else {
                 throw AIProviderError.invalidConfiguration(
                     detail: support.reason ?? "\(providerName) ACP is not available."

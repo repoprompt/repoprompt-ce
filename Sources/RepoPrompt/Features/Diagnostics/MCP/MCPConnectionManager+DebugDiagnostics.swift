@@ -35,6 +35,8 @@ import MCP
                 return await debugRoutingSnapshotToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "connection_history":
                 return debugConnectionHistoryToolPayload(op: op, arguments: arguments)
+            case "run_routing_history":
+                return debugRunRoutingHistoryToolPayload(op: op, arguments: arguments)
             case "clear_connection_history":
                 return debugClearConnectionHistoryToolPayload(op: op, arguments: arguments)
             case "wait_for_reconnect":

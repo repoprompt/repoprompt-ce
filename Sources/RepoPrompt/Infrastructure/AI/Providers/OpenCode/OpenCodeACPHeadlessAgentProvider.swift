@@ -52,10 +52,10 @@ final class OpenCodeACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
-                try await controller.setSessionMode(config.sessionModeID)
                 if let model = Self.selectedModelToApply(config: config) {
                     try await controller.setSessionModel(model)
                 }
+                try await controller.setSessionMode(config.sessionModeID)
             },
             approvalPolicy: .declineUnsupported
         )

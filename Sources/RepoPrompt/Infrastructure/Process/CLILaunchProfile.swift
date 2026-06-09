@@ -54,7 +54,7 @@ enum CLILaunchProfiles {
 
     static let cursor = CLILaunchProfile(
         commandName: "cursor-agent",
-        preferredBasenames: ["cursor-agent", "cursor"],
+        preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
     )
 

@@ -199,7 +199,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         do {
             let recorder = LifecycleRecorder()
-            let provider = LifecycleFakeACPProvider(providerID: .openCode, commandPath: "/usr/bin/true")
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                recorder: recorder
+            )
             let harness = makeHarness(
                 recorder: recorder,
                 acpProviderFactory: { _, _ in
@@ -226,9 +230,87 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(session.runState, .failed)
             XCTAssertNil(session.activeRunOwnership)
             XCTAssertTrue(recorder.contains("factory:acp-provider"))
+            XCTAssertTrue(recorder.contains("provider:support"))
             XCTAssertTrue(recorder.contains("factory:acp-controller"))
+            assertOrderedEvents(["factory:acp-provider", "provider:support", "factory:acp-controller"], in: recorder)
             XCTAssertFalse(recorder.contains("factory:claude"))
             XCTAssertFalse(recorder.contains("factory:headless"))
+        }
+
+        do {
+            let recorder = LifecycleRecorder()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                supportResult: .unsupported(reason: "fixture unsupported"),
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in
+                    recorder.record("factory:acp-provider")
+                    return provider
+                },
+                acpControllerFactory: { _, _ in
+                    recorder.record("factory:acp-controller")
+                    throw LifecycleTestError.expectedACPDispatchStop
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "unsupported acp",
+                initialMessageForRun: "unsupported acp",
+                attachments: []
+            )
+
+            XCTAssertNil(outcome)
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(recorder.contains("factory:acp-provider"))
+            XCTAssertTrue(recorder.contains("provider:support"))
+            XCTAssertFalse(recorder.contains("factory:acp-controller"))
+        }
+
+        do {
+            let recorder = LifecycleRecorder()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                cancelSupport: true,
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in
+                    recorder.record("factory:acp-provider")
+                    return provider
+                },
+                acpControllerFactory: { _, _ in
+                    recorder.record("factory:acp-controller")
+                    throw LifecycleTestError.unexpectedACPControllerCreation
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "cancelled support",
+                initialMessageForRun: "cancelled support",
+                attachments: []
+            )
+
+            XCTAssertNil(outcome)
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+            XCTAssertTrue(recorder.contains("provider:support"))
+            XCTAssertFalse(recorder.contains("factory:acp-controller"))
         }
     }
 
@@ -911,6 +993,88 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testOpenCodePermissionModesUseModernConfigAfterModelAndBeforePrompt() async throws {
+        let rows: [(OpenCodeAgentToolPreferences.PermissionLevel, String)] = [
+            (.managedDefault, OpenCodeAgentConfig.managedSessionModeID),
+            (.fullAccess, OpenCodeAgentConfig.managedFullAccessSessionModeID)
+        ]
+
+        for (level, expectedMode) in rows {
+            let recorder = LifecycleRecorder()
+            let directory = try makeTemporaryDirectory()
+            let recordURL = directory.appendingPathComponent("opencode-flow-\(level.rawValue).jsonl")
+            let scriptURL = try makeOpenCodeModeFlowServerScript()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: scriptURL.path,
+                environment: ["ACP_RECORD_PATH": recordURL.path]
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                workspacePathProvider: { _ in directory.path },
+                acpProviderFactory: { agent, _ in
+                    XCTAssertEqual(agent, .openCode)
+                    return provider
+                },
+                autoSignalACPRouting: true
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+            session.selectedModelRaw = "model-b"
+            session.permissionProfile = .providerOverride(.openCode(level))
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "OpenCode flow",
+                initialMessageForRun: "OpenCode flow",
+                attachments: []
+            )
+            XCTAssertNil(outcome, level.rawValue)
+            await session.agentTask?.value
+
+            let requests = recordedOpenCodeFlowRequests(at: recordURL)
+            let relevant = requests.filter { request in
+                request.method == "session/new"
+                    || request.method == "session/set_config_option"
+                    || request.method == "session/prompt"
+            }
+            XCTAssertEqual(
+                relevant.map(\.method),
+                ["session/new", "session/set_config_option", "session/set_config_option", "session/prompt"],
+                level.rawValue
+            )
+            XCTAssertEqual(relevant[1].params["configId"] as? String, "model", level.rawValue)
+            XCTAssertEqual(relevant[1].params["value"] as? String, "model-b", level.rawValue)
+            XCTAssertEqual(relevant[2].params["configId"] as? String, "mode", level.rawValue)
+            XCTAssertEqual(relevant[2].params["value"] as? String, expectedMode, level.rawValue)
+            XCTAssertFalse(session.items.contains { $0.kind == .error }, level.rawValue)
+
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+    }
+
+    private struct RecordedOpenCodeFlowRequest {
+        let method: String
+        let params: [String: Any]
+    }
+
+    private func recordedOpenCodeFlowRequests(at url: URL) -> [RecordedOpenCodeFlowRequest] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8)
+        else { return [] }
+        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let method = object["method"] as? String
+            else { return nil }
+            return RecordedOpenCodeFlowRequest(
+                method: method,
+                params: object["params"] as? [String: Any] ?? [:]
+            )
+        }
+    }
+
     private func makeHarness(
         recorder: LifecycleRecorder,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
@@ -922,7 +1086,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpProviderFactory: AgentModeViewModel.ACPProviderFactory? = nil,
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
-        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil
+        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        autoSignalACPRouting: Bool = false
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -938,7 +1103,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("factory:acp-controller")
             return try ACPAgentSessionController(provider: provider, runRequest: request)
         }
-        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, _, _, _, _, _, _ in }
+        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
+            if autoSignalACPRouting, let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
+        }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = {}
         let host = AgentModeViewModel(
             testWindowID: 1,
@@ -1149,6 +1318,93 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return url
     }
 
+    private func makeOpenCodeModeFlowServerScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("fake_opencode_mode_flow_server.py")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import os
+        import sys
+
+        record_path = os.environ.get("ACP_RECORD_PATH")
+        current_model = "model-a"
+        current_mode = "ask"
+
+        def record(method, params):
+            if not record_path:
+                return
+            with open(record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"method": method, "params": params}) + "\n")
+
+        def config_options():
+            return [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": current_model,
+                    "options": [
+                        {"value": "model-a", "name": "Model A"},
+                        {"value": "model-b", "name": "Model B"}
+                    ]
+                },
+                {
+                    "id": "mode",
+                    "name": "Session Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": current_mode,
+                    "options": [
+                        {"value": "ask", "name": "Ask"},
+                        {"value": "repoprompt_acp", "name": "RepoPrompt"},
+                        {"value": "repoprompt_acp_full_access", "name": "RepoPrompt Full Access"}
+                    ]
+                }
+            ]
+
+        def respond(request_id, result=None):
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result if result is not None else {}
+            }), flush=True)
+
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except Exception:
+                continue
+            method = request.get("method")
+            params = request.get("params") or {}
+            record(method, params)
+            if method == "initialize":
+                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+            elif method == "session/new":
+                respond(request.get("id"), {
+                    "sessionId": "opencode-mode-flow",
+                    "configOptions": config_options()
+                })
+            elif method == "session/set_config_option":
+                if params.get("configId") == "model":
+                    current_model = params.get("value")
+                elif params.get("configId") == "mode":
+                    current_mode = params.get("value")
+                respond(request.get("id"), {"configOptions": config_options()})
+            elif method == "session/prompt":
+                respond(request.get("id"), {
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1}
+                })
+            else:
+                respond(request.get("id"), {})
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     private func makeFakeACPServerScript() throws -> URL {
         let directory = try makeTemporaryDirectory()
         let scriptURL = directory.appendingPathComponent("fake_acp_server.py")
@@ -1347,6 +1603,7 @@ private enum LifecycleCancellationRow: String, CaseIterable {
 private enum LifecycleTestError: LocalizedError {
     case workspaceMissing
     case expectedACPDispatchStop
+    case unexpectedACPControllerCreation
     case expectedClaudeSendFailure
     case expectedCodexSendFailure
 
@@ -1356,6 +1613,8 @@ private enum LifecycleTestError: LocalizedError {
             "Lifecycle test workspace is missing."
         case .expectedACPDispatchStop:
             "Expected ACP dispatch stop."
+        case .unexpectedACPControllerCreation:
+            "ACP controller creation was not expected."
         case .expectedClaudeSendFailure:
             "Expected Claude send failure."
         case .expectedCodexSendFailure:
@@ -1646,9 +1905,17 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 private struct LifecycleFakeACPProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let commandPath: String
+    var environment: [String: String] = [:]
+    var supportResult: ACPSupportResult = .supported
+    var cancelSupport = false
+    var recorder: LifecycleRecorder?
 
-    func support(for request: ACPRunRequest) async -> ACPSupportResult {
-        .supported
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        recorder?.record("provider:support")
+        if cancelSupport {
+            throw CancellationError()
+        }
+        return supportResult
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
@@ -1656,7 +1923,7 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
             providerID: providerID,
             command: commandPath,
             arguments: [],
-            environment: [:],
+            environment: environment,
             workingDirectory: request.workspacePath,
             additionalPathHints: [],
             enableDebugLogging: false

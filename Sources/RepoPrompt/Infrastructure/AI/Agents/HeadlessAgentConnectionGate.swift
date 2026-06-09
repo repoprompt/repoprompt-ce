@@ -137,6 +137,16 @@ actor HeadlessAgentConnectionGate {
         }
     }
 
+    #if DEBUG
+        func debugWaitingCount() -> Int {
+            waitingContinuations.count
+        }
+
+        func debugActiveConnectionID() -> UUID? {
+            activeConnectionID
+        }
+    #endif
+
     /// Cancel all waiting agents (e.g., on app shutdown)
     func cancelAll() {
         activeConnectionID = nil

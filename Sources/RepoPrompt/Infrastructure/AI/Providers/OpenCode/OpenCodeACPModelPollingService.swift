@@ -45,7 +45,7 @@ struct OpenCodeACPControllerModelDiscoveryClient: OpenCodeACPModelDiscoveryClien
             taskLabelKind: nil
         )
         guard let provider = providerFactory(.openCode, nil) else { return nil }
-        let support = await provider.support(for: request)
+        let support = try await provider.support(for: request)
         guard support == .supported else {
             throw AIProviderError.invalidConfiguration(
                 detail: support.reason ?? "OpenCode ACP is not available."

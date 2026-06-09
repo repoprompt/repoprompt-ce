@@ -214,6 +214,13 @@ The associated event/session/turn types are currently `typealias`es over the Cla
 
 `ClaudeSessionControlling` is retained as a backwards-compatible alias for existing Claude call sites.
 
+## ACP provider MCP tool-call timeouts
+
+RepoPrompt CE cannot impose one MCP tool-call timeout across external ACP providers; configure the provider where supported.
+
+- **OpenCode:** Timeout values are milliseconds. For a 10,000-second call, set `"timeout": 10000000` on the existing RepoPrompt MCP server entry, preserving its `type`, `command`, and `environment` fields.
+- **Cursor Agent:** Current builds expose no supported ACP, CLI, environment, or configuration override that RepoPrompt CE can set to 10,000 seconds. Do not add a speculative CE timeout control; add one only if Cursor documents a supported configuration surface.
+
 ## How a new provider plugs in
 
 The recommended pattern when adding (for example) a hypothetical `acmeAgent` family:

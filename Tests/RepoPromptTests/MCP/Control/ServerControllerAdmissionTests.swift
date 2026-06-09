@@ -26,6 +26,17 @@ final class ServerControllerAdmissionTests: XCTestCase {
         #endif
     }
 
+    func testDefaultAllowListIncludesSynchronousACPClients() throws {
+        #if DEBUG
+            let allowed = ServerController.test_defaultAlwaysAllowedClients
+
+            XCTAssertTrue(allowed.contains(AgentProviderKind.openCodeMCPClientID))
+            XCTAssertTrue(allowed.contains(AgentProviderKind.cursorMCPClientID))
+        #else
+            throw XCTSkip("DEBUG-only ServerController admission seams are unavailable in release builds")
+        #endif
+    }
+
     func testSanitizerRemovesPersistedRepoPromptCLIAllowListEntries() {
         #if DEBUG
             let sanitized = ServerController.test_sanitizedAlwaysAllowedClients([
