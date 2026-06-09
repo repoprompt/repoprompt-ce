@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptShared
 
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }

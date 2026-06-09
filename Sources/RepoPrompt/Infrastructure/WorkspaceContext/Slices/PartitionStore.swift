@@ -46,42 +46,26 @@ actor PartitionStore {
 
     /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
-        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
-        return identity.applicationSupportRootURL()
+        return Self.filesystemIdentity.applicationSupportRootURL()
             .appendingPathComponent("Partitions", isDirectory: true)
     }
+
+    #if DEBUG
+    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
+    #else
+    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
+    #endif
 
     private static let legacyMigrationKey = "PartitionStore.legacyPathMigrated"
 
     /// One-time migration: move partition data from the legacy `RepoPrompt/Partitions/`
     /// path to the CE-branded `RepoPrompt CE/Partitions/` path.
     private static func migrateFromLegacyPathIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: legacyMigrationKey) else { return }
-        defer { UserDefaults.standard.set(true, forKey: legacyMigrationKey) }
-
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let legacyDir = appSupport
-            .appendingPathComponent("RepoPrompt", isDirectory: true)
-            .appendingPathComponent("Partitions", isDirectory: true)
-
-        guard fm.fileExists(atPath: legacyDir.path) else { return }
-
-        let newDir = partitionsBaseURL()
-        try? fm.createDirectory(at: newDir, withIntermediateDirectories: true)
-
-        let items = (try? fm.contentsOfDirectory(at: legacyDir,
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles)) ?? []
-
-        for item in items {
-            let dest = newDir.appendingPathComponent(item.lastPathComponent)
-            if !fm.fileExists(atPath: dest.path) {
-                try? fm.moveItem(at: item, to: dest)
-            }
-        }
-
-        try? fm.removeItem(at: legacyDir)
+        AppSupportDirectoryMigration.migrate(
+            legacySubdirectory: "Partitions",
+            migrationKey: legacyMigrationKey,
+            identity: Self.filesystemIdentity
+        )
     }
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"

@@ -1,5 +1,4 @@
 import Foundation
-import RepoPromptShared
 
 final actor ClaudeNativeProcessSessionController {
     private static let rawEventLogFilePathKey = "claudeRawEventLogFilePath"

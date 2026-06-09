@@ -129,10 +129,15 @@ final class AgentWorkflowStore: ObservableObject {
 
     /// `~/Library/Application Support/RepoPrompt CE/Workflows/`
     static var workflowsDirectoryURL: URL {
-        let identity = MCPFilesystemIdentity.repoPromptCE(.debug)
-        return identity.applicationSupportRootURL()
+        return Self.filesystemIdentity.applicationSupportRootURL()
             .appendingPathComponent("Workflows", isDirectory: true)
     }
+
+    #if DEBUG
+    static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
+    #else
+    static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
+    #endif
 
     @discardableResult
     static func ensureWorkflowsDirectoryExists() throws -> URL {
@@ -152,41 +157,11 @@ final class AgentWorkflowStore: ObservableObject {
     private static let legacyMigrationKey = "AgentWorkflowStore.legacyPathMigrated"
 
     private func migrateFromLegacyPathIfNeeded() {
-        guard !UserDefaults.standard.bool(forKey: Self.legacyMigrationKey) else { return }
-
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let legacyDir = appSupport
-            .appendingPathComponent("RepoPrompt", isDirectory: true)
-            .appendingPathComponent("Workflows", isDirectory: true)
-
-        guard fm.fileExists(atPath: legacyDir.path) else {
-            // No legacy data — mark migrated and move on.
-            UserDefaults.standard.set(true, forKey: Self.legacyMigrationKey)
-            return
-        }
-
-        let newDir = Self.workflowsDirectoryURL
-
-        // Ensure the new directory exists.
-        try? fm.createDirectory(at: newDir, withIntermediateDirectories: true)
-
-        // Move each file that doesn't already exist in the new location.
-        let legacyFiles = (try? fm.contentsOfDirectory(at: legacyDir,
-            includingPropertiesForKeys: nil,
-            options: .skipsHiddenFiles)) ?? []
-
-        for file in legacyFiles {
-            let destination = newDir.appendingPathComponent(file.lastPathComponent)
-            if !fm.fileExists(atPath: destination.path) {
-                try? fm.moveItem(at: file, to: destination)
-            }
-        }
-
-        // Remove the legacy Workflows directory if empty.
-        try? fm.removeItem(at: legacyDir)
-
-        UserDefaults.standard.set(true, forKey: Self.legacyMigrationKey)
+        AppSupportDirectoryMigration.migrate(
+            legacySubdirectory: "Workflows",
+            migrationKey: Self.legacyMigrationKey,
+            identity: Self.filesystemIdentity
+        )
     }
 
     // MARK: Init
