@@ -176,7 +176,7 @@ actor PartitionStore {
     func save(forRoot rootPath: String, scope: PartitionScope, data: PartitionData) async throws {
         let url = partitionURL(forRoot: rootPath, scope: scope)
 
-        // Ensure directories exist: .../Application Support/RepoPrompt/Partitions/<repoKey>/
+        // Ensure directories exist: .../Application Support/RepoPrompt CE/Partitions/<repoKey>/
         let dirURL = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
 

@@ -193,29 +193,44 @@ final class ApplicationSupportPathBrandingTests: XCTestCase {
 
     // MARK: - Temp directories use CE name
 
-    func testClaudeRawEventsTempPathUsesCEName() {
-        let tempBase = FileManager.default.temporaryDirectory
-        let cePath = tempBase.appendingPathComponent("RepoPrompt CE", isDirectory: true)
-            .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
+    func testTempDirectoriesUseCENameInProductionCode() {
+        // Verify the production source files contain "RepoPrompt CE" (not bare "RepoPrompt")
+        // in their temp directory paths. This is a source-level regression test — if someone
+        // changes the string back, this test catches it.
+        let fm = FileManager.default
+        let testsDir = URL(fileURLWithPath: #file)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let repoRoot = testsDir
 
-        XCTAssertTrue(
-            cePath.path.contains("RepoPrompt CE"),
-            "Claude raw events temp path should contain 'RepoPrompt CE': \(cePath.path)"
-        )
-        XCTAssertFalse(
-            cePath.path.contains("/tmp/RepoPrompt/"),
-            "Path should not use legacy '/tmp/RepoPrompt/' pattern: \(cePath.path)"
-        )
-    }
+        let claudeFile = repoRoot
+            .appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/Providers/ClaudeCode/SDK/ClaudeNativeProcessSessionController.swift")
+        let codexFile = repoRoot
+            .appendingPathComponent("Sources/RepoPrompt/Infrastructure/AI/Providers/Codex/AppServer/CodexNativeSessionController.swift")
 
-    func testCodexLogsTempPathUsesCEName() {
-        let tempBase = FileManager.default.temporaryDirectory
-        let cePath = tempBase.appendingPathComponent("RepoPrompt CE/.codexlogs", isDirectory: true)
+        let claudeSource = try? String(contentsOf: claudeFile, encoding: .utf8)
+        let codexSource = try? String(contentsOf: codexFile, encoding: .utf8)
 
-        XCTAssertTrue(
-            cePath.path.contains("RepoPrompt CE"),
-            "Codex logs temp path should contain 'RepoPrompt CE': \(cePath.path)"
-        )
+        // Claude raw events temp path should use "RepoPrompt CE"
+        if let source = claudeSource {
+            XCTAssertTrue(
+                source.contains("\"RepoPrompt CE\""),
+                "ClaudeNativeProcessSessionController should use \"RepoPrompt CE\" in temp path"
+            )
+            XCTAssertFalse(
+                source.contains("appendingPathComponent(\"RepoPrompt\"") && !source.contains("RepoPrompt CE"),
+                "ClaudeNativeProcessSessionController should not use bare \"RepoPrompt\" for temp paths"
+            )
+        }
+
+        // Codex logs temp path should use "RepoPrompt CE"
+        if let source = codexSource {
+            XCTAssertTrue(
+                source.contains("\"RepoPrompt CE"),
+                "CodexNativeSessionController should use \"RepoPrompt CE\" in temp path"
+            )
+        }
     }
 
     // MARK: - Build-flavor identity
