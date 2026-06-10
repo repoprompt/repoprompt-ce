@@ -121,8 +121,24 @@ final class ACPIntegratedAgentModeRunner {
                let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session)
             {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
-                session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] _ in
-                    self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+                let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
+                    ? nil
+                    : makeLease(runID)
+                session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
+                    let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+                    return {
+                        await trackerTeardown?()
+                        switch terminalState {
+                        case .failed:
+                            await deferredLease?.failAndCleanup()
+                        case .cancelled:
+                            await deferredLease?.cancelAndCleanup()
+                        case .completed:
+                            await deferredLease?.cleanupDeferredRouting()
+                        default:
+                            break
+                        }
+                    }
                 }
                 session.agentTask = Task { [weak self, weak session] in
                     guard let self, let session else { return }
@@ -139,6 +155,7 @@ final class ACPIntegratedAgentModeRunner {
                             attachments: attachments,
                             controller: existingController,
                             runRequest: runRequest,
+                            deferredLease: deferredLease,
                             attachmentReservationID: attachmentReservationID
                         )
                     } onCancel: {}
@@ -565,6 +582,7 @@ final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
+        deferredLease: MCPBootstrapLease?,
         attachmentReservationID: UUID?
     ) async {
         do {
@@ -586,6 +604,26 @@ final class ACPIntegratedAgentModeRunner {
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
             try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+
+            if let deferredLease {
+                let acquired = await deferredLease.acquire()
+                guard acquired else {
+                    await finalize(
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        controller: controller,
+                        attachmentReservationID: attachmentReservationID,
+                        terminalState: .failed,
+                        errorText: "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission.",
+                        notifyTurnComplete: false,
+                        shouldShutdownController: true
+                    )
+                    return
+                }
+                await deferredLease.releaseGateForDeferredRouting()
+                log("deferred MCP routing until ACP follow-up prompt", runID: runID)
+            }
 
             await runPromptTurn(
                 session: session,

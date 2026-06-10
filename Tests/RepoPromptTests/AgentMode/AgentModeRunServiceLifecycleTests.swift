@@ -485,6 +485,67 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    func testCursorACPReusedSessionInstallsDeferredPolicyForFollowUpPrompt() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("cursor-deferred-follow-up-routing.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .cursor)
+                recorder.record("factory:acp-provider")
+                return provider
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+
+        let firstOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor prompt one",
+            initialMessageForRun: "Cursor prompt one",
+            attachments: []
+        )
+        XCTAssertNil(firstOutcome)
+        try await withLifecycleTimeout("Cursor ACP initial deferred routing run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let firstRunID = try XCTUnwrap(session.runID)
+
+        let secondOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor prompt two",
+            initialMessageForRun: "Cursor prompt two",
+            attachments: []
+        )
+        XCTAssertNil(secondOutcome)
+        try await withLifecycleTimeout("Cursor ACP deferred routing follow-up run") {
+            await session.agentTask?.value
+        }
+
+        let methods = recordedOpenCodeFlowRequests(at: recordURL).map(\.method)
+        XCTAssertEqual(methods.count(where: { $0 == "session/new" }), 1)
+        XCTAssertEqual(methods.count(where: { $0 == "session/prompt" }), 2)
+        XCTAssertEqual(session.runID, firstRunID)
+        XCTAssertFalse(session.items.contains { $0.text.contains("MCP routing did not complete") })
+        XCTAssertEqual(session.runState, .completed)
+
+        let policyEvents = recorder.events.filter { $0.hasPrefix("policy:cursor:") }
+        XCTAssertEqual(policyEvents.count, 2)
+        XCTAssertEqual(Set(policyEvents).count, 1)
+    }
+
     func testTerminalBarrierRejectsStaleOwnership() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
@@ -1146,7 +1207,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("factory:acp-controller")
             return try ACPAgentSessionController(provider: provider, runRequest: request)
         }
-        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, runID, _, _, _, _, _ in
+        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _ in
+            recorder.record("policy:\(clientName):\(runID?.uuidString ?? "nil")")
             if autoSignalACPRouting, let runID {
                 await MCPRoutingWaiter.notifyRouted(runID: runID)
             }
