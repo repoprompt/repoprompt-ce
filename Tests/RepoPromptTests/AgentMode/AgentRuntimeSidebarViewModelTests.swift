@@ -100,6 +100,90 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 0)
     }
 
+    func testClaudeFableSelectionFallsBackToOneMillionTokenContextWindow() {
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5"
+        )
+
+        XCTAssertNil(store.runtimeVM.snapshot.contextWindowTokens)
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+    }
+
+    func testEncodedClaudeEffortSelectionResolvesContextWindowFallback() {
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "opus[1m]:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "sonnet:high"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+    }
+
+    func testProviderReportedContextWindowWinsOverModelFallback() {
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: AgentContextUsage(
+                modelContextWindow: 250_000,
+                lastTotalTokens: 1000,
+                totalTotalTokens: nil
+            ),
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5"
+        )
+
+        XCTAssertEqual(store.runtimeVM.snapshot.contextWindowTokens, 250_000)
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 250_000)
+    }
+
+    func testItemsUpdateWithoutSelectedAgentResolvesExactRawsOnly() {
+        let viewModel = AgentRuntimeSidebarViewModel()
+
+        // Without an agent, an exact model raw still resolves its context window.
+        viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-fable-5")
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        // Encoded selections need the agent to disambiguate the specifier
+        // grammar; without one they pin to the conservative default.
+        viewModel.update(items: [], codexUsage: nil, selectedModelRaw: "claude-fable-5:xhigh")
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 200_000)
+
+        // Supplying the agent unlocks encoded-raw resolution on the items path.
+        viewModel.update(
+            items: [],
+            codexUsage: nil,
+            selectedAgent: .claudeCode,
+            selectedModelRaw: "claude-fable-5:xhigh"
+        )
+        XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
+    }
+
     private func makeManageSelectionItem(fileCount: Int, timestamp: Date = Date()) throws -> AgentChatItem {
         let files = makeSelectedFiles(fileCount: fileCount)
         let reply = ToolResultDTOs.SelectionReply(
