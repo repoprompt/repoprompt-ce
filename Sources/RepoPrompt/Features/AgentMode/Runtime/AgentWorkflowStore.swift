@@ -126,14 +126,9 @@ final class AgentWorkflowStore: ObservableObject {
 
     // MARK: Filesystem paths
 
-    /// `~/Library/Application Support/RepoPrompt/Workflows/`
+    /// `~/Library/Application Support/RepoPrompt CE/Workflows/`
     static var workflowsDirectoryURL: URL {
-        let appSupport = FileManager.default.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first!
-        return appSupport
-            .appendingPathComponent("RepoPrompt", isDirectory: true)
+        MCPFilesystemConstants.identity.applicationSupportRootURL()
             .appendingPathComponent("Workflows", isDirectory: true)
     }
 

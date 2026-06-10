@@ -43,10 +43,10 @@ actor PartitionStore {
     static let notifSourceIDKey = "sourceID"
     nonisolated let notificationSourceID = UUID()
 
-    /// <AppSupport>/RepoPrompt/Partitions
+    /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return base.appendingPathComponent("RepoPrompt/Partitions", isDirectory: true)
+        MCPFilesystemConstants.identity.applicationSupportRootURL()
+            .appendingPathComponent("Partitions", isDirectory: true)
     }
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
@@ -156,7 +156,7 @@ actor PartitionStore {
     func save(forRoot rootPath: String, scope: PartitionScope, data: PartitionData) async throws {
         let url = partitionURL(forRoot: rootPath, scope: scope)
 
-        // Ensure directories exist: .../Application Support/RepoPrompt/Partitions/<repoKey>/
+        // Ensure directories exist: .../Application Support/RepoPrompt CE/Partitions/<repoKey>/
         let dirURL = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true, attributes: nil)
 

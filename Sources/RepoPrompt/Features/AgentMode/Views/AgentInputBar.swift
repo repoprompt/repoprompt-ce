@@ -1544,8 +1544,8 @@ struct AgentImageInputAdapter {
     init(fileManager: FileManager = .default, temporaryRoot: URL? = nil) {
         self.fileManager = fileManager
         self.temporaryRoot = temporaryRoot
-            ?? fileManager.temporaryDirectory
-            .appendingPathComponent("RepoPromptAgentImageInput", isDirectory: true)
+            ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
+            .appendingPathComponent("AgentImageInput", isDirectory: true)
             .standardizedFileURL
     }
 

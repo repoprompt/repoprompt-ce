@@ -39,6 +39,21 @@ final class MCPFilesystemIdentityTests: XCTestCase {
         XCTAssertEqual(release.claudeWrapperCommandName, "claude-rpce")
     }
 
+    func testCETemporaryRootUsesCanonicalProductDirectoryForBothBuildFlavors() {
+        let fileManager = FileManager.default
+        let expected = fileManager.temporaryDirectory
+            .appendingPathComponent("RepoPrompt CE", isDirectory: true)
+
+        XCTAssertEqual(
+            MCPFilesystemIdentity.repoPromptCE(.debug).temporaryRootURL(fileManager: fileManager),
+            expected
+        )
+        XCTAssertEqual(
+            MCPFilesystemIdentity.repoPromptCE(.release).temporaryRootURL(fileManager: fileManager),
+            expected
+        )
+    }
+
     func testAppConstantsDelegateToSharedIdentity() {
         #if DEBUG
             let expected = MCPFilesystemIdentity.repoPromptCE(.debug)

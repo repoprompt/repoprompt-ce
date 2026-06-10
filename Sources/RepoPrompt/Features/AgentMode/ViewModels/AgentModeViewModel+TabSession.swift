@@ -96,6 +96,8 @@ extension AgentModeViewModel {
         /// Ephemeral location intent for a new manual thread. It is consumed on first send
         /// and intentionally never persisted as session state.
         var pendingInitialStartLocation: InitialStartLocation = .local
+        var composerSubmissionToken = UUID()
+        var isComposerSubmissionInFlight = false
         var isPreparingInitialWorktree: Bool = false
         var isChangingExecutionLocation: Bool = false
 

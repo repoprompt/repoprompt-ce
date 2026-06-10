@@ -55,11 +55,13 @@ extension AgentModeViewModel {
     }
 
     func makeComposerSubmitTarget(tabID: UUID?, session: TabSession?) -> AgentComposerSubmitTarget? {
-        guard let tabID,
-              session?.isPreparingInitialWorktree != true,
-              session?.isChangingExecutionLocation != true
+        guard let tabID else { return nil }
+        let resolvedSession = session ?? self.session(for: tabID)
+        guard !resolvedSession.isComposerSubmissionInFlight,
+              !resolvedSession.isPreparingInitialWorktree,
+              !resolvedSession.isChangingExecutionLocation
         else { return nil }
-        let expectedSourceAgentSessionID = composerSourceAgentSessionID(tabID: tabID, session: session)
+        let expectedSourceAgentSessionID = composerSourceAgentSessionID(tabID: tabID, session: resolvedSession)
         let hasLinkedSession = hasLinkedAgentSession(for: tabID)
         let route: AgentComposerSubmitTarget.Route
         if hasLinkedSession {
@@ -67,18 +69,16 @@ extension AgentModeViewModel {
             route = .existingAgentSession
         } else {
             guard expectedSourceAgentSessionID == nil else { return nil }
-            if let session {
-                guard !session.runState.isActive,
-                      session.runID == nil,
-                      session.activeRunAttemptID == nil
-                else { return nil }
-            }
+            guard !resolvedSession.runState.isActive,
+                  resolvedSession.runID == nil,
+                  resolvedSession.activeRunAttemptID == nil
+            else { return nil }
             route = .createAgentSessionFromSourceTab
         }
 
-        let expectedRunState = session?.runState ?? .idle
-        let expectedRunID = session?.runID
-        let expectedRunAttemptID = session?.activeRunAttemptID
+        let expectedRunState = resolvedSession.runState
+        let expectedRunID = resolvedSession.runID
+        let expectedRunAttemptID = resolvedSession.activeRunAttemptID
         guard !expectedRunState.isActive || expectedRunID != nil else { return nil }
         let expectedInitialStartLocation = initialStartLocationProps(tabID: tabID)?.selection
         return AgentComposerSubmitTarget(
@@ -88,6 +88,7 @@ extension AgentModeViewModel {
             expectedRunState: expectedRunState,
             expectedRunID: expectedRunID,
             expectedRunAttemptID: expectedRunAttemptID,
+            expectedSubmissionToken: resolvedSession.composerSubmissionToken,
             expectedInitialStartLocation: expectedInitialStartLocation
         )
     }

@@ -709,8 +709,8 @@ final class CodexNativeSessionController {
                 return URL(fileURLWithPath: workspacePath, isDirectory: true)
                     .appendingPathComponent(".codexlogs", isDirectory: true)
             }
-            return FileManager.default.temporaryDirectory
-                .appendingPathComponent("RepoPrompt/.codexlogs", isDirectory: true)
+            return MCPFilesystemConstants.identity.temporaryRootURL()
+                .appendingPathComponent(".codexlogs", isDirectory: true)
         }()
         do {
             try FileManager.default.createDirectory(at: baseDirectory, withIntermediateDirectories: true)
