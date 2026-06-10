@@ -15,7 +15,7 @@ struct WorkspaceReadableFileService {
     func awaitFreshnessForExplicitRequest(
         _ userPath: String,
         fallbackScope: WorkspaceLookupRootScope
-    ) async {
+    ) async throws {
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessBegan,
@@ -26,6 +26,7 @@ struct WorkspaceReadableFileService {
             userPath: userPath,
             fallbackScope: fallbackScope
         )
+        try Task.checkCancellation()
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait,
             freshnessState,

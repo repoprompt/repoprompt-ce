@@ -104,6 +104,7 @@ import Foundation
         ) async -> [FileSystemDelta] {
             // Clear any previous deltas
             processedFolders.removeAll()
+            processedFolderBatches.removeAll()
 
             // Process the events and get deltas directly
             let formattedEvents = events.map { ($0.absolutePath, $0.flags, $0.eventId) }
@@ -115,6 +116,10 @@ import Foundation
         /// Test-only method to get processed folders
         func getProcessedFolders() -> Set<String> {
             processedFolders
+        }
+
+        func getProcessedFolderBatches() -> [[String]] {
+            processedFolderBatches
         }
 
         /// Test-only method to get current state

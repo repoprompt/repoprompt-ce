@@ -154,6 +154,114 @@ import MCP
             ])
         }
 
+        func debugMCPReadSearchRuntimeSnapshotPayload(
+            op: String,
+            connectionID: UUID,
+            arguments: [String: Value]
+        ) async -> CallTool.Result {
+            guard let requestedConnectionID = debugOptionalUUID(arguments, "connection_id", op: op) else {
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "invalid_params",
+                    message: "`connection_id` must be a UUID string when provided."
+                )
+            }
+
+            let requestedWindowID: Int?
+            switch debugSearchLaneWindowID(arguments, op: op) {
+            case let .success(windowID):
+                requestedWindowID = windowID
+            case let .failure(result):
+                return result
+            }
+
+            let recentPublicationLimit: Int
+            switch debugBoundedInt(arguments, "recent_publication_limit", defaultValue: 8, range: 0 ... 32) {
+            case let .value(parsed), let .defaulted(parsed):
+                recentPublicationLimit = parsed
+            case .invalid:
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "invalid_params",
+                    message: "`recent_publication_limit` must be an integer between 0 and 32."
+                )
+            }
+
+            let rootLimit: Int
+            switch debugBoundedInt(arguments, "root_limit", defaultValue: 64, range: 1 ... 256) {
+            case let .value(parsed), let .defaulted(parsed):
+                rootLimit = parsed
+            case .invalid:
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "invalid_params",
+                    message: "`root_limit` must be an integer between 1 and 256."
+                )
+            }
+
+            let targets = await debugReadSearchRuntimeTargets(windowID: requestedWindowID)
+            if let requestedWindowID, targets.isEmpty {
+                return debugDiagnosticsError(
+                    op: op,
+                    code: "no_window",
+                    message: "No RepoPrompt window matched window_id \(requestedWindowID)."
+                )
+            }
+
+            var windows: [[String: Any]] = []
+            windows.reserveCapacity(targets.count)
+            for target in targets {
+                let snapshots = await target.store.readSearchRootDiagnosticsSnapshot(
+                    recentPublicationLimit: recentPublicationLimit
+                )
+                let ordered = snapshots.sorted { $0.rootToken.uuidString < $1.rootToken.uuidString }
+                let included = Array(ordered.prefix(rootLimit))
+                windows.append([
+                    "window_id": target.windowID,
+                    "root_count": ordered.count,
+                    "omitted_root_count": max(0, ordered.count - included.count),
+                    "handled_projection_event_count": target.projection.handledEventCount,
+                    "projection_direct_file_id_lookup_count": target.projection.directFileIDLookupCount,
+                    "projection_direct_folder_id_lookup_count": target.projection.directFolderIDLookupCount,
+                    "projection_direct_id_lookup_miss_count": target.projection.directIDLookupMissCount,
+                    "projection_canonical_resync_count": target.projection.canonicalResyncCount,
+                    "read_file_auto_selection": readFileAutoSelectionPayload(target.readFileAutoSelection),
+                    "roots": included.map { root in
+                        readSearchRuntimeRootPayload(
+                            root,
+                            handledGeneration: target.projection.handledGenerationByRootID[root.rootID] ?? 0
+                        )
+                    }
+                ])
+            }
+
+            let targetConnectionID = requestedConnectionID ?? connectionID
+            let limiter = await connectionLimiterDiagnosticsSnapshot(connectionID: targetConnectionID)
+            var limiterPayload = limiter.map { readSearchLimiterPayload($0) } ?? ["found": false]
+            limiterPayload["connection_id"] = targetConnectionID.uuidString
+            return debugDiagnosticsResult([
+                "ok": true,
+                "op": op,
+                "runtime": [
+                    "consistency": "best_effort",
+                    "limiter": limiterPayload,
+                    "observers": [
+                        "tool_call_observer_count": toolCallObserverCount(),
+                        "tool_event_observer_count": toolEventObserverCount()
+                    ],
+                    "window_count": windows.count,
+                    "windows": windows
+                ]
+            ])
+        }
+
+        private struct DebugReadSearchRuntimeTarget {
+            let windowID: Int
+            let store: WorkspaceFileContextStore
+            let projection: WorkspaceFilesViewModel.AppliedIndexProjectionDiagnosticsSnapshot
+            let readFileAutoSelection: MCPReadFileAutoSelectionCoordinator.DebugSnapshot
+        }
+
         private enum DebugSearchLaneWindowIDResult {
             case success(Int?)
             case failure(CallTool.Result)
@@ -174,6 +282,153 @@ import MCP
                     message: "`window_id` must be a positive integer."
                 ))
             }
+        }
+
+        private func debugReadSearchRuntimeTargets(windowID: Int?) async -> [DebugReadSearchRuntimeTarget] {
+            await MainActor.run {
+                WindowStatesManager.shared.allWindows
+                    .filter { windowID == nil || $0.windowID == windowID }
+                    .sorted { $0.windowID < $1.windowID }
+                    .map { window in
+                        DebugReadSearchRuntimeTarget(
+                            windowID: window.windowID,
+                            store: window.workspaceFileContextStore,
+                            projection: window.workspaceFilesViewModel.appliedIndexProjectionDiagnosticsSnapshot(),
+                            readFileAutoSelection: window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
+                        )
+                    }
+            }
+        }
+
+        private func readFileAutoSelectionPayload(
+            _ snapshot: MCPReadFileAutoSelectionCoordinator.DebugSnapshot
+        ) -> [String: Any] {
+            [
+                "canonical_lane_count": snapshot.canonicalLaneCount,
+                "canonical_worker_count": snapshot.canonicalWorkerCount,
+                "mirror_lane_count": snapshot.mirrorLaneCount,
+                "mirror_worker_count": snapshot.mirrorWorkerCount,
+                "closing_context_count": snapshot.closingContextCount,
+                "pending_canonical_batch_count": snapshot.pendingCanonicalBatchCount,
+                "pending_mirror_batch_count": snapshot.pendingMirrorBatchCount
+            ]
+        }
+
+        private func readSearchLimiterPayload(_ snapshot: AsyncLimiter.DebugSnapshot) -> [String: Any] {
+            [
+                "found": true,
+                "limit": snapshot.limit,
+                "permits": snapshot.permits,
+                "active_permit_count": snapshot.activePermitCount,
+                "waiter_count": snapshot.waiterCount,
+                "in_flight_count": snapshot.inFlight,
+                "oldest_waiter_age_ms": Self.debugOptionalValue(snapshot.oldestWaiterAgeMilliseconds),
+                "cancelled_waiter_count": snapshot.cancelledWaiterCount,
+                "is_closed": snapshot.isClosed,
+                "is_idle": snapshot.isIdle
+            ]
+        }
+
+        private func readSearchRuntimeRootPayload(
+            _ root: WorkspaceFileContextStore.ReadSearchRootDiagnosticsSnapshot,
+            handledGeneration: UInt64
+        ) -> [String: Any] {
+            let producedGeneration = root.producedAppliedIndexGeneration
+            let generationLag = producedGeneration >= handledGeneration
+                ? producedGeneration - handledGeneration
+                : 0
+            return [
+                "root_token": root.rootToken.uuidString,
+                "ingress": readSearchIngressPayload(root.ingress),
+                "barrier": readSearchBarrierPayload(root.barrier),
+                "invalidation": readSearchInvalidationPayload(root.invalidation),
+                "projection": [
+                    "produced_generation": producedGeneration,
+                    "handled_generation": handledGeneration,
+                    "generation_lag": generationLag
+                ]
+            ]
+        }
+
+        private func readSearchIngressPayload(
+            _ snapshot: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
+        ) -> [String: Any] {
+            [
+                "is_open": snapshot.isOpen,
+                "queued_publication_count": snapshot.queuedPublicationCount,
+                "applying_publication_count": snapshot.applyingPublicationCount,
+                "outstanding_publication_count": snapshot.outstandingPublicationCount,
+                "waiter_count": snapshot.waiterCount,
+                "accepted_service_publication_sequence": snapshot.acceptedServicePublicationSequence,
+                "applied_service_publication_sequence": snapshot.appliedServicePublicationSequence,
+                "accepted_applied_sequence_gap": snapshot.acceptedAppliedSequenceGap,
+                "applied_watcher_watermark": snapshot.appliedWatcherWatermark,
+                "oldest_outstanding_publication_age_ms": Self.debugOptionalValue(
+                    snapshot.oldestOutstandingPublicationAgeMilliseconds
+                )
+            ]
+        }
+
+        private func readSearchBarrierPayload(
+            _ snapshot: WorkspaceFileContextStore.ScopedIngressBarrierDebugSnapshot
+        ) -> [String: Any] {
+            let active = snapshot.active.map { active in
+                [
+                    "target_watcher_watermark": active.targetWatcherWatermark,
+                    "target_service_publication_sequence": active.targetServicePublicationSequence,
+                    "age_ms": active.ageMilliseconds
+                ]
+            }
+            let completed = snapshot.lastCompleted.map { completed in
+                [
+                    "token": completed.token,
+                    "target_watcher_watermark": completed.targetWatcherWatermark,
+                    "target_service_publication_sequence": completed.targetServicePublicationSequence,
+                    "published_service_publication_sequence": completed.publishedServicePublicationSequence,
+                    "applied_service_publication_sequence": completed.appliedServicePublicationSequence,
+                    "applied_watcher_watermark": completed.appliedWatcherWatermark,
+                    "duration_ms": completed.durationMilliseconds
+                ]
+            }
+            return [
+                "launch_count": snapshot.launchCount,
+                "join_count": snapshot.joinCount,
+                "successor_count": snapshot.successorCount,
+                "completion_count": snapshot.completionCount,
+                "active": Self.debugOptionalValue(active),
+                "last_completed": Self.debugOptionalValue(completed)
+            ]
+        }
+
+        private func readSearchInvalidationPayload(
+            _ snapshot: WorkspaceFileContextStore.PublicationInvalidationHistoryDebugSnapshot
+        ) -> [String: Any] {
+            [
+                "retained_sample_limit": snapshot.retainedSampleLimit,
+                "total_observed_publication_count": snapshot.totalObservedPublicationCount,
+                "dropped_publication_sample_count": snapshot.droppedPublicationSampleCount,
+                "returned_sample_count": snapshot.samples.count,
+                "recent_publications": snapshot.samples.map(readSearchInvalidationSamplePayload)
+            ]
+        }
+
+        private func readSearchInvalidationSamplePayload(
+            _ sample: WorkspaceFileContextStore.PublicationInvalidationDebugSample
+        ) -> [String: Any] {
+            [
+                "service_publication_sequence": Self.debugOptionalValue(sample.servicePublicationSequence),
+                "watcher_accepted_watermark": Self.debugOptionalValue(sample.watcherAcceptedWatermark),
+                "prepared_delta_count": sample.preparedDeltaCount,
+                "topology_invalidation_count": sample.topologyInvalidationCount,
+                "catalog_generation_advance_count": sample.catalogGenerationAdvanceCount,
+                "search_catalog_cache_clear_count": sample.searchCatalogCacheClearCount,
+                "path_worker_invalidation_request_count": sample.pathWorkerInvalidationRequestCount,
+                "content_invalidation_count": sample.contentInvalidationCount,
+                "distinct_content_key_count": sample.distinctContentKeyCount,
+                "decoded_cache_invalidation_request_count": sample.decodedCacheInvalidationRequestCount,
+                "codemap_invalidation_request_count": sample.codemapInvalidationRequestCount,
+                "applied_index_event_yield_count": sample.appliedIndexEventYieldCount
+            ]
         }
 
         private func debugSearchLaneTargets(

@@ -153,6 +153,16 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_content_read_scheduler_snapshot` is only available in DEBUG builds.")
                 #endif
+            case "mcp_read_search_runtime_snapshot":
+                #if DEBUG
+                    return await debugMCPReadSearchRuntimeSnapshotPayload(
+                        op: op,
+                        connectionID: connectionID,
+                        arguments: arguments
+                    )
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_runtime_snapshot` is only available in DEBUG builds.")
+                #endif
             case "bootstrap_diagnostics":
                 return await debugBootstrapDiagnosticsPayload(op: op)
             case "sparkle_status":

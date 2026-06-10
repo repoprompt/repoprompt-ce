@@ -551,6 +551,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             XCTAssertEqual(snapshot.handshake.appliedPolicy?.purpose, .agentModeRun)
             XCTAssertEqual(snapshot.handshake.appliedPolicy?.windowID, fixture.windowID)
+            XCTAssertEqual(snapshot.limiter?.limit, 1)
+            XCTAssertEqual(snapshot.limiter?.permits, 1)
+            XCTAssertEqual(snapshot.limiter?.activePermitCount, 0)
+            XCTAssertEqual(snapshot.limiter?.waiterCount, 0)
+            XCTAssertEqual(snapshot.limiter?.inFlight, 0)
+            XCTAssertEqual(snapshot.limiter?.cancelledWaiterCount, 0)
+            XCTAssertEqual(snapshot.limiter?.isClosed, false)
+            XCTAssertEqual(snapshot.limiter?.isIdle, true)
         }
 
         static func assertSuccessfulResponse(_ rawJSON: String, id: Int) throws {
@@ -729,6 +737,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     parentManager: ServerNetworkManager.shared
                 )
                 connectionManager = resolvedConnectionManager
+                _ = await ServerNetworkManager.shared.debugInstallConnectionLimiterForTesting(
+                    connectionID: connectionID
+                )
                 let spec = MCPBootstrapLeaseSpec.agentMode(
                     tabID: tabID,
                     runID: runID,
@@ -801,6 +812,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let pendingPolicyCount = await networkManager.debugPendingPolicySnapshot(
                 for: AgentProviderKind.codexMCPClientID
             ).count
+            let limiter = await networkManager.connectionLimiterSnapshotForTesting(
+                connectionID: Self.connectionID
+            )
             return await RetainedConnectionSnapshot(
                 connectionID: Self.connectionID,
                 capabilityToken: connectionManager.capabilityToken,
@@ -827,7 +841,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 pendingPolicyCount: pendingPolicyCount,
                 binding: window.mcpServer.connectionBindingSnapshot(forConnection: Self.connectionID),
                 mappedConnectionID: window.mcpServer.connectionID(forRunID: Self.runID),
-                handshake: handshakeRecorder.snapshot()
+                handshake: handshakeRecorder.snapshot(),
+                limiter: limiter
             )
         }
 
@@ -838,6 +853,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             await connectionManager.stop()
             socketClient.close()
             await networkManager.removeConnection(Self.connectionID)
+            let limiterAfterRemoval = await networkManager.connectionLimiterSnapshotForTesting(
+                connectionID: Self.connectionID
+            )
+            XCTAssertNil(limiterAfterRemoval)
             await networkManager.clearExpectedAgentPID(
                 getpid(),
                 for: AgentProviderKind.codexMCPClientID,
@@ -883,6 +902,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let binding: MCPServerViewModel.ConnectionBindingSnapshot
         let mappedConnectionID: UUID?
         let handshake: HandshakeRecorder.Snapshot
+        let limiter: AsyncLimiter.DebugSnapshot?
     }
 
     private struct ConnectionPolicySnapshot: Equatable {

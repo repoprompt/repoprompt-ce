@@ -61,19 +61,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             throw XCTSkip("Exact persisted routing session cleanup diagnostics require DEBUG helpers.")
         #endif
     }
-
-    func testRemoveConnectionSourceStillDropsPerConnectionLimiter() throws {
-        let sourceURL = try RepoRoot.url()
-            .appendingPathComponent("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
-        let source = try String(contentsOf: sourceURL, encoding: .utf8)
-        let start = try XCTUnwrap(source.range(of: "func removeConnection(_ id: UUID) async {"))
-        let end = try XCTUnwrap(source.range(
-            of: "/// Reads the cached TCP client name",
-            range: start.upperBound ..< source.endIndex
-        ))
-        let body = String(source[start.lowerBound ..< end.lowerBound])
-        XCTAssertTrue(body.contains("callLimiters[id] = nil"), body)
-    }
 }
 
 #if DEBUG
