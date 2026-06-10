@@ -1,6 +1,6 @@
 ---
 name: rpce-test-quality
-description: Select, design, review, consolidate, or delete RepoPrompt CE tests and diagnostics by regression value and maintenance cost. Use for bug fixes or features that may need coverage, test-adequacy reviews, XCTest or provider-package changes, runtime diagnostic harnesses, live or packaged smoke, core migrations, and decisions about whether a test is worth committing.
+description: Select, design, review, consolidate, or remove RepoPrompt CE tests, diagnostic harnesses, and smoke checks by regression value and maintenance cost. Use when the task centers on test, diagnostic, or smoke coverage, including whether a single regression test is worth committing. Do not use for feature or bug-fix work merely because it may need coverage, or for routine test or validation execution.
 ---
 
 # RepoPrompt CE Test Quality
