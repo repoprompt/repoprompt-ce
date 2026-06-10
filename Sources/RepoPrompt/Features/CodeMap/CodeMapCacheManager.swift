@@ -323,12 +323,10 @@ class CodeMapCacheManager {
     }
 
     #if DEBUG
-    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
     #else
-    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
+        private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
     #endif
-
-
 
     /// Returns an SHA-256 hash for the given string, used as a unique filename.
     private func hashedFilename(forRootFolderPath rootFolderPath: String) -> String {

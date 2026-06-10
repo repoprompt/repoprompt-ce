@@ -9957,11 +9957,27 @@ final class AgentModeViewModel: ObservableObject {
             resyncAfterRejectedSubmitTarget(target)
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
+        guard let claimedSourceSession = claimComposerSubmitTarget(target) else {
+            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "submission_token_mismatch")
+            resyncAfterRejectedSubmitTarget(target)
+            return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
+        defer {
+            claimedSourceSession.isComposerSubmissionInFlight = false
+            resyncAfterConsumedSubmitTarget(target)
+        }
 
         switch target.route {
         case .existingAgentSession:
             let preparedSession = await ensureSessionReady(tabID: target.tabID)
-            if let rejectionReason = submitTargetRejectionReason(target, session: preparedSession) {
+            guard preparedSession === claimedSourceSession else {
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+            if let rejectionReason = submitTargetRejectionReason(
+                target,
+                session: preparedSession,
+                validateSubmissionToken: false
+            ) {
                 logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
@@ -9997,11 +10013,22 @@ final class AgentModeViewModel: ObservableObject {
                 try await prepareInitialExecutionLocation(initialLocation, for: preparedSession) {
                     !Task.isCancelled
                         && self.sessions[target.tabID] === preparedSession
+                        && self.composerSourceAgentSessionID(
+                            tabID: target.tabID,
+                            session: preparedSession
+                        ) == target.expectedSourceAgentSessionID
                         && sourceSnapshot.matches(self.sessions[target.tabID])
                         && Self.pendingUserTurnState(from: preparedSession) == pendingState
                 }
             } catch {
                 return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
+            }
+            guard composerSourceAgentSessionID(tabID: target.tabID, session: preparedSession)
+                == target.expectedSourceAgentSessionID
+            else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch")
+                resyncAfterRejectedSubmitTarget(target)
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
             guard !Task.isCancelled,
                   sessions[target.tabID] === preparedSession,
@@ -10019,7 +10046,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             return submitUserTurn(text: text, tabID: target.tabID)
         case .createAgentSessionFromSourceTab:
-            let sourceSession = session(for: target.tabID, createIfNeeded: false)
+            let sourceSession = claimedSourceSession
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: sourceSession,
                 fallbackSelectedAgent: selectedAgent,
@@ -10030,13 +10057,13 @@ final class AgentModeViewModel: ObservableObject {
             let pendingState = Self.pendingUserTurnState(from: sourceSession)
             let preparesExecutionLocation = pendingState.initialStartLocation != .local
             if preparesExecutionLocation {
-                sourceSession?.isPreparingInitialWorktree = true
+                sourceSession.isPreparingInitialWorktree = true
                 syncComposerUIState(tabID: target.tabID)
                 syncStatusPillsUIState()
             }
             defer {
                 if preparesExecutionLocation {
-                    sourceSession?.isPreparingInitialWorktree = false
+                    sourceSession.isPreparingInitialWorktree = false
                     if target.tabID == currentTabID {
                         syncComposerUIState(tabID: target.tabID)
                         syncStatusPillsUIState()
@@ -10050,7 +10077,15 @@ final class AgentModeViewModel: ObservableObject {
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
-            if let rejectionReason = submitTargetRejectionReason(target, session: sessions[target.tabID]) {
+            guard sessions[target.tabID] === sourceSession else {
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+            if let rejectionReason = submitTargetRejectionReason(
+                target,
+                session: sourceSession,
+                validateSubmissionToken: false
+            ) {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
@@ -10101,6 +10136,7 @@ final class AgentModeViewModel: ObservableObject {
                     try await prepareInitialExecutionLocation(pendingState.initialStartLocation, for: destinationSession) {
                         !Task.isCancelled
                             && self.sessions[destinationTabID] === destinationSession
+                            && self.sessions[target.tabID] === sourceSession
                             && sourceSnapshot.matches(self.sessions[target.tabID])
                             && Self.pendingUserTurnState(from: destinationSession) == pendingState
                     }
@@ -10112,6 +10148,7 @@ final class AgentModeViewModel: ObservableObject {
             }
             guard !Task.isCancelled,
                   sessions[destinationTabID] === destinationSession,
+                  sessions[target.tabID] === sourceSession,
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
@@ -13004,7 +13041,28 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func submitTargetRejectionReason(_ target: AgentComposerSubmitTarget, session: TabSession?) -> String? {
+    private func claimComposerSubmitTarget(_ target: AgentComposerSubmitTarget) -> TabSession? {
+        guard let session = sessions[target.tabID],
+              !session.isComposerSubmissionInFlight,
+              session.composerSubmissionToken == target.expectedSubmissionToken
+        else { return nil }
+        session.isComposerSubmissionInFlight = true
+        session.composerSubmissionToken = UUID()
+        return session
+    }
+
+    private func resyncAfterConsumedSubmitTarget(_ target: AgentComposerSubmitTarget) {
+        if currentTabID == target.tabID {
+            syncComposerUIState(tabID: target.tabID)
+        }
+        requestUIRefresh(tabID: target.tabID, urgent: true)
+    }
+
+    private func submitTargetRejectionReason(
+        _ target: AgentComposerSubmitTarget,
+        session: TabSession?,
+        validateSubmissionToken: Bool = true
+    ) -> String? {
         let liveHasLinkedSession = hasLinkedAgentSession(for: target.tabID)
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let liveRunState = session?.runState ?? .idle
@@ -13012,36 +13070,48 @@ final class AgentModeViewModel: ObservableObject {
         let liveRunAttemptID = session?.activeRunAttemptID
         let liveInitialStartLocation = initialStartLocationProps(tabID: target.tabID)?.selection
 
+        if validateSubmissionToken, session?.composerSubmissionToken != target.expectedSubmissionToken {
+            return "submission_token_mismatch"
+        }
+
         switch target.route {
         case .existingAgentSession:
             guard liveHasLinkedSession else { return "linked_state_mismatch" }
+            guard let expectedSourceAgentSessionID = target.expectedSourceAgentSessionID else {
+                return "missing_expected_agent_session_id"
+            }
+            guard liveSourceAgentSessionID == expectedSourceAgentSessionID else {
+                return "agent_session_id_mismatch"
+            }
+            guard liveInitialStartLocation == target.expectedInitialStartLocation else {
+                return "initial_start_location_mismatch"
+            }
+            return nil
         case .createAgentSessionFromSourceTab:
             guard !liveHasLinkedSession else { return "linked_state_mismatch" }
+            guard liveSourceAgentSessionID == target.expectedSourceAgentSessionID else {
+                return "agent_session_id_mismatch"
+            }
+            guard liveRunState == target.expectedRunState else {
+                return "run_state_mismatch"
+            }
+            if liveRunState.isActive, target.expectedRunID == nil {
+                return "missing_expected_run_id"
+            }
+            guard liveRunID == target.expectedRunID else {
+                return "run_id_mismatch"
+            }
+            guard liveRunAttemptID == target.expectedRunAttemptID else {
+                return "run_attempt_id_mismatch"
+            }
+            guard liveInitialStartLocation == target.expectedInitialStartLocation else {
+                return "initial_start_location_mismatch"
+            }
+            if liveSourceAgentSessionID != nil || liveRunState.isActive || liveRunID != nil || liveRunAttemptID != nil {
+                return "unlinked_source_has_run_identity"
+            }
+            return nil
         }
-        guard liveSourceAgentSessionID == target.expectedSourceAgentSessionID else {
-            return "agent_session_id_mismatch"
-        }
-        guard liveRunState == target.expectedRunState else {
-            return "run_state_mismatch"
-        }
-        if liveRunState.isActive, target.expectedRunID == nil {
-            return "missing_expected_run_id"
-        }
-        guard liveRunID == target.expectedRunID else {
-            return "run_id_mismatch"
-        }
-        guard liveRunAttemptID == target.expectedRunAttemptID else {
-            return "run_attempt_id_mismatch"
-        }
-        guard liveInitialStartLocation == target.expectedInitialStartLocation else {
-            return "initial_start_location_mismatch"
-        }
-        if target.route == .createAgentSessionFromSourceTab,
-           liveSourceAgentSessionID != nil || liveRunState.isActive || liveRunID != nil || liveRunAttemptID != nil
-        {
-            return "unlinked_source_has_run_identity"
-        }
-        return nil
     }
 
     private func logRejectedSubmitTarget(_ target: AgentComposerSubmitTarget, session: TabSession?, reason: String) {
@@ -13065,7 +13135,9 @@ final class AgentModeViewModel: ObservableObject {
                     "expectedRunID": AgentModePerfDiagnostics.shortID(target.expectedRunID),
                     "liveRunID": AgentModePerfDiagnostics.shortID(session?.runID),
                     "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID)
+                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID),
+                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target.expectedSubmissionToken),
+                    "liveSubmissionToken": AgentModePerfDiagnostics.shortID(session?.composerSubmissionToken)
                 ]
             )
         #endif

@@ -53,9 +53,14 @@ struct AgentComposerSubmitTarget: Equatable {
     let tabID: UUID
     let route: Route
     let expectedSourceAgentSessionID: UUID?
+    // Exact freshness guards for unlinked first-send targets. For an existing
+    // persistent session, these remain render-time diagnostics while live routing
+    // selects the current run and attempt at send time.
     let expectedRunState: AgentSessionRunState
     let expectedRunID: UUID?
     let expectedRunAttemptID: UUID?
+    /// One-shot render identity claimed before submission performs any async work.
+    let expectedSubmissionToken: UUID
     let expectedInitialStartLocation: AgentModeViewModel.InitialStartLocation?
 }
 

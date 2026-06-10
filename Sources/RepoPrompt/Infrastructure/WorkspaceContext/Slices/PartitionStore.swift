@@ -46,17 +46,15 @@ actor PartitionStore {
 
     /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
-        return Self.filesystemIdentity.applicationSupportRootURL()
+        filesystemIdentity.applicationSupportRootURL()
             .appendingPathComponent("Partitions", isDirectory: true)
     }
 
     #if DEBUG
-    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
     #else
-    private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
+        private static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
     #endif
-
-
 
     /// repoKey = "<leafName>-<sha256(stdPath)[0..12]>"
     private func repoKey(forRoot rootPath: String) -> String {

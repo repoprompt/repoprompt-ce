@@ -129,14 +129,14 @@ final class AgentWorkflowStore: ObservableObject {
 
     /// `~/Library/Application Support/RepoPrompt CE/Workflows/`
     static var workflowsDirectoryURL: URL {
-        return Self.filesystemIdentity.applicationSupportRootURL()
+        filesystemIdentity.applicationSupportRootURL()
             .appendingPathComponent("Workflows", isDirectory: true)
     }
 
     #if DEBUG
-    static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
+        static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.debug)
     #else
-    static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
+        static let filesystemIdentity = MCPFilesystemIdentity.repoPromptCE(.release)
     #endif
 
     @discardableResult
@@ -148,8 +148,6 @@ final class AgentWorkflowStore: ObservableObject {
         }
         return url
     }
-
-
 
     // MARK: Init
 
