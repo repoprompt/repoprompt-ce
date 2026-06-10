@@ -1719,42 +1719,24 @@ final class AgentModeViewModel: ObservableObject {
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?
     ) -> AgentSessionWorktreeBinding? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        return primaryWorkspacePath.flatMap { primaryPath in
-            bindings.first { binding in
-                standardizedWorkspacePath(binding.logicalRootPath) == primaryPath
-            }
-        } ?? (primaryWorkspacePath == nil && bindings.count == 1 ? bindings[0] : nil)
+        AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+            in: bindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func effectiveWorkspacePath(
         for session: TabSession,
         fallbackWorkspacePath: String?
     ) throws -> String? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        let binding = primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: fallbackWorkspacePath)
-
-        guard let binding else {
-            return primaryWorkspacePath
-        }
-        let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath)
-        guard let worktreePath else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: worktreePath, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        return worktreePath
+        try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func standardizedWorkspacePath(_ path: String?) -> String? {
-        guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty
-        else {
-            return nil
-        }
-        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL.path
+        AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(path)
     }
 
     private func currentWorkspacePath() -> String? {
@@ -5183,6 +5165,14 @@ final class AgentModeViewModel: ObservableObject {
         else {
             throw ExecutionLocationTransitionError.stale
         }
+        try await materializeWorktreeBindingsForTransition(desiredBindings, sessionID: sessionID)
+        guard sessions[session.tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              session.worktreeBindings == previousBindings,
+              !session.runState.isActive
+        else {
+            throw ExecutionLocationTransitionError.stale
+        }
         if !changedDuringActiveRun {
             await stageResumeRecoveryHandoffIfNeeded(for: session)
         }
@@ -5200,6 +5190,35 @@ final class AgentModeViewModel: ObservableObject {
     private func executionDestinationPath(in bindings: [AgentSessionWorktreeBinding]) -> String? {
         let binding = Self.primaryExecutionBinding(in: bindings, fallbackWorkspacePath: workspacePathProvider())
         return Self.standardizedWorkspacePath(binding?.worktreeRootPath) ?? Self.standardizedWorkspacePath(workspacePathProvider())
+    }
+
+    private func materializeWorktreeBindingsForTransition(
+        _ bindings: [AgentSessionWorktreeBinding],
+        sessionID: UUID
+    ) async throws {
+        guard !bindings.isEmpty else { return }
+        guard let promptManager else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+        guard let projection = await WorkspaceRootBindingProjectionMaterializer(
+            store: promptManager.workspaceFileContextStore
+        ).materialize(sessionID: sessionID, bindings: bindings), !projection.isEmpty else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+
+        let availability = await promptManager.workspaceFileContextStore.rootScopeAvailability(projection.lookupRootScope)
+        guard case .available = availability else {
+            let missingPaths: [String] = switch availability {
+            case .available:
+                []
+            case let .sessionWorktreeUnavailable(paths):
+                paths
+            }
+            let suffix = missingPaths.isEmpty ? "" : ": \(missingPaths.joined(separator: ", "))"
+            throw ExecutionLocationTransitionError.unavailable(
+                "The selected worktree roots are unavailable\(suffix). The thread was not switched to the canonical checkout."
+            )
+        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {

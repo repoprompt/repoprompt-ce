@@ -68,7 +68,8 @@ extension MCPServerViewModel {
     @MainActor
     func evaluateVirtualPromptEntries(
         for selection: StoredSelection,
-        codeMapUsage: CodeMapUsage
+        codeMapUsage: CodeMapUsage,
+        rootScope: WorkspaceLookupRootScope = .allLoaded
     ) async -> PromptEntriesEvaluation {
         let store = promptVM.workspaceFileContextStore
         let accountingService = PromptContextAccountingService()
@@ -76,7 +77,7 @@ extension MCPServerViewModel {
             selection: selection,
             codeMapUsage: codeMapUsage,
             filePathDisplay: promptVM.filePathDisplayOption,
-            rootScope: .allLoaded,
+            rootScope: rootScope,
             pathLocateProfile: .uiAssisted
         )
         let accounting = await accountingService.calculatePromptStats(request: request, store: store)
@@ -270,7 +271,8 @@ extension MCPServerViewModel {
         let collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
         let evaluation = await evaluateVirtualPromptEntries(
             for: effectiveSelection,
-            codeMapUsage: collections.codeMapUsage
+            codeMapUsage: collections.codeMapUsage,
+            rootScope: lookupContext.rootScope
         )
         let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
         let tokens = TokenServices(owner: self)
@@ -435,7 +437,8 @@ extension MCPServerViewModel {
             fileCount: 0,
             content: "",
             unmappedPaths: unmapped,
-            omittedCount: nil
+            omittedCount: nil,
+            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection)
         )
     }
 }

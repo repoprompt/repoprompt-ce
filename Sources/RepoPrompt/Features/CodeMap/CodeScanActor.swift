@@ -239,6 +239,7 @@ actor CodeScanActor {
     /// -------------------------------------
     enum ScanBatchPurpose {
         case initialRootLoad
+        case selfHealing
         case adhoc
     }
 
@@ -879,8 +880,8 @@ actor CodeScanActor {
         for request in requests {
             let rootKey = canonicalRoot(request.rootFolderPath)
 
-            // Skip if we have a known date >= this request (except during initial root load).
-            if purpose != .initialRootLoad,
+            // Ad hoc scans may skip unchanged files; initial loads and self-healing must requeue them.
+            if purpose == .adhoc,
                let knownDate = latestFileModDates[request.fileID],
                knownDate >= request.modificationDate
             {

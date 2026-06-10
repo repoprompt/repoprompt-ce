@@ -32,6 +32,7 @@ enum ToolOutputFormatter {
     }
 
     private enum WorktreeScopeOperation {
+        case codeStructure
         case fileTree
         case search
         case readFile
@@ -44,6 +45,8 @@ enum ToolOutputFormatter {
     ) -> [String] {
         guard let scope, !scope.rootMappings.isEmpty else { return [] }
         let action = switch operation {
+        case .codeStructure:
+            "codemap scans use"
         case .fileTree:
             "filesystem reads use"
         case .search:
@@ -2573,8 +2576,9 @@ extension ToolOutputFormatter {
             let tokenBudgetOmitted = dto.tokenBudgetOmittedCount ?? 0
             let totalOmitted = dto.omittedTotal ?? (maxResultsOmitted + tokenBudgetOmitted)
             let hasRenderableResult = dto.fileCount > 0 || totalOmitted > 0
+            let hasPendingRepair = dto.pendingPaths?.isEmpty == false
             var out: [String] = []
-            out.append("## Code Structure \(statusIcon(success: hasRenderableResult))")
+            out.append("## Code Structure \(statusIcon(success: hasRenderableResult, warning: hasPendingRepair))")
             out.append("- **Files with codemap**: \(dto.fileCount)")
             switch (maxResultsOmitted, tokenBudgetOmitted) {
             case let (maxOmitted, 0) where maxOmitted > 0:
@@ -2586,6 +2590,19 @@ extension ToolOutputFormatter {
                 out.append("- **Guidance**: Increase `max_results` to consider more files, or narrow `paths` to change which files fit inside the response cap.")
             default:
                 break
+            }
+            out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
+            if let pending = dto.pendingPaths, !pending.isEmpty {
+                out.append("- **Codemap repair pending**: \(pending.count) (bounded wait expired; retry with narrower `paths` if needed)")
+                out.append("")
+                out.append("### Files still awaiting codemap")
+                let grouped = groupPathsByRoot(pending)
+                for (root, paths) in grouped {
+                    out.append("- **\(root)**")
+                    for p in paths {
+                        out.append("  - `\(p)`")
+                    }
+                }
             }
             if let unmapped = dto.unmappedPaths, !unmapped.isEmpty {
                 out.append("- **Without codemap**: \(unmapped.count)")

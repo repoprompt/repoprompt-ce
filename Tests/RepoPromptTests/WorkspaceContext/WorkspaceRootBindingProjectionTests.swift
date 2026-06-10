@@ -276,6 +276,47 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
     }
 
+    func testMaterializerInitializesSessionWorktreeCodemapsIdempotently() async throws {
+        let logicalRootURL = try makeTemporaryRoot(name: "ProjectionCodemapLogical")
+        let physicalRootURL = try makeTemporaryRoot(name: "ProjectionCodemapPhysical")
+        try write(
+            "struct WorktreeInitializedType {\n    func initializedMethod() {}\n}\n",
+            to: physicalRootURL.appendingPathComponent("Sources/App.swift")
+        )
+        let store = WorkspaceFileContextStore()
+        let loadedLogicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = WorkspaceRootRef(
+            id: loadedLogicalRoot.id,
+            name: loadedLogicalRoot.name,
+            fullPath: loadedLogicalRoot.standardizedFullPath
+        )
+        let physicalRoot = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: physicalRootURL.path)
+        let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "codemap")
+
+        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [binding]
+        )
+        let firstProjection = try XCTUnwrap(materializedProjection)
+        let physicalRootID = try XCTUnwrap(firstProjection.physicalRootRefs.first?.id)
+
+        let firstRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
+        XCTAssertTrue(firstRedundantInitialization.isEmpty)
+        let snapshot = try await waitForCodemapSnapshot(
+            store: store,
+            rootID: physicalRootID,
+            relativePath: "Sources/App.swift"
+        )
+        XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("WorktreeInitializedType") == true)
+
+        _ = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: UUID(),
+            bindings: [binding]
+        )
+        let secondRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
+        XCTAssertTrue(secondRedundantInitialization.isEmpty)
+    }
+
     func testMaterializedSessionWorktreeScopeReportsAvailable() async throws {
         let logicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailableLogical")
         let physicalRootURL = try makeTemporaryRoot(name: "ProjectionAvailablePhysical")
@@ -300,6 +341,24 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertTrue(scopedRoots.contains {
             $0.standardizedFullPath == physicalRootURL.standardizedFileURL.path
         })
+    }
+
+    private func waitForCodemapSnapshot(
+        store: WorkspaceFileContextStore,
+        rootID: UUID,
+        relativePath: String,
+        timeout: Duration = .seconds(6)
+    ) async throws -> WorkspaceCodemapSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let snapshot = await store.codemapSnapshot(rootID: rootID, relativePath: relativePath) {
+                return snapshot
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for codemap snapshot")
+        throw NSError(domain: "WorkspaceRootBindingProjectionTests", code: 1)
     }
 
     private static func binding(

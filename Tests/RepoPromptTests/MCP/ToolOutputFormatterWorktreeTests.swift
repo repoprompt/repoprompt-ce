@@ -239,6 +239,24 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 
+    func testCodeStructureOutputShowsPendingLogicalPathsAndWorktreeScope() throws {
+        let dto = ToolResultDTOs.SelectedCodeStructureDTO(
+            fileCount: 0,
+            content: "",
+            pendingPaths: ["Project/Sources/App.swift"],
+            worktreeScope: Self.scope()
+        )
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatCodeStructure(value: Self.value(dto)))
+
+        XCTAssertTrue(text.contains("## Code Structure ⚠️"), text)
+        XCTAssertTrue(text.contains("Codemap repair pending**: 1"), text)
+        XCTAssertTrue(text.contains("- **Project**"), text)
+        XCTAssertTrue(text.contains("`Sources/App.swift`"), text)
+        XCTAssertTrue(text.contains("codemap scans use"), text)
+        Self.assertScopeBlock(in: text)
+    }
+
     func testWorkspaceContextOutputShowsSingleWorktreeScopeBlock() throws {
         let scope = Self.scope()
         let dto = ToolResultDTOs.PromptContextDTO(

@@ -275,6 +275,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
     ) async -> WorkspaceRootBindingProjection? {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
+        var loadedSessionWorktreeRootIDs: [UUID] = []
         for binding in bindings {
             let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
             let logicalRoot = visibleRoots.first { $0.standardizedFullPath == logicalPath }
@@ -297,6 +298,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                     name: logicalRoot.name,
                     fullPath: physicalRecord.standardizedFullPath
                 )
+                loadedSessionWorktreeRootIDs.append(physicalRecord.id)
             } catch {
                 // Fail closed for bound sessions: keep the logical -> physical projection so
                 // display paths and complete-diff policy still know this session is worktree-bound,
@@ -313,6 +315,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
         }
         guard !boundRoots.isEmpty else { return nil }
+        _ = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: loadedSessionWorktreeRootIDs)
         return WorkspaceRootBindingProjection(sessionID: sessionID, boundRoots: boundRoots, visibleLogicalRoots: visibleRoots)
     }
 }

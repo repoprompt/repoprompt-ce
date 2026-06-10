@@ -10,6 +10,7 @@ struct MCPWindowToolDependencies {
         let tabID: UUID
         let workspaceID: UUID?
         let bindCaller: Bool
+        let workspaceContext: ContextBuilderWorkspaceContext?
     }
 
     typealias ExecuteTool = @Sendable (_ args: [String: Value]) async throws -> Value
@@ -49,7 +50,8 @@ struct MCPWindowToolDependencies {
         _ selection: StoredSelection,
         _ includeBlocks: Bool,
         _ display: FilePathDisplay,
-        _ codeMapUsageOverride: CodeMapUsage?
+        _ codeMapUsageOverride: CodeMapUsage?,
+        _ lookupContextOverride: WorkspaceLookupContext?
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias SendStageProgress = @Sendable (
         _ connectionID: UUID?,
@@ -77,7 +79,8 @@ struct MCPWindowToolDependencies {
         _ tabID: UUID,
         _ mode: HeadlessMode,
         _ prompt: String,
-        _ selection: StoredSelection
+        _ selection: StoredSelection,
+        _ lookupContext: WorkspaceLookupContext?
     ) async throws -> ChatSendReply
     typealias CaptureRequestMetadata = @MainActor @Sendable () async -> MCPServerViewModel.RequestMetadata
     typealias ResolveTabContextSnapshot = @MainActor @Sendable (
@@ -173,7 +176,7 @@ struct MCPWindowToolDependencies {
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupRootScope: WorkspaceLookupRootScope) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> String?
-    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ projection: WorkspaceRootBindingProjection?) async throws -> ToolResultDTOs.SelectedCodeStructureDTO
+    typealias BuildCodeStructureDTO = @MainActor @Sendable (_ files: [WorkspaceFileRecord], _ maxResults: Int, _ includeUnmappedPaths: Bool, _ lookupContext: WorkspaceLookupContext) async throws -> ToolResultDTOs.SelectedCodeStructureDTO
     typealias ResolveFilesForCodeStructure = @MainActor @Sendable (_ paths: [String], _ lookupRootScope: WorkspaceLookupRootScope) async throws -> [WorkspaceFileRecord]
     typealias BuildStoreBackedFileTreeResult = @MainActor @Sendable (_ mode: String, _ maxDepth: Int?, _ startPath: String?, _ lookupContext: WorkspaceLookupContext) async throws -> (result: FileTreeResult, rootCount: Int)
     typealias ReadFile = @MainActor @Sendable (_ path: String, _ startLine1Based: Int?, _ lineCount: Int?, _ lookupRootScope: WorkspaceLookupRootScope) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)

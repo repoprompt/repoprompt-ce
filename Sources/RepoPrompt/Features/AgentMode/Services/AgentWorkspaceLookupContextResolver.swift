@@ -35,6 +35,34 @@ struct AgentWorkspaceLookupContextIdentity: Hashable {
 }
 
 enum AgentWorkspaceLookupContextResolver {
+    static func requiredLookupContext(
+        source: AgentWorkspaceLookupContextSource,
+        store: WorkspaceFileContextStore
+    ) async throws -> WorkspaceLookupContext {
+        guard let sessionID = source.activeAgentSessionID,
+              !source.worktreeBindings.isEmpty
+        else {
+            return .visibleWorkspace
+        }
+
+        try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(source.worktreeBindings)
+        guard let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: sessionID,
+            bindings: source.worktreeBindings
+        ),
+            !projection.isEmpty
+        else {
+            throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
+        }
+
+        switch await store.rootScopeAvailability(projection.lookupRootScope) {
+        case .available:
+            return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        case .sessionWorktreeUnavailable:
+            throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
+        }
+    }
+
     static func lookupContext(
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
@@ -50,5 +78,13 @@ enum AgentWorkspaceLookupContextResolver {
             return WorkspaceLookupContext.visibleWorkspace
         }
         return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+    }
+}
+
+enum AgentWorkspaceLookupContextResolutionError: LocalizedError {
+    case unavailableProjection
+
+    var errorDescription: String? {
+        "The Agent session worktree projection is unavailable. The operation stopped rather than falling back to the canonical checkout."
     }
 }

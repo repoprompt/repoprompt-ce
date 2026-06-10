@@ -434,6 +434,11 @@ struct WorkspaceCodemapSnapshot {
     let fileAPI: FileAPI?
 }
 
+struct WorkspaceCodemapRepairResult {
+    let snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]
+    let pendingFileIDs: Set<UUID>
+}
+
 struct WorkspaceCodemapUpdateEvent {
     let rootID: UUID
     let rootPath: String

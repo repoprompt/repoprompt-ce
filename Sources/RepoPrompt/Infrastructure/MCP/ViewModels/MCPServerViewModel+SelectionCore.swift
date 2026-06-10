@@ -733,7 +733,7 @@ extension MCPServerViewModel {
 
     struct CodeStructureBuilder {
         unowned let owner: MCPServerViewModel
-        let projection: WorkspaceRootBindingProjection?
+        let lookupContext: WorkspaceLookupContext
 
         func build(for files: [WorkspaceFileRecord]) async throws -> ToolResultDTOs.SelectedCodeStructureDTO? {
             guard !files.isEmpty else { return nil }
@@ -744,7 +744,7 @@ extension MCPServerViewModel {
                 fromRecords: files,
                 maxResults: 25,
                 includeUnmappedPaths: true,
-                projection: projection
+                lookupContext: lookupContext
             )
         }
     }
