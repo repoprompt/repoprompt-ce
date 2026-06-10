@@ -21,6 +21,8 @@ struct WorkspaceLandingView: View {
     var onSetupGuide: (() -> Void)?
 
     @State private var refreshTrigger = UUID()
+    @State private var isImportingClassicRepoPrompt = false
+    @State private var classicRepoPromptImportResultMessage: String?
     @ObservedObject private var fontScale = FontScaleManager.shared
     @ObservedObject private var windowStatesManager = WindowStatesManager.shared
     private var fontPreset: FontScalePreset {
@@ -43,6 +45,23 @@ struct WorkspaceLandingView: View {
         .onReceive(NotificationCenter.default.publisher(for: .workspaceListDidChange).receive(on: RunLoop.main)) { _ in
             refreshTrigger = UUID()
         }
+        .alert(
+            "Classic RepoPrompt Import",
+            isPresented: Binding(
+                get: { classicRepoPromptImportResultMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        classicRepoPromptImportResultMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                classicRepoPromptImportResultMessage = nil
+            }
+        } message: {
+            Text(classicRepoPromptImportResultMessage ?? "")
+        }
     }
 
     // MARK: - Compact Layout (unchanged)
@@ -52,6 +71,8 @@ struct WorkspaceLandingView: View {
             headerBlock(centered: true)
 
             openFolderButton
+
+            classicRepoPromptImportButton
 
             Divider().padding(.vertical, 4)
 
@@ -107,6 +128,8 @@ struct WorkspaceLandingView: View {
                         .padding(.horizontal, 20)
                     }
                     .buttonStyle(CustomButtonStyle())
+
+                    classicRepoPromptImportButton
                 }
 
                 Spacer()
@@ -253,6 +276,40 @@ struct WorkspaceLandingView: View {
         }
         .buttonStyle(CustomButtonStyle())
         .hoverTooltip("Open a folder and create a new workspace", .top)
+    }
+
+    @ViewBuilder
+    private var classicRepoPromptImportButton: some View {
+        if ClassicRepoPromptImportService().sourceExists() {
+            Button {
+                runClassicRepoPromptImport()
+            } label: {
+                HStack(spacing: 8) {
+                    if isImportingClassicRepoPrompt {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: "square.and.arrow.down")
+                    }
+                    Text(isImportingClassicRepoPrompt ? "Importing Classic..." : "Import Classic RepoPrompt")
+                        .font(fontPreset.subheadlineFont)
+                }
+            }
+            .buttonStyle(CustomButtonStyle(verticalPadding: 6, horizontalPadding: 12, height: fontPreset.scaledMetric(32)))
+            .disabled(isImportingClassicRepoPrompt)
+            .hoverTooltip("Import Classic workspaces, sessions, settings, presets, prompts, models, workflows, and CLI/provider settings.", .top)
+        }
+    }
+
+    private func runClassicRepoPromptImport() {
+        guard !isImportingClassicRepoPrompt else { return }
+        isImportingClassicRepoPrompt = true
+
+        Task { @MainActor in
+            let result = await workspaceManager.importClassicRepoPromptData()
+            isImportingClassicRepoPrompt = false
+            classicRepoPromptImportResultMessage = result.userFacingSummary()
+        }
     }
 
     @ViewBuilder

@@ -1570,6 +1570,14 @@ class WorkspaceManagerViewModel: ObservableObject {
         )
     }
 
+    func notifyWorkspaceListDidChange() {
+        NotificationCenter.default.post(
+            name: .workspaceListDidChange,
+            object: nil,
+            userInfo: ["managerID": instanceID]
+        )
+    }
+
     private func mergeRepoPathsFromDisk(for workspaceID: UUID) async {
         guard let index = workspaceIndex(for: workspaceID) else { return }
         let fileURL = workspaceFileURL(for: workspaces[index])
