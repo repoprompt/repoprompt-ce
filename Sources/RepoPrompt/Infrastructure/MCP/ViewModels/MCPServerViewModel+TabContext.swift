@@ -1284,6 +1284,7 @@ extension MCPServerViewModel {
         }
         var merged = latest
         merged.selection = context.selection
+        merged.readFileAutoSelectionGeneration = context.readFileAutoSelectionGeneration
         return merged
     }
 
@@ -1291,6 +1292,16 @@ extension MCPServerViewModel {
         case persisted
         case unchanged
         case unavailable
+    }
+
+    struct MCPSelectionPersistenceVerification: Equatable {
+        let outcome: MCPSelectionCoordinatorPersistenceResult
+        let expectedSelection: StoredSelection
+        let canonicalSelection: StoredSelection?
+
+        var isVerified: Bool {
+            canonicalSelection == expectedSelection
+        }
     }
 
     static func logicalizeSelectionForPersistence(
@@ -1321,6 +1332,35 @@ extension MCPServerViewModel {
     }
 
     @MainActor
+    static func persistMCPSelectionAndVerifyThroughCoordinator(
+        _ selection: StoredSelection,
+        for tabID: UUID,
+        selectionCoordinator: WorkspaceSelectionCoordinator?
+    ) async -> MCPSelectionPersistenceVerification {
+        let outcome = await persistMCPSelectionThroughCoordinator(
+            selection,
+            for: tabID,
+            selectionCoordinator: selectionCoordinator
+        )
+        let canonicalSelection = selectionCoordinator?
+            .selectionSnapshot(for: tabID, flushPendingUIIfActive: false)?
+            .selection
+        return MCPSelectionPersistenceVerification(
+            outcome: outcome,
+            expectedSelection: selection,
+            canonicalSelection: canonicalSelection
+        )
+    }
+
+    @MainActor
+    private func canonicalPersistedSelection(for tabID: UUID) -> StoredSelection? {
+        if let selection = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: false)?.selection {
+            return selection
+        }
+        return workspaceManager?.composeTab(with: tabID)?.selection
+    }
+
+    @MainActor
     private func persistenceSafeTabContext(_ context: TabContextSnapshot) async -> TabContextSnapshot {
         let lookupContext = await lookupContext(for: context)
         var persisted = context
@@ -1329,41 +1369,45 @@ extension MCPServerViewModel {
     }
 
     @MainActor
+    @discardableResult
     func persistResolvedTabContextSnapshot(
         _ resolved: ResolvedTabContextSnapshot,
         metadata: RequestMetadata,
         mutated: Bool
-    ) async {
-        guard mutated else { return }
+    ) async -> MCPSelectionPersistenceVerification? {
+        guard mutated else { return nil }
         let context = await persistenceSafeTabContext(resolved.snapshot)
-        if !resolved.usesActiveTabCompatibility,
-           let connectionID = metadata.connectionID,
-           var latest = tabContextByConnectionID[connectionID],
-           latest.tabID == context.tabID
-        {
-            let persistenceResult = await Self.persistMCPSelectionThroughCoordinator(
-                context.selection,
-                for: context.tabID,
-                selectionCoordinator: selectionCoordinator
+        var verification = await Self.persistMCPSelectionAndVerifyThroughCoordinator(
+            context.selection,
+            for: context.tabID,
+            selectionCoordinator: selectionCoordinator
+        )
+        if verification.outcome == .unavailable {
+            await commitTabContext(selectionOnlyCommitContext(from: context))
+            verification = MCPSelectionPersistenceVerification(
+                outcome: .unavailable,
+                expectedSelection: context.selection,
+                canonicalSelection: canonicalPersistedSelection(for: context.tabID)
             )
-            if latest.selection != context.selection {
-                latest.selection = context.selection
-                tabContextByConnectionID[connectionID] = latest
-                await pushVirtualContextToUI(latest)
-            }
-            if persistenceResult == .unavailable {
-                await commitTabContext(selectionOnlyCommitContext(from: context))
-            }
-        } else {
-            let persistenceResult = await Self.persistMCPSelectionThroughCoordinator(
-                context.selection,
-                for: context.tabID,
-                selectionCoordinator: selectionCoordinator
-            )
-            if persistenceResult == .unavailable {
-                await commitTabContext(selectionOnlyCommitContext(from: context))
-            }
         }
+
+        if !resolved.usesActiveTabCompatibility,
+           let canonicalSelection = verification.canonicalSelection,
+           canonicalSelection == verification.expectedSelection,
+           let connectionID = metadata.connectionID,
+           let latest = tabContextByConnectionID[connectionID],
+           latest.tabID == context.tabID,
+           latest.windowID == context.windowID,
+           latest.workspaceID == context.workspaceID,
+           latest.runID == context.runID,
+           latest.readFileAutoSelectionGeneration == context.readFileAutoSelectionGeneration
+        {
+            var refreshed = selectionOnlyCommitContext(from: context)
+            refreshed.selection = canonicalSelection
+            refreshed.readFileAutoSelectionGeneration = latest.readFileAutoSelectionGeneration
+            tabContextByConnectionID[connectionID] = refreshed
+        }
+        return verification
     }
 
     @MainActor

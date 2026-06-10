@@ -933,12 +933,28 @@ enum ToolResultDTOs {
         let action: String // "create", "delete", "move"
         let path: String
         let newPath: String? // present for move/rename
+        let warning: String?
+
+        init(
+            status: String,
+            action: String,
+            path: String,
+            newPath: String?,
+            warning: String? = nil
+        ) {
+            self.status = status
+            self.action = action
+            self.path = path
+            self.newPath = newPath
+            self.warning = warning
+        }
 
         private enum CodingKeys: String, CodingKey {
             case status
             case action
             case path
             case newPath = "new_path"
+            case warning
         }
     }
 

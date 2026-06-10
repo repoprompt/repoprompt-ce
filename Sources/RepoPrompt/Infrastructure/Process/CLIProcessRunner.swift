@@ -352,7 +352,9 @@ final class CLIProcessRunner {
         outputMode: OutputFlagMode = .auto(.streamJson),
         timeout: TimeInterval?,
         additionalEnvironment: [String: String] = [:],
-        additionalRemovedKeys: Set<String> = []
+        additionalRemovedKeys: Set<String> = [],
+        onProcessStarted: (@Sendable (pid_t) async -> Void)? = nil,
+        onProcessTerminated: (@Sendable (pid_t) async -> Void)? = nil
     ) async throws -> AsyncThrowingStream<StreamEvent, Error> {
         // Hold the permit for the entire lifetime of the child process
         ProcessDiagnostics.log("🔵 [GATE] Acquiring gate...")
@@ -469,6 +471,7 @@ final class CLIProcessRunner {
         }
 
         await registry.add(spawned)
+        await onProcessStarted?(spawned.pid)
 
         let collector = config.logCollector
 
@@ -603,7 +606,9 @@ final class CLIProcessRunner {
                     continuation.finish(throwing: error)
                 }
                 ProcessDiagnostics.log("🧹 [CLEANUP] Cleaning up pid=\(spawned.pid)")
-                await cleanupProcess(pid: spawned.pid)
+                if await cleanupProcess(pid: spawned.pid) {
+                    await onProcessTerminated?(spawned.pid)
+                }
                 ProcessDiagnostics.log("🔴 [GATE] Releasing gate for pid=\(spawned.pid)")
                 if await gateCoordinator.markReleased() {
                     await gate.release()
@@ -634,7 +639,9 @@ final class CLIProcessRunner {
                         let _ = await Self.waitForGroup(group, timeout: 2.0, pid: spawned.pid) { msg in
                             ProcessDiagnostics.log(msg)
                         }
-                        await cleanupProcess(pid: spawned.pid)
+                        if await cleanupProcess(pid: spawned.pid) {
+                            await onProcessTerminated?(spawned.pid)
+                        }
 
                         if await gateCoordinator.markReleased() {
                             ProcessDiagnostics.log("🟠 [CANCEL] Releasing gate (onTermination) pid=\(spawned.pid)")
@@ -708,12 +715,13 @@ final class CLIProcessRunner {
         }
     }
 
-    private func cleanupProcess(pid: pid_t) async {
-        if let process = await registry.remove(pid: pid) {
-            process.stdin?.closeFile()
-            process.stdout.closeFile()
-            process.stderr.closeFile()
-        }
+    @discardableResult
+    private func cleanupProcess(pid: pid_t) async -> Bool {
+        guard let process = await registry.remove(pid: pid) else { return false }
+        process.stdin?.closeFile()
+        process.stdout.closeFile()
+        process.stderr.closeFile()
+        return true
     }
 
     private func mapLauncherError(

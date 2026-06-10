@@ -90,7 +90,13 @@ enum CommandPathResolver {
     }
 
     static func expandPath(_ path: String, environment: [String: String]) -> String {
-        let tildeExpanded = (path as NSString).expandingTildeInPath
+        let tildeExpanded: String = if let home = environment["HOME"], !home.isEmpty, path == "~" {
+            home
+        } else if let home = environment["HOME"], !home.isEmpty, path.hasPrefix("~/") {
+            home + path.dropFirst()
+        } else {
+            (path as NSString).expandingTildeInPath
+        }
         guard tildeExpanded.contains("$") else { return tildeExpanded }
         return expandEnvironmentVariables(in: tildeExpanded, environment: environment)
     }
@@ -119,7 +125,7 @@ enum CommandPathResolver {
         func append(path: String) {
             let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
-            let expanded = (trimmed as NSString).expandingTildeInPath
+            let expanded = expandPath(trimmed, environment: environment)
             if seen.insert(expanded).inserted {
                 components.append(expanded)
             }

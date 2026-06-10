@@ -374,13 +374,31 @@ final class ClaudeCodeAgentProvider: HeadlessAgentProvider {
                             let additionalEnvironment = self.config.effortEnvironmentOverrides.merging(
                                 context.launchEnvironment?.environmentOverrides ?? [:]
                             ) { _, resolverValue in resolverValue }
+                            let expectedPIDRunID = context.runID
+                            let expectedPIDClientName = self.config.runtimeVariant.agentKind.mcpClientNameHint
                             let stream = try await self.runner.runStreaming(
                                 args: args,
                                 stdin: userMessage, // Pass the user message via stdin
                                 outputMode: .auto(.streamJson),
                                 timeout: 6000, // 100 minute timeout (matches Codex)
                                 additionalEnvironment: additionalEnvironment,
-                                additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? []
+                                additionalRemovedKeys: context.launchEnvironment?.removedEnvironmentKeys ?? [],
+                                onProcessStarted: { pid in
+                                    guard let expectedPIDClientName else { return }
+                                    await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                        pid,
+                                        for: expectedPIDClientName,
+                                        runID: expectedPIDRunID
+                                    )
+                                },
+                                onProcessTerminated: { pid in
+                                    guard let expectedPIDClientName else { return }
+                                    await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                        pid,
+                                        for: expectedPIDClientName,
+                                        runID: expectedPIDRunID
+                                    )
+                                }
                             )
                             try await AsyncScope.withCleanup({}, cleanup: {
                                 await self.runner.cancelAll()

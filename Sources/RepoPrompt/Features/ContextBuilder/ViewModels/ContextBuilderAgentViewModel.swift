@@ -93,6 +93,21 @@ enum ContextBuilderFollowUpType: String, CaseIterable, Codable {
     }
 }
 
+private enum ContextBuilderMCPRoutingError: LocalizedError {
+    case routingFailed(agentDisplayName: String, clientName: String, timeoutSeconds: TimeInterval)
+
+    var errorDescription: String? {
+        switch self {
+        case let .routingFailed(agentDisplayName, clientName, timeoutSeconds):
+            "mcp_routing_failed: \(agentDisplayName) did not route the expected MCP client '\(clientName)' to this Context Builder run within \(Self.format(timeoutSeconds))s. The run was terminated and MCP bootstrap state was released."
+        }
+    }
+
+    private static func format(_ seconds: TimeInterval) -> String {
+        String(format: "%.1f", seconds)
+    }
+}
+
 @MainActor
 final class ContextBuilderAgentViewModel: ObservableObject {
     typealias ProviderFactory = (
@@ -777,6 +792,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private let mcpServer: MCPServerViewModel
     private let providerFactory: ProviderFactory
+
     /// Chat VM used for headless plan generation from discovery.
     /// Weak to avoid accidental strong cycles with the view layer.
     private weak var oracleViewModel: OracleViewModel?
@@ -2066,6 +2082,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 return .failed("Failed to start MCP server. Check Local Network permission in System Settings.")
             }
 
+            let mcpPreparedMessage: AgentMessage?
+            if record.origin.isMCP {
+                debugLog("Building MCP-initiated agent message before acquiring the one-shot routing policy")
+                mcpPreparedMessage = await buildAgentMessage(for: session, runID: runID)
+                guard acceptsEvents(from: record) else { return .cancelled }
+            } else {
+                mcpPreparedMessage = nil
+            }
+
             debugLog("Acquiring headless run lease (gate + policy)...")
             let additionalTools = additionalToolsForContextBuilderAgent(tabID: record.tabID)
             let windowID = mcpServer.windowID
@@ -2076,7 +2101,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 modelString: nil,
                 windowID: windowID,
                 restrictedTools: DiscoverMCPToolPolicy.restrictedTools,
-                connectionTTL: 15
+                connectionTTL: ContextBuilderDefaults.mcpBootstrapConnectionTTL
             )
 
             let lease: MCPBootstrapLease
@@ -2110,11 +2135,16 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             do {
-                debugLog("Building agent message")
-                let message = await buildAgentMessage(for: session, runID: runID)
-                guard acceptsEvents(from: record) else {
-                    await lease.failAndCleanup()
-                    return .cancelled
+                let message: AgentMessage
+                if let mcpPreparedMessage {
+                    message = mcpPreparedMessage
+                } else {
+                    debugLog("Building agent message")
+                    message = await buildAgentMessage(for: session, runID: runID)
+                    guard acceptsEvents(from: record) else {
+                        await lease.failAndCleanup()
+                        return .cancelled
+                    }
                 }
 
                 debugLog("System prompt length: \(message.systemPrompt.count)")
@@ -2130,9 +2160,23 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     stage: .running
                 )
 
-                let routed = await lease.releaseWhenRouted(timeoutMs: 10000)
-                guard acceptsEvents(from: record) else { return .cancelled }
+                let routed = await lease.releaseWhenRouted(
+                    timeoutMs: ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds
+                )
+                guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
                 debugLog("Routing result for run \(runID): routed=\(routed)")
+
+                if !routed, record.origin.isMCP {
+                    let timeoutSeconds = TimeInterval(ContextBuilderDefaults.mcpRoutingTimeoutMilliseconds) / 1000
+                    let clientName = record.agentKind.mcpClientNameHint ?? record.agentKind.displayName
+                    return .failed(
+                        ContextBuilderMCPRoutingError.routingFailed(
+                            agentDisplayName: record.agentKind.displayName,
+                            clientName: clientName,
+                            timeoutSeconds: timeoutSeconds
+                        ).localizedDescription
+                    )
+                }
 
                 let connectionMessage = if routed {
                     record.origin.isMCP
@@ -2755,6 +2799,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     // MARK: - Error handling
 
     private func extractVerboseErrorMessage(from error: Error) -> String {
+        if error is ContextBuilderMCPRoutingError {
+            return error.localizedDescription
+        }
+
         let errorMessage: String = if let providerError = error as? AIProviderError {
             switch providerError {
             case let .invalidConfiguration(detail):

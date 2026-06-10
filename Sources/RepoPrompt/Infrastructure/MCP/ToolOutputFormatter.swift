@@ -3599,6 +3599,7 @@ extension ToolOutputFormatter {
             out.append("- Path: `\(dto.path)`")
             if let np = dto.newPath { out.append("- New path: `\(np)`") }
             if dto.action.lowercased() == "delete" { out.append("- Result: Moved to macOS Trash") }
+            if let warning = dto.warning, !warning.isEmpty { out.append("- Warning: \(warning)") }
             return [.text(out.joined(separator: "\n"))]
         }
         if case let .object(obj) = value {

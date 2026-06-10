@@ -11,7 +11,9 @@ enum CLILaunchProfiles {
         "~/.claude/local"
     ]
 
-    static let openCodeProviderSpecificPaths: [String] = []
+    static let openCodeProviderSpecificPaths: [String] = [
+        "~/.opencode/bin"
+    ]
     static let cursorProviderSpecificPaths: [String] = []
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager

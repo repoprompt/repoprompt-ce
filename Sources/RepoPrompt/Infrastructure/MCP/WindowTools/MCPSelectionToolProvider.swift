@@ -373,12 +373,19 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
         view: String
     ) async throws -> ToolResultDTOs.SelectionReply {
         resolvedContext.snapshot.selection = selection
-        await dependencies.persistResolvedTabContextSnapshot(resolvedContext, metadata, true)
+        let verification = await dependencies.persistResolvedTabContextSnapshot(resolvedContext, metadata, true)
+        let canonicalSelection = try Self.requireCanonicalSelection(
+            verification,
+            requested: selection,
+            tabID: resolvedContext.snapshot.tabID,
+            operation: "manage_selection",
+            recovery: "Retry manage_selection for the same context_id or rebind the tab context before continuing."
+        )
         let codeMapOverride: CodeMapUsage? = (!resolvedContext.usesActiveTabCompatibility && baseContext.runID != nil) ? .auto : nil
         var replyContext = baseContext
-        replyContext.selection = selection
+        replyContext.selection = canonicalSelection
         return try await dependencies.buildSelectionMutationReply(
-            selection,
+            canonicalSelection,
             includeBlocks,
             display,
             extraInvalid,
@@ -386,5 +393,42 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             codeMapOverride,
             resolvedContext.usesActiveTabCompatibility ? nil : replyContext
         )
+    }
+
+    static func requireCanonicalSelection(
+        _ verification: MCPServerViewModel.MCPSelectionPersistenceVerification?,
+        requested: StoredSelection,
+        tabID: UUID,
+        operation: String,
+        recovery: String
+    ) throws -> StoredSelection {
+        guard let verification,
+              let canonicalSelection = verification.canonicalSelection,
+              verification.isVerified
+        else {
+            throw MCPError.internalError(selectionPersistenceMismatchMessage(
+                expected: verification?.expectedSelection ?? requested,
+                canonical: verification?.canonicalSelection,
+                tabID: tabID,
+                operation: operation,
+                recovery: recovery
+            ))
+        }
+        return canonicalSelection
+    }
+
+    private static func selectionPersistenceMismatchMessage(
+        expected: StoredSelection,
+        canonical: StoredSelection?,
+        tabID: UUID,
+        operation: String,
+        recovery: String
+    ) -> String {
+        let canonicalSummary = canonical.map(selectionSummary) ?? "unavailable"
+        return "Selection persistence handoff failed for \(operation) on tab \(tabID.uuidString): canonical selection did not match the requested mutation (expected \(selectionSummary(expected)); canonical \(canonicalSummary)). \(recovery)"
+    }
+
+    private static func selectionSummary(_ selection: StoredSelection) -> String {
+        "selected=\(selection.selectedPaths.count), codemap=\(selection.autoCodemapPaths.count), slices=\(selection.slices.count), auto=\(selection.codemapAutoEnabled)"
     }
 }

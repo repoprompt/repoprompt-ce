@@ -70,8 +70,14 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let newPath = args["new_path"]?.stringValue
             let ifExists = args["if_exists"]?.stringValue?.lowercased() ?? "error"
 
-            try await dependencies.performFileAction(action, path, content, newPath, ifExists)
-            return try Value(ToolResultDTOs.FileActionReply(status: "ok", action: action, path: path, newPath: newPath))
+            let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
+            return try Value(ToolResultDTOs.FileActionReply(
+                status: "ok",
+                action: action,
+                path: path,
+                newPath: newPath,
+                warning: warning
+            ))
         }
     }
 

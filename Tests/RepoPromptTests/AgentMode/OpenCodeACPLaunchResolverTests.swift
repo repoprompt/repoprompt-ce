@@ -49,6 +49,41 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(probedPath, launch.command)
     }
 
+    func testDefaultProfileResolvesOpenCodeFromProviderSpecificHomeBin() async throws {
+        let fakeHome = try makeTemporaryDirectory()
+        let minimalPath = try makeTemporaryDirectory()
+        let openCodeBin = fakeHome.appendingPathComponent(".opencode/bin", isDirectory: true)
+        try FileManager.default.createDirectory(at: openCodeBin, withIntermediateDirectories: true)
+        let executable = try makeExecutable(in: openCodeBin)
+        let environment = [
+            "HOME": fakeHome.path,
+            "PATH": minimalPath.path,
+            "SHELL": "/bin/false"
+        ]
+        let resolver = OpenCodeACPLaunchResolver(environmentProvider: { _ in environment })
+        let config = OpenCodeAgentConfig(
+            includeRepoPromptMCPServer: false,
+            includeManagedConfigOverlay: false
+        )
+
+        let support = try await resolver.probeSupport(for: config)
+        let launch = try resolver.resolvedLaunch(for: config)
+
+        XCTAssertEqual(support, .supported)
+        XCTAssertEqual(launch.command, executable.resolvingSymlinksInPath().standardizedFileURL.path)
+    }
+
+    func testOpenCodeHomeBinHintDoesNotLeakIntoNativeDefaultsOrOtherProviders() {
+        let openCodeHomeBin = "~/.opencode/bin"
+
+        XCTAssertEqual(CLILaunchProfiles.openCodeProviderSpecificPaths, [openCodeHomeBin])
+        XCTAssertTrue(CLILaunchProfiles.openCode.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLINativePathDefaults.defaultAdditionalPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.claudeCode.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.codex.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertFalse(CLILaunchProfiles.cursor.supplementalSearchPaths.contains(openCodeHomeBin))
+    }
+
     func testRepeatedProbeRefreshesCurrentEnvironmentBeforeSpawn() async throws {
         let firstDirectory = try makeTemporaryDirectory()
         let secondDirectory = try makeTemporaryDirectory()

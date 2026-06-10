@@ -487,6 +487,160 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testMCPSelectionPersistenceRereadsCanonicalSelectionAndReportsMismatch() async {
+        let activeTabID = UUID()
+        let inactiveTabID = UUID()
+        let staleSelection = StoredSelection(selectedPaths: ["/tmp/old-agent.swift"])
+        let requestedSelection = StoredSelection(
+            selectedPaths: ["/tmp/new-agent.swift"],
+            autoCodemapPaths: ["/tmp/new-dependency.swift"],
+            codemapAutoEnabled: false
+        )
+        let manager = FakeMCPSelectionManager(
+            tabs: [
+                ComposeTabState(id: activeTabID, name: "Active", selection: StoredSelection()),
+                ComposeTabState(id: inactiveTabID, name: "Agent", selection: staleSelection)
+            ],
+            activeTabID: activeTabID,
+            ignoreStoredOnlyUpdates: true
+        )
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: manager,
+            store: WorkspaceFileContextStore()
+        )
+
+        let result = await MCPServerViewModel.persistMCPSelectionAndVerifyThroughCoordinator(
+            requestedSelection,
+            for: inactiveTabID,
+            selectionCoordinator: coordinator
+        )
+
+        XCTAssertEqual(result.outcome, .persisted)
+        XCTAssertEqual(result.expectedSelection, requestedSelection)
+        XCTAssertEqual(result.canonicalSelection, staleSelection)
+        XCTAssertFalse(result.isVerified)
+        XCTAssertEqual(manager.composeTab(with: inactiveTabID)?.selection, staleSelection)
+    }
+
+    @MainActor
+    func testSelectionMutationRejectsCanonicalPersistenceMismatchWithActionableError() {
+        let tabID = UUID()
+        let requestedSelection = StoredSelection(selectedPaths: ["/tmp/requested.swift"])
+        let canonicalSelection = StoredSelection(selectedPaths: ["/tmp/stale.swift"])
+        let verification = MCPServerViewModel.MCPSelectionPersistenceVerification(
+            outcome: .persisted,
+            expectedSelection: requestedSelection,
+            canonicalSelection: canonicalSelection
+        )
+
+        XCTAssertThrowsError(try MCPSelectionToolProvider.requireCanonicalSelection(
+            verification,
+            requested: requestedSelection,
+            tabID: tabID,
+            operation: "manage_selection",
+            recovery: "Retry manage_selection for the same context_id or rebind the tab context before continuing."
+        )) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("Selection persistence handoff failed"), message)
+            XCTAssertTrue(message.contains(tabID.uuidString), message)
+            XCTAssertTrue(message.contains("Retry manage_selection for the same context_id"), message)
+        }
+    }
+
+    @MainActor
+    func testManageSelectionSetPersistsAcrossConnectionRebindAndWorkspaceSerialization() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let root = try makeTemporaryDirectory(named: "tool-persistence-root")
+        let storageRoot = try makeTemporaryDirectory(named: "serialized-workspace")
+        defer {
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: storageRoot.deletingLastPathComponent())
+        }
+        let sources = root.appendingPathComponent("Sources", isDirectory: true)
+        try FileManager.default.createDirectory(at: sources, withIntermediateDirectories: true)
+        let selectedFile = sources.appendingPathComponent("App.swift")
+        try "struct App {}\n".write(to: selectedFile, atomically: true, encoding: .utf8)
+
+        let activeTabID = UUID()
+        let tabID = UUID()
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Selection Tool Persistence \(UUID().uuidString.prefix(8))",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
+        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+            ComposeTabState(id: activeTabID, name: "Active"),
+            ComposeTabState(id: tabID, name: "Agent")
+        ]
+        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
+        await window.workspaceManager.switchWorkspace(
+            to: window.workspaceManager.workspaces[workspaceIndex],
+            saveState: false,
+            reason: "manageSelectionPersistenceTestTabs"
+        )
+        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        let tools = await window.mcpServer.windowMCPTools
+        let manageSelection = try XCTUnwrap(
+            tools.first { $0.name == MCPWindowToolName.manageSelection }
+        )
+
+        let firstConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: firstConnectionID,
+            clientName: "first-selection-client",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let setValue = try await ServerNetworkManager.withConnectionID(firstConnectionID) {
+            try await manageSelection([
+                "op": .string("set"),
+                "paths": .array([.string(selectedFile.path)]),
+                "mode": .string("full"),
+                "view": .string("files"),
+                "path_display": .string("full"),
+                "strict": .bool(true)
+            ])
+        }
+        XCTAssertEqual(try selectedPaths(from: setValue), [selectedFile.path])
+
+        await window.mcpServer.commitAndClearTabContext(connectionID: firstConnectionID)
+        let secondConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: secondConnectionID,
+            clientName: "second-selection-client",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID
+        )
+        let getValue = try await ServerNetworkManager.withConnectionID(secondConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try selectedPaths(from: getValue), [selectedFile.path])
+
+        let canonicalTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+        XCTAssertEqual(canonicalTab.selection.selectedPaths, [selectedFile.path])
+
+        var workspaceToSave = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+        workspaceToSave.customStoragePath = storageRoot
+        let savedURL = try window.workspaceManager.saveWorkspaceToFile(workspaceToSave, source: .directUnknown)
+        let serializedWorkspace = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: savedURL))
+        let serializedTab = try XCTUnwrap(serializedWorkspace.composeTabs.first { $0.id == tabID })
+        XCTAssertEqual(serializedTab.selection.selectedPaths, [selectedFile.path])
+    }
+
+    @MainActor
     func testMCPLogicalizeSelectionForPersistenceConvertsWorktreePhysicalPaths() {
         let logicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/repo/project")
         let physicalRoot = WorkspaceRootRef(id: UUID(), name: "Project", fullPath: "/tmp/worktrees/project-agent")
@@ -617,6 +771,14 @@ final class TabContextRoutingTests: XCTestCase {
         ))
     }
 
+    private func selectedPaths(from value: Value) throws -> [String] {
+        let object = try XCTUnwrap(value.objectValue)
+        let files = try XCTUnwrap(object["files"]?.arrayValue)
+        return try files.map { file in
+            try XCTUnwrap(file.objectValue?["path"]?.stringValue)
+        }
+    }
+
     private func makeResolver(
         matchesByContextID: [UUID: [MCPContextBindingMatch]],
         existingWindowID: Int? = nil,
@@ -696,7 +858,10 @@ final class TabContextRoutingTests: XCTestCase {
 private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
 
-    init(tabs: [ComposeTabState], activeTabID: UUID) {
+    private let ignoreStoredOnlyUpdates: Bool
+
+    init(tabs: [ComposeTabState], activeTabID: UUID, ignoreStoredOnlyUpdates: Bool = false) {
+        self.ignoreStoredOnlyUpdates = ignoreStoredOnlyUpdates
         activeWorkspace = WorkspaceModel(
             name: "Test Workspace",
             repoPaths: [],
@@ -712,6 +877,7 @@ private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
 
     func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
+        guard !ignoreStoredOnlyUpdates else { return }
         guard var workspace = activeWorkspace,
               let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
         else { return }
