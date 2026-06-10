@@ -371,6 +371,13 @@ struct WorkspaceIngressBarrierSample: Equatable {
     let appliedWatcherWatermark: UInt64
 }
 
+struct WorkspaceAppliedIndexRootSnapshot: Equatable {
+    let root: WorkspaceRootRecord
+    let generation: UInt64
+    let files: [WorkspaceFileRecord]
+    let folders: [WorkspaceFolderRecord]
+}
+
 struct WorkspaceAppliedIndexBatchEvent: Equatable {
     let rootID: UUID
     let rootPath: String

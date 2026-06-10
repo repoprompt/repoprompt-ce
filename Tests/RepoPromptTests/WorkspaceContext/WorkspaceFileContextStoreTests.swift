@@ -562,6 +562,123 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(applied.appliedWatcherWatermark.rawValue, 7)
         }
 
+        #if DEBUG
+            func testWorkspaceIngressCoordinatorCancelledWaiterDetachesWhileLiveWaiterCompletes() async {
+                let coordinator = WorkspaceFileSystemIngressCoordinator()
+                let rootID = UUID()
+                let applyGate = AsyncGate()
+                let subscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                    guard publication.servicePublicationSequence == 1 else { return }
+                    await applyGate.markStartedAndWaitForRelease()
+                }
+
+                XCTAssertTrue(coordinator.accept(
+                    subscription,
+                    publication: FileSystemDeltaPublication(
+                        servicePublicationSequence: 1,
+                        source: .watcherBarrierNoop,
+                        watcherAcceptedWatermark: .init(rawValue: 13),
+                        deltas: []
+                    ),
+                    lifecycleCorrelation: nil
+                ))
+                await applyGate.waitUntilStarted()
+
+                let cancelledCompleted = AsyncSignal()
+                let liveCompleted = AsyncSignal()
+                let cancelledWaiter = Task {
+                    await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 1)
+                    await cancelledCompleted.mark()
+                }
+                let liveWaiter = Task {
+                    await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 1)
+                    await liveCompleted.mark()
+                }
+                let bothRegistered = await waitForAsyncCondition {
+                    coordinator.debugSnapshot(rootID: rootID).waiterCount == 2
+                }
+                XCTAssertTrue(bothRegistered)
+
+                cancelledWaiter.cancel()
+                let cancelledPromptly = await waitForAsyncCondition {
+                    await cancelledCompleted.isMarked()
+                }
+                XCTAssertTrue(cancelledPromptly)
+                let liveCompletedBeforeRelease = await liveCompleted.isMarked()
+                XCTAssertFalse(liveCompletedBeforeRelease)
+                let afterCancellation = coordinator.debugSnapshot(rootID: rootID)
+                XCTAssertEqual(afterCancellation.waiterCount, 1)
+                XCTAssertEqual(afterCancellation.appliedServicePublicationSequence, 0)
+                XCTAssertEqual(afterCancellation.appliedWatcherWatermark, 0)
+
+                await applyGate.release()
+                await cancelledWaiter.value
+                await liveWaiter.value
+                let settled = coordinator.debugSnapshot(rootID: rootID)
+                XCTAssertEqual(settled.waiterCount, 0)
+                XCTAssertEqual(settled.appliedServicePublicationSequence, 1)
+                XCTAssertEqual(settled.appliedWatcherWatermark, 13)
+            }
+
+            func testWorkspaceIngressCoordinatorDebugSnapshotReportsDepthGapAndOldestAge() async {
+                let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 2_000_000_000)
+                let coordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: { clock.now() })
+                let rootID = UUID()
+                let firstApplyGate = AsyncGate()
+                let subscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                    if publication.servicePublicationSequence == 1 {
+                        await firstApplyGate.markStartedAndWaitForRelease()
+                    }
+                }
+
+                XCTAssertTrue(coordinator.accept(
+                    subscription,
+                    publication: FileSystemDeltaPublication(
+                        servicePublicationSequence: 1,
+                        source: .syntheticMutation,
+                        watcherAcceptedWatermark: nil,
+                        deltas: [.fileAdded("A.swift")]
+                    ),
+                    lifecycleCorrelation: nil
+                ))
+                await firstApplyGate.waitUntilStarted()
+                XCTAssertTrue(coordinator.accept(
+                    subscription,
+                    publication: FileSystemDeltaPublication(
+                        servicePublicationSequence: 2,
+                        source: .watcherBarrierNoop,
+                        watcherAcceptedWatermark: .init(rawValue: 9),
+                        deltas: []
+                    ),
+                    lifecycleCorrelation: nil
+                ))
+
+                clock.advance(milliseconds: 450)
+                let blocked = coordinator.debugSnapshot(rootID: rootID)
+                XCTAssertTrue(blocked.isOpen)
+                XCTAssertEqual(blocked.queuedPublicationCount, 1)
+                XCTAssertEqual(blocked.applyingPublicationCount, 1)
+                XCTAssertEqual(blocked.outstandingPublicationCount, 2)
+                XCTAssertEqual(blocked.acceptedServicePublicationSequence, 2)
+                XCTAssertEqual(blocked.appliedServicePublicationSequence, 0)
+                XCTAssertEqual(blocked.acceptedAppliedSequenceGap, 2)
+                XCTAssertEqual(blocked.appliedWatcherWatermark, 0)
+                XCTAssertEqual(blocked.oldestOutstandingPublicationAgeMilliseconds, 450)
+
+                await firstApplyGate.release()
+                await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 2)
+                let settled = coordinator.debugSnapshot(rootID: rootID)
+                XCTAssertEqual(settled.queuedPublicationCount, 0)
+                XCTAssertEqual(settled.applyingPublicationCount, 0)
+                XCTAssertEqual(settled.outstandingPublicationCount, 0)
+                XCTAssertEqual(settled.acceptedServicePublicationSequence, 2)
+                XCTAssertEqual(settled.appliedServicePublicationSequence, 2)
+                XCTAssertEqual(settled.acceptedAppliedSequenceGap, 0)
+                XCTAssertEqual(settled.appliedWatcherWatermark, 9)
+                XCTAssertNil(settled.oldestOutstandingPublicationAgeMilliseconds)
+            }
+        #endif
+
         func testWorkspaceIngressCoordinatorFinishResolvesOutstandingWaiter() async {
             let coordinator = WorkspaceFileSystemIngressCoordinator()
             let rootID = UUID()
@@ -617,6 +734,295 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(firstSamples.map(\.rootID), [rootID])
             XCTAssertEqual(secondSamples.map(\.rootID), [rootID])
             XCTAssertEqual(flushStartCount, 1)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testScopedAppliedIngressCancelledFollowerDetachesWhileLeaderCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressFollowerCancellation")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootID = record.id
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let leaderCompleted = AsyncSignal()
+            let followerCompleted = AsyncSignal()
+            let leader = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await leaderCompleted.mark()
+                return samples
+            }
+            await flushGate.waitUntilStarted()
+            let follower = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await followerCompleted.mark()
+                return samples
+            }
+            let joined = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).joinCount == 1
+            }
+            XCTAssertTrue(joined)
+
+            follower.cancel()
+            let followerDetached = await waitForAsyncCondition {
+                await followerCompleted.isMarked()
+            }
+            XCTAssertTrue(followerDetached)
+            let leaderCompletedBeforeRelease = await leaderCompleted.isMarked()
+            XCTAssertFalse(leaderCompletedBeforeRelease)
+            let activeBeforeRelease = await store.readSearchRootDiagnosticsSnapshot()
+            XCTAssertNotNil(activeBeforeRelease.first { $0.rootID == rootID }?.barrier.active)
+
+            await flushGate.release()
+            let followerSamples = await follower.value
+            let leaderSamples = await leader.value
+            let settled = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(settled.first { $0.rootID == rootID })
+            XCTAssertTrue(followerSamples.isEmpty)
+            XCTAssertEqual(leaderSamples.map(\.rootID), [rootID])
+            XCTAssertNil(settledRoot.barrier.active)
+            XCTAssertEqual(settledRoot.barrier.completionCount, 1)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testScopedAppliedIngressCancelledLauncherDoesNotCancelLiveJoiner() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressLauncherCancellation")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let rootID = record.id
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let launcherCompleted = AsyncSignal()
+            let joinerCompleted = AsyncSignal()
+            let launcher = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await launcherCompleted.mark()
+                return samples
+            }
+            await flushGate.waitUntilStarted()
+            let joiner = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await joinerCompleted.mark()
+                return samples
+            }
+            let joined = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).joinCount == 1
+            }
+            XCTAssertTrue(joined)
+
+            launcher.cancel()
+            let launcherDetached = await waitForAsyncCondition {
+                await launcherCompleted.isMarked()
+            }
+            XCTAssertTrue(launcherDetached)
+            let joinerCompletedBeforeRelease = await joinerCompleted.isMarked()
+            XCTAssertFalse(joinerCompletedBeforeRelease)
+
+            await flushGate.release()
+            let launcherSamples = await launcher.value
+            let joinerSamples = await joiner.value
+            let settled = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(settled.first { $0.rootID == rootID })
+            XCTAssertTrue(launcherSamples.isEmpty)
+            XCTAssertEqual(joinerSamples.map(\.rootID), [rootID])
+            XCTAssertNil(settledRoot.barrier.active)
+            XCTAssertEqual(settledRoot.barrier.completionCount, 1)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testScopedAppliedIngressAllCancelledCallersStillReachIdleCleanup() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressAllCancellation")
+            let addedURL = root.appendingPathComponent("Added.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let rootID = record.id
+            let sinkGate = AsyncGate()
+            let publisherWaitStarted = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setPublisherIngressWillWaitHandler { rootIDs in
+                guard rootIDs.contains(rootID) else { return }
+                await publisherWaitStarted.mark()
+            }
+
+            try write("added", to: addedURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileAdded("Added.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+            let initialRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let initialIngress = initialRoots.first { $0.rootID == rootID }?.ingress
+            XCTAssertGreaterThan(initialIngress?.acceptedServicePublicationSequence ?? 0, 0)
+            XCTAssertEqual(initialIngress?.appliedServicePublicationSequence, 0)
+
+            let firstCompleted = AsyncSignal()
+            let secondCompleted = AsyncSignal()
+            let first = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await firstCompleted.mark()
+                return samples
+            }
+            await publisherWaitStarted.waitUntilMarked()
+            let canonicalWaitRegistered = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                return roots.first { $0.rootID == rootID }?.ingress.waiterCount == 1
+            }
+            XCTAssertTrue(canonicalWaitRegistered)
+            let second = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await secondCompleted.mark()
+                return samples
+            }
+            let joined = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).joinCount == 1
+            }
+            XCTAssertTrue(joined)
+
+            first.cancel()
+            second.cancel()
+            let bothDetached = await waitForAsyncCondition {
+                let firstIsCompleted = await firstCompleted.isMarked()
+                let secondIsCompleted = await secondCompleted.isMarked()
+                return firstIsCompleted && secondIsCompleted
+            }
+            XCTAssertTrue(bothDetached)
+            let firstSamples = await first.value
+            let secondSamples = await second.value
+            XCTAssertTrue(firstSamples.isEmpty)
+            XCTAssertTrue(secondSamples.isEmpty)
+            let activeBeforeRelease = await store.readSearchRootDiagnosticsSnapshot()
+            let activeRoot = activeBeforeRelease.first { $0.rootID == rootID }
+            XCTAssertNotNil(activeRoot?.barrier.active)
+            XCTAssertEqual(activeRoot?.barrier.completionCount, 0)
+            XCTAssertEqual(activeRoot?.ingress.waiterCount, 1)
+            XCTAssertGreaterThan(activeRoot?.ingress.outstandingPublicationCount ?? 0, 0)
+            XCTAssertEqual(activeRoot?.ingress.appliedServicePublicationSequence, 0)
+
+            await sinkGate.release()
+            let reachedIdle = await waitForAsyncCondition {
+                let roots = await store.readSearchRootDiagnosticsSnapshot()
+                guard let root = roots.first(where: { $0.rootID == rootID }) else { return false }
+                return root.barrier.active == nil
+                    && root.barrier.completionCount == 1
+                    && root.ingress.waiterCount == 0
+                    && root.ingress.outstandingPublicationCount == 0
+            }
+            XCTAssertTrue(reachedIdle)
+            let settledRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let settledRoot = try XCTUnwrap(settledRoots.first { $0.rootID == rootID })
+            XCTAssertEqual(
+                settledRoot.ingress.appliedServicePublicationSequence,
+                settledRoot.ingress.acceptedServicePublicationSequence
+            )
+            XCTAssertGreaterThanOrEqual(
+                settledRoot.ingress.appliedServicePublicationSequence,
+                initialIngress?.acceptedServicePublicationSequence ?? 0
+            )
+            XCTAssertEqual(settledRoot.ingress.appliedWatcherWatermark, 0)
+            XCTAssertEqual(settledRoot.barrier.lastCompleted?.appliedWatcherWatermark, 0)
+            XCTAssertEqual(
+                settledRoot.barrier.lastCompleted?.appliedServicePublicationSequence,
+                settledRoot.ingress.appliedServicePublicationSequence
+            )
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setPublisherIngressWillWaitHandler(nil)
+            await store.stopWatchingRoot(id: rootID)
+        }
+
+        func testCancelledReadFreshnessJoinThrowsBeforeCanonicalFlightCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "ReadFreshnessCancellation")
+            let fileURL = root.appendingPathComponent("Seed.swift")
+            try write("seed", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let completed = AsyncSignal()
+            let request = Task { () -> Bool in
+                let wasCancelled: Bool
+                do {
+                    let service = WorkspaceReadableFileService(store: store)
+                    try await service.awaitFreshnessForExplicitRequest(
+                        fileURL.path,
+                        fallbackScope: .visibleWorkspace
+                    )
+                    wasCancelled = false
+                } catch is CancellationError {
+                    wasCancelled = true
+                } catch {
+                    wasCancelled = false
+                }
+                await completed.mark()
+                return wasCancelled
+            }
+            await flushGate.waitUntilStarted()
+            request.cancel()
+            let cancelledPromptly = await waitForAsyncCondition {
+                await completed.isMarked()
+            }
+            XCTAssertTrue(cancelledPromptly)
+
+            await flushGate.release()
+            let wasCancelled = await request.value
+            XCTAssertTrue(wasCancelled)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testCancelledFileSearchJoinThrowsBeforeCanonicalFlightCompletes() async throws {
+            let root = try makeTemporaryRoot(name: "SearchFreshnessCancellation")
+            try write("needle", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let completed = AsyncSignal()
+            let request = Task { () -> Bool in
+                let wasCancelled: Bool
+                do {
+                    _ = try await StoreBackedWorkspaceSearch.search(
+                        pattern: "needle",
+                        mode: .content,
+                        store: store,
+                        workspaceManager: nil
+                    )
+                    wasCancelled = false
+                } catch is CancellationError {
+                    wasCancelled = true
+                } catch {
+                    wasCancelled = false
+                }
+                await completed.mark()
+                return wasCancelled
+            }
+            await flushGate.waitUntilStarted()
+            request.cancel()
+            let cancelledPromptly = await waitForAsyncCondition {
+                await completed.isMarked()
+            }
+            XCTAssertTrue(cancelledPromptly)
+
+            await flushGate.release()
+            let wasCancelled = await request.value
+            XCTAssertTrue(wasCancelled)
             await store.setScopedIngressBarrierWillFlushHandler(nil)
         }
 
@@ -784,6 +1190,250 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(Set(samples.map(\.rootID)), Set([recordA.id, recordB.id]))
             XCTAssertEqual(statsA.launchCount, 1)
             XCTAssertEqual(statsB.launchCount, 1)
+        }
+
+        func testScopedIngressBarrierDiagnosticsReportActiveTargetAndCompletedTiming() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressDiagnostics")
+            let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 3_000_000_000)
+            let store = WorkspaceFileContextStore(debugNowNanoseconds: { clock.now() })
+            let record = try await store.loadRoot(path: root.path)
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let barrierTask = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+            await flushGate.waitUntilStarted()
+            clock.advance(milliseconds: 325)
+
+            let activeRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let activeRoot = try XCTUnwrap(activeRoots.first { $0.rootID == record.id })
+            let active = try XCTUnwrap(activeRoot.barrier.active)
+            XCTAssertEqual(active.targetWatcherWatermark, 0)
+            XCTAssertEqual(active.targetServicePublicationSequence, 0)
+            XCTAssertEqual(active.ageMilliseconds, 325)
+            XCTAssertEqual(activeRoot.barrier.launchCount, 1)
+            XCTAssertEqual(activeRoot.barrier.completionCount, 0)
+            XCTAssertNil(activeRoot.barrier.lastCompleted)
+
+            await flushGate.release()
+            let samples = await barrierTask.value
+            XCTAssertEqual(samples.map(\.rootID), [record.id])
+
+            let completedRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let completedRoot = try XCTUnwrap(completedRoots.first { $0.rootID == record.id })
+            let completed = try XCTUnwrap(completedRoot.barrier.lastCompleted)
+            XCTAssertNil(completedRoot.barrier.active)
+            XCTAssertEqual(completedRoot.barrier.completionCount, 1)
+            XCTAssertEqual(completed.targetWatcherWatermark, 0)
+            XCTAssertEqual(completed.targetServicePublicationSequence, 0)
+            XCTAssertEqual(completed.appliedServicePublicationSequence, samples[0].appliedServicePublicationSequence)
+            XCTAssertEqual(completed.appliedWatcherWatermark, samples[0].appliedWatcherWatermark)
+            XCTAssertEqual(completed.durationMilliseconds, 325)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testRootUnloadCancelsOwnedScopedIngressFlightAndReleasesDetachedService() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressUnloadRelease")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            var service: FileSystemService? = await store.fileSystemServiceForTesting(rootID: record.id)
+            let weakService = WeakObjectBox(service)
+            let cancellationGate = CancellationAwareGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await cancellationGate.markStartedAndWaitForCancellation()
+            }
+
+            let barrierTask = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+            await cancellationGate.waitUntilStarted()
+            let activeFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
+            XCTAssertEqual(activeFlightCount, 1)
+
+            await store.unloadRoot(id: record.id)
+            service = nil
+            let samples = await barrierTask.value
+            let roots = await store.roots()
+            let retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
+            let remainingFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
+            let serviceReleased = await waitForAsyncCondition(maxYields: 10000) {
+                weakService.value == nil
+            }
+
+            XCTAssertTrue(samples.isEmpty)
+            XCTAssertTrue(roots.isEmpty)
+            XCTAssertEqual(remainingFlightCount, 0)
+            XCTAssertFalse(retainedRootIDs.contains(record.id))
+            XCTAssertTrue(serviceReleased)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testLargePublicationUsesOneGlobalInvalidationCycleAndPreservesFinalCatalog() async throws {
+            let root = try makeTemporaryRoot(name: "PublicationInvalidationBatch")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let fileCount = 600
+            let relativePaths = (0 ..< fileCount).map { String(format: "Batch-%03d.swift", $0) }
+            for relativePath in relativePaths {
+                try write(relativePath, to: root.appendingPathComponent(relativePath))
+            }
+            var appliedIndexEvents = await store.appliedIndexEvents().makeAsyncIterator()
+
+            let sample = try await store.replayFileSystemPublicationForInvalidationDiagnosticsForTesting(
+                rootID: record.id,
+                deltas: relativePaths.map { .fileAdded($0) }
+            )
+
+            XCTAssertEqual(sample.servicePublicationSequence, 0)
+            XCTAssertNil(sample.watcherAcceptedWatermark)
+            XCTAssertEqual(sample.preparedDeltaCount, fileCount)
+            XCTAssertEqual(sample.topologyInvalidationCount, 1)
+            XCTAssertEqual(sample.catalogGenerationAdvanceCount, 3)
+            XCTAssertEqual(sample.searchCatalogCacheClearCount, 1)
+            XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 1)
+            XCTAssertEqual(sample.contentInvalidationCount, 0)
+            XCTAssertEqual(sample.distinctContentKeyCount, 0)
+            XCTAssertEqual(sample.decodedCacheInvalidationRequestCount, 0)
+            XCTAssertEqual(sample.codemapInvalidationRequestCount, 0)
+            guard sample.appliedIndexEventYieldCount == 1 else {
+                XCTFail("Expected exactly one applied-index event, got \(sample.appliedIndexEventYieldCount)")
+                return
+            }
+
+            let appliedIndexEvent = await appliedIndexEvents.next()
+            let observedAppliedIndexEvent = try XCTUnwrap(appliedIndexEvent)
+            XCTAssertEqual(observedAppliedIndexEvent.rootID, record.id)
+            XCTAssertEqual(observedAppliedIndexEvent.generation, 1)
+            XCTAssertEqual(observedAppliedIndexEvent.upsertedFiles.map(\.standardizedRelativePath), relativePaths)
+            XCTAssertTrue(observedAppliedIndexEvent.upsertedFolders.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.removedFileIDs.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.removedFolderIDs.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.removedFilePaths.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.removedFolderPaths.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.modifiedFileIDs.isEmpty)
+            XCTAssertTrue(observedAppliedIndexEvent.modifiedFolderIDs.isEmpty)
+
+            let rootSnapshots = await store.readSearchRootDiagnosticsSnapshot()
+            let rootSnapshot = try XCTUnwrap(rootSnapshots.first { $0.rootID == record.id })
+            XCTAssertEqual(rootSnapshot.invalidation.totalObservedPublicationCount, 0)
+            XCTAssertTrue(rootSnapshot.invalidation.samples.isEmpty)
+
+            let catalog = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+            XCTAssertEqual(catalog.files.map(\.standardizedRelativePath), relativePaths)
+        }
+
+        func testLargeModificationPublicationUsesOneDecodedCacheInvalidationAndPreservesFreshContent() async throws {
+            let root = try makeTemporaryRoot(name: "PublicationContentInvalidationBatch")
+            let fileCount = 64
+            let relativePaths = (0 ..< fileCount).map { String(format: "Content-%03d.swift", $0) }
+            let fixedDate = Date(timeIntervalSince1970: 1_700_000_000)
+            for (index, relativePath) in relativePaths.enumerated() {
+                let fileURL = root.appendingPathComponent(relativePath)
+                try write(String(format: "old-%03d", index), to: fileURL)
+                try setDiskModificationDate(fixedDate, for: fileURL)
+            }
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            var files: [WorkspaceFileRecord] = []
+            var initialRevisionsByFileID: [UUID: UInt64] = [:]
+            for (index, relativePath) in relativePaths.enumerated() {
+                let loadedFile = await store.file(rootID: record.id, relativePath: relativePath)
+                let file = try XCTUnwrap(loadedFile)
+                let snapshot = try await store.searchContentSnapshot(for: file)
+                XCTAssertEqual(snapshot.content, String(format: "old-%03d", index))
+                files.append(file)
+                initialRevisionsByFileID[file.id] = try XCTUnwrap(snapshot.contentRevision)
+            }
+            try await store.startWatchingRoot(id: record.id)
+
+            for (index, relativePath) in relativePaths.enumerated() {
+                let fileURL = root.appendingPathComponent(relativePath)
+                try write(String(format: "new-%03d", index), to: fileURL)
+                try setDiskModificationDate(fixedDate, for: fileURL)
+            }
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: relativePaths.map { .fileModified($0, fixedDate) }
+            )
+            _ = await store.awaitAppliedIngressForAllRoots()
+
+            let rootSnapshots = await store.readSearchRootDiagnosticsSnapshot(recentPublicationLimit: 32)
+            let rootSnapshot = try XCTUnwrap(rootSnapshots.first { $0.rootID == record.id })
+            let sample = try XCTUnwrap(rootSnapshot.invalidation.samples.last {
+                $0.preparedDeltaCount == fileCount && $0.contentInvalidationCount == fileCount
+            })
+            XCTAssertEqual(sample.topologyInvalidationCount, 0)
+            XCTAssertEqual(sample.catalogGenerationAdvanceCount, 0)
+            XCTAssertEqual(sample.searchCatalogCacheClearCount, 0)
+            XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0)
+            XCTAssertEqual(sample.distinctContentKeyCount, fileCount)
+            XCTAssertEqual(sample.decodedCacheInvalidationRequestCount, 1)
+            XCTAssertEqual(sample.codemapInvalidationRequestCount, fileCount)
+            XCTAssertEqual(sample.appliedIndexEventYieldCount, 1)
+
+            for (index, file) in files.enumerated() {
+                let refreshed = try await store.searchContentSnapshot(for: file)
+                XCTAssertTrue(refreshed.isFresh)
+                XCTAssertEqual(refreshed.content, String(format: "new-%03d", index))
+                let refreshedRevision = try XCTUnwrap(refreshed.contentRevision)
+                XCTAssertGreaterThan(refreshedRevision, try XCTUnwrap(initialRevisionsByFileID[file.id]))
+            }
+        }
+
+        func testPublicationInvalidationDiagnosticsRetainOnlyLatestThirtyTwoSamples() async throws {
+            let root = try makeTemporaryRoot(name: "PublicationInvalidationRetention")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+
+            // Keep publisher ingress attached for synthetic publications while excluding live
+            // FSEvents from the measurement window.
+            let loadedFileSystemService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let fileSystemService = try XCTUnwrap(loadedFileSystemService)
+            await fileSystemService.stopWatchingForChanges()
+            _ = await store.awaitAppliedIngressForAllRoots()
+            let baselineSnapshots = await store.readSearchRootDiagnosticsSnapshot(recentPublicationLimit: 32)
+            let baselineSnapshot = try XCTUnwrap(baselineSnapshots.first { $0.rootID == record.id })
+            let publicationCount = 40
+
+            for _ in 0 ..< publicationCount {
+                try await store.publishSyntheticFileSystemDeltasForTesting(
+                    rootID: record.id,
+                    deltas: [.fileModified("Seed.swift", nil)]
+                )
+                _ = await store.awaitAppliedIngressForAllRoots()
+            }
+
+            let rootSnapshots = await store.readSearchRootDiagnosticsSnapshot(recentPublicationLimit: 32)
+            let rootSnapshot = try XCTUnwrap(rootSnapshots.first { $0.rootID == record.id })
+            let invalidation = rootSnapshot.invalidation
+            XCTAssertEqual(invalidation.retainedSampleLimit, 32)
+            XCTAssertEqual(
+                invalidation.totalObservedPublicationCount,
+                baselineSnapshot.invalidation.totalObservedPublicationCount + publicationCount
+            )
+            XCTAssertEqual(
+                invalidation.droppedPublicationSampleCount,
+                invalidation.totalObservedPublicationCount - invalidation.samples.count
+            )
+            XCTAssertEqual(invalidation.samples.count, 32)
+            XCTAssertTrue(invalidation.samples.allSatisfy {
+                $0.watcherAcceptedWatermark == nil && $0.preparedDeltaCount == 1
+            })
+            let retainedSequences = invalidation.samples.map(\.servicePublicationSequence)
+            XCTAssertTrue(retainedSequences.allSatisfy { $0 > 0 })
+            XCTAssertTrue(zip(retainedSequences, retainedSequences.dropFirst()).allSatisfy { pair in
+                pair.0 < pair.1
+            })
+
+            await store.stopWatchingRoot(id: record.id)
         }
 
         func testSearchCatalogSnapshotCacheReusesUnchangedScopeAndPreservesOrderingDiagnostics() async throws {
@@ -2373,6 +3023,64 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         await manager.unloadAllRootFolders()
     }
 
+    #if DEBUG
+        @MainActor
+        func testAppliedIndexProjectionDiagnosticsReportProducedHandledLag() async throws {
+            let root = try makeTemporaryRoot(name: "AppliedIndexProjectionLag")
+            try write("seed", to: root.appendingPathComponent("Seed.swift"))
+            let store = WorkspaceFileContextStore()
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            await manager.setCodeScanEnabled(false)
+            let workspace = WorkspaceModel(name: "AppliedIndexProjectionLag", repoPaths: [root.path])
+            try await manager.loadFolder(at: root, for: workspace)
+            let roots = await store.roots()
+            let rootRecord = try XCTUnwrap(roots.first)
+            let projectionGate = AsyncGate()
+            manager.setAppliedIndexProjectionWillHandleHandlerForTesting { rootID, _ in
+                guard rootID == rootRecord.id else { return }
+                await projectionGate.markStartedAndWaitForRelease()
+            }
+
+            let addedURL = root.appendingPathComponent("Added.swift")
+            try write("added", to: addedURL)
+            let replayCompleted = AsyncSignal()
+            let replayTask = Task {
+                await store.replayObservedFileSystemDeltas(
+                    rootID: rootRecord.id,
+                    deltas: [.fileAdded("Added.swift")]
+                )
+                await replayCompleted.mark()
+            }
+            await projectionGate.waitUntilStarted()
+            let producerCompletedBeforeProjectionRelease = await waitForAsyncCondition {
+                await replayCompleted.isMarked()
+            }
+            XCTAssertTrue(producerCompletedBeforeProjectionRelease)
+
+            let producedRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let producedRoot = try XCTUnwrap(producedRoots.first { $0.rootID == rootRecord.id })
+            let blockedProjection = manager.appliedIndexProjectionDiagnosticsSnapshot()
+            XCTAssertEqual(producedRoot.producedAppliedIndexGeneration, 1)
+            XCTAssertEqual(blockedProjection.handledGenerationByRootID[rootRecord.id] ?? 0, 0)
+            XCTAssertEqual(
+                producedRoot.producedAppliedIndexGeneration - (blockedProjection.handledGenerationByRootID[rootRecord.id] ?? 0),
+                1
+            )
+
+            await projectionGate.release()
+            await replayTask.value
+            let projectionSettled = await waitForAsyncCondition {
+                manager.appliedIndexProjectionDiagnosticsSnapshot().handledGenerationByRootID[rootRecord.id] == 1
+            }
+            XCTAssertTrue(projectionSettled)
+            let settledProjection = manager.appliedIndexProjectionDiagnosticsSnapshot()
+            XCTAssertEqual(settledProjection.handledEventCount, 1)
+            XCTAssertEqual(settledProjection.handledGenerationByRootID[rootRecord.id], 1)
+            manager.setAppliedIndexProjectionWillHandleHandlerForTesting(nil)
+            await manager.unloadAllRootFolders()
+        }
+    #endif
+
     @MainActor
     func testCancelledRootLoadDoesNotCommitUIOrStoreRoot() async throws {
         #if DEBUG
@@ -2566,6 +3274,159 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotNil(value?.revision)
             XCTAssertEqual(snapshot.entryCount, 1)
             XCTAssertEqual(snapshot.acceptedLoadCount, 1)
+        }
+
+        func testBulkSearchContentInvalidationEvictsEveryDistinctKeyAtUnchangedFingerprint() async throws {
+            let cache = WorkspaceSearchDecodedContentCache(maxEntryCount: 8, maxEstimatedCost: 1000)
+            let rootID = UUID()
+            let fingerprint = FileContentFingerprint(
+                deviceID: 1,
+                fileNumber: 1,
+                byteSize: 1,
+                modificationSeconds: 1,
+                modificationNanoseconds: 0,
+                statusChangeSeconds: 1,
+                statusChangeNanoseconds: 0
+            )
+            let keys = (0 ..< 4).map { index in
+                WorkspaceSearchContentCacheKey(
+                    rootID: rootID,
+                    fileID: UUID(),
+                    standardizedRelativePath: "\(index).swift"
+                )
+            }
+            var initialRevisions: [WorkspaceSearchContentCacheKey: UInt64] = [:]
+            for (index, key) in keys.enumerated() {
+                let value = try await cache.snapshot(for: key, fingerprint: fingerprint, invalidationEpoch: 1) {
+                    ValidatedFileContentSnapshot(
+                        content: "old-\(index)",
+                        detectedEncodingRawValue: String.Encoding.utf8.rawValue,
+                        modificationDate: fingerprint.modificationDate,
+                        fingerprint: fingerprint
+                    )
+                }
+                initialRevisions[key] = try XCTUnwrap(value?.revision)
+            }
+
+            var batch = WorkspaceSearchContentInvalidationBatch()
+            for key in keys {
+                batch.record(key, through: 1)
+            }
+            await cache.invalidate(batch)
+
+            for (index, key) in keys.enumerated() {
+                let refreshed = try await cache.snapshot(for: key, fingerprint: fingerprint, invalidationEpoch: 1) {
+                    ValidatedFileContentSnapshot(
+                        content: "new-\(index)",
+                        detectedEncodingRawValue: String.Encoding.utf8.rawValue,
+                        modificationDate: fingerprint.modificationDate,
+                        fingerprint: fingerprint
+                    )
+                }
+                XCTAssertEqual(refreshed?.content, "new-\(index)")
+                XCTAssertGreaterThan(try XCTUnwrap(refreshed?.revision), try XCTUnwrap(initialRevisions[key]))
+            }
+            let snapshot = await cache.snapshotForTesting()
+
+            XCTAssertEqual(batch.count, keys.count)
+            XCTAssertEqual(snapshot.entryCount, keys.count)
+            XCTAssertEqual(snapshot.loadCount, keys.count * 2)
+            XCTAssertEqual(snapshot.acceptedLoadCount, keys.count * 2)
+            XCTAssertEqual(snapshot.hitCount, 0)
+        }
+
+        func testBulkSearchContentInvalidationRetainsMaximumEpochAndProtectsNewerFlight() async throws {
+            let cache = WorkspaceSearchDecodedContentCache(maxEntryCount: 2, maxEstimatedCost: 1000)
+            let key = WorkspaceSearchContentCacheKey(
+                rootID: UUID(),
+                fileID: UUID(),
+                standardizedRelativePath: "A.swift"
+            )
+            let oldFingerprint = FileContentFingerprint(
+                deviceID: 1,
+                fileNumber: 1,
+                byteSize: 9,
+                modificationSeconds: 9,
+                modificationNanoseconds: 0,
+                statusChangeSeconds: 9,
+                statusChangeNanoseconds: 0
+            )
+            let newFingerprint = FileContentFingerprint(
+                deviceID: 1,
+                fileNumber: 1,
+                byteSize: 10,
+                modificationSeconds: 10,
+                modificationNanoseconds: 0,
+                statusChangeSeconds: 10,
+                statusChangeNanoseconds: 0
+            )
+            let oldGate = AsyncGate()
+            let newGate = AsyncGate()
+            let oldFlight = Task {
+                try await cache.snapshot(for: key, fingerprint: oldFingerprint, invalidationEpoch: 9) {
+                    await oldGate.markStartedAndWaitForRelease()
+                    return ValidatedFileContentSnapshot(
+                        content: "old",
+                        detectedEncodingRawValue: String.Encoding.utf8.rawValue,
+                        modificationDate: oldFingerprint.modificationDate,
+                        fingerprint: oldFingerprint
+                    )
+                }
+            }
+            let newFlight = Task {
+                try await cache.snapshot(for: key, fingerprint: newFingerprint, invalidationEpoch: 10) {
+                    await newGate.markStartedAndWaitForRelease()
+                    return ValidatedFileContentSnapshot(
+                        content: "new",
+                        detectedEncodingRawValue: String.Encoding.utf8.rawValue,
+                        modificationDate: newFingerprint.modificationDate,
+                        fingerprint: newFingerprint
+                    )
+                }
+            }
+            await oldGate.waitUntilStarted()
+            await newGate.waitUntilStarted()
+
+            var batch = WorkspaceSearchContentInvalidationBatch()
+            batch.record(key, through: 7)
+            batch.record(key, through: 3)
+            batch.record(key, through: 9)
+            batch.record(key, through: 5)
+            XCTAssertEqual(batch.count, 1)
+            XCTAssertEqual(batch.maximumEpoch(for: key), 9)
+            await cache.invalidate(batch)
+
+            await oldGate.release()
+            await newGate.release()
+            let oldValue = try await oldFlight.value
+            let newValue = try await newFlight.value
+            XCTAssertNil(oldValue)
+            XCTAssertEqual(newValue?.content, "new")
+            let acceptedRevision = try XCTUnwrap(newValue?.revision)
+
+            var delayedOlderBatch = WorkspaceSearchContentInvalidationBatch()
+            delayedOlderBatch.record(key, through: 5)
+            await cache.invalidate(delayedOlderBatch)
+            let cachedNewValue = try await cache.snapshot(
+                for: key,
+                fingerprint: newFingerprint,
+                invalidationEpoch: 10
+            ) {
+                XCTFail("A delayed older invalidation must not evict the newer entry")
+                return ValidatedFileContentSnapshot(
+                    content: "unexpected",
+                    detectedEncodingRawValue: String.Encoding.utf8.rawValue,
+                    modificationDate: newFingerprint.modificationDate,
+                    fingerprint: newFingerprint
+                )
+            }
+            let snapshot = await cache.snapshotForTesting()
+
+            XCTAssertEqual(cachedNewValue?.content, "new")
+            XCTAssertEqual(cachedNewValue?.revision, acceptedRevision)
+            XCTAssertEqual(snapshot.entryCount, 1)
+            XCTAssertEqual(snapshot.acceptedLoadCount, 1)
+            XCTAssertEqual(snapshot.hitCount, 1)
         }
 
         func testSearchContentSnapshotWarmHitKeepsRevisionAndAvoidsSecondRead() async throws {
@@ -2928,10 +3789,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         try setDiskModificationDate(staleDate, for: fileURL)
 
         let store = WorkspaceFileContextStore()
+        let rootRecord = try await store.loadRoot(path: root.path)
         let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
         await manager.setCodeScanEnabled(false)
         let workspace = WorkspaceModel(name: "StrictSearchFreshness", repoPaths: [root.path])
-        try await manager.loadFolder(at: root, for: workspace)
+        manager.registerPreloadedWorkspaceRoot(rootRecord)
+        _ = try manager.attachRootShell(for: rootRecord, workspaceID: workspace.id)
         XCTAssertNil(manager.findFileByFullPath(fileURL.path))
 
         try write("struct A { let freshSearchToken = true }\n", to: fileURL)
@@ -3416,6 +4279,17 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             return final
         }
 
+        private func waitForAsyncCondition(
+            maxYields: Int = 1000,
+            _ condition: () async -> Bool
+        ) async -> Bool {
+            for _ in 0 ..< maxYields {
+                if await condition() { return true }
+                await Task.yield()
+            }
+            return await condition()
+        }
+
         private actor AsyncGate {
             private var started = false
             private var startedCount = 0
@@ -3452,6 +4326,62 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
             func startCount() -> Int {
                 startedCount
+            }
+        }
+
+        private actor CancellationAwareGate {
+            private struct Waiter {
+                let id: UUID
+                let continuation: CheckedContinuation<Void, Never>
+            }
+
+            private var started = false
+            private var startWaiters: [CheckedContinuation<Void, Never>] = []
+            private var cancellationWaiter: Waiter?
+            private var cancelledWaiterIDs: Set<UUID> = []
+
+            func markStartedAndWaitForCancellation() async {
+                started = true
+                let waiters = startWaiters
+                startWaiters.removeAll()
+                waiters.forEach { $0.resume() }
+
+                let waiterID = UUID()
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        if Task.isCancelled || cancelledWaiterIDs.remove(waiterID) != nil {
+                            continuation.resume()
+                        } else {
+                            cancellationWaiter = Waiter(id: waiterID, continuation: continuation)
+                        }
+                    }
+                } onCancel: {
+                    Task { await self.cancel(waiterID) }
+                }
+            }
+
+            func waitUntilStarted() async {
+                guard !started else { return }
+                await withCheckedContinuation { continuation in
+                    startWaiters.append(continuation)
+                }
+            }
+
+            private func cancel(_ waiterID: UUID) {
+                guard let cancellationWaiter, cancellationWaiter.id == waiterID else {
+                    cancelledWaiterIDs.insert(waiterID)
+                    return
+                }
+                self.cancellationWaiter = nil
+                cancellationWaiter.continuation.resume()
+            }
+        }
+
+        private final class WeakObjectBox<T: AnyObject>: @unchecked Sendable {
+            weak var value: T?
+
+            init(_ value: T?) {
+                self.value = value
             }
         }
 
@@ -3757,6 +4687,29 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             APIPaths = aggregate.orderedFileAPIs.map(\.filePath)
             XCTAssertEqual(APIPaths, [retainedFile.path])
             XCTAssertEqual(Set(aggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path])
+        }
+    #endif
+
+    #if DEBUG
+        private final class LockedWorkspaceDiagnosticsClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: UInt64
+
+            init(nowNanoseconds: UInt64) {
+                value = nowNanoseconds
+            }
+
+            func now() -> UInt64 {
+                lock.lock()
+                defer { lock.unlock() }
+                return value
+            }
+
+            func advance(milliseconds: UInt64) {
+                lock.lock()
+                value &+= milliseconds * 1_000_000
+                lock.unlock()
+            }
         }
     #endif
 

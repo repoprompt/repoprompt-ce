@@ -106,6 +106,175 @@
             XCTAssertNotNil(scheduler["overload_count"])
         }
 
+        func testLimiterDiagnosticsReportPromptQueuedCancellationAndIdleState() async {
+            let clock = LockedMCPDiagnosticsClock(nowNanoseconds: 1_000_000_000)
+            let limiter = AsyncLimiter(limit: 1, debugNowNanoseconds: { clock.now() })
+            let holderGate = MCPDiagnosticsGate()
+            let waiterBodyRan = MCPDiagnosticsSignal()
+            let snapshotSignal = MCPDiagnosticsSnapshotSignal()
+            await limiter.setDebugStateObserver { snapshot in
+                Task { await snapshotSignal.record(snapshot) }
+            }
+
+            let holder = Task {
+                try await limiter.withPermit {
+                    await holderGate.markStartedAndWaitForRelease()
+                }
+            }
+            await holderGate.waitUntilStarted()
+
+            let waiter = Task {
+                do {
+                    try await limiter.withPermit {
+                        await waiterBodyRan.mark()
+                    }
+                    return false
+                } catch is CancellationError {
+                    return true
+                } catch {
+                    return false
+                }
+            }
+
+            let queued = await snapshotSignal.waitUntil { $0.waiterCount == 1 }
+            XCTAssertEqual(queued.limit, 1)
+            XCTAssertEqual(queued.permits, 0)
+            XCTAssertEqual(queued.activePermitCount, 1)
+            XCTAssertEqual(queued.waiterCount, 1)
+            XCTAssertEqual(queued.inFlight, 2)
+            XCTAssertEqual(queued.oldestWaiterAgeMilliseconds, 0)
+            XCTAssertFalse(queued.isClosed)
+            XCTAssertFalse(queued.isIdle)
+
+            clock.advance(milliseconds: 275)
+            let aged = await limiter.debugSnapshot()
+            XCTAssertEqual(aged.oldestWaiterAgeMilliseconds, 275)
+
+            waiter.cancel()
+            let cancelled = await snapshotSignal.waitUntil {
+                $0.cancelledWaiterCount == 1 && $0.waiterCount == 0 && $0.inFlight == 1
+            }
+            XCTAssertEqual(cancelled.waiterCount, 0)
+            XCTAssertEqual(cancelled.cancelledWaiterCount, 1)
+            let waiterWasCancelled = await waiter.value
+            let didRunWaiterBody = await waiterBodyRan.isMarked()
+            XCTAssertTrue(waiterWasCancelled)
+            XCTAssertFalse(didRunWaiterBody)
+
+            await holderGate.release()
+            try? await holder.value
+
+            let settled = await snapshotSignal.waitUntil { $0.isIdle }
+            XCTAssertEqual(settled.permits, 1)
+            XCTAssertEqual(settled.activePermitCount, 0)
+            XCTAssertEqual(settled.waiterCount, 0)
+            XCTAssertEqual(settled.inFlight, 0)
+            XCTAssertNil(settled.oldestWaiterAgeMilliseconds)
+            XCTAssertEqual(settled.cancelledWaiterCount, 1)
+            XCTAssertFalse(settled.isClosed)
+            XCTAssertTrue(settled.isIdle)
+            await limiter.setDebugStateObserver(nil)
+        }
+
+        @MainActor
+        func testRuntimeSnapshotHiddenOperationValidatesBoundsAndReturnsAggregateShape() async throws {
+            let manager = ServerNetworkManager.shared
+            let connectionID = UUID()
+            let runID = UUID()
+            await manager.registerToolCallObserver(for: runID) { _ in }
+            await manager.registerToolEventObserver(
+                for: runID,
+                observer: ServerNetworkManager.ToolEventObserver(onCalled: { _, _, _ in }, onCompleted: nil)
+            )
+            addTeardownBlock {
+                await manager.unregisterToolObservers(for: runID)
+            }
+
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            addTeardownBlock { @MainActor in
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+
+            let expectedToolCallObserverCount = await manager.toolCallObserverCount()
+            let expectedToolEventObserverCount = await manager.toolEventObserverCount()
+            let result = await manager.handleDebugDiagnosticsTool(
+                connectionID: connectionID,
+                arguments: [
+                    "op": .string("mcp_read_search_runtime_snapshot"),
+                    "window_id": .int(window.windowID),
+                    "recent_publication_limit": .int(0),
+                    "root_limit": .int(1)
+                ]
+            )
+            let payload = try debugDiagnosticsPayload(result)
+            XCTAssertEqual(payload["ok"] as? Bool, true)
+            XCTAssertEqual(payload["op"] as? String, "mcp_read_search_runtime_snapshot")
+            let runtime = try XCTUnwrap(payload["runtime"] as? [String: Any])
+            XCTAssertEqual(runtime["consistency"] as? String, "best_effort")
+            XCTAssertEqual((runtime["window_count"] as? NSNumber)?.intValue, 1)
+            let observers = try XCTUnwrap(runtime["observers"] as? [String: Any])
+            XCTAssertEqual(
+                (observers["tool_call_observer_count"] as? NSNumber)?.intValue,
+                expectedToolCallObserverCount
+            )
+            XCTAssertEqual(
+                (observers["tool_event_observer_count"] as? NSNumber)?.intValue,
+                expectedToolEventObserverCount
+            )
+            let windows = try XCTUnwrap(runtime["windows"] as? [[String: Any]])
+            let windowPayload = try XCTUnwrap(windows.first)
+            XCTAssertEqual((windowPayload["window_id"] as? NSNumber)?.intValue, window.windowID)
+            XCTAssertNotNil(windowPayload["projection_direct_file_id_lookup_count"])
+            XCTAssertNotNil(windowPayload["projection_direct_folder_id_lookup_count"])
+            XCTAssertNotNil(windowPayload["projection_direct_id_lookup_miss_count"])
+            XCTAssertNotNil(windowPayload["projection_canonical_resync_count"])
+            let autoSelection = try XCTUnwrap(windowPayload["read_file_auto_selection"] as? [String: Any])
+            for key in [
+                "canonical_lane_count",
+                "canonical_worker_count",
+                "mirror_lane_count",
+                "mirror_worker_count",
+                "closing_context_count",
+                "pending_canonical_batch_count",
+                "pending_mirror_batch_count"
+            ] {
+                XCTAssertEqual((autoSelection[key] as? NSNumber)?.intValue, 0, key)
+            }
+            let limiter = try XCTUnwrap(runtime["limiter"] as? [String: Any])
+            XCTAssertEqual(limiter["found"] as? Bool, false)
+            XCTAssertEqual(limiter["connection_id"] as? String, connectionID.uuidString)
+
+            for invalidArguments: [String: Value] in [
+                [
+                    "op": .string("mcp_read_search_runtime_snapshot"),
+                    "connection_id": .string("not-a-uuid")
+                ],
+                [
+                    "op": .string("mcp_read_search_runtime_snapshot"),
+                    "recent_publication_limit": .int(33)
+                ],
+                [
+                    "op": .string("mcp_read_search_runtime_snapshot"),
+                    "root_limit": .int(0)
+                ]
+            ] {
+                let invalidResult = await manager.handleDebugDiagnosticsTool(
+                    connectionID: connectionID,
+                    arguments: invalidArguments
+                )
+                let invalidPayload = try debugDiagnosticsPayload(invalidResult)
+                XCTAssertEqual(invalidPayload["ok"] as? Bool, false)
+                XCTAssertEqual(invalidPayload["op"] as? String, "mcp_read_search_runtime_snapshot")
+                XCTAssertEqual(invalidPayload["code"] as? String, "invalid_params")
+            }
+        }
+
         func testExpectedAttributionStagesRemainPresent() throws {
             let perf = try source("Sources/RepoPrompt/Infrastructure/Diffing/EditFlowPerf.swift")
             for stage in [
@@ -243,10 +412,10 @@
             }
 
             let limiterBegin = try XCTUnwrap(manager.range(of: "let limiterWaitState = EditFlowPerf.begin("))
-            let withPermit = try XCTUnwrap(manager.range(of: "return await limiter.withPermit {", range: limiterBegin.upperBound ..< manager.endIndex))
-            let limiterEnd = try XCTUnwrap(manager.range(of: "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState)", range: withPermit.upperBound ..< manager.endIndex))
-            XCTAssertLessThan(limiterBegin.lowerBound, withPermit.lowerBound)
-            XCTAssertLessThan(withPermit.lowerBound, limiterEnd.lowerBound)
+            let limiterEnd = try XCTUnwrap(manager.range(of: "defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState) }", range: limiterBegin.upperBound ..< manager.endIndex))
+            let withPermit = try XCTUnwrap(manager.range(of: "return await limiter.withPermit(", range: limiterEnd.upperBound ..< manager.endIndex))
+            XCTAssertLessThan(limiterBegin.lowerBound, limiterEnd.lowerBound)
+            XCTAssertLessThan(limiterEnd.lowerBound, withPermit.lowerBound)
 
             let lookupBegin = try XCTUnwrap(manager.range(of: "let serviceToolLookupState = EditFlowPerf.begin("))
             let directInvocation = try XCTUnwrap(manager.range(of: "toolDef.callAsFunction(effectiveArgs)", range: lookupBegin.upperBound ..< manager.endIndex))
@@ -424,8 +593,8 @@
                 "endPreLimiterEnvelopeIfNeeded()",
                 "EditFlowPerf.Stage.MCPToolCall.limiterEnvelope",
                 "let limiterWaitState = EditFlowPerf.begin(",
-                "await limiter.withPermit {",
-                "EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState)",
+                "defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState) }",
+                "await limiter.withPermit(",
                 "EditFlowPerf.Stage.MCPToolCall.permitBodyEnvelope",
                 "let permitPreDispatchEnvelopeState = EditFlowPerf.begin(",
                 "EditFlowPerf.Stage.MCPToolCall.enabledStateSnapshot",
@@ -1501,7 +1670,6 @@
             XCTAssertTrue(store.contains("private static let maxCachedSearchCatalogSnapshotScopes = 16"))
             XCTAssertTrue(store.contains("private var searchCatalogSnapshotsByScope: [WorkspaceLookupRootScope: SearchCatalogSnapshotCacheEntry] = [:]"))
             XCTAssertTrue(store.contains("case .sessionBoundWorkspace:\n            scopedSnapshotGeneration(scope: .allLoaded)"))
-            XCTAssertTrue(store.contains("private func clearSearchCatalogSnapshotCache() {\n        searchCatalogSnapshotsByScope.removeAll(keepingCapacity: true)\n    }"))
             XCTAssertTrue(store.contains("rootStatesByID[originalRootID] = state\n            clearSearchCatalogSnapshotCache()\n            indexed.append(fullPath)"))
             assertSourceOrder(
                 in: store,
@@ -2147,7 +2315,7 @@
                     "EditFlowPerf.Lifecycle.MCPToolCall.received",
                     "EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted",
                     "EditFlowPerf.Lifecycle.MCPToolCall.limiterWaitBegan",
-                    "return await limiter.withPermit {",
+                    "return await limiter.withPermit(",
                     "EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired",
                     "Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation)"
                 ]
@@ -2183,7 +2351,7 @@
                     "EditFlowPerf.Lifecycle.FileSystem.callbackAccepted",
                     "func drainAcceptedWatcherIngressMailbox()",
                     "EditFlowPerf.Lifecycle.FileSystem.serviceEnqueueEntered",
-                    "watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"
+                    "watcherAcceptedWatermark: publishableWatcherWatermark"
                 ]
             )
 
@@ -2238,7 +2406,7 @@
                 in: server,
                 hooks: [
                     "let readableService = WorkspaceReadableFileService(store: store)",
-                    "await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)",
+                    "try await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)",
                     "let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)"
                 ]
             )
@@ -2264,8 +2432,98 @@
             XCTAssertFalse(fsevents.contains("changePublisher.send"))
             XCTAssertFalse(operations.contains("changePublisher.send"))
             XCTAssertTrue(fsevents.contains("source: .watcherBarrierNoop"))
-            XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark"))
+            XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: publishableWatcherWatermark"))
             XCTAssertEqual(operations.components(separatedBy: "source: .syntheticMutation").count - 1, 5)
+        }
+
+        private actor MCPDiagnosticsGate {
+            private var started = false
+            private var released = false
+            private var startWaiters: [CheckedContinuation<Void, Never>] = []
+            private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+            func markStartedAndWaitForRelease() async {
+                started = true
+                let pendingStartWaiters = startWaiters
+                startWaiters.removeAll()
+                pendingStartWaiters.forEach { $0.resume() }
+                guard !released else { return }
+                await withCheckedContinuation { continuation in
+                    releaseWaiters.append(continuation)
+                }
+            }
+
+            func waitUntilStarted() async {
+                guard !started else { return }
+                await withCheckedContinuation { continuation in
+                    startWaiters.append(continuation)
+                }
+            }
+
+            func release() {
+                released = true
+                let pendingReleaseWaiters = releaseWaiters
+                releaseWaiters.removeAll()
+                pendingReleaseWaiters.forEach { $0.resume() }
+            }
+        }
+
+        private actor MCPDiagnosticsSignal {
+            private var marked = false
+
+            func mark() {
+                marked = true
+            }
+
+            func isMarked() -> Bool {
+                marked
+            }
+        }
+
+        private actor MCPDiagnosticsSnapshotSignal {
+            typealias Snapshot = AsyncLimiter.DebugSnapshot
+            private var latest: Snapshot?
+            private var waiter: (
+                predicate: @Sendable (Snapshot) -> Bool,
+                continuation: CheckedContinuation<Snapshot, Never>
+            )?
+
+            func record(_ snapshot: Snapshot) {
+                latest = snapshot
+                guard let waiter, waiter.predicate(snapshot) else { return }
+                self.waiter = nil
+                waiter.continuation.resume(returning: snapshot)
+            }
+
+            func waitUntil(
+                _ predicate: @escaping @Sendable (Snapshot) -> Bool
+            ) async -> Snapshot {
+                if let latest, predicate(latest) { return latest }
+                return await withCheckedContinuation { continuation in
+                    waiter = (predicate, continuation)
+                }
+            }
+        }
+
+        private final class LockedMCPDiagnosticsClock: @unchecked Sendable {
+            private let lock = NSLock()
+            private var value: UInt64
+
+            init(nowNanoseconds: UInt64) {
+                value = nowNanoseconds
+            }
+
+            func now() -> UInt64 {
+                lock.lock()
+                defer { lock.unlock() }
+                return value
+            }
+
+            func advance(milliseconds: UInt64) {
+                lock.lock()
+                value &+= milliseconds * 1_000_000
+                lock.unlock()
+            }
         }
 
         private final class LockedCorrelationIDs: @unchecked Sendable {

@@ -79,15 +79,19 @@ struct FileHierarchyIndex {
         let scanInvocationCount: Int
     }
 
-    // New: Store file & folder ViewModels by their fullPath.
+    // Store file & folder ViewModels by canonical path and store-backed identity.
     var filesByFullPath: [String: FileViewModel] = [:]
     var foldersByFullPath: [String: FolderViewModel] = [:]
+    var filesByID: [UUID: FileViewModel] = [:]
+    var foldersByID: [UUID: FolderViewModel] = [:]
     var filePathsByRoot: [String: Set<String>] = [:]
     var folderPathsByRoot: [String: Set<String>] = [:]
 
     mutating func clearAll() {
         filesByFullPath.removeAll()
         foldersByFullPath.removeAll()
+        filesByID.removeAll()
+        foldersByID.removeAll()
         filePathsByRoot.removeAll()
         folderPathsByRoot.removeAll()
     }
@@ -112,21 +116,35 @@ struct FileHierarchyIndex {
         let path = folder.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? StandardizedPath.absolute(folder.rootPath)
         if let existing = foldersByFullPath.updateValue(folder, forKey: path) {
+            if foldersByID[existing.id] === existing {
+                foldersByID.removeValue(forKey: existing.id)
+            }
             let previousRootKey = StandardizedPath.absolute(existing.rootPath)
             if previousRootKey != ownerRootKey {
                 Self.removePath(path, from: &folderPathsByRoot, rootKey: previousRootKey)
             }
         }
+        foldersByID[folder.id] = folder
         folderPathsByRoot[ownerRootKey, default: []].insert(path)
         if path == ownerRootKey {
             _ = filePathsByRoot[ownerRootKey, default: []]
         }
     }
 
+    mutating func rekeyFolder(_ folder: FolderViewModel, from oldID: UUID) {
+        if foldersByID[oldID] === folder {
+            foldersByID.removeValue(forKey: oldID)
+        }
+        foldersByID[folder.id] = folder
+    }
+
     @discardableResult
     mutating func removeFolder(forKey path: String, expectedRootKey: String? = nil) -> FolderViewModel? {
         let standardizedPath = StandardizedPath.absolute(path)
         let removed = foldersByFullPath.removeValue(forKey: standardizedPath)
+        if let removed, foldersByID[removed.id] === removed {
+            foldersByID.removeValue(forKey: removed.id)
+        }
         let ownerRootKey = removed.map { StandardizedPath.absolute($0.rootPath) }
             ?? expectedRootKey.map(StandardizedPath.absolute)
         if let ownerRootKey {
@@ -139,11 +157,15 @@ struct FileHierarchyIndex {
         let path = file.standardizedFullPath
         let ownerRootKey = rootKey.map(StandardizedPath.absolute) ?? file.standardizedRootFolderPath
         if let existing = filesByFullPath.updateValue(file, forKey: path) {
+            if filesByID[existing.id] === existing {
+                filesByID.removeValue(forKey: existing.id)
+            }
             let previousRootKey = existing.standardizedRootFolderPath
             if previousRootKey != ownerRootKey {
                 Self.removePath(path, from: &filePathsByRoot, rootKey: previousRootKey)
             }
         }
+        filesByID[file.id] = file
         filePathsByRoot[ownerRootKey, default: []].insert(path)
     }
 
@@ -151,6 +173,9 @@ struct FileHierarchyIndex {
     mutating func removeFile(forKey path: String, expectedRootKey: String? = nil) -> FileViewModel? {
         let standardizedPath = StandardizedPath.absolute(path)
         let removed = filesByFullPath.removeValue(forKey: standardizedPath)
+        if let removed, filesByID[removed.id] === removed {
+            filesByID.removeValue(forKey: removed.id)
+        }
         let ownerRootKey = removed?.standardizedRootFolderPath
             ?? expectedRootKey.map(StandardizedPath.absolute)
         if let ownerRootKey {
@@ -173,10 +198,18 @@ struct FileHierarchyIndex {
         folderPathsByRoot.removeValue(forKey: rootKey)
         filePathsByRoot.removeValue(forKey: rootKey)
         for folderPath in folderPaths {
-            foldersByFullPath.removeValue(forKey: folderPath)
+            if let removed = foldersByFullPath.removeValue(forKey: folderPath),
+               foldersByID[removed.id] === removed
+            {
+                foldersByID.removeValue(forKey: removed.id)
+            }
         }
         for filePath in filePaths {
-            filesByFullPath.removeValue(forKey: filePath)
+            if let removed = filesByFullPath.removeValue(forKey: filePath),
+               filesByID[removed.id] === removed
+            {
+                filesByID.removeValue(forKey: removed.id)
+            }
         }
     }
 
@@ -267,10 +300,18 @@ struct FileHierarchyIndex {
             filePathsByRoot[standardizedRootKey] = []
         }
         for folderPath in folderPaths {
-            foldersByFullPath.removeValue(forKey: folderPath)
+            if let removed = foldersByFullPath.removeValue(forKey: folderPath),
+               foldersByID[removed.id] === removed
+            {
+                foldersByID.removeValue(forKey: removed.id)
+            }
         }
         for filePath in filePaths {
-            filesByFullPath.removeValue(forKey: filePath)
+            if let removed = filesByFullPath.removeValue(forKey: filePath),
+               filesByID[removed.id] === removed
+            {
+                filesByID.removeValue(forKey: removed.id)
+            }
         }
     }
 }
@@ -518,6 +559,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     func removeRootFolder(_ folder: FolderViewModel) {
         let stdPath = folder.standardizedFullPath
         let rootKey = rootKey(forPath: folder.fullPath)
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         unregisterExpansionTracking(for: folder)
         rootFolders.removeAll { $0.id == folder.id }
         rootShellPersistenceKeysByRootKey.removeValue(forKey: rootKey)
@@ -771,6 +813,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         typealias RootReplayPassPerfSample = Never
     #endif
 
+    private var appliedIndexProjectionHandledGenerationByRootID: [UUID: UInt64] = [:]
+
     #if DEBUG
         struct IndexRebuildPerfSample: Equatable {
             let rootKey: String
@@ -932,6 +976,57 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var currentReplayParentLookupCount = 0
         private var deltaReplayChunkSizeOverride: Int?
         private var deltaReplayInterChunkDelayNanosecondsOverride: UInt64?
+
+        struct AppliedIndexProjectionDiagnosticsSnapshot: Equatable {
+            let handledEventCount: Int
+            let handledGenerationByRootID: [UUID: UInt64]
+            let directFileIDLookupCount: Int
+            let directFolderIDLookupCount: Int
+            let directIDLookupMissCount: Int
+            let canonicalResyncCount: Int
+        }
+
+        private var appliedIndexProjectionHandledEventCount = 0
+        private var appliedIndexProjectionDirectFileIDLookupCount = 0
+        private var appliedIndexProjectionDirectFolderIDLookupCount = 0
+        private var appliedIndexProjectionDirectIDLookupMissCount = 0
+        private var appliedIndexProjectionCanonicalResyncCount = 0
+        private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
+        private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+
+        func setAppliedIndexProjectionWillHandleHandlerForTesting(
+            _ handler: (@Sendable (UUID, UInt64) async -> Void)?
+        ) {
+            appliedIndexProjectionWillHandleHandler = handler
+        }
+
+        func setAppliedIndexProjectionStateObserverForTesting(
+            _ observer: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
+        ) {
+            appliedIndexProjectionStateObserver = observer
+            observer?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        func appliedIndexProjectionDiagnosticsSnapshot() -> AppliedIndexProjectionDiagnosticsSnapshot {
+            AppliedIndexProjectionDiagnosticsSnapshot(
+                handledEventCount: appliedIndexProjectionHandledEventCount,
+                handledGenerationByRootID: appliedIndexProjectionHandledGenerationByRootID,
+                directFileIDLookupCount: appliedIndexProjectionDirectFileIDLookupCount,
+                directFolderIDLookupCount: appliedIndexProjectionDirectFolderIDLookupCount,
+                directIDLookupMissCount: appliedIndexProjectionDirectIDLookupMissCount,
+                canonicalResyncCount: appliedIndexProjectionCanonicalResyncCount
+            )
+        }
+
+        private func notifyAppliedIndexProjectionStateChanged() {
+            appliedIndexProjectionStateObserver?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        func resetAppliedIndexProjectionLookupDiagnosticsForTesting() {
+            appliedIndexProjectionDirectFileIDLookupCount = 0
+            appliedIndexProjectionDirectFolderIDLookupCount = 0
+            appliedIndexProjectionDirectIDLookupMissCount = 0
+        }
     #endif
     private var workspaceStoreDeltaBridgeTask: Task<Void, Never>?
     private var workspaceStoreCodemapBridgeTask: Task<Void, Never>?
@@ -1137,25 +1232,441 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
+    private struct WorkspaceAppliedIndexModificationTargets {
+        let filesByID: [UUID: FileViewModel]
+        let foldersByID: [UUID: FolderViewModel]
+    }
+
+    private enum WorkspaceAppliedIndexModificationResolution {
+        case targets(WorkspaceAppliedIndexModificationTargets)
+        case requiresCanonicalResync
+        case rootNoLongerCurrent
+    }
+
     @MainActor
     private func handleWorkspaceAppliedIndexEvent(_ event: WorkspaceAppliedIndexBatchEvent) async {
-        let rootKey = rootKey(forPath: event.rootPath)
-        guard let targetRootVM = rootFolders.first(where: { $0.id == event.rootID || $0.standardizedFullPath == rootKey }) else { return }
+        #if DEBUG
+            if let appliedIndexProjectionWillHandleHandler {
+                await appliedIndexProjectionWillHandleHandler(event.rootID, event.generation)
+            }
+        #endif
+
+        guard !Task.isCancelled,
+              let (rootKey, targetRootVM) = currentWorkspaceAppliedIndexRoot(for: event)
+        else { return }
+        let handledGeneration = appliedIndexProjectionHandledGenerationByRootID[event.rootID] ?? 0
+        guard event.generation > handledGeneration else { return }
+
         if event.isRootUnload {
-            guard rootFolders.contains(where: { $0.id == targetRootVM.id }) else { return }
             _ = detachRootShellReferences(targetRootVM)
+            recordHandledWorkspaceAppliedIndexEvent()
             return
+        }
+
+        let nextExpectedGeneration = handledGeneration &+ 1
+        if event.requiresFullResync || event.generation != nextExpectedGeneration {
+            _ = await resyncAndRecordWorkspaceAppliedIndexProjection(
+                for: event,
+                rootKey: rootKey,
+                targetRootVM: targetRootVM
+            )
+            return
+        }
+
+        let modificationTargets: WorkspaceAppliedIndexModificationTargets
+        switch await resolveContiguousWorkspaceAppliedIndexModificationTargets(
+            for: event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM
+        ) {
+        case let .targets(resolvedTargets):
+            modificationTargets = resolvedTargets
+        case .requiresCanonicalResync:
+            _ = await resyncAndRecordWorkspaceAppliedIndexProjection(
+                for: event,
+                rootKey: rootKey,
+                targetRootVM: targetRootVM
+            )
+            return
+        case .rootNoLongerCurrent:
+            return
+        }
+
+        guard await applyWorkspaceAppliedIndexEvent(
+            event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM,
+            useCanonicalSnapshotMetadata: false,
+            modificationTargets: modificationTargets
+        ) else { return }
+        appliedIndexProjectionHandledGenerationByRootID[event.rootID] = event.generation
+        recordHandledWorkspaceAppliedIndexEvent()
+    }
+
+    @MainActor
+    private func currentWorkspaceAppliedIndexRoot(
+        for event: WorkspaceAppliedIndexBatchEvent
+    ) -> (rootKey: RootKey, root: FolderViewModel)? {
+        let rootKey = rootKey(forPath: event.rootPath)
+        guard workspaceFileContextRootsByRootKey[rootKey]?.id == event.rootID,
+              let root = rootFolders.first(where: { $0.id == event.rootID }),
+              root.standardizedFullPath == rootKey,
+              fileHierarchyIndex.foldersByID[event.rootID] === root
+        else {
+            return nil
+        }
+        return (rootKey, root)
+    }
+
+    @MainActor
+    private func isCurrentWorkspaceAppliedIndexRoot(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        targetRootVM: FolderViewModel
+    ) -> Bool {
+        guard !Task.isCancelled,
+              let current = currentWorkspaceAppliedIndexRoot(for: event)
+        else {
+            return false
+        }
+        return current.root === targetRootVM
+    }
+
+    @MainActor
+    private func isCurrentAttachedRoot(
+        _ root: FolderViewModel,
+        expectedRootID: UUID? = nil
+    ) -> Bool {
+        guard !Task.isCancelled else { return false }
+        let rootKey = StandardizedPath.absolute(root.standardizedFullPath)
+        let rootID = expectedRootID ?? root.id
+        return root.id == rootID
+            && workspaceFileContextRootsByRootKey[rootKey]?.id == rootID
+            && rootFolders.contains(where: { $0 === root })
+            && fileHierarchyIndex.foldersByID[rootID] === root
+            && fileHierarchyIndex.foldersByFullPath[rootKey] === root
+    }
+
+    @MainActor
+    private func recordHandledWorkspaceAppliedIndexEvent() {
+        #if DEBUG
+            appliedIndexProjectionHandledEventCount += 1
+            notifyAppliedIndexProjectionStateChanged()
+        #endif
+    }
+
+    @MainActor
+    private func resyncAndRecordWorkspaceAppliedIndexProjection(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> Bool {
+        guard let resyncedGeneration = await resyncWorkspaceAppliedIndexProjection(
+            for: event,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM
+        ) else {
+            return false
+        }
+        appliedIndexProjectionHandledGenerationByRootID[event.rootID] = resyncedGeneration
+        #if DEBUG
+            appliedIndexProjectionCanonicalResyncCount += 1
+        #endif
+        recordHandledWorkspaceAppliedIndexEvent()
+        return true
+    }
+
+    @MainActor
+    private func resolveContiguousWorkspaceAppliedIndexModificationTargets(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> WorkspaceAppliedIndexModificationResolution {
+        var filesByID: [UUID: FileViewModel] = [:]
+        filesByID.reserveCapacity(event.modifiedFileIDs.count)
+        var missingFileIDs: [UUID] = []
+        missingFileIDs.reserveCapacity(event.modifiedFileIDs.count)
+        for fileID in event.modifiedFileIDs {
+            guard let file = projectedFileForAppliedIndexModification(id: fileID) else {
+                missingFileIDs.append(fileID)
+                continue
+            }
+            guard isConsistentProjectedFile(file, id: fileID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+            filesByID[fileID] = file
+        }
+
+        var foldersByID: [UUID: FolderViewModel] = [:]
+        foldersByID.reserveCapacity(event.modifiedFolderIDs.count)
+        var missingFolderIDs: [UUID] = []
+        missingFolderIDs.reserveCapacity(event.modifiedFolderIDs.count)
+        for folderID in event.modifiedFolderIDs {
+            guard let folder = projectedFolderForAppliedIndexModification(id: folderID) else {
+                missingFolderIDs.append(folderID)
+                continue
+            }
+            guard isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+            foldersByID[folderID] = folder
+        }
+
+        guard !missingFileIDs.isEmpty || !missingFolderIDs.isEmpty else {
+            return .targets(WorkspaceAppliedIndexModificationTargets(
+                filesByID: filesByID,
+                foldersByID: foldersByID
+            ))
+        }
+
+        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
+              snapshot.root.id == event.rootID,
+              snapshot.root.standardizedFullPath == rootKey,
+              snapshot.generation >= event.generation
+        else {
+            return .requiresCanonicalResync
+        }
+        guard !Task.isCancelled,
+              let current = currentWorkspaceAppliedIndexRoot(for: event),
+              current.root === targetRootVM
+        else {
+            return .rootNoLongerCurrent
+        }
+
+        for (fileID, file) in filesByID {
+            guard isConsistentProjectedFile(file, id: fileID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+        }
+        for (folderID, folder) in foldersByID {
+            guard isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey) else {
+                return .requiresCanonicalResync
+            }
+        }
+
+        let canonicalFilesByID = Dictionary(uniqueKeysWithValues: snapshot.files.map { ($0.id, $0) })
+        for fileID in missingFileIDs {
+            guard let record = canonicalFilesByID[fileID] else {
+                return .requiresCanonicalResync
+            }
+            let fileByID = fileHierarchyIndex.filesByID[fileID]
+            let fileByPath = fileHierarchyIndex.filesByFullPath[record.standardizedFullPath]
+            switch (fileByID, fileByPath) {
+            case (nil, nil):
+                continue
+            case let (idFile?, pathFile?) where idFile === pathFile
+                && isConsistentProjectedFile(
+                    idFile,
+                    id: fileID,
+                    rootKey: rootKey,
+                    expectedFullPath: record.standardizedFullPath
+                ):
+                filesByID[fileID] = idFile
+            default:
+                return .requiresCanonicalResync
+            }
+        }
+
+        let canonicalFoldersByID = Dictionary(uniqueKeysWithValues: snapshot.folders.map { ($0.id, $0) })
+        for folderID in missingFolderIDs {
+            guard let record = canonicalFoldersByID[folderID] else {
+                return .requiresCanonicalResync
+            }
+            let folderByID = fileHierarchyIndex.foldersByID[folderID]
+            let folderByPath = fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath]
+            switch (folderByID, folderByPath) {
+            case (nil, nil):
+                continue
+            case let (idFolder?, pathFolder?) where idFolder === pathFolder
+                && isConsistentProjectedFolder(
+                    idFolder,
+                    id: folderID,
+                    rootKey: rootKey,
+                    expectedFullPath: record.standardizedFullPath
+                ):
+                foldersByID[folderID] = idFolder
+            default:
+                return .requiresCanonicalResync
+            }
+        }
+
+        return .targets(WorkspaceAppliedIndexModificationTargets(
+            filesByID: filesByID,
+            foldersByID: foldersByID
+        ))
+    }
+
+    @MainActor
+    private func resolveStrictWorkspaceAppliedIndexModificationTargets(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey
+    ) -> WorkspaceAppliedIndexModificationTargets? {
+        var filesByID: [UUID: FileViewModel] = [:]
+        filesByID.reserveCapacity(event.modifiedFileIDs.count)
+        for fileID in event.modifiedFileIDs {
+            guard let file = projectedFileForAppliedIndexModification(id: fileID),
+                  isConsistentProjectedFile(file, id: fileID, rootKey: rootKey)
+            else {
+                return nil
+            }
+            filesByID[fileID] = file
+        }
+
+        var foldersByID: [UUID: FolderViewModel] = [:]
+        foldersByID.reserveCapacity(event.modifiedFolderIDs.count)
+        for folderID in event.modifiedFolderIDs {
+            guard let folder = projectedFolderForAppliedIndexModification(id: folderID),
+                  isConsistentProjectedFolder(folder, id: folderID, rootKey: rootKey)
+            else {
+                return nil
+            }
+            foldersByID[folderID] = folder
+        }
+        return WorkspaceAppliedIndexModificationTargets(filesByID: filesByID, foldersByID: foldersByID)
+    }
+
+    @MainActor
+    private func isConsistentProjectedFile(
+        _ file: FileViewModel,
+        id: UUID,
+        rootKey: RootKey,
+        expectedFullPath: String? = nil
+    ) -> Bool {
+        file.id == id
+            && file.standardizedRootFolderPath == rootKey
+            && (expectedFullPath.map { file.standardizedFullPath == $0 } ?? true)
+            && fileHierarchyIndex.filesByID[id] === file
+            && fileHierarchyIndex.filesByFullPath[file.standardizedFullPath] === file
+    }
+
+    @MainActor
+    private func isConsistentProjectedFolder(
+        _ folder: FolderViewModel,
+        id: UUID,
+        rootKey: RootKey,
+        expectedFullPath: String? = nil
+    ) -> Bool {
+        folder.id == id
+            && StandardizedPath.absolute(folder.rootPath) == rootKey
+            && (expectedFullPath.map { folder.standardizedFullPath == $0 } ?? true)
+            && fileHierarchyIndex.foldersByID[id] === folder
+            && fileHierarchyIndex.foldersByFullPath[folder.standardizedFullPath] === folder
+    }
+
+    @MainActor
+    private func resyncWorkspaceAppliedIndexProjection(
+        for event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel
+    ) async -> UInt64? {
+        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
+              snapshot.root.id == event.rootID,
+              snapshot.root.standardizedFullPath == rootKey,
+              snapshot.generation >= event.generation,
+              let current = currentWorkspaceAppliedIndexRoot(for: event),
+              current.root === targetRootVM
+        else {
+            return nil
+        }
+
+        rebuildFileHierarchyIndex(for: targetRootVM)
+
+        let canonicalFilePaths = Set(snapshot.files.map(\.standardizedFullPath))
+        let canonicalFolderPaths = Set(snapshot.folders.map(\.standardizedFullPath)).union([rootKey])
+        let currentFilePaths = fileHierarchyIndex.filePathsByRoot[rootKey]
+            ?? Set(fileHierarchyIndex.filesByFullPath.keys.filter { StandardizedPath.isDescendant($0, of: rootKey) })
+        let currentFolderPaths = fileHierarchyIndex.folderPathsByRoot[rootKey]
+            ?? Set(fileHierarchyIndex.foldersByFullPath.keys.filter { StandardizedPath.isDescendant($0, of: rootKey) })
+
+        let upsertedFiles = snapshot.files.filter { record in
+            fileHierarchyIndex.filesByFullPath[record.standardizedFullPath]?.id != record.id
+        }
+        let upsertedFolders = snapshot.folders.filter { record in
+            !record.standardizedRelativePath.isEmpty
+                && fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath]?.id != record.id
+        }
+        let modifiedFileIDs = snapshot.files.compactMap { record -> UUID? in
+            guard let modificationDate = record.modificationDate,
+                  let currentFile = fileHierarchyIndex.filesByFullPath[record.standardizedFullPath],
+                  currentFile.id == record.id,
+                  currentFile.modificationDate != modificationDate
+            else {
+                return nil
+            }
+            return record.id
+        }
+        let modifiedFolderIDs = snapshot.folders.compactMap { record -> UUID? in
+            guard !record.standardizedRelativePath.isEmpty,
+                  let modificationDate = record.modificationDate,
+                  let currentFolder = fileHierarchyIndex.foldersByFullPath[record.standardizedFullPath],
+                  currentFolder.id == record.id,
+                  currentFolder.modificationDate != modificationDate
+            else {
+                return nil
+            }
+            return record.id
+        }
+        let removedFilePaths = currentFilePaths.subtracting(canonicalFilePaths).map {
+            StandardizedPath.relative(String($0.dropFirst(rootKey.count)))
+        }
+        let removedFolderPaths = currentFolderPaths.subtracting(canonicalFolderPaths).map {
+            StandardizedPath.relative(String($0.dropFirst(rootKey.count)))
+        }
+
+        guard !upsertedFiles.isEmpty || !upsertedFolders.isEmpty
+            || !removedFilePaths.isEmpty || !removedFolderPaths.isEmpty
+            || !modifiedFileIDs.isEmpty || !modifiedFolderIDs.isEmpty
+        else {
+            return snapshot.generation
+        }
+
+        let resyncEvent = WorkspaceAppliedIndexBatchEvent(
+            rootID: event.rootID,
+            rootPath: rootKey,
+            generation: snapshot.generation,
+            upsertedFiles: upsertedFiles,
+            upsertedFolders: upsertedFolders,
+            removedFilePaths: removedFilePaths,
+            removedFolderPaths: removedFolderPaths,
+            modifiedFileIDs: modifiedFileIDs,
+            modifiedFolderIDs: modifiedFolderIDs
+        )
+        guard let modificationTargets = resolveStrictWorkspaceAppliedIndexModificationTargets(
+            for: resyncEvent,
+            rootKey: rootKey
+        ), await applyWorkspaceAppliedIndexEvent(
+            resyncEvent,
+            rootKey: rootKey,
+            targetRootVM: targetRootVM,
+            useCanonicalSnapshotMetadata: true,
+            modificationTargets: modificationTargets
+        ) else {
+            return nil
+        }
+        return snapshot.generation
+    }
+
+    @MainActor
+    private func applyWorkspaceAppliedIndexEvent(
+        _ event: WorkspaceAppliedIndexBatchEvent,
+        rootKey: RootKey,
+        targetRootVM: FolderViewModel,
+        useCanonicalSnapshotMetadata: Bool,
+        modificationTargets: WorkspaceAppliedIndexModificationTargets
+    ) async -> Bool {
+        guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+            return false
         }
 
         var topologyChanged = false
         var dirtyFolders: [UUID: FolderViewModel] = [:]
+        var removedSubtrees: [RemovedFolderSubtree] = []
         let sortedFolders = event.upsertedFolders.sorted { lhs, rhs in
             let lhsDepth = lhs.standardizedRelativePath.split(separator: "/").count
             let rhsDepth = rhs.standardizedRelativePath.split(separator: "/").count
             if lhsDepth != rhsDepth { return lhsDepth < rhsDepth }
             return lhs.standardizedRelativePath < rhs.standardizedRelativePath
         }
-        for folder in sortedFolders where !folder.standardizedRelativePath.isEmpty {
+        for folder in sortedFolders where folder.rootID == event.rootID && !folder.standardizedRelativePath.isEmpty {
             if let outcome = handleNewFolder(record: folder, onRootFolder: targetRootVM) {
                 topologyChanged = true
                 if let parent = outcome.parentFolderForStateRecompute {
@@ -1163,47 +1674,104 @@ class WorkspaceFilesViewModel: ObservableObject {
                 }
             }
         }
-        for file in event.upsertedFiles {
-            if let outcome = await handleNewFile(record: file, onRootFolder: targetRootVM) {
+        for file in event.upsertedFiles where file.rootID == event.rootID {
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            let outcome = await handleNewFile(
+                record: file,
+                onRootFolder: targetRootVM,
+                useRecordModificationDateForExistingFile: useCanonicalSnapshotMetadata
+            )
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            if let outcome {
                 topologyChanged = true
                 if let parent = outcome.parentFolderForStateRecompute {
                     dirtyFolders[parent.id] = parent
                 }
             }
         }
-        for path in event.removedFilePaths {
-            let fullPath = StandardizedPath.join(standardizedRoot: rootKey, standardizedRelativePath: path)
+
+        var removedFileFullPaths = Set(event.removedFilePaths.map {
+            StandardizedPath.join(standardizedRoot: rootKey, standardizedRelativePath: $0)
+        })
+        for fileID in event.removedFileIDs {
+            if let file = fileHierarchyIndex.filesByID[fileID], file.standardizedRootFolderPath == rootKey {
+                removedFileFullPaths.insert(file.standardizedFullPath)
+            }
+        }
+        for fullPath in removedFileFullPaths {
             guard let fileVM = findFileByFullPath(fullPath) else { continue }
-            let formerParent = fileVM.parentFolder ?? parentFolderForRelativePath(path, under: targetRootVM)
+            let formerParent = fileVM.parentFolder ?? parentFolderForRelativePath(fileVM.relativePath, under: targetRootVM)
             removeFileFromParentChildrenArray(fileVM)
             fileHierarchyIndex.removeFile(forKey: fullPath, expectedRootKey: rootKey)
             topologyChanged = true
             if let formerParent { dirtyFolders[formerParent.id] = formerParent }
         }
-        for path in event.removedFolderPaths.sorted(by: { $0.count > $1.count }) where !path.isEmpty {
+
+        var removedFolderRelativePaths = Set(event.removedFolderPaths.map(StandardizedPath.relative))
+        for folderID in event.removedFolderIDs {
+            if let folder = fileHierarchyIndex.foldersByID[folderID],
+               folder !== targetRootVM,
+               StandardizedPath.absolute(folder.rootPath) == rootKey
+            {
+                removedFolderRelativePaths.insert(folder.relativePath)
+            }
+        }
+        for path in removedFolderRelativePaths.sorted(by: { $0.count > $1.count }) where !path.isEmpty {
             if let removed = removeFolderRecursive(in: targetRootVM, relativePath: path) {
+                removedSubtrees.append(removed)
                 topologyChanged = true
                 if let parent = removed.formerParentFolder ?? parentFolderForRelativePath(path, under: targetRootVM) {
                     dirtyFolders[parent.id] = parent
                 }
             }
         }
+        if !removedSubtrees.isEmpty {
+            _ = performBatchedIncrementalRemovedSubtreeCleanup(removedSubtrees, rootKey: rootKey)
+        }
+
         for fileID in event.modifiedFileIDs {
-            guard let fileVM = fileHierarchyIndex.filesByFullPath.values.first(where: { $0.id == fileID }) else { continue }
+            guard let fileVM = modificationTargets.filesByID[fileID] else { continue }
+            let date: Date
             do {
-                let date = try await workspaceFileContextStore.fileModificationDate(rootID: event.rootID, relativePath: fileVM.relativePath)
-                await fileVM.setModificationDate(date, forceInvalidation: true)
+                date = try await workspaceFileContextStore.fileModificationDate(
+                    rootID: event.rootID,
+                    relativePath: fileVM.relativePath
+                )
             } catch {
-                await fileVM.setModificationDate(Date(), forceInvalidation: true)
+                date = Date()
+            }
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            await fileVM.setModificationDate(date, forceInvalidation: true)
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
             }
             requestCodeScan(for: fileVM)
-            scheduleSliceRebasesForModifiedFiles([ReplaySliceRebaseRequest(file: fileVM, relativePath: fileVM.relativePath)])
+            scheduleSliceRebasesForModifiedFiles([
+                ReplaySliceRebaseRequest(file: fileVM, relativePath: fileVM.relativePath)
+            ])
         }
         for folderID in event.modifiedFolderIDs {
-            guard let folderVM = fileHierarchyIndex.foldersByFullPath.values.first(where: { $0.id == folderID }) else { continue }
-            if let date = try? await workspaceFileContextStore.itemModificationDateIfAvailable(rootID: event.rootID, relativePath: folderVM.relativePath) {
+            guard let folderVM = modificationTargets.foldersByID[folderID] else { continue }
+            let date = try? await workspaceFileContextStore.itemModificationDateIfAvailable(
+                rootID: event.rootID,
+                relativePath: folderVM.relativePath
+            )
+            guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+                return false
+            }
+            if let date {
                 folderVM.setModificationDate(date)
             }
+        }
+
+        guard isCurrentWorkspaceAppliedIndexRoot(for: event, targetRootVM: targetRootVM) else {
+            return false
         }
         flushPendingInserts()
         if topologyChanged {
@@ -1217,6 +1785,31 @@ class WorkspaceFilesViewModel: ObservableObject {
         onRootFoldersChanged?()
         fileSystemDeltasAppliedPublisher.send(FileSystemDeltasAppliedEvent(rootKey: rootKey, deltas: []))
         invalidateStaticSnapshot(forRootFullPath: targetRootVM.standardizedFullPath)
+        return true
+    }
+
+    @MainActor
+    private func projectedFileForAppliedIndexModification(id: UUID) -> FileViewModel? {
+        #if DEBUG
+            appliedIndexProjectionDirectFileIDLookupCount += 1
+        #endif
+        let file = fileHierarchyIndex.filesByID[id]
+        #if DEBUG
+            if file == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+        #endif
+        return file
+    }
+
+    @MainActor
+    private func projectedFolderForAppliedIndexModification(id: UUID) -> FolderViewModel? {
+        #if DEBUG
+            appliedIndexProjectionDirectFolderIDLookupCount += 1
+        #endif
+        let folder = fileHierarchyIndex.foldersByID[id]
+        #if DEBUG
+            if folder == nil { appliedIndexProjectionDirectIDLookupMissCount += 1 }
+        #endif
+        return folder
     }
 
     @MainActor
@@ -1371,7 +1964,16 @@ class WorkspaceFilesViewModel: ObservableObject {
         if let subscription = expansionSubscriptions.removeValue(forKey: oldID) {
             subscription.cancel()
         }
+        let pendingChildren = pendingChildInserts.removeValue(forKey: oldID)
+        let pendingParent = pendingInsertParents.removeValue(forKey: oldID)
         folder.adoptCanonicalIDForStoreCorrelation(canonicalID)
+        fileHierarchyIndex.rekeyFolder(folder, from: oldID)
+        if let pendingChildren {
+            pendingChildInserts[canonicalID, default: []].append(contentsOf: pendingChildren)
+        }
+        if let pendingParent {
+            pendingInsertParents[canonicalID] = pendingParent
+        }
         registerExpansionTracking(for: folder)
     }
 
@@ -1627,6 +2229,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func detachRootShellReferences(_ folder: FolderViewModel) -> WorkspaceRootRecord? {
         let stdRoot = folder.standardizedFullPath
         let rootKey = rootKey(forPath: folder.fullPath)
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         removeDeferredInitialRootLoadScanRoot(stdRoot)
         unregisterExpansionTracking(for: folder)
         dropSelections(underFolderFullPath: folder.fullPath)
@@ -3550,7 +4153,8 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func handleNewFile(
         record: WorkspaceFileRecord,
         onRootFolder root: FolderViewModel,
-        requestCodeScanImmediately: Bool = true
+        requestCodeScanImmediately: Bool = true,
+        useRecordModificationDateForExistingFile: Bool = false
     ) async -> FileAdditionApplyOutcome? {
         let metadata = FileViewModel.PrecomputedPathMetadata.preparedReplay(
             standardizedAbsolutePath: record.standardizedFullPath,
@@ -3564,7 +4168,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             preparedReplayPathMetadata: metadata,
             recordID: record.id,
             parentFolderID: record.parentFolderID,
-            modificationDate: record.modificationDate ?? Date()
+            modificationDate: record.modificationDate ?? Date(),
+            useProvidedModificationDateForExistingFile: useRecordModificationDateForExistingFile,
+            expectedRootID: record.rootID
         )
     }
 
@@ -3660,8 +4266,12 @@ class WorkspaceFilesViewModel: ObservableObject {
         preparedReplayPathMetadata: FileViewModel.PrecomputedPathMetadata? = nil,
         recordID: UUID? = nil,
         parentFolderID: UUID? = nil,
-        modificationDate: Date = Date()
+        modificationDate: Date = Date(),
+        useProvidedModificationDateForExistingFile: Bool = false,
+        expectedRootID: UUID? = nil
     ) async -> FileAdditionApplyOutcome? {
+        guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+
         let stdAbs: String
         if let preparedReplayPathMetadata {
             stdAbs = preparedReplayPathMetadata.standardizedFullPath
@@ -3679,11 +4289,16 @@ class WorkspaceFilesViewModel: ObservableObject {
             adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentFolderID)
         } else if !parentRelativePath.isEmpty,
                   let intendedParentFolder,
-                  let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath],
-                  let parentRecord = await workspaceFileContextStore.folder(rootID: workspaceRoot.id, relativePath: parentRelativePath),
-                  intendedParentFolder.id != parentRecord.id
+                  let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath]
         {
-            adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentRecord.id)
+            let parentRecord = await workspaceFileContextStore.folder(
+                rootID: workspaceRoot.id,
+                relativePath: parentRelativePath
+            )
+            guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+            if let parentRecord, intendedParentFolder.id != parentRecord.id {
+                adoptCanonicalFolderIDForStoreCorrelation(intendedParentFolder, canonicalID: parentRecord.id)
+            }
         }
 
         // If already tracked, only refresh m-date & scan. If store replay later supplies
@@ -3694,18 +4309,25 @@ class WorkspaceFilesViewModel: ObservableObject {
                 removeFileFromParentChildrenArray(existing)
                 fileHierarchyIndex.removeFile(forKey: stdAbs, expectedRootKey: root.standardizedFullPath)
             } else {
-                do {
-                    guard let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath] else {
-                        throw FileManagerError.fileSystemServiceNotFoundWithContext("Workspace store root unavailable for '\(root.standardizedFullPath)'.")
+                let resolvedModificationDate: Date
+                if useProvidedModificationDateForExistingFile {
+                    resolvedModificationDate = modificationDate
+                } else {
+                    do {
+                        guard let workspaceRoot = workspaceFileContextRootsByRootKey[root.standardizedFullPath] else {
+                            throw FileManagerError.fileSystemServiceNotFoundWithContext("Workspace store root unavailable for '\(root.standardizedFullPath)'.")
+                        }
+                        resolvedModificationDate = try await workspaceFileContextStore.fileModificationDate(
+                            rootID: workspaceRoot.id,
+                            relativePath: relativePath
+                        )
+                    } catch {
+                        resolvedModificationDate = Date()
                     }
-                    let diskDate = try await workspaceFileContextStore.fileModificationDate(
-                        rootID: workspaceRoot.id,
-                        relativePath: relativePath
-                    )
-                    await existing.setModificationDate(diskDate, forceInvalidation: true)
-                } catch {
-                    await existing.setModificationDate(Date(), forceInvalidation: true)
                 }
+                guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
+                await existing.setModificationDate(resolvedModificationDate, forceInvalidation: true)
+                guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
                 if requestCodeScanImmediately {
                     requestCodeScan(for: existing)
                 }
@@ -3718,6 +4340,8 @@ class WorkspaceFilesViewModel: ObservableObject {
                 )
             }
         }
+
+        guard isCurrentAttachedRoot(root, expectedRootID: expectedRootID) else { return nil }
 
         let newFile = File(
             id: recordID ?? UUID(),
@@ -4364,6 +4988,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     func unloadRootFolder(_ folder: FolderViewModel) async {
         let signpost = WorkspaceExitPerf.begin("unloadRootFolder")
+        appliedIndexProjectionHandledGenerationByRootID.removeValue(forKey: folder.id)
         defer { WorkspaceExitPerf.end("unloadRootFolder", signpost) }
         let stdRoot = folder.standardizedFullPath
         removeDeferredInitialRootLoadScanRoot(stdRoot)
@@ -4997,6 +5622,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         error = nil
         fileHierarchyIndex.clearAll()
         fileHierarchyIndex = FileHierarchyIndex()
+        appliedIndexProjectionHandledGenerationByRootID.removeAll(keepingCapacity: true)
         autoCodemapSyncTask?.cancel()
         autoCodemapSyncTask = nil
         resetAutoCodemapFiles([])
@@ -5027,6 +5653,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         resetSelection()
         fileHierarchyIndex.clearAll()
         fileHierarchyIndex = FileHierarchyIndex()
+        appliedIndexProjectionHandledGenerationByRootID.removeAll(keepingCapacity: true)
         rootShellLoadedPaths.removeAll()
         rootHierarchyGenerations.removeAll()
         invalidateStaticSnapshot(forRootFullPath: nil)
@@ -7503,6 +8130,32 @@ class WorkspaceFilesViewModel: ObservableObject {
             let matchedFileKeys: Int
             let cleanupCandidateFileKeys: Int
             let usedFallbackGlobalScan: Bool
+        }
+
+        struct AppliedIndexProjectionIndexSnapshot: Equatable {
+            let filePathsByID: [UUID: String]
+            let folderPathsByID: [UUID: String]
+            let fileIDsByPath: [String: UUID]
+            let folderIDsByPath: [String: UUID]
+        }
+
+        @MainActor
+        func applyWorkspaceAppliedIndexEventForTesting(_ event: WorkspaceAppliedIndexBatchEvent) async {
+            await handleWorkspaceAppliedIndexEvent(event)
+        }
+
+        @MainActor
+        func appliedIndexProjectedFileForTesting(id: UUID) -> FileViewModel? {
+            fileHierarchyIndex.filesByID[id]
+        }
+
+        func appliedIndexProjectionIndexSnapshotForTesting() -> AppliedIndexProjectionIndexSnapshot {
+            AppliedIndexProjectionIndexSnapshot(
+                filePathsByID: fileHierarchyIndex.filesByID.mapValues(\.standardizedFullPath),
+                folderPathsByID: fileHierarchyIndex.foldersByID.mapValues(\.standardizedFullPath),
+                fileIDsByPath: fileHierarchyIndex.filesByFullPath.mapValues(\.id),
+                folderIDsByPath: fileHierarchyIndex.foldersByFullPath.mapValues(\.id)
+            )
         }
 
         @MainActor

@@ -2932,6 +2932,10 @@ final class MCPServerViewModel: ObservableObject {
             readFileAutoSelectionCoordinator.setCanonicalApplyGateForTesting(gate)
         }
 
+        @MainActor
+        func readFileAutoSelectionDiagnosticsSnapshot() -> MCPReadFileAutoSelectionCoordinator.DebugSnapshot {
+            readFileAutoSelectionCoordinator.debugSnapshot()
+        }
     #endif
 
     @MainActor
@@ -3512,7 +3516,7 @@ final class MCPServerViewModel: ObservableObject {
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
         let readableService = WorkspaceReadableFileService(store: store)
-        await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)
+        try await readableService.awaitFreshnessForExplicitRequest(path, fallbackScope: lookupRootScope)
         try Task.checkCancellation()
         let (roots, readableFile): ([WorkspaceRootRef], WorkspaceReadableFileHandle?) = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.resolveReadableFile) {
             let exactPathIssueDetection = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactPathIssueDetection)

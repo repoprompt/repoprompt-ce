@@ -182,17 +182,21 @@ extension FileSystemService {
     func flushPendingEventsNow(
         throughAcceptedWatcherWatermark target: FileSystemWatcherIngressMailbox.Watermark
     ) async -> UInt64 {
+        guard !Task.isCancelled else { return lastServicePublicationSequence }
         drainAcceptedWatcherIngressMailboxPayloads(through: target)
         cancelScheduledCoalescingDelay()
 
         while lastPublishedWatcherAcceptedWatermark < target {
+            guard !Task.isCancelled else { return lastServicePublicationSequence }
             if let watcherBatchProcessingTask {
                 await watcherBatchProcessingTask.value
+                guard !Task.isCancelled else { return lastServicePublicationSequence }
                 drainAcceptedWatcherIngressMailboxPayloads(through: target)
                 cancelScheduledCoalescingDelay()
                 continue
             }
 
+            guard !Task.isCancelled else { return lastServicePublicationSequence }
             guard startProcessingPendingWatcherBatchIfNeeded() else {
                 // A callback cut must remain representable even if accepted payloads
                 // were explicitly abandoned during watcher teardown or produced no deltas.
@@ -540,7 +544,9 @@ extension FileSystemService {
     func startProcessingPendingWatcherBatchIfNeeded() -> Bool {
         guard watcherBatchProcessingTask == nil else { return true }
         let batch = takePendingFSEventsForProcessing()
-        guard !batch.isEmpty || batch.watcherAcceptedHighWatermark != nil else { return false }
+        guard !batch.isEmpty || batch.watcherAcceptedHighWatermark != nil
+            || !pendingQuietFolderScanTargets.isEmpty
+        else { return false }
 
         nextWatcherBatchProcessingToken &+= 1
         let token = nextWatcherBatchProcessingToken
@@ -571,6 +577,8 @@ extension FileSystemService {
         watcherBatchProcessingToken = nil
         if !pendingFSEvents.isEmpty {
             scheduleCoalescingIfNeeded()
+        } else if !pendingQuietFolderScanTargets.isEmpty {
+            _ = startProcessingPendingWatcherBatchIfNeeded()
         }
     }
 
@@ -625,6 +633,7 @@ extension FileSystemService {
         hasPendingOverflowRescan = false
         overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
         pendingScanTargets.removeAll(keepingCapacity: false)
+        pendingQuietFolderScanTargets.removeAll(keepingCapacity: false)
         lastScannedEventIdByFolder.removeAll(keepingCapacity: false)
         lastVerifiedAtByFolder.removeAll(keepingCapacity: false)
         fileEventCountSinceLastScan.removeAll(keepingCapacity: false)
@@ -797,7 +806,7 @@ extension FileSystemService {
             return testMode ? [] : nil
         }
         let events = batch.events
-        guard !events.isEmpty else {
+        guard !events.isEmpty || !pendingQuietFolderScanTargets.isEmpty else {
             if let watermark = batch.watcherAcceptedHighWatermark {
                 publishFileSystemDeltas([], source: .watcherBarrierNoop, watcherAcceptedWatermark: watermark)
             }
@@ -1254,7 +1263,8 @@ extension FileSystemService {
         // Build eligible set: folders that need scanning
         // - nil lastScannedId means "never scanned" → always eligible
         // - Otherwise, only rescan if pendingId > lastScannedId
-        let eligibleFolders = Set(foldersToScan.filter { folder in
+        let scanCandidates = foldersToScan.union(pendingQuietFolderScanTargets)
+        let eligibleFolderSet = Set(scanCandidates.filter { folder in
             guard let pendingId = pendingScanTargets[folder] else {
                 return false // No pending scan target (shouldn't happen, but be defensive)
             }
@@ -1263,19 +1273,15 @@ extension FileSystemService {
             }
             return pendingId > lastScannedId // Only rescan if newer events arrived
         })
+        // Carry-over work always precedes newly arrived work. Once a carried folder is
+        // scanned it leaves this set, so capped batches advance through the backlog.
+        let carriedFolders = pendingQuietFolderScanTargets.intersection(eligibleFolderSet).sorted()
+        let newlyEligibleFolders = eligibleFolderSet.subtracting(pendingQuietFolderScanTargets).sorted()
+        let eligibleFolders = carriedFolders + newlyEligibleFolders
 
         // Use parallel scanning for better I/O performance
         if !eligibleFolders.isEmpty {
             do {
-                #if DEBUG
-                    if isTestMode {
-                        // Track all folders being processed
-                        for folder in eligibleFolders {
-                            processedFolders.insert(folder)
-                        }
-                    }
-                #endif
-
                 // Ensure all folders have their ignore rules loaded before parallel scan
                 if enableHierarchicalIgnores {
                     for folderRelPath in eligibleFolders {
@@ -1283,11 +1289,17 @@ extension FileSystemService {
                     }
                 }
 
-                let folderDeltas = try await scanFoldersInParallel(eligibleFolders)
-                allDeltas.append(contentsOf: folderDeltas)
+                let scanResult = try await scanFoldersInParallel(eligibleFolders)
+                allDeltas.append(contentsOf: scanResult.deltas)
 
-                // Update tracking for successfully scanned folders
-                for folder in eligibleFolders {
+                #if DEBUG
+                    if isTestMode {
+                        processedFolders.formUnion(scanResult.scannedFolders)
+                    }
+                #endif
+
+                // Update tracking only for folders actually scanned after applying the cap.
+                for folder in scanResult.scannedFolders {
                     if let pendingId = pendingScanTargets[folder] {
                         lastScannedEventIdByFolder[folder] = pendingId
                         pendingScanTargets.removeValue(forKey: folder)
@@ -1295,8 +1307,18 @@ extension FileSystemService {
                     // Record verification time for safety-net tracking
                     recordFolderVerified(folder)
                 }
+                pendingQuietFolderScanTargets.subtract(scanResult.scannedFolders)
+                if watcherBatchBelongsToCurrentIngressGeneration(batch) {
+                    pendingQuietFolderScanTargets.formUnion(
+                        eligibleFolderSet.subtracting(scanResult.scannedFolders)
+                    )
+                    pendingQuietFolderScanTargets.formIntersection(Set(pendingScanTargets.keys))
+                }
             } catch {
                 print("Error during parallel folder scanning: \(error)")
+                // A failed scan remains pending for a future event, but must not create a
+                // tight quiet-retry loop. The serial fallback gets one immediate attempt.
+                pendingQuietFolderScanTargets.subtract(Set(eligibleFolders))
                 // Fallback to serial scanning if parallel fails
                 for folderRelPath in eligibleFolders {
                     do {
@@ -1372,6 +1394,21 @@ extension FileSystemService {
             #endif
         }
 
+        let hasPendingQuietFolderScans = !pendingQuietFolderScanTargets.isEmpty
+        let publishableWatcherWatermark: FileSystemWatcherIngressMailbox.Watermark?
+        if hasPendingQuietFolderScans, let acceptedHighWatermark = batch.watcherAcceptedHighWatermark {
+            pendingWatcherAcceptedHighWatermark = max(
+                pendingWatcherAcceptedHighWatermark ?? .zero,
+                acceptedHighWatermark
+            )
+            if batch.publicationSource == .overflowRootRescan {
+                pendingWatcherPublicationSource = .overflowRootRescan
+            }
+            publishableWatcherWatermark = nil
+        } else {
+            publishableWatcherWatermark = batch.watcherAcceptedHighWatermark
+        }
+
         let publicationSource: FileSystemDeltaPublicationSource = if batch.publicationSource == .overflowRootRescan {
             .overflowRootRescan
         } else if publishableDeltas.isEmpty {
@@ -1379,11 +1416,11 @@ extension FileSystemService {
         } else {
             batch.publicationSource
         }
-        if !publishableDeltas.isEmpty || batch.watcherAcceptedHighWatermark != nil {
+        if !publishableDeltas.isEmpty || publishableWatcherWatermark != nil {
             publishFileSystemDeltas(
                 publishableDeltas,
                 source: publicationSource,
-                watcherAcceptedWatermark: batch.watcherAcceptedHighWatermark
+                watcherAcceptedWatermark: publishableWatcherWatermark
             )
         }
         FileSystemPublishPerf.end("coalesceAndPublishFileSystemDeltas", publishSignpost)
