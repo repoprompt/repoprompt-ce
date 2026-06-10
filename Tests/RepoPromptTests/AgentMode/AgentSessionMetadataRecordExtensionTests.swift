@@ -195,6 +195,106 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.keyPaths, Set(["only.swift"]))
     }
 
+    func testFactoryKeyPathsFromToolExecutionsWhenNoSummary() {
+        // Active (uncompacted) turns have summary=nil but toolExecution activities
+        // carry keyPaths. The indexer should fall back to reading those.
+        let toolActivity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 5),
+            sequenceIndex: 1,
+            role: .toolExecution,
+            itemKind: .assistant,
+            text: "",
+            toolExecution: AgentTranscriptToolExecution(
+                stableExecutionID: "exec-1",
+                toolName: "apply_edits",
+                invocationID: nil,
+                argsJSON: nil,
+                resultJSON: nil,
+                toolIsError: nil,
+                status: .success,
+                keyPaths: ["src/main.swift", "lib/helpers.swift"]
+            )
+        )
+        let span = AgentTranscriptProviderResponseSpan(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 0),
+            activities: [toolActivity]
+        )
+        let turn = AgentTranscriptTurn(
+            responseSpans: [span],
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 10)
+        )
+        let session = makeSession(turns: [turn])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        XCTAssertEqual(record.keyPaths, Set(["src/main.swift", "lib/helpers.swift"]))
+    }
+
+    func testFactoryKeyPathsPrefersSummaryOverToolExecutions() {
+        // When a turn has both a summary and tool executions, summary wins.
+        let toolActivity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 5),
+            sequenceIndex: 1,
+            role: .toolExecution,
+            itemKind: .assistant,
+            text: "",
+            toolExecution: AgentTranscriptToolExecution(
+                stableExecutionID: "exec-1",
+                toolName: "apply_edits",
+                invocationID: nil,
+                argsJSON: nil,
+                resultJSON: nil,
+                toolIsError: nil,
+                status: .success,
+                keyPaths: ["from_tool.swift"]
+            )
+        )
+        let span = AgentTranscriptProviderResponseSpan(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 0),
+            activities: [toolActivity]
+        )
+        let turn = AgentTranscriptTurn(
+            responseSpans: [span],
+            summary: .init(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: nil,
+                middleSummaryText: nil,
+                toolCount: 1,
+                notableToolNames: [],
+                keyPaths: ["from_summary.swift"],
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 10)
+        )
+        let session = makeSession(turns: [turn])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        // Summary keyPaths take priority — tool execution paths should NOT be included.
+        XCTAssertEqual(record.keyPaths, Set(["from_summary.swift"]))
+    }
+
     // MARK: - Factory: activeDurationSeconds Computation
 
     func testActiveDurationSingleTurn() {

@@ -258,7 +258,22 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     ) -> AgentSessionMetadataRecord {
         let aggregatedKeyPaths: Set<String> = {
             guard let turns = session.transcript?.turns else { return [] }
-            return Set(turns.flatMap { $0.summary?.keyPaths ?? [] })
+            var collected: Set<String> = []
+            for turn in turns {
+                // Prefer summary keyPaths when available (compacted turns).
+                if let summaryPaths = turn.summary?.keyPaths, !summaryPaths.isEmpty {
+                    collected.formUnion(summaryPaths)
+                    continue
+                }
+                // Fall back to walking tool executions in response span activities.
+                for span in turn.responseSpans {
+                    for activity in span.activities {
+                        guard let exec = activity.toolExecution else { continue }
+                        collected.formUnion(exec.keyPaths)
+                    }
+                }
+            }
+            return collected
         }()
 
         let durationSeconds: Int = {
