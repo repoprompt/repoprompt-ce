@@ -101,6 +101,7 @@ push_success() {
   cat <<'EOF'
 
 Scripted push checks passed.
+Before opening or updating a PR, do one judgment-based cleanup pass over the complete branch diff: remove abandoned scaffolding, incidental scope, and tests that do not protect a meaningful current contract. Minimize maintenance surface, not line count; keep justified support code and valuable coverage.
 Any validation-matrix evidence is still required before push; read `.agents/skills/rpce-contribution-check/references/validation-matrix.md`.
 Push mode validated only the current branch against the computed range above. It does not validate tags, `--all`, `--mirror`, or arbitrary refspecs.
 EOF
