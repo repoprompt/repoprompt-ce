@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 2
+    static let currentSchemaVersion = 3
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -65,6 +65,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var observedFileSize: Int64?
     var observedFileModificationDate: Date?
     var lastIndexedAt: Date
+    var keyPaths: Set<String>
+    var activeDurationSeconds: Int
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
@@ -93,7 +95,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         serializationVersion: Int?,
         observedFileSize: Int64?,
         observedFileModificationDate: Date?,
-        lastIndexedAt: Date
+        lastIndexedAt: Date,
+        keyPaths: Set<String> = [],
+        activeDurationSeconds: Int = 0
     ) {
         self.id = id
         self.filename = filename
@@ -118,6 +122,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.observedFileSize = observedFileSize
         self.observedFileModificationDate = observedFileModificationDate
         self.lastIndexedAt = lastIndexedAt
+        self.keyPaths = keyPaths
+        self.activeDurationSeconds = activeDurationSeconds
     }
 
     enum CodingKeys: String, CodingKey {
@@ -144,6 +150,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case observedFileSize
         case observedFileModificationDate
         case lastIndexedAt
+        case keyPaths
+        case activeDurationSeconds
     }
 
     init(from decoder: Decoder) throws {
@@ -171,6 +179,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileSize = try container.decodeIfPresent(Int64.self, forKey: .observedFileSize)
         observedFileModificationDate = try container.decodeIfPresent(Date.self, forKey: .observedFileModificationDate)
         lastIndexedAt = try container.decodeIfPresent(Date.self, forKey: .lastIndexedAt) ?? savedAt
+        keyPaths = try container.decodeIfPresent(Set<String>.self, forKey: .keyPaths) ?? []
+        activeDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .activeDurationSeconds) ?? 0
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -235,6 +245,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && serializationVersion == other.serializationVersion
             && observedFileSize == other.observedFileSize
             && observedFileModificationDate == other.observedFileModificationDate
+            && keyPaths == other.keyPaths
+            && activeDurationSeconds == other.activeDurationSeconds
     }
 
     static func record(
@@ -244,7 +256,17 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileModificationDate: Date?,
         lastIndexedAt: Date = Date()
     ) -> AgentSessionMetadataRecord {
-        AgentSessionMetadataRecord(
+        let aggregatedKeyPaths: Set<String> = {
+            guard let turns = session.transcript?.turns else { return [] }
+            return Set(turns.flatMap { $0.summary?.keyPaths ?? [] })
+        }()
+
+        let durationSeconds: Int = {
+            guard let turns = session.transcript?.turns else { return 0 }
+            return Self.computeActiveDurationSeconds(from: turns)
+        }()
+
+        return AgentSessionMetadataRecord(
             id: session.id,
             filename: fileURL.lastPathComponent,
             workspaceID: session.workspaceID,
@@ -267,8 +289,41 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             serializationVersion: session.serializationVersion,
             observedFileSize: observedFileSize,
             observedFileModificationDate: observedFileModificationDate,
-            lastIndexedAt: lastIndexedAt
+            lastIndexedAt: lastIndexedAt,
+            keyPaths: aggregatedKeyPaths,
+            activeDurationSeconds: durationSeconds
         )
+    }
+
+    /// Compute active duration in seconds from transcript turns, excluding idle gaps > 30 minutes.
+    /// Uses `completedAt ?? lastActivityAt` as the turn end time. Skips turns without completion timestamps.
+    private static func computeActiveDurationSeconds(from turns: [AgentTranscriptTurn]) -> Int {
+        let thirtyMinutes: TimeInterval = 30 * 60
+        var totalSeconds = 0
+        var previousEnd: Date?
+
+        for turn in turns {
+            guard let end = turn.completedAt ?? turn.lastActivityAt else { continue }
+            let start = turn.startedAt
+
+            if let prev = previousEnd {
+                let gap = start.timeIntervalSince(prev)
+                if gap > thirtyMinutes {
+                    // Gap exceeds idle threshold; don't count the gap as active time.
+                    totalSeconds += Int(end.timeIntervalSince(start))
+                } else {
+                    // Continuous — count from previous end to this turn's end.
+                    totalSeconds += Int(end.timeIntervalSince(prev))
+                }
+            } else {
+                // First turn with timestamps.
+                totalSeconds += Int(end.timeIntervalSince(start))
+            }
+
+            previousEnd = end
+        }
+
+        return max(0, totalSeconds)
     }
 }
 

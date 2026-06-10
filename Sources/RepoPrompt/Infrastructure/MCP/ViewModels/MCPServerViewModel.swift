@@ -1540,7 +1540,8 @@ final class MCPServerViewModel: ObservableObject {
             MCPContextBuilderToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAskUserToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPAgentControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
-            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
+            MCPAgentSessionControlToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
+            MCPHistoryToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies)
         ]
     )
     private var cancellables: Set<AnyCancellable> = []
