@@ -239,8 +239,7 @@ final class CLIProcessRunner {
             } operation: {
                 // 1) Immediately start draining child output (prevents cross‑pipe back‑pressure)
                 let group = DispatchGroup()
-                var stdoutData = Data()
-                var stderrData = Data()
+                let outputBuffer = LockedProcessOutputBuffer()
 
                 group.enter()
                 DispatchQueue.global(qos: .userInitiated).async {
@@ -248,7 +247,7 @@ final class CLIProcessRunner {
                     let chunkSize = 64 * 1024
                     while true {
                         guard let chunk = try? spawned.stdout.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stdoutData.append(chunk)
+                        outputBuffer.appendStdout(chunk)
                     }
                 }
 
@@ -258,7 +257,7 @@ final class CLIProcessRunner {
                     let chunkSize = 64 * 1024
                     while true {
                         guard let chunk = try? spawned.stderr.read(upToCount: chunkSize), !chunk.isEmpty else { break }
-                        stderrData.append(chunk)
+                        outputBuffer.appendStderr(chunk)
                     }
                 }
 
@@ -328,11 +327,14 @@ final class CLIProcessRunner {
                 spawned.stdout.closeFile()
                 spawned.stderr.closeFile()
                 await Self.waitForGroup(group)
-                if !stdoutData.isEmpty {
-                    config.logCollector?.appendDataSection(title: "STDOUT", data: stdoutData)
+                let outputSnapshot = outputBuffer.snapshot()
+                let capturedStdoutData = outputSnapshot.stdout
+                let capturedStderrData = outputSnapshot.stderr
+                if !capturedStdoutData.isEmpty {
+                    config.logCollector?.appendDataSection(title: "STDOUT", data: capturedStdoutData)
                 }
-                if !stderrData.isEmpty {
-                    config.logCollector?.appendDataSection(title: "STDERR", data: stderrData)
+                if !capturedStderrData.isEmpty {
+                    config.logCollector?.appendDataSection(title: "STDERR", data: capturedStderrData)
                 }
                 log("Process \(spawned.pid) exited with status \(status) (timed out: \(timedOut))")
                 // On success, memorize the absolute path for next time.
@@ -341,7 +343,7 @@ final class CLIProcessRunner {
                 {
                     await ResolvedCommandCache.shared.put(resolvedCommand, for: config.command)
                 }
-                return Result(stdout: stdoutData, stderr: stderrData, status: status, timedOut: timedOut)
+                return Result(stdout: capturedStdoutData, stderr: capturedStderrData, status: status, timedOut: timedOut)
             }
         }
     }
@@ -823,5 +825,30 @@ final class CLIProcessRunner {
                 throw CLIProcessRunnerError.waitFailed(message)
             }
         }
+    }
+}
+
+private final class LockedProcessOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stdout = Data()
+    private var stderr = Data()
+
+    func appendStdout(_ data: Data) {
+        lock.lock()
+        stdout.append(data)
+        lock.unlock()
+    }
+
+    func appendStderr(_ data: Data) {
+        lock.lock()
+        stderr.append(data)
+        lock.unlock()
+    }
+
+    func snapshot() -> (stdout: Data, stderr: Data) {
+        lock.lock()
+        let output = (stdout, stderr)
+        lock.unlock()
+        return output
     }
 }
