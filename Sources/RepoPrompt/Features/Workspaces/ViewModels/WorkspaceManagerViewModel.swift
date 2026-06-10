@@ -1314,11 +1314,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         // Listen for workspace list changes from other windows
         NotificationCenter.default.publisher(for: .workspaceListDidChange)
             .sink { [weak self] notification in
-                guard
-                    let self,
-                    let senderID = notification.userInfo?["managerID"] as? UUID,
-                    senderID != instanceID
-                else { return }
+                guard let self else { return }
+                if let senderID = notification.userInfo?["managerID"] as? UUID,
+                   senderID == instanceID
+                {
+                    return
+                }
                 reloadWorkspacesFromDisk()
             }
             .store(in: &cancellables)

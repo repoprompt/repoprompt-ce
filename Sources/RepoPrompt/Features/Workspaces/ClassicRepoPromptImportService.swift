@@ -48,6 +48,52 @@ struct ClassicRepoPromptImportSectionResult: Equatable {
         messages.append(message)
         failureMessages.append(message)
     }
+
+    static func failed(message: String) -> ClassicRepoPromptImportSectionResult {
+        .init(failedCount: 1, messages: [message], failureMessages: [message])
+    }
+}
+
+private extension Set<UUID> {
+    func containsVisibilityKey(_ key: String) -> Bool {
+        guard let id = UUID(uuidString: key) else { return false }
+        return contains(id)
+    }
+}
+
+private struct ClassicWorkspaceIndexEntry: Decodable {
+    let id: UUID
+    let name: String
+    let customStoragePath: URL?
+    let isSystemWorkspace: Bool
+    let isHiddenInMenus: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case customStoragePath
+        case isSystemWorkspace
+        case isHiddenInMenus
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        customStoragePath = try container.decodeIfPresent(URL.self, forKey: .customStoragePath)
+        isSystemWorkspace = try container.decodeIfPresent(Bool.self, forKey: .isSystemWorkspace) ?? false
+        isHiddenInMenus = try container.decodeIfPresent(Bool.self, forKey: .isHiddenInMenus) ?? false
+    }
+
+    var workspaceIndexEntry: WorkspaceIndexEntry {
+        WorkspaceIndexEntry(
+            id: id,
+            name: name,
+            customStoragePath: customStoragePath,
+            isSystemWorkspace: isSystemWorkspace,
+            isHiddenInMenus: isHiddenInMenus
+        )
+    }
 }
 
 struct ClassicRepoPromptImportResult {
@@ -219,12 +265,27 @@ struct ClassicRepoPromptImportResult {
     }
 }
 
-protocol ClassicRepoPromptSecureValueReading {
+protocol ClassicRepoPromptSecureValueReading: Sendable {
     func get(
         for key: String,
         accessMode: KeychainAccessMode
     ) throws -> String
 }
+
+protocol ClassicRepoPromptSecureValueWriting: Sendable {
+    func getPlainValue(
+        for account: SecureStorageAccount,
+        accessMode: KeychainAccessMode
+    ) throws -> String?
+
+    func savePlainValue(
+        _ value: String,
+        for account: SecureStorageAccount,
+        accessMode: KeychainAccessMode
+    ) throws
+}
+
+extension SecureKeysService: ClassicRepoPromptSecureValueWriting {}
 
 protocol ClassicRepoPromptPreferences: Sendable {
     func object(forKey key: String) -> Any?
@@ -240,20 +301,6 @@ private struct UserDefaultsClassicRepoPromptPreferences: ClassicRepoPromptPrefer
 
     func setObject(_ value: Any, forKey key: String) {
         defaults.set(value, forKey: key)
-    }
-}
-
-extension SecureKeyValueStorageBackend {
-    func classicValueReader() -> ClassicRepoPromptSecureValueReading {
-        SecureStorageClassicValueReaderAdapter(store: self)
-    }
-}
-
-private struct SecureStorageClassicValueReaderAdapter: ClassicRepoPromptSecureValueReading {
-    let store: SecureKeyValueStorageBackend
-
-    func get(for key: String, accessMode: KeychainAccessMode) throws -> String {
-        try store.get(for: key, accessMode: accessMode)
     }
 }
 
@@ -303,6 +350,30 @@ struct ClassicRepoPromptImportService {
         "CodexCLIConnected",
         "OpenCodeCLIConnected",
         "CursorCLIConnected",
+        "ClaudeCodeCompatibleBackendConfigs",
+        "ClaudeCodeCompatibleBackendConfigured.glmZAI",
+        "ClaudeCodeCompatibleBackendConfigured.kimi",
+        "ClaudeCodeCompatibleBackendConfigured.custom",
+        "ClaudeCodeGLMZAIConfigured",
+        "CustomProviderConfig",
+        "CustomProviderSettings",
+        "openrouter_configuration",
+        "provider_config_anthropic",
+        "provider_config_openAI",
+        "provider_config_ollama",
+        "provider_config_azure",
+        "provider_config_openRouter",
+        "provider_config_gemini",
+        "provider_config_deepseek",
+        "provider_config_customProvider",
+        "provider_config_fireworks",
+        "provider_config_grok",
+        "provider_config_groq",
+        "provider_config_zAI",
+        "provider_config_claudeCode",
+        "provider_config_codex",
+        "provider_config_openCode",
+        "provider_config_cursor",
         "customModelOpenAI",
         "customModelAnthropic",
         "customModelGemini",
@@ -366,13 +437,17 @@ struct ClassicRepoPromptImportService {
         self.documentEncoder = documentEncoder
     }
 
-    func importFromDefaultClassicInstallation(targetWorkspacesRoot: URL) async throws -> ClassicRepoPromptImportResult {
+    func importFromDefaultClassicInstallation(
+        targetWorkspacesRoot: URL,
+        targetWorkspacesRootIsGlobalCustomStorage: Bool = false
+    ) async throws -> ClassicRepoPromptImportResult {
         try await importClassicRepoPromptData(
             sourceAppSupportRoot: Self.defaultClassicAppSupportRoot,
             targetAppSupportRoot: Self.defaultCEAppSupportRoot,
             sourcePromptSupportRoot: Self.defaultSharedPromptSupportRoot,
             targetPromptSupportRoot: Self.defaultSharedPromptSupportRoot,
             targetWorkspacesRoot: targetWorkspacesRoot,
+            targetWorkspacesRootIsGlobalCustomStorage: targetWorkspacesRootIsGlobalCustomStorage,
             // Classic Keychain ACLs can prompt once per saved secret, even when the
             // user has already approved one item. The default import is intentionally
             // no-prompt and migrates durable non-secret configuration instead.
@@ -389,8 +464,9 @@ struct ClassicRepoPromptImportService {
         sourcePromptSupportRoot: URL,
         targetPromptSupportRoot: URL,
         targetWorkspacesRoot: URL,
+        targetWorkspacesRootIsGlobalCustomStorage: Bool = false,
         sourceSecureValueReader: ClassicRepoPromptSecureValueReading? = nil,
-        targetSecureStore: SecureKeyValueStorageBackend? = nil,
+        targetSecureStore: ClassicRepoPromptSecureValueWriting? = nil,
         sourcePreferences: ClassicRepoPromptPreferences? = nil,
         targetPreferences: ClassicRepoPromptPreferences? = nil
     ) async throws -> ClassicRepoPromptImportResult {
@@ -401,6 +477,7 @@ struct ClassicRepoPromptImportService {
                 sourcePromptSupportRoot: sourcePromptSupportRoot,
                 targetPromptSupportRoot: targetPromptSupportRoot,
                 targetWorkspacesRoot: targetWorkspacesRoot,
+                targetWorkspacesRootIsGlobalCustomStorage: targetWorkspacesRootIsGlobalCustomStorage,
                 sourceSecureValueReader: sourceSecureValueReader,
                 targetSecureStore: targetSecureStore,
                 sourcePreferences: sourcePreferences,
@@ -415,17 +492,59 @@ struct ClassicRepoPromptImportService {
         }.value
     }
 
-    func sourceExists(at appSupportRoot: URL = Self.defaultClassicAppSupportRoot) -> Bool {
-        fileManager.fileExists(atPath: appSupportRoot.appendingPathComponent(Self.classicSettingsRelativePath).path) ||
+    func defaultClassicSourceExists() -> Bool {
+        sourceExists(
+            at: Self.defaultClassicAppSupportRoot,
+            preferences: UserDefaults(suiteName: Self.classicDefaultsSuiteName).map(UserDefaultsClassicRepoPromptPreferences.init(defaults:))
+        )
+    }
+
+    func sourceExists(
+        at appSupportRoot: URL = Self.defaultClassicAppSupportRoot,
+        preferences: ClassicRepoPromptPreferences? = nil
+    ) -> Bool {
+        let sourceWorkspacesRoot = sourceWorkspacesRoot(appSupportRoot: appSupportRoot, preferences: preferences)
+        return fileManager.fileExists(atPath: appSupportRoot.appendingPathComponent(Self.classicSettingsRelativePath).path) ||
             fileManager.fileExists(atPath: appSupportRoot.appendingPathComponent(Self.workflowPresetsRelativePath).path) ||
             fileManager.fileExists(atPath: appSupportRoot.appendingPathComponent(Self.modelPresetsRelativePath).path) ||
             classicWorkflowFilesExist(at: appSupportRoot.appendingPathComponent(Self.workflowsDirectoryName, isDirectory: true)) ||
-            fileManager.fileExists(atPath: appSupportRoot.appendingPathComponent("Workspaces/workspacesIndex.json").path)
+            fileManager.fileExists(atPath: sourceWorkspacesRoot.appendingPathComponent("workspacesIndex.json").path) ||
+            preferencesContainImportableValues(preferences)
     }
 
     private func classicWorkflowFilesExist(at directory: URL) -> Bool {
         guard let files = try? markdownFiles(in: directory) else { return false }
         return !files.isEmpty
+    }
+
+    private func sourceWorkspacesRoot(
+        appSupportRoot: URL,
+        preferences: ClassicRepoPromptPreferences?
+    ) -> URL {
+        let defaultRoot = appSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        guard let customRoot = classicGlobalCustomStorageURL(from: preferences) else {
+            return defaultRoot
+        }
+
+        // Classic writes the workspace index under GlobalCustomStorageURL when set.
+        let customIndexURL = customRoot.appendingPathComponent("workspacesIndex.json")
+        guard fileManager.fileExists(atPath: customIndexURL.path) else {
+            return defaultRoot
+        }
+        return customRoot
+    }
+
+    private func classicGlobalCustomStorageURL(from preferences: ClassicRepoPromptPreferences?) -> URL? {
+        guard let rawValue = preferences?.object(forKey: "GlobalCustomStorageURL") else { return nil }
+        if let url = rawValue as? URL {
+            return url
+        }
+        guard let path = rawValue as? String,
+              !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return nil
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
 
     private func importClassicRepoPromptDataSynchronously(
@@ -434,21 +553,35 @@ struct ClassicRepoPromptImportService {
         sourcePromptSupportRoot: URL,
         targetPromptSupportRoot: URL,
         targetWorkspacesRoot: URL,
+        targetWorkspacesRootIsGlobalCustomStorage: Bool,
         sourceSecureValueReader: ClassicRepoPromptSecureValueReading?,
-        targetSecureStore: SecureKeyValueStorageBackend?,
+        targetSecureStore: ClassicRepoPromptSecureValueWriting?,
         sourcePreferences: ClassicRepoPromptPreferences?,
         targetPreferences: ClassicRepoPromptPreferences?
     ) throws -> ClassicRepoPromptImportResult {
-        guard sourceExists(at: sourceAppSupportRoot) else {
+        guard sourceExists(at: sourceAppSupportRoot, preferences: sourcePreferences) else {
             throw ImportError.sourceMissing(sourceAppSupportRoot)
         }
 
-        let sourceWorkspacesRoot = sourceAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
-        var result = try importWorkspacesSynchronously(
-            sourceRoot: sourceWorkspacesRoot,
-            targetRoot: targetWorkspacesRoot,
-            missingSourceIsSkip: true
+        let sourceWorkspacesRoot = sourceWorkspacesRoot(
+            appSupportRoot: sourceAppSupportRoot,
+            preferences: sourcePreferences
         )
+        var result: ClassicRepoPromptImportResult
+        do {
+            result = try importWorkspacesSynchronously(
+                sourceRoot: sourceWorkspacesRoot,
+                targetRoot: targetWorkspacesRoot,
+                missingSourceIsSkip: true,
+                targetRootIsGlobalCustomStorage: targetWorkspacesRootIsGlobalCustomStorage
+            )
+        } catch {
+            result = ClassicRepoPromptImportResult(
+                sourceRoot: sourceWorkspacesRoot,
+                targetRoot: targetWorkspacesRoot,
+                failed: [.init(name: "Classic RepoPrompt workspaces", id: nil, message: error.localizedDescription)]
+            )
+        }
 
         result.settings = importSettings(
             sourceURL: sourceAppSupportRoot.appendingPathComponent(Self.classicSettingsRelativePath),
@@ -489,7 +622,8 @@ struct ClassicRepoPromptImportService {
     private func importWorkspacesSynchronously(
         sourceRoot: URL,
         targetRoot: URL,
-        missingSourceIsSkip: Bool = false
+        missingSourceIsSkip: Bool = false,
+        targetRootIsGlobalCustomStorage _: Bool = false
     ) throws -> ClassicRepoPromptImportResult {
         let sourceIndexURL = sourceRoot.appendingPathComponent("workspacesIndex.json")
         guard fileManager.fileExists(atPath: sourceIndexURL.path) else {
@@ -505,17 +639,18 @@ struct ClassicRepoPromptImportService {
 
         try fileManager.createDirectory(at: targetRoot, withIntermediateDirectories: true)
 
-        let sourceEntries = loadIndex(from: sourceIndexURL)
+        let sourceEntries = try loadIndex(from: sourceIndexURL)
         let targetIndexURL = targetRoot.appendingPathComponent("workspacesIndex.json")
-        var targetEntries = loadIndex(from: targetIndexURL)
+        var targetEntries = try loadIndex(from: targetIndexURL)
         var existingIDs = Set(targetEntries.map(\.id))
         var result = ClassicRepoPromptImportResult(
             sourceRoot: sourceRoot,
             targetRoot: targetRoot
         )
+        let sourceAndTargetRootsMatch = sourceRoot.standardizedFileURL == targetRoot.standardizedFileURL
 
         for entry in sourceEntries {
-            guard !existingIDs.contains(entry.id) else {
+            guard !existingIDs.contains(entry.id) || sourceAndTargetRootsMatch else {
                 result.skipped.append(.init(name: entry.name, id: entry.id, reason: "Already exists in RepoPrompt CE"))
                 continue
             }
@@ -529,8 +664,22 @@ struct ClassicRepoPromptImportService {
                 var workspace = try loadWorkspace(from: sourceFileURL)
                 workspace = normalizedImportedWorkspace(workspace)
                 let targetDirectory = targetRoot.appendingPathComponent(directoryName(for: workspace), isDirectory: true)
-                guard !fileManager.fileExists(atPath: targetDirectory.path) else {
-                    result.skipped.append(.init(name: workspace.name, id: workspace.id, reason: "Target folder already exists"))
+                let importedCustomStoragePath = importedCustomStoragePath(
+                    targetDirectory: targetDirectory,
+                    workspace: workspace
+                )
+                workspace.customStoragePath = importedCustomStoragePath
+                if fileManager.fileExists(atPath: targetDirectory.path) {
+                    let repairedEntry = try recoverWorkspaceIndexEntry(
+                        fromExistingTargetDirectory: targetDirectory,
+                        expectedWorkspaceID: workspace.id,
+                        fallbackName: workspace.name,
+                        customStoragePath: importedCustomStoragePath
+                    )
+                    try copyMissingWorkspaceSidecars(from: sourceFileURL.deletingLastPathComponent(), to: targetDirectory)
+                    upsertWorkspaceIndexEntry(repairedEntry, into: &targetEntries)
+                    existingIDs.insert(repairedEntry.id)
+                    result.imported.append(repairedEntry)
                     continue
                 }
 
@@ -539,7 +688,7 @@ struct ClassicRepoPromptImportService {
                 let importedEntry = WorkspaceIndexEntry(
                     id: workspace.id,
                     name: workspace.name,
-                    customStoragePath: nil,
+                    customStoragePath: workspace.customStoragePath,
                     isSystemWorkspace: false,
                     isHiddenInMenus: workspace.isHiddenInMenus
                 )
@@ -552,11 +701,81 @@ struct ClassicRepoPromptImportService {
         }
 
         if !result.imported.isEmpty {
-            let data = try encoder.encode(targetEntries)
-            try data.write(to: targetIndexURL, options: .atomic)
+            try writeMergedWorkspaceIndex(
+                importedEntries: result.imported,
+                fallbackEntries: targetEntries,
+                to: targetIndexURL
+            )
         }
 
         return result
+    }
+
+    private func writeMergedWorkspaceIndex(
+        importedEntries: [WorkspaceIndexEntry],
+        fallbackEntries: [WorkspaceIndexEntry],
+        to targetIndexURL: URL
+    ) throws {
+        var latestEntries = (try? loadIndex(from: targetIndexURL)) ?? fallbackEntries
+        for importedEntry in importedEntries {
+            upsertWorkspaceIndexEntry(importedEntry, into: &latestEntries)
+        }
+        let data = try encoder.encode(latestEntries)
+        try data.write(to: targetIndexURL, options: .atomic)
+    }
+
+    private func upsertWorkspaceIndexEntry(_ entry: WorkspaceIndexEntry, into entries: inout [WorkspaceIndexEntry]) {
+        if let index = entries.firstIndex(where: { $0.id == entry.id }) {
+            entries[index] = entry
+        } else {
+            entries.append(entry)
+        }
+    }
+
+    private func recoverWorkspaceIndexEntry(
+        fromExistingTargetDirectory targetDirectory: URL,
+        expectedWorkspaceID: UUID,
+        fallbackName: String,
+        customStoragePath: URL?
+    ) throws -> WorkspaceIndexEntry {
+        let workspaceURL = targetDirectory.appendingPathComponent("workspace.json")
+        guard fileManager.fileExists(atPath: workspaceURL.path) else {
+            throw ImportRecoveryError.existingTargetMissingWorkspace(targetDirectory.path)
+        }
+        var workspace = try loadWorkspace(from: workspaceURL)
+        guard workspace.id == expectedWorkspaceID else {
+            throw ImportRecoveryError.existingTargetWorkspaceMismatch(
+                expected: expectedWorkspaceID,
+                actual: workspace.id
+            )
+        }
+        var recoveredWorkspace = normalizedImportedWorkspace(workspace)
+        recoveredWorkspace.customStoragePath = customStoragePath
+        if recoveredWorkspace != workspace {
+            workspace = recoveredWorkspace
+            try encoder.encode(workspace).write(to: workspaceURL, options: .atomic)
+        }
+        return WorkspaceIndexEntry(
+            id: workspace.id,
+            name: fallbackName,
+            customStoragePath: customStoragePath,
+            isSystemWorkspace: false,
+            isHiddenInMenus: workspace.isHiddenInMenus
+        )
+    }
+
+    private enum ImportRecoveryError: LocalizedError {
+        case existingTargetMissingWorkspace(String)
+        case existingTargetWorkspaceMismatch(expected: UUID, actual: UUID)
+
+        var errorDescription: String? {
+            switch self {
+            case let .existingTargetMissingWorkspace(path):
+                "Target folder already exists without workspace.json: \(path)"
+            case let .existingTargetWorkspaceMismatch(expected, actual):
+                "Target folder contains workspace \(actual.uuidString), expected \(expected.uuidString)."
+            }
+        }
     }
 
     private func importSettings(sourceURL: URL, targetURL: URL) -> ClassicRepoPromptImportSectionResult {
@@ -606,7 +825,7 @@ struct ClassicRepoPromptImportService {
             try targetStore.save(mergedDocument)
             return .init(importedCount: importedCount)
         } catch {
-            return .init(failedCount: 1, messages: ["Settings import failed: \(error.localizedDescription)"])
+            return .failed(message: "Settings import failed: \(error.localizedDescription)")
         }
     }
 
@@ -623,19 +842,23 @@ struct ClassicRepoPromptImportService {
 
             importedCount += appendMissingCopyPresets(sourceDocument.copyUserPresets, to: &targetDocument.copyUserPresets)
             importedCount += appendMissingChatPresets(sourceDocument.chatUserPresets, to: &targetDocument.chatUserPresets)
-            importedCount += appendMissingCopyOverrides(sourceDocument.copyOverrides, to: &targetDocument.copyOverrides)
-            importedCount += appendMissingChatOverrides(sourceDocument.chatOverrides, to: &targetDocument.chatOverrides)
-            importedCount += mergeMissingVisibility(sourceDocument.copyVisibilityByPresetID, into: &targetDocument.copyVisibilityByPresetID)
-            importedCount += mergeMissingVisibility(sourceDocument.chatVisibilityByPresetID, into: &targetDocument.chatVisibilityByPresetID)
+
+            // Metadata is only valid for presets that survived ID/name de-dupe into CE.
+            let copyPresetIDs = Set(targetDocument.copyUserPresets.map(\.id))
+            let chatPresetIDs = Set(targetDocument.chatUserPresets.map(\.id))
+            importedCount += appendMissingCopyOverrides(sourceDocument.copyOverrides, to: &targetDocument.copyOverrides, allowedPresetIDs: copyPresetIDs)
+            importedCount += appendMissingChatOverrides(sourceDocument.chatOverrides, to: &targetDocument.chatOverrides, allowedPresetIDs: chatPresetIDs)
+            importedCount += mergeMissingVisibility(sourceDocument.copyVisibilityByPresetID, into: &targetDocument.copyVisibilityByPresetID, allowedPresetIDs: copyPresetIDs)
+            importedCount += mergeMissingVisibility(sourceDocument.chatVisibilityByPresetID, into: &targetDocument.chatVisibilityByPresetID, allowedPresetIDs: chatPresetIDs)
 
             guard importedCount > 0 else {
                 return .init(skippedCount: 1, messages: ["Classic workflow presets were already present."])
             }
 
-            targetStore.saveWorkflowPresets(targetDocument)
+            try targetStore.saveWorkflowPresetsThrowing(targetDocument)
             return .init(importedCount: importedCount)
         } catch {
-            return .init(failedCount: 1, messages: ["Workflow preset import failed: \(error.localizedDescription)"])
+            return .failed(message: "Workflow preset import failed: \(error.localizedDescription)")
         }
     }
 
@@ -654,10 +877,10 @@ struct ClassicRepoPromptImportService {
                 return .init(skippedCount: 1, messages: ["Classic model presets were already present."])
             }
 
-            targetStore.saveModelPresets(targetDocument)
+            try targetStore.saveModelPresetsThrowing(targetDocument)
             return .init(importedCount: importedCount)
         } catch {
-            return .init(failedCount: 1, messages: ["Model preset import failed: \(error.localizedDescription)"])
+            return .failed(message: "Model preset import failed: \(error.localizedDescription)")
         }
     }
 
@@ -679,7 +902,7 @@ struct ClassicRepoPromptImportService {
             try writeJSON(targetPrompts, to: targetURL, encoder: encoder)
             return .init(importedCount: importedCount)
         } catch {
-            return .init(failedCount: 1, messages: ["Saved prompt import failed: \(error.localizedDescription)"])
+            return .failed(message: "Saved prompt import failed: \(error.localizedDescription)")
         }
     }
 
@@ -701,7 +924,7 @@ struct ClassicRepoPromptImportService {
             try writeJSON(targetPrompts, to: targetURL, encoder: encoder)
             return .init(importedCount: importedCount)
         } catch {
-            return .init(failedCount: 1, messages: ["Context builder prompt import failed: \(error.localizedDescription)"])
+            return .failed(message: "Context builder prompt import failed: \(error.localizedDescription)")
         }
     }
 
@@ -743,7 +966,7 @@ struct ClassicRepoPromptImportService {
             }
             return result
         } catch {
-            return .init(failedCount: 1, messages: ["Workflow import failed: \(error.localizedDescription)"])
+            return .failed(message: "Workflow import failed: \(error.localizedDescription)")
         }
     }
 
@@ -757,11 +980,22 @@ struct ClassicRepoPromptImportService {
 
         var result = ClassicRepoPromptImportSectionResult()
         for key in Self.preferenceKeysToImport {
-            guard let sourceValue = sourcePreferences.object(forKey: key) else {
+            guard let rawSourceValue = sourcePreferences.object(forKey: key) else {
                 result.skipItems()
                 continue
             }
-            guard targetPreferences.object(forKey: key) == nil else {
+            let sourceValue = normalizedPreferenceValue(key: key, value: rawSourceValue)
+            if let rawTargetValue = targetPreferences.object(forKey: key) {
+                let targetValue = normalizedPreferenceValue(key: key, value: rawTargetValue)
+                if let mergedValue = mergedCompositePreferenceValue(
+                    key: key,
+                    sourceValue: sourceValue,
+                    targetValue: targetValue
+                ) {
+                    targetPreferences.setObject(mergedValue, forKey: key)
+                    result.importItems(1)
+                    continue
+                }
                 result.skipItems()
                 continue
             }
@@ -775,9 +1009,270 @@ struct ClassicRepoPromptImportService {
         return result
     }
 
+    private func normalizedPreferenceValue(key: String, value: Any) -> Any {
+        switch key {
+        case "openrouter_configuration":
+            normalizedOpenRouterConfigurationData(from: value) ?? value
+        case "CustomProviderConfig":
+            normalizedCustomProviderConfigurationData(from: value) ?? value
+        case "ClaudeCodeCompatibleBackendConfigs":
+            normalizedCompatibleBackendConfigsData(from: value) ?? value
+        default:
+            value
+        }
+    }
+
+    private func normalizedOpenRouterConfigurationData(from value: Any) -> Data? {
+        guard let data = value as? Data else { return nil }
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        if let config = try? decoder.decode(OpenRouterConfiguration.self, from: data) {
+            return try? encoder.encode(config)
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let baseConfig = object["baseConfig"] as? [String: Any]
+        let temperature = (object["temperature"] as? NSNumber)?.doubleValue
+            ?? (baseConfig?["temperature"] as? NSNumber)?.doubleValue
+        let maxTokens = (object["maxTokens"] as? NSNumber)?.intValue
+            ?? (baseConfig?["maxTokens"] as? NSNumber)?.intValue
+        let customHeaders = object["customHeaders"] as? [String: String]
+            ?? object["headers"] as? [String: String]
+            ?? [:]
+        let useCustomSettings = (object["useCustomSettings"] as? Bool) ?? true
+        return try? encoder.encode(
+            OpenRouterConfiguration(
+                temperature: temperature,
+                maxTokens: maxTokens,
+                customHeaders: customHeaders,
+                useCustomSettings: useCustomSettings
+            )
+        )
+    }
+
+    private func normalizedCustomProviderConfigurationData(from value: Any) -> Data? {
+        guard let data = value as? Data else { return nil }
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        if let config = try? decoder.decode(CustomProviderConfiguration.self, from: data) {
+            return try? encoder.encode(config)
+        }
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let url = object["url"] as? String,
+              let defaultModel = object["defaultModel"] as? String
+        else {
+            return nil
+        }
+        let headers = object["headers"] as? [String: String] ?? [:]
+        let name = (object["name"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enabledModels = Set((object["enabledModels"] as? [String]) ?? [defaultModel])
+        let maxTokens = (object["maxTokens"] as? NSNumber)?.intValue
+        let userPreferredModel = object["userPreferredModel"] as? String
+        let includeContentTypeHeader = (object["includeContentTypeHeader"] as? Bool) ?? false
+        let apiVersion = object["apiVersion"] as? String
+        guard let config = try? CustomProviderConfiguration(
+            url: url,
+            defaultModel: defaultModel,
+            headers: headers,
+            name: name?.isEmpty == false ? name! : "Classic Custom Provider",
+            enabledModels: enabledModels,
+            maxTokens: maxTokens,
+            userPreferredModel: userPreferredModel,
+            includeContentTypeHeader: includeContentTypeHeader,
+            apiVersion: apiVersion
+        ) else {
+            return nil
+        }
+        return try? encoder.encode(config)
+    }
+
+    private func normalizedCompatibleBackendConfigsData(from value: Any) -> Data? {
+        guard let data = value as? Data,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+
+        let decoder = JSONDecoder()
+        let encoder = JSONEncoder()
+        if let configs = try? decoder.decode([String: ClaudeCodeCompatibleBackendConfig].self, from: data) {
+            return try? encoder.encode(configs.mapValues(\.normalized))
+        }
+
+        var normalizedConfigs: [String: ClaudeCodeCompatibleBackendConfig] = [:]
+        for (rawID, rawConfig) in object {
+            guard let id = ClaudeCodeCompatibleBackendID(rawValue: rawID),
+                  let configObject = rawConfig as? [String: Any]
+            else {
+                continue
+            }
+
+            if JSONSerialization.isValidJSONObject(configObject),
+               let configData = try? JSONSerialization.data(withJSONObject: configObject),
+               let decodedConfig = try? decoder.decode(ClaudeCodeCompatibleBackendConfig.self, from: configData)
+            {
+                normalizedConfigs[rawID] = decodedConfig.normalized
+                continue
+            }
+
+            var config = id.defaultPreset
+            if let isEnabled = configObject["isEnabled"] as? Bool {
+                config.isEnabled = isEnabled
+            }
+            if let displayName = configObject["displayName"] as? String {
+                config.displayName = displayName
+            }
+            if let baseURL = configObject["baseURL"] as? String {
+                config.baseURL = baseURL
+            }
+            normalizedConfigs[rawID] = config.normalized
+        }
+
+        guard !normalizedConfigs.isEmpty else { return nil }
+        return try? encoder.encode(normalizedConfigs)
+    }
+
+    private func mergedCompositePreferenceValue(
+        key: String,
+        sourceValue: Any,
+        targetValue: Any
+    ) -> Any? {
+        // Preserve existing CE composite entries while filling gaps from Classic.
+        if key == "openrouter_configuration",
+           let openRouterValue = importedOpenRouterPreferenceValue(sourceValue: sourceValue, targetValue: targetValue)
+        {
+            return openRouterValue
+        }
+
+        if let mergedData = mergedJSONDictionaryPreferenceValue(sourceValue: sourceValue, targetValue: targetValue) {
+            return mergedData
+        }
+
+        if let mergedStringArray = mergedMissingStrings(
+            sourceValue: sourceValue,
+            targetValue: targetValue,
+            preferSourceOrder: key == "AgentWorkflowStore.featuredWorkflowIDs"
+        ) {
+            return mergedStringArray
+        }
+
+        if let mergedDictionary = mergedMissingDictionaryValues(sourceValue: sourceValue, targetValue: targetValue) {
+            return mergedDictionary
+        }
+
+        return nil
+    }
+
+    private func importedOpenRouterPreferenceValue(sourceValue: Any, targetValue: Any) -> Data? {
+        guard let sourceData = sourceValue as? Data,
+              let targetData = targetValue as? Data,
+              sourceData != targetData,
+              let targetObject = try? JSONSerialization.jsonObject(with: targetData) as? [String: Any],
+              isGeneratedDefaultOpenRouterConfiguration(targetObject)
+        else {
+            return nil
+        }
+        return sourceData
+    }
+
+    private func isGeneratedDefaultOpenRouterConfiguration(_ object: [String: Any]) -> Bool {
+        let allowedKeys: Set = ["baseConfig", "customHeaders", "useCustomSettings"]
+        guard Set(object.keys).isSubset(of: allowedKeys) else { return false }
+        guard (object["useCustomSettings"] as? Bool) ?? true else { return false }
+
+        if let baseConfig = object["baseConfig"] as? [String: Any],
+           baseConfig.contains(where: { !($0.value is NSNull) })
+        {
+            return false
+        }
+        if let customHeaders = object["customHeaders"] as? [String: Any],
+           !customHeaders.isEmpty
+        {
+            return false
+        }
+        return true
+    }
+
+    private func mergedJSONDictionaryPreferenceValue(sourceValue: Any, targetValue: Any) -> Data? {
+        guard let sourceData = sourceValue as? Data,
+              let sourceObject = try? JSONSerialization.jsonObject(with: sourceData) as? [String: Any],
+              !sourceObject.isEmpty
+        else {
+            return nil
+        }
+
+        let targetObject: [String: Any]
+        if let targetData = targetValue as? Data,
+           let decodedTarget = try? JSONSerialization.jsonObject(with: targetData) as? [String: Any]
+        {
+            targetObject = decodedTarget
+        } else {
+            return nil
+        }
+
+        guard let mergedObject = mergeMissingJSONFields(target: targetObject, source: sourceObject) as? [String: Any] else {
+            return nil
+        }
+
+        guard !NSDictionary(dictionary: mergedObject).isEqual(to: targetObject),
+              JSONSerialization.isValidJSONObject(mergedObject)
+        else {
+            return nil
+        }
+        return try? JSONSerialization.data(withJSONObject: mergedObject, options: [.sortedKeys])
+    }
+
+    private func mergedMissingStrings(sourceValue: Any, targetValue: Any, preferSourceOrder: Bool = false) -> [String]? {
+        guard let sourceArray = stringArray(from: sourceValue),
+              let targetArray = stringArray(from: targetValue),
+              !sourceArray.isEmpty
+        else {
+            return nil
+        }
+
+        let orderedValues = preferSourceOrder ? sourceArray + targetArray : targetArray + sourceArray
+        var existing: Set<String> = []
+        var merged: [String] = []
+        for value in orderedValues where existing.insert(value).inserted {
+            merged.append(value)
+        }
+        return merged == targetArray ? nil : merged
+    }
+
+    private func stringArray(from value: Any) -> [String]? {
+        if let array = value as? [String] {
+            return array
+        }
+        if let array = value as? NSArray {
+            return array.compactMap { $0 as? String }.count == array.count ? array.compactMap { $0 as? String } : nil
+        }
+        return nil
+    }
+
+    private func mergedMissingDictionaryValues(sourceValue: Any, targetValue: Any) -> [String: Any]? {
+        guard let sourceDictionary = sourceValue as? [String: Any],
+              let targetDictionary = targetValue as? [String: Any],
+              !sourceDictionary.isEmpty
+        else {
+            return nil
+        }
+
+        let mergedDictionary = mergeMissingJSONFields(target: targetDictionary, source: sourceDictionary)
+        guard let typedMergedDictionary = mergedDictionary as? [String: Any],
+              !NSDictionary(dictionary: typedMergedDictionary).isEqual(to: targetDictionary)
+        else {
+            return nil
+        }
+        return typedMergedDictionary
+    }
+
+    private func preferencesContainImportableValues(_ preferences: ClassicRepoPromptPreferences?) -> Bool {
+        guard let preferences else { return false }
+        return Self.preferenceKeysToImport.contains { preferences.object(forKey: $0) != nil }
+    }
+
     private func importSecureAccounts(
         sourceSecureValueReader: ClassicRepoPromptSecureValueReading?,
-        targetSecureStore: SecureKeyValueStorageBackend?
+        targetSecureStore: ClassicRepoPromptSecureValueWriting?
     ) -> ClassicRepoPromptImportSectionResult {
         guard let sourceSecureValueReader, let targetSecureStore else {
             return .init(skippedCount: 1, messages: ["Classic secure account import is unavailable in this runtime."])
@@ -801,23 +1296,22 @@ struct ClassicRepoPromptImportService {
             }
 
             do {
-                let existingValue = try targetSecureStore.get(for: account.identifier, accessMode: accessMode)
-                if existingValue == sourceValue {
-                    result.skipItems()
-                } else {
-                    result.skipItems(message: "\(account.displayName) already has a different RepoPrompt CE value.")
+                if let existingValue = try targetSecureStore.getPlainValue(for: account, accessMode: accessMode) {
+                    if existingValue == sourceValue {
+                        result.skipItems()
+                    } else {
+                        result.skipItems(message: "\(account.displayName) already has a different RepoPrompt CE value.")
+                    }
+                    continue
                 }
-                continue
-            } catch KeychainService.KeychainError.itemNotFound {
-                // Save below.
             } catch {
                 result.failItems(message: "\(account.displayName): \(error.localizedDescription)")
                 continue
             }
 
             do {
-                try targetSecureStore.save(sourceValue, for: account.identifier, accessMode: accessMode)
-                let verifiedValue = try targetSecureStore.get(for: account.identifier, accessMode: accessMode)
+                try targetSecureStore.savePlainValue(sourceValue, for: account, accessMode: accessMode)
+                let verifiedValue = try targetSecureStore.getPlainValue(for: account, accessMode: accessMode)
                 if verifiedValue == sourceValue {
                     result.importItems(1)
                 } else {
@@ -898,14 +1392,13 @@ struct ClassicRepoPromptImportService {
         return candidate
     }
 
-    private func loadIndex(from url: URL) -> [WorkspaceIndexEntry] {
-        guard fileManager.fileExists(atPath: url.path),
-              let data = try? Data(contentsOf: url),
-              let entries = try? decoder.decode([WorkspaceIndexEntry].self, from: data)
-        else {
+    private func loadIndex(from url: URL) throws -> [WorkspaceIndexEntry] {
+        guard fileManager.fileExists(atPath: url.path) else {
             return []
         }
-        return entries
+        // Classic indexes can predate CE-only fields; normalize them at the import boundary.
+        return try decoder.decode([ClassicWorkspaceIndexEntry].self, from: Data(contentsOf: url))
+            .map(\.workspaceIndexEntry)
     }
 
     private func workspaceFileURL(for entry: WorkspaceIndexEntry, sourceRoot: URL) -> URL? {
@@ -980,6 +1473,42 @@ struct ClassicRepoPromptImportService {
         }
     }
 
+    private func copyMissingWorkspaceSidecars(from sourceDirectory: URL, to targetDirectory: URL) throws {
+        // Recovery keeps the verified CE workspace.json, then fills in missing Classic sidecars.
+        try removeIfPresent(targetDirectory.appendingPathComponent("AgentSessions/AgentSessionIndex.json"))
+        guard let enumerator = fileManager.enumerator(
+            at: sourceDirectory,
+            includingPropertiesForKeys: [.isDirectoryKey]
+        ) else {
+            return
+        }
+
+        let sourceRootPath = sourceDirectory.standardizedFileURL.path
+        for case let sourceURL as URL in enumerator {
+            let sourcePath = sourceURL.standardizedFileURL.path
+            guard sourcePath.hasPrefix(sourceRootPath + "/") else { continue }
+            let relativePath = String(sourcePath.dropFirst(sourceRootPath.count + 1))
+            guard relativePath != "workspace.json",
+                  relativePath != "AgentSessions/AgentSessionIndex.json"
+            else {
+                continue
+            }
+
+            let targetURL = targetDirectory.appendingPathComponent(relativePath)
+            if fileManager.fileExists(atPath: targetURL.path) {
+                continue
+            }
+
+            let isDirectory = (try? sourceURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDirectory {
+                try fileManager.createDirectory(at: targetURL, withIntermediateDirectories: true)
+            } else {
+                try fileManager.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try fileManager.copyItem(at: sourceURL, to: targetURL)
+            }
+        }
+    }
+
     private func removeIfPresent(_ url: URL) throws {
         if fileManager.fileExists(atPath: url.path) {
             try fileManager.removeItem(at: url)
@@ -995,6 +1524,16 @@ struct ClassicRepoPromptImportService {
             .replacingOccurrences(of: "/", with: "_")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return "Workspace-\(safeName)-\(id.uuidString)"
+    }
+
+    private func importedCustomStoragePath(
+        targetDirectory: URL,
+        workspace: WorkspaceModel
+    ) -> URL? {
+        // Some legacy names cannot be reloaded through WorkspaceIndexEntry's raw
+        // `Workspace-\(name)-\(id)` lookup, so pin those imports to their copied folder.
+        let rawIndexDirectoryName = "Workspace-\(workspace.name)-\(workspace.id.uuidString)"
+        return directoryName(for: workspace) == rawIndexDirectoryName ? nil : targetDirectory
     }
 
     @inline(never)
@@ -1097,11 +1636,15 @@ struct ClassicRepoPromptImportService {
         return importedCount
     }
 
-    private func appendMissingCopyOverrides(_ source: [CopyPresetOverrides], to target: inout [CopyPresetOverrides]) -> Int {
+    private func appendMissingCopyOverrides(
+        _ source: [CopyPresetOverrides],
+        to target: inout [CopyPresetOverrides],
+        allowedPresetIDs: Set<UUID>
+    ) -> Int {
         var existingIDs = Set(target.map(\.presetID))
         var importedCount = 0
 
-        for item in source where !existingIDs.contains(item.presetID) {
+        for item in source where allowedPresetIDs.contains(item.presetID) && !existingIDs.contains(item.presetID) {
             target.append(item)
             existingIDs.insert(item.presetID)
             importedCount += 1
@@ -1109,11 +1652,15 @@ struct ClassicRepoPromptImportService {
         return importedCount
     }
 
-    private func appendMissingChatOverrides(_ source: [ChatPresetOverrides], to target: inout [ChatPresetOverrides]) -> Int {
+    private func appendMissingChatOverrides(
+        _ source: [ChatPresetOverrides],
+        to target: inout [ChatPresetOverrides],
+        allowedPresetIDs: Set<UUID>
+    ) -> Int {
         var existingIDs = Set(target.map(\.presetID))
         var importedCount = 0
 
-        for item in source where !existingIDs.contains(item.presetID) {
+        for item in source where allowedPresetIDs.contains(item.presetID) && !existingIDs.contains(item.presetID) {
             target.append(item)
             existingIDs.insert(item.presetID)
             importedCount += 1
@@ -1121,9 +1668,13 @@ struct ClassicRepoPromptImportService {
         return importedCount
     }
 
-    private func mergeMissingVisibility(_ source: [String: Bool], into target: inout [String: Bool]) -> Int {
+    private func mergeMissingVisibility(
+        _ source: [String: Bool],
+        into target: inout [String: Bool],
+        allowedPresetIDs: Set<UUID>
+    ) -> Int {
         var importedCount = 0
-        for (key, value) in source where target[key] == nil {
+        for (key, value) in source where target[key] == nil && allowedPresetIDs.containsVisibilityKey(key) {
             target[key] = value
             importedCount += 1
         }
@@ -1195,43 +1746,68 @@ extension WorkspaceManagerViewModel {
     @MainActor
     func importClassicRepoPromptData() async -> ClassicRepoPromptImportResult {
         let targetRoot = globalCustomStorageURL ?? WorkspaceStoragePaths.defaultRoot
+        let targetRootIsGlobalCustomStorage = globalCustomStorageURL != nil
         do {
             let result = try await ClassicRepoPromptImportService()
-                .importFromDefaultClassicInstallation(targetWorkspacesRoot: targetRoot)
+                .importFromDefaultClassicInstallation(
+                    targetWorkspacesRoot: targetRoot,
+                    targetWorkspacesRootIsGlobalCustomStorage: targetRootIsGlobalCustomStorage
+                )
             if result.importedCount > 0 {
                 reloadWorkspacesFromDisk()
                 notifyWorkspaceListDidChange()
             }
-            if result.settings.didImport {
-                _ = GlobalSettingsStore.shared.reloadFromDisk()
+            if result.savedPrompts.didImport {
+                promptViewModel.loadStoredPrompts()
             }
-            if result.workflows.didImport {
-                AgentWorkflowStore.shared.refresh()
+            if result.contextBuilderPrompts.didImport {
+                ContextBuilderPromptStorage.shared.loadPrompts()
             }
-            if result.preferences.didImport {
-                NotificationCenter.default.post(name: .claudeCodeConnectionChanged, object: nil)
-                NotificationCenter.default.post(name: .codexConnectionChanged, object: nil)
-                NotificationCenter.default.post(name: .openCodeConnectionChanged, object: nil)
-                NotificationCenter.default.post(name: .cursorConnectionChanged, object: nil)
-            }
-            if result.secureAccounts.didImport {
-                for domain in AgentPermissionSecureDomain.allCases {
-                    NotificationCenter.default.post(
-                        name: .agentPermissionSecureStoreDidChange,
-                        object: nil,
-                        userInfo: [
-                            AgentPermissionSecureStoreNotificationKey.domain: domain.rawValue,
-                            AgentPermissionSecureStoreNotificationKey.writeSucceeded: true
-                        ]
-                    )
-                }
-            }
+            applyClassicRepoPromptImportSideEffects(result)
             return result
         } catch {
             return ClassicRepoPromptImportResult(
                 sourceRoot: ClassicRepoPromptImportService.defaultClassicAppSupportRoot,
                 targetRoot: targetRoot,
                 failed: [.init(name: "Classic RepoPrompt", id: nil, message: error.localizedDescription)]
+            )
+        }
+    }
+}
+
+@MainActor
+func applyClassicRepoPromptImportSideEffects(_ result: ClassicRepoPromptImportResult) {
+    if result.settings.didImport {
+        _ = GlobalSettingsStore.shared.reloadFromDisk()
+    }
+    if result.preferences.didImport {
+        AgentWorkflowStore.shared.reloadPreferencesFromDefaults(acceptImportedFeaturedIDs: true)
+    }
+    if result.workflows.didImport || result.preferences.didImport {
+        AgentWorkflowStore.shared.refresh()
+    }
+    if result.workflowPresets.didImport {
+        CopyPresetManager.shared.load()
+        ChatPresetManager.shared.load()
+    }
+    if result.modelPresets.didImport {
+        ModelPresetsManager.shared.reloadFromDisk()
+    }
+    if result.preferences.didImport {
+        NotificationCenter.default.post(name: .claudeCodeConnectionChanged, object: nil)
+        NotificationCenter.default.post(name: .codexConnectionChanged, object: nil)
+        NotificationCenter.default.post(name: .openCodeConnectionChanged, object: nil)
+        NotificationCenter.default.post(name: .cursorConnectionChanged, object: nil)
+    }
+    if result.secureAccounts.didImport {
+        for domain in AgentPermissionSecureDomain.allCases {
+            NotificationCenter.default.post(
+                name: .agentPermissionSecureStoreDidChange,
+                object: nil,
+                userInfo: [
+                    AgentPermissionSecureStoreNotificationKey.domain: domain.rawValue,
+                    AgentPermissionSecureStoreNotificationKey.writeSucceeded: true
+                ]
             )
         }
     }

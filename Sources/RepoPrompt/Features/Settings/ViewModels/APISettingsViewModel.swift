@@ -412,22 +412,23 @@ public class APISettingsViewModel: ObservableObject {
         .store(in: &cliConnectionCancellables)
     }
 
+    @MainActor
     private func reloadCLIConnectionFlagsFromDefaults() {
         let wasCursorConnected = isCursorConnected
-        isClaudeCodeConnected = UserDefaults.standard.bool(forKey: "ClaudeCodeConnected")
-        if isClaudeCodeConnected {
-            claudeCodeCLIStatus = .binaryPresent
+        loadNonSecretStoredData()
+        if wasCursorConnected != isCursorConnected {
+            if isCursorConnected {
+                startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
+            } else {
+                stopCursorModelsSubscription(clearModels: true)
+            }
         }
-        isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
-        isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
-        isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
-        guard wasCursorConnected != isCursorConnected else { return }
-        if isCursorConnected {
-            startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
-        } else {
-            stopCursorModelsSubscription(clearModels: true)
+        Task { [weak self] in
+            guard let self else { return }
+            await loadCompatibleBackendState(accessMode: .nonInteractive(reason: .backgroundAvailabilityCheck))
+            postCompatibleBackendAvailabilityChanged()
+            await updateAvailableModels()
         }
-        Task { await updateAvailableModels() }
     }
 
     private func publishClaudeCodeGLMAvailability() {
@@ -868,6 +869,19 @@ public class APISettingsViewModel: ObservableObject {
 
     @MainActor
     private func loadNonSecretStoredData() {
+        azureCustomModel = UserDefaults.standard.string(forKey: "customModelAzure") ?? ""
+        anthropicCustomModel = UserDefaults.standard.string(forKey: "customModelAnthropic") ?? ""
+        openAICustomModel = UserDefaults.standard.string(forKey: "customModelOpenAI") ?? ""
+        geminiCustomModel = UserDefaults.standard.string(forKey: "customModelGemini") ?? ""
+        deepSeekCustomModel = UserDefaults.standard.string(forKey: "customModelDeepSeek") ?? ""
+        fireworksCustomModel = UserDefaults.standard.string(forKey: "customModelFireworks") ?? ""
+        grokCustomModel = UserDefaults.standard.string(forKey: "customModelGrok") ?? ""
+        groqCustomModel = UserDefaults.standard.string(forKey: "customModelGroq") ?? ""
+        zaiCustomModel = UserDefaults.standard.string(forKey: "customModelZAI") ?? ""
+        openAIBaseURL = UserDefaults.standard.string(forKey: "customBaseURLOpenAI") ?? ""
+        openAIServiceTier = UserDefaults.standard.string(forKey: "openAIServiceTier") ?? "auto"
+        openAIShowServiceTierVariants = UserDefaults.standard.bool(forKey: "openAIShowServiceTierVariants")
+
         includeDefaultOpenRouterModels = UserDefaults.standard.bool(forKey: "includeDefaultOpenRouterModels")
         openRouterConfig = ProviderConfigurationManager.shared.getOpenRouterConfiguration()
 
@@ -890,6 +904,7 @@ public class APISettingsViewModel: ObservableObject {
         }
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
+        isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
 
         if let customConfig = try? CustomProviderConfiguration.load() {
             if let version = customConfig.apiVersion, !version.isEmpty {

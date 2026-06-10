@@ -280,7 +280,7 @@ struct WorkspaceLandingView: View {
 
     @ViewBuilder
     private var classicRepoPromptImportButton: some View {
-        if ClassicRepoPromptImportService().sourceExists() {
+        if ClassicRepoPromptImportService().defaultClassicSourceExists() {
             Button {
                 runClassicRepoPromptImport()
             } label: {

@@ -508,6 +508,11 @@ public enum GitignoreCompiler {
         var hints = TraversalHints()
         for prefixLength in 1 ... limit {
             let prefixComponents = Array(components.prefix(prefixLength))
+            // A parent-less "**/file" negation should not force traversal into
+            // every ignored directory; deeper hints such as "**/logs" still matter.
+            if prefixComponents.count == 1, prefixComponents.first == "**" {
+                continue
+            }
             if let literalVariants = literalPrefixVariants(for: prefixComponents) {
                 for variant in literalVariants {
                     let prefix = variant.joined(separator: "/")

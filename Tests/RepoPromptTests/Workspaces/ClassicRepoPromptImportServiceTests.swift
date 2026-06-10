@@ -90,6 +90,78 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("AgentSessions/AgentSessionIndex.json").path))
     }
 
+    func testFullImportLeavesWorkspacePathNilWhenCETargetUsesGlobalCustomStorage() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = tempRoot.appendingPathComponent("CE Custom Workspaces", isDirectory: true)
+        let workspaceID = UUID()
+        let chatID = UUID()
+        let agentID = UUID()
+        let workspace = WorkspaceModel(
+            id: workspaceID,
+            name: "Custom CE Root",
+            repoPaths: ["/tmp/custom-ce-root"],
+            composeTabs: [
+                ComposeTabState(
+                    name: "Imported Tab",
+                    activeChatSessionID: chatID,
+                    activeAgentSessionID: agentID
+                )
+            ]
+        )
+
+        try writeClassicWorkspace(
+            workspace,
+            sourceRoot: sourceAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true),
+            chatID: chatID,
+            agentID: agentID
+        )
+
+        let result = try await ClassicRepoPromptImportService().importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot,
+            targetWorkspacesRootIsGlobalCustomStorage: true
+        )
+
+        XCTAssertEqual(result.importedCount, 1)
+        let targetDirectory = targetWorkspacesRoot.appendingPathComponent("Workspace-Custom CE Root-\(workspaceID.uuidString)", isDirectory: true)
+        let targetIndex = try readIndex(from: targetWorkspacesRoot)
+        XCTAssertNil(targetIndex.first?.customStoragePath)
+
+        let importedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+            at: targetDirectory.appendingPathComponent("workspace.json")
+        )
+        XCTAssertNil(importedWorkspace.customStoragePath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("Chats/ChatSession-\(chatID.uuidString).json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("AgentSessions/AgentSession-\(agentID.uuidString).json").path))
+    }
+
+    func testImportPinsWorkspacePathWhenNameCannotRoundTripThroughIndexPath() async throws {
+        let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
+        let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
+        let workspace = WorkspaceModel(id: UUID(), name: "Client/API", repoPaths: ["/tmp/client-api"])
+        try writeClassicWorkspace(workspace, sourceRoot: sourceRoot)
+
+        let result = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sourceRoot, targetRoot: targetRoot)
+
+        XCTAssertEqual(result.importedCount, 1)
+        let targetDirectory = targetRoot.appendingPathComponent("Workspace-Client_API-\(workspace.id.uuidString)", isDirectory: true)
+        let targetIndex = try readIndex(from: targetRoot)
+        XCTAssertEqual(targetIndex.first?.name, "Client/API")
+        XCTAssertEqual(targetIndex.first?.customStoragePath, targetDirectory)
+
+        let importedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+            at: targetDirectory.appendingPathComponent("workspace.json")
+        )
+        XCTAssertEqual(importedWorkspace.name, "Client/API")
+        XCTAssertEqual(importedWorkspace.customStoragePath, targetDirectory)
+    }
+
     func testImportIsIdempotentByWorkspaceID() async throws {
         let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
         let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
@@ -103,6 +175,178 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         XCTAssertEqual(second.importedCount, 0)
         XCTAssertEqual(second.skippedCount, 1)
         XCTAssertEqual(try readIndex(from: targetRoot).count, 1)
+    }
+
+    func testImportRepairsWorkspaceWhenSourceAndTargetRootsMatch() async throws {
+        let sharedRoot = tempRoot.appendingPathComponent("Shared Classic Workspaces", isDirectory: true)
+        let chatID = UUID()
+        let agentID = UUID()
+        let workspace = WorkspaceModel(
+            id: UUID(),
+            name: "Default",
+            repoPaths: ["/tmp/shared-classic"],
+            isSystemWorkspace: true,
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(
+                    name: "Imported Tab",
+                    activeChatSessionID: chatID,
+                    activeAgentSessionID: agentID
+                )
+            ]
+        )
+        try writeClassicWorkspace(
+            workspace,
+            sourceRoot: sharedRoot,
+            chatID: chatID,
+            agentID: agentID,
+            includeAgentIndex: true
+        )
+
+        let result = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sharedRoot, targetRoot: sharedRoot)
+
+        XCTAssertEqual(result.importedCount, 1)
+        let repairedIndex = try readIndex(from: sharedRoot)
+        XCTAssertEqual(repairedIndex.first?.name, "Default (Classic)")
+        XCTAssertEqual(repairedIndex.first?.isSystemWorkspace, false)
+        let repairedDirectory = sharedRoot.appendingPathComponent("Workspace-Default (Classic)-\(workspace.id.uuidString)", isDirectory: true)
+        let repairedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+            at: repairedDirectory.appendingPathComponent("workspace.json")
+        )
+        XCTAssertEqual(repairedWorkspace.name, "Default (Classic)")
+        XCTAssertFalse(repairedWorkspace.isSystemWorkspace)
+        XCTAssertFalse(repairedWorkspace.isEphemeral)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: repairedDirectory.appendingPathComponent("AgentSessions/AgentSessionIndex.json").path))
+    }
+
+    func testImportRepairsExistingTargetFolderMissingIndexEntry() async throws {
+        let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
+        let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
+        let workspace = WorkspaceModel(id: UUID(), name: "Recovered", repoPaths: ["/tmp/recovered"])
+        let chatID = UUID()
+        let agentID = UUID()
+        try writeClassicWorkspace(
+            workspace,
+            sourceRoot: sourceRoot,
+            chatID: chatID,
+            agentID: agentID,
+            includeAgentIndex: true
+        )
+
+        let targetDirectory = targetRoot.appendingPathComponent("Workspace-Recovered-\(workspace.id.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+        try JSONEncoder().encode(workspace).write(to: targetDirectory.appendingPathComponent("workspace.json"))
+
+        let result = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sourceRoot, targetRoot: targetRoot)
+
+        XCTAssertEqual(result.importedCount, 1)
+        XCTAssertEqual(result.failedCount, 0)
+        XCTAssertEqual(try readIndex(from: targetRoot).map(\.id), [workspace.id])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("Chats/ChatSession-\(chatID.uuidString).json").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("AgentSessions/AgentSession-\(agentID.uuidString).json").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: targetDirectory.appendingPathComponent("AgentSessions/AgentSessionIndex.json").path))
+    }
+
+    func testImportRepairsExistingTargetFolderWithNormalizedIndexName() async throws {
+        let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
+        let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
+        let workspace = WorkspaceModel(
+            id: UUID(),
+            name: "Default",
+            repoPaths: ["/tmp/recovered"],
+            isSystemWorkspace: true,
+            ephemeralFlag: true
+        )
+        try writeClassicWorkspace(workspace, sourceRoot: sourceRoot)
+
+        let targetDirectory = targetRoot.appendingPathComponent("Workspace-Default (Classic)-\(workspace.id.uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: targetDirectory, withIntermediateDirectories: true)
+        try JSONEncoder().encode(workspace).write(to: targetDirectory.appendingPathComponent("workspace.json"))
+
+        let result = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sourceRoot, targetRoot: targetRoot)
+
+        XCTAssertEqual(result.importedCount, 1)
+        XCTAssertEqual(try readIndex(from: targetRoot).first?.name, "Default (Classic)")
+
+        let recoveredWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(
+            at: targetDirectory.appendingPathComponent("workspace.json")
+        )
+        XCTAssertEqual(recoveredWorkspace.name, "Default (Classic)")
+        XCTAssertFalse(recoveredWorkspace.isSystemWorkspace)
+        XCTAssertFalse(recoveredWorkspace.isEphemeral)
+    }
+
+    func testImportFailsCorruptClassicWorkspaceIndex() async throws {
+        let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
+        let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
+        try Data("{".utf8).write(to: sourceRoot.appendingPathComponent("workspacesIndex.json"))
+
+        do {
+            _ = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sourceRoot, targetRoot: targetRoot)
+            XCTFail("Expected corrupt Classic workspace index to fail import")
+        } catch {
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+    }
+
+    func testFullImportContinuesAfterCorruptWorkspaceIndex() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = targetAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let sourceWorkspacesRoot = sourceAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceWorkspacesRoot, withIntermediateDirectories: true)
+        try Data("{".utf8).write(to: sourceWorkspacesRoot.appendingPathComponent("workspacesIndex.json"))
+        try writeDocument(
+            GlobalSettingsDocument(globalDefaults: GlobalDefaults(discoverAgentRaw: "codexExec")),
+            to: sourceAppSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        )
+
+        let result = try await ClassicRepoPromptImportService().importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot
+        )
+
+        XCTAssertEqual(result.failedCount, 1)
+        XCTAssertEqual(result.settings.importedCount, 1)
+        XCTAssertGreaterThan(result.totalFailedCount, 0)
+    }
+
+    func testFullImportUsesClassicGlobalCustomWorkspaceStorage() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = targetAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let classicCustomWorkspacesRoot = tempRoot.appendingPathComponent("Classic Custom Workspaces", isDirectory: true)
+        let workspace = WorkspaceModel(id: UUID(), name: "Custom Root Project", repoPaths: ["/tmp/custom-root"])
+        let sourcePreferences = InMemoryPreferences(values: [
+            "GlobalCustomStorageURL": classicCustomWorkspacesRoot.path
+        ])
+
+        try writeClassicWorkspace(workspace, sourceRoot: classicCustomWorkspacesRoot)
+
+        let service = ClassicRepoPromptImportService()
+        XCTAssertTrue(service.sourceExists(at: sourceAppSupportRoot, preferences: sourcePreferences))
+        XCTAssertFalse(service.sourceExists(at: sourceAppSupportRoot))
+
+        let result = try await service.importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot,
+            sourcePreferences: sourcePreferences
+        )
+
+        XCTAssertEqual(result.sourceRoot, classicCustomWorkspacesRoot)
+        XCTAssertEqual(result.importedCount, 1)
+        XCTAssertEqual(try readIndex(from: targetWorkspacesRoot).map(\.id), [workspace.id])
     }
 
     func testImportAppendsToExistingCEIndexWithoutOverwritingWorkspaces() async throws {
@@ -143,6 +387,31 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         let importedWorkspace = try WorkspaceManagerViewModel.loadWorkspaceFromFile(at: importedWorkspaceURL)
         XCTAssertEqual(importedWorkspace.id, workspace.id)
         XCTAssertEqual(importedWorkspace.repoPaths, ["/tmp/classic-extra"])
+    }
+
+    func testImportDecodesOlderClassicWorkspaceIndexMissingHiddenFlag() async throws {
+        let sourceRoot = tempRoot.appendingPathComponent("RepoPrompt/Workspaces", isDirectory: true)
+        let targetRoot = tempRoot.appendingPathComponent("RepoPrompt CE/Workspaces", isDirectory: true)
+        let workspace = WorkspaceModel(id: UUID(), name: "Legacy Index", repoPaths: ["/tmp/legacy-index"])
+        try writeClassicWorkspace(workspace, sourceRoot: sourceRoot)
+        let legacyIndex = """
+        [
+          {
+            "id": "\(workspace.id.uuidString)",
+            "name": "Legacy Index",
+            "customStoragePath": null,
+            "isSystemWorkspace": false
+          }
+        ]
+        """
+        try Data(legacyIndex.utf8).write(to: sourceRoot.appendingPathComponent("workspacesIndex.json"))
+
+        let result = try await ClassicRepoPromptImportService().importWorkspaces(sourceRoot: sourceRoot, targetRoot: targetRoot)
+
+        XCTAssertEqual(result.importedCount, 1)
+        let targetIndex = try readIndex(from: targetRoot)
+        XCTAssertEqual(targetIndex.first?.id, workspace.id)
+        XCTAssertEqual(targetIndex.first?.isHiddenInMenus, false)
     }
 
     func testImportSkipsMissingWorkspaceFile() async throws {
@@ -233,15 +502,32 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         let sourcePreferences = InMemoryPreferences(values: [
             "CodexCLIConnected": true,
             "ClaudeCodeConnected": true,
+            "ClaudeCodeCompatibleBackendConfigs": Data(#"{"kimi":{"displayName":"Classic Kimi"}}"#.utf8),
+            "ClaudeCodeCompatibleBackendConfigured.kimi": true,
+            "CustomProviderConfig": Data(#"{"url":"https://classic.example","defaultModel":"classic-model"}"#.utf8),
+            "openrouter_configuration": Data(#"{"useCustomSettings":false}"#.utf8),
+            "provider_config_openAI": Data(#"{"temperature":0.7}"#.utf8),
+            "CustomOpenRouterModels": ["classic-router", "existing-router"],
+            "OllamaLocalModels": ["classic-ollama"],
             "agentMode.lastUsedAgent": "codexExec",
             "agentMode.lastUsedModelsByAgent": ["codexExec": "gpt-5"],
             "AgentWorkflowStore.featuredWorkflowIDs": ["custom-\(workflowID.uuidString)"],
+            "codexAgentTools.mcpServerToggles": ["classic": true],
             "codexAgentTools.bash.sandboxMode": "danger-full-access",
+            "codexAgent.reasoning.lastUsedEffortByModelSlug": ["gpt-5": "medium"],
             "claudeCodePermissionMode": "acceptEdits",
             "cursorACPToolPermissionLevel": "fullAccess"
         ])
         let targetPreferences = InMemoryPreferences(values: [
-            "ClaudeCodeConnected": false
+            "ClaudeCodeConnected": false,
+            "ClaudeCodeCompatibleBackendConfigs": Data(#"{"custom":{"displayName":"Existing Custom"}}"#.utf8),
+            "openrouter_configuration": Data(#"{"baseConfig":{},"customHeaders":{},"useCustomSettings":true}"#.utf8),
+            "provider_config_openAI": Data(#"{"maxTokens":1000}"#.utf8),
+            "CustomOpenRouterModels": ["existing-router"],
+            "agentMode.lastUsedModelsByAgent": ["engineer": "claude-sonnet"],
+            "AgentWorkflowStore.featuredWorkflowIDs": ["ce-default-1", "ce-default-2", "ce-default-3", "ce-default-4"],
+            "codexAgentTools.mcpServerToggles": ["existing": false],
+            "codexAgent.reasoning.lastUsedEffortByModelSlug": ["o3": "high"]
         ])
 
         let sourceSecureStore = InMemorySecureStore(values: [
@@ -317,10 +603,56 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
 
         XCTAssertEqual(targetPreferences.object(forKey: "CodexCLIConnected") as? Bool, true)
         XCTAssertEqual(targetPreferences.object(forKey: "ClaudeCodeConnected") as? Bool, false)
+        let mergedBackendConfigsData = try XCTUnwrap(
+            targetPreferences.object(forKey: "ClaudeCodeCompatibleBackendConfigs") as? Data
+        )
+        let mergedBackendConfigs = try JSONDecoder().decode([String: ClaudeCodeCompatibleBackendConfig].self, from: mergedBackendConfigsData)
+        XCTAssertNotNil(mergedBackendConfigs["custom"])
+        XCTAssertEqual(mergedBackendConfigs["kimi"]?.displayName, "Classic Kimi")
+        XCTAssertEqual(mergedBackendConfigs["kimi"]?.baseURL, "https://api.kimi.com/coding/")
+        XCTAssertEqual(targetPreferences.object(forKey: "ClaudeCodeCompatibleBackendConfigured.kimi") as? Bool, true)
+        let customProviderConfigData = try XCTUnwrap(targetPreferences.object(forKey: "CustomProviderConfig") as? Data)
+        let customProviderConfig = try JSONDecoder().decode(CustomProviderConfiguration.self, from: customProviderConfigData)
+        XCTAssertEqual(customProviderConfig.url, "https://classic.example")
+        XCTAssertEqual(customProviderConfig.defaultModel, "classic-model")
+        XCTAssertEqual(customProviderConfig.name, "Classic Custom Provider")
+        XCTAssertTrue(customProviderConfig.enabledModels.contains("classic-model"))
+        let openRouterConfigData = try XCTUnwrap(targetPreferences.object(forKey: "openrouter_configuration") as? Data)
+        let openRouterConfig = try JSONDecoder().decode(OpenRouterConfiguration.self, from: openRouterConfigData)
+        XCTAssertEqual(openRouterConfig.useCustomSettings, false)
+        XCTAssertEqual(openRouterConfig.customHeaders, [:])
+        XCTAssertEqual(openRouterConfig.baseConfig.maxTokens, nil)
+        XCTAssertEqual(openRouterConfig.baseConfig.temperature, nil)
+        let mergedOpenAIConfigData = try XCTUnwrap(targetPreferences.object(forKey: "provider_config_openAI") as? Data)
+        let mergedOpenAIConfig = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: mergedOpenAIConfigData) as? [String: Any]
+        )
+        XCTAssertEqual(mergedOpenAIConfig["temperature"] as? Double, 0.7)
+        XCTAssertEqual(mergedOpenAIConfig["maxTokens"] as? Int, 1000)
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "CustomOpenRouterModels") as? [String],
+            ["existing-router", "classic-router"]
+        )
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "OllamaLocalModels") as? [String],
+            ["classic-ollama"]
+        )
         XCTAssertEqual(targetPreferences.object(forKey: "agentMode.lastUsedAgent") as? String, "codexExec")
         XCTAssertEqual(
             targetPreferences.object(forKey: "agentMode.lastUsedModelsByAgent") as? [String: String],
-            ["codexExec": "gpt-5"]
+            ["engineer": "claude-sonnet", "codexExec": "gpt-5"]
+        )
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "AgentWorkflowStore.featuredWorkflowIDs") as? [String],
+            ["custom-\(workflowID.uuidString)", "ce-default-1", "ce-default-2", "ce-default-3", "ce-default-4"]
+        )
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "codexAgentTools.mcpServerToggles") as? [String: Bool],
+            ["existing": false, "classic": true]
+        )
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "codexAgent.reasoning.lastUsedEffortByModelSlug") as? [String: String],
+            ["o3": "high", "gpt-5": "medium"]
         )
         XCTAssertEqual(targetPreferences.object(forKey: "codexAgentTools.bash.sandboxMode") as? String, "danger-full-access")
         XCTAssertEqual(targetPreferences.object(forKey: "claudeCodePermissionMode") as? String, "acceptEdits")
@@ -333,6 +665,57 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
             #"{"schemaVersion":1}"#
         )
         XCTAssertEqual(try targetSecureStore.get(for: SecureStorageAccount.anthropicAPI.identifier, accessMode: .interactive), "existing-ce-key")
+    }
+
+    func testWorkflowPresetMetadataSkipsPresetsRejectedByName() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = targetAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let sourceCopyID = UUID()
+        let targetCopyID = UUID()
+        let sourceChatID = UUID()
+        let targetChatID = UUID()
+
+        let sourcePresets = PresetFileStore.WorkflowPresetDocument(
+            copyUserPresets: [CopyPreset(id: sourceCopyID, name: "Shared Copy")],
+            copyVisibility: [sourceCopyID: true],
+            copyOverrides: [CopyPresetOverrides(presetID: sourceCopyID, includeFiles: true)],
+            chatUserPresets: [ChatPreset(id: sourceChatID, name: "Shared Chat", mode: .chat)],
+            chatVisibility: [sourceChatID: true],
+            chatOverrides: [ChatPresetOverrides.empty(for: sourceChatID)]
+        )
+        let targetPresets = PresetFileStore.WorkflowPresetDocument(
+            copyUserPresets: [CopyPreset(id: targetCopyID, name: "Shared Copy")],
+            chatUserPresets: [ChatPreset(id: targetChatID, name: "Shared Chat", mode: .chat)]
+        )
+        try writeDocument(sourcePresets, to: sourceAppSupportRoot.appendingPathComponent("Presets/workflowPresets.json"))
+        try writeDocument(targetPresets, to: targetAppSupportRoot.appendingPathComponent("Presets/workflowPresets.json"))
+
+        let result = try await ClassicRepoPromptImportService().importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot,
+            sourceSecureValueReader: nil,
+            targetSecureStore: nil,
+            sourcePreferences: nil,
+            targetPreferences: nil
+        )
+
+        XCTAssertEqual(result.workflowPresets.importedCount, 0)
+        let mergedPresets = try documentDecoder.decode(
+            PresetFileStore.WorkflowPresetDocument.self,
+            from: Data(contentsOf: targetAppSupportRoot.appendingPathComponent("Presets/workflowPresets.json"))
+        )
+        XCTAssertEqual(mergedPresets.copyUserPresets.map(\.id), [targetCopyID])
+        XCTAssertEqual(mergedPresets.chatUserPresets.map(\.id), [targetChatID])
+        XCTAssertTrue(mergedPresets.copyOverrides.isEmpty)
+        XCTAssertTrue(mergedPresets.chatOverrides.isEmpty)
+        XCTAssertTrue(mergedPresets.copyVisibilityByPresetID.isEmpty)
+        XCTAssertTrue(mergedPresets.chatVisibilityByPresetID.isEmpty)
     }
 
     func testImportWithoutSecureStoresMigratesConfigWithoutKeychainAccess() async throws {
@@ -387,6 +770,50 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         )
     }
 
+    func testImportCanRunForPreferenceOnlyClassicSource() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = targetAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let sourcePreferences = InMemoryPreferences(values: [
+            "CodexCLIConnected": true,
+            "ClaudeCodeConnected": true,
+            "OpenCodeCLIConnected": true,
+            "agentMode.lastUsedAgent": "codexExec",
+            "agentMode.lastUsedModelsByAgent": ["engineer": "gpt-5"]
+        ])
+        let targetPreferences = InMemoryPreferences()
+        let service = ClassicRepoPromptImportService()
+
+        XCTAssertFalse(service.sourceExists(at: sourceAppSupportRoot))
+        XCTAssertTrue(service.sourceExists(at: sourceAppSupportRoot, preferences: sourcePreferences))
+
+        let result = try await service.importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot,
+            sourceSecureValueReader: nil,
+            targetSecureStore: nil,
+            sourcePreferences: sourcePreferences,
+            targetPreferences: targetPreferences
+        )
+
+        XCTAssertEqual(result.importedCount, 0)
+        XCTAssertEqual(result.preferences.importedCount, 5)
+        XCTAssertEqual(result.secureAccounts.importedCount, 0)
+        XCTAssertEqual(targetPreferences.object(forKey: "CodexCLIConnected") as? Bool, true)
+        XCTAssertEqual(targetPreferences.object(forKey: "ClaudeCodeConnected") as? Bool, true)
+        XCTAssertEqual(targetPreferences.object(forKey: "OpenCodeCLIConnected") as? Bool, true)
+        XCTAssertEqual(targetPreferences.object(forKey: "agentMode.lastUsedAgent") as? String, "codexExec")
+        XCTAssertEqual(
+            targetPreferences.object(forKey: "agentMode.lastUsedModelsByAgent") as? [String: String],
+            ["engineer": "gpt-5"]
+        )
+    }
+
     func testSourceExistsRequiresClassicAppSupportDataNotOnlySharedPrompts() throws {
         let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
         XCTAssertFalse(ClassicRepoPromptImportService().sourceExists(at: sourceAppSupportRoot))
@@ -436,6 +863,28 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         XCTAssertFalse(summary.contains("Failed 1 item: Classic workflow presets were already present."))
     }
 
+    func testSectionFailureSummaryIncludesImportError() async throws {
+        let sourceAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt", isDirectory: true)
+        let targetAppSupportRoot = tempRoot.appendingPathComponent("RepoPrompt CE", isDirectory: true)
+        let sourcePromptRoot = tempRoot.appendingPathComponent("ClassicPromptSupport", isDirectory: true)
+        let targetPromptRoot = tempRoot.appendingPathComponent("CEPromptSupport", isDirectory: true)
+        let targetWorkspacesRoot = targetAppSupportRoot.appendingPathComponent("Workspaces", isDirectory: true)
+        let settingsURL = sourceAppSupportRoot.appendingPathComponent("Settings/globalSettings.json")
+        try FileManager.default.createDirectory(at: settingsURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("{".utf8).write(to: settingsURL)
+
+        let result = try await ClassicRepoPromptImportService().importClassicRepoPromptData(
+            sourceAppSupportRoot: sourceAppSupportRoot,
+            targetAppSupportRoot: targetAppSupportRoot,
+            sourcePromptSupportRoot: sourcePromptRoot,
+            targetPromptSupportRoot: targetPromptRoot,
+            targetWorkspacesRoot: targetWorkspacesRoot
+        )
+
+        XCTAssertEqual(result.settings.failedCount, 1)
+        XCTAssertTrue(result.userFacingSummary().contains("Failed 1 item: Settings import failed:"))
+    }
+
     private func writeClassicWorkspace(
         _ workspace: WorkspaceModel,
         sourceRoot: URL,
@@ -445,7 +894,7 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
         includeClassicOnlyFields: Bool = false
     ) throws {
         try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
-        let workspaceDirectory = sourceRoot.appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)", isDirectory: true)
+        let workspaceDirectory = sourceRoot.appendingPathComponent(workspaceDirectoryName(for: workspace), isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
         var workspaceData = try JSONEncoder().encode(workspace)
         if includeClassicOnlyFields {
@@ -502,7 +951,7 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
 
     private func writeCEWorkspace(_ workspace: WorkspaceModel, targetRoot: URL) throws {
         try FileManager.default.createDirectory(at: targetRoot, withIntermediateDirectories: true)
-        let workspaceDirectory = targetRoot.appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)", isDirectory: true)
+        let workspaceDirectory = targetRoot.appendingPathComponent(workspaceDirectoryName(for: workspace), isDirectory: true)
         try FileManager.default.createDirectory(at: workspaceDirectory, withIntermediateDirectories: true)
         try JSONEncoder().encode(workspace).write(to: workspaceDirectory.appendingPathComponent("workspace.json"))
         try writeIndex(
@@ -530,6 +979,13 @@ final class ClassicRepoPromptImportServiceTests: XCTestCase {
             return []
         }
         return try JSONDecoder().decode([WorkspaceIndexEntry].self, from: Data(contentsOf: url))
+    }
+
+    private func workspaceDirectoryName(for workspace: WorkspaceModel) -> String {
+        let safeName = workspace.name
+            .replacingOccurrences(of: "/", with: "_")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return "Workspace-\(safeName)-\(workspace.id.uuidString)"
     }
 
     private func writeDocument(_ document: some Encodable, to url: URL) throws {
@@ -575,8 +1031,7 @@ private final class InMemoryPreferences: ClassicRepoPromptPreferences, @unchecke
     }
 }
 
-private final class InMemorySecureStore: SecureKeyValueStorageBackend, ClassicRepoPromptSecureValueReading, @unchecked Sendable {
-    let persistsValuesAcrossLaunches = true
+private final class InMemorySecureStore: ClassicRepoPromptSecureValueReading, ClassicRepoPromptSecureValueWriting, @unchecked Sendable {
     private var values: [String: String]
     private let lock = NSLock()
 
@@ -597,6 +1052,18 @@ private final class InMemorySecureStore: SecureKeyValueStorageBackend, ClassicRe
             throw KeychainService.KeychainError.itemNotFound
         }
         return value
+    }
+
+    func savePlainValue(_ value: String, for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws {
+        try save(value, for: account.identifier, accessMode: accessMode)
+    }
+
+    func getPlainValue(for account: SecureStorageAccount, accessMode: KeychainAccessMode) throws -> String? {
+        do {
+            return try get(for: account.identifier, accessMode: accessMode)
+        } catch KeychainService.KeychainError.itemNotFound {
+            return nil
+        }
     }
 
     func delete(for key: String, accessMode: KeychainAccessMode) throws {

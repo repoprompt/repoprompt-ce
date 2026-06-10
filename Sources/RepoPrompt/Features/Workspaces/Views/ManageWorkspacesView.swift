@@ -235,7 +235,7 @@ struct ManageWorkspacesView: View {
     }
 
     private var classicRepoPromptSourceExists: Bool {
-        ClassicRepoPromptImportService().sourceExists()
+        ClassicRepoPromptImportService().defaultClassicSourceExists()
     }
 
     private func runClassicRepoPromptImport() {
