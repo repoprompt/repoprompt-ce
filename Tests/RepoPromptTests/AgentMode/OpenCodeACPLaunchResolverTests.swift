@@ -77,7 +77,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let openCodeHomeBin = "~/.opencode/bin"
 
         XCTAssertEqual(CLILaunchProfiles.openCodeProviderSpecificPaths, [openCodeHomeBin])
-        XCTAssertTrue(CLILaunchProfiles.openCode.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertEqual(CLILaunchProfiles.openCode.supplementalSearchPaths.first, openCodeHomeBin)
         XCTAssertFalse(CLINativePathDefaults.defaultAdditionalPaths.contains(openCodeHomeBin))
         XCTAssertFalse(CLILaunchProfiles.claudeCode.supplementalSearchPaths.contains(openCodeHomeBin))
         XCTAssertFalse(CLILaunchProfiles.codex.supplementalSearchPaths.contains(openCodeHomeBin))
