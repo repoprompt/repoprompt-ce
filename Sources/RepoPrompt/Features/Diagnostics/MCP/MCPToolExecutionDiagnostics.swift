@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 
 struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     enum Phase: String {
@@ -81,10 +82,8 @@ enum MCPToolExecutionTracer {
         sink?(event)
 
         guard event.isAlwaysEmitted || successTracingEnabled else { return }
-        guard let data = "[MCPToolExecution] \(event)\n".data(using: .utf8) else { return }
-        state.lock.lock()
-        FileHandle.standardError.write(data)
-        state.lock.unlock()
+        let data = Data("[MCPToolExecution] \(event)\n".utf8)
+        MCPBestEffortRawFDWriter.write(data)
     }
 
     #if DEBUG

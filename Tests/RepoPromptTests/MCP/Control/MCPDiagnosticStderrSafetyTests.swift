@@ -11,6 +11,7 @@ final class MCPDiagnosticStderrSafetyTests: XCTestCase {
     func testMCPDiagnosticStderrPathsUseBestEffortRawFDWriter() throws {
         let rootURL = try RepoRoot.url()
         let diagnosticSourcePaths = [
+            "Sources/RepoPrompt/Features/Diagnostics/MCP/MCPToolExecutionDiagnostics.swift",
             "Sources/RepoPromptShared/MCP/JSONRPCBridgeLedger.swift",
             "Sources/RepoPromptMCP/main.swift"
         ]
