@@ -33,6 +33,10 @@ import XCTest
                 Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
             )
             XCTAssertEqual(
+                MCPToolDurationInventory.workspaceSwitchExecutionDeadlineSeconds,
+                Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds)
+            )
+            XCTAssertEqual(
                 MCPToolDurationInventory.preservedLongSynchronousToolNames,
                 [
                     MCPWindowToolName.search,
@@ -90,6 +94,35 @@ import XCTest
                 manageWorktree?.semanticWaitMaximumSeconds,
                 MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds
             )
+            let manageWorkspaces = try? XCTUnwrap(MCPToolDurationInventory.entries.first {
+                $0.toolName == MCPGlobalToolName.manageWorkspaces
+            })
+            XCTAssertEqual(manageWorkspaces?.contractKind, .workspaceLifecycleCancellable)
+            XCTAssertNil(manageWorkspaces?.executionDeadlineSeconds)
+            XCTAssertNil(manageWorkspaces?.cleanupGraceSeconds)
+            XCTAssertEqual(
+                manageWorkspaces?.conditionalExecutionOverrides,
+                [
+                    .init(
+                        action: "switch",
+                        condition: "always",
+                        executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
+                        cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                    ),
+                    .init(
+                        action: "create",
+                        condition: "switch_to_created != false (handler default)",
+                        executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
+                        cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                    ),
+                    .init(
+                        action: "delete",
+                        condition: "close_window == true",
+                        executionDeadlineSeconds: Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds),
+                        cleanupGraceSeconds: Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                    )
+                ]
+            )
             for toolName in [
                 MCPWindowToolName.askUser,
                 MCPWindowToolName.waitForNextInstruction,
@@ -129,6 +162,10 @@ import XCTest
                 (payload["bounded_cleanup_grace_seconds"] as? NSNumber)?.intValue,
                 MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds
             )
+            XCTAssertEqual(
+                (payload["workspace_switch_execution_deadline_seconds"] as? NSNumber)?.intValue,
+                MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds
+            )
             XCTAssertEqual(payload["timeout_scope"] as? String, "per_mcp_server")
             XCTAssertEqual(payload["per_tool_timeout_overrides_supported"] as? Bool, false)
             XCTAssertEqual(payload["intentional_phase_b3_deviation"] as? Bool, true)
@@ -154,7 +191,28 @@ import XCTest
                     MCPWindowToolName.manageWorktree
                 ]
             )
-            XCTAssertEqual((payload["tools"] as? [[String: Any]])?.count, 26)
+            let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]])
+            XCTAssertEqual(tools.count, 26)
+            let manageWorkspaces = try XCTUnwrap(tools.first {
+                $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
+            })
+            XCTAssertEqual(
+                manageWorkspaces["execution_contract"] as? String,
+                MCPToolExecutionContract.Kind.workspaceLifecycleCancellable.rawValue
+            )
+            XCTAssertNil(manageWorkspaces["execution_deadline_seconds"])
+            let conditionalOverrides = try XCTUnwrap(
+                manageWorkspaces["conditional_execution_overrides"] as? [[String: Any]]
+            )
+            XCTAssertEqual(conditionalOverrides.map { $0["action"] as? String }, ["switch", "create", "delete"])
+            XCTAssertEqual(
+                conditionalOverrides.map { ($0["execution_deadline_seconds"] as? NSNumber)?.intValue },
+                [120, 120, 120]
+            )
+            XCTAssertEqual(
+                conditionalOverrides.map { $0["condition"] as? String },
+                ["always", "switch_to_created != false (handler default)", "close_window == true"]
+            )
 
             for forbiddenKey in [
                 "prompt_text",

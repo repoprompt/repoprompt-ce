@@ -325,6 +325,7 @@ import MCP
         ) async -> CallTool.Result {
             let includeIdentity = debugBool(arguments, "include_identity") ?? false
             let snapshot = await dashboardSnapshot()
+            let activeToolScopes = debugActiveToolScopesForTesting()
             var payload: [String: Any] = [
                 "ok": true,
                 "op": op,
@@ -338,8 +339,26 @@ import MCP
                         "transport": entry.transport.rawValue,
                         "has_in_flight_calls": entry.hasInFlightCalls,
                         "active_tool_name": entry.activeToolName ?? NSNull(),
+                        "active_tool_window_id": entry.activeToolWindowID.map { $0 as Any } ?? NSNull(),
+                        "active_tool_scope_count": entry.activeToolScopeCount,
+                        "active_tool_scopes": entry.activeToolScopes.map { scope in
+                            [
+                                "window_id": scope.windowID,
+                                "tool_name": scope.toolName,
+                                "sequence": scope.sequence
+                            ] as [String: Any]
+                        },
                         "session_key_present": entry.sessionKey != nil,
                         "session_fingerprint": debugSessionFingerprint(forToken: entry.sessionKey) ?? NSNull()
+                    ] as [String: Any]
+                },
+                "active_tool_scopes": activeToolScopes.map { scope in
+                    [
+                        "scope_id": scope.scopeID.uuidString,
+                        "window_id": scope.windowID,
+                        "connection_id": scope.connectionID.uuidString,
+                        "tool_name": scope.toolName,
+                        "sequence": scope.sequence
                     ] as [String: Any]
                 }
             ]
@@ -456,11 +475,11 @@ import MCP
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "marker is required and must be <= 128 characters.")
             }
 
-            let didSeed = await MainActor.run { () -> Bool in
+            let slotToken = await MainActor.run { () -> UUID? in
                 guard let window = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }) else {
-                    return false
+                    return nil
                 }
-                window.mcpServer.test_setActiveToolSlot(
+                return window.mcpServer.test_setActiveToolSlot(
                     toolName: toolName,
                     connectionID: targetID,
                     cancel: {
@@ -469,18 +488,29 @@ import MCP
                         }
                     }
                 )
-                return true
             }
-            guard didSeed else {
+            guard let slotToken else {
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "No window found for window_id \(windowID).")
             }
-            debugMarkActiveToolOwner(windowID: windowID, connectionID: targetID, toolName: toolName)
+            guard let scopeID = debugBeginActiveToolScopeForTesting(
+                windowID: windowID,
+                connectionID: targetID,
+                toolName: toolName,
+                scopeID: slotToken
+            ) else {
+                await MainActor.run {
+                    guard let window = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }) else { return }
+                    window.mcpServer.test_clearActiveToolSlot(ifToken: slotToken)
+                }
+                return debugDiagnosticsError(op: op, code: "internal_error", message: "Unable to allocate an active-tool scope.")
+            }
             return debugDiagnosticsResult([
                 "ok": true,
                 "op": op,
                 "window_id": windowID,
                 "connection_id": targetID.uuidString,
                 "tool_name": toolName,
+                "scope_id": scopeID.uuidString,
                 "marker": marker
             ])
         }
@@ -520,20 +550,44 @@ import MCP
             guard let markers = debugStringArray(arguments, "markers", op: op) else {
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "markers must be a string or an array of strings.")
             }
+            let scopeID: UUID?
+            if let scopeIDString = debugString(arguments, "scope_id") {
+                guard let parsedScopeID = UUID(uuidString: scopeIDString) else {
+                    return debugDiagnosticsError(op: op, code: "invalid_params", message: "scope_id must be a UUID string.")
+                }
+                scopeID = parsedScopeID
+            } else {
+                scopeID = nil
+            }
             let didFindWindow = await MainActor.run { () -> Bool in
                 guard let window = WindowStatesManager.shared.allWindows.first(where: { $0.windowID == windowID }) else {
                     return false
                 }
-                window.mcpServer.test_clearActiveToolSlot()
+                if let scopeID {
+                    _ = window.mcpServer.test_clearActiveToolSlot(ifToken: scopeID)
+                } else {
+                    window.mcpServer.test_clearActiveToolSlot()
+                }
                 return true
             }
-            debugClearActiveToolOwner(windowID: windowID)
+            let removedScopeCount: Int
+            if let scopeID {
+                removedScopeCount = debugEndActiveToolScopeForTesting(
+                    windowID: windowID,
+                    scopeID: scopeID
+                ) ? 1 : 0
+            } else {
+                let beforeCount = debugActiveToolScopesForTesting().count
+                debugClearActiveToolOwner(windowID: windowID)
+                removedScopeCount = beforeCount - debugActiveToolScopesForTesting().count
+            }
             await MCPDebugDiagnosticsProbeStore.shared.clear(markers: markers)
             return debugDiagnosticsResult([
                 "ok": true,
                 "op": op,
                 "window_id": windowID,
-                "window_found": didFindWindow
+                "window_found": didFindWindow,
+                "removed_scope_count": removedScopeCount
             ])
         }
 

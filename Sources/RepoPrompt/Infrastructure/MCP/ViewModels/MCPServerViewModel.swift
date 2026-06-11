@@ -14,6 +14,32 @@ import MCP
 import Ontology
 import RepoPromptShared
 
+private actor MCPRunToolStartGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            if isOpen {
+                continuation.resume()
+            } else {
+                waiters.append(continuation)
+            }
+        }
+    }
+
+    func open() {
+        guard !isOpen else { return }
+        isOpen = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending {
+            waiter.resume()
+        }
+    }
+}
+
 private final class MCPRunToolCleanupClaim: @unchecked Sendable {
     private let lock = NSLock()
     private var claimed = false
@@ -454,20 +480,14 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
-    /// Returns the active tool name for this window, based on dashboard ownership when available.
+    /// Returns the newest active tool name for this exact window.
     @MainActor
     var windowActiveToolName: String? {
-        if let dashboard {
-            let allowNilWindow = !isMultiWindowModeEffectivelyActive
-            for connection in dashboard.connections {
-                if connection.windowID == windowID || (allowNilWindow && connection.windowID == nil) {
-                    if let toolName = connection.activeToolName {
-                        return toolName
-                    }
-                }
-            }
-        }
-        return activeToolName
+        let dashboardScope = dashboard?.connections
+            .flatMap(\.activeToolScopes)
+            .filter { $0.windowID == windowID }
+            .max(by: { $0.sequence < $1.sequence })
+        return dashboardScope?.toolName ?? activeToolName
     }
 
     /// True when any tool is actively running for this window.
@@ -941,11 +961,13 @@ final class MCPServerViewModel: ObservableObject {
             }
         }
         let liveConnectionCount = liveConnections.count
-        var activeExecutionCount = liveConnections.reduce(into: 0) { partialResult, connection in
-            if connection.hasInFlightCalls {
-                partialResult += 1
-            }
-        }
+        let dashboardActiveExecutionCount = dashboard?.connections.reduce(into: 0) { count, connection in
+            count += connection.activeToolScopes.count(where: { $0.windowID == windowID })
+        } ?? 0
+        var activeExecutionCount = max(
+            activeToolExecutionsByID.count,
+            dashboardActiveExecutionCount
+        )
         let activeTool = windowActiveToolName
         if activeExecutionCount == 0, activeTool != nil {
             activeExecutionCount = 1
@@ -962,12 +984,13 @@ final class MCPServerViewModel: ObservableObject {
 
     // MARK: - - Cancellation support
 
-    /// Per-run active tool execution tracking — supports multiple concurrent tool calls per run.
+    /// Token-primary active tool execution tracking. Run ID is a secondary index;
+    /// executions remain connection-owned and cancellable even when no run resolves.
     @MainActor
     private struct ActiveToolExecution {
         let executionID: UUID
-        let runID: UUID
-        let connectionID: UUID
+        let runID: UUID?
+        let connectionID: UUID?
         let toolName: String
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let startedAt: Date
@@ -975,9 +998,11 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     @MainActor
-    private var activeToolExecutionsByRunID: [UUID: [UUID: ActiveToolExecution]] = [:]
+    private var activeToolExecutionsByID: [UUID: ActiveToolExecution] = [:]
     @MainActor
-    private var runIDByToolExecutionID: [UUID: UUID] = [:]
+    private var activeToolExecutionIDsByRunID: [UUID: Set<UUID>] = [:]
+    @MainActor
+    private var activeToolExecutionIDsByConnectionID: [UUID: Set<UUID>] = [:]
 
     @MainActor
     private struct AgentRunWaitScope {
@@ -1008,9 +1033,9 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     private func debugActiveTools(for runID: UUID) -> String {
-        let executions = activeToolExecutionsByRunID[runID] ?? [:]
-        guard !executions.isEmpty else { return "none" }
-        return executions.values
+        let executionIDs = activeToolExecutionIDsByRunID[runID] ?? []
+        guard !executionIDs.isEmpty else { return "none" }
+        return executionIDs.compactMap { activeToolExecutionsByID[$0] }
             .map { "\($0.toolName)#\(String($0.executionID.uuidString.prefix(8)))" }
             .sorted()
             .joined(separator: ",")
@@ -1022,10 +1047,8 @@ final class MCPServerViewModel: ObservableObject {
 
     @MainActor
     func cancelActiveTool() {
-        // Prefer cancellation via the per-run registry if the active token is tracked
         if let token = activeToolToken,
-           let runID = runIDByToolExecutionID[token],
-           activeToolExecutionsByRunID[runID]?[token] != nil
+           activeToolExecutionsByID[token] != nil
         {
             cancelToolExecution(executionID: token, reason: "cancelActiveTool")
         } else {
@@ -1049,34 +1072,19 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func cancelActiveToolsForRun(runID: UUID, reason: String? = nil) -> Int {
-        guard let executions = activeToolExecutionsByRunID.removeValue(forKey: runID) else {
-            // Even if there are no active tools, resume any waiters so
-            // steering flush tasks unblock and can observe cancellation.
+        let executionIDs = activeToolExecutionIDsByRunID[runID] ?? []
+        guard !executionIDs.isEmpty else {
             resumeAllToolIdleWaiters(forRunID: runID)
             toolEndedCountByRunID.removeValue(forKey: runID)
             return 0
         }
+
         var cancelledCount = 0
-        for (executionID, execution) in executions {
-            execution.cancel()
-            EditFlowPerf.lifecycleEvent(
-                EditFlowPerf.Lifecycle.MCPRunTool.unregister,
-                correlation: execution.lifecycleCorrelation,
-                EditFlowPerf.Dimensions(toolName: execution.toolName, outcome: "cancelled")
-            )
-            runIDByToolExecutionID.removeValue(forKey: executionID)
-            cancelledCount += 1
+        for executionID in executionIDs {
+            if cancelToolExecution(executionID: executionID, reason: reason) {
+                cancelledCount += 1
+            }
         }
-        // Clear single-slot UI state if it was pointing at one of the cancelled executions
-        if let token = activeToolToken, executions[token] != nil {
-            clearActiveToolSlot()
-        }
-        // Resume any steering idle-waiters since the run's tools are now gone
-        resumeAllToolIdleWaiters(
-            forRunID: runID,
-            lifecycleCorrelation: executions.values.lazy.compactMap(\.lifecycleCorrelation).first
-        )
-        // Clean up the ended-count tracker for this run since it's being torn down.
         toolEndedCountByRunID.removeValue(forKey: runID)
         return cancelledCount
     }
@@ -1087,12 +1095,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     func cancelActiveToolsForConnection(connectionID: UUID, reason: String? = nil) -> Int {
-        let matchingExecutionIDs = activeToolExecutionsByRunID.values.flatMap { executions in
-            executions.values.compactMap { execution in
-                execution.connectionID == connectionID ? execution.executionID : nil
-            }
-        }
-        let matchingExecutionIDSet = Set(matchingExecutionIDs)
+        let matchingExecutionIDs = activeToolExecutionIDsByConnectionID[connectionID] ?? []
         let activeTokenBeforeCancellation = activeToolToken
 
         var cancelledCount = 0
@@ -1102,19 +1105,18 @@ final class MCPServerViewModel: ObservableObject {
             }
         }
 
-        guard activeToolConnectionID == connectionID else {
-            return cancelledCount
-        }
-
         if let activeTokenBeforeCancellation,
-           matchingExecutionIDSet.contains(activeTokenBeforeCancellation)
+           matchingExecutionIDs.contains(activeTokenBeforeCancellation)
         {
             clearActiveToolSlot()
             return cancelledCount
         }
 
-        // Legacy single-slot fallback for work that predates or bypasses the per-run registry.
-        // Only the recorded owning connection may cancel this slot.
+        guard activeToolConnectionID == connectionID else {
+            return cancelledCount
+        }
+
+        // Legacy single-slot fallback for work that predates or bypasses the token registry.
         if activeToolName != nil || cancelCurrentTool != nil || activeToolToken != nil {
             let legacyCancel = cancelCurrentTool
             legacyCancel?()
@@ -1130,8 +1132,8 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private func registerToolExecution(
         executionID: UUID,
-        runID: UUID,
-        connectionID: UUID,
+        runID: UUID?,
+        connectionID: UUID?,
         toolName: String,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         cancel: @escaping () -> Void
@@ -1145,34 +1147,55 @@ final class MCPServerViewModel: ObservableObject {
             startedAt: Date(),
             cancel: cancel
         )
-        activeToolExecutionsByRunID[runID, default: [:]][executionID] = execution
-        runIDByToolExecutionID[executionID] = runID
-        steeringDebugLog("[AgentRunSteeringWake] MCP tool register runID=\(runID) executionID=\(executionID) tool=\(toolName) active=\(debugActiveTools(for: runID))")
+        activeToolExecutionsByID[executionID] = execution
+        if let runID {
+            activeToolExecutionIDsByRunID[runID, default: []].insert(executionID)
+            steeringDebugLog("[AgentRunSteeringWake] MCP tool register runID=\(runID) executionID=\(executionID) tool=\(toolName) active=\(debugActiveTools(for: runID))")
+        }
+        if let connectionID {
+            activeToolExecutionIDsByConnectionID[connectionID, default: []].insert(executionID)
+        }
+        recomputeCloseSafetyState()
     }
 
     @MainActor
-    private func unregisterToolExecution(executionID: UUID) {
-        guard let runID = runIDByToolExecutionID.removeValue(forKey: executionID) else {
-            steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister ignored missing runID executionID=\(executionID)")
+    private func unregisterToolExecution(
+        executionID: UUID,
+        countAsEnded: Bool = true
+    ) {
+        guard let execution = activeToolExecutionsByID.removeValue(forKey: executionID) else {
+            steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister ignored missing executionID=\(executionID)")
             return
         }
-        let execution = activeToolExecutionsByRunID[runID]?[executionID]
-        let toolName = execution?.toolName ?? "unknown"
+
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.MCPRunTool.unregister,
-            correlation: execution?.lifecycleCorrelation,
-            EditFlowPerf.Dimensions(toolName: toolName)
+            correlation: execution.lifecycleCorrelation,
+            EditFlowPerf.Dimensions(toolName: execution.toolName)
         )
-        activeToolExecutionsByRunID[runID]?.removeValue(forKey: executionID)
-        // Track cumulative tool completions for steering interrupt safety gate.
-        toolEndedCountByRunID[runID, default: 0] += 1
-        if activeToolExecutionsByRunID[runID]?.isEmpty == true {
-            activeToolExecutionsByRunID.removeValue(forKey: runID)
-            steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister drained runID=\(runID) executionID=\(executionID) tool=\(toolName) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
-            resumeAllToolIdleWaiters(forRunID: runID, lifecycleCorrelation: execution?.lifecycleCorrelation)
-        } else {
-            steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister runID=\(runID) executionID=\(executionID) tool=\(toolName) remaining=\(debugActiveTools(for: runID)) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
+
+        if let connectionID = execution.connectionID {
+            activeToolExecutionIDsByConnectionID[connectionID]?.remove(executionID)
+            if activeToolExecutionIDsByConnectionID[connectionID]?.isEmpty == true {
+                activeToolExecutionIDsByConnectionID.removeValue(forKey: connectionID)
+            }
         }
+
+        if let runID = execution.runID {
+            activeToolExecutionIDsByRunID[runID]?.remove(executionID)
+            if countAsEnded {
+                toolEndedCountByRunID[runID, default: 0] += 1
+            }
+            if activeToolExecutionIDsByRunID[runID]?.isEmpty == true {
+                activeToolExecutionIDsByRunID.removeValue(forKey: runID)
+                steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister drained runID=\(runID) executionID=\(executionID) tool=\(execution.toolName) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
+                resumeAllToolIdleWaiters(forRunID: runID, lifecycleCorrelation: execution.lifecycleCorrelation)
+            } else {
+                steeringDebugLog("[AgentRunSteeringWake] MCP tool unregister runID=\(runID) executionID=\(executionID) tool=\(execution.toolName) remaining=\(debugActiveTools(for: runID)) endedCount=\(toolEndedCountByRunID[runID] ?? 0)")
+            }
+        }
+
+        recomputeCloseSafetyState()
     }
 
     /// Returns the cumulative number of tool executions that have completed for the given runID.
@@ -1185,10 +1208,7 @@ final class MCPServerViewModel: ObservableObject {
     /// Returns whether the given run currently has any active RepoPrompt MCP tool executions.
     @MainActor
     func hasActiveToolExecutions(runID: UUID) -> Bool {
-        guard let executions = activeToolExecutionsByRunID[runID] else {
-            return false
-        }
-        return !executions.isEmpty
+        !(activeToolExecutionIDsByRunID[runID]?.isEmpty ?? true)
     }
 
     /// Returns whether the given parent run is currently blocked in an `agent_run` wait.
@@ -1215,7 +1235,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     func awaitNoActiveToolExecutions(runID: UUID) async throws {
         // Fast path: already idle
-        let executions = activeToolExecutionsByRunID[runID]
+        let executions = activeToolExecutionIDsByRunID[runID]
         if executions == nil || executions!.isEmpty {
             steeringDebugLog("[AgentRunSteeringWake] MCP idle wait fast-idle runID=\(runID)")
             return
@@ -1230,7 +1250,7 @@ final class MCPServerViewModel: ObservableObject {
             await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
                 // Double-check under the same MainActor turn — tools may have
                 // drained between the fast-path check and here.
-                let stillActive = activeToolExecutionsByRunID[runID]
+                let stillActive = activeToolExecutionIDsByRunID[runID]
                 if stillActive == nil || stillActive!.isEmpty {
                     steeringDebugLog("[AgentRunSteeringWake] MCP idle wait drained before parking runID=\(runID) waiterID=\(waiterID)")
                     continuation.resume()
@@ -1284,9 +1304,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     @discardableResult
     private func cancelToolExecution(executionID: UUID, reason: String?) -> Bool {
-        guard let runID = runIDByToolExecutionID[executionID],
-              let execution = activeToolExecutionsByRunID[runID]?[executionID]
-        else {
+        guard let execution = activeToolExecutionsByID[executionID] else {
             return false
         }
         execution.cancel()
@@ -1523,28 +1541,40 @@ final class MCPServerViewModel: ObservableObject {
             resolvedContext: ResolvedTabContextSnapshot?,
             toolName: String = "test_tool",
             cancel: @escaping () -> Void = {}
-        ) async -> (executionID: UUID, runID: UUID)? {
-            guard let connectionID = metadata.connectionID,
-                  let runID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext),
-                  shouldRegisterRunToolExecution(toolName: toolName)
-            else {
+        ) async -> (executionID: UUID, runID: UUID?)? {
+            guard let connectionID = metadata.connectionID else {
                 return nil
             }
 
+            let resolvedRunID = await resolveRunIDForExecution(
+                metadata: metadata,
+                resolvedContext: resolvedContext
+            )
+            let indexedRunID = shouldRegisterRunToolExecution(toolName: toolName)
+                ? resolvedRunID
+                : nil
             let executionID = UUID()
             registerToolExecution(
                 executionID: executionID,
-                runID: runID,
+                runID: indexedRunID,
                 connectionID: connectionID,
                 toolName: toolName,
                 cancel: cancel
             )
-            return (executionID, runID)
+            return (executionID, indexedRunID)
         }
 
         @MainActor
         func test_endToolExecution(executionID: UUID) {
             unregisterToolExecution(executionID: executionID)
+        }
+
+        @MainActor
+        func test_activeToolExecutionCount(connectionID: UUID? = nil) -> Int {
+            if let connectionID {
+                return activeToolExecutionIDsByConnectionID[connectionID]?.count ?? 0
+            }
+            return activeToolExecutionsByID.count
         }
 
         @MainActor
@@ -1592,6 +1622,14 @@ final class MCPServerViewModel: ObservableObject {
         @MainActor
         func test_activeToolConnectionID() -> UUID? {
             activeToolConnectionID
+        }
+
+        @MainActor
+        @discardableResult
+        func test_clearActiveToolSlot(ifToken token: UUID) -> Bool {
+            guard activeToolToken == token else { return false }
+            clearActiveToolSlot()
+            return true
         }
 
         @MainActor
@@ -2161,10 +2199,24 @@ final class MCPServerViewModel: ObservableObject {
 
         let shouldTrackActiveTool = await shouldTrackActiveTool(for: metadata)
         let executionRunID = await resolveRunIDForExecution(metadata: metadata, resolvedContext: resolvedContext)
+        let indexedRunID = shouldRegisterRunToolExecution(toolName: name)
+            ? executionRunID
+            : nil
 
         // Generate a unique token for this tool execution to prevent cleanup races
         let toolToken = UUID()
         let capturedConnectionID = metadata.connectionID
+        let serverViewModelIdentity = ObjectIdentifier(self)
+        let dispatchAuthorization = ServerNetworkManager.currentToolDispatchAuthorization
+        if let dispatchAuthorization {
+            guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
+                dispatchAuthorization,
+                expectedWindowID: windowID,
+                expectedServerViewModelIdentity: serverViewModelIdentity
+            ) else {
+                throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+            }
+        }
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolSetup, runToolSetupState)
 
         let runToolRegistrationState = EditFlowPerf.begin(
@@ -2190,10 +2242,22 @@ final class MCPServerViewModel: ObservableObject {
             }
         }
 
-        // 🔑 run work completely off the UI thread
-        // Propagate TaskLocal connectionID so tools can resolve tab context
+        let startGate = MCPRunToolStartGate()
+        // 🔑 run work completely off the UI thread, but do not let the provider begin
+        // until token registration and final exact dispatch validation are complete.
         let task = Task {
-            try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
+            await startGate.wait()
+            try Task.checkCancellation()
+            if let dispatchAuthorization {
+                guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
+                    dispatchAuthorization,
+                    expectedWindowID: windowID,
+                    expectedServerViewModelIdentity: serverViewModelIdentity
+                ) else {
+                    throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+                }
+            }
+            return try await ServerNetworkManager.withConnectionID(capturedConnectionID) {
                 EditFlowPerf.lifecycleEvent(
                     EditFlowPerf.Lifecycle.MCPRunTool.providerBegan,
                     correlation: lifecycleCorrelation,
@@ -2226,7 +2290,6 @@ final class MCPServerViewModel: ObservableObject {
             }
         }
 
-        // Register in per-run tracking and store a single-slot canceller for legacy UI
         await MainActor.run {
             if !shouldTrackActiveTool {
                 EditFlowPerf.lifecycleEvent(
@@ -2238,20 +2301,35 @@ final class MCPServerViewModel: ObservableObject {
             if shouldTrackActiveTool {
                 self.cancelCurrentTool = { task.cancel() }
             }
-            if shouldRegisterRunToolExecution(toolName: name),
-               let connectionID = capturedConnectionID,
-               let runID = executionRunID
-            {
-                self.registerToolExecution(
-                    executionID: toolToken,
-                    runID: runID,
-                    connectionID: connectionID,
-                    toolName: name,
-                    lifecycleCorrelation: lifecycleCorrelation,
-                    cancel: { task.cancel() }
-                )
-            }
+            self.registerToolExecution(
+                executionID: toolToken,
+                runID: indexedRunID,
+                connectionID: capturedConnectionID,
+                toolName: name,
+                lifecycleCorrelation: lifecycleCorrelation,
+                cancel: { task.cancel() }
+            )
         }
+
+        if let dispatchAuthorization,
+           await !(ServerNetworkManager.shared.validateToolDispatchAuthorization(
+               dispatchAuthorization,
+               expectedWindowID: windowID,
+               expectedServerViewModelIdentity: serverViewModelIdentity
+           ))
+        {
+            task.cancel()
+            await startGate.open()
+            await MainActor.run {
+                self.unregisterToolExecution(executionID: toolToken, countAsEnded: false)
+                if shouldTrackActiveTool, self.activeToolToken == toolToken {
+                    self.clearActiveToolSlot()
+                }
+            }
+            throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
+        }
+        await startGate.open()
+
         EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.runToolRegistration, runToolRegistrationState)
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.MCPRunTool.registrationEnded,

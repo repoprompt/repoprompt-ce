@@ -193,22 +193,63 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             try write("let gammaNeedle = true\n", to: gammaURL)
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
+            await configureSingleLeaseSearchLane(store)
             let gate = AsyncGate()
+            let freshnessCaptureCount = AsyncCounter()
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                _ = await freshnessCaptureCount.incrementAndValue()
+            }
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await gate.release()
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
             }
 
             let first = Task { try await self.searchContent(pattern: "alphaNeedle", store: store) }
             await assertAsyncTrue(gate.waitUntilStartedCount(1))
             let second = Task { try await self.searchContent(pattern: "betaNeedle", store: store) }
             await assertAsyncTrue(waitForAdmissionWaiterCount(1, store: store))
-            let third = Task { try await self.searchContent(pattern: "gammaNeedle", store: store) }
-            do {
-                _ = try await third.value
-                XCTFail("Expected third broad search to be rejected")
-            } catch let error as StoreBackedWorkspaceSearchAdmissionError {
-                XCTAssertEqual(error, .queueFull(scope: .perStore, retryAfterMilliseconds: 1000))
+            let thirdCompleted = AsyncSignal()
+            let third = Task { () -> Result<SearchResults, Error> in
+                do {
+                    let result = try await self.searchContent(pattern: "gammaNeedle", store: store)
+                    await thirdCompleted.mark()
+                    return .success(result)
+                } catch {
+                    await thirdCompleted.mark()
+                    return .failure(error)
+                }
             }
+            let thirdDidComplete = await thirdCompleted.waitUntilMarked()
+            if !thirdDidComplete {
+                third.cancel()
+                second.cancel()
+                first.cancel()
+                await gate.release()
+                _ = await third.value
+                _ = try? await second.value
+                _ = try? await first.value
+                XCTFail("Timed out waiting for third broad search overflow rejection")
+                return
+            }
+            switch await third.value {
+            case .success:
+                XCTFail("Expected third broad search to be rejected")
+            case let .failure(error):
+                guard let admissionError = error as? StoreBackedWorkspaceSearchAdmissionError else {
+                    return XCTFail("Expected broad-search admission error, got \(error)")
+                }
+                XCTAssertEqual(admissionError, .queueFull(scope: .perStore, retryAfterMilliseconds: 1000))
+            }
+            let heldFreshnessCaptureCount = await freshnessCaptureCount.currentValue()
+            XCTAssertEqual(
+                heldFreshnessCaptureCount,
+                0,
+                "No broad search may enter freshness while the active permit hook is held; the waiter and rejected overflow must remain bounded at admission"
+            )
 
             let heldSnapshot = await store.searchLaneSnapshotForTesting()
             XCTAssertEqual(heldSnapshot.activePermitCount, 1)
@@ -223,30 +264,130 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertTrue(finalSnapshot.isIdle)
             XCTAssertEqual(finalSnapshot.maximumActivePermitCount, 1)
             XCTAssertEqual(finalSnapshot.maximumWaiterCount, 1)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
         }
 
-        func testQueuedBroadContentSearchCancellationRemovesWaiterAndDoesNotLeakLane() async throws {
+        func testConcurrentBroadSearchBurstSharesOneIngressFreshnessFlight() async throws {
+            let configuration = StoreBackedWorkspaceSearchLane.Configuration.production
+            let burstSize = configuration.maxActiveLeases
+            let root = try makeTemporaryRoot(name: "BroadLaneBurstFreshness")
+            for index in 0 ..< burstSize {
+                try write("let burstNeedle\(index) = true\n", to: root.appendingPathComponent("Burst\(index).swift"))
+            }
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let freshnessCaptureCount = AsyncCounter()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                _ = await freshnessCaptureCount.incrementAndValue()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try write("let burstHoldNeedle = true\n", to: root.appendingPathComponent("Hold.swift"))
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileAdded("Hold.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+            let statsBeforeBurst = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+
+            // The production lane admits the entire burst concurrently, so every member
+            // captures the same watermark cut and shares the single blocked barrier flight.
+            let burst = (0 ..< burstSize).map { index in
+                Task { try await self.searchContent(pattern: "burstNeedle\(index)", store: store) }
+            }
+            await assertAsyncTrue(freshnessCaptureCount.waitUntilValue(atLeast: burstSize))
+            let heldStats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+            XCTAssertEqual(heldStats.launchCount - statsBeforeBurst.launchCount, 1)
+            XCTAssertEqual(heldStats.joinCount - statsBeforeBurst.joinCount, burstSize - 1)
+            let heldLane = await store.searchLaneSnapshotForTesting()
+            XCTAssertEqual(heldLane.activePermitCount, burstSize)
+            XCTAssertEqual(heldLane.waiterCount, 0)
+            XCTAssertEqual(heldLane.overloadCount, 0)
+
+            await sinkGate.release()
+            for (index, task) in burst.enumerated() {
+                let result = try await task.value
+                XCTAssertEqual(result.matches?.map(\.filePath), [root.appendingPathComponent("Burst\(index).swift").path])
+            }
+            let settledLane = await store.searchLaneSnapshotForTesting()
+            XCTAssertTrue(settledLane.isIdle)
+            XCTAssertEqual(settledLane.maximumActivePermitCount, burstSize)
+        }
+
+        func testQueuedBroadContentSearchCancellationRemovesWaiterWithoutEnteringFreshness() async throws {
             let root = try makeTemporaryRoot(name: "BroadLaneCancellation")
             try write("let holdNeedle = true\nlet laterNeedle = true\n", to: root.appendingPathComponent("A.swift"))
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
+            await configureSingleLeaseSearchLane(store)
             let gate = AsyncGate()
+            let freshnessCaptureCount = AsyncCounter()
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                _ = await freshnessCaptureCount.incrementAndValue()
+            }
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await gate.release()
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
             }
 
             let first = Task { try await self.searchContent(pattern: "holdNeedle", store: store) }
             await assertAsyncTrue(gate.waitUntilStartedCount(1))
-            let cancelled = Task { try await self.searchContent(pattern: "cancelledNeedle", store: store) }
+            let cancellationCompleted = AsyncSignal()
+            let cancelled = Task { () -> Result<SearchResults, Error> in
+                do {
+                    let result = try await self.searchContent(pattern: "cancelledNeedle", store: store)
+                    await cancellationCompleted.mark()
+                    return .success(result)
+                } catch {
+                    await cancellationCompleted.mark()
+                    return .failure(error)
+                }
+            }
             await assertAsyncTrue(waitForAdmissionWaiterCount(1, store: store))
+            let queuedFreshnessCaptureCount = await freshnessCaptureCount.currentValue()
+            XCTAssertEqual(
+                queuedFreshnessCaptureCount,
+                0,
+                "A queued broad search must not capture an applied-ingress target before admission"
+            )
             cancelled.cancel()
-            do {
-                _ = try await cancelled.value
+            let cancellationDidComplete = await cancellationCompleted.waitUntilMarked()
+            if !cancellationDidComplete {
+                first.cancel()
+                await gate.release()
+                _ = await cancelled.value
+                _ = try? await first.value
+                XCTFail("Timed out waiting for queued broad search cancellation")
+                return
+            }
+            switch await cancelled.value {
+            case .success:
                 XCTFail("Expected queued broad search cancellation")
-            } catch is CancellationError {
-                // Expected.
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError)
             }
             await assertAsyncTrue(waitForAdmissionWaiterCount(0, store: store))
+            let cancelledFreshnessCaptureCount = await freshnessCaptureCount.currentValue()
+            XCTAssertEqual(
+                cancelledFreshnessCaptureCount,
+                0,
+                "Cancelling the queued search must not start freshness work"
+            )
             let later = Task { try await self.searchContent(pattern: "laterNeedle", store: store) }
             await assertAsyncTrue(waitForAdmissionWaiterCount(1, store: store))
 
@@ -257,6 +398,9 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let finalSnapshot = await store.searchLaneSnapshotForTesting()
             XCTAssertTrue(finalSnapshot.isIdle)
             XCTAssertEqual(finalSnapshot.queuedCancellationCount, 1)
+            let finalFreshnessCaptureCount = await freshnessCaptureCount.currentValue()
+            XCTAssertEqual(finalFreshnessCaptureCount, 2)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
         }
 
         func testPathScopedContentAndDifferentStoreSearchesBypassHeldBroadLane() async throws {
@@ -520,6 +664,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: root.path)
             let baseline = try await searchContent(pattern: "needle", countOnly: true, store: store)
+            await configureSingleLeaseSearchLane(store)
 
             let gate = AsyncGate()
             await store.setSearchLanePermitAcquiredHandlerForTesting {
@@ -654,7 +799,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertEqual(cache.latestRevision, 1)
         }
 
-        func testStoreBackedSearchAwaitsScopedFreshnessBeforeBroadPermitAndCatalogSnapshot() async throws {
+        func testStoreBackedSearchAcquiresBroadPermitBeforeAwaitingScopedFreshnessAndCatalogSnapshot() async throws {
             let root = try makeTemporaryRoot(name: "ScopedSearchFreshness")
             let addedURL = root.appendingPathComponent("Added.swift")
             let store = WorkspaceFileContextStore()
@@ -669,6 +814,12 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await permitSignal.mark()
             }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
 
             try write("freshNeedle", to: addedURL)
             try await store.publishSyntheticFileSystemDeltasForTesting(rootID: record.id, deltas: [.fileAdded("Added.swift")])
@@ -676,17 +827,82 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let searchTask = Task {
                 try await self.searchContent(pattern: "freshNeedle", store: store)
             }
-            let permitMarkedEarly = await permitSignal.waitUntilMarked(timeoutNanoseconds: 50_000_000)
-            XCTAssertFalse(permitMarkedEarly)
-            let preAdmissionLaneSnapshot = await store.searchLaneSnapshotForTesting()
-            XCTAssertTrue(preAdmissionLaneSnapshot.isIdle)
+            await assertAsyncTrue(permitSignal.waitUntilMarked())
+            let freshnessLaneSnapshot = await store.searchLaneSnapshotForTesting()
+            XCTAssertEqual(freshnessLaneSnapshot.activePermitCount, 1)
+            XCTAssertEqual(freshnessLaneSnapshot.waiterCount, 0)
 
             await sinkGate.release()
-            await assertAsyncTrue(permitSignal.waitUntilMarked())
             let result = try await searchTask.value
             XCTAssertEqual(result.matches?.map(\.filePath), [addedURL.path])
             let laneSnapshot = await store.searchLaneSnapshotForTesting()
             XCTAssertTrue(laneSnapshot.isIdle)
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testCancelledBroadSearchBlockedInFreshnessReleasesAdmissionPermit() async throws {
+            let root = try makeTemporaryRoot(name: "CancelledBroadSearchFreshness")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let permitSignal = AsyncSignal()
+            let completionSignal = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setSearchLanePermitAcquiredHandlerForTesting {
+                await permitSignal.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try write("cancelNeedle", to: root.appendingPathComponent("Added.swift"))
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileAdded("Added.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+            let searchTask = Task { () -> Result<SearchResults, Error> in
+                do {
+                    let result = try await self.searchContent(pattern: "cancelNeedle", store: store)
+                    await completionSignal.mark()
+                    return .success(result)
+                } catch {
+                    await completionSignal.mark()
+                    return .failure(error)
+                }
+            }
+            await assertAsyncTrue(permitSignal.waitUntilMarked())
+            let heldSnapshot = await store.searchLaneSnapshotForTesting()
+            XCTAssertEqual(heldSnapshot.activePermitCount, 1)
+
+            searchTask.cancel()
+            let completedWhileIngressBlocked = await completionSignal.waitUntilMarked()
+            XCTAssertTrue(
+                completedWhileIngressBlocked,
+                "Cancellation after admission must detach from freshness without waiting for ingress application"
+            )
+            let releasedBeforeIngress = await waitForSearchLaneIdle(store: store)
+            XCTAssertTrue(
+                releasedBeforeIngress,
+                "Cancellation during freshness must release the broad-search permit before ingress unblocks"
+            )
+
+            await sinkGate.release()
+            switch await searchTask.value {
+            case .success:
+                XCTFail("Expected cancelled broad search to fail")
+            case let .failure(error):
+                XCTAssertTrue(error is CancellationError)
+            }
             await store.setWatcherSinkWillApplyHandler(nil)
             await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
             await store.stopWatchingRoot(id: record.id)
@@ -739,6 +955,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             _ = try await store.loadRoot(path: logicalRoot.path)
             let physicalRecord = try await store.loadRoot(path: physicalRoot.path, kind: .sessionWorktree)
+            await configureSingleLeaseSearchLane(store)
             let gate = AsyncGate()
             await store.setSearchLanePermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
@@ -779,6 +996,24 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertTrue(laneSnapshot.isIdle)
         }
     #endif
+
+    func testBroadSearchOrchestrationChecksScopeAndReadinessBeforeAndAfterAdmission() throws {
+        let source = try String(
+            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Features/Search/StoreBackedWorkspaceSearch.swift"),
+            encoding: .utf8
+        )
+        try assertOrdered([
+            "try await ensureRootScopeAvailable(rootScope, store: store)",
+            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
+            "let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode",
+            "return try await store.withStoreBackedSearchAccess(",
+            "try await ensureRootScopeAvailable(rootScope, store: store)",
+            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
+            "_ = await store.awaitAppliedIngress(rootScope: rootScope)",
+            "try Task.checkCancellation()",
+            "try await performSearch("
+        ], in: source)
+    }
 
     func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
         let source = try String(
@@ -857,6 +1092,25 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertTrue(value, message(), file: file, line: line)
         }
 
+        /// Pins the store's broad-search lane to one active lease and one waiter so the
+        /// queue/overflow choreography stays deterministic under the burst-capacity production policy.
+        private func configureSingleLeaseSearchLane(
+            _ store: WorkspaceFileContextStore,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async {
+            let configuration = StoreBackedWorkspaceSearchLane.Configuration(
+                maxQueueWait: .milliseconds(1500)
+            )
+            guard case .applied = await store.configureSearchLaneForTesting(configuration) else {
+                return XCTFail(
+                    "Expected the idle store lane to accept the single-lease test configuration",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+
         private func waitForAdmissionWaiterCount(
             _ expectedCount: Int,
             store: WorkspaceFileContextStore,
@@ -869,6 +1123,19 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                 waited += interval
             }
             return await store.searchLaneSnapshotForTesting().waiterCount == expectedCount
+        }
+
+        private func waitForSearchLaneIdle(
+            store: WorkspaceFileContextStore,
+            timeoutNanoseconds: UInt64 = 1_000_000_000
+        ) async -> Bool {
+            let interval: UInt64 = 10_000_000
+            var waited: UInt64 = 0
+            while await !store.searchLaneSnapshotForTesting().isIdle, waited < timeoutNanoseconds {
+                try? await Task.sleep(nanoseconds: interval)
+                waited += interval
+            }
+            return await store.searchLaneSnapshotForTesting().isIdle
         }
 
         private func waitForCacheIdle(

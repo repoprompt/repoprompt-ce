@@ -737,8 +737,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                     parentManager: ServerNetworkManager.shared
                 )
                 connectionManager = resolvedConnectionManager
-                _ = await ServerNetworkManager.shared.debugInstallConnectionLimiterForTesting(
-                    connectionID: connectionID
+                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                    connectionID: connectionID,
+                    connection: resolvedConnectionManager,
+                    clientName: AgentProviderKind.codexMCPClientID,
+                    sessionToken: sessionToken
                 )
                 let spec = MCPBootstrapLeaseSpec.agentMode(
                     tabID: tabID,

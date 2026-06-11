@@ -29,10 +29,12 @@ enum WindowStateCompositionFactory {
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
-        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
+        workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
+        workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production
     ) -> WindowStateComposition {
         // 1) Workspace file context store + visible file-tree UI adapter
-        let workspaceFileContextStore = WorkspaceFileContextStore()
+        let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? WorkspaceFileContextStore()
         let workspaceSearchService = WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
@@ -59,7 +61,8 @@ enum WindowStateCompositionFactory {
         let workspaceManager = WorkspaceManagerViewModel(
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
-            workspaceSearchService: workspaceSearchService
+            workspaceSearchService: workspaceSearchService,
+            switchTimingPolicy: workspaceSwitchTimingPolicy
         )
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,

@@ -856,7 +856,7 @@ class WindowState: ObservableObject {
 
         if workspaceManager.activeWorkspaceID != route.workspaceID {
             let switchResult = await workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
-            if !switchResult.didSwitch, workspaceManager.activeWorkspaceID != route.workspaceID {
+            if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
         }
