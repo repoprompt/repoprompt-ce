@@ -6,9 +6,11 @@ import XCTest
 /// through `HistoryMCPToolService.execute(args:scanner:)` using a real
 /// `HistorySessionScanner` backed by temporary directory fixtures.
 ///
-/// Each test creates realistic workspace/session directory structures on disk,
-/// points a scanner at them, and calls the service — testing the complete
-/// path from filesystem scan through args dispatch to response formatting.
+/// Each test creates `AgentSession` objects with realistic transcripts,
+/// runs them through `AgentSessionMetadataRecord.record(from:)` to build
+/// metadata via the **real indexer** (not hand-crafted records), writes the
+/// results to disk, and calls the service. This catches bugs in the indexer
+/// that hand-crafted record tests cannot.
 final class HistoryIntegrationTests: XCTestCase {
     // MARK: - Test Infrastructure
 
@@ -87,19 +89,21 @@ final class HistoryIntegrationTests: XCTestCase {
         let matchID = UUID()
         let noMatchID = UUID()
 
+        // Build sessions with tool execution activities — the indexer should extract keyPaths.
+        let matchSession = makeSessionWithToolExecutions(
+            id: matchID,
+            name: "Touched File Session",
+            keyPaths: ["src/main.swift", "lib/utils.swift"]
+        )
+        let noMatchSession = makeSessionWithToolExecutions(
+            id: noMatchID,
+            name: "No Match Session",
+            keyPaths: ["docs/README.md"]
+        )
+
         try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(
-                id: matchID,
-                name: "Touched File Session",
-                keyPaths: ["src/main.swift", "lib/utils.swift"],
-                savedAt: Date(timeIntervalSince1970: 1_700_000_100)
-            ),
-            makeRecord(
-                id: noMatchID,
-                name: "No Match Session",
-                keyPaths: ["docs/README.md"],
-                savedAt: Date(timeIntervalSince1970: 1_700_000_200)
-            )
+            indexRecord(from: matchSession, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
+            indexRecord(from: noMatchSession, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
         ])
 
         let result = try await HistoryMCPToolService.execute(
@@ -112,7 +116,7 @@ final class HistoryIntegrationTests: XCTestCase {
         XCTAssertEqual(sessions?.count, 1)
         XCTAssertEqual(sessions?.first?["session_id"] as? String, matchID.uuidString)
 
-        // Verify files_touched is populated
+        // Verify files_touched is populated from tool execution keyPaths.
         let filesTouched = sessions?.first?["files_touched"] as? [String]
         XCTAssertEqual(filesTouched, ["lib/utils.swift", "src/main.swift"])
     }
@@ -351,17 +355,19 @@ final class HistoryIntegrationTests: XCTestCase {
         let ws = try createWorkspaceDir(name: "TimeProject", uuid: wsID)
         try writeWorkspaceJSON(in: ws, name: "TimeProject", id: wsID)
 
-        // Day 1: two sessions with durations 120s and 180s
-        // Day 2: one session with duration 300s
-        // Use fixed calendar dates
         let gregorian = Calendar(identifier: .gregorian)
         let day1 = try XCTUnwrap(gregorian.date(from: DateComponents(year: 2026, month: 6, day: 8, hour: 10)))
         let day2 = try XCTUnwrap(gregorian.date(from: DateComponents(year: 2026, month: 6, day: 9, hour: 14)))
 
+        // Sessions with tool execution turns — durations computed by the real indexer.
+        let s1 = makeSessionWithToolExecutions(name: "Day1-A", keyPaths: [], turnDurationSeconds: 120)
+        let s2 = makeSessionWithToolExecutions(name: "Day1-B", keyPaths: [], turnDurationSeconds: 180)
+        let s3 = makeSessionWithToolExecutions(name: "Day2-A", keyPaths: [], turnDurationSeconds: 300)
+
         try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(id: UUID(), name: "Day1-A", activeDurationSeconds: 120, savedAt: day1),
-            makeRecord(id: UUID(), name: "Day1-B", activeDurationSeconds: 180, savedAt: day1),
-            makeRecord(id: UUID(), name: "Day2-A", activeDurationSeconds: 300, savedAt: day2)
+            indexRecord(from: s1, savedAt: day1),
+            indexRecord(from: s2, savedAt: day1),
+            indexRecord(from: s3, savedAt: day2)
         ])
 
         let result = try await HistoryMCPToolService.execute(
@@ -395,15 +401,18 @@ final class HistoryIntegrationTests: XCTestCase {
         let ws2ID = UUID()
         let ws1 = try createWorkspaceDir(name: "Frontend", uuid: ws1ID)
         try writeWorkspaceJSON(in: ws1, name: "Frontend", id: ws1ID)
+        let fe1 = makeSessionWithToolExecutions(name: "FE-1", keyPaths: [], turnDurationSeconds: 200)
+        let fe2 = makeSessionWithToolExecutions(name: "FE-2", keyPaths: [], turnDurationSeconds: 100)
         try createAgentSessionsIndex(in: ws1, records: [
-            makeRecord(id: UUID(), name: "FE-1", activeDurationSeconds: 200, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
-            makeRecord(id: UUID(), name: "FE-2", activeDurationSeconds: 100, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
+            indexRecord(from: fe1, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
+            indexRecord(from: fe2, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
         ])
 
         let ws2 = try createWorkspaceDir(name: "Backend", uuid: ws2ID)
         try writeWorkspaceJSON(in: ws2, name: "Backend", id: ws2ID)
+        let be1 = makeSessionWithToolExecutions(name: "BE-1", keyPaths: [], turnDurationSeconds: 400)
         try createAgentSessionsIndex(in: ws2, records: [
-            makeRecord(id: UUID(), name: "BE-1", activeDurationSeconds: 400, savedAt: Date(timeIntervalSince1970: 1_700_000_300))
+            indexRecord(from: be1, savedAt: Date(timeIntervalSince1970: 1_700_000_300))
         ])
 
         let result = try await HistoryMCPToolService.execute(
@@ -429,7 +438,86 @@ final class HistoryIntegrationTests: XCTestCase {
         XCTAssertEqual(frontendGroup?["active_duration_seconds"] as? Int, 300)
     }
 
-    // MARK: - 8. Empty result set
+    // MARK: - 8. keyPaths from tool executions (not summaries)
+
+    /// This test catches the bug where keyPaths were always empty because the indexer
+    /// only read `summary?.keyPaths` (nil for active turns) and never fell back to
+    /// tool execution activities. The session has NO summary — only tool executions.
+    func testListSessions_filesTouched_fromToolExecutions_notSummary() async throws {
+        let wsID = UUID()
+        let ws = try createWorkspaceDir(name: "ToolExecProject", uuid: wsID)
+        try writeWorkspaceJSON(in: ws, name: "ToolExecProject", id: wsID)
+
+        // Session with tool execution activities but NO turn summary.
+        // This is the production shape for active (uncompacted) turns.
+        let session = makeSessionWithToolExecutions(
+            id: UUID(),
+            name: "Active Session",
+            keyPaths: ["Sources/Foo.swift", "Sources/Bar.swift"]
+        )
+        try createAgentSessionsIndex(in: ws, records: [
+            indexRecord(from: session)
+        ])
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: scanner
+        )
+
+        let sessions = result["sessions"] as? [[String: Any]]
+        XCTAssertEqual(sessions?.count, 1)
+
+        // keyPaths MUST be populated from tool execution activities, not just summaries.
+        let filesTouched = sessions?.first?["files_touched"] as? [String]
+        XCTAssertEqual(filesTouched, ["Sources/Bar.swift", "Sources/Foo.swift"].sorted())
+    }
+
+    /// Verify touched_file filter works when keyPaths come from tool executions.
+    func testListSessions_touchedFileFilter_worksWithToolExecutionKeyPaths() async throws {
+        let wsID = UUID()
+        let ws = try createWorkspaceDir(name: "FilterProject", uuid: wsID)
+        try writeWorkspaceJSON(in: ws, name: "FilterProject", id: wsID)
+
+        let matching = makeSessionWithToolExecutions(name: "Match", keyPaths: ["Package.swift"])
+        let nonMatching = makeSessionWithToolExecutions(name: "NoMatch", keyPaths: ["README.md"])
+
+        try createAgentSessionsIndex(in: ws, records: [
+            indexRecord(from: matching, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
+            indexRecord(from: nonMatching, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
+        ])
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "touched_file": "Package.swift"],
+            scanner: scanner
+        )
+
+        XCTAssertEqual(result["total_sessions"] as? Int, 1)
+        let sessions = result["sessions"] as? [[String: Any]]
+        XCTAssertEqual(sessions?.first?["session_name"] as? String, "Match")
+    }
+
+    /// Verify duration is computed correctly from turn timestamps via the indexer.
+    func testListSessions_duration_computedFromTranscriptTurns() async throws {
+        let wsID = UUID()
+        let ws = try createWorkspaceDir(name: "DurationProject", uuid: wsID)
+        try writeWorkspaceJSON(in: ws, name: "DurationProject", id: wsID)
+
+        // Session with a 90-second turn.
+        let session = makeSessionWithToolExecutions(name: "DurationTest", keyPaths: [], turnDurationSeconds: 90)
+        try createAgentSessionsIndex(in: ws, records: [
+            indexRecord(from: session)
+        ])
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: scanner
+        )
+
+        let sessions = result["sessions"] as? [[String: Any]]
+        XCTAssertEqual(sessions?.first?["active_duration_seconds"] as? Int, 90)
+    }
+
+    // MARK: - 9. Empty result set
 
     func testListSessions_emptyResultSet() async throws {
         let wsID = UUID()
@@ -512,41 +600,112 @@ final class HistoryIntegrationTests: XCTestCase {
         try data.write(to: fileURL, options: .atomic)
     }
 
+    // MARK: - Session + Indexer Helpers
+
+    /// Build a real metadata record by running the session through the indexer factory.
+    /// This exercises `AgentSessionMetadataRecord.record(from:)` including keyPaths
+    /// aggregation and duration computation — the actual production code path.
+    private func indexRecord(
+        from session: AgentSession,
+        savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
+    ) -> AgentSessionMetadataRecord {
+        let fileURL = URL(fileURLWithPath: "AgentSession-\(session.id.uuidString).json")
+        var record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        // Override savedAt for deterministic date filtering in tests.
+        record.savedAt = savedAt
+        return record
+    }
+
+    /// Create a session with turns that have tool execution activities carrying keyPaths.
+    /// This is what production sessions look like for active (uncompacted) turns.
+    private func makeSessionWithToolExecutions(
+        id: UUID = UUID(),
+        name: String = "Test Session",
+        keyPaths: [String],
+        turnDurationSeconds: Int = 60
+    ) -> AgentSession {
+        let toolActivity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 1),
+            sequenceIndex: 0,
+            role: .toolExecution,
+            itemKind: .assistant,
+            text: "",
+            toolExecution: AgentTranscriptToolExecution(
+                stableExecutionID: "exec-\(UUID().uuidString)",
+                toolName: "apply_edits",
+                invocationID: nil,
+                argsJSON: nil,
+                resultJSON: nil,
+                toolIsError: nil,
+                status: .success,
+                keyPaths: keyPaths
+            )
+        )
+        let span = AgentTranscriptProviderResponseSpan(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 0),
+            activities: [toolActivity]
+        )
+        let turn = AgentTranscriptTurn(
+            id: UUID(),
+            responseSpans: [span],
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: TimeInterval(turnDurationSeconds))
+        )
+        return AgentSession(
+            id: id,
+            name: name,
+            transcript: AgentTranscript(turns: [turn]),
+            itemCount: 1
+        )
+    }
+
+    /// Create a minimal session with a single turn that has a summary (compacted turn).
+    private func makeSessionWithSummary(
+        id: UUID = UUID(),
+        name: String = "Test Session",
+        summaryKeyPaths: [String] = [],
+        turnDurationSeconds: Int = 60
+    ) -> AgentSession {
+        let turn = AgentTranscriptTurn(
+            id: UUID(),
+            summary: AgentTranscriptTurnSummary(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: nil,
+                middleSummaryText: nil,
+                toolCount: 1,
+                notableToolNames: [],
+                keyPaths: summaryKeyPaths,
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: TimeInterval(turnDurationSeconds))
+        )
+        return AgentSession(
+            id: id,
+            name: name,
+            transcript: AgentTranscript(turns: [turn]),
+            itemCount: 1
+        )
+    }
+
+    /// Minimal record for tests that only exercise metadata scanning (no transcript loading).
+    /// Uses the real indexer via `makeSessionWithSummary` so keyPaths/duration flow through production code.
     private func makeRecord(
         id: UUID = UUID(),
         name: String = "Test Session",
-        agentKindRaw: String? = nil,
-        agentModelRaw: String? = nil,
-        keyPaths: Set<String> = [],
-        activeDurationSeconds: Int = 0,
-        savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000),
-        itemCount: Int = 1,
-        lastRunStateRaw: String? = nil
+        savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
     ) -> AgentSessionMetadataRecord {
-        AgentSessionMetadataRecord(
-            id: id,
-            filename: "AgentSession-\(id.uuidString).json",
-            workspaceID: nil,
-            composeTabID: nil,
-            name: name,
-            savedAt: savedAt,
-            lastUserMessageAt: nil,
-            itemCount: itemCount,
-            transcriptProjectionCounts: nil,
-            hasUnknownConversationContent: false,
-            agentKindRaw: agentKindRaw,
-            agentModelRaw: agentModelRaw,
-            agentReasoningEffortRaw: nil,
-            lastRunStateRaw: lastRunStateRaw,
-            autoEditEnabled: true,
-            parentSessionID: nil,
-            isMCPOriginated: false,
-            serializationVersion: nil,
-            observedFileSize: nil,
-            observedFileModificationDate: nil,
-            lastIndexedAt: savedAt,
-            keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds
-        )
+        let session = makeSessionWithSummary(id: id, name: name)
+        return indexRecord(from: session, savedAt: savedAt)
     }
 }
