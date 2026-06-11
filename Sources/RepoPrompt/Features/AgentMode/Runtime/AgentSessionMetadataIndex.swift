@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 3
+    static let currentSchemaVersion = 4
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -65,8 +65,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var observedFileSize: Int64?
     var observedFileModificationDate: Date?
     var lastIndexedAt: Date
+    var firstActivityAt: Date?
+    var lastActivityAt: Date?
     var keyPaths: Set<String>
     var activeDurationSeconds: Int
+    var toolCallCount: Int
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
@@ -96,8 +99,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileSize: Int64?,
         observedFileModificationDate: Date?,
         lastIndexedAt: Date,
+        firstActivityAt: Date? = nil,
+        lastActivityAt: Date? = nil,
         keyPaths: Set<String> = [],
-        activeDurationSeconds: Int = 0
+        activeDurationSeconds: Int = 0,
+        toolCallCount: Int = 0
     ) {
         self.id = id
         self.filename = filename
@@ -122,8 +128,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.observedFileSize = observedFileSize
         self.observedFileModificationDate = observedFileModificationDate
         self.lastIndexedAt = lastIndexedAt
+        self.firstActivityAt = firstActivityAt
+        self.lastActivityAt = lastActivityAt
         self.keyPaths = keyPaths
         self.activeDurationSeconds = activeDurationSeconds
+        self.toolCallCount = toolCallCount
     }
 
     enum CodingKeys: String, CodingKey {
@@ -150,8 +159,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case observedFileSize
         case observedFileModificationDate
         case lastIndexedAt
+        case firstActivityAt
+        case lastActivityAt
         case keyPaths
         case activeDurationSeconds
+        case toolCallCount
     }
 
     init(from decoder: Decoder) throws {
@@ -179,8 +191,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileSize = try container.decodeIfPresent(Int64.self, forKey: .observedFileSize)
         observedFileModificationDate = try container.decodeIfPresent(Date.self, forKey: .observedFileModificationDate)
         lastIndexedAt = try container.decodeIfPresent(Date.self, forKey: .lastIndexedAt) ?? savedAt
+        firstActivityAt = try container.decodeIfPresent(Date.self, forKey: .firstActivityAt)
+        lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
         keyPaths = try container.decodeIfPresent(Set<String>.self, forKey: .keyPaths) ?? []
         activeDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .activeDurationSeconds) ?? 0
+        toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
     }
 
     func sidebarEntry(tabID overrideTabID: UUID? = nil, displayName: String? = nil) -> AgentSessionIndexEntry? {
@@ -245,8 +260,11 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && serializationVersion == other.serializationVersion
             && observedFileSize == other.observedFileSize
             && observedFileModificationDate == other.observedFileModificationDate
+            && firstActivityAt == other.firstActivityAt
+            && lastActivityAt == other.lastActivityAt
             && keyPaths == other.keyPaths
             && activeDurationSeconds == other.activeDurationSeconds
+            && toolCallCount == other.toolCallCount
     }
 
     static func record(
@@ -276,10 +294,10 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             return collected
         }()
 
-        let durationSeconds: Int = {
-            guard let turns = session.transcript?.turns else { return 0 }
-            return Self.computeActiveDurationSeconds(from: turns)
-        }()
+        let turns = session.transcript?.turns ?? []
+        let activityBounds = Self.computeActivityBounds(from: turns)
+        let durationSeconds = Self.computeActiveDurationSeconds(from: turns)
+        let computedToolCallCount = Self.computeToolCallCount(from: turns)
 
         return AgentSessionMetadataRecord(
             id: session.id,
@@ -305,21 +323,66 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             observedFileSize: observedFileSize,
             observedFileModificationDate: observedFileModificationDate,
             lastIndexedAt: lastIndexedAt,
+            firstActivityAt: activityBounds.first,
+            lastActivityAt: activityBounds.last,
             keyPaths: aggregatedKeyPaths,
-            activeDurationSeconds: durationSeconds
+            activeDurationSeconds: durationSeconds,
+            toolCallCount: computedToolCallCount
         )
     }
 
+    /// Compute first and last activity timestamps from transcript turns.
+    private static func computeActivityBounds(from turns: [AgentTranscriptTurn]) -> (first: Date?, last: Date?) {
+        var first: Date?
+        var last: Date?
+
+        func include(_ date: Date?) {
+            guard let date else { return }
+            if first.map({ date < $0 }) ?? true {
+                first = date
+            }
+            if last.map({ date > $0 }) ?? true {
+                last = date
+            }
+        }
+
+        for turn in turns {
+            include(turn.startedAt)
+            include(turn.lastActivityAt)
+            include(turn.completedAt)
+            for activity in turn.allActivities {
+                include(activity.timestamp)
+            }
+        }
+
+        return (first, last)
+    }
+
+    /// Compute tool call count from transcript turns.
+    /// Compacted turns retain only `summary.toolCount`; active turns retain tool execution activities.
+    private static func computeToolCallCount(from turns: [AgentTranscriptTurn]) -> Int {
+        turns.reduce(0) { total, turn in
+            if let summaryToolCount = turn.summary?.toolCount, summaryToolCount > 0 {
+                return total + summaryToolCount
+            }
+            return total + turn.responseSpans.reduce(0) { spanTotal, span in
+                spanTotal + span.activities.count(where: { $0.toolExecution != nil })
+            }
+        }
+    }
+
     /// Compute active duration in seconds from transcript turns, excluding idle gaps > 30 minutes.
-    /// Uses `completedAt ?? lastActivityAt` as the turn end time. Skips turns without completion timestamps.
+    /// Uses `completedAt ?? lastActivityAt ?? startedAt` as the turn end time.
+    /// Falls back to `startedAt` when completion/activity timestamps are unavailable —
+    /// the turn contributes 0 duration but advances `previousEnd` so gap tracking stays accurate.
     private static func computeActiveDurationSeconds(from turns: [AgentTranscriptTurn]) -> Int {
         let thirtyMinutes: TimeInterval = 30 * 60
         var totalSeconds = 0
         var previousEnd: Date?
 
         for turn in turns {
-            guard let end = turn.completedAt ?? turn.lastActivityAt else { continue }
             let start = turn.startedAt
+            let end = turn.completedAt ?? turn.lastActivityAt ?? start
 
             if let prev = previousEnd {
                 let gap = start.timeIntervalSince(prev)

@@ -72,11 +72,11 @@ enum HistoryMCPToolService {
                 "workspace_name": session.workspaceName,
                 "agent_kind": r.agentKindRaw as Any,
                 "agent_model": r.agentModelRaw as Any,
-                "first_activity_at": dateFormatter.string(from: r.savedAt),
-                "last_activity_at": dateFormatter.string(from: r.activityDate),
+                "first_activity_at": dateFormatter.string(from: r.firstActivityAt ?? r.activityDate),
+                "last_activity_at": dateFormatter.string(from: r.lastActivityAt ?? r.savedAt),
                 "active_duration_seconds": r.activeDurationSeconds,
                 "turn_count": r.itemCount,
-                "tool_call_count": 0, // v1: no metadata field yet
+                "tool_call_count": r.toolCallCount,
                 "files_touched": Array(r.keyPaths).sorted(),
                 "had_errors": r.hasUnknownConversationContent,
                 "last_run_state": r.lastRunStateRaw as Any
@@ -372,7 +372,7 @@ enum HistoryMCPToolService {
                     "sessions": 1,
                     "active_duration_seconds": session.record.activeDurationSeconds,
                     "turn_count": session.record.itemCount,
-                    "tool_call_count": 0 // v1: no metadata field yet
+                    "tool_call_count": session.record.toolCallCount
                 ]
                 if includeDetails {
                     group["details"] = [[
@@ -412,13 +412,14 @@ enum HistoryMCPToolService {
             let sessionsInGroup = grouped[key]!
             let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds }
             let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
+            let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
             var group: [String: Any] = [
                 "key": key,
                 "sessions": sessionsInGroup.count,
                 "active_duration_seconds": totalDuration,
                 "turn_count": totalTurns,
-                "tool_call_count": 0 // v1: no metadata field yet
+                "tool_call_count": totalToolCalls
             ]
             if includeDetails {
                 group["details"] = sessionsInGroup.map { s in
@@ -449,13 +450,14 @@ enum HistoryMCPToolService {
             let sessionsInGroup = grouped[key]!
             let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds }
             let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
+            let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
             var group: [String: Any] = [
                 "key": key,
                 "sessions": sessionsInGroup.count,
                 "active_duration_seconds": totalDuration,
                 "turn_count": totalTurns,
-                "tool_call_count": 0 // v1: no metadata field yet
+                "tool_call_count": totalToolCalls
             ]
             if includeDetails {
                 group["details"] = sessionsInGroup.map { s in

@@ -179,6 +179,39 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(sessions?[1]["session_name"] as? String, "Old")
     }
 
+    func testListSessions_timestampsUseIndexedActivityBounds() async throws {
+        let firstActivity = Date(timeIntervalSince1970: 1_700_000_000)
+        let lastActivity = Date(timeIntervalSince1970: 1_700_000_120)
+        let record = makeRecord(
+            name: "S1",
+            savedAt: Date(timeIntervalSince1970: 1_700_001_000),
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let session = (result["sessions"] as? [[String: Any]])?.first
+        let formatter = ISO8601DateFormatter()
+        XCTAssertEqual(session?["first_activity_at"] as? String, formatter.string(from: firstActivity))
+        XCTAssertEqual(session?["last_activity_at"] as? String, formatter.string(from: lastActivity))
+    }
+
+    func testListSessions_toolCallCountFromMetadata() async throws {
+        let record = makeRecord(name: "S1", toolCallCount: 7)
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let session = (result["sessions"] as? [[String: Any]])?.first
+        XCTAssertEqual(session?["tool_call_count"] as? Int, 7)
+    }
+
     func testListSessions_hadErrorsTrue() async throws {
         let record = makeRecord(name: "S1", hasUnknownContent: true)
         mockScanner.scanResults = [makeScanResult(records: [record])]
@@ -189,6 +222,33 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         )
         let session = (result["sessions"] as? [[String: Any]])?.first
         XCTAssertEqual(session?["had_errors"] as? Bool, true)
+    }
+
+    func testListSessions_passesMetadataFiltersToScanner() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "list_sessions",
+                "workspace": "FilterWorkspace",
+                "agent_kind": "claude",
+                "model": "sonnet",
+                "touched_file": "Sources/App.swift",
+                "date_from": "2026-06-10T12:00:00Z",
+                "date_to": "2026-06-11T12:00:00Z"
+            ],
+            scanner: mockScanner
+        )
+
+        XCTAssertEqual(result["total_sessions"] as? Int, 1)
+        let request = try XCTUnwrap(mockScanner.filterRequests.first)
+        XCTAssertEqual(request.workspace, "FilterWorkspace")
+        XCTAssertEqual(request.agentKind, "claude")
+        XCTAssertEqual(request.model, "sonnet")
+        XCTAssertEqual(request.filePath, "Sources/App.swift")
+        XCTAssertEqual(request.from, HistoryMCPToolService.parseDate("2026-06-10T12:00:00Z"))
+        XCTAssertEqual(request.to, HistoryMCPToolService.parseDate("2026-06-11T12:00:00Z"))
     }
 
     // MARK: - search
@@ -991,6 +1051,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertNotEqual(snippet, text)
     }
 
+    func testExtractSnippet_usesFirstOccurrence() {
+        let prefix = String(repeating: "a", count: 40)
+        let middle = String(repeating: "b", count: 260)
+        let suffix = String(repeating: "c", count: 40)
+        let text = "\(prefix)FINDME_FIRST\(middle)FINDME_SECOND\(suffix)"
+
+        let snippet = HistoryMCPToolService.extractSnippet(text: text, query: "FINDME")
+        XCTAssertTrue(snippet.contains("FINDME_FIRST"))
+        XCTAssertFalse(snippet.contains("FINDME_SECOND"))
+    }
+
     func testExtractSnippet_queryAtStart() {
         let suffix = String(repeating: "a", count: 200)
         let text = "FINDME\(suffix)"
@@ -1015,78 +1086,54 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     // MARK: - Role Mapping
 
-    func testMapActivityRole_assistant() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.assistant), "assistant")
-    }
+    func testMapActivityRole_userFacingGroups() {
+        let cases: [(AgentTranscriptActivityRole, String)] = [
+            (.assistant, "assistant"),
+            (.thinking, "assistant"),
+            (.toolExecution, "tool"),
+            (.progress, "system"),
+            (.note, "system"),
+            (.system, "system"),
+            (.error, "system")
+        ]
 
-    func testMapActivityRole_thinking() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.thinking), "assistant")
-    }
-
-    func testMapActivityRole_toolExecution() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.toolExecution), "tool")
-    }
-
-    func testMapActivityRole_progress() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.progress), "system")
-    }
-
-    func testMapActivityRole_note() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.note), "system")
-    }
-
-    func testMapActivityRole_system() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.system), "system")
-    }
-
-    func testMapActivityRole_error() {
-        XCTAssertEqual(HistoryMCPToolService.mapActivityRole(.error), "system")
+        for (role, expected) in cases {
+            XCTAssertEqual(HistoryMCPToolService.mapActivityRole(role), expected, "role=\(role)")
+        }
     }
 
     // MARK: - parseDate
 
-    func testParseDate_validISO8601() {
-        let date = HistoryMCPToolService.parseDate("2026-06-10T12:00:00Z")
-        XCTAssertNotNil(date)
+    func testParseDate_acceptsISO8601WithAndWithoutFractionalSeconds() {
+        for value in ["2026-06-10T12:00:00Z", "2026-06-10T12:00:00.123Z"] {
+            XCTAssertNotNil(HistoryMCPToolService.parseDate(value), value)
+        }
     }
 
-    func testParseDate_validISO8601WithFractional() {
-        let date = HistoryMCPToolService.parseDate("2026-06-10T12:00:00.123Z")
-        XCTAssertNotNil(date)
-    }
-
-    func testParseDate_nil() {
-        let date = HistoryMCPToolService.parseDate(nil)
-        XCTAssertNil(date)
-    }
-
-    func testParseDate_emptyString() {
-        let date = HistoryMCPToolService.parseDate("")
-        XCTAssertNil(date)
-    }
-
-    func testParseDate_invalidString() {
-        let date = HistoryMCPToolService.parseDate("not-a-date")
-        XCTAssertNil(date)
+    func testParseDate_returnsNilForMissingOrInvalidValues() {
+        for value in [nil, "", "not-a-date"] as [String?] {
+            XCTAssertNil(HistoryMCPToolService.parseDate(value), value ?? "nil")
+        }
     }
 
     // MARK: - clampLimit
 
-    func testClampLimit_defaultValue() {
-        XCTAssertEqual(HistoryMCPToolService.clampLimit(nil, default: 30, max: 100), 30)
-    }
+    func testClampLimit_appliesDefaultBoundsAndMaximum() {
+        let cases: [(value: Int?, expected: Int, label: String)] = [
+            (nil, 30, "default"),
+            (50, 50, "within range"),
+            (200, 100, "maximum"),
+            (0, 1, "zero lower bound"),
+            (-5, 1, "negative lower bound")
+        ]
 
-    func testClampLimit_withinRange() {
-        XCTAssertEqual(HistoryMCPToolService.clampLimit(50, default: 30, max: 100), 50)
-    }
-
-    func testClampLimit_exceedsMax() {
-        XCTAssertEqual(HistoryMCPToolService.clampLimit(200, default: 30, max: 100), 100)
-    }
-
-    func testClampLimit_belowOne() {
-        XCTAssertEqual(HistoryMCPToolService.clampLimit(0, default: 30, max: 100), 1)
-        XCTAssertEqual(HistoryMCPToolService.clampLimit(-5, default: 30, max: 100), 1)
+        for testCase in cases {
+            XCTAssertEqual(
+                HistoryMCPToolService.clampLimit(testCase.value, default: 30, max: 100),
+                testCase.expected,
+                testCase.label
+            )
+        }
     }
 
     // MARK: - Helpers
@@ -1098,7 +1145,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         agentModelRaw: String? = nil,
         keyPaths: Set<String> = [],
         activeDurationSeconds: Int = 0,
+        toolCallCount: Int = 0,
         savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000),
+        firstActivityAt: Date? = nil,
+        lastActivityAt: Date? = nil,
         itemCount: Int = 1,
         lastRunStateRaw: String? = nil,
         hasUnknownContent: Bool = false
@@ -1125,8 +1175,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             observedFileSize: nil,
             observedFileModificationDate: nil,
             lastIndexedAt: savedAt,
+            firstActivityAt: firstActivityAt,
+            lastActivityAt: lastActivityAt,
             keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds
+            activeDurationSeconds: activeDurationSeconds,
+            toolCallCount: toolCallCount
         )
     }
 
@@ -1146,8 +1199,18 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
 // MARK: - Mock Scanner
 
+private struct FilterRequest: Equatable {
+    let workspace: String?
+    let agentKind: String?
+    let model: String?
+    let filePath: String?
+    let from: Date?
+    let to: Date?
+}
+
 private final class MockHistoryScanner: HistorySessionScanning {
     var scanResults: [HistoryWorkspaceScanResult] = []
+    var filterRequests: [FilterRequest] = []
     var transcriptProvider: ((UUID) throws -> AgentTranscript)?
 
     func scanAllWorkspaces() async throws -> [HistoryWorkspaceScanResult] {
@@ -1163,41 +1226,24 @@ private final class MockHistoryScanner: HistorySessionScanning {
         from: Date?,
         to: Date?
     ) -> [HistoryFilteredSessionRecord] {
-        var results: [HistoryFilteredSessionRecord] = []
+        filterRequests.append(FilterRequest(
+            workspace: workspace,
+            agentKind: agentKind,
+            model: model,
+            filePath: filePath,
+            from: from,
+            to: to
+        ))
 
-        for scan in records {
-            if let workspace {
-                let nameMatch = scan.workspaceName.localizedCaseInsensitiveContains(workspace)
-                let idMatch = scan.workspaceID?.uuidString.caseInsensitiveCompare(workspace) == .orderedSame
-                guard nameMatch || idMatch else { continue }
-            }
-
-            for record in scan.records {
-                if let agentKind {
-                    guard record.agentKindRaw?.localizedCaseInsensitiveContains(agentKind) == true else { continue }
-                }
-                if let model {
-                    guard record.agentModelRaw?.localizedCaseInsensitiveContains(model) == true else { continue }
-                }
-                if let filePath {
-                    let matches = record.keyPaths.contains { $0.localizedCaseInsensitiveContains(filePath) }
-                    guard matches else { continue }
-                }
-                if let from {
-                    guard record.activityDate >= from else { continue }
-                }
-                if let to {
-                    guard record.activityDate <= to else { continue }
-                }
-                results.append(HistoryFilteredSessionRecord(
+        return records.flatMap { scan in
+            scan.records.map { record in
+                HistoryFilteredSessionRecord(
                     record: record,
                     workspaceName: scan.workspaceName,
                     workspaceDir: scan.workspaceDir
-                ))
+                )
             }
         }
-
-        return results
     }
 
     func loadTranscriptForSearch(sessionID: UUID, workspaceDir: URL) async throws -> AgentTranscript {

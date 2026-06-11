@@ -124,9 +124,10 @@ Session inventory with content-aware filters.
 
 **Returns:** `total_sessions`, `truncated`, and array of `sessions` with: `session_id`, `session_name`, `workspace_name`, `agent_kind`, `agent_model`, `first_activity_at`, `last_activity_at`, `active_duration_seconds`, `turn_count`, `tool_call_count`, `files_touched`, `had_errors`, `last_run_state`.
 
-- `first_activity_at`: approximated from `savedAt` in v1.
+- `first_activity_at`: earliest indexed transcript turn/activity timestamp, with session activity date as a fallback for legacy indexes.
+- `last_activity_at`: latest indexed transcript turn/activity timestamp, with `savedAt` as a fallback for legacy indexes.
 - `last_run_state`: terminal state of the session's last run — one of `"completed"` | `"cancelled"` | `"failed"` | `"waiting_for_input"`.
-- `request_previews` and `tool_call_count` are omitted from v1. `tool_call_count` returns `0`.
+- `request_previews` is omitted from v1.
 
 ---
 
@@ -169,7 +170,7 @@ Aggregate time-in-session analytics.
 
 **Returns:** `total_sessions`, `total_active_duration_seconds`, `truncated`, and array of `groups` keyed by the `group_by` value. Each group has `sessions`, `active_duration_seconds`, `turn_count`, `tool_call_count`, and optional `details` array with per-session breakdowns.
 
-**Duration:** Sum of turn durations for completed turns. Falls back to span timing when turn completion is unavailable. Excludes gaps > 30 minutes between consecutive turns (idle threshold).
+**Duration:** Sum of turn durations using `completedAt ?? lastActivityAt ?? startedAt` for each turn end. Started-at-only turns contribute elapsed time between adjacent turn starts, which preserves useful duration estimates for provider transcripts that omit completion timestamps. Excludes gaps > 30 minutes between consecutive turns (idle threshold).
 
 ## Implementation Notes
 
@@ -183,15 +184,14 @@ The search operation prioritizes `conclusionText` (the full, non-truncated concl
 
 ### Metadata index
 
-`AgentSessionMetadataRecord` was extended with `keyPaths: Set<String>` and `activeDurationSeconds: Int` fields. The index schema version was bumped from 2 → 3, triggering automatic rebuild on first access. Key paths are aggregated from `AgentTranscriptTurnSummary.keyPaths` which survives all compaction tiers.
+`AgentSessionMetadataRecord` was extended with `keyPaths: Set<String>`, `activeDurationSeconds: Int`, `toolCallCount: Int`, `firstActivityAt: Date?`, and `lastActivityAt: Date?`. The index schema version was bumped to 4, triggering automatic rebuild on first access for older indexes. Key paths are aggregated from `AgentTranscriptTurnSummary.keyPaths` for compacted turns and from persisted `toolExecution.keyPaths` for active turns. Tool counts are aggregated from summary `toolCount` when present, otherwise from tool execution activities.
 
 ### Known gaps (v1)
 
 - Secret sanitization in search snippets deferred to v2 (`MCPResponseSanitizationPolicy` does not exist). Snippets may expose tool args containing secrets. Risk is bounded (session data is local).
 - `file_edits` and `knowledge` ops deferred (see `docs/spec/history-query-tools-extensions.md`).
 - `request_previews` omitted from `list_sessions` response.
-- `tool_call_count` returns `0` (no metadata field yet).
-- `first_activity_at` uses `savedAt` as an approximation.
+- `files_touched` depends on persisted summary key paths or persisted `toolExecution.keyPaths`; older sanitized sessions whose tool args were stripped before key path extraction may still have empty file lists.
 - `had_errors` maps to `hasUnknownConversationContent` (semantically broader than "had errors").
 - Invalid `session_id` filter values (non-UUID strings) are silently ignored rather than throwing an error.
 - `time` response `truncated` is always `false` (no limit parameter in v1).

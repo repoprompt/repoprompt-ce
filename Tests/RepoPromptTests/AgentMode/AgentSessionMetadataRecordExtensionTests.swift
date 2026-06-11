@@ -26,6 +26,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
         XCTAssertEqual(record.keyPaths, [])
         XCTAssertEqual(record.activeDurationSeconds, 0)
+        XCTAssertEqual(record.toolCallCount, 0)
+        XCTAssertNil(record.firstActivityAt)
+        XCTAssertNil(record.lastActivityAt)
     }
 
     func testDecodingPresentKeyPathsAndDurationFields() throws {
@@ -41,8 +44,11 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             "hasUnknownConversationContent": false,
             "autoEditEnabled": true,
             "lastIndexedAt": \(now.timeIntervalSince1970),
+            "firstActivityAt": \(now.addingTimeInterval(-60).timeIntervalSinceReferenceDate),
+            "lastActivityAt": \(now.addingTimeInterval(-5).timeIntervalSinceReferenceDate),
             "keyPaths": ["src/foo.swift", "src/bar.swift"],
-            "activeDurationSeconds": 42
+            "activeDurationSeconds": 42,
+            "toolCallCount": 7
         }
         """
         let data = try XCTUnwrap(json.data(using: .utf8))
@@ -50,6 +56,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
         XCTAssertEqual(record.keyPaths, Set(["src/foo.swift", "src/bar.swift"]))
         XCTAssertEqual(record.activeDurationSeconds, 42)
+        XCTAssertEqual(record.toolCallCount, 7)
+        XCTAssertEqual(record.firstActivityAt, now.addingTimeInterval(-60))
+        XCTAssertEqual(record.lastActivityAt, now.addingTimeInterval(-5))
     }
 
     func testRoundTripEncodingDecoding() throws {
@@ -77,8 +86,11 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             observedFileSize: nil,
             observedFileModificationDate: nil,
             lastIndexedAt: now,
+            firstActivityAt: now.addingTimeInterval(-120),
+            lastActivityAt: now.addingTimeInterval(-10),
             keyPaths: ["a.swift", "b.swift"],
-            activeDurationSeconds: 99
+            activeDurationSeconds: 99,
+            toolCallCount: 4
         )
 
         let encoder = JSONEncoder()
@@ -87,6 +99,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
         XCTAssertEqual(decoded.keyPaths, Set(["a.swift", "b.swift"]))
         XCTAssertEqual(decoded.activeDurationSeconds, 99)
+        XCTAssertEqual(decoded.toolCallCount, 4)
+        XCTAssertEqual(decoded.firstActivityAt, now.addingTimeInterval(-120))
+        XCTAssertEqual(decoded.lastActivityAt, now.addingTimeInterval(-10))
         XCTAssertEqual(decoded.id, uuid)
     }
 
@@ -414,8 +429,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             observedFileModificationDate: nil
         )
 
-        // First turn has no completion → skipped. Second turn is first valid: 200-100 = 100.
-        XCTAssertEqual(record.activeDurationSeconds, 100)
+        // First turn has no completion/activity timestamps → falls back to startedAt (0 duration).
+        // previousEnd advances to t=0. Second turn continuous from prev end: 200-0 = 200.
+        XCTAssertEqual(record.activeDurationSeconds, 200)
     }
 
     func testActiveDurationUsesLastActivityAtFallback() {
@@ -453,18 +469,255 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.activeDurationSeconds, 0)
     }
 
+    // MARK: - Activity Bounds
+
+    func testFactoryComputesActivityBoundsFromTranscriptTurns() {
+        let session = makeSession(turns: [
+            makeTurn(
+                startedAt: Date(timeIntervalSince1970: 100),
+                completedAt: Date(timeIntervalSince1970: 160)
+            ),
+            makeTurn(
+                startedAt: Date(timeIntervalSince1970: 200),
+                completedAt: nil,
+                lastActivityAt: Date(timeIntervalSince1970: 245)
+            )
+        ])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        XCTAssertEqual(record.firstActivityAt, Date(timeIntervalSince1970: 100))
+        XCTAssertEqual(record.lastActivityAt, Date(timeIntervalSince1970: 245))
+    }
+
+    // MARK: - toolCallCount
+
+    func testToolCallCount_withToolExecutions() {
+        let toolActivity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 5),
+            sequenceIndex: 0,
+            role: .toolExecution,
+            itemKind: .assistant,
+            text: "",
+            toolExecution: AgentTranscriptToolExecution(
+                stableExecutionID: "exec-1",
+                toolName: "apply_edits",
+                invocationID: nil,
+                argsJSON: nil,
+                resultJSON: nil,
+                toolIsError: nil,
+                status: .success,
+                keyPaths: ["src/main.swift"]
+            )
+        )
+        let assistantActivity = AgentTranscriptActivity(
+            id: UUID(),
+            timestamp: Date(timeIntervalSince1970: 3),
+            sequenceIndex: 0,
+            role: .assistant,
+            itemKind: .assistant,
+            text: "Hello"
+        )
+        let span = AgentTranscriptProviderResponseSpan(
+            id: UUID(),
+            startedAt: Date(timeIntervalSince1970: 0),
+            activities: [assistantActivity, toolActivity]
+        )
+        // Two turns, each with one tool execution.
+        let turn1 = AgentTranscriptTurn(
+            responseSpans: [span],
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 30)
+        )
+        let turn2 = AgentTranscriptTurn(
+            responseSpans: [span],
+            startedAt: Date(timeIntervalSince1970: 40),
+            completedAt: Date(timeIntervalSince1970: 70)
+        )
+        let session = makeSession(turns: [turn1, turn2])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        // 2 turns × 1 tool execution per turn = 2 total.
+        XCTAssertEqual(record.toolCallCount, 2)
+    }
+
+    func testToolCallCount_noToolExecutions() {
+        let session = makeSession(turns: [
+            makeTurn(
+                startedAt: Date(timeIntervalSince1970: 0),
+                completedAt: Date(timeIntervalSince1970: 10)
+            )
+        ])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        XCTAssertEqual(record.toolCallCount, 0)
+    }
+
+    func testToolCallCount_usesSummaryToolCountForCompactedTurns() {
+        let session = makeSession(turns: [
+            makeTurn(
+                summary: .init(
+                    requestText: nil,
+                    conclusionText: nil,
+                    compactConclusionText: nil,
+                    middleSummaryText: nil,
+                    toolCount: 4,
+                    notableToolNames: ["apply_edits"],
+                    keyPaths: ["Sources/App.swift"],
+                    compactedActivityCount: 7,
+                    hadWarning: false,
+                    hadError: false
+                ),
+                startedAt: Date(timeIntervalSince1970: 0),
+                completedAt: Date(timeIntervalSince1970: 10)
+            )
+        ])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        XCTAssertEqual(record.toolCallCount, 4)
+    }
+
+    // MARK: - Duration with startedAt-only turns
+
+    func testActiveDuration_continuousTurnsWithOnlyStartedAt() {
+        // Turns with no completedAt or lastActivityAt — only startedAt.
+        // Each contributes 0 duration but advances previousEnd for gap tracking.
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 60)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 120))
+        ])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        // All turns have end == start (startedAt fallback).
+        // Turn 1: 0s. Turn 2: continuous from prev end (0), 60-0=60s. Turn 3: continuous from prev end (60), 120-60=60s.
+        // Total: 0+60+60 = 120.
+        XCTAssertEqual(record.activeDurationSeconds, 120)
+    }
+
+    func testActiveDuration_mixedTurnsSomeWithCompletionSomeWithout() {
+        // Turn 1: has completion (0-60 = 60s).
+        // Turn 2: no completion, only startedAt at t=70 → 0 duration, advances previousEnd to 70.
+        // Turn 3: has completion (80-140 = 60s). Continuous from prev end (70): 140-70 = 70s.
+        let session = makeSession(turns: [
+            makeTurn(
+                startedAt: Date(timeIntervalSince1970: 0),
+                completedAt: Date(timeIntervalSince1970: 60)
+            ),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 70)),
+            makeTurn(
+                startedAt: Date(timeIntervalSince1970: 80),
+                completedAt: Date(timeIntervalSince1970: 140)
+            )
+        ])
+
+        let fileURL = URL(fileURLWithPath: "/tmp/AgentSession-test.json")
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: fileURL,
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+
+        // Turn 1: 60s. Turn 2: startedAt fallback, continuous 70-60=10s. Turn 3: continuous 140-70=70s. Total=140.
+        XCTAssertEqual(record.activeDurationSeconds, 140)
+    }
+
     // MARK: - matchesIndexedSessionMetadata
 
-    func testMatchesIndexedSessionMetadataComparNewFields() {
+    func testMatchesIndexedSessionMetadataComparesHistoryIndexFields() {
         let id = UUID()
-        let base = makeMinimalRecord(id: id, keyPaths: ["a.swift"], activeDurationSeconds: 10)
-        let same = makeMinimalRecord(id: id, keyPaths: ["a.swift"], activeDurationSeconds: 10)
-        let differentKeyPaths = makeMinimalRecord(id: id, keyPaths: ["b.swift"], activeDurationSeconds: 10)
-        let differentDuration = makeMinimalRecord(id: id, keyPaths: ["a.swift"], activeDurationSeconds: 20)
+        let firstActivity = Date(timeIntervalSince1970: 10)
+        let lastActivity = Date(timeIntervalSince1970: 20)
+        let base = makeMinimalRecord(
+            id: id,
+            keyPaths: ["a.swift"],
+            activeDurationSeconds: 10,
+            toolCallCount: 2,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        let same = makeMinimalRecord(
+            id: id,
+            keyPaths: ["a.swift"],
+            activeDurationSeconds: 10,
+            toolCallCount: 2,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        let differentKeyPaths = makeMinimalRecord(
+            id: id,
+            keyPaths: ["b.swift"],
+            activeDurationSeconds: 10,
+            toolCallCount: 2,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        let differentDuration = makeMinimalRecord(
+            id: id,
+            keyPaths: ["a.swift"],
+            activeDurationSeconds: 20,
+            toolCallCount: 2,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        let differentToolCount = makeMinimalRecord(
+            id: id,
+            keyPaths: ["a.swift"],
+            activeDurationSeconds: 10,
+            toolCallCount: 3,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity
+        )
+        let differentActivityBounds = makeMinimalRecord(
+            id: id,
+            keyPaths: ["a.swift"],
+            activeDurationSeconds: 10,
+            toolCallCount: 2,
+            firstActivityAt: firstActivity,
+            lastActivityAt: lastActivity.addingTimeInterval(1)
+        )
 
         XCTAssertTrue(base.matchesIndexedSessionMetadata(same))
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentKeyPaths))
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentDuration))
+        XCTAssertFalse(base.matchesIndexedSessionMetadata(differentToolCount))
+        XCTAssertFalse(base.matchesIndexedSessionMetadata(differentActivityBounds))
     }
 
     // MARK: - Helpers
@@ -472,7 +725,10 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     private func makeMinimalRecord(
         id: UUID = UUID(),
         keyPaths: Set<String>,
-        activeDurationSeconds: Int
+        activeDurationSeconds: Int,
+        toolCallCount: Int = 0,
+        firstActivityAt: Date? = nil,
+        lastActivityAt: Date? = nil
     ) -> AgentSessionMetadataRecord {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         return AgentSessionMetadataRecord(
@@ -497,8 +753,11 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             observedFileSize: nil,
             observedFileModificationDate: nil,
             lastIndexedAt: now,
+            firstActivityAt: firstActivityAt,
+            lastActivityAt: lastActivityAt,
             keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds
+            activeDurationSeconds: activeDurationSeconds,
+            toolCallCount: toolCallCount
         )
     }
 

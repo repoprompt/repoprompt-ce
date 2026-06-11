@@ -2,57 +2,108 @@ import Foundation
 @testable import RepoPrompt
 import XCTest
 
-/// Integration tests that exercise the full `history` MCP tool flow end-to-end
-/// through `HistoryMCPToolService.execute(args:scanner:)` using a real
-/// `HistorySessionScanner` backed by temporary directory fixtures.
+/// End-to-end history MCP tests against generated on-disk workspace/session fixtures.
 ///
-/// Each test creates `AgentSession` objects with realistic transcripts,
-/// runs them through `AgentSessionMetadataRecord.record(from:)` to build
-/// metadata via the **real indexer** (not hand-crafted records), writes the
-/// results to disk, and calls the service. This catches bugs in the indexer
-/// that hand-crafted record tests cannot.
+/// These tests intentionally avoid hand-crafted `AgentSessionMetadataRecord` values.
+/// Each fixture writes real `AgentSession` JSON, builds `AgentSessionIndex.json` through
+/// `AgentSessionMetadataRecord.record(from:)`, then exercises `HistorySessionScanner`
+/// and `HistoryMCPToolService` together.
 final class HistoryIntegrationTests: XCTestCase {
-    // MARK: - Test Infrastructure
-
-    private var tempDir: URL!
-    private var workspacesRoot: URL!
+    private var fixture: HistoryTestFixture!
     private var scanner: HistorySessionScanner!
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
 
-    override func setUp() {
-        super.setUp()
-        tempDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("HistoryIntegrationTests-\(UUID().uuidString)", isDirectory: true)
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-        workspacesRoot = tempDir.appendingPathComponent("Workspaces", isDirectory: true)
-        scanner = HistorySessionScanner(applicationSupportRoot: tempDir)
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        fixture = try HistoryTestFixture()
+        scanner = fixture.makeScanner()
     }
 
-    override func tearDown() {
-        try? FileManager.default.removeItem(at: tempDir)
-        super.tearDown()
+    override func tearDownWithError() throws {
+        scanner = nil
+        fixture = nil
+        try super.tearDownWithError()
     }
 
-    // MARK: - 1. Cross-workspace list_sessions
+    func testRawSessionFixtures_alignWithPersistedSessionJSONShapes() async throws {
+        let workspace = try fixture.createWorkspace(name: "RawFixtureProject")
+        _ = try fixture.installRawFixtures([
+            HistoryTestFixture.rawToolExecutionFixture,
+            HistoryTestFixture.rawStartedAtOnlyFixture,
+            HistoryTestFixture.rawCompactedSummaryFixture
+        ], in: workspace)
 
-    func testListSessions_crossWorkspace_includesBothWorkspaces() async throws {
-        let ws1ID = UUID()
-        let ws2ID = UUID()
-        let session1ID = UUID()
-        let session2ID = UUID()
+        let listResult = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "limit": 10],
+            scanner: scanner
+        )
+        XCTAssertEqual(listResult["total_sessions"] as? Int, 3)
+        let sessions = try sessionRows(listResult)
 
-        let ws1 = try createWorkspaceDir(name: "ProjectAlpha", uuid: ws1ID)
-        try writeWorkspaceJSON(in: ws1, name: "ProjectAlpha", id: ws1ID)
-        try createAgentSessionsIndex(in: ws1, records: [
-            makeRecord(id: session1ID, name: "Alpha Session", savedAt: Date(timeIntervalSince1970: 1_700_000_100))
-        ])
+        let toolRow = try XCTUnwrap(row(named: "Raw Tool Execution Session", in: sessions))
+        XCTAssertEqual(toolRow["files_touched"] as? [String], ["src/api/register.ts", "src/logging/log.ts"])
+        XCTAssertEqual(toolRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawToolExecutionFixture.expectedDurationSeconds)
+        XCTAssertEqual(toolRow["tool_call_count"] as? Int, HistoryTestFixture.rawToolExecutionFixture.expectedToolCallCount)
+        assertActivityBounds(
+            toolRow,
+            first: HistoryTestFixture.rawToolExecutionFixture.expectedFirstActivityAt,
+            last: HistoryTestFixture.rawToolExecutionFixture.expectedLastActivityAt
+        )
 
-        let ws2 = try createWorkspaceDir(name: "ProjectBeta", uuid: ws2ID)
-        try writeWorkspaceJSON(in: ws2, name: "ProjectBeta", id: ws2ID)
-        try createAgentSessionsIndex(in: ws2, records: [
-            makeRecord(id: session2ID, name: "Beta Session", savedAt: Date(timeIntervalSince1970: 1_700_000_200))
-        ])
+        let startedOnlyRow = try XCTUnwrap(row(named: "Raw StartedAt Only Session", in: sessions))
+        XCTAssertEqual(startedOnlyRow["files_touched"] as? [String], [])
+        XCTAssertEqual(startedOnlyRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawStartedAtOnlyFixture.expectedDurationSeconds)
+        XCTAssertEqual(startedOnlyRow["tool_call_count"] as? Int, 0)
+        assertActivityBounds(
+            startedOnlyRow,
+            first: HistoryTestFixture.rawStartedAtOnlyFixture.expectedFirstActivityAt,
+            last: HistoryTestFixture.rawStartedAtOnlyFixture.expectedLastActivityAt
+        )
+
+        let summaryRow = try XCTUnwrap(row(named: "Raw Compacted Summary Session", in: sessions))
+        XCTAssertEqual(summaryRow["files_touched"] as? [String], ["Sources/History/RawSummary.swift"])
+        XCTAssertEqual(summaryRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawCompactedSummaryFixture.expectedDurationSeconds)
+        XCTAssertEqual(summaryRow["tool_call_count"] as? Int, HistoryTestFixture.rawCompactedSummaryFixture.expectedToolCallCount)
+
+        let activitySearch = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "raw persisted logging"],
+            scanner: scanner
+        )
+        XCTAssertEqual(activitySearch["total_matches"] as? Int, 1)
+        XCTAssertEqual(try searchRows(activitySearch).first?["source"] as? String, "activity")
+
+        let summarySearch = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "raw summary keyword"],
+            scanner: scanner
+        )
+        XCTAssertEqual(summarySearch["total_matches"] as? Int, 1)
+        XCTAssertEqual(try searchRows(summarySearch).first?["source"] as? String, "summary")
+
+        let timeResult = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "workspace"],
+            scanner: scanner
+        )
+        XCTAssertEqual(timeResult["total_active_duration_seconds"] as? Int, 410)
+        let groups = try groupRows(timeResult)
+        let rawGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "RawFixtureProject" })
+        XCTAssertEqual(rawGroup["sessions"] as? Int, 3)
+        XCTAssertEqual(rawGroup["tool_call_count"] as? Int, 6)
+    }
+
+    func testListSessions_crossWorkspace_readsGeneratedIndexes() async throws {
+        let alpha = try fixture.createWorkspace(name: "ProjectAlpha")
+        let beta = try fixture.createWorkspace(name: "ProjectBeta")
+        let alphaSession = HistoryTestFixture.toolExecutionSession(
+            name: "Alpha Session",
+            files: ["Sources/Alpha.swift"],
+            startedAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        let betaSession = HistoryTestFixture.toolExecutionSession(
+            name: "Beta Session",
+            files: ["Sources/Beta.swift"],
+            startedAt: Date(timeIntervalSince1970: 1_700_000_200)
+        )
+        try fixture.install([alphaSession], in: alpha)
+        try fixture.install([betaSession], in: beta)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "list_sessions"],
@@ -61,151 +112,123 @@ final class HistoryIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result["total_sessions"] as? Int, 2)
         XCTAssertEqual(result["truncated"] as? Bool, false)
-
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertNotNil(sessions)
-        XCTAssertEqual(sessions?.count, 2)
-
-        let workspaceNames = sessions?.compactMap { $0["workspace_name"] as? String }.sorted()
-        XCTAssertEqual(workspaceNames, ["ProjectAlpha", "ProjectBeta"])
-
-        // Verify each session carries the correct workspace_name
-        let alphaSession = sessions?.first { $0["workspace_name"] as? String == "ProjectAlpha" }
-        XCTAssertEqual(alphaSession?["session_name"] as? String, "Alpha Session")
-        XCTAssertEqual(alphaSession?["session_id"] as? String, session1ID.uuidString)
-
-        let betaSession = sessions?.first { $0["workspace_name"] as? String == "ProjectBeta" }
-        XCTAssertEqual(betaSession?["session_name"] as? String, "Beta Session")
-        XCTAssertEqual(betaSession?["session_id"] as? String, session2ID.uuidString)
+        let sessions = try sessionRows(result)
+        XCTAssertEqual(Set(sessions.compactMap { $0["workspace_name"] as? String }), ["ProjectAlpha", "ProjectBeta"])
+        XCTAssertEqual(row(named: "Alpha Session", in: sessions)?["session_id"] as? String, alphaSession.id.uuidString)
+        XCTAssertEqual(row(named: "Beta Session", in: sessions)?["session_id"] as? String, betaSession.id.uuidString)
     }
 
-    // MARK: - 2. list_sessions filter by touched_file
-
-    func testListSessions_filterByTouchedFile_returnsMatchingOnly() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "MyProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "MyProject", id: wsID)
-
-        let matchID = UUID()
-        let noMatchID = UUID()
-
-        // Build sessions with tool execution activities — the indexer should extract keyPaths.
-        let matchSession = makeSessionWithToolExecutions(
-            id: matchID,
-            name: "Touched File Session",
-            keyPaths: ["src/main.swift", "lib/utils.swift"]
+    func testListSessions_workspaceFilterMatchesDirectoryNameWhenMetadataNameDiffers() async throws {
+        let workspace = try fixture.createWorkspace(
+            name: "Display Name From Workspace JSON",
+            directoryName: "Workspace-DirectoryOnlyProject-6E7C25B8-4F53-4BD2-B2B2-44B4FBE4C001"
         )
-        let noMatchSession = makeSessionWithToolExecutions(
-            id: noMatchID,
-            name: "No Match Session",
-            keyPaths: ["docs/README.md"]
+        let spec = HistoryTestFixture.toolExecutionSession(
+            name: "Directory Filter Match",
+            files: ["Sources/History.swift"]
         )
-
-        try createAgentSessionsIndex(in: ws, records: [
-            indexRecord(from: matchSession, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
-            indexRecord(from: noMatchSession, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
-        ])
+        try fixture.install([spec], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions", "touched_file": "main.swift"],
+            args: ["op": "list_sessions", "workspace": "DirectoryOnlyProject"],
             scanner: scanner
         )
 
         XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.count, 1)
-        XCTAssertEqual(sessions?.first?["session_id"] as? String, matchID.uuidString)
-
-        // Verify files_touched is populated from tool execution keyPaths.
-        let filesTouched = sessions?.first?["files_touched"] as? [String]
-        XCTAssertEqual(filesTouched, ["lib/utils.swift", "src/main.swift"])
+        let sessions = try sessionRows(result)
+        XCTAssertEqual(sessions.first?["session_name"] as? String, "Directory Filter Match")
+        XCTAssertEqual(sessions.first?["workspace_name"] as? String, "Display Name From Workspace JSON")
     }
 
-    // MARK: - 3. list_sessions truncation
-
-    func testListSessions_truncation_whenMoreThanLimit() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "BigProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "BigProject", id: wsID)
-
-        // Create 5 sessions, limit to 3
-        var records: [AgentSessionMetadataRecord] = []
-        for i in 0 ..< 5 {
-            records.append(makeRecord(
-                id: UUID(),
-                name: "Session \(i)",
-                savedAt: Date(timeIntervalSince1970: 1_700_000_000 + Double(i * 100))
-            ))
-        }
-        try createAgentSessionsIndex(in: ws, records: records)
+    func testListSessions_metadataDerivedFromRealSessionFiles() async throws {
+        let workspace = try fixture.createWorkspace(name: "FixtureProject")
+        let edited = HistoryTestFixture.toolExecutionSession(
+            name: "Edited Files",
+            files: ["Sources/Foo.swift", "Sources/Bar.swift"],
+            toolCount: 2,
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            durationSeconds: 120
+        )
+        let compacted = HistoryTestFixture.compactedSummarySession(
+            name: "Compacted Summary",
+            files: ["Docs/History.md"],
+            toolCount: 3,
+            startedAt: Date(timeIntervalSince1970: 1_700_001_000),
+            durationSeconds: 90
+        )
+        let startedOnly = HistoryTestFixture.startedAtOnlySession(
+            name: "StartedAt Only",
+            offsets: [0, 60, 120, 200],
+            base: Date(timeIntervalSince1970: 1_700_002_000)
+        )
+        let failed = HistoryTestFixture.failedSession(
+            name: "Failed Session",
+            startedAt: Date(timeIntervalSince1970: 1_700_003_000),
+            durationSeconds: 30
+        )
+        try fixture.install([edited, compacted, startedOnly, failed], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions", "limit": 3],
+            args: ["op": "list_sessions", "limit": 10],
+            scanner: scanner
+        )
+        let sessions = try sessionRows(result)
+
+        let editedRow = try XCTUnwrap(row(named: "Edited Files", in: sessions))
+        XCTAssertEqual(editedRow["files_touched"] as? [String], ["Sources/Bar.swift", "Sources/Foo.swift"])
+        XCTAssertEqual(editedRow["active_duration_seconds"] as? Int, edited.expectedDurationSeconds)
+        XCTAssertEqual(editedRow["tool_call_count"] as? Int, edited.expectedToolCallCount)
+        assertActivityBounds(editedRow, first: edited.expectedFirstActivityAt, last: edited.expectedLastActivityAt)
+
+        let compactedRow = try XCTUnwrap(row(named: "Compacted Summary", in: sessions))
+        XCTAssertEqual(compactedRow["files_touched"] as? [String], ["Docs/History.md"])
+        XCTAssertEqual(compactedRow["tool_call_count"] as? Int, compacted.expectedToolCallCount)
+
+        let startedOnlyRow = try XCTUnwrap(row(named: "StartedAt Only", in: sessions))
+        XCTAssertEqual(startedOnlyRow["active_duration_seconds"] as? Int, startedOnly.expectedDurationSeconds)
+        assertActivityBounds(startedOnlyRow, first: startedOnly.expectedFirstActivityAt, last: startedOnly.expectedLastActivityAt)
+
+        let failedRow = try XCTUnwrap(row(named: "Failed Session", in: sessions))
+        XCTAssertEqual(failedRow["last_run_state"] as? String, "failed")
+    }
+
+    func testListSessions_touchedFileFilterUsesIndexedToolExecutionKeyPaths() async throws {
+        let workspace = try fixture.createWorkspace(name: "FilterProject")
+        let matching = HistoryTestFixture.toolExecutionSession(
+            name: "Match",
+            files: ["Package.swift", "Sources/App.swift"],
+            startedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        let nonMatching = HistoryTestFixture.toolExecutionSession(
+            name: "No Match",
+            files: ["README.md"],
+            startedAt: Date(timeIntervalSince1970: 1_700_000_100)
+        )
+        try fixture.install([matching, nonMatching], in: workspace)
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "touched_file": "Package.swift"],
             scanner: scanner
         )
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 5)
-        XCTAssertEqual(result["truncated"] as? Bool, true)
-
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.count, 3)
+        XCTAssertEqual(result["total_sessions"] as? Int, 1)
+        let sessions = try sessionRows(result)
+        XCTAssertEqual(sessions.first?["session_name"] as? String, "Match")
+        XCTAssertEqual(sessions.first?["files_touched"] as? [String], ["Package.swift", "Sources/App.swift"])
     }
 
-    // MARK: - 4. search across compacted and live turns
-
-    func testSearch_matchesCompactedAndLiveTurns() async throws {
-        let wsID = UUID()
-        let sessionID = UUID()
-        let ws = try createWorkspaceDir(name: "SearchProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "SearchProject", id: wsID)
-        try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(id: sessionID, name: "Search Session", savedAt: Date(timeIntervalSince1970: 1_700_000_100))
-        ])
-
-        // Build a transcript with a compacted turn (summary only) and a live turn (activities)
-        let compactedTurn = AgentTranscriptTurn(
-            id: UUID(),
-            retentionTier: .summary,
-            summary: AgentTranscriptTurnSummary(
-                requestText: "Fix the database connection pool",
-                conclusionText: nil,
-                compactConclusionText: "Fixed the database connection pool by adjusting timeout settings",
-                middleSummaryText: nil,
-                toolCount: 3,
-                notableToolNames: ["apply_edits"],
-                keyPaths: ["src/db/pool.swift"],
-                compactedActivityCount: 5,
-                hadWarning: false,
-                hadError: false
-            ),
-            startedAt: Date(timeIntervalSince1970: 1_700_000_050),
-            completedAt: Date(timeIntervalSince1970: 1_700_000_080)
+    func testSearch_matchesActivityAndCompactedSummaryFromSessionFiles() async throws {
+        let workspace = try fixture.createWorkspace(name: "SearchProject")
+        let live = HistoryTestFixture.textSearchSession(
+            name: "Live Activity",
+            activityText: "I found a database connection pool issue in config"
         )
-
-        let liveActivity = AgentTranscriptActivity(
-            id: UUID(),
-            timestamp: Date(timeIntervalSince1970: 1_700_000_110),
-            sequenceIndex: 0,
-            role: .assistant,
-            itemKind: .assistant,
-            text: "I found a database connection pool issue in the configuration file"
+        let compacted = HistoryTestFixture.compactedSummarySession(
+            name: "Compacted Hit",
+            files: ["Sources/DB.swift"],
+            summaryText: "Fixed the database connection pool timeout"
         )
-        let liveSpan = AgentTranscriptProviderResponseSpan(
-            id: UUID(),
-            lifecycle: .completed,
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            activities: [liveActivity]
-        )
-        let liveTurn = AgentTranscriptTurn(
-            id: UUID(),
-            responseSpans: [liveSpan],
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            completedAt: Date(timeIntervalSince1970: 1_700_000_120)
-        )
-
-        let transcript = AgentTranscript(turns: [compactedTurn, liveTurn])
-        let session = AgentSession(id: sessionID, name: "Search Session", transcript: transcript, itemCount: 2)
-        try writeSessionFile(session, in: ws)
+        try fixture.install([live, compacted], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "database connection pool"],
@@ -214,161 +237,72 @@ final class HistoryIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result["total_matches"] as? Int, 2)
         XCTAssertEqual(result["truncated"] as? Bool, false)
-
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertNotNil(results)
-        XCTAssertEqual(results?.count, 2)
-
-        // Verify sources are present — one from activity, one from summary
-        let sources = results?.compactMap { $0["source"] as? String }
-        // The live turn should have source "activity" and the compacted turn "summary"
-        XCTAssertTrue(sources?.contains("activity") == true)
-        XCTAssertTrue(sources?.contains("summary") == true)
+        let results = try searchRows(result)
+        XCTAssertEqual(Set(results.compactMap { $0["source"] as? String }), ["activity", "summary"])
     }
 
-    func testSearch_dedup_whenQueryMatchesBothActivityAndSummary() async throws {
-        let wsID = UUID()
-        let sessionID = UUID()
-        let ws = try createWorkspaceDir(name: "DedupProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "DedupProject", id: wsID)
-        try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(id: sessionID, name: "Dedup Session", savedAt: Date(timeIntervalSince1970: 1_700_000_100))
-        ])
-
-        // Build a turn with both an activity containing "unique_search_term_xyz"
-        // and a summary compactConclusionText containing the same phrase
-        let activity = AgentTranscriptActivity(
-            id: UUID(),
-            timestamp: Date(timeIntervalSince1970: 1_700_000_110),
-            sequenceIndex: 0,
-            role: .assistant,
-            itemKind: .assistant,
-            text: "I resolved the unique_search_term_xyz problem by refactoring"
+    func testSearch_dedupPrefersActivityWhenActivityAndSummaryMatchSameTurn() async throws {
+        let workspace = try fixture.createWorkspace(name: "DedupProject")
+        let spec = HistoryTestFixture.textSearchSession(
+            name: "Dedup Session",
+            activityText: "I resolved unique_search_term_xyz in the implementation",
+            summaryText: "Fixed unique_search_term_xyz"
         )
-        let span = AgentTranscriptProviderResponseSpan(
-            id: UUID(),
-            lifecycle: .completed,
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            activities: [activity]
-        )
-        let turn = AgentTranscriptTurn(
-            id: UUID(),
-            responseSpans: [span],
-            summary: AgentTranscriptTurnSummary(
-                requestText: nil,
-                conclusionText: nil,
-                compactConclusionText: "Fixed the unique_search_term_xyz issue",
-                middleSummaryText: nil,
-                toolCount: 1,
-                notableToolNames: [],
-                keyPaths: [],
-                compactedActivityCount: 0,
-                hadWarning: false,
-                hadError: false
-            ),
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            completedAt: Date(timeIntervalSince1970: 1_700_000_120)
-        )
-
-        let transcript = AgentTranscript(turns: [turn])
-        let session = AgentSession(id: sessionID, name: "Dedup Session", transcript: transcript, itemCount: 1)
-        try writeSessionFile(session, in: ws)
+        try fixture.install([spec], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "unique_search_term_xyz"],
             scanner: scanner
         )
 
-        // Should be only 1 match despite matching in both activity and summary
         XCTAssertEqual(result["total_matches"] as? Int, 1)
-
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
-
-        // Activity takes priority for dedup
-        XCTAssertEqual(results?.first?["source"] as? String, "activity")
+        let rows = try searchRows(result)
+        XCTAssertEqual(rows.first?["source"] as? String, "activity")
     }
 
-    // MARK: - 5. search snippet extraction
-
-    func testSearch_snippetExtraction() async throws {
-        let wsID = UUID()
-        let sessionID = UUID()
-        let ws = try createWorkspaceDir(name: "SnippetProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "SnippetProject", id: wsID)
-        try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(id: sessionID, name: "Snippet Session", savedAt: Date(timeIntervalSince1970: 1_700_000_100))
-        ])
-
-        // Create a long text where the match is in the middle
+    func testSearch_snippetExtractionUsesBoundedContext() async throws {
+        let workspace = try fixture.createWorkspace(name: "SnippetProject")
         let padding = String(repeating: "a", count: 300)
-        let longText = "\(padding)FINDME_KEYWORD_12345\(padding)"
-        let activity = AgentTranscriptActivity(
-            id: UUID(),
-            timestamp: Date(timeIntervalSince1970: 1_700_000_110),
-            sequenceIndex: 0,
-            role: .assistant,
-            itemKind: .assistant,
-            text: longText
-        )
-        let span = AgentTranscriptProviderResponseSpan(
-            id: UUID(),
-            lifecycle: .completed,
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            activities: [activity]
-        )
-        let turn = AgentTranscriptTurn(
-            id: UUID(),
-            responseSpans: [span],
-            startedAt: Date(timeIntervalSince1970: 1_700_000_100),
-            completedAt: Date(timeIntervalSince1970: 1_700_000_120)
-        )
-
-        let transcript = AgentTranscript(turns: [turn])
-        let session = AgentSession(id: sessionID, name: "Snippet Session", transcript: transcript, itemCount: 1)
-        try writeSessionFile(session, in: ws)
+        let text = "\(padding)FINDME_KEYWORD_12345\(padding)"
+        let spec = HistoryTestFixture.textSearchSession(name: "Snippet Session", activityText: text)
+        try fixture.install([spec], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "FINDME_KEYWORD_12345"],
             scanner: scanner
         )
 
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
-
-        let snippet = results?.first?["snippet"] as? String
-        XCTAssertNotNil(snippet)
-
-        // Snippet should be approximately 200 chars (±100 on each side of match)
-        // The exact size depends on match position; verify it's in a reasonable range
-        XCTAssertLessThanOrEqual(snippet?.count ?? 0, 250)
-        XCTAssertGreaterThanOrEqual(snippet?.count ?? 0, 100)
-
-        // Snippet must contain the search term
-        XCTAssertTrue(snippet?.contains("FINDME_KEYWORD_12345") == true)
+        let rows = try searchRows(result)
+        let snippet = try XCTUnwrap(rows.first?["snippet"] as? String)
+        XCTAssertTrue(snippet.contains("FINDME_KEYWORD_12345"))
+        XCTAssertLessThanOrEqual(snippet.count, 250)
+        XCTAssertGreaterThanOrEqual(snippet.count, 100)
+        XCTAssertNotEqual(snippet, text)
     }
 
-    // MARK: - 6. time grouped by day
+    func testSearch_emptyResultSet() async throws {
+        let workspace = try fixture.createWorkspace(name: "NoMatchProject")
+        let spec = HistoryTestFixture.textSearchSession(name: "Session", activityText: "ordinary text")
+        try fixture.install([spec], in: workspace)
 
-    func testTime_groupedByDay() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "TimeProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "TimeProject", id: wsID)
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "this_query_matches_nothing_at_all"],
+            scanner: scanner
+        )
 
-        let gregorian = Calendar(identifier: .gregorian)
-        let day1 = try XCTUnwrap(gregorian.date(from: DateComponents(year: 2026, month: 6, day: 8, hour: 10)))
-        let day2 = try XCTUnwrap(gregorian.date(from: DateComponents(year: 2026, month: 6, day: 9, hour: 14)))
+        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        XCTAssertEqual(result["truncated"] as? Bool, false)
+        XCTAssertEqual(try searchRows(result).count, 0)
+    }
 
-        // Sessions with tool execution turns — durations computed by the real indexer.
-        let s1 = makeSessionWithToolExecutions(name: "Day1-A", keyPaths: [], turnDurationSeconds: 120)
-        let s2 = makeSessionWithToolExecutions(name: "Day1-B", keyPaths: [], turnDurationSeconds: 180)
-        let s3 = makeSessionWithToolExecutions(name: "Day2-A", keyPaths: [], turnDurationSeconds: 300)
-
-        try createAgentSessionsIndex(in: ws, records: [
-            indexRecord(from: s1, savedAt: day1),
-            indexRecord(from: s2, savedAt: day1),
-            indexRecord(from: s3, savedAt: day2)
-        ])
+    func testTime_groupedByDayAggregatesDurationAndToolCalls() async throws {
+        let workspace = try fixture.createWorkspace(name: "TimeProject")
+        let day1 = try localDate(year: 2026, month: 6, day: 8, hour: 12)
+        let day2 = try localDate(year: 2026, month: 6, day: 9, hour: 12)
+        let s1 = HistoryTestFixture.toolExecutionSession(name: "Day1-A", files: [], toolCount: 1, startedAt: day1, durationSeconds: 120)
+        let s2 = HistoryTestFixture.toolExecutionSession(name: "Day1-B", files: [], toolCount: 2, startedAt: day1.addingTimeInterval(300), durationSeconds: 180)
+        let s3 = HistoryTestFixture.toolExecutionSession(name: "Day2-A", files: [], toolCount: 3, startedAt: day2, durationSeconds: 300)
+        try fixture.install([s1, s2, s3], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "day"],
@@ -377,43 +311,29 @@ final class HistoryIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result["total_sessions"] as? Int, 3)
         XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 600)
+        XCTAssertEqual(result["truncated"] as? Bool, false)
+        let groups = try groupRows(result)
+        XCTAssertEqual(groups.count, 2)
 
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertNotNil(groups)
-        XCTAssertEqual(groups?.count, 2)
+        let day2Group = try XCTUnwrap(groups.first { ($0["key"] as? String)?.hasPrefix("2026-06-09") == true })
+        XCTAssertEqual(day2Group["sessions"] as? Int, 1)
+        XCTAssertEqual(day2Group["active_duration_seconds"] as? Int, 300)
+        XCTAssertEqual(day2Group["tool_call_count"] as? Int, 3)
 
-        // Groups sorted descending, so day2 first
-        let day2Group = groups?.first { ($0["key"] as? String)?.hasPrefix("2026-06-09") == true }
-        XCTAssertNotNil(day2Group)
-        XCTAssertEqual(day2Group?["sessions"] as? Int, 1)
-        XCTAssertEqual(day2Group?["active_duration_seconds"] as? Int, 300)
-
-        let day1Group = groups?.first { ($0["key"] as? String)?.hasPrefix("2026-06-08") == true }
-        XCTAssertNotNil(day1Group)
-        XCTAssertEqual(day1Group?["sessions"] as? Int, 2)
-        XCTAssertEqual(day1Group?["active_duration_seconds"] as? Int, 300) // 120 + 180
+        let day1Group = try XCTUnwrap(groups.first { ($0["key"] as? String)?.hasPrefix("2026-06-08") == true })
+        XCTAssertEqual(day1Group["sessions"] as? Int, 2)
+        XCTAssertEqual(day1Group["active_duration_seconds"] as? Int, 300)
+        XCTAssertEqual(day1Group["tool_call_count"] as? Int, 3)
     }
 
-    // MARK: - 7. time by workspace
-
-    func testTime_groupedByWorkspace() async throws {
-        let ws1ID = UUID()
-        let ws2ID = UUID()
-        let ws1 = try createWorkspaceDir(name: "Frontend", uuid: ws1ID)
-        try writeWorkspaceJSON(in: ws1, name: "Frontend", id: ws1ID)
-        let fe1 = makeSessionWithToolExecutions(name: "FE-1", keyPaths: [], turnDurationSeconds: 200)
-        let fe2 = makeSessionWithToolExecutions(name: "FE-2", keyPaths: [], turnDurationSeconds: 100)
-        try createAgentSessionsIndex(in: ws1, records: [
-            indexRecord(from: fe1, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
-            indexRecord(from: fe2, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
-        ])
-
-        let ws2 = try createWorkspaceDir(name: "Backend", uuid: ws2ID)
-        try writeWorkspaceJSON(in: ws2, name: "Backend", id: ws2ID)
-        let be1 = makeSessionWithToolExecutions(name: "BE-1", keyPaths: [], turnDurationSeconds: 400)
-        try createAgentSessionsIndex(in: ws2, records: [
-            indexRecord(from: be1, savedAt: Date(timeIntervalSince1970: 1_700_000_300))
-        ])
+    func testTime_groupedByWorkspaceAggregatesGeneratedMetadata() async throws {
+        let frontend = try fixture.createWorkspace(name: "Frontend")
+        let backend = try fixture.createWorkspace(name: "Backend")
+        let fe1 = HistoryTestFixture.toolExecutionSession(name: "FE-1", files: [], toolCount: 2, durationSeconds: 200)
+        let fe2 = HistoryTestFixture.compactedSummarySession(name: "FE-2", files: [], toolCount: 3, durationSeconds: 100)
+        let be1 = HistoryTestFixture.toolExecutionSession(name: "BE-1", files: [], toolCount: 1, durationSeconds: 400)
+        try fixture.install([fe1, fe2], in: frontend)
+        try fixture.install([be1], in: backend)
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "workspace"],
@@ -422,108 +342,47 @@ final class HistoryIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result["total_sessions"] as? Int, 3)
         XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 700)
+        let groups = try groupRows(result)
 
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertNotNil(groups)
-        XCTAssertEqual(groups?.count, 2)
+        let backendGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "Backend" })
+        XCTAssertEqual(backendGroup["sessions"] as? Int, 1)
+        XCTAssertEqual(backendGroup["active_duration_seconds"] as? Int, 400)
+        XCTAssertEqual(backendGroup["tool_call_count"] as? Int, 1)
 
-        let backendGroup = groups?.first { $0["key"] as? String == "Backend" }
-        XCTAssertNotNil(backendGroup)
-        XCTAssertEqual(backendGroup?["sessions"] as? Int, 1)
-        XCTAssertEqual(backendGroup?["active_duration_seconds"] as? Int, 400)
-
-        let frontendGroup = groups?.first { $0["key"] as? String == "Frontend" }
-        XCTAssertNotNil(frontendGroup)
-        XCTAssertEqual(frontendGroup?["sessions"] as? Int, 2)
-        XCTAssertEqual(frontendGroup?["active_duration_seconds"] as? Int, 300)
+        let frontendGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "Frontend" })
+        XCTAssertEqual(frontendGroup["sessions"] as? Int, 2)
+        XCTAssertEqual(frontendGroup["active_duration_seconds"] as? Int, 300)
+        XCTAssertEqual(frontendGroup["tool_call_count"] as? Int, 5)
     }
 
-    // MARK: - 8. keyPaths from tool executions (not summaries)
-
-    /// This test catches the bug where keyPaths were always empty because the indexer
-    /// only read `summary?.keyPaths` (nil for active turns) and never fell back to
-    /// tool execution activities. The session has NO summary — only tool executions.
-    func testListSessions_filesTouched_fromToolExecutions_notSummary() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "ToolExecProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "ToolExecProject", id: wsID)
-
-        // Session with tool execution activities but NO turn summary.
-        // This is the production shape for active (uncompacted) turns.
-        let session = makeSessionWithToolExecutions(
-            id: UUID(),
-            name: "Active Session",
-            keyPaths: ["Sources/Foo.swift", "Sources/Bar.swift"]
-        )
-        try createAgentSessionsIndex(in: ws, records: [
-            indexRecord(from: session)
-        ])
+    func testTime_sessionFilterWithDetails() async throws {
+        let workspace = try fixture.createWorkspace(name: "DetailsProject")
+        let target = HistoryTestFixture.toolExecutionSession(name: "Target", files: [], toolCount: 2, durationSeconds: 75)
+        let other = HistoryTestFixture.toolExecutionSession(name: "Other", files: [], toolCount: 1, durationSeconds: 50)
+        try fixture.install([target, other], in: workspace)
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions"],
-            scanner: scanner
-        )
-
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.count, 1)
-
-        // keyPaths MUST be populated from tool execution activities, not just summaries.
-        let filesTouched = sessions?.first?["files_touched"] as? [String]
-        XCTAssertEqual(filesTouched, ["Sources/Bar.swift", "Sources/Foo.swift"].sorted())
-    }
-
-    /// Verify touched_file filter works when keyPaths come from tool executions.
-    func testListSessions_touchedFileFilter_worksWithToolExecutionKeyPaths() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "FilterProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "FilterProject", id: wsID)
-
-        let matching = makeSessionWithToolExecutions(name: "Match", keyPaths: ["Package.swift"])
-        let nonMatching = makeSessionWithToolExecutions(name: "NoMatch", keyPaths: ["README.md"])
-
-        try createAgentSessionsIndex(in: ws, records: [
-            indexRecord(from: matching, savedAt: Date(timeIntervalSince1970: 1_700_000_100)),
-            indexRecord(from: nonMatching, savedAt: Date(timeIntervalSince1970: 1_700_000_200))
-        ])
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions", "touched_file": "Package.swift"],
+            args: [
+                "op": "time",
+                "group_by": "session",
+                "include_details": true,
+                "session_id": target.id.uuidString
+            ],
             scanner: scanner
         )
 
         XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.first?["session_name"] as? String, "Match")
+        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 75)
+        let groups = try groupRows(result)
+        XCTAssertEqual(groups.count, 1)
+        XCTAssertEqual(groups.first?["key"] as? String, target.id.uuidString)
+        XCTAssertEqual(groups.first?["tool_call_count"] as? Int, 2)
+        let details = try XCTUnwrap(groups.first?["details"] as? [[String: Any]])
+        XCTAssertEqual(details.first?["session_name"] as? String, "Target")
     }
-
-    /// Verify duration is computed correctly from turn timestamps via the indexer.
-    func testListSessions_duration_computedFromTranscriptTurns() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "DurationProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "DurationProject", id: wsID)
-
-        // Session with a 90-second turn.
-        let session = makeSessionWithToolExecutions(name: "DurationTest", keyPaths: [], turnDurationSeconds: 90)
-        try createAgentSessionsIndex(in: ws, records: [
-            indexRecord(from: session)
-        ])
-
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "list_sessions"],
-            scanner: scanner
-        )
-
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.first?["active_duration_seconds"] as? Int, 90)
-    }
-
-    // MARK: - 9. Empty result set
 
     func testListSessions_emptyResultSet() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "EmptyProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "EmptyProject", id: wsID)
-        // No sessions in this workspace
+        _ = try fixture.createWorkspace(name: "EmptyProject")
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "list_sessions", "workspace": "NonExistent"],
@@ -532,180 +391,39 @@ final class HistoryIntegrationTests: XCTestCase {
 
         XCTAssertEqual(result["total_sessions"] as? Int, 0)
         XCTAssertEqual(result["truncated"] as? Bool, false)
-
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.count, 0)
-    }
-
-    func testSearch_emptyResultSet() async throws {
-        let wsID = UUID()
-        let ws = try createWorkspaceDir(name: "NoMatchProject", uuid: wsID)
-        try writeWorkspaceJSON(in: ws, name: "NoMatchProject", id: wsID)
-        try createAgentSessionsIndex(in: ws, records: [
-            makeRecord(id: UUID(), name: "Session", savedAt: Date(timeIntervalSince1970: 1_700_000_100))
-        ])
-
-        // No session file written — transcript loading will fail and be skipped
-        let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "this_query_matches_nothing_at_all"],
-            scanner: scanner
-        )
-
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 0)
+        XCTAssertEqual(try sessionRows(result).count, 0)
     }
 
     // MARK: - Helpers
 
-    private func createWorkspaceDir(name: String, uuid: UUID) throws -> URL {
-        try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: true)
-        let dirName = "Workspace-\(name)-\(uuid.uuidString)"
-        let wsDir = workspacesRoot.appendingPathComponent(dirName, isDirectory: true)
-        try FileManager.default.createDirectory(at: wsDir, withIntermediateDirectories: true)
-        return wsDir
+    private func sessionRows(_ result: [String: Any]) throws -> [[String: Any]] {
+        try XCTUnwrap(result["sessions"] as? [[String: Any]])
     }
 
-    private func createAgentSessionsIndex(
-        in workspaceDir: URL,
-        records: [AgentSessionMetadataRecord]
-    ) throws {
-        let agentSessions = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
-        try FileManager.default.createDirectory(at: agentSessions, withIntermediateDirectories: true)
-
-        let index = AgentSessionMetadataIndex(
-            schemaVersion: AgentSessionMetadataIndex.currentSchemaVersion,
-            entries: records
-        )
-        let data = try encoder.encode(index)
-        let indexFile = agentSessions.appendingPathComponent("AgentSessionIndex.json")
-        try data.write(to: indexFile, options: .atomic)
+    private func searchRows(_ result: [String: Any]) throws -> [[String: Any]] {
+        try XCTUnwrap(result["results"] as? [[String: Any]])
     }
 
-    private func writeWorkspaceJSON(in workspaceDir: URL, name: String, id: UUID) throws {
-        let json: [String: Any] = ["name": name, "id": id.uuidString]
-        let data = try JSONSerialization.data(withJSONObject: json)
-        let file = workspaceDir.appendingPathComponent("workspace.json")
-        try data.write(to: file, options: .atomic)
+    private func groupRows(_ result: [String: Any]) throws -> [[String: Any]] {
+        try XCTUnwrap(result["groups"] as? [[String: Any]])
     }
 
-    private func writeSessionFile(_ session: AgentSession, in workspaceDir: URL) throws {
-        let agentSessions = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
-        try FileManager.default.createDirectory(at: agentSessions, withIntermediateDirectories: true)
-        let filename = "AgentSession-\(session.id.uuidString).json"
-        let fileURL = agentSessions.appendingPathComponent(filename)
-        let data = try encoder.encode(session)
-        try data.write(to: fileURL, options: .atomic)
+    private func row(named name: String, in rows: [[String: Any]]) -> [String: Any]? {
+        rows.first { $0["session_name"] as? String == name }
     }
 
-    // MARK: - Session + Indexer Helpers
-
-    /// Build a real metadata record by running the session through the indexer factory.
-    /// This exercises `AgentSessionMetadataRecord.record(from:)` including keyPaths
-    /// aggregation and duration computation — the actual production code path.
-    private func indexRecord(
-        from session: AgentSession,
-        savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
-    ) -> AgentSessionMetadataRecord {
-        let fileURL = URL(fileURLWithPath: "AgentSession-\(session.id.uuidString).json")
-        var record = AgentSessionMetadataRecord.record(
-            from: session,
-            fileURL: fileURL,
-            observedFileSize: nil,
-            observedFileModificationDate: nil
-        )
-        // Override savedAt for deterministic date filtering in tests.
-        record.savedAt = savedAt
-        return record
+    private func assertActivityBounds(_ row: [String: Any], first: Date?, last: Date?) {
+        let formatter = ISO8601DateFormatter()
+        if let first {
+            XCTAssertEqual(row["first_activity_at"] as? String, formatter.string(from: first))
+        }
+        if let last {
+            XCTAssertEqual(row["last_activity_at"] as? String, formatter.string(from: last))
+        }
     }
 
-    /// Create a session with turns that have tool execution activities carrying keyPaths.
-    /// This is what production sessions look like for active (uncompacted) turns.
-    private func makeSessionWithToolExecutions(
-        id: UUID = UUID(),
-        name: String = "Test Session",
-        keyPaths: [String],
-        turnDurationSeconds: Int = 60
-    ) -> AgentSession {
-        let toolActivity = AgentTranscriptActivity(
-            id: UUID(),
-            timestamp: Date(timeIntervalSince1970: 1),
-            sequenceIndex: 0,
-            role: .toolExecution,
-            itemKind: .assistant,
-            text: "",
-            toolExecution: AgentTranscriptToolExecution(
-                stableExecutionID: "exec-\(UUID().uuidString)",
-                toolName: "apply_edits",
-                invocationID: nil,
-                argsJSON: nil,
-                resultJSON: nil,
-                toolIsError: nil,
-                status: .success,
-                keyPaths: keyPaths
-            )
-        )
-        let span = AgentTranscriptProviderResponseSpan(
-            id: UUID(),
-            startedAt: Date(timeIntervalSince1970: 0),
-            activities: [toolActivity]
-        )
-        let turn = AgentTranscriptTurn(
-            id: UUID(),
-            responseSpans: [span],
-            startedAt: Date(timeIntervalSince1970: 0),
-            completedAt: Date(timeIntervalSince1970: TimeInterval(turnDurationSeconds))
-        )
-        return AgentSession(
-            id: id,
-            name: name,
-            transcript: AgentTranscript(turns: [turn]),
-            itemCount: 1
-        )
-    }
-
-    /// Create a minimal session with a single turn that has a summary (compacted turn).
-    private func makeSessionWithSummary(
-        id: UUID = UUID(),
-        name: String = "Test Session",
-        summaryKeyPaths: [String] = [],
-        turnDurationSeconds: Int = 60
-    ) -> AgentSession {
-        let turn = AgentTranscriptTurn(
-            id: UUID(),
-            summary: AgentTranscriptTurnSummary(
-                requestText: nil,
-                conclusionText: nil,
-                compactConclusionText: nil,
-                middleSummaryText: nil,
-                toolCount: 1,
-                notableToolNames: [],
-                keyPaths: summaryKeyPaths,
-                compactedActivityCount: 0,
-                hadWarning: false,
-                hadError: false
-            ),
-            startedAt: Date(timeIntervalSince1970: 0),
-            completedAt: Date(timeIntervalSince1970: TimeInterval(turnDurationSeconds))
-        )
-        return AgentSession(
-            id: id,
-            name: name,
-            transcript: AgentTranscript(turns: [turn]),
-            itemCount: 1
-        )
-    }
-
-    /// Minimal record for tests that only exercise metadata scanning (no transcript loading).
-    /// Uses the real indexer via `makeSessionWithSummary` so keyPaths/duration flow through production code.
-    private func makeRecord(
-        id: UUID = UUID(),
-        name: String = "Test Session",
-        savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000)
-    ) -> AgentSessionMetadataRecord {
-        let session = makeSessionWithSummary(id: id, name: name)
-        return indexRecord(from: session, savedAt: savedAt)
+    private func localDate(year: Int, month: Int, day: Int, hour: Int) throws -> Date {
+        let date = Calendar.current.date(from: DateComponents(year: year, month: month, day: day, hour: hour))
+        return try XCTUnwrap(date)
     }
 }
