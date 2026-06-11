@@ -123,7 +123,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
             return try resolveExplicitLaunch(for: config, environment: environment)
         }
 
-        let effectiveHints = CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints)
+        let effectiveHints = Self.effectiveSearchPaths(providerSpecificPaths: config.additionalPathHints)
         let resolved = CommandPathResolver.resolve(
             configuredCommand,
             environment: environment,
@@ -145,7 +145,7 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
         guard configuredCommand.contains("/") else {
             throw OpenCodeACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
-        let effectiveHints = CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints)
+        let effectiveHints = Self.effectiveSearchPaths(providerSpecificPaths: config.additionalPathHints)
         return try validatedLaunch(
             entryPath: CommandPathResolver.expandPath(configuredCommand, environment: environment),
             configuredCommand: configuredCommand,
@@ -205,5 +205,9 @@ final class OpenCodeACPLaunchResolver: @unchecked Sendable {
 
     private func cacheKey(for config: OpenCodeAgentConfig) -> String {
         ([config.commandName] + config.additionalPathHints).joined(separator: "\u{1F}")
+    }
+
+    private static func effectiveSearchPaths(providerSpecificPaths: [String]) -> [String] {
+        CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(providerSpecificPaths)
     }
 }

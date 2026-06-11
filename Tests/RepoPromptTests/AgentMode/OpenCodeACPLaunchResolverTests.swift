@@ -53,8 +53,11 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let fakeHome = try makeTemporaryDirectory()
         let minimalPath = try makeTemporaryDirectory()
         let openCodeBin = fakeHome.appendingPathComponent(".opencode/bin", isDirectory: true)
+        let nativeFallbackBin = fakeHome.appendingPathComponent(".local/bin", isDirectory: true)
         try FileManager.default.createDirectory(at: openCodeBin, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: nativeFallbackBin, withIntermediateDirectories: true)
         let executable = try makeExecutable(in: openCodeBin)
+        _ = try makeExecutable(in: nativeFallbackBin, output: "Native fallback OpenCode ACP support")
         let environment = [
             "HOME": fakeHome.path,
             "PATH": minimalPath.path,
@@ -77,7 +80,7 @@ final class OpenCodeACPLaunchResolverTests: XCTestCase {
         let openCodeHomeBin = "~/.opencode/bin"
 
         XCTAssertEqual(CLILaunchProfiles.openCodeProviderSpecificPaths, [openCodeHomeBin])
-        XCTAssertTrue(CLILaunchProfiles.openCode.supplementalSearchPaths.contains(openCodeHomeBin))
+        XCTAssertEqual(CLILaunchProfiles.openCode.supplementalSearchPaths.first, openCodeHomeBin)
         XCTAssertFalse(CLINativePathDefaults.defaultAdditionalPaths.contains(openCodeHomeBin))
         XCTAssertFalse(CLILaunchProfiles.claudeCode.supplementalSearchPaths.contains(openCodeHomeBin))
         XCTAssertFalse(CLILaunchProfiles.codex.supplementalSearchPaths.contains(openCodeHomeBin))
