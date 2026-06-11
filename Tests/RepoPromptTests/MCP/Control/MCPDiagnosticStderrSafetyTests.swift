@@ -1,7 +1,11 @@
-import Darwin
 import Foundation
 @testable import RepoPromptShared
 import XCTest
+#if canImport(Darwin)
+    import Darwin
+#elseif canImport(Glibc)
+    import Glibc
+#endif
 
 final class MCPDiagnosticStderrSafetyTests: XCTestCase {
     func testMCPDiagnosticStderrPathsUseBestEffortRawFDWriter() throws {
@@ -43,6 +47,11 @@ final class MCPDiagnosticStderrSafetyTests: XCTestCase {
         let scriptedWrites = [2, 2, 1]
 
         MCPBestEffortRawFDWriter.write(payload, to: 42) { _, pointer, count in
+            let callIndex = observedFirstBytes.count
+            guard callIndex < scriptedWrites.count else {
+                XCTFail("Writer should stop after scripted partial writes")
+                return -1
+            }
             guard let pointer else {
                 XCTFail("Expected a non-nil write pointer")
                 return -1
@@ -50,7 +59,7 @@ final class MCPDiagnosticStderrSafetyTests: XCTestCase {
             let bytePointer = pointer.assumingMemoryBound(to: UInt8.self)
             observedFirstBytes.append(bytePointer.pointee)
             observedCounts.append(count)
-            return scriptedWrites[observedFirstBytes.count - 1]
+            return scriptedWrites[callIndex]
         }
 
         XCTAssertEqual(observedFirstBytes, [1, 3, 5])
