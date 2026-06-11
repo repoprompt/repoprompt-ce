@@ -430,11 +430,14 @@ public class APISettingsViewModel: ObservableObject {
         Task { await updateAvailableModels() }
     }
 
-    private func publishClaudeCodeGLMAvailability() {
-        let didChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
+    @discardableResult
+    private func publishClaudeCodeGLMAvailability() -> Bool {
+        let previousSecretPresent = compatibleBackendSecretPresence[.glmZAI] ?? false
+        let configuredDidChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
         compatibleBackendSecretPresence[.glmZAI] = hasStoredZAIKey
-        guard didChange else { return }
+        guard configuredDidChange || previousSecretPresent != hasStoredZAIKey else { return false }
         NotificationCenter.default.post(name: .claudeCodeGLMAvailabilityChanged, object: nil)
+        return true
     }
 
     // MARK: - Claude Code-compatible backends ------------------------------------------------
@@ -740,6 +743,7 @@ public class APISettingsViewModel: ObservableObject {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         invalidateCompatibleBackendTestResult(for: id)
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let postedAvailabilityChange: Bool
         if id == .glmZAI {
             // Share the existing Z.ai API Provider key.
             try await keyManager.saveAPIKey(trimmed, for: .zAI)
@@ -747,12 +751,15 @@ public class APISettingsViewModel: ObservableObject {
             hasStoredZAIKey = !trimmed.isEmpty
             isZaiKeyValid = hasStoredZAIKey
             availableZAIModels = hasStoredZAIKey ? defaultZAIModels : []
-            publishClaudeCodeGLMAvailability()
+            postedAvailabilityChange = publishClaudeCodeGLMAvailability()
         } else {
             try await compatibleBackendStore.saveSecret(trimmed, for: id)
             compatibleBackendSecretPresence[id] = !trimmed.isEmpty
+            postedAvailabilityChange = false
         }
-        postCompatibleBackendAvailabilityChanged()
+        if id != .glmZAI, !postedAvailabilityChange {
+            postCompatibleBackendAvailabilityChanged()
+        }
         if id == .glmZAI {
             await updateAvailableModels()
         } else {
@@ -768,20 +775,24 @@ public class APISettingsViewModel: ObservableObject {
     ) async throws {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         invalidateCompatibleBackendTestResult(for: id)
+        let postedAvailabilityChange: Bool
         if id == .glmZAI {
             try await keyManager.deleteAPIKey(for: .zAI)
             hasStoredZAIKey = false
             zaiApiKey = ""
             isZaiKeyValid = false
             availableZAIModels = []
-            publishClaudeCodeGLMAvailability()
+            postedAvailabilityChange = publishClaudeCodeGLMAvailability()
             zaiCustomModel = ""
             UserDefaults.standard.removeObject(forKey: "customModelZAI")
         } else {
             try await compatibleBackendStore.deleteSecret(for: id)
             compatibleBackendSecretPresence[id] = false
+            postedAvailabilityChange = false
         }
-        postCompatibleBackendAvailabilityChanged()
+        if id != .glmZAI, !postedAvailabilityChange {
+            postCompatibleBackendAvailabilityChanged()
+        }
         if id == .glmZAI {
             await updateAvailableModels()
             resetPreferredModelIfNeeded(for: .zAI)
