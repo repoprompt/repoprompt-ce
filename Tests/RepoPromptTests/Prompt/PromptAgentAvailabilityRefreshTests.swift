@@ -1,70 +1,109 @@
+import Foundation
 @testable import RepoPrompt
 import XCTest
 
 @MainActor
 final class PromptAgentAvailabilityRefreshTests: XCTestCase {
-    func testPromptRefreshesAvailableAgentKindsWhenPreconfiguredZAIKeyLoadsAtStartup() async throws {
-        let defaults = UserDefaults.standard
-        let store = ClaudeCodeCompatibleBackendStore.shared
-        let configuredKey = store.configuredDefaultsKey(for: .glmZAI)
-        let legacyConfiguredKey = ClaudeCodeGLMIntegration.configuredDefaultsKey
-        let configsKey = ClaudeCodeCompatibleBackendStore.configsDefaultsKey
+    func testSavingGLMSecretPublishesSingleAvailabilityRefresh() async throws {
+        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
+        defer { restoreDefaults(restoredDefaults) }
+        resetAvailabilityDefaults(glmConfigured: false)
 
-        let originalConfigured = defaults.object(forKey: configuredKey)
-        let originalLegacyConfigured = defaults.object(forKey: legacyConfiguredKey)
-        let originalConfigs = defaults.object(forKey: configsKey)
-        defer {
-            restoreDefaultsValue(originalConfigured, forKey: configuredKey, in: defaults)
-            restoreDefaultsValue(originalLegacyConfigured, forKey: legacyConfiguredKey, in: defaults)
-            restoreDefaultsValue(originalConfigs, forKey: configsKey, in: defaults)
+        let notification = expectation(description: "GLM availability refresh is published once")
+        let observer = NotificationCenter.default.addObserver(
+            forName: .claudeCodeGLMAvailabilityChanged,
+            object: nil,
+            queue: nil
+        ) { _ in
+            notification.fulfill()
         }
+        defer { NotificationCenter.default.removeObserver(observer) }
 
-        store.saveConfig(ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset)
-        _ = store.setConfigured(true, for: .glmZAI)
+        let viewModel = makeViewModel()
 
-        let secureStorage = EphemeralSecureKeyValueStore()
-        let secureService = SecureKeysService(secureStorage: secureStorage)
+        try await viewModel.saveCompatibleBackendSecret("zai-test-key", for: .glmZAI)
+
+        await fulfillment(of: [notification], timeout: 1.0)
+        XCTAssertTrue(viewModel.compatibleBackendHasSecret(.glmZAI))
+        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured())
+    }
+
+    func testLoadingPreconfiguredZAIKeyPublishesGLMAvailabilityRefresh() async {
+        let restoredDefaults = preserveDefaults(Self.availabilityDefaultsKeys)
+        defer { restoreDefaults(restoredDefaults) }
+        resetAvailabilityDefaults(glmConfigured: true)
+
+        let notification = expectation(description: "GLM availability refresh is published")
+        notification.assertForOverFulfill = false
+        let observer = NotificationCenter.default.addObserver(
+            forName: .claudeCodeGLMAvailabilityChanged,
+            object: nil,
+            queue: nil
+        ) { _ in
+            notification.fulfill()
+        }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let viewModel = makeViewModel()
+
+        await viewModel.loadStoredData(accessMode: .nonInteractive(reason: .test))
+
+        await fulfillment(of: [notification], timeout: 1.0)
+        XCTAssertTrue(viewModel.compatibleBackendHasSecret(.glmZAI))
+        XCTAssertTrue(ClaudeCodeGLMIntegration.isConfigured())
+    }
+
+    private static var availabilityDefaultsKeys: [String] {
+        [
+            "ClaudeCodeConnected",
+            "CodexCLIConnected",
+            "OpenCodeCLIConnected",
+            "CursorCLIConnected",
+            ClaudeCodeGLMIntegration.configuredDefaultsKey,
+            ClaudeCodeCompatibleBackendStore.configsDefaultsKey
+        ] + ClaudeCodeCompatibleBackendID.allCases.map {
+            ClaudeCodeCompatibleBackendStore.shared.configuredDefaultsKey(for: $0)
+        }
+    }
+
+    private func resetAvailabilityDefaults(glmConfigured: Bool) {
+        UserDefaults.standard.set(false, forKey: "ClaudeCodeConnected")
+        UserDefaults.standard.set(false, forKey: "CodexCLIConnected")
+        UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
+        UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
+        UserDefaults.standard.removeObject(forKey: ClaudeCodeCompatibleBackendStore.configsDefaultsKey)
+        for id in ClaudeCodeCompatibleBackendID.allCases {
+            UserDefaults.standard.set(
+                id == .glmZAI && glmConfigured,
+                forKey: ClaudeCodeCompatibleBackendStore.shared.configuredDefaultsKey(for: id)
+            )
+        }
+        UserDefaults.standard.set(glmConfigured, forKey: ClaudeCodeGLMIntegration.configuredDefaultsKey)
+    }
+
+    private func makeViewModel() -> APISettingsViewModel {
+        let secureService = SecureKeysService(secureStorage: TestSecureStorageBackend(values: [
+            .zAIAPI: "zai-test-key"
+        ]))
         let keyManager = KeyManager(secureService: secureService)
-        try await keyManager.saveAPIKey("test-zai-key", for: .zAI, accessMode: .nonInteractive(reason: .test))
-
-        let aiQueriesService = AIQueriesService(keyManager: keyManager)
-        let apiSettings = APISettingsViewModel(aiQueriesService: aiQueriesService, keyManager: keyManager, loadStoredDataOnInit: false)
-        let prompt = PromptViewModel(
-            fileManager: WorkspaceFilesViewModel(),
-            aiQueriesService: aiQueriesService,
-            apiSettingsViewModel: apiSettings,
-            windowID: 999,
-            settingsManager: WindowSettingsManager(windowID: 999)
-        )
-
-        XCTAssertFalse(apiSettings.agentModeAvailabilityContext.zaiConfigured)
-        XCTAssertFalse(prompt.availableAgentKinds.contains(.claudeCodeGLM))
-
-        await apiSettings.loadStoredData(accessMode: .nonInteractive(reason: .test))
-        XCTAssertTrue(apiSettings.agentModeAvailabilityContext.zaiConfigured)
-        XCTAssertTrue(apiSettings.compatibleBackendIsActive(.glmZAI))
-
-        await drainMainQueue()
-
-        XCTAssertTrue(
-            prompt.availableAgentKinds.contains(.claudeCodeGLM),
-            "PromptViewModel should refresh IDE agent options after an already-configured ZAI key loads during startup."
+        return APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
         )
     }
 
-    private func drainMainQueue(file: StaticString = #filePath, line: UInt = #line) async {
-        let drained = expectation(description: "main queue drained")
-        DispatchQueue.main.async {
-            drained.fulfill()
-        }
-        await fulfillment(of: [drained], timeout: 1)
+    private func preserveDefaults(_ keys: [String]) -> [String: Any?] {
+        Dictionary(uniqueKeysWithValues: keys.map { ($0, UserDefaults.standard.object(forKey: $0)) })
     }
 
-    private func restoreDefaultsValue(_ value: Any?, forKey key: String, in defaults: UserDefaults) {
-        if let value {
-            defaults.set(value, forKey: key)
-        } else {
-            defaults.removeObject(forKey: key)
+    private func restoreDefaults(_ snapshot: [String: Any?]) {
+        for (key, value) in snapshot {
+            if let value {
+                UserDefaults.standard.set(value, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
         }
     }
 }
