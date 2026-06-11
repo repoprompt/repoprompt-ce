@@ -61,6 +61,7 @@ enum AgentModel: String, CaseIterable, Codable {
     case claudeOpus1m = "opus[1m]"
 
     // Claude Code full model IDs (static known versions; no dynamic probing)
+    case claudeFable5 = "claude-fable-5"
     case claudeSonnet46 = "claude-sonnet-4-6"
     case claudeSonnet45 = "claude-sonnet-4-5"
     case claudeOpus47 = "claude-opus-4-7"
@@ -110,6 +111,7 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeOpus: "Opus Latest"
         case .claudeHaiku: "Haiku Latest"
         case .claudeOpus1m: "Opus Latest (1M)"
+        case .claudeFable5: "Fable 5"
         case .claudeSonnet46: "Sonnet 4.6"
         case .claudeSonnet45: "Sonnet 4.5"
         case .claudeOpus47: "Opus 4.7"
@@ -150,14 +152,15 @@ enum AgentModel: String, CaseIterable, Codable {
         case .gpt54MiniMedium: "GPT-5.4 Mini with balanced reasoning. Best exploration sub-agent for context gathering."
         case .gpt54MiniHigh: "GPT-5.4 Mini with deep reasoning. Good for complex exploration and analysis."
         case .claudeSonnet: "Balanced speed and capability. Good for general coding, analysis, and everyday work."
-        case .claudeOpus: "Strongest Claude model. Best for open-ended tasks, architecture, and complex reasoning."
+        case .claudeOpus: "Most capable Opus-tier model. Best for open-ended tasks, architecture, and complex reasoning."
         case .claudeHaiku: "Fast and lightweight. Good for exploration, quick edits, and mapping codebases."
         case .claudeOpus1m: "Claude Opus with 1M token context. Best for large codebases and tasks requiring extensive context."
+        case .claudeFable5: "Claude Fable 5. Anthropic's most capable widely released model for demanding reasoning and long-horizon agentic work."
         case .claudeSonnet46: "Pinned Claude Sonnet 4.6. Balanced speed and capability for everyday engineering."
         case .claudeSonnet45: "Pinned Claude Sonnet 4.5. Balanced speed and capability for everyday engineering."
-        case .claudeOpus47: "Pinned Claude Opus 4.7. Strongest Claude tier for complex reasoning and architecture."
-        case .claudeOpus46: "Pinned Claude Opus 4.6. Strongest Claude tier for complex reasoning and architecture."
-        case .claudeOpus45: "Pinned Claude Opus 4.5. Strongest Claude tier for complex reasoning and architecture."
+        case .claudeOpus47: "Pinned Claude Opus 4.7. Opus-tier capability for complex reasoning and architecture."
+        case .claudeOpus46: "Pinned Claude Opus 4.6. Opus-tier capability for complex reasoning and architecture."
+        case .claudeOpus45: "Pinned Claude Opus 4.5. Opus-tier capability for complex reasoning and architecture."
         case .claudeHaiku45: "Pinned Claude Haiku 4.5. Fast and lightweight for quick edits and exploration."
         case .glm47: "GLM tier via Z.ai. Fast and lightweight, good for exploration."
         case .glm5Turbo: "GLM tier via Z.ai. Balanced, good for general work."
@@ -199,10 +202,11 @@ enum AgentModel: String, CaseIterable, Codable {
             ]
         case .claudeCode:
             // Family priority matches the Claude Code picker catalog:
-            // Opus[1M] → Opus → Sonnet → Haiku. Within each family,
+            // Fable → Opus[1M] → Opus → Sonnet → Haiku. Within each family,
             // latest aliases come first, then pinned full IDs by descending version.
             [
                 .defaultModel,
+                .claudeFable5,
                 .claudeOpus1m,
                 .claudeOpus, .claudeOpus47, .claudeOpus46, .claudeOpus45,
                 .claudeSonnet, .claudeSonnet46, .claudeSonnet45,
@@ -396,13 +400,9 @@ enum AgentModel: String, CaseIterable, Codable {
     }
 
     /// Whether this model uses the 1M extended context window.
+    /// Derived from `contextWindowTokens` so the two facts cannot drift.
     var isExtendedContext: Bool {
-        switch self {
-        case .claudeOpus1m:
-            true
-        default:
-            false
-        }
+        (contextWindowTokens ?? 0) >= 1_000_000
     }
 
     /// Returns the release date for models with staged rollouts
@@ -426,6 +426,8 @@ enum AgentModel: String, CaseIterable, Codable {
             [.fast, .exploration, .engineering]
         case .gpt55CodexHigh:
             [.complex, .engineering, .pair]
+        case .claudeFable5:
+            [.complex, .engineering, .pair, .extendedContext]
         case .claudeOpus:
             [.complex, .engineering, .pair]
         default:
@@ -437,7 +439,7 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeOpus1m:
+        case .claudeFable5, .claudeOpus1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,

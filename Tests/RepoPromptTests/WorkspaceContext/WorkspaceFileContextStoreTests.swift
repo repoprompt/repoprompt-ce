@@ -294,7 +294,18 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         func testUnloadRootDrainsTrackedPublisherIngressWithoutPostDetachMutation() async throws {
             let root = try makeTemporaryRoot(name: "UnloadPublisherIngress")
             let lateFileURL = root.appendingPathComponent("Late.swift")
-            let store = WorkspaceFileContextStore()
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let store = WorkspaceFileContextStore(
+                unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy(
+                    publisherIngressGraceNanoseconds: 11,
+                    watcherStopGraceNanoseconds: 22,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            )
+            let diagnosticsRecorder = WorkspaceRootUnloadDiagnosticsRecorder()
+            await store.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+                await diagnosticsRecorder.record(diagnostics)
+            }
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
 
@@ -320,6 +331,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await unloadCompletedSignal.mark()
             }
             await unloadWaitSignal.waitUntilMarked()
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
             let unloadCompletedBeforeRelease = await unloadCompletedSignal.isMarked()
             let rootsDuringUnload = await store.roots()
             let pendingIngressCount = await store.publisherIngressCountForTesting(rootID: rootID)
@@ -331,11 +343,284 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await unloadTask.value
             let lateFile = await store.file(rootID: rootID, relativePath: "Late.swift")
             let remainingIngressCount = await store.publisherIngressCountForTesting(rootID: rootID)
+            let recordedDiagnostics = await diagnosticsRecorder.snapshot()
+            let diagnostics = try XCTUnwrap(recordedDiagnostics)
+            let publisherReport = try XCTUnwrap(diagnostics.publisherIngressReports.first)
             XCTAssertNil(lateFile)
             XCTAssertEqual(remainingIngressCount, 0)
+            XCTAssertEqual(publisherReport.rootID, rootID)
+            XCTAssertEqual(publisherReport.outcome, .graceful)
 
             await store.setWatcherSinkWillApplyHandler(nil)
             await store.setPublisherIngressWillWaitHandler(nil)
+            await store.setRootUnloadTerminationDidCompleteHandler(nil)
+        }
+
+        func testUnloadRootForceDiscardsWedgedPublisherIngressAndReleasesWaiters() async throws {
+            let root = try makeTemporaryRoot(name: "UnloadForcedPublisherIngress")
+            let firstURL = root.appendingPathComponent("First.swift")
+            let secondURL = root.appendingPathComponent("Second.swift")
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let store = WorkspaceFileContextStore(
+                unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy(
+                    publisherIngressGraceNanoseconds: 11,
+                    watcherStopGraceNanoseconds: 22,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            )
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+
+            let sinkGate = AsyncGate()
+            let unloadCompleted = AsyncSignal()
+            let waiterCompleted = AsyncSignal()
+            let diagnosticsRecorder = WorkspaceRootUnloadDiagnosticsRecorder()
+            let rootID = record.id
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+                await diagnosticsRecorder.record(diagnostics)
+            }
+
+            try write("first", to: firstURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileAdded("First.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+            try write("second", to: secondURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileAdded("Second.swift")]
+            )
+            let targetSequence = await store.appliedIngressSnapshotForTesting(rootID: rootID)
+                .acceptedServicePublicationSequence
+            let waiter = Task {
+                await store.waitUntilPublisherIngressAppliedForTesting(
+                    rootID: rootID,
+                    servicePublicationSequence: targetSequence
+                )
+                await waiterCompleted.mark()
+            }
+            let waiterRegistered = await waitForAsyncCondition {
+                await store.publisherIngressDebugSnapshotForTesting(rootID: rootID).waiterCount == 1
+            }
+            XCTAssertTrue(waiterRegistered)
+
+            let unload = Task {
+                await store.unloadRoot(id: rootID)
+                await unloadCompleted.mark()
+            }
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
+            let unloadCompletedBeforeTimeout = await unloadCompleted.isMarked()
+            let waiterCompletedBeforeTimeout = await waiterCompleted.isMarked()
+            XCTAssertFalse(unloadCompletedBeforeTimeout)
+            XCTAssertFalse(waiterCompletedBeforeTimeout)
+
+            await sleeper.release(nanoseconds: 11)
+            await unload.value
+            await waiter.value
+
+            let recordedDiagnostics = await diagnosticsRecorder.snapshot()
+            let diagnostics = try XCTUnwrap(recordedDiagnostics)
+            let publisherReport = try XCTUnwrap(diagnostics.publisherIngressReports.first)
+            let unloadCompletedAfterTimeout = await unloadCompleted.isMarked()
+            let waiterCompletedAfterTimeout = await waiterCompleted.isMarked()
+            XCTAssertTrue(unloadCompletedAfterTimeout)
+            XCTAssertTrue(waiterCompletedAfterTimeout)
+            XCTAssertEqual(publisherReport.rootID, rootID)
+            XCTAssertEqual(publisherReport.outcome, .forced)
+            XCTAssertEqual(publisherReport.queuedPublicationCount, 1)
+            XCTAssertEqual(publisherReport.applyingPublicationCount, 1)
+            XCTAssertEqual(publisherReport.waiterCount, 1)
+            XCTAssertEqual(publisherReport.acceptedServicePublicationSequence, targetSequence)
+            XCTAssertEqual(publisherReport.appliedServicePublicationSequence, 0)
+            let remainingIngressCount = await store.publisherIngressCountForTesting(rootID: rootID)
+            let remainingRoots = await store.roots()
+            let sinkStartCountBeforeRelease = await sinkGate.startCount()
+            XCTAssertEqual(remainingIngressCount, 0)
+            XCTAssertTrue(remainingRoots.isEmpty)
+            XCTAssertEqual(sinkStartCountBeforeRelease, 1)
+
+            await sinkGate.release()
+            let staleDrainFinished = await waitForAsyncCondition {
+                await sinkGate.startCount() == 1
+            }
+            XCTAssertTrue(staleDrainFinished)
+            let sinkStartCountAfterRelease = await sinkGate.startCount()
+            XCTAssertEqual(sinkStartCountAfterRelease, 1)
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setRootUnloadTerminationDidCompleteHandler(nil)
+        }
+
+        func testWatcherBoundedWaitPrefersCompletionThatRacesTimeout() async {
+            let latch = WorkspaceRootUnloadCompletionLatch()
+
+            let outcome = await WorkspaceRootUnloadBoundedWait.waitForCompletion(
+                latch,
+                timeoutNanoseconds: 22,
+                sleep: { _ in latch.complete() }
+            )
+
+            XCTAssertEqual(outcome, .completed)
+
+            let cancellationRaceLatch = WorkspaceRootUnloadCompletionLatch()
+            cancellationRaceLatch.complete()
+            XCTAssertEqual(
+                cancellationRaceLatch.resolvedOutcome(after: .cancelled),
+                .completed
+            )
+        }
+
+        func testUnloadRootBoundsWatcherStopCallerSideWithoutInterruptClaim() async throws {
+            let root = try makeTemporaryRoot(name: "UnloadWatcherStopBound")
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let store = WorkspaceFileContextStore(
+                unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy(
+                    publisherIngressGraceNanoseconds: 11,
+                    watcherStopGraceNanoseconds: 22,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            )
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+
+            let watcherStopGate = AsyncGate()
+            let unloadCompleted = AsyncSignal()
+            let diagnosticsRecorder = WorkspaceRootUnloadDiagnosticsRecorder()
+            await store.setWatcherStopWillBeginHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await watcherStopGate.markStartedAndWaitForRelease()
+            }
+            await store.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+                await diagnosticsRecorder.record(diagnostics)
+            }
+
+            let unload = Task {
+                await store.unloadRoot(id: record.id)
+                await unloadCompleted.mark()
+            }
+            await watcherStopGate.waitUntilStarted()
+            await sleeper.waitUntilSleeping(nanoseconds: 22)
+            let unloadCompletedBeforeTimeout = await unloadCompleted.isMarked()
+            XCTAssertFalse(unloadCompletedBeforeTimeout)
+
+            await sleeper.release(nanoseconds: 22)
+            await unload.value
+
+            let recordedDiagnostics = await diagnosticsRecorder.snapshot()
+            let diagnostics = try XCTUnwrap(recordedDiagnostics)
+            let watcherReport = try XCTUnwrap(diagnostics.watcherStopReports.first)
+            let unloadCompletedAfterTimeout = await unloadCompleted.isMarked()
+            XCTAssertTrue(unloadCompletedAfterTimeout)
+            XCTAssertEqual(watcherReport.rootID, record.id)
+            XCTAssertEqual(watcherReport.outcome, .timedOut)
+            let remainingRoots = await store.roots()
+            XCTAssertTrue(remainingRoots.isEmpty)
+
+            await watcherStopGate.release()
+            await store.setWatcherStopWillBeginHandler(nil)
+            await store.setRootUnloadTerminationDidCompleteHandler(nil)
+        }
+
+        func testUnloadRootReportsCompletedWatcherStopWhenStopFinishesWithinGrace() async throws {
+            let root = try makeTemporaryRoot(name: "UnloadWatcherStopCompleted")
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let store = WorkspaceFileContextStore(
+                unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy(
+                    publisherIngressGraceNanoseconds: 11,
+                    watcherStopGraceNanoseconds: 22,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            )
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let diagnosticsRecorder = WorkspaceRootUnloadDiagnosticsRecorder()
+            await store.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+                await diagnosticsRecorder.record(diagnostics)
+            }
+
+            await store.unloadRoot(id: record.id)
+
+            let recordedDiagnostics = await diagnosticsRecorder.snapshot()
+            let diagnostics = try XCTUnwrap(recordedDiagnostics)
+            let watcherReport = try XCTUnwrap(diagnostics.watcherStopReports.first)
+            XCTAssertEqual(watcherReport.rootID, record.id)
+            XCTAssertEqual(watcherReport.outcome, .completed)
+            let remainingRoots = await store.roots()
+            XCTAssertTrue(remainingRoots.isEmpty)
+            await store.setRootUnloadTerminationDidCompleteHandler(nil)
+        }
+
+        func testCancelledUnloadReportsWatcherStopCancelledWhileDetachedStopIsBlocked() async throws {
+            let root = try makeTemporaryRoot(name: "UnloadWatcherStopCancelled")
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let store = WorkspaceFileContextStore(
+                unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy(
+                    publisherIngressGraceNanoseconds: 11,
+                    watcherStopGraceNanoseconds: 22,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            )
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+
+            let watcherStopGate = AsyncGate()
+            let diagnosticsRecorder = WorkspaceRootUnloadDiagnosticsRecorder()
+            await store.setWatcherStopWillBeginHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await watcherStopGate.markStartedAndWaitForRelease()
+            }
+            await store.setRootUnloadTerminationDidCompleteHandler { diagnostics in
+                await diagnosticsRecorder.record(diagnostics)
+            }
+
+            let unload = Task {
+                await store.unloadRoot(id: record.id)
+            }
+            await watcherStopGate.waitUntilStarted()
+            await sleeper.waitUntilSleeping(nanoseconds: 22)
+            unload.cancel()
+            await unload.value
+
+            let recordedDiagnostics = await diagnosticsRecorder.snapshot()
+            let diagnostics = try XCTUnwrap(recordedDiagnostics)
+            let watcherReport = try XCTUnwrap(diagnostics.watcherStopReports.first)
+            XCTAssertEqual(watcherReport.rootID, record.id)
+            XCTAssertEqual(watcherReport.outcome.rawValue, "cancelled")
+            let remainingRoots = await store.roots()
+            XCTAssertTrue(remainingRoots.isEmpty)
+
+            await watcherStopGate.release()
+            await store.setWatcherStopWillBeginHandler(nil)
+            await store.setRootUnloadTerminationDidCompleteHandler(nil)
+        }
+
+        func testStalePublisherLifetimeCannotMutateCurrentRootState() async throws {
+            let root = try makeTemporaryRoot(name: "StalePublisherLifetime")
+            let lateURL = root.appendingPathComponent("Late.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let currentLifetimeID = try await store.rootLifetimeIDForTesting(rootID: record.id)
+            try write("late", to: lateURL)
+
+            await store.replayPublisherFileSystemPublicationForTesting(
+                rootID: record.id,
+                expectedLifetimeID: UUID(),
+                deltas: [.fileAdded("Late.swift")]
+            )
+            let staleLifetimeFile = await store.file(rootID: record.id, relativePath: "Late.swift")
+            XCTAssertNil(staleLifetimeFile)
+
+            await store.replayPublisherFileSystemPublicationForTesting(
+                rootID: record.id,
+                expectedLifetimeID: currentLifetimeID,
+                deltas: [.fileAdded("Late.swift")]
+            )
+            let currentLifetimeFile = await store.file(rootID: record.id, relativePath: "Late.swift")
+            XCTAssertNotNil(currentLifetimeFile)
         }
 
         func testRedundantStartWatchingRootKeepsPublisherSinkAttached() async throws {
@@ -679,6 +964,271 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
         #endif
 
+        func testWorkspaceIngressCoordinatorForcedTerminationDropsQueuedWorkReleasesWaitersAndReportsSnapshot() async throws {
+            let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 7_000_000_000)
+            let coordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: { clock.now() })
+            let rootID = UUID()
+            let firstApplyGate = AsyncGate()
+            let recorder = OrderedIngressRecorder()
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let subscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                await recorder.append(publication.servicePublicationSequence)
+                if publication.servicePublicationSequence == 1 {
+                    await firstApplyGate.markStartedAndWaitForRelease()
+                }
+            }
+
+            XCTAssertTrue(coordinator.accept(
+                subscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 1,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: [.fileAdded("A.swift")]
+                ),
+                lifecycleCorrelation: nil
+            ))
+            await firstApplyGate.waitUntilStarted()
+            XCTAssertTrue(coordinator.accept(
+                subscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 2,
+                    source: .watcherBarrierNoop,
+                    watcherAcceptedWatermark: .init(rawValue: 17),
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            coordinator.closePublisherIngress(rootID: rootID)
+
+            let waiterCompleted = AsyncSignal()
+            let waiter = Task {
+                await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 2)
+                await waiterCompleted.mark()
+            }
+            let waiterRegistered = await waitForAsyncCondition {
+                coordinator.debugSnapshot(rootID: rootID).waiterCount == 1
+            }
+            XCTAssertTrue(waiterRegistered)
+            clock.advance(milliseconds: 625)
+
+            let termination = Task {
+                await coordinator.terminateClosedPublisherIngress(
+                    rootIDs: [rootID],
+                    gracefulDrainTimeoutNanoseconds: 11,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            }
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
+            let waiterCompletedBeforeTimeout = await waiterCompleted.isMarked()
+            XCTAssertFalse(waiterCompletedBeforeTimeout)
+            await sleeper.release(nanoseconds: 11)
+
+            let reports = await termination.value
+            await waiter.value
+            let report = try XCTUnwrap(reports.first)
+            XCTAssertEqual(report.rootID, rootID)
+            XCTAssertEqual(report.outcome, .forced)
+            XCTAssertEqual(report.queuedPublicationCount, 1)
+            XCTAssertEqual(report.applyingPublicationCount, 1)
+            XCTAssertEqual(report.waiterCount, 1)
+            XCTAssertEqual(report.acceptedServicePublicationSequence, 2)
+            XCTAssertEqual(report.appliedServicePublicationSequence, 0)
+            XCTAssertEqual(report.acceptedAppliedSequenceGap, 2)
+            XCTAssertEqual(report.oldestOutstandingPublicationAgeMilliseconds, 625)
+            let waiterCompletedAfterTimeout = await waiterCompleted.isMarked()
+            let recordedBeforeRelease = await recorder.snapshot()
+            XCTAssertTrue(waiterCompletedAfterTimeout)
+            XCTAssertEqual(coordinator.pendingPublisherIngressCount(rootIDs: [rootID]), 0)
+            XCTAssertEqual(recordedBeforeRelease, [1])
+
+            await firstApplyGate.release()
+            let recordedAfterRelease = await recorder.snapshot()
+            XCTAssertEqual(recordedAfterRelease, [1])
+        }
+
+        func testWorkspaceIngressCoordinatorTerminationDoesNotForceReopenedIngressDuringGrace() async {
+            let coordinator = WorkspaceFileSystemIngressCoordinator()
+            let rootID = UUID()
+            let oldApplyGate = AsyncGate()
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let oldSubscription = coordinator.openPublisherIngress(rootID: rootID) { _, _ in
+                await oldApplyGate.markStartedAndWaitForRelease()
+            }
+            XCTAssertTrue(coordinator.accept(
+                oldSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 40,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            await oldApplyGate.waitUntilStarted()
+            coordinator.closePublisherIngress(rootID: rootID)
+
+            let termination = Task {
+                await coordinator.terminateClosedPublisherIngress(
+                    rootIDs: [rootID],
+                    gracefulDrainTimeoutNanoseconds: 11,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            }
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
+
+            let reopenedRecorder = OrderedIngressRecorder()
+            let reopenedSubscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                await reopenedRecorder.append(publication.servicePublicationSequence)
+            }
+            XCTAssertTrue(coordinator.accept(
+                reopenedSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 41,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+
+            await sleeper.release(nanoseconds: 11)
+            let reports = await termination.value
+            XCTAssertEqual(reports.first?.outcome, .superseded)
+            XCTAssertTrue(coordinator.isPublisherIngressOpen(reopenedSubscription))
+            XCTAssertTrue(coordinator.accept(
+                reopenedSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 42,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+
+            await oldApplyGate.release()
+            await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 42)
+            let reopenedSequences = await reopenedRecorder.snapshot()
+            XCTAssertEqual(reopenedSequences, [41, 42])
+        }
+
+        func testWorkspaceIngressCoordinatorLateForcedDrainCannotCorruptReopenedSameRootState() async {
+            let rootID = UUID()
+            let oldFinishApplyingLatch = WorkspaceRootUnloadCompletionLatch()
+            let coordinator = WorkspaceFileSystemIngressCoordinator(
+                debugFinishApplyingHandler: { observedRootID, servicePublicationSequence in
+                    guard observedRootID == rootID, servicePublicationSequence == 40 else { return }
+                    oldFinishApplyingLatch.complete()
+                }
+            )
+            let oldApplyGate = AsyncGate()
+            let oldHandlerFinished = AsyncSignal()
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let oldSubscription = coordinator.openPublisherIngress(rootID: rootID) { _, _ in
+                await oldApplyGate.markStartedAndWaitForRelease()
+                await oldHandlerFinished.mark()
+            }
+            XCTAssertTrue(coordinator.accept(
+                oldSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 40,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: .init(rawValue: 19),
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            await oldApplyGate.waitUntilStarted()
+            coordinator.closePublisherIngress(rootID: rootID)
+
+            let termination = Task {
+                await coordinator.terminateClosedPublisherIngress(
+                    rootIDs: [rootID],
+                    gracefulDrainTimeoutNanoseconds: 11,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            }
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
+            await sleeper.release(nanoseconds: 11)
+            let reports = await termination.value
+            XCTAssertEqual(reports.first?.outcome, .forced)
+
+            let newRecorder = OrderedIngressRecorder()
+            let newSubscription = coordinator.openPublisherIngress(rootID: rootID) { publication, _ in
+                await newRecorder.append(publication.servicePublicationSequence)
+            }
+            XCTAssertFalse(coordinator.accept(
+                oldSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 41,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            XCTAssertTrue(coordinator.accept(
+                newSubscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 1,
+                    source: .syntheticMutation,
+                    watcherAcceptedWatermark: nil,
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            await coordinator.waitUntilApplied(rootID: rootID, servicePublicationSequence: 1)
+            await oldApplyGate.release()
+            await oldHandlerFinished.waitUntilMarked()
+            _ = await oldFinishApplyingLatch.wait()
+
+            XCTAssertEqual(coordinator.appliedSnapshot(rootID: rootID).appliedServicePublicationSequence, 1)
+            XCTAssertEqual(coordinator.appliedSnapshot(rootID: rootID).appliedWatcherWatermark, .zero)
+            let newRecordedSequences = await newRecorder.snapshot()
+            XCTAssertEqual(newRecordedSequences, [1])
+        }
+
+        func testWorkspaceIngressCoordinatorTerminationPreservesGracefulCompletionWithinBound() async throws {
+            let coordinator = WorkspaceFileSystemIngressCoordinator()
+            let rootID = UUID()
+            let applyGate = AsyncGate()
+            let sleeper = ManualWorkspaceRootUnloadSleeper()
+            let subscription = coordinator.openPublisherIngress(rootID: rootID) { _, _ in
+                await applyGate.markStartedAndWaitForRelease()
+            }
+            XCTAssertTrue(coordinator.accept(
+                subscription,
+                publication: FileSystemDeltaPublication(
+                    servicePublicationSequence: 1,
+                    source: .watcherBarrierNoop,
+                    watcherAcceptedWatermark: .init(rawValue: 23),
+                    deltas: []
+                ),
+                lifecycleCorrelation: nil
+            ))
+            await applyGate.waitUntilStarted()
+            coordinator.closePublisherIngress(rootID: rootID)
+
+            let termination = Task {
+                await coordinator.terminateClosedPublisherIngress(
+                    rootIDs: [rootID],
+                    gracefulDrainTimeoutNanoseconds: 11,
+                    sleep: { nanoseconds in await sleeper.sleep(nanoseconds: nanoseconds) }
+                )
+            }
+            await sleeper.waitUntilSleeping(nanoseconds: 11)
+            await applyGate.release()
+            let reports = await termination.value
+            let report = try XCTUnwrap(reports.first)
+
+            XCTAssertEqual(report.outcome, .graceful)
+            XCTAssertEqual(report.acceptedServicePublicationSequence, 1)
+            XCTAssertEqual(report.appliedServicePublicationSequence, 1)
+            XCTAssertEqual(report.appliedWatcherWatermark, 23)
+            XCTAssertEqual(coordinator.pendingPublisherIngressCount(rootIDs: [rootID]), 0)
+        }
+
         func testWorkspaceIngressCoordinatorFinishResolvesOutstandingWaiter() async {
             let coordinator = WorkspaceFileSystemIngressCoordinator()
             let rootID = UUID()
@@ -835,6 +1385,83 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNil(settledRoot.barrier.active)
             XCTAssertEqual(settledRoot.barrier.completionCount, 1)
             await store.setScopedIngressBarrierWillFlushHandler(nil)
+        }
+
+        func testScopedAppliedIngressCancelledPendingCallerDoesNotCancelLiveCoalescedJoiner() async throws {
+            let root = try makeTemporaryRoot(name: "ScopedIngressPendingCancellation")
+            let addedURL = root.appendingPathComponent("Added.swift")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let rootID = record.id
+            let flushGate = AsyncGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == rootID else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+
+            let activeBarrier = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+            await flushGate.waitUntilStarted()
+
+            try write("added", to: addedURL)
+            let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
+                rootID: rootID,
+                events: [(absolutePath: addedURL.path, flags: createdFileFlags, eventId: 250)],
+                scheduleDrain: false
+            )
+            let accepted = try XCTUnwrap(acceptedPayload)
+            let cancelledCompleted = AsyncSignal()
+            let liveCompleted = AsyncSignal()
+            let cancelledPendingCaller = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await cancelledCompleted.mark()
+                return samples
+            }
+            let pendingCreated = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).successorCount == 1
+            }
+            XCTAssertTrue(pendingCreated)
+
+            let livePendingJoiner = Task {
+                let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                await liveCompleted.mark()
+                return samples
+            }
+            let coalesced = await waitForAsyncCondition {
+                let stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+                return stats.joinCount == 1 && stats.coalescedSuccessorCount == 1
+            }
+            XCTAssertTrue(coalesced)
+
+            cancelledPendingCaller.cancel()
+            let cancelledDetached = await waitForAsyncCondition {
+                await cancelledCompleted.isMarked()
+            }
+            XCTAssertTrue(cancelledDetached)
+            let liveCompletedBeforeRelease = await liveCompleted.isMarked()
+            XCTAssertFalse(liveCompletedBeforeRelease)
+            let blockedStats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+            XCTAssertEqual(blockedStats.launchCount, 1)
+            XCTAssertEqual(blockedStats.successorCount, 1)
+
+            await flushGate.release()
+            let activeSamples = await activeBarrier.value
+            let cancelledSamples = await cancelledPendingCaller.value
+            let liveSamples = await livePendingJoiner.value
+            let liveSample = try XCTUnwrap(liveSamples.first)
+            let settledStats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+
+            XCTAssertEqual(activeSamples.map(\.rootID), [rootID])
+            XCTAssertTrue(cancelledSamples.isEmpty)
+            XCTAssertEqual(liveSample.acceptedWatcherWatermark, accepted.rawValue)
+            XCTAssertGreaterThanOrEqual(liveSample.appliedWatcherWatermark, accepted.rawValue)
+            XCTAssertEqual(settledStats.launchCount, 2)
+            XCTAssertEqual(settledStats.successorCount, 1)
+            XCTAssertEqual(settledStats.coalescedSuccessorCount, 1)
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+            await store.stopWatchingRoot(id: rootID)
         }
 
         func testScopedAppliedIngressAllCancelledCallersStillReachIdleCleanup() async throws {
@@ -1026,10 +1653,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.setScopedIngressBarrierWillFlushHandler(nil)
         }
 
-        func testScopedAppliedIngressNewerSameRootTargetLaunchesSuccessorFlight() async throws {
+        func testScopedAppliedIngressCoalescesNewerSameRootTargetsIntoOnePendingSuccessor() async throws {
             let root = try makeTemporaryRoot(name: "ScopedIngressSuccessor")
-            let addedURL = root.appendingPathComponent("Added.swift")
-            let store = WorkspaceFileContextStore()
+            let firstAddedURL = root.appendingPathComponent("FirstAdded.swift")
+            let secondAddedURL = root.appendingPathComponent("SecondAdded.swift")
+            let clock = LockedWorkspaceDiagnosticsClock(nowNanoseconds: 4_000_000_000)
+            let store = WorkspaceFileContextStore(debugNowNanoseconds: { clock.now() })
             let record = try await store.loadRoot(path: root.path)
             try await store.startWatchingRoot(id: record.id)
             let rootID = record.id
@@ -1043,34 +1672,93 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
             await flushGate.waitUntilStarted()
-            try write("added", to: addedURL)
-            let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
+
+            try write("first", to: firstAddedURL)
+            let firstAcceptedPayload = try await store.acceptWatcherPayloadForTesting(
                 rootID: rootID,
-                events: [(absolutePath: addedURL.path, flags: createdFileFlags, eventId: 300)],
+                events: [(absolutePath: firstAddedURL.path, flags: createdFileFlags, eventId: 300)],
                 scheduleDrain: false
             )
-            let accepted = try XCTUnwrap(acceptedPayload)
+            let firstAccepted = try XCTUnwrap(firstAcceptedPayload)
             let secondBarrier = Task {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
-
-            var stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
-            for _ in 0 ..< 100 where stats.successorCount == 0 {
-                await Task.yield()
-                stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+            let pendingSuccessorCreated = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).successorCount == 1
             }
+            XCTAssertTrue(pendingSuccessorCreated)
+
+            try write("second", to: secondAddedURL)
+            let secondAcceptedPayload = try await store.acceptWatcherPayloadForTesting(
+                rootID: rootID,
+                events: [(absolutePath: secondAddedURL.path, flags: createdFileFlags, eventId: 301)],
+                scheduleDrain: false
+            )
+            let secondAccepted = try XCTUnwrap(secondAcceptedPayload)
+            XCTAssertGreaterThan(secondAccepted.rawValue, firstAccepted.rawValue)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: rootID,
+                deltas: [.fileModified("FirstAdded.swift", nil)]
+            )
+            let acceptedServicePublicationSequence = await store.appliedIngressSnapshotForTesting(rootID: rootID)
+                .acceptedServicePublicationSequence
+            XCTAssertGreaterThan(acceptedServicePublicationSequence, 0)
+            let thirdBarrier = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+
+            for _ in 0 ..< 1000 {
+                let stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+                if await flushGate.startCount() >= 3 || stats.coalescedSuccessorCount == 1 { break }
+                await Task.yield()
+            }
+            clock.advance(milliseconds: 175)
+            let statsWhileBlocked = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+            let flightCountWhileBlocked = await store.scopedIngressBarrierFlightCountForTesting()
+            let flushStartCountWhileBlocked = await flushGate.startCount()
+            let blockedRoots = await store.readSearchRootDiagnosticsSnapshot()
+            let blockedRoot = try XCTUnwrap(blockedRoots.first { $0.rootID == rootID })
+            let active = try XCTUnwrap(blockedRoot.barrier.active)
+            let pending = try XCTUnwrap(blockedRoot.barrier.pending)
+
+            XCTAssertEqual(statsWhileBlocked.launchCount, 1)
+            XCTAssertEqual(statsWhileBlocked.joinCount, 1)
+            XCTAssertEqual(statsWhileBlocked.successorCount, 1)
+            XCTAssertEqual(statsWhileBlocked.coalescedSuccessorCount, 1)
+            XCTAssertEqual(flightCountWhileBlocked, 2)
+            XCTAssertEqual(flushStartCountWhileBlocked, 1)
+            XCTAssertEqual(active.targetWatcherWatermark, 0)
+            XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
+            XCTAssertEqual(pending.ageMilliseconds, 175)
+
             await flushGate.release()
             let firstSamples = await firstBarrier.value
             let secondSamples = await secondBarrier.value
-            let flushStartCount = await flushGate.startCount()
+            let thirdSamples = await thirdBarrier.value
+            let settledStats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
+            let settledFlushStartCount = await flushGate.startCount()
             let secondSample = try XCTUnwrap(secondSamples.first)
+            let thirdSample = try XCTUnwrap(thirdSamples.first)
 
-            XCTAssertEqual(stats.launchCount, 2)
-            XCTAssertEqual(stats.successorCount, 1)
-            XCTAssertEqual(flushStartCount, 2)
+            XCTAssertEqual(settledStats.launchCount, 2)
+            XCTAssertEqual(settledStats.joinCount, 1)
+            XCTAssertEqual(settledStats.successorCount, 1)
+            XCTAssertEqual(settledStats.coalescedSuccessorCount, 1)
+            XCTAssertEqual(settledFlushStartCount, 2)
             XCTAssertEqual(firstSamples.first?.acceptedWatcherWatermark, 0)
-            XCTAssertEqual(secondSample.acceptedWatcherWatermark, accepted.rawValue)
-            XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, accepted.rawValue)
+            XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(thirdSample.appliedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(
+                secondSample.appliedServicePublicationSequence,
+                acceptedServicePublicationSequence
+            )
+            XCTAssertGreaterThanOrEqual(
+                thirdSample.appliedServicePublicationSequence,
+                acceptedServicePublicationSequence
+            )
             await store.setScopedIngressBarrierWillFlushHandler(nil)
             await store.stopWatchingRoot(id: rootID)
         }
@@ -1216,7 +1904,9 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(active.targetServicePublicationSequence, 0)
             XCTAssertEqual(active.ageMilliseconds, 325)
             XCTAssertEqual(activeRoot.barrier.launchCount, 1)
+            XCTAssertEqual(activeRoot.barrier.coalescedSuccessorCount, 0)
             XCTAssertEqual(activeRoot.barrier.completionCount, 0)
+            XCTAssertNil(activeRoot.barrier.pending)
             XCTAssertNil(activeRoot.barrier.lastCompleted)
 
             await flushGate.release()
@@ -1227,6 +1917,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let completedRoot = try XCTUnwrap(completedRoots.first { $0.rootID == record.id })
             let completed = try XCTUnwrap(completedRoot.barrier.lastCompleted)
             XCTAssertNil(completedRoot.barrier.active)
+            XCTAssertNil(completedRoot.barrier.pending)
             XCTAssertEqual(completedRoot.barrier.completionCount, 1)
             XCTAssertEqual(completed.targetWatcherWatermark, 0)
             XCTAssertEqual(completed.targetServicePublicationSequence, 0)
@@ -1236,10 +1927,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             await store.setScopedIngressBarrierWillFlushHandler(nil)
         }
 
-        func testRootUnloadCancelsOwnedScopedIngressFlightAndReleasesDetachedService() async throws {
+        func testRootUnloadCancelsActiveAndPendingScopedIngressFlightsAndReleasesDetachedService() async throws {
             let root = try makeTemporaryRoot(name: "ScopedIngressUnloadRelease")
+            let addedURL = root.appendingPathComponent("Pending.swift")
             let store = WorkspaceFileContextStore()
             let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
             var service: FileSystemService? = await store.fileSystemServiceForTesting(rootID: record.id)
             let weakService = WeakObjectBox(service)
             let cancellationGate = CancellationAwareGate()
@@ -1248,16 +1941,32 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await cancellationGate.markStartedAndWaitForCancellation()
             }
 
-            let barrierTask = Task {
+            let activeBarrier = Task {
                 await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
             }
             await cancellationGate.waitUntilStarted()
-            let activeFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
-            XCTAssertEqual(activeFlightCount, 1)
+
+            try write("pending", to: addedURL)
+            let acceptedPayload = try await store.acceptWatcherPayloadForTesting(
+                rootID: record.id,
+                events: [(absolutePath: addedURL.path, flags: createdFileFlags, eventId: 400)],
+                scheduleDrain: false
+            )
+            XCTAssertNotNil(acceptedPayload)
+            let pendingBarrier = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+            let pendingCreated = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: record.id).successorCount == 1
+            }
+            XCTAssertTrue(pendingCreated)
+            let ownedFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
+            XCTAssertEqual(ownedFlightCount, 2)
 
             await store.unloadRoot(id: record.id)
             service = nil
-            let samples = await barrierTask.value
+            let activeSamples = await activeBarrier.value
+            let pendingSamples = await pendingBarrier.value
             let roots = await store.roots()
             let retainedRootIDs = await store.retainedReadSearchDiagnosticRootIDsForTesting()
             let remainingFlightCount = await store.scopedIngressBarrierFlightCountForTesting()
@@ -1265,7 +1974,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 weakService.value == nil
             }
 
-            XCTAssertTrue(samples.isEmpty)
+            XCTAssertTrue(activeSamples.isEmpty)
+            XCTAssertTrue(pendingSamples.isEmpty)
             XCTAssertTrue(roots.isEmpty)
             XCTAssertEqual(remainingFlightCount, 0)
             XCTAssertFalse(retainedRootIDs.contains(record.id))
@@ -4245,6 +4955,81 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         private var createdFileFlags: FSEventStreamEventFlags {
             FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+        }
+
+        private actor WorkspaceRootUnloadDiagnosticsRecorder {
+            private var diagnostics: WorkspaceRootUnloadTerminationDiagnostics?
+
+            func record(_ diagnostics: WorkspaceRootUnloadTerminationDiagnostics) {
+                self.diagnostics = diagnostics
+            }
+
+            func snapshot() -> WorkspaceRootUnloadTerminationDiagnostics? {
+                diagnostics
+            }
+        }
+
+        private actor ManualWorkspaceRootUnloadSleeper {
+            private struct Waiter {
+                let id: UUID
+                let continuation: CheckedContinuation<Void, Never>
+            }
+
+            private var sleepWaitersByNanoseconds: [UInt64: [UUID: Waiter]] = [:]
+            private var registrationWaitersByNanoseconds: [UInt64: [CheckedContinuation<Void, Never>]] = [:]
+            private var releasedNanoseconds: Set<UInt64> = []
+            private var cancelledWaiterIDs: Set<UUID> = []
+
+            func sleep(nanoseconds: UInt64) async {
+                if releasedNanoseconds.contains(nanoseconds) { return }
+                let waiterID = UUID()
+                await withTaskCancellationHandler {
+                    await withCheckedContinuation { continuation in
+                        if Task.isCancelled || cancelledWaiterIDs.remove(waiterID) != nil {
+                            continuation.resume()
+                            return
+                        }
+                        if releasedNanoseconds.contains(nanoseconds) {
+                            continuation.resume()
+                            return
+                        }
+                        sleepWaitersByNanoseconds[nanoseconds, default: [:]][waiterID] = Waiter(
+                            id: waiterID,
+                            continuation: continuation
+                        )
+                        let registrationWaiters = registrationWaitersByNanoseconds.removeValue(forKey: nanoseconds) ?? []
+                        registrationWaiters.forEach { $0.resume() }
+                    }
+                } onCancel: {
+                    Task { await self.cancel(waiterID: waiterID, nanoseconds: nanoseconds) }
+                }
+            }
+
+            func waitUntilSleeping(nanoseconds: UInt64) async {
+                guard sleepWaitersByNanoseconds[nanoseconds]?.isEmpty != false else { return }
+                await withCheckedContinuation { continuation in
+                    registrationWaitersByNanoseconds[nanoseconds, default: []].append(continuation)
+                }
+            }
+
+            func release(nanoseconds: UInt64) {
+                releasedNanoseconds.insert(nanoseconds)
+                let waiters = sleepWaitersByNanoseconds.removeValue(forKey: nanoseconds) ?? [:]
+                waiters.values.forEach { $0.continuation.resume() }
+                let registrationWaiters = registrationWaitersByNanoseconds.removeValue(forKey: nanoseconds) ?? []
+                registrationWaiters.forEach { $0.resume() }
+            }
+
+            private func cancel(waiterID: UUID, nanoseconds: UInt64) {
+                guard let waiter = sleepWaitersByNanoseconds[nanoseconds]?.removeValue(forKey: waiterID) else {
+                    cancelledWaiterIDs.insert(waiterID)
+                    return
+                }
+                if sleepWaitersByNanoseconds[nanoseconds]?.isEmpty == true {
+                    sleepWaitersByNanoseconds.removeValue(forKey: nanoseconds)
+                }
+                waiter.continuation.resume()
+            }
         }
 
         private actor OrderedIngressRecorder {

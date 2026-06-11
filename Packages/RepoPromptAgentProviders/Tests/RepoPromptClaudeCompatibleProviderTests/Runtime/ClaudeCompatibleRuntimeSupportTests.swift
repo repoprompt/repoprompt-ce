@@ -149,6 +149,7 @@ final class ClaudeCompatibleRuntimeSupportTests: XCTestCase {
         XCTAssertEqual(claude.defaultModelRaw, "opus")
         XCTAssertEqual(claude.options.first?.rawValue, "default")
         XCTAssertEqual(claude.options.first?.isPlaceholderDefault, true)
+        XCTAssertTrue(claude.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(claude.options.contains { $0.rawValue == "opus[1m]" && $0.supportedEffortLevels.contains("xhigh") })
 
         let zai = ClaudeCompatibleModelCatalog.snapshot(pluginID: .zaiClaudeCode, includeEffortVariants: false)

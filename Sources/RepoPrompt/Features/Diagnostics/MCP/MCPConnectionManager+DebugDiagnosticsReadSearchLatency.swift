@@ -96,6 +96,33 @@ import MCP
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "`retry_after_ms` must be an integer between 0 and 60000.")
             }
 
+            let productionConfiguration = StoreBackedWorkspaceSearchLane.Configuration.production
+            let maxActiveLeases: Int
+            switch debugBoundedInt(
+                arguments,
+                "max_active_leases",
+                defaultValue: productionConfiguration.maxActiveLeases,
+                range: 1 ... 64
+            ) {
+            case let .value(parsed), let .defaulted(parsed):
+                maxActiveLeases = parsed
+            case .invalid:
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "`max_active_leases` must be an integer between 1 and 64.")
+            }
+
+            let maxQueuedWaiters: Int
+            switch debugBoundedInt(
+                arguments,
+                "max_queued_waiters",
+                defaultValue: productionConfiguration.maxQueuedWaiters,
+                range: 1 ... 64
+            ) {
+            case let .value(parsed), let .defaulted(parsed):
+                maxQueuedWaiters = parsed
+            case .invalid:
+                return debugDiagnosticsError(op: op, code: "invalid_params", message: "`max_queued_waiters` must be an integer between 1 and 64.")
+            }
+
             let targets = await debugSearchLaneTargets(windowID: requestedWindowID)
             guard !targets.isEmpty else {
                 let message = requestedWindowID.map { "No RepoPrompt window matched window_id \($0)." }
@@ -115,6 +142,8 @@ import MCP
             }
 
             let configuration = StoreBackedWorkspaceSearchLane.Configuration(
+                maxActiveLeases: maxActiveLeases,
+                maxQueuedWaiters: maxQueuedWaiters,
                 maxQueueWait: .milliseconds(maxQueueWaitMilliseconds),
                 retryAfterMilliseconds: retryAfterMilliseconds
             )
@@ -314,9 +343,30 @@ import MCP
             ]
         }
 
-        private func readSearchLimiterPayload(_ snapshot: AsyncLimiter.DebugSnapshot) -> [String: Any] {
+        private func readSearchLimiterPayload(
+            _ snapshot: MCPConnectionCallLimiterDebugSnapshot
+        ) -> [String: Any] {
             [
                 "found": true,
+                "lane_count": snapshot.laneCount,
+                "limit": snapshot.limit,
+                "permits": snapshot.permits,
+                "active_permit_count": snapshot.activePermitCount,
+                "waiter_count": snapshot.waiterCount,
+                "in_flight_count": snapshot.inFlight,
+                "oldest_waiter_age_ms": Self.debugOptionalValue(snapshot.oldestWaiterAgeMilliseconds),
+                "cancelled_waiter_count": snapshot.cancelledWaiterCount,
+                "is_closed": snapshot.isClosed,
+                "is_idle": snapshot.isIdle,
+                "lanes": [
+                    MCPConnectionCallLane.ordinary.rawValue: readSearchLimiterLanePayload(snapshot.ordinary),
+                    MCPConnectionCallLane.fileSearch.rawValue: readSearchLimiterLanePayload(snapshot.fileSearch)
+                ]
+            ]
+        }
+
+        private func readSearchLimiterLanePayload(_ snapshot: AsyncLimiter.DebugSnapshot) -> [String: Any] {
+            [
                 "limit": snapshot.limit,
                 "permits": snapshot.permits,
                 "active_permit_count": snapshot.activePermitCount,
@@ -379,6 +429,13 @@ import MCP
                     "age_ms": active.ageMilliseconds
                 ]
             }
+            let pending = snapshot.pending.map { pending in
+                [
+                    "target_watcher_watermark": pending.targetWatcherWatermark,
+                    "target_service_publication_sequence": pending.targetServicePublicationSequence,
+                    "age_ms": pending.ageMilliseconds
+                ]
+            }
             let completed = snapshot.lastCompleted.map { completed in
                 [
                     "token": completed.token,
@@ -394,8 +451,10 @@ import MCP
                 "launch_count": snapshot.launchCount,
                 "join_count": snapshot.joinCount,
                 "successor_count": snapshot.successorCount,
+                "coalesced_successor_count": snapshot.coalescedSuccessorCount,
                 "completion_count": snapshot.completionCount,
                 "active": Self.debugOptionalValue(active),
+                "pending": Self.debugOptionalValue(pending),
                 "last_completed": Self.debugOptionalValue(completed)
             ]
         }
@@ -469,8 +528,8 @@ import MCP
                     [
                         "window_id": entry.windowID,
                         "configuration": [
-                            "active_capacity": 1,
-                            "max_queued": 1,
+                            "active_capacity": entry.snapshot.configuration.maxActiveLeases,
+                            "max_queued": entry.snapshot.configuration.maxQueuedWaiters,
                             "max_queue_wait_ms": entry.snapshot.configuration.maxQueueWaitMilliseconds,
                             "retry_after_ms": entry.snapshot.configuration.retryAfterMilliseconds
                         ],

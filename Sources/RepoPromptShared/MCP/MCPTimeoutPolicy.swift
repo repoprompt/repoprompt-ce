@@ -6,8 +6,18 @@ public enum MCPTimeoutPolicy {
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
 
+    public static let workspaceSwitchToolExecutionDeadlineSeconds = 120
+    public static let workspaceSwitchToolExecutionDeadline: Duration = .seconds(
+        workspaceSwitchToolExecutionDeadlineSeconds
+    )
+
     public static let boundedToolCancellationCleanupGraceSeconds = 5
     public static let boundedToolCancellationCleanupGrace: Duration = .seconds(boundedToolCancellationCleanupGraceSeconds)
+
+    public static let bootstrapReplacementPredecessorStopGraceSeconds = 5
+    public static let bootstrapReplacementPredecessorStopGrace: Duration = .seconds(
+        bootstrapReplacementPredecessorStopGraceSeconds
+    )
 
     public static let responseSendDeadlineSeconds = 30
     public static let responseSendDeadline: Duration = .seconds(responseSendDeadlineSeconds)

@@ -42,14 +42,22 @@ enum StoreBackedWorkspaceSearchAdmissionError: LocalizedError, Equatable {
 /// Per-workspace execution lane for store-backed file search.
 ///
 /// Path-only and explicitly scoped searches bypass broad admission. Unscoped content-capable
-/// searches use a fixed one-active/one-queued gate so one workspace cannot monopolize another.
+/// searches use a fixed-capacity batch gate: a bounded set of active leases runs concurrently
+/// so a parallel burst (one connection's batched tool calls, or several agents on the same
+/// workspace) shares one ingress freshness flight instead of reconstructing it serially per
+/// search. Beyond the active batch, a bounded FIFO wait queue absorbs the rest of the burst;
+/// overflow still fails fast so one workspace cannot monopolize another.
 actor StoreBackedWorkspaceSearchLane {
     struct Configuration: Equatable {
         static let production = Configuration(
+            maxActiveLeases: 4,
+            maxQueuedWaiters: 4,
             maxQueueWait: .milliseconds(1500),
             retryAfterMilliseconds: 1000
         )
 
+        let maxActiveLeases: Int
+        let maxQueuedWaiters: Int
         let maxQueueWait: Duration
         let retryAfterMilliseconds: Int
 
@@ -59,9 +67,18 @@ actor StoreBackedWorkspaceSearchLane {
             return Int(clamping: milliseconds)
         }
 
-        init(maxQueueWait: Duration, retryAfterMilliseconds: Int = 1000) {
+        init(
+            maxActiveLeases: Int = 1,
+            maxQueuedWaiters: Int = 1,
+            maxQueueWait: Duration,
+            retryAfterMilliseconds: Int = 1000
+        ) {
+            precondition(maxActiveLeases >= 1)
+            precondition(maxQueuedWaiters >= 1)
             precondition(maxQueueWait > .zero)
             precondition(retryAfterMilliseconds >= 0)
+            self.maxActiveLeases = maxActiveLeases
+            self.maxQueuedWaiters = maxQueuedWaiters
             self.maxQueueWait = maxQueueWait
             self.retryAfterMilliseconds = retryAfterMilliseconds
         }
@@ -134,9 +151,9 @@ actor StoreBackedWorkspaceSearchLane {
     private let fileSearchActor = FileSearchActor()
     private var configuration: Configuration
     private let clock: AdmissionClock
-    private var activeLeaseID: UUID?
-    private var waiterID: UUID?
-    private var waiterState: WaiterState?
+    private var activeLeaseIDs: Set<UUID> = []
+    private var waiterIDsInOrder: [UUID] = []
+    private var waiterStatesByID: [UUID: WaiterState] = [:]
     private var grantCount = 0
     private var overloadCount = 0
     private var waitExpiryCount = 0
@@ -255,7 +272,7 @@ actor StoreBackedWorkspaceSearchLane {
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) async throws -> PermitAcquisition {
         try Task.checkCancellation()
-        if activeLeaseID == nil {
+        if activeLeaseIDs.count < configuration.maxActiveLeases {
             return allocatePermit(
                 searchMode: searchMode,
                 admissionClass: admissionClass,
@@ -263,7 +280,7 @@ actor StoreBackedWorkspaceSearchLane {
                 waited: false
             )
         }
-        guard waiterState == nil else {
+        guard waiterStatesByID.count < configuration.maxQueuedWaiters else {
             overloadCount &+= 1
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.Search.broadAdmissionOverloaded,
@@ -305,7 +322,7 @@ actor StoreBackedWorkspaceSearchLane {
         admissionClass: BroadSearchAdmissionClass,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
     ) {
-        if activeLeaseID == nil {
+        if activeLeaseIDs.count < configuration.maxActiveLeases {
             continuation.resume(returning: allocatePermit(
                 searchMode: searchMode,
                 admissionClass: admissionClass,
@@ -314,7 +331,7 @@ actor StoreBackedWorkspaceSearchLane {
             ))
             return
         }
-        guard waiterState == nil else {
+        guard waiterStatesByID.count < configuration.maxQueuedWaiters else {
             overloadCount &+= 1
             continuation.resume(throwing: StoreBackedWorkspaceSearchAdmissionError.queueFull(
                 scope: .perStore,
@@ -325,8 +342,8 @@ actor StoreBackedWorkspaceSearchLane {
 
         let enqueuedAt = clock.now()
         let deadline = enqueuedAt + configuration.maxQueueWait
-        waiterID = id
-        waiterState = WaiterState(
+        waiterIDsInOrder.append(id)
+        waiterStatesByID[id] = WaiterState(
             continuation: continuation,
             searchMode: searchMode,
             admissionClass: admissionClass,
@@ -335,7 +352,7 @@ actor StoreBackedWorkspaceSearchLane {
             deadline: deadline,
             timeoutTask: nil
         )
-        maximumWaiterCount = max(maximumWaiterCount, 1)
+        maximumWaiterCount = max(maximumWaiterCount, waiterStatesByID.count)
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.broadAdmissionWaitBegan,
             correlation: lifecycleCorrelation,
@@ -355,18 +372,23 @@ actor StoreBackedWorkspaceSearchLane {
                 // Grant and cancellation paths cancel the sleeper after removing the waiter.
             }
         }
-        if var current = waiterState, waiterID == id {
-            current.timeoutTask = timeoutTask
-            waiterState = current
+        if waiterStatesByID[id] != nil {
+            waiterStatesByID[id]?.timeoutTask = timeoutTask
         } else {
             timeoutTask.cancel()
         }
     }
 
+    private func removeWaiter(id: UUID) -> WaiterState? {
+        guard let state = waiterStatesByID.removeValue(forKey: id) else { return nil }
+        if let index = waiterIDsInOrder.firstIndex(of: id) {
+            waiterIDsInOrder.remove(at: index)
+        }
+        return state
+    }
+
     private func cancelWaiter(id: UUID) {
-        guard waiterID == id, let state = waiterState else { return }
-        waiterID = nil
-        waiterState = nil
+        guard let state = removeWaiter(id: id) else { return }
         state.timeoutTask?.cancel()
         queuedCancellationCount &+= 1
         EditFlowPerf.lifecycleEvent(
@@ -384,9 +406,7 @@ actor StoreBackedWorkspaceSearchLane {
     }
 
     private func expireWaiter(id: UUID) {
-        guard waiterID == id, let state = waiterState else { return }
-        waiterID = nil
-        waiterState = nil
+        guard let state = removeWaiter(id: id) else { return }
         waitExpiryCount &+= 1
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.broadAdmissionWaitExpired,
@@ -405,8 +425,7 @@ actor StoreBackedWorkspaceSearchLane {
     }
 
     private func release(_ acquisition: PermitAcquisition) {
-        guard activeLeaseID == acquisition.leaseID else { return }
-        activeLeaseID = nil
+        guard activeLeaseIDs.remove(acquisition.leaseID) != nil else { return }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.broadAdmissionPermitReleased,
             correlation: acquisition.lifecycleCorrelation,
@@ -418,25 +437,24 @@ actor StoreBackedWorkspaceSearchLane {
                 queueAgeBucket: acquisition.queueAgeBucket
             )
         )
-        promoteWaiterIfPossible()
+        promoteWaitersIfPossible()
     }
 
-    private func promoteWaiterIfPossible() {
-        guard activeLeaseID == nil,
-              waiterID != nil,
-              let state = waiterState
-        else { return }
-        waiterID = nil
-        waiterState = nil
-        state.timeoutTask?.cancel()
-        let acquisition = allocatePermit(
-            searchMode: state.searchMode,
-            admissionClass: state.admissionClass,
-            lifecycleCorrelation: state.lifecycleCorrelation,
-            waited: true,
-            queueAgeBucket: Self.queueAgeBucket(since: state.enqueuedAtUptimeNanoseconds)
-        )
-        state.continuation.resume(returning: acquisition)
+    private func promoteWaitersIfPossible() {
+        while activeLeaseIDs.count < configuration.maxActiveLeases,
+              let id = waiterIDsInOrder.first,
+              let state = removeWaiter(id: id)
+        {
+            state.timeoutTask?.cancel()
+            let acquisition = allocatePermit(
+                searchMode: state.searchMode,
+                admissionClass: state.admissionClass,
+                lifecycleCorrelation: state.lifecycleCorrelation,
+                waited: true,
+                queueAgeBucket: Self.queueAgeBucket(since: state.enqueuedAtUptimeNanoseconds)
+            )
+            state.continuation.resume(returning: acquisition)
+        }
     }
 
     private func allocatePermit(
@@ -446,11 +464,11 @@ actor StoreBackedWorkspaceSearchLane {
         waited: Bool,
         queueAgeBucket: String = "immediate"
     ) -> PermitAcquisition {
-        precondition(activeLeaseID == nil)
+        precondition(activeLeaseIDs.count < configuration.maxActiveLeases)
         let leaseID = UUID()
-        activeLeaseID = leaseID
+        activeLeaseIDs.insert(leaseID)
         grantCount &+= 1
-        maximumActivePermitCount = max(maximumActivePermitCount, 1)
+        maximumActivePermitCount = max(maximumActivePermitCount, activeLeaseIDs.count)
         let acquisition = PermitAcquisition(
             leaseID: leaseID,
             searchMode: searchMode,
@@ -476,8 +494,8 @@ actor StoreBackedWorkspaceSearchLane {
 
     private func metrics() -> AdmissionMetrics {
         AdmissionMetrics(
-            activeCount: activeLeaseID == nil ? 0 : 1,
-            queueDepth: waiterState == nil ? 0 : 1
+            activeCount: activeLeaseIDs.count,
+            queueDepth: waiterStatesByID.count
         )
     }
 
@@ -490,7 +508,7 @@ actor StoreBackedWorkspaceSearchLane {
     ) -> EditFlowPerf.Dimensions {
         EditFlowPerf.Dimensions(
             outcome: outcome,
-            storeCapacity: 1,
+            storeCapacity: configuration.maxActiveLeases,
             globalCapacity: 0,
             storeActiveCount: metrics.activeCount,
             globalActiveCount: 0,
@@ -554,8 +572,8 @@ actor StoreBackedWorkspaceSearchLane {
         func snapshotForTesting() -> Snapshot {
             Snapshot(
                 configuration: configuration,
-                activePermitCount: activeLeaseID == nil ? 0 : 1,
-                waiterCount: waiterState == nil ? 0 : 1,
+                activePermitCount: activeLeaseIDs.count,
+                waiterCount: waiterStatesByID.count,
                 grantCount: grantCount,
                 overloadCount: overloadCount,
                 waitExpiryCount: waitExpiryCount,
@@ -566,7 +584,7 @@ actor StoreBackedWorkspaceSearchLane {
         }
 
         func configureForTesting(_ newConfiguration: Configuration) -> DebugConfigurationUpdateResult {
-            guard activeLeaseID == nil, waiterState == nil else {
+            guard activeLeaseIDs.isEmpty, waiterStatesByID.isEmpty else {
                 return .busy(snapshotForTesting())
             }
             configuration = newConfiguration

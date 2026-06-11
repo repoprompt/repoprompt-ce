@@ -70,6 +70,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(snapshot.defaultModelRaw, "opus")
         XCTAssertEqual(snapshot.options.first?.rawValue, "default")
         XCTAssertEqual(snapshot.options.first?.isPlaceholderDefault, true)
+        XCTAssertTrue(snapshot.options.contains { $0.rawValue == "claude-fable-5" && $0.supportedEffortLevels.contains("xhigh") })
         XCTAssertTrue(snapshot.options.contains { $0.rawValue == "opus" && $0.supportedEffortLevels.contains("xhigh") })
 
         let options = AgentModelCatalog.options(for: .claudeCode, availability: availability)
@@ -77,6 +78,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(AgentModelCatalog.defaultModelRaw(for: .claudeCode, availability: availability), "opus")
         XCTAssertEqual(menu.defaultOption?.rawValue, "default")
         let groupRaws = Set(menu.groups.map(\.baseModelRaw))
+        XCTAssertTrue(groupRaws.contains("claude-fable-5"))
         XCTAssertTrue(groupRaws.contains("opus[1m]"))
         XCTAssertTrue(groupRaws.contains("opus"))
         XCTAssertTrue(groupRaws.contains("sonnet"))
@@ -86,6 +88,7 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(discovery.defaults.selectionID?.rawValue, "claudeCode:opus")
         XCTAssertEqual(discovery.runtime, "claude_native")
         XCTAssertTrue(discovery.models.contains { $0.id == "default" })
+        XCTAssertTrue(discovery.models.contains { $0.id == "claude-fable-5" && $0.contextWindowTokens == 1_000_000 })
         XCTAssertTrue(discovery.models.contains { $0.id == "opus" })
 
         let compatiblePluginOptions = [
@@ -125,6 +128,59 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         XCTAssertEqual(
             ClaudeCompatibleModelCatalogAdapter.modelOptions(from: [compatiblePluginOptions[2]], for: .customClaudeCompatible).map(\.rawValue),
             [AgentModel.customClaudeCompatible.rawValue]
+        )
+    }
+
+    /// XHigh eligibility is declared in three places: the provider package's
+    /// per-model effort lists (read here through the adapter snapshot), the
+    /// adapter's eligibility set, and the AI picker's model definitions. This
+    /// guards against the hand-synced copies drifting apart.
+    func testClaudeXHighEligibilityIsConsistentAcrossCatalogSurfaces() throws {
+        let availability = AgentModelCatalog.AvailabilityContext(claudeCodeAvailable: true)
+        let snapshot = try XCTUnwrap(ClaudeCompatibleModelCatalogAdapter.catalogSnapshot(
+            for: .claudeCode,
+            availability: availability,
+            includeClaudeEffortVariants: false
+        ))
+
+        var pickerBaseRaws: Set<String> = []
+        var pickerXHighBaseRaws: Set<String> = []
+        for model in ClaudeCodeAIModelCatalog.modelsForPicker() {
+            guard let raw = ClaudeCodeAIModelCatalog.runtimeSpecifierRaw(for: model) else { continue }
+            let specifier = ClaudeModelSpecifier(raw: raw)
+            guard let base = specifier.baseModel?.lowercased() else { continue }
+            pickerBaseRaws.insert(base)
+            if specifier.explicitEffortLevel == .xhigh {
+                pickerXHighBaseRaws.insert(base)
+            }
+        }
+
+        var comparedPickerRaws = 0
+        for option in snapshot.options where !option.isPlaceholderDefault {
+            let base = option.rawValue.lowercased()
+            let providerXHigh = option.supportedEffortLevels.contains("xhigh")
+            let adapterXHigh = ClaudeCompatibleModelCatalogAdapter.claudeEffort(
+                .xhigh,
+                isSupportedForBaseModelRaw: option.rawValue,
+                agentKind: .claudeCode
+            )
+            XCTAssertEqual(
+                providerXHigh,
+                adapterXHigh,
+                "XHigh eligibility for \(option.rawValue) drifted between the provider catalog and the adapter"
+            )
+            guard pickerBaseRaws.contains(base) else { continue }
+            comparedPickerRaws += 1
+            XCTAssertEqual(
+                providerXHigh,
+                pickerXHighBaseRaws.contains(base),
+                "XHigh exposure for \(option.rawValue) drifted between the provider catalog and the AI picker"
+            )
+        }
+        XCTAssertGreaterThanOrEqual(
+            comparedPickerRaws,
+            6,
+            "AI picker shares too few base raws with the provider catalog; the consistency check lost coverage"
         )
     }
 

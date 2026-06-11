@@ -110,12 +110,21 @@ struct WorkspaceDisplayRootRefsSnapshot: Equatable {
 
 actor WorkspaceFileContextStore {
     private struct RootState {
+        let lifetimeID: UUID
         let root: WorkspaceRootRecord
         let service: FileSystemService
         var folderIDsByRelativePath: [String: UUID]
         var fileIDsByRelativePath: [String: UUID]
         var childFolderIDsByFolderID: [UUID: [UUID]]
         var childFileIDsByFolderID: [UUID: [UUID]]
+    }
+
+    private struct DetachedWatcherStop {
+        let index: Int
+        let rootID: UUID
+        let rootPath: String
+        let completionLatch: WorkspaceRootUnloadCompletionLatch
+        let task: Task<Void, Never>
     }
 
     private struct RootLoadConfiguration: Hashable {
@@ -140,6 +149,16 @@ actor WorkspaceFileContextStore {
         func covers(_ other: ScopedIngressBarrierTarget) -> Bool {
             watcherAcceptedWatermark >= other.watcherAcceptedWatermark
                 && acceptedServicePublicationSequence >= other.acceptedServicePublicationSequence
+        }
+
+        func merging(_ other: ScopedIngressBarrierTarget) -> ScopedIngressBarrierTarget {
+            ScopedIngressBarrierTarget(
+                watcherAcceptedWatermark: max(watcherAcceptedWatermark, other.watcherAcceptedWatermark),
+                acceptedServicePublicationSequence: max(
+                    acceptedServicePublicationSequence,
+                    other.acceptedServicePublicationSequence
+                )
+            )
         }
     }
 
@@ -228,15 +247,55 @@ actor WorkspaceFileContextStore {
         }
     }
 
+    private final class ScopedIngressBarrierPendingFlight {
+        var target: ScopedIngressBarrierTarget
+        let join: ScopedIngressBarrierJoin
+        #if DEBUG
+            let enqueuedAtNanoseconds: UInt64
+        #endif
+
+        init(
+            target: ScopedIngressBarrierTarget,
+            join: ScopedIngressBarrierJoin,
+            enqueuedAtNanoseconds: UInt64 = 0
+        ) {
+            self.target = target
+            self.join = join
+            #if DEBUG
+                self.enqueuedAtNanoseconds = enqueuedAtNanoseconds
+            #endif
+        }
+    }
+
+    private final class ScopedIngressBarrierRootFlightState {
+        var active: ScopedIngressBarrierFlight?
+        var pending: ScopedIngressBarrierPendingFlight?
+
+        init(
+            active: ScopedIngressBarrierFlight? = nil,
+            pending: ScopedIngressBarrierPendingFlight? = nil
+        ) {
+            self.active = active
+            self.pending = pending
+        }
+    }
+
     #if DEBUG
         struct ScopedIngressBarrierStats: Equatable {
             let launchCount: Int
             let joinCount: Int
             let successorCount: Int
+            let coalescedSuccessorCount: Int
         }
 
         struct ScopedIngressBarrierDebugSnapshot: Equatable {
             struct Active: Equatable {
+                let targetWatcherWatermark: UInt64
+                let targetServicePublicationSequence: UInt64
+                let ageMilliseconds: UInt64
+            }
+
+            struct Pending: Equatable {
                 let targetWatcherWatermark: UInt64
                 let targetServicePublicationSequence: UInt64
                 let ageMilliseconds: UInt64
@@ -255,8 +314,10 @@ actor WorkspaceFileContextStore {
             let launchCount: Int
             let joinCount: Int
             let successorCount: Int
+            let coalescedSuccessorCount: Int
             let completionCount: Int
             let active: Active?
+            let pending: Pending?
             let lastCompleted: Completed?
         }
 
@@ -325,11 +386,14 @@ actor WorkspaceFileContextStore {
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
         private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
+        private var watcherStopWillBeginHandler: (@Sendable (UUID) async -> Void)?
+        private var rootUnloadTerminationDidCompleteHandler: (@Sendable (WorkspaceRootUnloadTerminationDiagnostics) async -> Void)?
         private var appliedIngressDidCaptureWatermarksHandler: (@Sendable ([UUID: UInt64]) async -> Void)?
         private var scopedIngressBarrierWillFlushHandler: (@Sendable (UUID) async -> Void)?
         private var scopedIngressBarrierLaunchCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierJoinCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierSuccessorCountsByRootID: [UUID: Int] = [:]
+        private var scopedIngressBarrierCoalescedSuccessorCountsByRootID: [UUID: Int] = [:]
         private var scopedIngressBarrierCompletionCountsByRootID: [UUID: Int] = [:]
         private var lastCompletedScopedIngressBarrierByRootID: [UUID: ScopedIngressBarrierDebugSnapshot.Completed] = [:]
         private var publicationInvalidationHistoryByRootID: [UUID: PublicationInvalidationHistoryState] = [:]
@@ -362,6 +426,16 @@ actor WorkspaceFileContextStore {
             watcherServiceStateWillReconcileHandler = handler
         }
 
+        func setWatcherStopWillBeginHandler(_ handler: (@Sendable (UUID) async -> Void)?) {
+            watcherStopWillBeginHandler = handler
+        }
+
+        func setRootUnloadTerminationDidCompleteHandler(
+            _ handler: (@Sendable (WorkspaceRootUnloadTerminationDiagnostics) async -> Void)?
+        ) {
+            rootUnloadTerminationDidCompleteHandler = handler
+        }
+
         func setAppliedIngressDidCaptureWatermarksHandler(_ handler: (@Sendable ([UUID: UInt64]) async -> Void)?) {
             appliedIngressDidCaptureWatermarksHandler = handler
         }
@@ -374,12 +448,15 @@ actor WorkspaceFileContextStore {
             ScopedIngressBarrierStats(
                 launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
                 joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
-                successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0
+                successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0,
+                coalescedSuccessorCount: scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID] ?? 0
             )
         }
 
         func scopedIngressBarrierFlightCountForTesting() -> Int {
-            scopedIngressBarrierFlightsByRootID.values.reduce(0) { $0 + $1.count }
+            scopedIngressBarrierFlightStatesByRootID.values.reduce(0) { count, state in
+                count + (state.active == nil ? 0 : 1) + (state.pending == nil ? 0 : 1)
+            }
         }
 
         func fileSystemServiceForTesting(rootID: UUID) -> FileSystemService? {
@@ -410,13 +487,25 @@ actor WorkspaceFileContextStore {
         }
 
         private func scopedIngressBarrierDebugSnapshot(rootID: UUID) -> ScopedIngressBarrierDebugSnapshot {
-            let active = scopedIngressBarrierFlightsByRootID[rootID]?.last.map { flight in
+            let now = debugNowNanoseconds()
+            let state = scopedIngressBarrierFlightStatesByRootID[rootID]
+            let active = state?.active.map { flight in
                 ScopedIngressBarrierDebugSnapshot.Active(
                     targetWatcherWatermark: flight.target.watcherAcceptedWatermark.rawValue,
                     targetServicePublicationSequence: flight.target.acceptedServicePublicationSequence,
                     ageMilliseconds: Self.elapsedMilliseconds(
                         since: flight.startedAtNanoseconds,
-                        now: debugNowNanoseconds()
+                        now: now
+                    )
+                )
+            }
+            let pending = state?.pending.map { pending in
+                ScopedIngressBarrierDebugSnapshot.Pending(
+                    targetWatcherWatermark: pending.target.watcherAcceptedWatermark.rawValue,
+                    targetServicePublicationSequence: pending.target.acceptedServicePublicationSequence,
+                    ageMilliseconds: Self.elapsedMilliseconds(
+                        since: pending.enqueuedAtNanoseconds,
+                        now: now
                     )
                 )
             }
@@ -424,8 +513,10 @@ actor WorkspaceFileContextStore {
                 launchCount: scopedIngressBarrierLaunchCountsByRootID[rootID] ?? 0,
                 joinCount: scopedIngressBarrierJoinCountsByRootID[rootID] ?? 0,
                 successorCount: scopedIngressBarrierSuccessorCountsByRootID[rootID] ?? 0,
+                coalescedSuccessorCount: scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID] ?? 0,
                 completionCount: scopedIngressBarrierCompletionCountsByRootID[rootID] ?? 0,
                 active: active,
+                pending: pending,
                 lastCompleted: lastCompletedScopedIngressBarrierByRootID[rootID]
             )
         }
@@ -434,6 +525,7 @@ actor WorkspaceFileContextStore {
             Set(scopedIngressBarrierLaunchCountsByRootID.keys)
                 .union(scopedIngressBarrierJoinCountsByRootID.keys)
                 .union(scopedIngressBarrierSuccessorCountsByRootID.keys)
+                .union(scopedIngressBarrierCoalescedSuccessorCountsByRootID.keys)
                 .union(scopedIngressBarrierCompletionCountsByRootID.keys)
                 .union(lastCompletedScopedIngressBarrierByRootID.keys)
                 .union(publicationInvalidationHistoryByRootID.keys)
@@ -605,7 +697,8 @@ actor WorkspaceFileContextStore {
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
     private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
-    private var scopedIngressBarrierFlightsByRootID: [UUID: [ScopedIngressBarrierFlight]] = [:]
+    private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
+    private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
     private var nextScopedIngressBarrierToken: UInt64 = 0
     private static let maxConcurrentScopedIngressBarriers = 8
     private var codeScanResultTask: Task<Void, Never>?
@@ -616,10 +709,12 @@ actor WorkspaceFileContextStore {
     #if DEBUG
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
-            debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
+            debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
+            self.unloadTerminationPolicy = unloadTerminationPolicy
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -634,8 +729,12 @@ actor WorkspaceFileContextStore {
             #endif
         }
     #else
-        init(searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production) {
+        init(
+            searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
+        ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
+            self.unloadTerminationPolicy = unloadTerminationPolicy
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator()
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -723,6 +822,7 @@ actor WorkspaceFileContextStore {
             return
         }
         let root = state.root
+        let lifetimeID = state.lifetimeID
         let diagnosticRootToken = state.service.diagnosticRootToken
         let publisherIngressCoordinator = publisherIngressCoordinator
         let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: rootID) { [weak self] publication, publicationCorrelation in
@@ -739,12 +839,13 @@ actor WorkspaceFileContextStore {
             await self?.handleObservedPublisherFileSystemPublication(
                 publication,
                 root: root,
+                expectedLifetimeID: lifetimeID,
                 publicationCorrelation: publicationCorrelation,
                 diagnosticRootToken: diagnosticRootToken
             )
         }
         let publisher = await state.service.publisherForChanges()
-        guard rootStatesByID[rootID] != nil,
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
             await reconcileWatcherServiceState(state.service, rootID: rootID)
@@ -772,7 +873,7 @@ actor WorkspaceFileContextStore {
                 lifecycleCorrelation: publicationCorrelation
             )
         }
-        guard rootStatesByID[rootID] != nil,
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
             cancellable.cancel()
@@ -892,11 +993,45 @@ actor WorkspaceFileContextStore {
         func appliedIngressSnapshotForTesting(rootID: UUID) -> WorkspaceFileSystemIngressCoordinator.AppliedSnapshot {
             publisherIngressCoordinator.appliedSnapshot(rootID: rootID)
         }
+
+        func publisherIngressDebugSnapshotForTesting(
+            rootID: UUID
+        ) -> WorkspaceFileSystemIngressCoordinator.DebugSnapshot {
+            publisherIngressCoordinator.debugSnapshot(rootID: rootID)
+        }
+
+        func waitUntilPublisherIngressAppliedForTesting(
+            rootID: UUID,
+            servicePublicationSequence: UInt64
+        ) async {
+            await publisherIngressCoordinator.waitUntilApplied(
+                rootID: rootID,
+                servicePublicationSequence: servicePublicationSequence
+            )
+        }
+
+        func rootLifetimeIDForTesting(rootID: UUID) throws -> UUID {
+            try state(for: rootID).lifetimeID
+        }
+
+        func replayPublisherFileSystemPublicationForTesting(
+            rootID: UUID,
+            expectedLifetimeID: UUID,
+            deltas: [FileSystemDelta]
+        ) async {
+            guard let root = rootStatesByID[rootID]?.root else { return }
+            await handleObservedFileSystemDeltas(
+                deltas,
+                root: root,
+                expectedLifetimeID: expectedLifetimeID
+            )
+        }
     #endif
 
     private func handleObservedPublisherFileSystemPublication(
         _ publication: FileSystemDeltaPublication,
         root: WorkspaceRootRecord,
+        expectedLifetimeID: UUID,
         publicationCorrelation: EditFlowPerf.LifecycleCorrelation?,
         diagnosticRootToken: UUID
     ) async {
@@ -905,9 +1040,11 @@ actor WorkspaceFileContextStore {
                 await watcherSinkWillApplyHandler(root.id)
             }
         #endif
+        guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
         await handleObservedFileSystemDeltas(
             publication.deltas,
             root: root,
+            expectedLifetimeID: expectedLifetimeID,
             publicationCorrelation: publicationCorrelation,
             diagnosticRootToken: diagnosticRootToken,
             watcherAcceptedWatermark: publication.watcherAcceptedWatermark,
@@ -918,14 +1055,16 @@ actor WorkspaceFileContextStore {
     private func handleObservedFileSystemDeltas(
         _ deltas: [FileSystemDelta],
         root: WorkspaceRootRecord,
+        expectedLifetimeID: UUID? = nil,
         publicationCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         diagnosticRootToken: UUID? = nil,
         watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil,
         servicePublicationSequence: UInt64? = nil
     ) async {
-        guard rootStatesByID[root.id] != nil else { return }
+        guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
         for delta in deltas {
             guard await isDiscoveryFacingFileSystemDelta(delta, rootID: root.id) else { continue }
+            guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
             yieldFileSystemDeltaEvent(WorkspaceFileSystemDeltaEvent(
                 rootID: root.id,
                 rootPath: root.standardizedFullPath,
@@ -937,11 +1076,16 @@ actor WorkspaceFileContextStore {
             await applyPreparedIndexDeltas(
                 rootID: root.id,
                 deltas: preparedDeltas,
+                expectedLifetimeID: expectedLifetimeID,
                 watcherAcceptedWatermark: watcherAcceptedWatermark,
                 servicePublicationSequence: servicePublicationSequence
             )
         #else
-            await applyPreparedIndexDeltas(rootID: root.id, deltas: preparedDeltas)
+            await applyPreparedIndexDeltas(
+                rootID: root.id,
+                deltas: preparedDeltas,
+                expectedLifetimeID: expectedLifetimeID
+            )
         #endif
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.WorkspaceIngress.storeCanonicalApplyCompleted,
@@ -1287,16 +1431,76 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         target: ScopedIngressBarrierTarget
     ) async -> WorkspaceIngressBarrierSample? {
-        guard !Task.isCancelled, let state = rootStatesByID[rootID] else { return nil }
-        if let flight = scopedIngressBarrierFlightsByRootID[rootID]?.first(where: { $0.target.covers(target) }) {
+        guard !Task.isCancelled, rootStatesByID[rootID] != nil else { return nil }
+        let flightState = scopedIngressBarrierFlightStatesByRootID[rootID]
+            ?? ScopedIngressBarrierRootFlightState()
+
+        if let active = flightState.active, active.target.covers(target) {
             #if DEBUG
                 scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
             #endif
-            guard let output = await flight.join.value() else { return nil }
+            guard let output = await active.join.value() else { return nil }
             return scopedIngressBarrierSample(from: output)
         }
 
-        let isSuccessor = scopedIngressBarrierFlightsByRootID[rootID]?.isEmpty == false
+        if let pending = flightState.pending, pending.target.covers(target) {
+            #if DEBUG
+                scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
+                scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID, default: 0] += 1
+            #endif
+            guard let output = await pending.join.value() else { return nil }
+            return scopedIngressBarrierSample(from: output)
+        }
+
+        if let pending = flightState.pending {
+            pending.target = pending.target.merging(target)
+            #if DEBUG
+                scopedIngressBarrierJoinCountsByRootID[rootID, default: 0] += 1
+                scopedIngressBarrierCoalescedSuccessorCountsByRootID[rootID, default: 0] += 1
+            #endif
+            guard let output = await pending.join.value() else { return nil }
+            return scopedIngressBarrierSample(from: output)
+        }
+
+        if flightState.active != nil {
+            let join = ScopedIngressBarrierJoin()
+            #if DEBUG
+                let enqueuedAtNanoseconds = debugNowNanoseconds()
+                scopedIngressBarrierSuccessorCountsByRootID[rootID, default: 0] += 1
+            #else
+                let enqueuedAtNanoseconds: UInt64 = 0
+            #endif
+            flightState.pending = ScopedIngressBarrierPendingFlight(
+                target: target,
+                join: join,
+                enqueuedAtNanoseconds: enqueuedAtNanoseconds
+            )
+            scopedIngressBarrierFlightStatesByRootID[rootID] = flightState
+            guard let output = await join.value() else { return nil }
+            return scopedIngressBarrierSample(from: output)
+        }
+
+        let join = ScopedIngressBarrierJoin()
+        launchScopedIngressBarrier(
+            rootID: rootID,
+            target: target,
+            join: join,
+            flightState: flightState
+        )
+        guard let output = await join.value() else { return nil }
+        return scopedIngressBarrierSample(from: output)
+    }
+
+    private func launchScopedIngressBarrier(
+        rootID: UUID,
+        target: ScopedIngressBarrierTarget,
+        join: ScopedIngressBarrierJoin,
+        flightState: ScopedIngressBarrierRootFlightState
+    ) {
+        guard let state = rootStatesByID[rootID] else {
+            join.complete(with: nil)
+            return
+        }
         nextScopedIngressBarrierToken &+= 1
         let token = nextScopedIngressBarrierToken
         let publisherIngressCoordinator = publisherIngressCoordinator
@@ -1304,9 +1508,6 @@ actor WorkspaceFileContextStore {
         let service = state.service
         #if DEBUG
             scopedIngressBarrierLaunchCountsByRootID[rootID, default: 0] += 1
-            if isSuccessor {
-                scopedIngressBarrierSuccessorCountsByRootID[rootID, default: 0] += 1
-            }
             let barrierCompletionNowNanoseconds = debugNowNanoseconds
             let barrierStartedAtNanoseconds = barrierCompletionNowNanoseconds()
             let scopedIngressBarrierWillFlushHandler = scopedIngressBarrierWillFlushHandler
@@ -1319,14 +1520,14 @@ actor WorkspaceFileContextStore {
         #else
             let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil
         #endif
-        let join = ScopedIngressBarrierJoin()
         let flight = ScopedIngressBarrierFlight(
             token: token,
             target: target,
             join: join,
             startedAtNanoseconds: barrierStartedAtNanoseconds
         )
-        scopedIngressBarrierFlightsByRootID[rootID, default: []].append(flight)
+        flightState.active = flight
+        scopedIngressBarrierFlightStatesByRootID[rootID] = flightState
         flight.task = Task { [weak self] in
             #if DEBUG
                 if let scopedIngressBarrierWillFlushHandler {
@@ -1483,8 +1684,6 @@ actor WorkspaceFileContextStore {
                 join.complete(with: output)
             }
         }
-        guard let output = await join.value() else { return nil }
-        return scopedIngressBarrierSample(from: output)
     }
 
     private func finishScopedIngressBarrier(
@@ -1495,18 +1694,13 @@ actor WorkspaceFileContextStore {
         startedAtNanoseconds: UInt64,
         join: ScopedIngressBarrierJoin
     ) {
-        guard var flights = scopedIngressBarrierFlightsByRootID[rootID],
-              flights.contains(where: { $0.token == token })
+        guard let flightState = scopedIngressBarrierFlightStatesByRootID[rootID],
+              flightState.active?.token == token
         else {
             join.complete(with: output)
             return
         }
-        flights.removeAll { $0.token == token }
-        if flights.isEmpty {
-            scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID)
-        } else {
-            scopedIngressBarrierFlightsByRootID[rootID] = flights
-        }
+        flightState.active = nil
         #if DEBUG
             if let output {
                 recordScopedIngressBarrierCompletion(
@@ -1519,6 +1713,25 @@ actor WorkspaceFileContextStore {
                 )
             }
         #endif
+
+        if let output, let pending = flightState.pending {
+            flightState.pending = nil
+            launchScopedIngressBarrier(
+                rootID: rootID,
+                target: pending.target,
+                join: pending.join,
+                flightState: flightState
+            )
+            join.complete(with: output)
+            return
+        }
+
+        let pending = flightState.pending
+        flightState.pending = nil
+        scopedIngressBarrierFlightStatesByRootID.removeValue(forKey: rootID)
+        if output == nil {
+            pending?.join.complete(with: nil)
+        }
         join.complete(with: output)
     }
 
@@ -2288,6 +2501,7 @@ actor WorkspaceFileContextStore {
         #endif
 
         var state = RootState(
+            lifetimeID: UUID(),
             root: root,
             service: service,
             folderIDsByRelativePath: [:],
@@ -2427,11 +2641,10 @@ actor WorkspaceFileContextStore {
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
         for rootID in orderedRootIDs {
-            if let flights = scopedIngressBarrierFlightsByRootID.removeValue(forKey: rootID) {
-                for flight in flights {
-                    flight.task?.cancel()
-                    flight.join.complete(with: nil)
-                }
+            if let flightState = scopedIngressBarrierFlightStatesByRootID.removeValue(forKey: rootID) {
+                flightState.active?.task?.cancel()
+                flightState.active?.join.complete(with: nil)
+                flightState.pending?.join.complete(with: nil)
             }
             watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
@@ -2488,27 +2701,34 @@ actor WorkspaceFileContextStore {
             let stopWatchersStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
 
-        // Stop watchers after the roots have been detached from actor lookup tables.
-        // This keeps stale ingress from resolving against roots being unloaded while
-        // preserving the existing awaited teardown semantics.
-        for entry in statesToUnload {
-            #if DEBUG
-                let stopWatcherRootStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
-            #endif
-            await reconcileWatcherServiceState(entry.state.service, rootID: entry.rootID)
-            #if DEBUG
-                WorkspaceRestorePerfLog.event(
-                    "store.rootUnload.stopWatcherRoot",
-                    fields: [
-                        "rootName": entry.state.root.name,
-                        "rootID": WorkspaceRestorePerfLog.shortID(entry.rootID),
-                        "duration": stopWatcherRootStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
-                    ]
-                )
-            #endif
-        }
-        await waitForCurrentPublisherIngress(rootIDs: removedRootIDSet)
-        publisherIngressCoordinator.finishPublisherIngress(rootIDs: removedRootIDSet)
+        // Stop each detached service exactly once. The caller only waits through a bounded
+        // completion latch; cancellation cannot interrupt synchronous FSEvents flush work.
+        let detachedWatcherStops = startDetachedWatcherStops(statesToUnload)
+        #if DEBUG
+            if publisherIngressCoordinator.pendingPublisherIngressCount(rootIDs: removedRootIDSet) > 0,
+               let publisherIngressWillWaitHandler
+            {
+                await publisherIngressWillWaitHandler(removedRootIDSet)
+            }
+        #endif
+        let removedRootIDsInOrder = statesToUnload.map(\.rootID)
+        async let publisherIngressReports = publisherIngressCoordinator.terminateClosedPublisherIngress(
+            rootIDs: removedRootIDsInOrder,
+            gracefulDrainTimeoutNanoseconds: unloadTerminationPolicy.publisherIngressGraceNanoseconds,
+            sleep: unloadTerminationPolicy.sleep
+        )
+        let watcherStopReports = await awaitDetachedWatcherStops(detachedWatcherStops)
+        let resolvedPublisherIngressReports = await publisherIngressReports
+        let terminationDiagnostics = WorkspaceRootUnloadTerminationDiagnostics(
+            publisherIngressReports: resolvedPublisherIngressReports,
+            watcherStopReports: watcherStopReports
+        )
+        WorkspaceRootUnloadDiagnosticsLog.record(terminationDiagnostics)
+        #if DEBUG
+            if let rootUnloadTerminationDidCompleteHandler {
+                await rootUnloadTerminationDidCompleteHandler(terminationDiagnostics)
+            }
+        #endif
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.stopWatchers",
@@ -2563,6 +2783,7 @@ actor WorkspaceFileContextStore {
                 scopedIngressBarrierLaunchCountsByRootID.removeValue(forKey: rootID)
                 scopedIngressBarrierJoinCountsByRootID.removeValue(forKey: rootID)
                 scopedIngressBarrierSuccessorCountsByRootID.removeValue(forKey: rootID)
+                scopedIngressBarrierCoalescedSuccessorCountsByRootID.removeValue(forKey: rootID)
                 scopedIngressBarrierCompletionCountsByRootID.removeValue(forKey: rootID)
                 lastCompletedScopedIngressBarrierByRootID.removeValue(forKey: rootID)
             #endif
@@ -2603,6 +2824,67 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+    }
+
+    private func startDetachedWatcherStops(
+        _ statesToUnload: [(rootID: UUID, state: RootState)]
+    ) -> [DetachedWatcherStop] {
+        statesToUnload.enumerated().map { index, entry in
+            let completionLatch = WorkspaceRootUnloadCompletionLatch()
+            let service = entry.state.service
+            #if DEBUG
+                let watcherStopWillBeginHandler = watcherStopWillBeginHandler
+            #endif
+            let task = Task.detached {
+                #if DEBUG
+                    if let watcherStopWillBeginHandler {
+                        await watcherStopWillBeginHandler(entry.rootID)
+                    }
+                #endif
+                await service.stopWatchingForChanges()
+                completionLatch.complete()
+            }
+            return DetachedWatcherStop(
+                index: index,
+                rootID: entry.rootID,
+                rootPath: entry.state.root.standardizedFullPath,
+                completionLatch: completionLatch,
+                task: task
+            )
+        }
+    }
+
+    private func awaitDetachedWatcherStops(
+        _ stops: [DetachedWatcherStop]
+    ) async -> [WorkspaceRootWatcherStopReport] {
+        await withTaskGroup(of: (Int, WorkspaceRootWatcherStopReport).self) { group in
+            for stop in stops {
+                group.addTask { [unloadTerminationPolicy] in
+                    let outcome = await WorkspaceRootUnloadBoundedWait.waitForCompletion(
+                        stop.completionLatch,
+                        timeoutNanoseconds: unloadTerminationPolicy.watcherStopGraceNanoseconds,
+                        sleep: unloadTerminationPolicy.sleep
+                    )
+                    if outcome != .completed {
+                        stop.task.cancel()
+                    }
+                    return (
+                        stop.index,
+                        WorkspaceRootWatcherStopReport(
+                            rootID: stop.rootID,
+                            rootPath: stop.rootPath,
+                            outcome: outcome,
+                            graceNanoseconds: unloadTerminationPolicy.watcherStopGraceNanoseconds
+                        )
+                    )
+                }
+            }
+            var reports: [(Int, WorkspaceRootWatcherStopReport)] = []
+            for await report in group {
+                reports.append(report)
+            }
+            return reports.sorted { $0.0 < $1.0 }.map(\.1)
+        }
     }
 
     func file(rootID: UUID, relativePath: String) -> WorkspaceFileRecord? {
@@ -3617,14 +3899,24 @@ actor WorkspaceFileContextStore {
         private func applyPreparedIndexDeltas(
             rootID: UUID,
             deltas: [PreparedFileSystemDelta],
+            expectedLifetimeID: UUID? = nil,
             watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
             servicePublicationSequence: UInt64?
         ) async {
             guard let servicePublicationSequence else {
-                await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+                await applyPreparedIndexDeltasBody(
+                    rootID: rootID,
+                    deltas: deltas,
+                    expectedLifetimeID: expectedLifetimeID
+                )
                 return
             }
-            let recorder = await applyPreparedIndexDeltasRecordingInvalidations(rootID: rootID, deltas: deltas)
+            let recorder = await applyPreparedIndexDeltasRecordingInvalidations(
+                rootID: rootID,
+                deltas: deltas,
+                expectedLifetimeID: expectedLifetimeID
+            )
+            guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
             recordPublicationInvalidationDiagnostics(
                 rootID: rootID,
                 servicePublicationSequence: servicePublicationSequence,
@@ -3635,41 +3927,68 @@ actor WorkspaceFileContextStore {
 
         private func applyPreparedIndexDeltasRecordingInvalidations(
             rootID: UUID,
-            deltas: [PreparedFileSystemDelta]
+            deltas: [PreparedFileSystemDelta],
+            expectedLifetimeID: UUID? = nil
         ) async -> PublicationInvalidationRecorder {
             let recorder = PublicationInvalidationRecorder(preparedDeltaCount: deltas.count)
             await Self.$activePublicationInvalidationRecorder.withValue(recorder) {
-                await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+                await applyPreparedIndexDeltasBody(
+                    rootID: rootID,
+                    deltas: deltas,
+                    expectedLifetimeID: expectedLifetimeID
+                )
             }
             return recorder
         }
     #else
-        private func applyPreparedIndexDeltas(rootID: UUID, deltas: [PreparedFileSystemDelta]) async {
-            await applyPreparedIndexDeltasBody(rootID: rootID, deltas: deltas)
+        private func applyPreparedIndexDeltas(
+            rootID: UUID,
+            deltas: [PreparedFileSystemDelta],
+            expectedLifetimeID: UUID? = nil
+        ) async {
+            await applyPreparedIndexDeltasBody(
+                rootID: rootID,
+                deltas: deltas,
+                expectedLifetimeID: expectedLifetimeID
+            )
         }
     #endif
 
-    private func applyPreparedIndexDeltasBody(rootID: UUID, deltas: [PreparedFileSystemDelta]) async {
-        let applicableDeltas = await preflightPreparedIndexDeltas(rootID: rootID, deltas: deltas)
+    private func applyPreparedIndexDeltasBody(
+        rootID: UUID,
+        deltas: [PreparedFileSystemDelta],
+        expectedLifetimeID: UUID? = nil
+    ) async {
+        let applicableDeltas = await preflightPreparedIndexDeltas(
+            rootID: rootID,
+            deltas: deltas,
+            expectedLifetimeID: expectedLifetimeID
+        )
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else { return }
         applyPreparedIndexDeltaMutations(rootID: rootID, deltas: applicableDeltas)
     }
 
     private func preflightPreparedIndexDeltas(
         rootID: UUID,
-        deltas: [PreparedFileSystemDelta]
+        deltas: [PreparedFileSystemDelta],
+        expectedLifetimeID: UUID? = nil
     ) async -> [PreparedFileSystemDelta] {
         var applicableDeltas: [PreparedFileSystemDelta] = []
         applicableDeltas.reserveCapacity(deltas.count)
         for prepared in deltas {
             switch prepared.delta {
             case .fileAdded:
-                guard let service = rootStatesByID[rootID]?.service,
-                      await service.catalogEligibleRegularFileExists(relativePath: prepared.relativePath)
+                guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID),
+                      let service = rootStatesByID[rootID]?.service,
+                      await service.catalogEligibleRegularFileExists(relativePath: prepared.relativePath),
+                      isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID)
                 else { continue }
                 applicableDeltas.append(prepared)
             case .folderAdded:
-                guard let service = rootStatesByID[rootID]?.service,
-                      await service.catalogFolderIsDiscoverable(relativePath: prepared.relativePath)
+                guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID),
+                      let service = rootStatesByID[rootID]?.service,
+                      await service.catalogFolderIsDiscoverable(relativePath: prepared.relativePath),
+                      isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID)
                 else { continue }
                 applicableDeltas.append(prepared)
             case .fileRemoved, .folderRemoved, .fileModified, .folderModified:
@@ -4740,6 +5059,12 @@ actor WorkspaceFileContextStore {
         for continuation in codemapUpdateContinuations.values {
             continuation.yield(event)
         }
+    }
+
+    private func isRootLifetimeCurrent(rootID: UUID, expectedLifetimeID: UUID?) -> Bool {
+        guard let state = rootStatesByID[rootID] else { return false }
+        guard let expectedLifetimeID else { return true }
+        return state.lifetimeID == expectedLifetimeID
     }
 
     private func state(for rootID: UUID) throws -> RootState {

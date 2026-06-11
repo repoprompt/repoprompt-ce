@@ -342,18 +342,23 @@ final class TabContextRoutingTests: XCTestCase {
             repoPaths: [logicalRoot.path],
             ephemeral: true
         )
-        await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "persistResolvedTabContextSnapshotTest")
+        let initialSwitchResult = await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "persistResolvedTabContextSnapshotTest"
+        )
+        XCTAssertEqual(initialSwitchResult, .switched)
         let workspaceIndex = try XCTUnwrap(window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id })
         window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
             ComposeTabState(id: activeTabID, name: "Active", selection: activeSelection),
             ComposeTabState(id: inactiveTabID, name: "Agent", selection: inactiveInitialSelection)
         ]
         window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = activeTabID
-        await window.workspaceManager.switchWorkspace(
-            to: window.workspaceManager.workspaces[workspaceIndex],
-            saveState: false,
+        let tabReloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+            window.workspaceManager.workspaces[workspaceIndex],
             reason: "persistResolvedTabContextSnapshotTestTabs"
         )
+        XCTAssertEqual(tabReloadResult, .switched)
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
         _ = try await window.workspaceFileContextStore.loadRoot(path: logicalRoot.path)

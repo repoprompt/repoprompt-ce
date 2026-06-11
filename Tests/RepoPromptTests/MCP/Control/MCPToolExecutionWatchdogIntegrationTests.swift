@@ -468,6 +468,383 @@ import XCTest
             }
         }
 
+        func testManageWorkspacesSwitchTimeoutReleasesPermitAndKeepsConnectionUsable() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let operationGate = MCPExecutionCooperativeCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let clientName = "manage-workspaces-cooperative-\(UUID().uuidString)"
+                var endpoint: PersistentMCPTestEndpoint?
+                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: fixture.contextA.window.windowID,
+                    restrictedTools: [],
+                    tabID: fixture.contextA.tabID,
+                    runID: UUID(),
+                    additionalTools: [MCPGlobalToolName.manageWorkspaces],
+                    purpose: .agentModeRun
+                )
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPGlobalToolName.manageWorkspaces) {
+                    try await operationGate.enterAndWait()
+                    return .null
+                }
+
+                do {
+                    let createdEndpoint = try await PersistentMCPTestEndpoint.make(
+                        label: "manage-workspaces-cooperative",
+                        networkManager: manager,
+                        clientName: clientName,
+                        requiredToolNames: [MCPGlobalToolName.manageWorkspaces]
+                    )
+                    endpoint = createdEndpoint
+                    let activeResponseTask = Task {
+                        try await createdEndpoint.callTool(
+                            name: MCPGlobalToolName.manageWorkspaces,
+                            arguments: [
+                                "action": "switch",
+                                "workspace": fixture.contextA.workspaceID.uuidString,
+                                "window_id": fixture.contextA.window.windowID
+                            ]
+                        )
+                    }
+                    responseTask = activeResponseTask
+                    try await clock.waitForSleeperCount(1)
+                    try await operationGate.waitUntilEntered()
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline)
+
+                    let response = try await activeResponseTask.value
+                    responseTask = nil
+                    let cancellationCount = await operationGate.observedCancellationCount()
+                    XCTAssertEqual(cancellationCount, 1)
+                    let text = try Self.toolResultText(response)
+                    XCTAssertEqual(text.components(separatedBy: "tool_execution_timeout").count - 1, 1, text)
+                    XCTAssertTrue(text.contains("120-second execution contract"), text)
+
+                    let events = recorder.snapshot().filter {
+                        $0.connectionID == createdEndpoint.connectionID
+                            && $0.toolName == MCPGlobalToolName.manageWorkspaces
+                    }
+                    let selected = try XCTUnwrap(events.first { $0.phase == .contractSelected })
+                    XCTAssertEqual(selected.contractKind, .bounded)
+                    XCTAssertEqual(
+                        selected.executionDeadlineSeconds,
+                        Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds)
+                    )
+                    XCTAssertEqual(
+                        selected.cleanupGraceSeconds,
+                        Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
+                    )
+                    XCTAssertEqual(events.count(where: { $0.phase == .deadlineExpired }), 1)
+                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(
+                        connectionID: createdEndpoint.connectionID
+                    )
+                    XCTAssertFalse(isTerminal)
+
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.manageWorkspaces,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    MCPToolExecutionTracer.setTestSink(nil)
+
+                    let listResponse = try await createdEndpoint.callTool(
+                        name: MCPGlobalToolName.manageWorkspaces,
+                        arguments: ["action": "list"]
+                    )
+                    let listText = try Self.toolResultText(listResponse)
+                    XCTAssertFalse(listText.contains("tool_execution_timeout"), listText)
+                    _ = try await createdEndpoint.client.request(method: "tools/list", params: [:])
+                    let limiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: createdEndpoint.connectionID
+                    )
+                    XCTAssertEqual(limiter?.permits, 1)
+                    XCTAssertEqual(limiter?.waiterCount, 0)
+                    XCTAssertEqual(limiter?.inFlight, 0)
+
+                    await Self.cleanupEndpoint(createdEndpoint, manager: manager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await operationGate.cancelForCleanup()
+                    responseTask?.cancel()
+                    if let responseTask {
+                        _ = try? await responseTask.value
+                    }
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.manageWorkspaces,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    if let endpoint {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testManageWorkspacesCreateDeleteAndListSelectExactContracts() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let clientName = "manage-workspaces-classification-\(UUID().uuidString)"
+                let cases: [(label: String, arguments: [String: Any], isBounded: Bool)] = [
+                    ("create default", ["action": "create"], true),
+                    ("create true", ["action": "create", "switch_to_created": true], true),
+                    ("create false", ["action": "create", "switch_to_created": false], false),
+                    ("delete close", ["action": "delete", "close_window": true], true),
+                    ("delete default", ["action": "delete"], false),
+                    ("delete no close", ["action": "delete", "close_window": false], false),
+                    ("list", ["action": "list"], false)
+                ]
+                var endpoint: PersistentMCPTestEndpoint?
+                var activeGate: MCPExecutionIgnoringCancellationGate?
+                var activeResponseTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: fixture.contextA.window.windowID,
+                    restrictedTools: [],
+                    tabID: fixture.contextA.tabID,
+                    runID: UUID(),
+                    additionalTools: [MCPGlobalToolName.manageWorkspaces],
+                    purpose: .agentModeRun
+                )
+                do {
+                    let createdEndpoint = try await PersistentMCPTestEndpoint.make(
+                        label: "manage-workspaces-classification",
+                        networkManager: manager,
+                        clientName: clientName,
+                        requiredToolNames: [MCPGlobalToolName.manageWorkspaces]
+                    )
+                    endpoint = createdEndpoint
+                    for (index, testCase) in cases.enumerated() {
+                        let clock = ExecutionWatchdogManualClock()
+                        let operationGate = MCPExecutionIgnoringCancellationGate()
+                        activeGate = operationGate
+                        let label = testCase.label
+                        await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                        await manager.debugSetResolvedToolOperationOverride(toolName: MCPGlobalToolName.manageWorkspaces) {
+                            await operationGate.enterAndWait()
+                            return .object([
+                                "action": .string(label),
+                                "status": .string("ok")
+                            ])
+                        }
+
+                        var arguments = testCase.arguments
+                        arguments["window_id"] = fixture.contextA.window.windowID
+                        let responseTask = Task {
+                            try await createdEndpoint.callTool(
+                                name: MCPGlobalToolName.manageWorkspaces,
+                                arguments: arguments
+                            )
+                        }
+                        activeResponseTask = responseTask
+                        try await operationGate.waitUntilEntered(count: 1)
+                        if testCase.isBounded {
+                            try await clock.waitForSleeperCount(1)
+                        } else {
+                            for _ in 0 ..< 20 {
+                                await Task.yield()
+                            }
+                            let sleeperCount = await clock.sleeperCount()
+                            XCTAssertEqual(sleeperCount, 0, testCase.label)
+                        }
+
+                        let selectedEvents = recorder.snapshot().filter {
+                            $0.connectionID == createdEndpoint.connectionID
+                                && $0.toolName == MCPGlobalToolName.manageWorkspaces
+                                && $0.phase == .contractSelected
+                        }
+                        XCTAssertEqual(selectedEvents.count, index + 1, testCase.label)
+                        let selected = try XCTUnwrap(selectedEvents.last, testCase.label)
+                        XCTAssertEqual(
+                            selected.contractKind,
+                            testCase.isBounded ? .bounded : .workspaceLifecycleCancellable,
+                            testCase.label
+                        )
+                        XCTAssertEqual(
+                            selected.executionDeadlineSeconds,
+                            testCase.isBounded
+                                ? Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds)
+                                : nil,
+                            testCase.label
+                        )
+
+                        await operationGate.release()
+                        _ = try await responseTask.value
+                        activeResponseTask = nil
+                        activeGate = nil
+                        await manager.debugSetResolvedToolOperationOverride(
+                            toolName: MCPGlobalToolName.manageWorkspaces,
+                            operation: nil
+                        )
+                        await manager.debugResetToolExecutionWatchdogEnvironment()
+                    }
+
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    let terminal = await manager.debugIsExecutionWatchdogTerminal(
+                        connectionID: createdEndpoint.connectionID
+                    )
+                    XCTAssertFalse(terminal)
+                    await Self.cleanupEndpoint(createdEndpoint, manager: manager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await activeGate?.release()
+                    activeResponseTask?.cancel()
+                    if let activeResponseTask {
+                        _ = try? await activeResponseTask.value
+                    }
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.manageWorkspaces,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    if let endpoint {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testUncooperativeManageWorkspacesSwitchForceDisconnectsAndBlocksQueuedProviderEntry() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let clock = ExecutionWatchdogManualClock()
+                let operationGate = MCPExecutionIgnoringCancellationGate()
+                let recorder = MCPExecutionTraceRecorder()
+                let manager = fixture.networkManager
+                let clientName = "manage-workspaces-uncooperative-\(UUID().uuidString)"
+                var endpoint: PersistentMCPTestEndpoint?
+
+                MCPToolExecutionTracer.setTestSink { recorder.append($0) }
+                await manager.installClientConnectionPolicy(
+                    for: clientName,
+                    windowID: fixture.contextA.window.windowID,
+                    restrictedTools: [],
+                    tabID: fixture.contextA.tabID,
+                    runID: UUID(),
+                    additionalTools: [MCPGlobalToolName.manageWorkspaces],
+                    purpose: .agentModeRun
+                )
+                await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPGlobalToolName.manageWorkspaces) {
+                    await operationGate.enterAndWait()
+                    return .null
+                }
+
+                do {
+                    let createdEndpoint = try await PersistentMCPTestEndpoint.make(
+                        label: "manage-workspaces-uncooperative",
+                        networkManager: manager,
+                        clientName: clientName,
+                        requiredToolNames: [MCPGlobalToolName.manageWorkspaces]
+                    )
+                    endpoint = createdEndpoint
+                    let first = Task {
+                        try await createdEndpoint.callTool(
+                            name: MCPGlobalToolName.manageWorkspaces,
+                            arguments: [
+                                "action": "switch",
+                                "workspace": fixture.contextA.workspaceID.uuidString,
+                                "window_id": fixture.contextA.window.windowID
+                            ]
+                        )
+                    }
+                    try await clock.waitForSleeperCount(1)
+                    try await operationGate.waitUntilEntered(count: 1)
+
+                    let queued = Task {
+                        try await createdEndpoint.callTool(
+                            name: MCPGlobalToolName.manageWorkspaces,
+                            arguments: [
+                                "action": "list",
+                                "window_id": fixture.contextA.window.windowID
+                            ]
+                        )
+                    }
+                    for _ in 0 ..< 1000 {
+                        let waiterCount = await manager.connectionLimiterSnapshotForTesting(
+                            connectionID: createdEndpoint.connectionID
+                        )?.waiterCount
+                        if waiterCount == 1 { break }
+                        await Task.yield()
+                    }
+                    let queuedLimiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: createdEndpoint.connectionID
+                    )
+                    XCTAssertEqual(queuedLimiter?.waiterCount, 1)
+
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline)
+                    try await clock.waitForSleeperCount(1)
+                    try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
+
+                    await Self.assertSocketClosed(first)
+                    await Self.assertSocketClosed(queued)
+                    let enteredCount = await operationGate.enteredCount()
+                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(
+                        connectionID: createdEndpoint.connectionID
+                    )
+                    XCTAssertEqual(enteredCount, 1)
+                    XCTAssertTrue(isTerminal)
+
+                    let events = recorder.snapshot().filter {
+                        $0.connectionID == createdEndpoint.connectionID
+                            && $0.toolName == MCPGlobalToolName.manageWorkspaces
+                    }
+                    let selected = try XCTUnwrap(events.first { $0.phase == .contractSelected })
+                    XCTAssertEqual(
+                        selected.executionDeadlineSeconds,
+                        Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds)
+                    )
+                    XCTAssertFalse(events.contains { $0.phase == .handlerCompleted })
+                    XCTAssertTrue(events.contains { $0.phase == .cleanupGraceExpired })
+                    XCTAssertTrue(events.contains { $0.phase == .connectionForceDisconnectRequested })
+
+                    await operationGate.release()
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.manageWorkspaces,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    await Self.cleanupEndpoint(createdEndpoint, manager: manager)
+                    endpoint = nil
+                    await fixture.cleanup()
+                } catch {
+                    await operationGate.release()
+                    MCPToolExecutionTracer.setTestSink(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.manageWorkspaces,
+                        operation: nil
+                    )
+                    await manager.debugResetToolExecutionWatchdogEnvironment()
+                    if let endpoint {
+                        await Self.cleanupEndpoint(endpoint, manager: manager)
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testWindowIDInjectionAndExplicitValueReachResolvedProviderArguments() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)

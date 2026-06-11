@@ -1,5 +1,6 @@
 #if DEBUG
     import Combine
+    import CoreServices
     import MCP
     @testable import RepoPrompt
     import XCTest
@@ -32,6 +33,9 @@
             XCTAssertTrue(sibling.contains("queued_count"))
             XCTAssertTrue(sibling.contains("window_count"))
             XCTAssertTrue(sibling.contains("\"lanes\""))
+            XCTAssertTrue(sibling.contains("\"lane_count\""))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.ordinary.rawValue"))
+            XCTAssertTrue(sibling.contains("MCPConnectionCallLane.fileSearch.rawValue"))
             XCTAssertTrue(sibling.contains("maximum_active_count"))
             XCTAssertTrue(sibling.contains("maximum_queued_count"))
             XCTAssertTrue(sibling.contains("max_queued_waiters"))
@@ -61,8 +65,8 @@
             XCTAssertTrue(configured.isIdle)
 
             let sibling = try? source("Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnosticsReadSearchLatency.swift")
-            XCTAssertTrue(sibling?.contains("\"active_capacity\": 1") == true)
-            XCTAssertTrue(sibling?.contains("\"max_queued\": 1") == true)
+            XCTAssertTrue(sibling?.contains("\"active_capacity\": entry.snapshot.configuration.maxActiveLeases") == true)
+            XCTAssertTrue(sibling?.contains("\"max_queued\": entry.snapshot.configuration.maxQueuedWaiters") == true)
             XCTAssertTrue(sibling?.contains("range: 100 ... 60000") == true)
             XCTAssertTrue(sibling?.contains("range: 0 ... 60000") == true)
             XCTAssertFalse(sibling?.contains("global_capacity") == true)
@@ -180,6 +184,10 @@
         func testRuntimeSnapshotHiddenOperationValidatesBoundsAndReturnsAggregateShape() async throws {
             let manager = ServerNetworkManager.shared
             let connectionID = UUID()
+            _ = await manager.debugInstallConnectionLimiterForTesting(connectionID: connectionID)
+            addTeardownBlock {
+                await manager.debugRemoveConnection(connectionID)
+            }
             let runID = UUID()
             await manager.registerToolCallObserver(for: runID) { _ in }
             await manager.registerToolEventObserver(
@@ -246,9 +254,47 @@
             ] {
                 XCTAssertEqual((autoSelection[key] as? NSNumber)?.intValue, 0, key)
             }
+            let fileSearchLaneLimit = ServerNetworkManager.fileSearchCallLaneLimit
             let limiter = try XCTUnwrap(runtime["limiter"] as? [String: Any])
-            XCTAssertEqual(limiter["found"] as? Bool, false)
+            XCTAssertEqual(limiter["found"] as? Bool, true)
             XCTAssertEqual(limiter["connection_id"] as? String, connectionID.uuidString)
+            XCTAssertEqual((limiter["lane_count"] as? NSNumber)?.intValue, 2)
+            XCTAssertEqual((limiter["limit"] as? NSNumber)?.intValue, 1 + fileSearchLaneLimit)
+            XCTAssertEqual((limiter["permits"] as? NSNumber)?.intValue, 1 + fileSearchLaneLimit)
+            XCTAssertEqual((limiter["active_permit_count"] as? NSNumber)?.intValue, 0)
+            XCTAssertEqual((limiter["waiter_count"] as? NSNumber)?.intValue, 0)
+            XCTAssertEqual((limiter["in_flight_count"] as? NSNumber)?.intValue, 0)
+            XCTAssertEqual(limiter["is_closed"] as? Bool, false)
+            XCTAssertEqual(limiter["is_idle"] as? Bool, true)
+            let lanes = try XCTUnwrap(limiter["lanes"] as? [String: Any])
+            XCTAssertEqual(Set(lanes.keys), ["ordinary", "file_search"])
+            for (laneName, laneLimit) in [("ordinary", 1), ("file_search", fileSearchLaneLimit)] {
+                let lane = try XCTUnwrap(lanes[laneName] as? [String: Any])
+                XCTAssertEqual((lane["limit"] as? NSNumber)?.intValue, laneLimit, laneName)
+                XCTAssertEqual((lane["permits"] as? NSNumber)?.intValue, laneLimit, laneName)
+                XCTAssertEqual((lane["active_permit_count"] as? NSNumber)?.intValue, 0, laneName)
+                XCTAssertEqual((lane["waiter_count"] as? NSNumber)?.intValue, 0, laneName)
+                XCTAssertEqual((lane["in_flight_count"] as? NSNumber)?.intValue, 0, laneName)
+                XCTAssertEqual(lane["is_closed"] as? Bool, false, laneName)
+                XCTAssertEqual(lane["is_idle"] as? Bool, true, laneName)
+            }
+
+            let missingConnectionID = UUID()
+            let missingResult = await manager.handleDebugDiagnosticsTool(
+                connectionID: connectionID,
+                arguments: [
+                    "op": .string("mcp_read_search_runtime_snapshot"),
+                    "connection_id": .string(missingConnectionID.uuidString),
+                    "window_id": .int(window.windowID),
+                    "recent_publication_limit": .int(0),
+                    "root_limit": .int(1)
+                ]
+            )
+            let missingPayload = try debugDiagnosticsPayload(missingResult)
+            let missingRuntime = try XCTUnwrap(missingPayload["runtime"] as? [String: Any])
+            let missingLimiter = try XCTUnwrap(missingRuntime["limiter"] as? [String: Any])
+            XCTAssertEqual(missingLimiter["found"] as? Bool, false)
+            XCTAssertEqual(missingLimiter["connection_id"] as? String, missingConnectionID.uuidString)
 
             for invalidArguments: [String: Value] in [
                 [
@@ -272,6 +318,151 @@
                 XCTAssertEqual(invalidPayload["ok"] as? Bool, false)
                 XCTAssertEqual(invalidPayload["op"] as? String, "mcp_read_search_runtime_snapshot")
                 XCTAssertEqual(invalidPayload["code"] as? String, "invalid_params")
+            }
+        }
+
+        @MainActor
+        func testRuntimeSnapshotProjectsActiveAndCoalescedPendingBarrierState() async throws {
+            let manager = ServerNetworkManager.shared
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            WindowStatesManager.shared.registerWindowState(window)
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            addTeardownBlock { @MainActor in
+                window.beginClose()
+                await window.tearDown()
+                WindowStatesManager.shared.unregisterWindowState(window)
+            }
+
+            let root = try temporaryRoots.makeRoot(suiteName: "RuntimePendingBarrier")
+            let firstURL = root.appendingPathComponent("First.swift")
+            let secondURL = root.appendingPathComponent("Second.swift")
+            try FileSystemTestSupport.write("first", to: firstURL)
+            try FileSystemTestSupport.write("second", to: secondURL)
+            let store = window.workspaceFileContextStore
+            let record = try await store.loadRoot(path: root.path)
+            let watcherStartGate = MCPDiagnosticsGate()
+            await store.setWatcherServiceStateWillReconcileHandler { observedRootID, shouldWatch in
+                guard observedRootID == record.id, shouldWatch else { return }
+                await watcherStartGate.markStartedAndWaitForRelease()
+            }
+            let watcherStartTask = Task {
+                try await store.startWatchingRoot(id: record.id)
+            }
+            await watcherStartGate.waitUntilStarted()
+
+            let flushGate = MCPDiagnosticsGate()
+            await store.setScopedIngressBarrierWillFlushHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await flushGate.markStartedAndWaitForRelease()
+            }
+            let activeBarrier = Task {
+                await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            }
+            var pendingBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
+            var coalescedBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
+
+            do {
+                await flushGate.waitUntilStarted()
+                let createdFileFlags = FSEventStreamEventFlags(
+                    kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
+                )
+                let firstAccepted = try await store.acceptWatcherPayloadForTesting(
+                    rootID: record.id,
+                    events: [(absolutePath: firstURL.path, flags: createdFileFlags, eventId: 500)],
+                    scheduleDrain: false
+                )
+                _ = try XCTUnwrap(firstAccepted, "Expected first watcher watermark")
+                pendingBarrier = Task {
+                    await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                }
+                for _ in 0 ..< 1000 {
+                    if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).successorCount == 1 { break }
+                    await Task.yield()
+                }
+
+                let acceptedSecondWatermark = try await store.acceptWatcherPayloadForTesting(
+                    rootID: record.id,
+                    events: [(absolutePath: secondURL.path, flags: createdFileFlags, eventId: 501)],
+                    scheduleDrain: false
+                )
+                let secondAccepted = try XCTUnwrap(
+                    acceptedSecondWatermark,
+                    "Expected second watcher watermark"
+                )
+                try await store.publishSyntheticFileSystemDeltasForTesting(
+                    rootID: record.id,
+                    deltas: [.fileModified("First.swift", nil)]
+                )
+                let acceptedServicePublicationSequence = await store.appliedIngressSnapshotForTesting(rootID: record.id)
+                    .acceptedServicePublicationSequence
+                coalescedBarrier = Task {
+                    await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                }
+                for _ in 0 ..< 1000 {
+                    if await store.scopedIngressBarrierStatsForTesting(rootID: record.id).coalescedSuccessorCount == 1 {
+                        break
+                    }
+                    await Task.yield()
+                }
+
+                let result = await manager.handleDebugDiagnosticsTool(
+                    connectionID: UUID(),
+                    arguments: [
+                        "op": .string("mcp_read_search_runtime_snapshot"),
+                        "window_id": .int(window.windowID),
+                        "recent_publication_limit": .int(0),
+                        "root_limit": .int(1)
+                    ]
+                )
+                await cleanupRuntimePendingBarrierTest(
+                    store: store,
+                    rootID: record.id,
+                    watcherStartGate: watcherStartGate,
+                    flushGate: flushGate,
+                    watcherStartTask: watcherStartTask,
+                    activeBarrier: activeBarrier,
+                    pendingBarrier: pendingBarrier,
+                    coalescedBarrier: coalescedBarrier
+                )
+
+                let payload = try debugDiagnosticsPayload(result)
+                let runtime = try XCTUnwrap(payload["runtime"] as? [String: Any])
+                let windows = try XCTUnwrap(runtime["windows"] as? [[String: Any]])
+                let windowPayload = try XCTUnwrap(windows.first)
+                let roots = try XCTUnwrap(windowPayload["roots"] as? [[String: Any]])
+                let rootPayload = try XCTUnwrap(roots.first)
+                let barrier = try XCTUnwrap(rootPayload["barrier"] as? [String: Any])
+                XCTAssertEqual((barrier["launch_count"] as? NSNumber)?.intValue, 1)
+                XCTAssertEqual((barrier["join_count"] as? NSNumber)?.intValue, 1)
+                XCTAssertEqual((barrier["successor_count"] as? NSNumber)?.intValue, 1)
+                XCTAssertEqual((barrier["coalesced_successor_count"] as? NSNumber)?.intValue, 1)
+                XCTAssertEqual((barrier["completion_count"] as? NSNumber)?.intValue, 0)
+                let active = try XCTUnwrap(barrier["active"] as? [String: Any])
+                XCTAssertEqual((active["target_watcher_watermark"] as? NSNumber)?.uint64Value, 0)
+                let pending = try XCTUnwrap(barrier["pending"] as? [String: Any])
+                XCTAssertEqual(
+                    (pending["target_watcher_watermark"] as? NSNumber)?.uint64Value,
+                    secondAccepted.rawValue
+                )
+                XCTAssertEqual(
+                    (pending["target_service_publication_sequence"] as? NSNumber)?.uint64Value,
+                    acceptedServicePublicationSequence
+                )
+                XCTAssertNotNil((pending["age_ms"] as? NSNumber)?.uint64Value)
+            } catch {
+                await cleanupRuntimePendingBarrierTest(
+                    store: store,
+                    rootID: record.id,
+                    watcherStartGate: watcherStartGate,
+                    flushGate: flushGate,
+                    watcherStartTask: watcherStartTask,
+                    activeBarrier: activeBarrier,
+                    pendingBarrier: pendingBarrier,
+                    coalescedBarrier: coalescedBarrier
+                )
+                throw error
             }
         }
 
@@ -413,7 +604,7 @@
 
             let limiterBegin = try XCTUnwrap(manager.range(of: "let limiterWaitState = EditFlowPerf.begin("))
             let limiterEnd = try XCTUnwrap(manager.range(of: "defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState) }", range: limiterBegin.upperBound ..< manager.endIndex))
-            let withPermit = try XCTUnwrap(manager.range(of: "return await limiter.withPermit(", range: limiterEnd.upperBound ..< manager.endIndex))
+            let withPermit = try XCTUnwrap(manager.range(of: "return await self.withConnectionCallPermit(", range: limiterEnd.upperBound ..< manager.endIndex))
             XCTAssertLessThan(limiterBegin.lowerBound, limiterEnd.lowerBound)
             XCTAssertLessThan(limiterEnd.lowerBound, withPermit.lowerBound)
 
@@ -594,7 +785,7 @@
                 "EditFlowPerf.Stage.MCPToolCall.limiterEnvelope",
                 "let limiterWaitState = EditFlowPerf.begin(",
                 "defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.limiterWait, limiterWaitState) }",
-                "await limiter.withPermit(",
+                "await self.withConnectionCallPermit(",
                 "EditFlowPerf.Stage.MCPToolCall.permitBodyEnvelope",
                 "let permitPreDispatchEnvelopeState = EditFlowPerf.begin(",
                 "EditFlowPerf.Stage.MCPToolCall.enabledStateSnapshot",
@@ -1557,13 +1748,15 @@
             let unloadEnd = try XCTUnwrap(store.range(of: "    func file(rootID: UUID, relativePath: String)", range: unloadStart.upperBound ..< store.endIndex))
             let unload = String(store[unloadStart.lowerBound ..< unloadEnd.lowerBound])
             let rootDetach = try XCTUnwrap(unload.range(of: "rootStatesByID.removeValue(forKey: rootID)"))
-            let stopWatching = try XCTUnwrap(unload.range(of: "await reconcileWatcherServiceState(entry.state.service, rootID: entry.rootID)"))
+            let watcherStopStart = try XCTUnwrap(unload.range(of: "let detachedWatcherStops = startDetachedWatcherStops(statesToUnload)"))
+            let watcherStopWait = try XCTUnwrap(unload.range(of: "let watcherStopReports = await awaitDetachedWatcherStops(detachedWatcherStops)"))
             let managedOnlyCleanup = try XCTUnwrap(unload.range(of: "managedOnlyFileIDs.remove(fileID)"))
             let rootSnapshotCleanup = try XCTUnwrap(unload.range(of: "removeCodemapSnapshots(forRootID: rootID)"))
-            XCTAssertLessThan(rootDetach.lowerBound, stopWatching.lowerBound)
-            XCTAssertLessThan(stopWatching.lowerBound, managedOnlyCleanup.lowerBound)
+            XCTAssertLessThan(rootDetach.lowerBound, watcherStopStart.lowerBound)
+            XCTAssertLessThan(watcherStopStart.lowerBound, watcherStopWait.lowerBound)
+            XCTAssertLessThan(watcherStopWait.lowerBound, managedOnlyCleanup.lowerBound)
             XCTAssertLessThan(managedOnlyCleanup.lowerBound, rootSnapshotCleanup.lowerBound)
-            XCTAssertFalse(String(unload[rootDetach.lowerBound ..< stopWatching.lowerBound]).contains("invalidateAllCodemapFileAPIsCache"))
+            XCTAssertFalse(String(unload[rootDetach.lowerBound ..< watcherStopStart.lowerBound]).contains("invalidateAllCodemapFileAPIsCache"))
             XCTAssertFalse(String(unload[managedOnlyCleanup.lowerBound ..< rootSnapshotCleanup.lowerBound]).contains("await"))
 
             let provider = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
@@ -2107,7 +2300,7 @@
             XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionOverloaded"))
             XCTAssertTrue(coordinator.contains("EditFlowPerf.Lifecycle.Search.broadAdmissionWaitExpired"))
             XCTAssertTrue(coordinator.contains("EditFlowPerf.Stage.Search.broadAdmissionLeaseHold"))
-            XCTAssertTrue(coordinator.contains("storeCapacity: 1"))
+            XCTAssertTrue(coordinator.contains("storeCapacity: configuration.maxActiveLeases"))
             XCTAssertTrue(coordinator.contains("globalCapacity: 0"))
             XCTAssertTrue(coordinator.contains("storeQueueDepth: metrics.queueDepth"))
             XCTAssertTrue(coordinator.contains("globalQueueDepth: 0"))
@@ -2278,7 +2471,7 @@
             XCTAssertTrue(coordinator.contains("snapshotForTesting"))
             XCTAssertTrue(coordinator.contains("configureForTesting"))
             XCTAssertTrue(coordinator.contains("resetConfigurationForTesting"))
-            XCTAssertTrue(coordinator.contains("activeLeaseID == nil, waiterState == nil"))
+            XCTAssertTrue(coordinator.contains("activeLeaseIDs.isEmpty, waiterStatesByID.isEmpty"))
             XCTAssertTrue(coordinator.contains("let enqueuedAt = clock.now()"))
             XCTAssertTrue(coordinator.contains("maximumActivePermitCount"))
             XCTAssertTrue(coordinator.contains("maximumWaiterCount"))
@@ -2307,6 +2500,31 @@
             XCTAssertTrue(sibling.contains("\"grant_count\": grantCount"))
         }
 
+        func testReadSearchBarrierDiagnosticsExposeBoundedPendingSuccessorState() throws {
+            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            for hook in [
+                "ScopedIngressBarrierRootFlightState",
+                "ScopedIngressBarrierPendingFlight",
+                "scopedIngressBarrierFlightStatesByRootID",
+                "scopedIngressBarrierCoalescedSuccessorCountsByRootID",
+                "flightState.pending = ScopedIngressBarrierPendingFlight(",
+                "pending.target = pending.target.merging(target)",
+                "flightState.active?.task?.cancel()",
+                "flightState.pending?.join.complete(with: nil)"
+            ] {
+                XCTAssertTrue(store.contains(hook), "Missing bounded barrier-state hook: \(hook)")
+            }
+            XCTAssertFalse(store.contains("scopedIngressBarrierFlightsByRootID"))
+
+            let diagnostics = try source(
+                "Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnosticsReadSearchLatency.swift"
+            )
+            XCTAssertTrue(diagnostics.contains("\"coalesced_successor_count\": snapshot.coalescedSuccessorCount"))
+            XCTAssertTrue(diagnostics.contains("\"pending\": Self.debugOptionalValue(pending)"))
+            XCTAssertTrue(diagnostics.contains("target_service_publication_sequence"))
+            XCTAssertTrue(diagnostics.contains("\"age_ms\": pending.ageMilliseconds"))
+        }
+
         func testLifecycleSourceOrderCoversDispatchRunToolAndIngressBoundaries() throws {
             let manager = try source("Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift")
             assertSourceOrder(
@@ -2315,7 +2533,7 @@
                     "EditFlowPerf.Lifecycle.MCPToolCall.received",
                     "EditFlowPerf.Lifecycle.MCPToolCall.routingSnapshotCompleted",
                     "EditFlowPerf.Lifecycle.MCPToolCall.limiterWaitBegan",
-                    "return await limiter.withPermit(",
+                    "return await self.withConnectionCallPermit(",
                     "EditFlowPerf.Lifecycle.MCPToolCall.limiterAcquired",
                     "Self.withConnectionID(connectionID, lifecycleCorrelation: lifecycleCorrelation)"
                 ]
@@ -2434,6 +2652,31 @@
             XCTAssertTrue(fsevents.contains("source: .watcherBarrierNoop"))
             XCTAssertTrue(fsevents.contains("watcherAcceptedWatermark: publishableWatcherWatermark"))
             XCTAssertEqual(operations.components(separatedBy: "source: .syntheticMutation").count - 1, 5)
+        }
+
+        @MainActor
+        private func cleanupRuntimePendingBarrierTest(
+            store: WorkspaceFileContextStore,
+            rootID: UUID,
+            watcherStartGate: MCPDiagnosticsGate,
+            flushGate: MCPDiagnosticsGate,
+            watcherStartTask: Task<Void, Error>,
+            activeBarrier: Task<[WorkspaceIngressBarrierSample], Never>,
+            pendingBarrier: Task<[WorkspaceIngressBarrierSample], Never>?,
+            coalescedBarrier: Task<[WorkspaceIngressBarrierSample], Never>?
+        ) async {
+            await flushGate.release()
+            activeBarrier.cancel()
+            pendingBarrier?.cancel()
+            coalescedBarrier?.cancel()
+            _ = await activeBarrier.value
+            _ = await pendingBarrier?.value
+            _ = await coalescedBarrier?.value
+            await store.setScopedIngressBarrierWillFlushHandler(nil)
+            await store.setWatcherServiceStateWillReconcileHandler(nil)
+            await watcherStartGate.release()
+            _ = try? await watcherStartTask.value
+            await store.stopWatchingRoot(id: rootID)
         }
 
         private actor MCPDiagnosticsGate {

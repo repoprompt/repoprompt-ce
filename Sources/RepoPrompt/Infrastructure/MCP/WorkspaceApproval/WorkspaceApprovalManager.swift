@@ -56,6 +56,10 @@ public final class WorkspaceApprovalManager: ObservableObject {
 
     /// Request approval for a workspace operation.
     /// Returns the user's decision.
+    ///
+    /// The wait is cancellation-aware: if the calling task is cancelled (for example by a
+    /// tool-execution watchdog), the request resolves as `.denied` instead of parking the
+    /// caller on an unresolvable continuation while the side effect remains pending.
     public func requestApproval(for request: WorkspaceApprovalRequest) async -> WorkspaceApprovalResult {
         // Check if auto-approved
         if settings.shouldAutoApprove(operation: request.operation, clientID: request.clientID) {
@@ -65,25 +69,53 @@ public final class WorkspaceApprovalManager: ObservableObject {
         }
 
         // Need user approval
-        return await withCheckedContinuation { continuation in
-            // If there's already a pending request, queue this one
-            if pendingRequest != nil {
-                pendingQueue.append((request, continuation))
-                return
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(returning: .denied)
+                    return
+                }
+
+                // If there's already a pending request, queue this one
+                if pendingRequest != nil {
+                    pendingQueue.append((request, continuation))
+                    return
+                }
+
+                // Show approval overlay
+                pendingRequest = request
+                currentContinuation = continuation
+                isApprovalOverlayVisible = true
+
+                // Bring window to front and request attention
+                bringWindowToFront(windowID: request.windowID)
+
+                if !NSApp.isActive {
+                    NSApp.requestUserAttention(.criticalRequest)
+                }
             }
-
-            // Show approval overlay
-            pendingRequest = request
-            currentContinuation = continuation
-            isApprovalOverlayVisible = true
-
-            // Bring window to front and request attention
-            bringWindowToFront(windowID: request.windowID)
-
-            if !NSApp.isActive {
-                NSApp.requestUserAttention(.criticalRequest)
+        } onCancel: {
+            Task { @MainActor in
+                WorkspaceApprovalManager.shared.cancelPending(requestID: request.id)
             }
         }
+    }
+
+    /// Deny and clear a specific pending approval request, whether it is the active
+    /// request or still queued. No-op if the request has already been resolved.
+    public func cancelPending(requestID: UUID) {
+        if pendingRequest?.id == requestID {
+            currentContinuation?.resume(returning: .denied)
+            currentContinuation = nil
+            pendingRequest = nil
+            isApprovalOverlayVisible = false
+            processNextQueuedRequest()
+            return
+        }
+
+        guard let index = pendingQueue.firstIndex(where: { $0.0.id == requestID }) else { return }
+        let (_, continuation) = pendingQueue.remove(at: index)
+        continuation.resume(returning: .denied)
     }
 
     /// Resolve the current pending approval request.
@@ -111,6 +143,12 @@ public final class WorkspaceApprovalManager: ObservableObject {
         // Process next queued request if any
         processNextQueuedRequest()
     }
+
+    #if DEBUG
+        var pendingQueueCountForTesting: Int {
+            pendingQueue.count
+        }
+    #endif
 
     /// Cancel all pending approvals (e.g., when window closes).
     public func cancelAllPending() {

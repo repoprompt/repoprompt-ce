@@ -54,6 +54,22 @@ final class ModelPickerStringOrderingTests: XCTestCase {
         XCTAssertEqual(AIModel.fromModelName("gemini-3-pro-preview"), .gemini3p1ProPreview)
     }
 
+    func testClaudeCodePickerExposesFable5WithEffortVariantsFirst() throws {
+        let models = AIModel.modelsForProvider(.claudeCode)
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5")))
+        XCTAssertTrue(models.contains(.claudeCodeModel(specifier: "claude-fable-5:xhigh")))
+        XCTAssertEqual(
+            AIModel.fromModelName("\(ClaudeCodeAIModelCatalog.rawPrefix)claude-fable-5:xhigh"),
+            .claudeCodeModel(specifier: "claude-fable-5:xhigh")
+        )
+
+        let menu = AIModel.claudeCodeMenu(for: models)
+        XCTAssertEqual(menu.groups.first?.baseModelRaw, "claude-fable-5")
+        let fableGroup = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "claude-fable-5" })
+        XCTAssertEqual(fableGroup.displayName, "Fable 5")
+        XCTAssertTrue(fableGroup.options.contains { $0.displayName == "XHigh" })
+    }
+
     func testAIModelCodexMenuGroupsUseStableSemanticOrdering() {
         let groups = AIModel.codexMenuGroups(for: [
             .codexCustom(name: "gpt-5.2-high"),

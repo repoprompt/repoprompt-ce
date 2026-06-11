@@ -325,6 +325,7 @@ enum ClaudeCompatibleModelCatalogAdapter {
 
     /// Base model raw values (lowercased) that support the XHigh effort tier.
     private static let claudeXHighEligibleBaseRaws: Set<String> = [
+        AgentModel.claudeFable5.rawValue.lowercased(),
         AgentModel.claudeOpus.rawValue.lowercased(),
         AgentModel.claudeOpus1m.rawValue.lowercased(),
         AgentModel.claudeOpus47.rawValue.lowercased(),
