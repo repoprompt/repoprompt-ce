@@ -142,8 +142,6 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
 }
 
 public enum MCPResponseDeliveryTracer {
-    private static let lock = NSLock()
-
     public static var successTracingEnabled: Bool {
         #if DEBUG
             ProcessInfo.processInfo.environment["REPOPROMPT_MCP_RESPONSE_TRACE"] == "1"
@@ -155,10 +153,8 @@ public enum MCPResponseDeliveryTracer {
 
     public static func emit(_ event: MCPResponseDeliveryTraceEvent) {
         guard event.terminalReason != nil || successTracingEnabled else { return }
-        guard let data = "[MCPResponseDelivery] \(event)\n".data(using: .utf8) else { return }
-        lock.lock()
-        FileHandle.standardError.write(data)
-        lock.unlock()
+        let data = Data("[MCPResponseDelivery] \(event)\n".utf8)
+        MCPBestEffortRawFDWriter.write(data)
     }
 
     public static func sha256Hex(_ data: Data) -> String {

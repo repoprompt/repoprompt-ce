@@ -1043,7 +1043,7 @@ extension BootstrapSocketProxy {
                 ) { framed in
                     // Progress notifications are an intentional stderr-only control surface.
                     if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        FileHandle.standardError.write("[progress] \(progressMessage)\n".data(using: .utf8)!)
+                        MCPBestEffortRawFDWriter.write(Data("[progress] \(progressMessage)\n".utf8))
                         return
                     }
                     do {
