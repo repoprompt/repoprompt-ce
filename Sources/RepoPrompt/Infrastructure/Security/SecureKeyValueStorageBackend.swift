@@ -62,6 +62,14 @@ enum SecureKeyValueStorageFactory {
             }
         case .appleDevelopmentDebug:
             KeychainService.debugShared
+        case .localDeveloperID:
+            if let bundleIdentifier = decision.localBundleIdentifier,
+               let teamIdentifier = decision.localTeamIdentifier
+            {
+                KeychainService.localDeveloperID(bundleIdentifier: bundleIdentifier, teamIdentifier: teamIdentifier)
+            } else {
+                EphemeralSecureKeyValueStore.shared
+            }
         case .ephemeral:
             EphemeralSecureKeyValueStore.shared
         }

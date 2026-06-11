@@ -60,6 +60,7 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
     static let legacyCanonicalServiceName = "com.pvncher.repoprompt.ce.keychain"
     static let officialV2ServiceName = "com.pvncher.repoprompt.ce.developer-id.keychain.v2"
     static let localSelfSignedServiceNamePrefix = "com.pvncher.repoprompt.ce.local-self-signed."
+    static let localDeveloperIDServiceNamePrefix = "repoprompt.ce.local-developer-id."
     static let debugServiceName = "com.pvncher.repoprompt.ce.debug.keychain"
 
     static let officialV2Shared = KeychainService(serviceName: officialV2ServiceName)
@@ -76,8 +77,45 @@ final class KeychainService: SecureKeyValueStorageBackend, @unchecked Sendable {
         KeychainService(serviceName: localSelfSignedServiceName(fingerprint: fingerprint, generation: generation))
     }
 
+    static func localDeveloperIDServiceName(bundleIdentifier: String, teamIdentifier: String) -> String {
+        let normalizedBundle = normalizedServiceComponent(bundleIdentifier)
+        let normalizedTeam = normalizedServiceComponent(teamIdentifier)
+        precondition(!normalizedBundle.isEmpty, "Local Developer ID bundle identifier must not be empty")
+        precondition(!normalizedTeam.isEmpty, "Local Developer ID team identifier must not be empty")
+        return "\(localDeveloperIDServiceNamePrefix)\(normalizedTeam).\(normalizedBundle).keychain.v1"
+    }
+
+    static func localDeveloperID(bundleIdentifier: String, teamIdentifier: String) -> KeychainService {
+        KeychainService(serviceName: localDeveloperIDServiceName(
+            bundleIdentifier: bundleIdentifier,
+            teamIdentifier: teamIdentifier
+        ))
+    }
+
     static func legacyRepairSource(secItemClient: SecItemClient = SystemSecItemClient()) -> KeychainService {
         KeychainService(serviceName: legacyCanonicalServiceName, secItemClient: secItemClient)
+    }
+
+    private static func normalizedServiceComponent(_ value: String) -> String {
+        value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .unicodeScalars
+            .map { scalar -> Character in
+                switch scalar.value {
+                case 48 ... 57, 97 ... 122:
+                    Character(scalar)
+                case 45, 46:
+                    Character(scalar)
+                default:
+                    "-"
+                }
+            }
+            .reduce(into: "") { result, character in
+                if character == "-", result.last == "-" { return }
+                result.append(character)
+            }
+            .trimmingCharacters(in: CharacterSet(charactersIn: ".-"))
     }
 
     let serviceName: String

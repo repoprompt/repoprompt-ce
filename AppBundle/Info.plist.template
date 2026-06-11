@@ -19,13 +19,13 @@
   <key>RepoPromptLocalSigningCertificateSHA256</key><string>__LOCAL_SIGNING_CERTIFICATE_SHA256__</string>
   <key>RepoPromptLocalSecureStorageGeneration</key><string>__LOCAL_SECURE_STORAGE_GENERATION__</string>
   <key>LSEnvironment</key><dict><key>REPOPROMPT_LAUNCH_SOURCE</key><string>launchservices</string></dict>
-  <key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>com.pvncher.repoprompt.ce</string><key>CFBundleURLSchemes</key><array><string>repoprompt-ce</string></array><key>CFBundleURLIconFile</key><string>AppIcon</string></dict></array>
+  <key>CFBundleURLTypes</key><array><dict><key>CFBundleTypeRole</key><string>Viewer</string><key>CFBundleURLName</key><string>__BUNDLE_ID__</string><key>CFBundleURLSchemes</key><array><string>__URL_SCHEME__</string></array><key>CFBundleURLIconFile</key><string>AppIcon</string></dict></array>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
-  <key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>RepoPrompt CE Document</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Default</string><key>LSItemContentTypes</key><array><string>com.pvncher.repoprompt.ce.document</string></array></dict></array>
-  <key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>com.pvncher.repoprompt.ce.document</string><key>UTTypeDescription</key><string>RepoPrompt CE Document</string><key>UTTypeConformsTo</key><array><string>public.data</string></array></dict></array>
+  <key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>__DISPLAY_NAME__ Document</string><key>CFBundleTypeRole</key><string>Viewer</string><key>LSHandlerRank</key><string>Default</string><key>LSItemContentTypes</key><array><string>__BUNDLE_ID__.document</string></array></dict></array>
+  <key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>__BUNDLE_ID__.document</string><key>UTTypeDescription</key><string>__DISPLAY_NAME__ Document</string><key>UTTypeConformsTo</key><array><string>public.data</string></array></dict></array>
   <key>SUFeedURL</key><string>https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/appcast.xml</string>
   <key>SUPublicEDKey</key><string>845kp9v5+kp4U6no85H53cUdnbfN3NmE1PJHKwH8Pd4=</string>
-  <key>SUBundleName</key><string>RepoPrompt CE.app</string>
+  <key>SUBundleName</key><string>__DISPLAY_NAME__.app</string>
   <key>NSLocalNetworkUsageDescription</key><string>RepoPrompt CE needs local network access to enable MCP server functionality, allowing external tools to connect and interact with your workspace.</string>
   <key>NSBonjourServices</key><array><string>_preflight_check._tcp</string><string>_mcp._tcp</string></array>
 </dict>

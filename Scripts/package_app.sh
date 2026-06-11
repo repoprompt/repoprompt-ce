@@ -67,14 +67,26 @@ finish(){
 }
 trap 'finish $?' EXIT
 
+DISPLAY_NAME_OVERRIDE="${DISPLAY_NAME:-}"
 BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+SIGNING_TEAM_ID_OVERRIDE="${SIGNING_TEAM_ID:-}"
+URL_SCHEME_OVERRIDE="${REPOPROMPT_URL_SCHEME:-${URL_SCHEME:-}}"
 # Invalidate public-release manifests before metadata parsing, checks, or builds
 # so failed non-public packaging cannot leave stale release metadata behind.
 remove_stale_artifact_manifests
 source "$CONTROL_PLANE_SCRIPTS_DIR/load_release_metadata.sh"
 load_release_metadata "$ROOT_DIR"
-APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID:-648A27MST5}"
+BASE_DISPLAY_NAME="${DISPLAY_NAME:-RepoPrompt CE}"
+APP_NAME="${APP_NAME:-RepoPrompt}"; DISPLAY_NAME="${DISPLAY_NAME_OVERRIDE:-${DISPLAY_NAME:-RepoPrompt CE}}"; BASE_BUNDLE_ID="${BUNDLE_ID:-com.pvncher.repoprompt.ce}"; MARKETING_VERSION="${MARKETING_VERSION:-0.1.0}"; BUILD_NUMBER="${BUILD_NUMBER:-1}"; SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-${SIGNING_TEAM_ID:-648A27MST5}}"
 ARTIFACT_MANIFEST="$ROOT_DIR/.build/release/$APP_NAME-artifact-manifest.json"
+
+url_scheme_from_bundle_id(){
+    local lower sanitized
+    lower="$(tr '[:upper:]' '[:lower:]' <<< "$1")"
+    sanitized="$(sed -E 's/[^a-z0-9+.-]+/-/g; s/^[^a-z]+//; s/[.-]+$//' <<< "$lower")"
+    [[ -n "$sanitized" ]] || sanitized="local"
+    printf 'repoprompt-ce-%s\n' "$sanitized"
+}
 
 IS_RELEASE=0
 [[ "$CONF" == "release" ]] && IS_RELEASE=1
@@ -83,6 +95,26 @@ if (( IS_RELEASE )); then
 else
     BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-${DEBUG_BUNDLE_ID:-$BASE_BUNDLE_ID.debug}}"
 fi
+if [[ -n "$URL_SCHEME_OVERRIDE" ]]; then
+    URL_SCHEME="$URL_SCHEME_OVERRIDE"
+elif [[ "$BUNDLE_ID" == "$BASE_BUNDLE_ID" || "$BUNDLE_ID" == "$BASE_BUNDLE_ID.debug" ]]; then
+    URL_SCHEME="repoprompt-ce"
+else
+    URL_SCHEME="$(url_scheme_from_bundle_id "$BUNDLE_ID")"
+fi
+
+TRIMMED_DISPLAY_NAME="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<< "$DISPLAY_NAME")"
+NORMALIZED_BUNDLE_ID="$(tr '[:upper:]' '[:lower:]' <<< "$BUNDLE_ID")"
+NORMALIZED_BASE_BUNDLE_ID="$(tr '[:upper:]' '[:lower:]' <<< "$BASE_BUNDLE_ID")"
+NORMALIZED_URL_SCHEME="$(tr '[:upper:]' '[:lower:]' <<< "$URL_SCHEME")"
+NORMALIZED_DISPLAY_NAME="$(tr '[:upper:]' '[:lower:]' <<< "$TRIMMED_DISPLAY_NAME")"
+NORMALIZED_BASE_DISPLAY_NAME="$(tr '[:upper:]' '[:lower:]' <<< "$BASE_DISPLAY_NAME")"
+
+[[ "$APP_NAME" =~ ^[A-Za-z0-9._\ -]+$ ]] || fail "APP_NAME contains unsupported characters: $APP_NAME"
+[[ -n "$DISPLAY_NAME" && "$DISPLAY_NAME" == "$TRIMMED_DISPLAY_NAME" && "$DISPLAY_NAME" != */* ]] || fail "DISPLAY_NAME must be non-empty, trimmed, and must not contain '/'."
+[[ "$BUNDLE_ID" =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] || fail "BUNDLE_ID is not a valid bundle identifier: $BUNDLE_ID"
+[[ "$SIGNING_TEAM_ID" =~ ^[A-Z0-9]+$ ]] || fail "SIGNING_TEAM_ID must contain only uppercase letters and digits: $SIGNING_TEAM_ID"
+[[ "$URL_SCHEME" =~ ^[A-Za-z][A-Za-z0-9+.-]*$ ]] || fail "URL scheme is invalid: $URL_SCHEME"
 
 phase "Checking build environment"
 run "$CONTROL_PLANE_SCRIPTS_DIR/doctor.sh" --quiet
@@ -94,6 +126,7 @@ SIGN_IDENTITY="${SIGN_IDENTITY:-}"
 ALLOW_ADHOC_SIGNING="${ALLOW_ADHOC_SIGNING:-0}"
 RELEASE_ALLOW_ADHOC_SIGNING="${RELEASE_ALLOW_ADHOC_SIGNING:-0}"
 LOCAL_SELF_SIGNED_RELEASE="${LOCAL_SELF_SIGNED_RELEASE:-0}"
+LOCAL_DEVELOPER_ID_RELEASE="${LOCAL_DEVELOPER_ID_RELEASE:-0}"
 LOCAL_SELF_SIGNED_CERTIFICATE_NAME="RepoPrompt CE Local Self-Signed Code Signing"
 LOCAL_SIGNING_CERTIFICATE_SHA1="${LOCAL_SIGNING_CERTIFICATE_SHA1:-}"
 LOCAL_SIGNING_CERTIFICATE_SHA256="${LOCAL_SIGNING_CERTIFICATE_SHA256:-}"
@@ -107,6 +140,7 @@ LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE="$ROOT_DIR/AppBundle/RepoPrompt.local-se
 APP_ENTITLEMENTS=""
 USE_ADHOC_SIGNING=0
 USE_LOCAL_SELF_SIGNED_RELEASE=0
+USE_LOCAL_DEVELOPER_ID_RELEASE=0
 DEBUG_STORAGE_BACKEND_MARKER="alternate-in-memory"
 SIGNING_MODE_MARKER="debug-apple-development"
 warn_adhoc_signing(){
@@ -121,6 +155,7 @@ warn_release_candidate_signing(){
 }
 if [[ "$LOCAL_SELF_SIGNED_RELEASE" == "1" || "$LOCAL_SELF_SIGNED_RELEASE" == "true" ]]; then
     (( IS_RELEASE )) || fail "LOCAL_SELF_SIGNED_RELEASE is only supported for release packaging."
+    [[ "$LOCAL_DEVELOPER_ID_RELEASE" != "1" && "$LOCAL_DEVELOPER_ID_RELEASE" != "true" ]] || fail "LOCAL_SELF_SIGNED_RELEASE and LOCAL_DEVELOPER_ID_RELEASE are mutually exclusive."
     [[ -n "$SIGN_IDENTITY" ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires SIGN_IDENTITY pointing at the user-local self-signed code-signing identity."
     [[ "$LOCAL_SIGNING_CERTIFICATE_SHA1" =~ ^[[:xdigit:]]{40}$ ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires LOCAL_SIGNING_CERTIFICATE_SHA1 with the selected certificate SHA-1 fingerprint."
     [[ "$LOCAL_SIGNING_CERTIFICATE_SHA256" =~ ^[[:xdigit:]]{64}$ ]] || fail "LOCAL_SELF_SIGNED_RELEASE requires LOCAL_SIGNING_CERTIFICATE_SHA256 with the selected certificate SHA-256 fingerprint."
@@ -130,6 +165,16 @@ if [[ "$LOCAL_SELF_SIGNED_RELEASE" == "1" || "$LOCAL_SELF_SIGNED_RELEASE" == "tr
     LOCAL_SELF_SIGNED_REQUIREMENT="identifier \"$BUNDLE_ID\" and certificate leaf = H\"$LOCAL_SIGNING_CERTIFICATE_SHA1\""
     USE_LOCAL_SELF_SIGNED_RELEASE=1
     echo "WARNING: Building a local-only self-signed production app."
+    echo "WARNING: This app is for installation on this Mac only. It is not notarized and must not be uploaded to GitHub Releases."
+elif [[ "$LOCAL_DEVELOPER_ID_RELEASE" == "1" || "$LOCAL_DEVELOPER_ID_RELEASE" == "true" ]]; then
+    (( IS_RELEASE )) || fail "LOCAL_DEVELOPER_ID_RELEASE is only supported for release packaging."
+    [[ -n "$SIGN_IDENTITY" ]] || fail "LOCAL_DEVELOPER_ID_RELEASE requires SIGN_IDENTITY pointing at the user's Developer ID Application identity."
+    [[ -n "$SIGNING_TEAM_ID" ]] || fail "LOCAL_DEVELOPER_ID_RELEASE requires SIGNING_TEAM_ID."
+    [[ "$NORMALIZED_BUNDLE_ID" != "$NORMALIZED_BASE_BUNDLE_ID" && "$NORMALIZED_BUNDLE_ID" != "$NORMALIZED_BASE_BUNDLE_ID.debug" ]] || fail "LOCAL_DEVELOPER_ID_RELEASE requires a personal BUNDLE_ID, not an upstream public/debug bundle identifier."
+    [[ "$NORMALIZED_DISPLAY_NAME" != "$NORMALIZED_BASE_DISPLAY_NAME" ]] || fail "LOCAL_DEVELOPER_ID_RELEASE requires a personal DISPLAY_NAME, not the upstream public app name '$BASE_DISPLAY_NAME'."
+    [[ "$NORMALIZED_URL_SCHEME" != "repoprompt-ce" ]] || fail "LOCAL_DEVELOPER_ID_RELEASE requires a URL scheme that does not collide with the public app."
+    USE_LOCAL_DEVELOPER_ID_RELEASE=1
+    echo "WARNING: Building a local-only Developer ID production app."
     echo "WARNING: This app is for installation on this Mac only. It is not notarized and must not be uploaded to GitHub Releases."
 fi
 if [[ -z "$SIGN_IDENTITY" ]] && (( ! IS_RELEASE )) && [[ "$PREFER_STABLE_DEBUG_SIGNING" == "1" || "$PREFER_STABLE_DEBUG_SIGNING" == "true" ]]; then
@@ -169,6 +214,9 @@ fi
 if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
     SIGNING_MODE_MARKER="local-self-signed"
+elif (( USE_LOCAL_DEVELOPER_ID_RELEASE )); then
+    DEBUG_STORAGE_BACKEND_MARKER="keychain"
+    SIGNING_MODE_MARKER="local-developer-id"
 elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     DEBUG_STORAGE_BACKEND_MARKER="keychain"
     SIGNING_MODE_MARKER="developer-id"
@@ -190,7 +238,7 @@ printf 'Signing mode marker: %s\n' "$SIGNING_MODE_MARKER"
 SWIFT_BUILD_ARGS=(-c "$CONF")
 PUBLIC_UNIVERSAL_RELEASE=0
 ARCHITECTURE_POLICY="matching"
-if (( IS_RELEASE )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )); then
+if (( IS_RELEASE )) && (( ! USE_LOCAL_SELF_SIGNED_RELEASE )) && (( ! USE_LOCAL_DEVELOPER_ID_RELEASE )); then
     PUBLIC_UNIVERSAL_RELEASE=1
     ARCHITECTURE_POLICY="arm64,x86_64"
 fi
@@ -253,23 +301,90 @@ shopt -u nullglob
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_required_swiftpm_resource_bundles.sh" "$APP_BUNDLE" "Packaged app SwiftPM resource bundle layout"
 
 phase "Writing Info.plist"
-run python3 - <<PY
+run env \
+    APP_BUNDLE="$APP_BUNDLE" \
+    APP_NAME="$APP_NAME" \
+    DISPLAY_NAME="$DISPLAY_NAME" \
+    BUNDLE_ID="$BUNDLE_ID" \
+    URL_SCHEME="$URL_SCHEME" \
+    MARKETING_VERSION="$MARKETING_VERSION" \
+    BUILD_NUMBER="$BUILD_NUMBER" \
+    SIGNING_TEAM_ID="$SIGNING_TEAM_ID" \
+    DEBUG_STORAGE_BACKEND_MARKER="$DEBUG_STORAGE_BACKEND_MARKER" \
+    SIGNING_MODE_MARKER="$SIGNING_MODE_MARKER" \
+    LOCAL_SIGNING_CERTIFICATE_SHA256="$LOCAL_SIGNING_CERTIFICATE_SHA256" \
+    LOCAL_SIGNING_SERVICE_GENERATION="$LOCAL_SIGNING_SERVICE_GENERATION" \
+    python3 - <<'PY'
+import os
+import plistlib
 from pathlib import Path
-s=Path('AppBundle/Info.plist.template').read_text()
-for k,v in {'__APP_NAME__':'$APP_NAME','__DISPLAY_NAME__':'$DISPLAY_NAME','__BUNDLE_ID__':'$BUNDLE_ID','__MARKETING_VERSION__':'$MARKETING_VERSION','__BUILD_NUMBER__':'$BUILD_NUMBER','__DEBUG_SECURE_STORAGE_BACKEND__':'$DEBUG_STORAGE_BACKEND_MARKER','__SIGNING_MODE__':'$SIGNING_MODE_MARKER','__LOCAL_SIGNING_CERTIFICATE_SHA256__':'$LOCAL_SIGNING_CERTIFICATE_SHA256','__LOCAL_SECURE_STORAGE_GENERATION__':'$LOCAL_SIGNING_SERVICE_GENERATION'}.items(): s=s.replace(k,v)
-Path('$APP_BUNDLE/Contents/Info.plist').write_text(s)
+
+replacements = {
+    "__APP_NAME__": os.environ["APP_NAME"],
+    "__DISPLAY_NAME__": os.environ["DISPLAY_NAME"],
+    "__BUNDLE_ID__": os.environ["BUNDLE_ID"],
+    "__URL_SCHEME__": os.environ["URL_SCHEME"],
+    "__MARKETING_VERSION__": os.environ["MARKETING_VERSION"],
+    "__BUILD_NUMBER__": os.environ["BUILD_NUMBER"],
+    "__SIGNING_TEAM_ID__": os.environ["SIGNING_TEAM_ID"],
+    "__DEBUG_SECURE_STORAGE_BACKEND__": os.environ["DEBUG_STORAGE_BACKEND_MARKER"],
+    "__SIGNING_MODE__": os.environ["SIGNING_MODE_MARKER"],
+    "__LOCAL_SIGNING_CERTIFICATE_SHA256__": os.environ["LOCAL_SIGNING_CERTIFICATE_SHA256"],
+    "__LOCAL_SECURE_STORAGE_GENERATION__": os.environ["LOCAL_SIGNING_SERVICE_GENERATION"],
+}
+
+def render(value):
+    if isinstance(value, str):
+        for placeholder, replacement in replacements.items():
+            value = value.replace(placeholder, replacement)
+        return value
+    if isinstance(value, list):
+        return [render(item) for item in value]
+    if isinstance(value, dict):
+        return {render(key): render(item) for key, item in value.items()}
+    return value
+
+plist = render(plistlib.loads(Path("AppBundle/Info.plist.template").read_bytes()))
+Path(os.environ["APP_BUNDLE"], "Contents", "Info.plist").write_bytes(plistlib.dumps(plist, sort_keys=False))
 PY
 run plutil -lint "$APP_BUNDLE/Contents/Info.plist"
 
-if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
-    phase "Rendering local self-signed entitlements"
-    [[ -f "$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE" ]] || fail "Missing local self-signed entitlements template: $LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE"
+if (( USE_LOCAL_SELF_SIGNED_RELEASE || USE_LOCAL_DEVELOPER_ID_RELEASE )); then
+    if (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
+        phase "Rendering local self-signed entitlements"
+    else
+        phase "Rendering local Developer ID entitlements"
+    fi
+    [[ -f "$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE" ]] || fail "Missing local entitlements template: $LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE"
     APP_ENTITLEMENTS="$(mktemp)"
-    run python3 - <<PY
+    run env \
+        ENTITLEMENTS_TEMPLATE="$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE" \
+        ENTITLEMENTS_OUTPUT="$APP_ENTITLEMENTS" \
+        BUNDLE_ID="$BUNDLE_ID" \
+        SIGNING_TEAM_ID="$SIGNING_TEAM_ID" \
+        python3 - <<'PY'
+import os
+import plistlib
 from pathlib import Path
-s=Path('$LOCAL_SELF_SIGNED_ENTITLEMENTS_TEMPLATE').read_text()
-s=s.replace('__BUNDLE_ID__', '$BUNDLE_ID')
-Path('$APP_ENTITLEMENTS').write_text(s)
+
+replacements = {
+    "__BUNDLE_ID__": os.environ["BUNDLE_ID"],
+    "__SIGNING_TEAM_ID__": os.environ["SIGNING_TEAM_ID"],
+}
+
+def render(value):
+    if isinstance(value, str):
+        for placeholder, replacement in replacements.items():
+            value = value.replace(placeholder, replacement)
+        return value
+    if isinstance(value, list):
+        return [render(item) for item in value]
+    if isinstance(value, dict):
+        return {render(key): render(item) for key, item in value.items()}
+    return value
+
+plist = render(plistlib.loads(Path(os.environ["ENTITLEMENTS_TEMPLATE"]).read_bytes()))
+Path(os.environ["ENTITLEMENTS_OUTPUT"]).write_bytes(plistlib.dumps(plist, sort_keys=False))
 PY
     run plutil -lint "$APP_ENTITLEMENTS"
 elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
@@ -283,11 +398,34 @@ elif (( IS_RELEASE )) && (( ! USE_ADHOC_SIGNING )); then
     [[ "$PROFILE_APP_IDENTIFIER" == "$SIGNING_TEAM_ID.$BUNDLE_ID" ]] || fail "Provisioning profile app identifier mismatch: expected $SIGNING_TEAM_ID.$BUNDLE_ID, got ${PROFILE_APP_IDENTIFIER:-<missing>}."
     run cp "$REPOPROMPT_PROVISIONING_PROFILE" "$APP_BUNDLE/Contents/embedded.provisionprofile"
     APP_ENTITLEMENTS="$(mktemp)"
-    run python3 - <<PY
+    run env \
+        ENTITLEMENTS_TEMPLATE="$APP_ENTITLEMENTS_TEMPLATE" \
+        ENTITLEMENTS_OUTPUT="$APP_ENTITLEMENTS" \
+        BUNDLE_ID="$BUNDLE_ID" \
+        SIGNING_TEAM_ID="$SIGNING_TEAM_ID" \
+        python3 - <<'PY'
+import os
+import plistlib
 from pathlib import Path
-s=Path('$APP_ENTITLEMENTS_TEMPLATE').read_text()
-for k,v in {'__BUNDLE_ID__':'$BUNDLE_ID','__SIGNING_TEAM_ID__':'$SIGNING_TEAM_ID'}.items(): s=s.replace(k,v)
-Path('$APP_ENTITLEMENTS').write_text(s)
+
+replacements = {
+    "__BUNDLE_ID__": os.environ["BUNDLE_ID"],
+    "__SIGNING_TEAM_ID__": os.environ["SIGNING_TEAM_ID"],
+}
+
+def render(value):
+    if isinstance(value, str):
+        for placeholder, replacement in replacements.items():
+            value = value.replace(placeholder, replacement)
+        return value
+    if isinstance(value, list):
+        return [render(item) for item in value]
+    if isinstance(value, dict):
+        return {render(key): render(item) for key, item in value.items()}
+    return value
+
+plist = render(plistlib.loads(Path(os.environ["ENTITLEMENTS_TEMPLATE"]).read_bytes()))
+Path(os.environ["ENTITLEMENTS_OUTPUT"]).write_bytes(plistlib.dumps(plist, sort_keys=False))
 PY
     run plutil -lint "$APP_ENTITLEMENTS"
 fi
@@ -309,6 +447,8 @@ sign_path(){
     if (( USE_ADHOC_SIGNING )); then
         args+=(--timestamp=none)
     elif (( USE_LOCAL_SELF_SIGNED_RELEASE )); then
+        args+=(--timestamp=none --options runtime)
+    elif (( USE_LOCAL_DEVELOPER_ID_RELEASE )); then
         args+=(--timestamp=none --options runtime)
     elif (( IS_RELEASE )); then
         args+=(--timestamp --options runtime)
@@ -363,6 +503,9 @@ verify_signed_app_identity(){
         printf 'Selected local certificate SHA-256: %s\n' "$LOCAL_SIGNING_CERTIFICATE_SHA256"
         printf 'Local secure-storage service generation: v%s\n' "$LOCAL_SIGNING_SERVICE_GENERATION"
         printf 'Extracted designated requirement: %s\n' "$designated_requirement"
+    elif (( USE_LOCAL_DEVELOPER_ID_RELEASE )); then
+        [[ "$team" == "$SIGNING_TEAM_ID" ]] || fail "Local Developer ID app team mismatch: expected $SIGNING_TEAM_ID, got ${team:-<missing>}"
+        run codesign --verify --deep --strict --verbose=2 -R="anchor apple generic and identifier \"$BUNDLE_ID\" and certificate leaf[subject.OU] = \"$SIGNING_TEAM_ID\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists" "$APP_BUNDLE"
     elif (( IS_RELEASE )); then
         [[ "$team" == "$SIGNING_TEAM_ID" ]] || fail "Signed app team mismatch: expected $SIGNING_TEAM_ID, got ${team:-<missing>}"
     else

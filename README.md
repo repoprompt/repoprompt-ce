@@ -64,8 +64,9 @@ SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" ./conductor app relaunch
 ```
 
 For a stable locally signed app under `/Applications`, use the local production
-installer below. Its self-signed identity is separate from the debug launcher's
-Apple Development signing path.
+installer below. It supports either the repository-managed self-signed local
+identity or your own paid Apple Developer `Developer ID Application` identity
+with a personal bundle identifier.
 
 > **Note:** If you use the debug app to modify RepoPrompt CE itself, validation
 > flows that launch the app or run live smoke checks may rebuild and relaunch it.
@@ -84,12 +85,33 @@ For a release-mode app under `/Applications`, install Python 3 and double-click
 [`Install RepoPrompt CE Local Production.command`](Install%20RepoPrompt%20CE%20Local%20Production.command)
 in Finder. The Finder launcher uses the coordinated developer daemon.
 
-The installer builds RepoPrompt CE from source and replaces any existing
+The default installer builds RepoPrompt CE from source and replaces any existing
 `/Applications/RepoPrompt CE.app` using a dedicated self-signed certificate
 trusted only on your Mac. macOS may ask you to approve the certificate.
 
-The resulting app is local-only. It is not notarized and should not be copied to
-another Mac or redistributed.
+Contributors with a paid Apple Developer account can instead install a personal
+Developer ID build with their own app name, bundle identifier, signing team, and
+persistent Keychain service. The installer requires a personal display name and
+bundle identifier so the installed app stays separate from debug builds and from
+upstream's public `com.pvncher.repoprompt.ce` identity:
+
+```bash
+CONFIRM_LOCAL_PRODUCTION_INSTALL=1 \
+LOCAL_PRODUCTION_SIGNING_MODE=developer-id \
+DISPLAY_NAME="My RepoPrompt CE" \
+BUNDLE_ID=com.example.repoprompt.ce \
+SIGNING_TEAM_ID=TEAMID1234 \
+SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID1234)" \
+./Scripts/install_local_production.sh
+```
+
+Custom bundle identifiers receive a derived URL scheme so the personal app does
+not compete with the public app for `repoprompt-ce:` links. Set
+`REPOPROMPT_URL_SCHEME=my-repoprompt-ce` if you need a specific unique local
+scheme; local Developer ID packaging rejects the public `repoprompt-ce` scheme.
+
+Both local production modes are local-only. They are not notarized and should not
+be copied to another Mac or redistributed.
 
 ### Source-build requirements
 

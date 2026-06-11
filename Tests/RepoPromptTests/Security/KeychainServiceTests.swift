@@ -162,9 +162,14 @@ final class KeychainServiceTests: XCTestCase {
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 1),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintA, generation: 2),
             KeychainService.localSelfSignedServiceName(fingerprint: fingerprintB, generation: 1),
+            KeychainService.localDeveloperIDServiceName(bundleIdentifier: "com.example.RepoPrompt CE", teamIdentifier: "TEAM123456"),
             KeychainService.debugServiceName
         ])
-        XCTAssertEqual(names.count, 6)
+        XCTAssertEqual(names.count, 7)
+        XCTAssertEqual(
+            KeychainService.localDeveloperIDServiceName(bundleIdentifier: "com.example.RepoPrompt CE", teamIdentifier: "TEAM123456"),
+            "repoprompt.ce.local-developer-id.team123456.com.example.repoprompt-ce.keychain.v1"
+        )
 
         let fake = FakeSecItemClient { _, _ in errSecItemNotFound }
         let legacy = KeychainService.legacyRepairSource(secItemClient: fake)

@@ -4,9 +4,20 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+DISPLAY_NAME_OVERRIDE="${DISPLAY_NAME:-}"
+BUNDLE_ID_OVERRIDE="${BUNDLE_ID:-}"
+SIGNING_TEAM_ID_OVERRIDE="${SIGNING_TEAM_ID:-}"
+
 set -a
 source "$ROOT_DIR/version.env"
 set +a
+
+DEFAULT_DISPLAY_NAME="$DISPLAY_NAME"
+DEFAULT_BUNDLE_ID="$BUNDLE_ID"
+DISPLAY_NAME="${DISPLAY_NAME_OVERRIDE:-$DISPLAY_NAME}"
+BUNDLE_ID="${BUNDLE_ID_OVERRIDE:-$BUNDLE_ID}"
+SIGNING_TEAM_ID="${SIGNING_TEAM_ID_OVERRIDE:-$SIGNING_TEAM_ID}"
+LOCAL_PRODUCTION_SIGNING_MODE="${LOCAL_PRODUCTION_SIGNING_MODE:-self-signed}"
 
 LOCAL_SELF_SIGNED_CERTIFICATE_NAME="RepoPrompt CE Local Self-Signed Code Signing"
 LOCAL_PRODUCTION_INSTALL_DIR="${LOCAL_PRODUCTION_INSTALL_DIR:-/Applications}"
@@ -17,6 +28,7 @@ LOCAL_SIGNING_IDENTITY_SHA256="${LOCAL_SIGNING_IDENTITY_SHA256:-}"
 ROTATE_LOCAL_SIGNING_IDENTITY="${ROTATE_LOCAL_SIGNING_IDENTITY:-0}"
 LOCAL_SIGNING_IDENTITY_TOOL="$ROOT_DIR/Scripts/local_signing_identity.py"
 TMP_DIR=""
+APP_INSTALL_LOCK_DIR=""
 STAGED_DIR=""
 STAGED_APP=""
 BACKUP_DIR=""
@@ -62,6 +74,10 @@ cleanup() {
         rm -f "$REGISTRY_LOCK_DIR/pid"
         rmdir "$REGISTRY_LOCK_DIR" 2>/dev/null || true
     fi
+    if [[ -n "$APP_INSTALL_LOCK_DIR" ]]; then
+        rm -f "$APP_INSTALL_LOCK_DIR/pid"
+        rmdir "$APP_INSTALL_LOCK_DIR" 2>/dev/null || true
+    fi
     exit "$status"
 }
 trap cleanup EXIT
@@ -81,6 +97,17 @@ if isinstance(value, bool):
 elif value is not None:
     print(value)
 PY
+}
+
+running_local_production_app_exists() {
+    local expected_command="$LOCAL_PRODUCTION_APP/Contents/MacOS/$APP_NAME"
+    local command
+    while IFS= read -r command; do
+        case "$command" in
+            "$expected_command"|"$expected_command "*) return 0 ;;
+        esac
+    done < <(ps -axo command=)
+    return 1
 }
 
 inventory_local_identities() {
@@ -200,15 +227,99 @@ rollback_transaction() {
 [[ "${CONFIRM_LOCAL_PRODUCTION_INSTALL:-}" == "1" ]] ||
     fail "Set CONFIRM_LOCAL_PRODUCTION_INSTALL=1 to build and replace the local production app in $LOCAL_PRODUCTION_INSTALL_DIR."
 
+TRIMMED_DISPLAY_NAME="$(sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//' <<< "$DISPLAY_NAME")"
+NORMALIZED_BUNDLE_ID="$(tr '[:upper:]' '[:lower:]' <<< "$BUNDLE_ID")"
+NORMALIZED_DEFAULT_BUNDLE_ID="$(tr '[:upper:]' '[:lower:]' <<< "$DEFAULT_BUNDLE_ID")"
+NORMALIZED_DISPLAY_NAME="$(tr '[:upper:]' '[:lower:]' <<< "$TRIMMED_DISPLAY_NAME")"
+NORMALIZED_DEFAULT_DISPLAY_NAME="$(tr '[:upper:]' '[:lower:]' <<< "$DEFAULT_DISPLAY_NAME")"
+
+[[ "$APP_NAME" =~ ^[A-Za-z0-9._\ -]+$ ]] || fail "APP_NAME contains unsupported characters: $APP_NAME"
+[[ -n "$DISPLAY_NAME" && "$DISPLAY_NAME" == "$TRIMMED_DISPLAY_NAME" && "$DISPLAY_NAME" != */* ]] || fail "DISPLAY_NAME must be non-empty, trimmed, and must not contain '/'."
+[[ "$BUNDLE_ID" =~ ^[A-Za-z0-9]+([.-][A-Za-z0-9]+)*$ ]] || fail "BUNDLE_ID is not a valid bundle identifier: $BUNDLE_ID"
+[[ "$SIGNING_TEAM_ID" =~ ^[A-Z0-9]+$ ]] || fail "SIGNING_TEAM_ID must contain only uppercase letters and digits: $SIGNING_TEAM_ID"
+
 for command in codesign ditto openssl plutil python3 security shasum swift; do
     require_command "$command"
 done
-[[ -f "$LOCAL_SIGNING_IDENTITY_TOOL" ]] || fail "Missing local signing identity tool: $LOCAL_SIGNING_IDENTITY_TOOL"
+if [[ "$LOCAL_PRODUCTION_SIGNING_MODE" != "self-signed" && "$LOCAL_PRODUCTION_SIGNING_MODE" != "developer-id" ]]; then
+    fail "LOCAL_PRODUCTION_SIGNING_MODE must be 'self-signed' or 'developer-id', got '$LOCAL_PRODUCTION_SIGNING_MODE'."
+fi
+[[ "$LOCAL_PRODUCTION_SIGNING_MODE" != "self-signed" || -f "$LOCAL_SIGNING_IDENTITY_TOOL" ]] || fail "Missing local signing identity tool: $LOCAL_SIGNING_IDENTITY_TOOL"
 
 LOGIN_KEYCHAIN="$(security default-keychain -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//')"
 [[ -n "$LOGIN_KEYCHAIN" && -f "$LOGIN_KEYCHAIN" ]] || fail "Could not resolve the user's default login keychain."
 
 TMP_DIR="$(mktemp -d)"
+mkdir -p "$LOCAL_PRODUCTION_INSTALL_DIR"
+APP_INSTALL_LOCK_CANDIDATE="$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.install.lock"
+mkdir "$APP_INSTALL_LOCK_CANDIDATE" 2>/dev/null || fail "Another local production install is active, or a stale lock must be inspected: $APP_INSTALL_LOCK_CANDIDATE"
+APP_INSTALL_LOCK_DIR="$APP_INSTALL_LOCK_CANDIDATE"
+chmod 700 "$APP_INSTALL_LOCK_DIR"
+printf '%s\n' "$$" > "$APP_INSTALL_LOCK_DIR/pid"
+chmod 600 "$APP_INSTALL_LOCK_DIR/pid"
+
+if [[ "$LOCAL_PRODUCTION_SIGNING_MODE" == "developer-id" ]]; then
+    [[ -n "${SIGN_IDENTITY:-}" ]] || fail "Developer ID local production install requires SIGN_IDENTITY."
+    [[ -n "$SIGNING_TEAM_ID" ]] || fail "Developer ID local production install requires SIGNING_TEAM_ID."
+    [[ "$NORMALIZED_BUNDLE_ID" != "$NORMALIZED_DEFAULT_BUNDLE_ID" && "$NORMALIZED_BUNDLE_ID" != "$NORMALIZED_DEFAULT_BUNDLE_ID.debug" ]] || fail "Developer ID local production installs require a personal BUNDLE_ID, not an upstream public/debug bundle identifier."
+    [[ "$NORMALIZED_DISPLAY_NAME" != "$NORMALIZED_DEFAULT_DISPLAY_NAME" ]] || fail "Developer ID local production installs require a personal DISPLAY_NAME, not the upstream public app name '$DEFAULT_DISPLAY_NAME'."
+    LOCAL_DEVELOPER_ID_RELEASE=1 \
+        DISPLAY_NAME="$DISPLAY_NAME" \
+        BUNDLE_ID="$BUNDLE_ID" \
+        SIGNING_TEAM_ID="$SIGNING_TEAM_ID" \
+        SIGN_IDENTITY="$SIGN_IDENTITY" \
+        "$ROOT_DIR/Scripts/package_app.sh" release
+
+    BUILD_DIR="$(swift build -c release --show-bin-path)"
+    SOURCE_APP="$BUILD_DIR/$APP_NAME.app"
+    [[ -d "$SOURCE_APP" ]] || fail "Missing packaged local Developer ID app: $SOURCE_APP"
+    [[ "$(plutil -extract CFBundleIdentifier raw "$SOURCE_APP/Contents/Info.plist")" == "$BUNDLE_ID" ]] ||
+        fail "Packaged app bundle identifier mismatch."
+    [[ "$(plutil -extract RepoPromptSigningMode raw "$SOURCE_APP/Contents/Info.plist")" == "local-developer-id" ]] ||
+        fail "Packaged app is missing the local Developer ID signing-mode marker."
+    LOCAL_DEVELOPER_ID_REQUIREMENT="anchor apple generic and identifier \"$BUNDLE_ID\" and certificate leaf[subject.OU] = \"$SIGNING_TEAM_ID\" and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+    codesign --verify --deep --strict --verbose=2 "$SOURCE_APP"
+    codesign --verify --deep --strict --verbose=2 -R="$LOCAL_DEVELOPER_ID_REQUIREMENT" "$SOURCE_APP"
+
+    if running_local_production_app_exists; then
+        fail "Quit $DISPLAY_NAME before replacing $LOCAL_PRODUCTION_APP."
+    fi
+
+    STAGED_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.installing.XXXXXX")"
+    STAGED_APP="$STAGED_DIR/$DISPLAY_NAME.app"
+    ditto "$SOURCE_APP" "$STAGED_APP"
+    codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+    codesign --verify --deep --strict --verbose=2 -R="$LOCAL_DEVELOPER_ID_REQUIREMENT" "$STAGED_APP"
+    TRANSACTION_ACTIVE=1
+    if [[ -e "$LOCAL_PRODUCTION_APP" ]]; then
+        BACKUP_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.backup.XXXXXX")"
+        BACKUP_APP="$BACKUP_DIR/$DISPLAY_NAME.app"
+        mv "$LOCAL_PRODUCTION_APP" "$BACKUP_APP"
+        APP_BACKED_UP=1
+    fi
+    mv "$STAGED_APP" "$LOCAL_PRODUCTION_APP"
+    APP_INSTALLED=1
+    STAGED_APP=""
+    rmdir "$STAGED_DIR"
+    STAGED_DIR=""
+    TRANSACTION_ACTIVE=0
+
+    if [[ -n "$BACKUP_APP" ]]; then
+        rm -rf "$BACKUP_APP"
+        rmdir "$BACKUP_DIR"
+        BACKUP_APP=""
+        BACKUP_DIR=""
+        APP_BACKED_UP=0
+    fi
+    APP_INSTALLED=0
+
+    printf 'Installed local Developer ID production app: %s\n' "$LOCAL_PRODUCTION_APP"
+    printf 'Bundle identifier: %s\n' "$BUNDLE_ID"
+    printf 'Signing team: %s\n' "$SIGNING_TEAM_ID"
+    printf 'This app is local-only and must not be uploaded to GitHub Releases.\n'
+    exit 0
+fi
+
 mkdir -p "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
 chmod 700 "$(dirname "$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH")"
 REGISTRY_LOCK_CANDIDATE="$LOCAL_SIGNING_IDENTITY_REGISTRY_PATH.lock"
@@ -296,11 +407,10 @@ grep -F -i -- "$SIGN_IDENTITY" <<< "$DESIGNATED_REQUIREMENT" >/dev/null ||
     fail "Packaged app designated requirement is not pinned to the selected certificate."
 printf 'Packaged designated requirement: %s\n' "$DESIGNATED_REQUIREMENT"
 
-if pgrep -f "$LOCAL_PRODUCTION_APP/Contents/MacOS/$APP_NAME" >/dev/null 2>&1; then
+if running_local_production_app_exists; then
     fail "Quit $DISPLAY_NAME before replacing $LOCAL_PRODUCTION_APP."
 fi
 
-mkdir -p "$LOCAL_PRODUCTION_INSTALL_DIR"
 STAGED_DIR="$(mktemp -d "$LOCAL_PRODUCTION_INSTALL_DIR/.$DISPLAY_NAME.app.installing.XXXXXX")"
 STAGED_APP="$STAGED_DIR/$DISPLAY_NAME.app"
 ditto "$SOURCE_APP" "$STAGED_APP"

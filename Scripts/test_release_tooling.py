@@ -54,6 +54,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("__SIGNING_TEAM_ID__.__BUNDLE_ID__", entitlements)
         self.assertIn("<string>__SIGNING_TEAM_ID__</string>", entitlements)
         self.assertEqual(info_plist["CFBundleIdentifier"], "__BUNDLE_ID__")
+        self.assertEqual(info_plist["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["__URL_SCHEME__"])
         self.assertIn("RepoPromptSigningMode", info_plist)
         self.assertIn("RepoPromptDebugSecureStorageBackend", info_plist)
         self.assertIn("RepoPromptLocalSigningCertificateSHA256", info_plist)
@@ -1896,6 +1897,7 @@ SIGNING_TEAM_ID=648A27MST5
             "__APP_NAME__": "RepoPrompt",
             "__DISPLAY_NAME__": "RepoPrompt CE",
             "__BUNDLE_ID__": "com.pvncher.repoprompt.ce",
+            "__URL_SCHEME__": "repoprompt-ce",
             "__MARKETING_VERSION__": "1.0.0",
             "__BUILD_NUMBER__": "1",
             "__DEBUG_SECURE_STORAGE_BACKEND__": "alternate-in-memory",
