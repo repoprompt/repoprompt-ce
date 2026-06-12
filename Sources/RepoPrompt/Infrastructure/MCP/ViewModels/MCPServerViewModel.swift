@@ -2998,10 +2998,11 @@ final class MCPServerViewModel: ObservableObject {
             )
             return
         }
+        let hasVirtualContext = !resolvedContext.usesActiveTabCompatibility
         let shouldApply = AutoSliceSelection.shouldApply(
             purpose: purpose,
-            hasVirtualContext: !resolvedContext.usesActiveTabCompatibility
-        )
+            hasVirtualContext: hasVirtualContext
+        ) || (purpose == .unknown && hasVirtualContext)
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.AutoSelect.eligibilityResolution,
             eligibilityResolution,
@@ -3035,7 +3036,13 @@ final class MCPServerViewModel: ObservableObject {
             }())
         )
         let key = readFileAutoSelectionContextKey(resolvedContext: resolvedContext, metadata: metadata)
-        _ = readFileAutoSelectionCoordinator.enqueue(intent: intent, for: key)
+        let accepted = readFileAutoSelectionCoordinator.enqueue(intent: intent, for: key)
+        if accepted, purpose == .unknown {
+            // Interactive CLI requests have no run policy and commonly disconnect after one call.
+            // Make the successful read response their selection durability boundary while preserving
+            // Agent Mode's asynchronous response path.
+            _ = await readFileAutoSelectionCoordinator.drain(.mirroredSelectionAndMetrics, for: key)
+        }
     }
 
     @MainActor

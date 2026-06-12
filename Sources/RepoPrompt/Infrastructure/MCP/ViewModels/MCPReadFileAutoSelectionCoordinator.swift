@@ -3,7 +3,7 @@ import Foundation
 /// Window-scoped response-lane coordinator for Agent Mode `read_file` and eligible `file_search`
 /// automatic selection.
 ///
-/// Ordinary reads and content-search slice replies enqueue a lightweight intent and return without
+/// Agent Mode reads and content-search slice replies enqueue a lightweight intent and return without
 /// awaiting structural selection mutation, UI mirroring, token recounts, or workspace durability.
 /// Explicit consumers drain a finite accepted high-water mark when they require stable selection state.
 @MainActor

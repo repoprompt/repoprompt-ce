@@ -45,7 +45,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
-    func testPartialReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
+    func testInteractivePartialReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -63,7 +63,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
-    func testFullReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
+    func testInteractiveFullReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
         #if DEBUG
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -123,8 +123,6 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             )
             context.window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
             try await Self.bind(readEndpoint, to: context.tabID)
-            await fixture.networkManager.setRunPurpose(.agentModeRun, for: readEndpoint.connectionID)
-
             _ = try await readEndpoint.callTool(
                 name: MCPWindowToolName.manageSelection,
                 arguments: ["op": "clear"]
@@ -144,25 +142,39 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 readArguments["start_line"] = 1
                 readArguments["limit"] = 1
             }
-            let readResponse = try await readEndpoint.callTool(
-                name: MCPWindowToolName.readFile,
-                arguments: readArguments
+            let readCompletion = PersistentMCPTaskResultBox<PersistentMCPTestRPCResponse>()
+            let readTask = Task {
+                do {
+                    let response = try await readEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: readArguments
+                    )
+                    readCompletion.store(.success(response))
+                    return response
+                } catch {
+                    readCompletion.store(.failure(error))
+                    throw error
+                }
+            }
+            let autoSelectionStarted = await gate.waitUntilStarted()
+            XCTAssertTrue(autoSelectionStarted)
+            XCTAssertNil(
+                readCompletion.load(),
+                "Interactive read_file returned before its auto-selection reached the provider durability barrier."
+            )
+            await gate.release()
+            let readResponse = try await Self.boundedTaskValue(
+                readTask,
+                description: "interactive read_file selection durability"
             )
             try Self.assertReadResult(
                 readResponse,
                 contains: context.sentinel,
                 excludes: fixture.contextB.sentinel
             )
-            let autoSelectionStarted = await gate.waitUntilStarted()
-            XCTAssertTrue(autoSelectionStarted)
 
             readEndpoint.client.close()
-            let removal = Task {
-                await fixture.networkManager.debugRemoveConnection(readEndpoint.connectionID)
-            }
-            await Task.yield()
-            await gate.release()
-            await removal.value
+            await fixture.networkManager.debugRemoveConnection(readEndpoint.connectionID)
             context.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
 
             try await Self.bind(freshEndpoint, to: context.tabID)
