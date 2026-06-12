@@ -11,7 +11,7 @@ struct AgentLogEntryRowView: View {
     let entry: AgentLogEntry
     var style: AgentLogRowStyle = .regular
 
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
 
     var body: some View {
         HStack(alignment: .top, spacing: style == .compact ? 6 : 8) {
@@ -47,7 +47,7 @@ struct AgentLogEntryRowView: View {
     private var timestamp: String {
         MessageTimestampFormatter.string(
             from: entry.timestamp,
-            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+            includeDateContext: showDatesInMessageTimestamps
         )
     }
 

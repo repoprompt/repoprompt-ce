@@ -12,6 +12,7 @@ struct AgentRuntimeSidebarView: View {
     let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
     let onCollapse: () -> Void
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     @State private var oracleAutoScrollEnabled: Bool = false
     @State private var selectedOracleSessionID: UUID?
 
@@ -79,6 +80,7 @@ struct AgentRuntimeSidebarView: View {
             }
         }
         .frame(minWidth: 300, idealWidth: 320, maxWidth: 360, maxHeight: .infinity)
+        .environment(\.showDatesInMessageTimestamps, globalSettings.showDatesInMessageTimestamps())
         .onChange(of: currentTabID) { _, _ in
             selectedOracleSessionID = nil
             selectLatestOracleSessionIfNeeded()

@@ -4,6 +4,8 @@ struct AgentRuntimeContextBuilderSection: View {
     @ObservedObject var contextBuilderAgentVM: ContextBuilderAgentViewModel
     let currentTabID: UUID?
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+
     @AppStorage("agent.runtime.sidebar.builder.expanded")
     private var isExpanded: Bool = true
 
@@ -53,5 +55,6 @@ struct AgentRuntimeContextBuilderSection: View {
                 }
             }
         }
+        .environment(\.showDatesInMessageTimestamps, globalSettings.showDatesInMessageTimestamps())
     }
 }

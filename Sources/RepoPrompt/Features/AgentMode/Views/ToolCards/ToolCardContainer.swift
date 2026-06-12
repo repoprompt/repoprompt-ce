@@ -70,7 +70,7 @@ struct ToolCardContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
 
     init(
         iconName: String,
@@ -292,7 +292,7 @@ struct ToolCardContainer<Content: View>: View {
     private func formattedTime(_ date: Date) -> String {
         MessageTimestampFormatter.string(
             from: date,
-            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+            includeDateContext: showDatesInMessageTimestamps
         )
     }
 
@@ -331,7 +331,7 @@ struct StaticToolCardContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
-    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+    @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
 
     init(
         iconName: String,
@@ -435,7 +435,7 @@ struct StaticToolCardContainer<Content: View>: View {
     private func formattedTime(_ date: Date) -> String {
         MessageTimestampFormatter.string(
             from: date,
-            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+            includeDateContext: showDatesInMessageTimestamps
         )
     }
 }

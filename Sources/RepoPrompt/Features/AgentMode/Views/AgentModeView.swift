@@ -181,6 +181,7 @@ struct AgentModeChatDetailView: View {
     @Environment(\.agentWindowIsFocused) private var agentWindowIsFocused
     @ObservedObject private var workflowStore: AgentWorkflowStore = .shared
     @ObservedObject private var fontScale = FontScaleManager.shared
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
@@ -2544,6 +2545,7 @@ struct AgentModeChatDetailView: View {
                 .id(block.id)
         }
         .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
+        .environment(\.showDatesInMessageTimestamps, globalSettings.showDatesInMessageTimestamps())
     }
 
     @ViewBuilder
