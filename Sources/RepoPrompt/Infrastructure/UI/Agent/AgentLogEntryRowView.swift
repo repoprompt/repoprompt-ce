@@ -11,6 +11,8 @@ struct AgentLogEntryRowView: View {
     let entry: AgentLogEntry
     var style: AgentLogRowStyle = .regular
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+
     var body: some View {
         HStack(alignment: .top, spacing: style == .compact ? 6 : 8) {
             Image(systemName: icon)
@@ -43,9 +45,10 @@ struct AgentLogEntryRowView: View {
     }
 
     private var timestamp: String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm:ss"
-        return formatter.string(from: entry.timestamp)
+        MessageTimestampFormatter.string(
+            from: entry.timestamp,
+            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+        )
     }
 
     private var icon: String {

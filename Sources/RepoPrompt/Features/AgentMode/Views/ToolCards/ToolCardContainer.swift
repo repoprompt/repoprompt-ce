@@ -1,12 +1,5 @@
 import SwiftUI
 
-/// Shared time formatter for tool cards — avoids repeated DateFormatter allocations.
-private let toolCardTimeFormatter: DateFormatter = {
-    let f = DateFormatter()
-    f.dateFormat = "HH:mm:ss"
-    return f
-}()
-
 func performAgentToolCardExpansionStateUpdateWithoutAnimation(_ update: () -> Void) {
     var transaction = Transaction(animation: nil)
     transaction.disablesAnimations = true
@@ -77,6 +70,7 @@ struct ToolCardContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
 
     init(
         iconName: String,
@@ -296,7 +290,10 @@ struct ToolCardContainer<Content: View>: View {
     }
 
     private func formattedTime(_ date: Date) -> String {
-        toolCardTimeFormatter.string(from: date)
+        MessageTimestampFormatter.string(
+            from: date,
+            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+        )
     }
 
     private var debugRenderStatePreference: [UUID: AgentToolCardRenderState] {
@@ -334,6 +331,7 @@ struct StaticToolCardContainer<Content: View>: View {
     @ViewBuilder let content: () -> Content
 
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
 
     init(
         iconName: String,
@@ -435,7 +433,10 @@ struct StaticToolCardContainer<Content: View>: View {
     }
 
     private func formattedTime(_ date: Date) -> String {
-        toolCardTimeFormatter.string(from: date)
+        MessageTimestampFormatter.string(
+            from: date,
+            includeDateContext: globalSettings.showDatesInMessageTimestamps()
+        )
     }
 }
 
