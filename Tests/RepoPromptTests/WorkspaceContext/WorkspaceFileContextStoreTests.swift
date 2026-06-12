@@ -1529,12 +1529,12 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(firstSamples.isEmpty)
             XCTAssertTrue(secondSamples.isEmpty)
             let activeBeforeRelease = await store.readSearchRootDiagnosticsSnapshot()
-            let activeRoot = activeBeforeRelease.first { $0.rootID == rootID }
-            XCTAssertNotNil(activeRoot?.barrier.active)
-            XCTAssertEqual(activeRoot?.barrier.completionCount, 0)
-            XCTAssertEqual(activeRoot?.ingress.waiterCount, 1)
-            XCTAssertGreaterThan(activeRoot?.ingress.outstandingPublicationCount ?? 0, 0)
-            XCTAssertEqual(activeRoot?.ingress.appliedServicePublicationSequence, 0)
+            let activeRoot = try XCTUnwrap(activeBeforeRelease.first { $0.rootID == rootID })
+            let activeBarrier = try XCTUnwrap(activeRoot.barrier.active)
+            XCTAssertEqual(activeRoot.barrier.completionCount, 0)
+            XCTAssertEqual(activeRoot.ingress.waiterCount, 1)
+            XCTAssertGreaterThan(activeRoot.ingress.outstandingPublicationCount, 0)
+            XCTAssertEqual(activeRoot.ingress.appliedServicePublicationSequence, 0)
 
             await sinkGate.release()
             let reachedIdle = await waitForAsyncCondition {
@@ -1556,10 +1556,19 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 settledRoot.ingress.appliedServicePublicationSequence,
                 initialIngress?.acceptedServicePublicationSequence ?? 0
             )
-            XCTAssertEqual(settledRoot.ingress.appliedWatcherWatermark, 0)
-            XCTAssertEqual(settledRoot.barrier.lastCompleted?.appliedWatcherWatermark, 0)
+            let completedBarrier = try XCTUnwrap(settledRoot.barrier.lastCompleted)
+            XCTAssertEqual(completedBarrier.targetWatcherWatermark, activeBarrier.targetWatcherWatermark)
+            XCTAssertEqual(completedBarrier.targetServicePublicationSequence, activeBarrier.targetServicePublicationSequence)
+            XCTAssertGreaterThanOrEqual(
+                completedBarrier.appliedWatcherWatermark,
+                completedBarrier.targetWatcherWatermark
+            )
+            XCTAssertGreaterThanOrEqual(
+                settledRoot.ingress.appliedWatcherWatermark,
+                completedBarrier.appliedWatcherWatermark
+            )
             XCTAssertEqual(
-                settledRoot.barrier.lastCompleted?.appliedServicePublicationSequence,
+                completedBarrier.appliedServicePublicationSequence,
                 settledRoot.ingress.appliedServicePublicationSequence
             )
             await store.setWatcherSinkWillApplyHandler(nil)
@@ -5414,14 +5423,22 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         let record = try await store.loadRoot(path: root.path)
+        let firstUpdates = await store.codemapUpdates()
+        let firstScan = Task {
+            await firstCodemapFileAPI(from: firstUpdates, containing: "firstScannedSymbol")
+        }
         try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        _ = try await waitForCodemapFileAPI(store: store, containing: "firstScannedSymbol")
+        _ = try await waitForCodemapFileAPI(firstScan, containing: "firstScannedSymbol")
         _ = await store.allCodemapFileAPIs()
 
         try write("func replacementScannedSymbol() {}", to: file)
         try setDiskModificationDate(Date().addingTimeInterval(2), for: file)
+        let replacementUpdates = await store.codemapUpdates()
+        let replacementScan = Task {
+            await firstCodemapFileAPI(from: replacementUpdates, containing: "replacementScannedSymbol")
+        }
         try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        let replacement = try await waitForCodemapFileAPI(store: store, containing: "replacementScannedSymbol")
+        let replacement = try await waitForCodemapFileAPI(replacementScan, containing: "replacementScannedSymbol")
         XCTAssertFalse(replacement.apiDescription.contains("firstScannedSymbol"))
     }
 
@@ -5513,15 +5530,46 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         return firstFileAPIByStandardizedNestedPath
     }
 
-    private func waitForCodemapFileAPI(store: WorkspaceFileContextStore, containing symbol: String) async throws -> FileAPI {
-        for _ in 0 ..< 100 {
-            if let API = await store.allCodemapFileAPIs().first(where: { $0.apiDescription.contains(symbol) }) {
+    private func firstCodemapFileAPI(
+        from updates: AsyncStream<WorkspaceCodemapUpdateEvent>,
+        containing symbol: String
+    ) async -> FileAPI? {
+        for await event in updates {
+            for snapshot in event.snapshots {
+                guard let API = snapshot.fileAPI,
+                      API.apiDescription.contains(symbol)
+                else {
+                    continue
+                }
                 return API
             }
-            try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("Timed out waiting for codemap symbol: \(symbol)")
-        throw NSError(domain: "WorkspaceFileContextStoreTests", code: 1)
+        return nil
+    }
+
+    private func waitForCodemapFileAPI(
+        _ task: Task<FileAPI?, Never>,
+        containing symbol: String,
+        timeout: Duration = .seconds(10)
+    ) async throws -> FileAPI {
+        let result = await withTaskGroup(of: FileAPI?.self) { group in
+            group.addTask {
+                await task.value
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            task.cancel()
+            return result
+        }
+        guard let result else {
+            XCTFail("Timed out waiting for codemap symbol: \(symbol)")
+            throw NSError(domain: "WorkspaceFileContextStoreTests", code: 1)
+        }
+        return result
     }
 
     #if DEBUG

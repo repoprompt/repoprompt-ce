@@ -25,6 +25,11 @@ struct AgentStatusPillsRow: View {
                     selectWorkflow: { agentModeVM.selectWorkflow($0) }
                 )
 
+                AgentInterviewPill(
+                    isOn: snapshot.interviewFirst,
+                    onToggle: { agentModeVM.toggleInterviewFirst() }
+                )
+
                 if let stagedSlashCommand = snapshot.stagedSlashCommand {
                     AgentStagedSlashCommandPill(staged: stagedSlashCommand)
                 }
