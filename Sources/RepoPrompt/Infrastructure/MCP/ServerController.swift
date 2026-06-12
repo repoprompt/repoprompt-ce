@@ -224,7 +224,13 @@ final actor ServerController: ObservableObject {
     }
 
     private func isDefaultAlwaysAllowed(_ clientID: String) -> Bool {
-        Self.defaultAlwaysAllowedClients.contains(where: { MCPClientIdentity.matches($0, clientID) })
+        Self.isBuiltInAlwaysAllowedClient(clientID)
+    }
+
+    /// Whether the client name (or a same-family variant) is one of the built-in
+    /// always-trusted defaults, which cannot be removed from the allow-list.
+    static func isBuiltInAlwaysAllowedClient(_ clientID: String) -> Bool {
+        defaultAlwaysAllowedClients.contains(where: { MCPClientIdentity.matches($0, clientID) })
     }
 
     private static func loadSanitizedAlwaysAllowedClients() -> Set<String> {

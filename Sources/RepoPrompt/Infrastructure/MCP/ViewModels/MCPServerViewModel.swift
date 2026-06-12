@@ -2041,6 +2041,12 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
+    /// Whether the client is one of the built-in always-trusted defaults,
+    /// which cannot be removed from the allow-list.
+    nonisolated func isBuiltInTrustedClient(_ clientID: String) -> Bool {
+        ServerController.isBuiltInAlwaysAllowedClient(clientID)
+    }
+
     /// Set the global auto-approve flag
     @MainActor
     func setAutoApproveAllClients(_ enabled: Bool) {

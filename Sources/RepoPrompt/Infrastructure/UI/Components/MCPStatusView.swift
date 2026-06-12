@@ -433,12 +433,22 @@ struct MCPStatusView: View {
 
             Spacer()
 
-            Button(action: { server.setAlwaysAllowed(clientID: client, allowed: false) }) {
-                Text("Remove")
+            if server.isBuiltInTrustedClient(client) {
+                Text("Built-in")
                     .font(.caption.weight(.medium))
-                    .foregroundColor(.red)
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
+                    .hoverTooltip("Built-in clients are always trusted and can't be removed")
+            } else {
+                Button(action: { server.setAlwaysAllowed(clientID: client, allowed: false) }) {
+                    Text("Remove")
+                        .font(.caption.weight(.medium))
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
             }
-            .buttonStyle(.plain)
         }
         .padding(10)
         .background(

@@ -37,6 +37,15 @@ final class ServerControllerAdmissionTests: XCTestCase {
         #endif
     }
 
+    func testBuiltInAlwaysAllowedClientMatchesDefaultFamiliesAndVariants() {
+        XCTAssertTrue(ServerController.isBuiltInAlwaysAllowedClient("claude-code"))
+        XCTAssertTrue(ServerController.isBuiltInAlwaysAllowedClient("Claude Code v2.1"))
+        XCTAssertTrue(ServerController.isBuiltInAlwaysAllowedClient("opencode"))
+        XCTAssertTrue(ServerController.isBuiltInAlwaysAllowedClient("cursor-agent"))
+        XCTAssertFalse(ServerController.isBuiltInAlwaysAllowedClient("my-custom-client"))
+        XCTAssertFalse(ServerController.isBuiltInAlwaysAllowedClient("RepoPrompt CLI"))
+    }
+
     func testSanitizerRemovesPersistedRepoPromptCLIAllowListEntries() {
         #if DEBUG
             let sanitized = ServerController.test_sanitizedAlwaysAllowedClients([
