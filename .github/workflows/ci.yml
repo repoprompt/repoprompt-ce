@@ -43,7 +43,7 @@ jobs:
         run: swift build --product repoprompt-mcp
 
       - name: Run app tests
-        run: swift test
+        run: python3 Scripts/run_swift_tests_in_class_shards.py
 
       - name: Run provider package tests
         working-directory: Packages/RepoPromptAgentProviders

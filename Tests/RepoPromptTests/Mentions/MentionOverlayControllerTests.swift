@@ -44,6 +44,8 @@ final class MentionOverlayControllerTests: XCTestCase {
                 parent: nil,
                 placement: placement
             )
+            window.isReleasedWhenClosed = false
+            defer { window.close() }
             window.setFrame(NSRect(x: 40, y: 100, width: 240, height: 1), display: false)
             window.updateSuggestions(suggestions, highlighted: 0)
             let compactFrame = window.frame
@@ -67,6 +69,8 @@ final class MentionOverlayControllerTests: XCTestCase {
             parent: nil,
             placement: .below
         )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
 
         XCTAssertFalse(
             window.hasShadow,
