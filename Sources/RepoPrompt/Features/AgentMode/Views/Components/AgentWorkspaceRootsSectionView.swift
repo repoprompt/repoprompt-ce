@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Always-visible workspace roots section for Agent Mode sidebar.
@@ -437,10 +438,110 @@ struct AgentWorkspaceRootsSectionView: View {
                 .fill(isHovered ? Color(NSColor.quaternaryLabelColor).opacity(0.5) : Color.clear)
         )
         .contentShape(Rectangle())
+        .contextMenu {
+            rootRowContextMenu(row, hasMultipleRoots: hasMultipleRoots)
+        }
         .onHover { hovered in
             hoveredRootID = hovered ? row.id : nil
         }
         .hoverTooltip(row.fullPath, .top)
+    }
+
+    // MARK: - Root Row Context Menu
+
+    @ViewBuilder
+    private func rootRowContextMenu(_ row: AgentWorkspaceRootRow, hasMultipleRoots: Bool) -> some View {
+        Button("Copy Root Path") {
+            copyToPasteboard(row.fullPath)
+        }
+
+        Button("Copy Root Name") {
+            copyToPasteboard(row.name)
+        }
+
+        if let branch = copyableRootBranch(for: row) {
+            Button("Copy Root Branch") {
+                copyToPasteboard(branch)
+            }
+        }
+
+        if let worktree = row.worktree {
+            Divider()
+
+            Button(worktree.isAvailable ? "Copy Active Worktree Path" : "Copy Missing Worktree Path") {
+                copyToPasteboard(worktree.worktreeRootPath)
+            }
+
+            Button("Copy Active Worktree Name") {
+                copyToPasteboard(copyableWorktreeName(for: worktree))
+            }
+
+            if let branch = copyableActiveWorktreeBranch(for: worktree) {
+                Button("Copy Active Worktree Branch") {
+                    copyToPasteboard(branch)
+                }
+            }
+
+            if worktree.isAvailable {
+                Button("Reveal Active Worktree in Finder") {
+                    revealInFinder(path: worktree.worktreeRootPath)
+                }
+            }
+        }
+
+        Divider()
+
+        if hasMultipleRoots {
+            Button("Move Root Up") {
+                rootsStore.moveRootUp(rowID: row.id)
+            }
+            .disabled(!row.canMoveUp)
+
+            Button("Move Root Down") {
+                rootsStore.moveRootDown(rowID: row.id)
+            }
+            .disabled(!row.canMoveDown)
+        }
+
+        Button("Remove from Workspace") {
+            rootsStore.removeRoot(rowID: row.id)
+        }
+    }
+
+    private func copyableRootBranch(for row: AgentWorkspaceRootRow) -> String? {
+        guard let branch = row.gitContext?.branchDisplayText?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !branch.isEmpty
+        else {
+            return nil
+        }
+        return branch
+    }
+
+    private func copyableWorktreeName(for worktree: AgentWorktreeIndicator) -> String {
+        if let name = worktree.worktreeName?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
+            return name
+        }
+        let lastPathComponent = URL(fileURLWithPath: worktree.worktreeRootPath).lastPathComponent
+        if !lastPathComponent.isEmpty {
+            return lastPathComponent
+        }
+        return worktree.label
+    }
+
+    private func copyableActiveWorktreeBranch(for worktree: AgentWorktreeIndicator) -> String? {
+        guard let branch = worktree.branch?.trimmingCharacters(in: .whitespacesAndNewlines), !branch.isEmpty else {
+            return nil
+        }
+        return branch
+    }
+
+    private func copyToPasteboard(_ value: String) {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(value, forType: .string)
+    }
+
+    private func revealInFinder(path: String) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
     // MARK: - Git Context Capsule
