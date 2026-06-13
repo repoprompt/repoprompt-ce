@@ -157,6 +157,45 @@ final class MCPToolExecutionWatchdogTests: XCTestCase {
         _ = try? await sleeper.value
     }
 
+    func testHandlerPhaseRecorderUsesWatchdogClockAndFormatsEscalationContext() async throws {
+        let clock = ExecutionWatchdogManualClock()
+        let origin = await clock.currentTime()
+        let recorder = MCPToolExecutionHandlerPhaseRecorder(
+            origin: origin,
+            now: { await clock.environment.now() }
+        )
+
+        await recorder.report(.manageSelectionAutoSelectionDrain, transition: .started)
+        try await clock.advanceWithoutSleepers(by: .seconds(2))
+        let phase = try XCTUnwrap(recorder.snapshot())
+        let invocationID = UUID()
+        let event = MCPToolExecutionTraceEvent(
+            toolName: MCPWindowToolName.manageSelection,
+            connectionID: UUID(),
+            invocationID: invocationID,
+            runID: nil,
+            contractKind: .bounded,
+            executionDeadlineSeconds: 30,
+            cleanupGraceSeconds: 5,
+            phase: .deadlineExpired,
+            elapsedMilliseconds: 2000,
+            cancellationRequested: nil,
+            cancellationOutcome: nil,
+            graceOutcome: nil,
+            escalationReason: nil,
+            handlerPhase: phase,
+            handlerPhaseAgeMilliseconds: 2000
+        )
+
+        XCTAssertEqual(phase.phase, .manageSelectionAutoSelectionDrain)
+        XCTAssertEqual(phase.transition, .started)
+        XCTAssertEqual(phase.elapsedMilliseconds, 0)
+        XCTAssertTrue(event.description.contains("invocation_id=\(invocationID.uuidString)"))
+        XCTAssertTrue(event.description.contains("handler_phase=manage_selection.auto_selection_drain"))
+        XCTAssertTrue(event.description.contains("handler_phase_transition=started"))
+        XCTAssertTrue(event.description.contains("handler_phase_age_ms=2000.000"))
+    }
+
     func testExternalCancellationCancelsOwnedTasksAndPropagatesCancellation() async throws {
         let clock = ExecutionWatchdogManualClock()
         let gate = ExecutionWatchdogUncooperativeGate()

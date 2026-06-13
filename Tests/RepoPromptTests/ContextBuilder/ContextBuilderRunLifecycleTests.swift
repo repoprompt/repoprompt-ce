@@ -1,6 +1,8 @@
 import Darwin
 import Foundation
+import MCP
 @testable import RepoPrompt
+import RepoPromptShared
 import XCTest
 
 @MainActor
@@ -47,6 +49,197 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let snapshot = try await waiter.value
         XCTAssertEqual(snapshot.runID, record.runID)
         XCTAssertEqual(snapshot.agentOutput, "done")
+    }
+
+    func testSuccessfulCommitPrecedesChildTerminationAndCleanupWaitsForJoin() async {
+        let connectionID = UUID()
+        let terminationGate = LifecycleTestGate()
+        var events: [String] = []
+        var cleanupCount = 0
+
+        let finalization = Task { @MainActor in
+            await ContextBuilderChildConnectionFinalizer.finalize(
+                connectionIDs: [connectionID],
+                commitContext: { committedID in
+                    XCTAssertEqual(committedID, connectionID)
+                    events.append("context_committed")
+                    return true
+                },
+                beforeTerminationRequest: {
+                    events.append("before_termination_request")
+                },
+                requestTermination: { requestedID in
+                    XCTAssertEqual(requestedID, connectionID)
+                    events.append("termination_requested")
+                    return Task { @MainActor in
+                        await terminationGate.arriveAndWait()
+                    }
+                },
+                beforeTerminationJoin: {
+                    events.append("termination_join")
+                },
+                cleanupMapping: { cleanedID in
+                    XCTAssertEqual(cleanedID, connectionID)
+                    cleanupCount += 1
+                    events.append("mapping_cleaned")
+                }
+            )
+        }
+
+        await terminationGate.waitUntilArrived()
+        XCTAssertEqual(events, [
+            "context_committed",
+            "before_termination_request",
+            "termination_requested",
+            "termination_join"
+        ])
+        XCTAssertEqual(cleanupCount, 0)
+
+        await terminationGate.release()
+        let didFinalize = await finalization.value
+        XCTAssertTrue(didFinalize)
+        XCTAssertEqual(cleanupCount, 1)
+        XCTAssertEqual(events, [
+            "context_committed",
+            "before_termination_request",
+            "termination_requested",
+            "termination_join",
+            "mapping_cleaned"
+        ])
+    }
+
+    func testMissingCommitOwnershipDoesNotRequestTermination() async {
+        let connectionID = UUID()
+        var didRequestTermination = false
+        var didCleanupMapping = false
+
+        let didFinalize = await ContextBuilderChildConnectionFinalizer.finalize(
+            connectionIDs: [connectionID],
+            commitContext: { _ in false },
+            beforeTerminationRequest: {
+                XCTFail("Termination phase must not start without committed context ownership")
+            },
+            requestTermination: { _ in
+                didRequestTermination = true
+                return Task {}
+            },
+            beforeTerminationJoin: {
+                XCTFail("Termination join must not start without committed context ownership")
+            },
+            cleanupMapping: { _ in
+                didCleanupMapping = true
+            }
+        )
+
+        XCTAssertFalse(didFinalize)
+        XCTAssertFalse(didRequestTermination)
+        XCTAssertFalse(didCleanupMapping)
+    }
+
+    func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
+        #if DEBUG
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("ContextBuilderCleanupCommitTests-\(UUID().uuidString)")
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Context Builder cleanup commit test",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "ContextBuilderRunLifecycleTests.realCleanup"
+            )
+
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            let tabID = try XCTUnwrap(
+                activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
+            )
+            let connectionID = UUID()
+            let runID = UUID()
+            let clientName = "context-builder-cleanup-commit-test"
+            let expectedPrompt = "context captured before real connection cleanup"
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: runID
+            )
+            var context = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+            context.promptText = expectedPrompt
+            window.mcpServer.tabContextByConnectionID[connectionID] = context
+
+            let connection = ContextBuilderCleanupTestConnection()
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: connectionID,
+                connection: connection,
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSetConnectionWindowForTesting(
+                connectionID: connectionID,
+                windowID: window.windowID
+            )
+            defer {
+                Task { await ServerNetworkManager.shared.debugRemoveConnection(connectionID) }
+            }
+
+            let didFinalize = await ContextBuilderChildConnectionFinalizer.finalize(
+                connectionIDs: [connectionID],
+                commitContext: { committedID in
+                    await window.mcpServer.commitAndClearTabContext(
+                        connectionID: committedID,
+                        expectedRunID: runID,
+                        deferRunMappingCleanupUntilCaller: true
+                    )
+                },
+                beforeTerminationRequest: {},
+                requestTermination: { requestedID in
+                    Task {
+                        await ServerNetworkManager.shared.terminateConnection(
+                            requestedID,
+                            reason: .runCompleted,
+                            message: "test successful completion"
+                        )
+                    }
+                },
+                beforeTerminationJoin: {},
+                cleanupMapping: { cleanedID in
+                    window.mcpServer.removeTabContext(
+                        forConnectionID: cleanedID,
+                        clientName: clientName,
+                        windowID: window.windowID,
+                        runID: runID
+                    )
+                }
+            )
+
+            XCTAssertTrue(didFinalize)
+            XCTAssertEqual(
+                window.workspaceManager.composeTab(with: tabID)?.promptText,
+                expectedPrompt
+            )
+            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
+            XCTAssertFalse(window.mcpServer.hasRunID(runID))
+            let terminationCount = await connection.terminationCount()
+            let stopCount = await connection.stopCount()
+            XCTAssertEqual(terminationCount, 1)
+            XCTAssertGreaterThanOrEqual(stopCount, 1)
+        #else
+            throw XCTSkip("Real MCP connection cleanup fixture is DEBUG-only.")
+        #endif
     }
 
     func testLogicalReleaseAdmitsSuccessorAndRejectsOldEvents() {
@@ -993,6 +1186,76 @@ private actor CodexShapedBlockedRoutingTestState {
 
     func recordDisposalFinished() {
         disposalFinished = true
+    }
+}
+
+private actor ContextBuilderCleanupTestConnection: MCPServerConnection {
+    private var terminations = 0
+    private var stops = 0
+
+    nonisolated var isFilesystemBacked: Bool {
+        false
+    }
+
+    nonisolated var connectionFolderURL: URL? {
+        nil
+    }
+
+    nonisolated var capabilityToken: String? {
+        nil
+    }
+
+    func start(approvalHandler _: @escaping (MCP.Client.Info) async -> Bool) async throws {
+        // No transport startup is required for the cleanup fixture.
+    }
+
+    func stop() async {
+        stops += 1
+    }
+
+    func abortForExecutionWatchdog() async {
+        // The fixture does not execute tools.
+    }
+
+    func notifyToolListChanged() async {
+        // The fixture has no client transport.
+    }
+
+    func connectionState() -> ConnectionStateSnapshot {
+        .ready
+    }
+
+    func isViableForRetention() -> Bool {
+        true
+    }
+
+    func secondsSinceLastActivity() async -> TimeInterval {
+        0
+    }
+
+    func transportIngressSnapshot() async -> MCPTransportIngressSnapshot? {
+        nil
+    }
+
+    func terminate(reason _: TerminationReason, message _: String?) async {
+        terminations += 1
+    }
+
+    func sendProgress(
+        tool _: String,
+        kind _: RepoPromptProgressKind,
+        stage _: String,
+        message _: String
+    ) async {
+        // The fixture has no client transport.
+    }
+
+    func terminationCount() -> Int {
+        terminations
+    }
+
+    func stopCount() -> Int {
+        stops
     }
 }
 

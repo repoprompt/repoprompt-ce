@@ -231,10 +231,17 @@ class WorkspaceManagerViewModel: ObservableObject {
                 workspaces.enumerated().map { ($1.id, $0) },
                 uniquingKeysWith: { _, last in last }
             )
+            refreshSelectionMirrorContextRevision()
         }
     }
 
-    @Published private(set) var activeWorkspaceID: UUID? = nil // New property to track the active workspace ID
+    @Published private(set) var activeWorkspaceID: UUID? = nil {
+        didSet {
+            guard oldValue != activeWorkspaceID else { return }
+            refreshSelectionMirrorContextRevision()
+        }
+    }
+
     #if DEBUG
         private var restoreTokenRecountWatchdogIDs: Set<UUID> = []
     #endif
@@ -253,8 +260,34 @@ class WorkspaceManagerViewModel: ObservableObject {
 
     @MainActor
     private static var nextWorkspaceSelectionRevision: UInt64 = 1
+    @MainActor
+    private static var nextMCPSelectionPropagationRevision: UInt64 = 1
+    let mcpSelectionPropagationHostID = UUID()
     private var selectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
     private var revisedSelectionByWorkspaceTab: [WorkspaceTabSelectionKey: StoredSelection] = [:]
+    private var latestMCPSelectionRevisionByWorkspaceTab: [WorkspaceTabSelectionKey: UInt64] = [:]
+
+    private struct SelectionMirrorContext: Equatable {
+        let workspaceID: UUID
+        let tabID: UUID
+    }
+
+    private var lastSelectionMirrorContext: SelectionMirrorContext?
+    private(set) var selectionMirrorContextRevision: UInt64 = 0
+
+    private func refreshSelectionMirrorContextRevision() {
+        let context: SelectionMirrorContext? = if let activeWorkspaceID,
+                                                  let workspace = workspaces.first(where: { $0.id == activeWorkspaceID }),
+                                                  let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
+        {
+            SelectionMirrorContext(workspaceID: activeWorkspaceID, tabID: tabID)
+        } else {
+            nil
+        }
+        guard context != lastSelectionMirrorContext else { return }
+        lastSelectionMirrorContext = context
+        selectionMirrorContextRevision &+= 1
+    }
 
     private func bumpStateVersion(for id: UUID?) {
         guard let id else { return }
@@ -267,10 +300,57 @@ class WorkspaceManagerViewModel: ObservableObject {
         return revision
     }
 
+    func registerMCPSelectionSourceMutation(
+        for identity: WorkspaceSelectionIdentity
+    ) -> MCPSelectionPropagationRegistration {
+        let revision = Self.nextMCPSelectionPropagationRevision
+        Self.nextMCPSelectionPropagationRevision &+= 1
+
+        let key = WorkspaceTabSelectionKey(workspaceID: identity.workspaceID, tabID: identity.tabID)
+        latestMCPSelectionRevisionByWorkspaceTab[key] = revision
+
+        let peerHostIDs = Set(WindowStatesManager.shared.allWindows.compactMap { window -> UUID? in
+            guard !window.isClosing else { return nil }
+            let peer = window.workspaceManager
+            guard peer !== self,
+                  peer.composeTab(for: identity) != nil
+            else { return nil }
+            return peer.mcpSelectionPropagationHostID
+        })
+        return MCPSelectionPropagationRegistration(
+            sourceRevision: revision,
+            peerHostIDs: peerHostIDs
+        )
+    }
+
+    func acceptMCPPeerSelectionRevision(_ revision: UInt64, for identity: WorkspaceSelectionIdentity) -> Bool {
+        let key = WorkspaceTabSelectionKey(workspaceID: identity.workspaceID, tabID: identity.tabID)
+        guard revision > latestMCPSelectionRevisionByWorkspaceTab[key, default: 0] else { return false }
+        latestMCPSelectionRevisionByWorkspaceTab[key] = revision
+        return true
+    }
+
+    func canCommitMCPSelectionPeerMutation(_ fence: MCPSelectionPeerMutationFence) -> Bool {
+        guard fence.hostID == mcpSelectionPropagationHostID else { return false }
+        return WindowStatesManager.shared.allWindows.contains { window in
+            !window.isClosing && window.workspaceManager === self
+        }
+    }
+
+    #if DEBUG
+        func debugStateVersionForWorkspace(_ workspaceID: UUID) -> Int {
+            stateVersionByWorkspaceID[workspaceID, default: 0]
+        }
+    #endif
+
     func debugActiveSelectionRevisionForCurrentTab() -> UInt64 {
         let tabID = activeWorkspace?.activeComposeTabID ?? activeWorkspace?.composeTabs.first?.id
         guard let workspaceID = activeWorkspace?.id else { return 0 }
         return selectionRevision(workspaceID: workspaceID, tabID: tabID)
+    }
+
+    func selectionRevisionForMCP(workspaceID: UUID, tabID: UUID) -> UInt64 {
+        selectionRevision(workspaceID: workspaceID, tabID: tabID)
     }
 
     private func selectionRevision(workspaceID: UUID, tabID: UUID?) -> UInt64 {
@@ -440,6 +520,10 @@ class WorkspaceManagerViewModel: ObservableObject {
         searchService: workspaceSearchService
     )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
+
+    var liveUISelectionRevision: UInt64 {
+        fileManager.selectionStateRevision
+    }
 
     @Published var isChatBusy: Bool = false
     @Published private(set) var tabsWithActiveChat: Set<UUID> = []
@@ -694,7 +778,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     private(set) var isSwitchingWorkspace = false
     @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle
     private var workspaceHydrationGeneration: UInt64 = 0
-    private var postCatalogRootWorkTasks: [UInt64: [Task<Void, Never>]] = [:]
+    private var postCatalogRootWorkTasks: [UInt64: [Task<WorkspaceRootLoadFailure?, Never>]] = [:]
     private var returnToSystemAfterSwitchCancellationOperationID: UUID?
     private var committedWorkspaceSwitchOperationID: UUID?
     private var recoveringWorkspaceSwitchOperationID: UUID?
@@ -3110,7 +3194,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             // StoredSelection is already authoritative; re-snapshotting the UI can
             // create selection feedback loops.
             if selectionCoordinator?.isApplyingSelectionMirror != true {
-                snapshot.selection = fileManager.snapshotSelection()
+                let liveUISelection = fileManager.snapshotSelection()
+                snapshot.selection = selectionCoordinator?.selectionForActiveUISnapshot(
+                    liveUISelection,
+                    tabID: snapshot.id
+                ) ?? liveUISelection
             }
             snapshot.expandedFolders = fileManager.snapshotExpandedFolderFullPaths()
             snapshot.promptText = promptViewModel.promptText
@@ -3201,22 +3289,22 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// In-memory commit of the active tab (no disk save)
     @MainActor
     private func updateComposeTabFastNoDirty(_ tab: ComposeTabState, touchModified: Bool = false) {
-        for wi in workspaces.indices {
-            if let ti = workspaces[wi].composeTabs.firstIndex(where: { $0.id == tab.id }) {
-                let oldSelection = workspaces[wi].composeTabs[ti].selection
-                var t = tab
-                if touchModified { t.lastModified = Date() }
-                workspaces[wi].composeTabs[ti] = t
-                recordSelectionRevisionIfChanged(
-                    workspaceIndex: wi,
-                    tabIndex: ti,
-                    oldSelection: oldSelection,
-                    newSelection: t.selection,
-                    reason: "updateComposeTabFastNoDirty.uiSnapshotCommit"
-                )
-                return
-            }
-        }
+        guard let activeWorkspaceID,
+              let workspaceIndex = workspaces.firstIndex(where: { $0.id == activeWorkspaceID }),
+              let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
+        else { return }
+
+        let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
+        var updatedTab = tab
+        if touchModified { updatedTab.lastModified = Date() }
+        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
+        recordSelectionRevisionIfChanged(
+            workspaceIndex: workspaceIndex,
+            tabIndex: tabIndex,
+            oldSelection: oldSelection,
+            newSelection: updatedTab.selection,
+            reason: "updateComposeTabFastNoDirty.uiSnapshotCommit"
+        )
     }
 
     /// Build a fresh snapshot of the active tab, optionally commit to memory, then publish.
@@ -3371,6 +3459,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         guard let active = activeWorkspace, active.activeComposeTabID == tab.id else { return }
         await fileManager.restoreExpansionState(from: tab.expandedFolders)
         await fileManager.onActiveTabChangedHeavy(for: tab.id, selection: tab.selection)
+        selectionCoordinator?.refreshDeferredUISelectionFence(forTabID: tab.id)
     }
 
     @MainActor
@@ -3445,6 +3534,11 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
         return nil
+    }
+
+    func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
+        workspaces.first(where: { $0.id == identity.workspaceID })?
+            .composeTabs.first(where: { $0.id == identity.tabID })
     }
 
     func composeTabName(with id: UUID) -> String? {
@@ -3806,25 +3900,116 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
     }
 
-    /// Applies the newest stored selection to the active file-selector UI without replaying
-    /// prompt text or other compose-tab state. Used by deferred `read_file` auto-selection.
+    /// Performs one selection mirror attempt. The coordinator owns identity fencing and repair.
+    @MainActor
+    func applySelectionMirrorAttempt(
+        _ selection: StoredSelection,
+        forTabID tabID: UUID,
+        workspaceID: UUID
+    ) async {
+        guard let active = activeWorkspace,
+              active.id == workspaceID,
+              active.activeComposeTabID == tabID
+        else { return }
+
+        beginApplyingTabContext(forTabID: tabID)
+        defer { endApplyingTabContext(forTabID: tabID) }
+        await fileManager.applyStoredSelection(selection)
+        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+    }
+
+    /// Applies the newest stored selection after deferred `read_file` auto-selection.
     @MainActor
     func applyStoredSelectionMirrorForReadFileAutoSelection(tabID: UUID) async {
         guard let active = activeWorkspace,
               active.activeComposeTabID == tabID,
               let tab = composeTab(with: tabID)
         else { return }
-
-        beginApplyingTabContext(forTabID: tabID)
-        defer { endApplyingTabContext(forTabID: tabID) }
         if let selectionCoordinator {
-            await selectionCoordinator.withApplyingSelectionMirror {
-                await fileManager.applyStoredSelection(tab.selection)
-            }
+            await selectionCoordinator.mirrorSelectionToActiveUI(tab.selection, forTabID: tabID)
         } else {
-            await fileManager.applyStoredSelection(tab.selection)
+            await applySelectionMirrorAttempt(
+                tab.selection,
+                forTabID: tabID,
+                workspaceID: active.id
+            )
         }
-        await promptViewModel.tokenCountingViewModel.forceImmediateRecount()
+    }
+
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
+        promptViewModel.updateComposeTabSelectionPresentation(selection, forTabID: tabID)
+    }
+
+    func updateComposeTabSelectionPresentation(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity
+    ) {
+        guard activeWorkspaceID == identity.workspaceID else { return }
+        promptViewModel.updateComposeTabSelectionPresentation(selection, forTabID: identity.tabID)
+    }
+
+    /// Keeps MCP-owned compose-tab selection canonical across the exact peer hosts that were
+    /// open when the source mutation registered. Host generations prevent delayed work from
+    /// crossing a manager replacement/reopen boundary, and closing windows are rechecked before
+    /// any canonical or UI mutation occurs.
+    @MainActor
+    func propagateMCPSelectionToPeerHosts(_ propagation: MCPSelectionPeerPropagation) async {
+        var visitedManagers = Set<ObjectIdentifier>()
+        visitedManagers.insert(ObjectIdentifier(self))
+        for window in WindowStatesManager.shared.allWindows {
+            guard !window.isClosing else { continue }
+            let peer = window.workspaceManager
+            let peerMutationFence = MCPSelectionPeerMutationFence(
+                hostID: peer.mcpSelectionPropagationHostID
+            )
+            guard propagation.peerHostIDs.contains(peerMutationFence.hostID),
+                  peer.canCommitMCPSelectionPeerMutation(peerMutationFence),
+                  visitedManagers.insert(ObjectIdentifier(peer)).inserted,
+                  let tab = peer.composeTab(for: propagation.identity)
+            else { continue }
+
+            if let peerCoordinator = peer.selectionCoordinator {
+                _ = await peerCoordinator.persistSelection(
+                    propagation.selection,
+                    for: propagation.identity,
+                    source: .mcpPeerContext,
+                    mirrorToUIIfActive: propagation.mirrorToUIIfActive,
+                    peerSourceRevision: propagation.sourceRevision,
+                    peerMutationFence: peerMutationFence
+                )
+            } else {
+                guard peer.canCommitMCPSelectionPeerMutation(peerMutationFence),
+                      peer.acceptMCPPeerSelectionRevision(
+                          propagation.sourceRevision,
+                          for: propagation.identity
+                      ) else { continue }
+                if tab.selection != propagation.selection {
+                    guard peer.canCommitMCPSelectionPeerMutation(peerMutationFence) else { continue }
+                    var updatedTab = tab
+                    updatedTab.selection = propagation.selection
+                    _ = peer.updateComposeTabStoredOnly(
+                        updatedTab,
+                        inWorkspaceID: propagation.identity.workspaceID
+                    )
+                }
+                guard peer.canCommitMCPSelectionPeerMutation(peerMutationFence) else { continue }
+                peer.updateComposeTabSelectionPresentation(
+                    propagation.selection,
+                    for: propagation.identity
+                )
+                if propagation.mirrorToUIIfActive,
+                   peer.canCommitMCPSelectionPeerMutation(peerMutationFence),
+                   peer.activeWorkspace?.id == propagation.identity.workspaceID,
+                   peer.activeWorkspace?.activeComposeTabID == propagation.identity.tabID
+                {
+                    await peer.applySelectionMirrorAttempt(
+                        propagation.selection,
+                        forTabID: propagation.identity.tabID,
+                        workspaceID: propagation.identity.workspaceID
+                    )
+                }
+            }
+        }
     }
 
     /// Silent "stored-only" update: updates the compose tab in the backing store
@@ -3832,31 +4017,38 @@ class WorkspaceManagerViewModel: ObservableObject {
     /// Used by MCP virtual context commits to avoid triggering empty live-UI snapshots.
     @MainActor
     func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
-        // Update the tab content in-place, without touching the live UI
-        for wi in workspaces.indices {
-            if let ti = workspaces[wi].composeTabs.firstIndex(where: { $0.id == tab.id }) {
-                let oldSelection = workspaces[wi].composeTabs[ti].selection
-                var t = tab
-                // Ensure a fresh modified timestamp
-                t.lastModified = Date()
-                workspaces[wi].composeTabs[ti] = t
-                recordSelectionRevisionIfChanged(
-                    workspaceIndex: wi,
-                    tabIndex: ti,
-                    oldSelection: oldSelection,
-                    newSelection: t.selection,
-                    reason: "updateComposeTabStoredOnly"
-                )
-                workspaces[wi].dateModified = Date()
+        guard let workspaceID = workspaces.first(where: { workspace in
+            workspace.composeTabs.contains(where: { $0.id == tab.id })
+        })?.id else { return }
+        _ = updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID)
+    }
 
-                // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
-                // and do NOT publish snapshots here. We only persist the stored tab data.
+    /// Exact-identity stored update. This avoids duplicate-tab ambiguity and dirties the
+    /// workspace that was actually mutated rather than whichever workspace is active.
+    @MainActor
+    @discardableResult
+    func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
+        guard let workspaceIndex = workspaces.firstIndex(where: { $0.id == workspaceID }),
+              let tabIndex = workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == tab.id })
+        else { return false }
 
-                // Always mark dirty so autosave/polling will persist this later
-                markWorkspaceDirty()
-                return
-            }
-        }
+        let oldSelection = workspaces[workspaceIndex].composeTabs[tabIndex].selection
+        var updatedTab = tab
+        updatedTab.lastModified = Date()
+        workspaces[workspaceIndex].composeTabs[tabIndex] = updatedTab
+        recordSelectionRevisionIfChanged(
+            workspaceIndex: workspaceIndex,
+            tabIndex: tabIndex,
+            oldSelection: oldSelection,
+            newSelection: updatedTab.selection,
+            reason: "updateComposeTabStoredOnly"
+        )
+        workspaces[workspaceIndex].dateModified = Date()
+
+        // Important: do NOT call promptViewModel.loadComposeTabsFromWorkspace(...)
+        // and do NOT publish snapshots here. We only persist the stored tab data.
+        bumpStateVersion(for: workspaceID)
+        return true
     }
 
     nonisolated static func rebasedStoredSelectionSlices(
@@ -5321,16 +5513,40 @@ class WorkspaceManagerViewModel: ObservableObject {
         workspace: WorkspaceModel,
         generation: UInt64
     ) {
-        let task = Task { @MainActor [weak self] in
+        let task: Task<WorkspaceRootLoadFailure?, Never> = Task { @MainActor [weak self] in
             guard let self,
-                  isHydrationGenerationCurrent(generation, workspaceID: workspace.id) else { return }
-            await fileManager.performPostCatalogRootWork(
-                for: rootRecord,
-                workspace: workspace,
-                rootKind: .user
-            )
+                  isHydrationGenerationCurrent(generation, workspaceID: workspace.id) else { return nil }
+            do {
+                try await fileManager.performPostCatalogRootWork(
+                    for: rootRecord,
+                    workspace: workspace,
+                    rootKind: .user
+                )
+                return nil
+            } catch is CancellationError {
+                return nil
+            } catch {
+                guard isHydrationGenerationCurrent(generation, workspaceID: workspace.id) else { return nil }
+                return WorkspaceRootLoadFailure(
+                    rootPath: rootRecord.standardizedFullPath,
+                    kind: rootRecord.kind,
+                    errorDescription: error.localizedDescription
+                )
+            }
         }
         postCatalogRootWorkTasks[generation, default: []].append(task)
+    }
+
+    private func awaitPostCatalogRootWorkFailures(generation: UInt64) async -> [WorkspaceRootLoadFailure] {
+        let tasks = postCatalogRootWorkTasks.removeValue(forKey: generation) ?? []
+        var failures: [WorkspaceRootLoadFailure] = []
+        failures.reserveCapacity(tasks.count)
+        for task in tasks {
+            if let failure = await task.value {
+                failures.append(failure)
+            }
+        }
+        return failures
     }
 
     private func loadWorkspaceFolders(
@@ -5532,6 +5748,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         if allPrimaryRootsVisibleSuccessfully, !Task.isCancelled {
             onAllPrimaryRootsVisible?()
         }
+        await failures.append(contentsOf: awaitPostCatalogRootWorkFailures(generation: hydrationGeneration))
+        guard isHydrationGenerationCurrent(hydrationGeneration, workspaceID: workspace.id) else { return }
         await workspaceSearchService.startKeepingFresh(with: fileManager.workspaceFileContextStore)
         #if DEBUG
             let searchCatalogSnapshotStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()

@@ -4565,41 +4565,71 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard !AgentToolTrackingSupport.shouldHideToolFromTranscript(toolName) else { return }
         let argsJSON = Self.encodeArgsToJSON(args)
         let canonicalToolName = MCPIntegrationHelper.canonicalRepoPromptToolName(toolName) ?? toolName
+        var correlationPath = "none"
+        var inspectedItemCount = 0
         let matchingIndex: Int? = {
             func namesMatch(_ candidate: String?) -> Bool {
                 (MCPIntegrationHelper.canonicalRepoPromptToolName(candidate) ?? candidate) == canonicalToolName
             }
             if let invocationID {
-                return session.items.lastIndex(where: {
-                    ($0.kind == .toolCall || $0.kind == .toolResult)
-                        && $0.toolInvocationID == invocationID
-                        && namesMatch($0.toolName)
+                let indexedCandidates = session.indexedToolItemIndices(invocationID: invocationID)
+                inspectedItemCount += indexedCandidates.count
+                if let indexedMatch = indexedCandidates.last(where: { namesMatch(session.items[$0].toolName) }) {
+                    correlationPath = "invocation_id"
+                    return indexedMatch
+                }
+                let fallback = session.activeTurnToolItemIndices(where: {
+                    $0.toolInvocationID == invocationID && namesMatch($0.toolName)
                 })
+                inspectedItemCount += fallback.scannedItemCount
+                correlationPath = fallback.lastIndex == nil ? "none" : "invocation_id_active_turn_scan"
+                return fallback.lastIndex
             }
-            let fallbackSignature = Self.canonicalNativeToolFallbackSignature(
+            let fallbackSignature = AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
                 toolName: canonicalToolName,
                 argsJSON: argsJSON
             )
-            if let argsMatchedIndex = session.items.lastIndex(where: {
-                guard $0.kind == .toolCall || $0.kind == .toolResult,
-                      $0.toolInvocationID == nil,
-                      namesMatch($0.toolName)
-                else {
-                    return false
-                }
-                return Self.canonicalNativeToolFallbackSignature(
-                    toolName: MCPIntegrationHelper.canonicalRepoPromptToolName($0.toolName) ?? $0.toolName ?? canonicalToolName,
-                    argsJSON: $0.toolArgsJSON
-                ) == fallbackSignature
+            let signatureCandidates = session.indexedToolItemIndices(signature: fallbackSignature)
+            inspectedItemCount += signatureCandidates.count
+            if let argsMatchedIndex = signatureCandidates.last(where: {
+                session.items[$0].toolInvocationID == nil && namesMatch(session.items[$0].toolName)
             }) {
+                correlationPath = "signature"
                 return argsMatchedIndex
             }
-            return session.items.lastIndex(where: {
-                ($0.kind == .toolCall || $0.kind == .toolResult)
-                    && $0.toolInvocationID == nil
+            let signatureFallback = session.activeTurnToolItemIndices(where: {
+                $0.toolInvocationID == nil
                     && namesMatch($0.toolName)
+                    && AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+                        toolName: $0.toolName,
+                        argsJSON: $0.toolArgsJSON
+                    ) == fallbackSignature
             })
+            inspectedItemCount += signatureFallback.scannedItemCount
+            if let argsMatchedIndex = signatureFallback.lastIndex {
+                correlationPath = "signature_active_turn_scan"
+                return argsMatchedIndex
+            }
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(canonicalToolName)
+            let nameCandidates = session.indexedNilInvocationToolItemIndices(
+                normalizedToolName: normalizedToolName
+            )
+            inspectedItemCount += nameCandidates.count
+            if let nameMatchedIndex = nameCandidates.last(where: { namesMatch(session.items[$0].toolName) }) {
+                correlationPath = "name_fallback"
+                return nameMatchedIndex
+            }
+            let nameFallback = session.activeTurnToolItemIndices(where: {
+                $0.toolInvocationID == nil && namesMatch($0.toolName)
+            })
+            inspectedItemCount += nameFallback.scannedItemCount
+            correlationPath = nameFallback.lastIndex == nil ? "none" : "name_active_turn_scan"
+            return nameFallback.lastIndex
         }()
+        MCPToolObserverAttributionContext.record(
+            correlationPath: correlationPath,
+            scannedItemCount: inspectedItemCount
+        )
         if let index = matchingIndex {
             // Prevent apply_patch terminal → running regression.
             if Self.shouldIgnoreApplyPatchRunningRegression(

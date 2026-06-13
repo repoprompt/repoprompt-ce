@@ -25,6 +25,7 @@ extension FileSystemService {
     func rebuildPerFolderIgnoreCache(
         changedDirs: Set<String>? = nil
     ) async {
+        let earlyFilterGeneration = watcherEarlyFilter.currentGeneration()
         // Clear all per-path ignore caches to avoid stale decisions
         ignoreCacheStore = IgnoreCacheStore()
 
@@ -40,6 +41,7 @@ extension FileSystemService {
                     respectCursorignore: respectCursorignore
                 )
                 cacheIgnoreRules(ignoreRules, for: "")
+                watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
             } catch {
                 print("Failed to rebuild ignore rules: \(error)")
             }
@@ -59,6 +61,7 @@ extension FileSystemService {
                     respectCursorignore: respectCursorignore
                 )
                 cacheIgnoreRules(ignoreRules, for: "")
+                watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
             } catch {
                 print("Failed to rebuild root ignore rules: \(error)")
             }
@@ -83,6 +86,7 @@ extension FileSystemService {
         }
 
         // 3) Root changes are handled above; no further action needed here.
+        watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
     }
 
     // MARK: - New prefix-based ignore check (cached in this actor)
@@ -263,6 +267,7 @@ extension FileSystemService {
     }
 
     public func refreshIgnoreRules() async throws {
+        let earlyFilterGeneration = watcherEarlyFilter.invalidate()
         ignoreRules = try await IgnoreRulesManager.shared.getIgnoreRules(
             for: path,
             respectGitignore: respectGitignore,
@@ -270,6 +275,7 @@ extension FileSystemService {
             respectCursorignore: respectCursorignore
         )
         invalidateAllIgnoreCaches()
+        watcherEarlyFilter.install(ignoreRules.snapshot(), generation: earlyFilterGeneration)
     }
 
     func effectiveRules(

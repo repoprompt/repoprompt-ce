@@ -159,6 +159,9 @@ private final class MCPTransportIngressGate: @unchecked Sendable {
 /// DispatchSourceRead, avoiding the CPU overhead of polling.
 public actor UnixSocketMCPTransport: Transport {
     private let socketURL: URL?
+    private let timelineConnectionID: String?
+    private let timelineCorrelationConnectionID: String?
+    private let timelineConnectionGeneration: UInt64
     public let logger: Logger
 
     private var socketFD: Int32 = -1
@@ -278,6 +281,9 @@ public actor UnixSocketMCPTransport: Transport {
     ) {
         let sanitizedReceiveBufferCapacity = max(1, receiveBufferCapacity)
         self.socketURL = socketURL
+        timelineConnectionID = nil
+        timelineCorrelationConnectionID = nil
+        timelineConnectionGeneration = 1
         ownsExistingFD = false
         self.logger = Self.createLogger(logger)
         self.writeStallTimeout = writeStallTimeout
@@ -294,6 +300,9 @@ public actor UnixSocketMCPTransport: Transport {
     ///   - logger: Optional logger
     public init(
         connectedFD: Int32,
+        connectionID: UUID? = nil,
+        correlationConnectionID: String? = nil,
+        connectionGeneration: UInt64 = 1,
         logger: Logger? = nil,
         writeStallTimeout: TimeInterval = MCPTimeoutPolicy.transportWriteStallTimeoutSeconds,
         writePollIntervalMilliseconds: Int32 = 250,
@@ -311,6 +320,9 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         socketURL = nil
+        timelineConnectionID = connectionID?.uuidString
+        timelineCorrelationConnectionID = correlationConnectionID ?? connectionID?.uuidString
+        timelineConnectionGeneration = connectionGeneration
         socketFD = connectedFD
         ownsExistingFD = true
         isConnected = false
@@ -417,35 +429,122 @@ public actor UnixSocketMCPTransport: Transport {
         }
 
         let framed = Self.frameWithNewlineIfNeeded(message)
-        MCPResponseDeliveryTracer.emitFrame(
-            layer: "app_uds_transport",
-            phase: "send_started",
-            frame: framed,
-            direction: .serverToClient,
-            connectionGeneration: fdGeneration
-        )
+        #if DEBUG
+            let recordedResponses: [MCPRequestTimelineRegistry.RecordedMessage] = if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.recordedResponses(
+                    in: framed,
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            } else {
+                []
+            }
+            if recordedResponses.isEmpty {
+                MCPResponseDeliveryTracer.emitFrame(
+                    layer: "app_uds_transport",
+                    phase: "sdk_encode_completed",
+                    frame: framed,
+                    direction: .serverToClient,
+                    connectionID: timelineCorrelationConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            } else {
+                for response in recordedResponses {
+                    MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                        layer: "app_uds_transport",
+                        phase: "sdk_encode_completed",
+                        connectionID: response.identity.connectionID ?? timelineCorrelationConnectionID,
+                        connectionGeneration: timelineConnectionGeneration,
+                        direction: .serverToClient,
+                        id: response.metadata.id,
+                        method: response.metadata.method,
+                        tool: response.metadata.tool,
+                        requestOrdinal: response.metadata.requestOrdinal,
+                        framedByteCount: framed.count,
+                        framedSHA256: MCPResponseDeliveryTracer.sha256Hex(framed),
+                        requestIdentity: response.identity,
+                        providerActive: false,
+                        networkScopeActive: false,
+                        permitActive: false,
+                        publicationPending: true,
+                        terminalBarrier: false
+                    ))
+                }
+            }
+        #else
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: "sdk_encode_completed",
+                frame: framed,
+                direction: .serverToClient,
+                connectionGeneration: fdGeneration
+            )
+        #endif
 
         do {
             try await writeAll(framed)
         } catch {
             MCPResponseDeliveryTracer.emitFrame(
                 layer: "app_uds_transport",
-                phase: "send_failed",
+                phase: "transport_write_failed",
                 frame: framed,
                 direction: .serverToClient,
-                connectionGeneration: fdGeneration,
+                connectionID: timelineCorrelationConnectionID,
+                connectionGeneration: timelineConnectionGeneration,
                 terminalReason: "app_uds_send_failed"
             )
             throw error
         }
         lastActivityTime = Date()
-        MCPResponseDeliveryTracer.emitFrame(
-            layer: "app_uds_transport",
-            phase: "send_completed",
-            frame: framed,
-            direction: .serverToClient,
-            connectionGeneration: fdGeneration
-        )
+        #if DEBUG
+            if recordedResponses.isEmpty {
+                MCPResponseDeliveryTracer.emitFrame(
+                    layer: "app_uds_transport",
+                    phase: "transport_write_completed",
+                    frame: framed,
+                    direction: .serverToClient,
+                    connectionID: timelineCorrelationConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            } else {
+                for response in recordedResponses {
+                    MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                        layer: "app_uds_transport",
+                        phase: "transport_write_completed",
+                        connectionID: response.identity.connectionID ?? timelineCorrelationConnectionID,
+                        connectionGeneration: timelineConnectionGeneration,
+                        direction: .serverToClient,
+                        id: response.metadata.id,
+                        method: response.metadata.method,
+                        tool: response.metadata.tool,
+                        requestOrdinal: response.metadata.requestOrdinal,
+                        framedByteCount: framed.count,
+                        framedSHA256: MCPResponseDeliveryTracer.sha256Hex(framed),
+                        requestIdentity: response.identity,
+                        providerActive: false,
+                        networkScopeActive: false,
+                        permitActive: false,
+                        publicationPending: false,
+                        terminalBarrier: false
+                    ))
+                }
+            }
+            if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.completeResponses(
+                    recordedResponses,
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            }
+        #else
+            MCPResponseDeliveryTracer.emitFrame(
+                layer: "app_uds_transport",
+                phase: "transport_write_completed",
+                frame: framed,
+                direction: .serverToClient,
+                connectionGeneration: fdGeneration
+            )
+        #endif
         mcpTransportLog("UnixSocketMCPTransport sent \(framed.count) bytes successfully")
     }
 
@@ -579,6 +678,14 @@ public actor UnixSocketMCPTransport: Transport {
     /// avoid a stale callback closing a reused descriptor number.
     private func tearDownSocket(error proposedError: Swift.Error?) {
         guard !streamFinished else { return }
+        #if DEBUG
+            if let timelineConnectionID {
+                MCPRequestTimelineRegistry.shared.removeConnection(
+                    connectionID: timelineConnectionID,
+                    connectionGeneration: timelineConnectionGeneration
+                )
+            }
+        #endif
         let ingressSnapshot = inboundChannel.gate.closeAndSnapshot()
         let resolvedError: Swift.Error? = if ingressSnapshot.terminalCause == .receiveBufferOverflow {
             MCPReceiveBufferOverflowError(
@@ -894,6 +1001,32 @@ public actor UnixSocketMCPTransport: Transport {
                 guard let self else { return }
                 switch inboundChannel.gate.offer(frame, to: inboundChannel.continuation) {
                 case .accepted:
+                    #if DEBUG
+                        if let timelineConnectionID {
+                            let recorded = MCPRequestTimelineRegistry.shared.recordAcceptedFrame(
+                                frame,
+                                connectionID: timelineConnectionID,
+                                correlationConnectionID: timelineCorrelationConnectionID ?? timelineConnectionID,
+                                connectionGeneration: timelineConnectionGeneration
+                            )
+                            for request in recorded {
+                                MCPResponseDeliveryTracer.emit(MCPResponseDeliveryTraceEvent(
+                                    layer: "app_uds_transport",
+                                    phase: "frame_accepted",
+                                    connectionID: request.identity.connectionID ?? timelineCorrelationConnectionID,
+                                    connectionGeneration: timelineConnectionGeneration,
+                                    direction: .clientToServer,
+                                    id: request.metadata.id,
+                                    method: request.metadata.method,
+                                    tool: request.metadata.tool,
+                                    requestOrdinal: request.metadata.requestOrdinal,
+                                    framedByteCount: frame.count,
+                                    framedSHA256: MCPResponseDeliveryTracer.sha256Hex(frame),
+                                    requestIdentity: request.identity
+                                ))
+                            }
+                        }
+                    #endif
                     mcpTransportLog("UnixSocketMCPTransport accepted message of \(frame.count) bytes")
                 case let .overflow(error):
                     mcpConnectionLog("UnixSocketMCPTransport receive buffer overflow; terminating connection")

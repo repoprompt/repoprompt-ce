@@ -77,6 +77,9 @@ public protocol VCSBackend: Sendable {
     /// - Returns: Tuple of (ahead, behind) counts, or nil if not applicable.
     func getAheadBehind(vs ref: String, at repoURL: URL) async throws -> (ahead: Int, behind: Int)?
 
+    /// Get one coherent branch/upstream/ahead-behind/working-tree status observation.
+    func getRepositoryStatus(at repoURL: URL) async throws -> VCSRepositoryStatus
+
     /// Get structured working directory status.
     /// - Parameter repoURL: The repository root URL.
     /// - Returns: The working status with staged, modified, and untracked files.

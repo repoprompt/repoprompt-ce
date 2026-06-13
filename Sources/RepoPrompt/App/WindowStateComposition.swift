@@ -30,6 +30,7 @@ enum WindowStateCompositionFactory {
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
+        aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production
     ) -> WindowStateComposition {
@@ -40,7 +41,8 @@ enum WindowStateCompositionFactory {
 
         // 2) AI queries
         let keyManager = KeyManager()
-        let aiQueriesService = AIQueriesService(keyManager: keyManager)
+        let aiQueriesService = aiQueriesServiceFactory?(keyManager)
+            ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
         let apiSettingsViewModel = APISettingsViewModel(aiQueriesService: aiQueriesService, keyManager: keyManager)

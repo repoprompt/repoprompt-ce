@@ -1,24 +1,35 @@
 import Foundation
 
-/// Actor-owned workspace path-search facade built from store catalog snapshots.
+/// Actor-owned workspace path-search facade built from immutable root catalog shards.
 ///
-/// The service keeps `PathSearchIndex` and all path-entry arrays off the main actor. Callers
-/// provide immutable `WorkspaceSearchCatalogSnapshot` values from `WorkspaceFileContextStore`,
-/// then query by text and receive pure value results.
+/// Each catalog shard owns one immutable C `PathSearchIndex`. Scope generations retain the
+/// relevant root-index references, and searches merge root-local candidates into the exact
+/// historical global rank order without rebuilding or mutating a shared C index.
 actor WorkspaceSearchService {
     private struct PreparedIndex {
         let generation: UInt64
         let diagnostics: WorkspaceCatalogDiagnostics
-        let orderedEntries: [WorkspaceSearchCatalogEntry]
-        let indexedPaths: [String]
-        let entriesByIndexedPath: [String: WorkspaceSearchCatalogEntry]
-        let index: PathSearchIndex
+        let rootPathIndexes: [WorkspaceSearchRootPathIndex]
+        let entryCount: Int
+        #if DEBUG
+            let orderMicroseconds: UInt64
+            let materializationMicroseconds: UInt64
+            let cIndexBuildMicroseconds: UInt64
+            let totalMicroseconds: UInt64
+        #endif
     }
 
-    private var readyIndex = PathSearchIndex()
-    private var orderedEntries: [WorkspaceSearchCatalogEntry] = []
-    private var indexedPaths: [String] = []
-    private var entriesByIndexedPath: [String: WorkspaceSearchCatalogEntry] = [:]
+    private struct RankedCandidateCursor {
+        let rootIndex: Int
+        let candidateIndex: Int
+    }
+
+    private struct EntryCursor {
+        let rootIndex: Int
+        let entryIndex: Int
+    }
+
+    private var readyRootPathIndexes: [WorkspaceSearchRootPathIndex] = []
     private var currentSnapshotGeneration: UInt64?
     private var currentIndexedGeneration: UInt64?
     private var currentDiagnostics: WorkspaceCatalogDiagnostics?
@@ -31,6 +42,27 @@ actor WorkspaceSearchService {
     private var automaticIndexBuildDelayNanoseconds: UInt64
     private var discardedAutomaticRebuildCompletions = 0
     private var isReadyIndexUsable = true
+    #if DEBUG
+        struct RebuildWorkDiagnosticsSnapshot: Equatable {
+            let rebuildCount: Int
+            let orderMicroseconds: UInt64
+            let materializationMicroseconds: UInt64
+            let cIndexBuildMicroseconds: UInt64
+            let totalMicroseconds: UInt64
+            let debounceCancellationCount: Int
+            let staleDiscardedCount: Int
+            let lastEntryCount: Int
+        }
+
+        private var debugRebuildCount = 0
+        private var debugOrderMicroseconds: UInt64 = 0
+        private var debugMaterializationMicroseconds: UInt64 = 0
+        private var debugCIndexBuildMicroseconds: UInt64 = 0
+        private var debugTotalMicroseconds: UInt64 = 0
+        private var debugDebounceCancellationCount = 0
+        private var debugLastEntryCount = 0
+        private var searchDidCaptureGenerationHandler: (@Sendable (UInt64?) async -> Void)?
+    #endif
 
     init(automaticIndexBuildDelayNanoseconds: UInt64 = 0) {
         self.automaticIndexBuildDelayNanoseconds = automaticIndexBuildDelayNanoseconds
@@ -54,7 +86,7 @@ actor WorkspaceSearchService {
     }
 
     var indexedPathCount: Int {
-        indexedPaths.count
+        readyRootPathIndexes.reduce(0) { $0 + $1.count }
     }
 
     var pendingGeneration: UInt64? {
@@ -68,6 +100,46 @@ actor WorkspaceSearchService {
     var discardedStaleRebuildCount: Int {
         discardedAutomaticRebuildCompletions
     }
+
+    #if DEBUG
+        func workDiagnosticsSnapshot() -> RebuildWorkDiagnosticsSnapshot {
+            RebuildWorkDiagnosticsSnapshot(
+                rebuildCount: debugRebuildCount,
+                orderMicroseconds: debugOrderMicroseconds,
+                materializationMicroseconds: debugMaterializationMicroseconds,
+                cIndexBuildMicroseconds: debugCIndexBuildMicroseconds,
+                totalMicroseconds: debugTotalMicroseconds,
+                debounceCancellationCount: debugDebounceCancellationCount,
+                staleDiscardedCount: discardedAutomaticRebuildCompletions,
+                lastEntryCount: debugLastEntryCount
+            )
+        }
+
+        func setSearchDidCaptureGenerationHandler(
+            _ handler: (@Sendable (UInt64?) async -> Void)?
+        ) {
+            searchDidCaptureGenerationHandler = handler
+        }
+
+        static func authoritativeGlobalResultsForTesting(
+            from snapshot: WorkspaceSearchCatalogSnapshot,
+            query: String,
+            limit: Int
+        ) -> [WorkspaceSearchCatalogEntry] {
+            let boundedLimit = max(0, limit)
+            guard boundedLimit > 0 else { return [] }
+            let orderedEntries = orderEntries(snapshot.entries)
+            let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                return Array(orderedEntries.prefix(boundedLimit))
+            }
+            let index = PathSearchIndex(paths: orderedEntries.map(\.pathSearchIndexKey))
+            return index.searchSynchronously(trimmed, limit: boundedLimit).compactMap { candidate in
+                guard orderedEntries.indices.contains(candidate.index) else { return nil }
+                return orderedEntries[candidate.index]
+            }
+        }
+    #endif
 
     func startKeepingFresh(
         with store: WorkspaceFileContextStore,
@@ -121,7 +193,10 @@ actor WorkspaceSearchService {
         activeRebuildGeneration = snapshot.generation
         latestObservedCatalogGeneration = snapshot.generation
 
-        let prepared = await Self.prepareIndex(from: snapshot)
+        let prepared = Self.prepareIndex(from: snapshot)
+        #if DEBUG
+            recordPreparedIndexWork(prepared)
+        #endif
         guard serial == rebuildSerial, !Task.isCancelled else {
             activeRebuildGeneration = nil
             return currentIndexedGeneration ?? snapshot.generation
@@ -142,9 +217,7 @@ actor WorkspaceSearchService {
         appliedIndexListenerTask = nil
         pendingRebuildTask?.cancel()
         pendingRebuildTask = nil
-        orderedEntries = []
-        indexedPaths = []
-        entriesByIndexedPath = [:]
+        readyRootPathIndexes = []
         currentSnapshotGeneration = nil
         currentIndexedGeneration = nil
         currentDiagnostics = nil
@@ -152,7 +225,6 @@ actor WorkspaceSearchService {
         pendingRebuildGeneration = nil
         activeRebuildGeneration = nil
         isReadyIndexUsable = true
-        readyIndex = PathSearchIndex()
     }
 
     func search(_ query: String, limit: Int = 300) async -> WorkspaceSearchQueryResult {
@@ -166,31 +238,29 @@ actor WorkspaceSearchService {
             return queryResult(query: query, results: [], isStale: stale)
         }
 
-        guard !trimmed.isEmpty else {
-            return queryResult(query: query, results: Array(orderedEntries.prefix(boundedLimit)), isStale: stale)
-        }
-
         guard isReadyIndexUsableAtSearchStart, currentIndexedGeneration != nil else {
             return queryResult(query: query, results: [], isStale: stale)
         }
 
-        let index = readyIndex
+        let rootPathIndexesAtSearchStart = readyRootPathIndexes
         let generationAtSearchStart = currentIndexedGeneration
         let snapshotGenerationAtSearchStart = currentSnapshotGeneration
-        let entriesAtSearchStart = orderedEntries
-        let entriesByPathAtSearchStart = entriesByIndexedPath
-        let candidates = await index.search(trimmed, limit: boundedLimit)
-        var seenIDs = Set<UUID>()
-        var results: [WorkspaceSearchCatalogEntry] = []
-        results.reserveCapacity(candidates.count)
-        for candidate in candidates {
-            let entry: WorkspaceSearchCatalogEntry? = if candidate.index >= 0, candidate.index < entriesAtSearchStart.count {
-                entriesAtSearchStart[candidate.index]
-            } else {
-                entriesByPathAtSearchStart[candidate.path]
+        #if DEBUG
+            if let searchDidCaptureGenerationHandler {
+                await searchDidCaptureGenerationHandler(generationAtSearchStart)
             }
-            guard let entry, seenIDs.insert(entry.id).inserted else { continue }
-            results.append(entry)
+        #endif
+
+        let results: [WorkspaceSearchCatalogEntry] = if trimmed.isEmpty {
+            Self.mergeRootEntries(rootPathIndexesAtSearchStart, limit: boundedLimit)
+        } else {
+            await Task.detached {
+                Self.searchRootIndexes(
+                    rootPathIndexesAtSearchStart,
+                    query: trimmed,
+                    limit: boundedLimit
+                )
+            }.value
         }
         return WorkspaceSearchQueryResult(
             query: query,
@@ -244,7 +314,7 @@ actor WorkspaceSearchService {
         debounceNanoseconds: UInt64
     ) async {
         if event.isRootUnload {
-            invalidateReadyEntriesForRootUnload(rootID: event.rootID)
+            dropReadyRootIndex(rootID: event.rootID)
         }
 
         let catalogGeneration = await store.catalogGeneration(rootScope: rootScope)
@@ -273,6 +343,11 @@ actor WorkspaceSearchService {
         debounceNanoseconds: UInt64
     ) {
         pendingRebuildGeneration = targetGeneration
+        #if DEBUG
+            if pendingRebuildTask != nil {
+                debugDebounceCancellationCount += 1
+            }
+        #endif
         pendingRebuildTask?.cancel()
         pendingRebuildTask = Task { [weak self, store] in
             if debounceNanoseconds > 0 {
@@ -316,7 +391,10 @@ actor WorkspaceSearchService {
         if automaticIndexBuildDelayNanoseconds > 0 {
             try? await Task.sleep(nanoseconds: automaticIndexBuildDelayNanoseconds)
         }
-        let prepared = await Self.prepareIndex(from: snapshot)
+        let prepared = Self.prepareIndex(from: snapshot)
+        #if DEBUG
+            recordPreparedIndexWork(prepared)
+        #endif
         guard !Task.isCancelled,
               latestObservedCatalogGeneration == prepared.generation,
               pendingRebuildGeneration == nil || pendingRebuildGeneration == prepared.generation,
@@ -333,59 +411,209 @@ actor WorkspaceSearchService {
         pendingRebuildTask = nil
     }
 
-    private func invalidateReadyEntriesForRootUnload(rootID: UUID) {
-        guard orderedEntries.contains(where: { $0.rootID == rootID }) else { return }
-        orderedEntries.removeAll { $0.rootID == rootID }
-        indexedPaths = orderedEntries.map(Self.indexPath(for:))
-        entriesByIndexedPath = Dictionary(zip(indexedPaths, orderedEntries), uniquingKeysWith: { first, _ in first })
-        currentIndexedGeneration = nil
-        currentSnapshotGeneration = nil
-        currentDiagnostics = nil
-        readyIndex = PathSearchIndex()
-        isReadyIndexUsable = false
+    private func dropReadyRootIndex(rootID: UUID) {
+        readyRootPathIndexes.removeAll { $0.identity.rootID == rootID }
     }
 
     private func commit(_ prepared: PreparedIndex) {
-        orderedEntries = prepared.orderedEntries
-        indexedPaths = prepared.indexedPaths
-        entriesByIndexedPath = prepared.entriesByIndexedPath
+        readyRootPathIndexes = prepared.rootPathIndexes
         currentSnapshotGeneration = prepared.generation
         currentDiagnostics = prepared.diagnostics
-        readyIndex = prepared.index
         currentIndexedGeneration = prepared.generation
         isReadyIndexUsable = true
     }
 
-    private static func prepareIndex(from snapshot: WorkspaceSearchCatalogSnapshot) async -> PreparedIndex {
-        let ordered = orderEntries(snapshot.entries)
-        let paths = ordered.map(indexPath(for:))
-        let entriesByIndexedPath = Dictionary(zip(paths, ordered), uniquingKeysWith: { first, _ in first })
-        let index = PathSearchIndex()
-        await index.rebuild(paths: paths)
-        return PreparedIndex(
-            generation: snapshot.generation,
-            diagnostics: snapshot.diagnostics,
-            orderedEntries: ordered,
-            indexedPaths: paths,
-            entriesByIndexedPath: entriesByIndexedPath,
-            index: index
-        )
+    private static func prepareIndex(from snapshot: WorkspaceSearchCatalogSnapshot) -> PreparedIndex {
+        #if DEBUG
+            let totalStart = DispatchTime.now().uptimeNanoseconds
+            let materializationStart = totalStart
+        #endif
+        let rootPathIndexes = snapshot.rootPathIndexes
+        let entryCount = rootPathIndexes.reduce(0) { $0 + $1.count }
+        #if DEBUG
+            let end = DispatchTime.now().uptimeNanoseconds
+            return PreparedIndex(
+                generation: snapshot.generation,
+                diagnostics: snapshot.diagnostics,
+                rootPathIndexes: rootPathIndexes,
+                entryCount: entryCount,
+                orderMicroseconds: 0,
+                materializationMicroseconds: elapsedMicroseconds(since: materializationStart, through: end),
+                cIndexBuildMicroseconds: 0,
+                totalMicroseconds: elapsedMicroseconds(since: totalStart, through: end)
+            )
+        #else
+            return PreparedIndex(
+                generation: snapshot.generation,
+                diagnostics: snapshot.diagnostics,
+                rootPathIndexes: rootPathIndexes,
+                entryCount: entryCount
+            )
+        #endif
+    }
+
+    private static func searchRootIndexes(
+        _ rootPathIndexes: [WorkspaceSearchRootPathIndex],
+        query: String,
+        limit: Int
+    ) -> [WorkspaceSearchCatalogEntry] {
+        let candidateBatches = rootPathIndexes.map { $0.search(query, limit: limit) }
+        var heap: [RankedCandidateCursor] = []
+        heap.reserveCapacity(candidateBatches.count)
+
+        func cursorPrecedes(_ lhs: RankedCandidateCursor, _ rhs: RankedCandidateCursor) -> Bool {
+            candidatePrecedes(
+                candidateBatches[lhs.rootIndex][lhs.candidateIndex],
+                candidateBatches[rhs.rootIndex][rhs.candidateIndex]
+            )
+        }
+
+        func push(_ cursor: RankedCandidateCursor) {
+            heap.append(cursor)
+            var index = heap.count - 1
+            while index > 0 {
+                let parent = (index - 1) / 2
+                guard cursorPrecedes(heap[index], heap[parent]) else { break }
+                heap.swapAt(index, parent)
+                index = parent
+            }
+        }
+
+        func pop() -> RankedCandidateCursor? {
+            guard !heap.isEmpty else { return nil }
+            if heap.count == 1 { return heap.removeLast() }
+            let first = heap[0]
+            heap[0] = heap.removeLast()
+            var index = 0
+            while true {
+                let left = index * 2 + 1
+                guard left < heap.count else { break }
+                let right = left + 1
+                let next = right < heap.count && cursorPrecedes(heap[right], heap[left]) ? right : left
+                guard cursorPrecedes(heap[next], heap[index]) else { break }
+                heap.swapAt(index, next)
+                index = next
+            }
+            return first
+        }
+
+        for rootIndex in candidateBatches.indices where !candidateBatches[rootIndex].isEmpty {
+            push(RankedCandidateCursor(rootIndex: rootIndex, candidateIndex: 0))
+        }
+
+        var seenIDs = Set<UUID>()
+        var results: [WorkspaceSearchCatalogEntry] = []
+        results.reserveCapacity(limit)
+        while results.count < limit, let cursor = pop() {
+            let candidate = candidateBatches[cursor.rootIndex][cursor.candidateIndex]
+            if seenIDs.insert(candidate.entry.id).inserted {
+                results.append(candidate.entry)
+            }
+            let nextCandidateIndex = cursor.candidateIndex + 1
+            if nextCandidateIndex < candidateBatches[cursor.rootIndex].count {
+                push(RankedCandidateCursor(rootIndex: cursor.rootIndex, candidateIndex: nextCandidateIndex))
+            }
+        }
+        return results
+    }
+
+    private static func mergeRootEntries(
+        _ rootPathIndexes: [WorkspaceSearchRootPathIndex],
+        limit: Int
+    ) -> [WorkspaceSearchCatalogEntry] {
+        var heap: [EntryCursor] = []
+        heap.reserveCapacity(rootPathIndexes.count)
+
+        func cursorPrecedes(_ lhs: EntryCursor, _ rhs: EntryCursor) -> Bool {
+            entryPrecedes(
+                rootPathIndexes[lhs.rootIndex].entries[lhs.entryIndex],
+                rootPathIndexes[rhs.rootIndex].entries[rhs.entryIndex]
+            )
+        }
+
+        func push(_ cursor: EntryCursor) {
+            heap.append(cursor)
+            var index = heap.count - 1
+            while index > 0 {
+                let parent = (index - 1) / 2
+                guard cursorPrecedes(heap[index], heap[parent]) else { break }
+                heap.swapAt(index, parent)
+                index = parent
+            }
+        }
+
+        func pop() -> EntryCursor? {
+            guard !heap.isEmpty else { return nil }
+            if heap.count == 1 { return heap.removeLast() }
+            let first = heap[0]
+            heap[0] = heap.removeLast()
+            var index = 0
+            while true {
+                let left = index * 2 + 1
+                guard left < heap.count else { break }
+                let right = left + 1
+                let next = right < heap.count && cursorPrecedes(heap[right], heap[left]) ? right : left
+                guard cursorPrecedes(heap[next], heap[index]) else { break }
+                heap.swapAt(index, next)
+                index = next
+            }
+            return first
+        }
+
+        for rootIndex in rootPathIndexes.indices where !rootPathIndexes[rootIndex].entries.isEmpty {
+            push(EntryCursor(rootIndex: rootIndex, entryIndex: 0))
+        }
+
+        var results: [WorkspaceSearchCatalogEntry] = []
+        results.reserveCapacity(limit)
+        while results.count < limit, let cursor = pop() {
+            results.append(rootPathIndexes[cursor.rootIndex].entries[cursor.entryIndex])
+            let nextEntryIndex = cursor.entryIndex + 1
+            if nextEntryIndex < rootPathIndexes[cursor.rootIndex].entries.count {
+                push(EntryCursor(rootIndex: cursor.rootIndex, entryIndex: nextEntryIndex))
+            }
+        }
+        return results
+    }
+
+    private static func candidatePrecedes(
+        _ lhs: WorkspaceSearchRootPathIndex.Candidate,
+        _ rhs: WorkspaceSearchRootPathIndex.Candidate
+    ) -> Bool {
+        if lhs.score != rhs.score { return lhs.score > rhs.score }
+        if lhs.tieBreakKey != rhs.tieBreakKey {
+            return lhs.tieBreakKey.utf8.lexicographicallyPrecedes(rhs.tieBreakKey.utf8)
+        }
+        return entryPrecedes(lhs.entry, rhs.entry)
+    }
+
+    private static func entryPrecedes(
+        _ lhs: WorkspaceSearchCatalogEntry,
+        _ rhs: WorkspaceSearchCatalogEntry
+    ) -> Bool {
+        if lhs.rootPath != rhs.rootPath { return lhs.rootPath < rhs.rootPath }
+        if lhs.standardizedRelativePath != rhs.standardizedRelativePath {
+            return lhs.standardizedRelativePath < rhs.standardizedRelativePath
+        }
+        return lhs.id.uuidString < rhs.id.uuidString
     }
 
     private static func orderEntries(_ entries: [WorkspaceSearchCatalogEntry]) -> [WorkspaceSearchCatalogEntry] {
-        entries.sorted {
-            if $0.rootPath != $1.rootPath { return $0.rootPath < $1.rootPath }
-            if $0.standardizedRelativePath != $1.standardizedRelativePath {
-                return $0.standardizedRelativePath < $1.standardizedRelativePath
-            }
-            return $0.id.uuidString < $1.id.uuidString
-        }
+        entries.sorted(by: entryPrecedes)
     }
 
-    private static func indexPath(for entry: WorkspaceSearchCatalogEntry) -> String {
-        // Include both the workspace display path and absolute path so the index works for UI-style
-        // queries ("Root/Sources/App.swift") and absolute-path consumers while retaining a stable
-        // one-entry-per-file mapping.
-        entry.displayPath + "\n" + entry.standardizedFullPath
-    }
+    #if DEBUG
+        private func recordPreparedIndexWork(_ prepared: PreparedIndex) {
+            debugRebuildCount += 1
+            debugOrderMicroseconds &+= prepared.orderMicroseconds
+            debugMaterializationMicroseconds &+= prepared.materializationMicroseconds
+            debugCIndexBuildMicroseconds &+= prepared.cIndexBuildMicroseconds
+            debugTotalMicroseconds &+= prepared.totalMicroseconds
+            debugLastEntryCount = prepared.entryCount
+        }
+
+        private static func elapsedMicroseconds(since start: UInt64, through end: UInt64) -> UInt64 {
+            end >= start ? (end - start) / 1000 : 0
+        }
+    #endif
 }

@@ -1,6 +1,85 @@
 import Foundation
 import RepoPromptShared
 
+enum MCPToolExecutionHandlerPhase: String, Equatable {
+    case manageSelectionAutoSelectionDrain = "manage_selection.auto_selection_drain"
+    case manageSelectionIngressWait = "manage_selection.ingress_wait"
+    case manageSelectionConstruction = "manage_selection.selection_construction"
+    case manageSelectionPersistence = "manage_selection.persistence"
+    case manageSelectionReplyConstruction = "manage_selection.reply_construction"
+    case fileActionsPreMutationChecks = "file_actions.pre_mutation_checks"
+    case fileActionsCatalogEligibility = "file_actions.catalog_eligibility"
+    case fileActionsMutationIO = "file_actions.mutation_io"
+    case fileActionsPostMutationCatalog = "file_actions.post_mutation_catalog"
+    case fileActionsPostMutationSelection = "file_actions.post_mutation_selection"
+    case fileActionsReplyConstruction = "file_actions.reply_construction"
+}
+
+enum MCPToolExecutionHandlerPhaseTransition: String, Equatable {
+    case started
+    case completed
+}
+
+struct MCPToolExecutionHandlerPhaseSnapshot: Equatable {
+    let phase: MCPToolExecutionHandlerPhase
+    let transition: MCPToolExecutionHandlerPhaseTransition
+    let elapsedMilliseconds: Double
+}
+
+/// Per-invocation progress state. Providers use the task-local accessor while the
+/// connection manager retains this recorder explicitly for watchdog escalation.
+final class MCPToolExecutionHandlerPhaseRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private let origin: Duration
+    private let now: @Sendable () async -> Duration
+    private var latest: MCPToolExecutionHandlerPhaseSnapshot?
+
+    init(
+        origin: Duration,
+        now: @escaping @Sendable () async -> Duration
+    ) {
+        self.origin = origin
+        self.now = now
+    }
+
+    func report(
+        _ phase: MCPToolExecutionHandlerPhase,
+        transition: MCPToolExecutionHandlerPhaseTransition
+    ) async {
+        let current = await now()
+        store(MCPToolExecutionHandlerPhaseSnapshot(
+            phase: phase,
+            transition: transition,
+            elapsedMilliseconds: max(0, current.mcpMilliseconds - origin.mcpMilliseconds)
+        ))
+    }
+
+    func snapshot() -> MCPToolExecutionHandlerPhaseSnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latest
+    }
+
+    private func store(_ snapshot: MCPToolExecutionHandlerPhaseSnapshot) {
+        lock.lock()
+        latest = snapshot
+        lock.unlock()
+    }
+}
+
+enum MCPToolExecutionHandlerPhaseContext {
+    @TaskLocal
+    static var recorder: MCPToolExecutionHandlerPhaseRecorder?
+
+    static func report(
+        _ phase: MCPToolExecutionHandlerPhase,
+        transition: MCPToolExecutionHandlerPhaseTransition = .started
+    ) async {
+        guard let recorder else { return }
+        await recorder.report(phase, transition: transition)
+    }
+}
+
 struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     enum Phase: String {
         case contractSelected = "execution_contract_selected"
@@ -26,6 +105,8 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
     let cancellationOutcome: String?
     let graceOutcome: String?
     let escalationReason: String?
+    let handlerPhase: MCPToolExecutionHandlerPhaseSnapshot?
+    let handlerPhaseAgeMilliseconds: Double?
 
     var isAlwaysEmitted: Bool {
         switch phase {
@@ -53,6 +134,14 @@ struct MCPToolExecutionTraceEvent: Equatable, CustomStringConvertible {
         if let cancellationOutcome { fields.append("cancellation_outcome=\(cancellationOutcome)") }
         if let graceOutcome { fields.append("grace_outcome=\(graceOutcome)") }
         if let escalationReason { fields.append("escalation_reason=\(escalationReason)") }
+        if let handlerPhase {
+            fields.append("handler_phase=\(handlerPhase.phase.rawValue)")
+            fields.append("handler_phase_transition=\(handlerPhase.transition.rawValue)")
+            fields.append("handler_phase_elapsed_ms=\(String(format: "%.3f", handlerPhase.elapsedMilliseconds))")
+        }
+        if let handlerPhaseAgeMilliseconds {
+            fields.append("handler_phase_age_ms=\(String(format: "%.3f", handlerPhaseAgeMilliseconds))")
+        }
         return fields.joined(separator: " ")
     }
 }

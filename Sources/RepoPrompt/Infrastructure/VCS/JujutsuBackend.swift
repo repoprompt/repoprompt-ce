@@ -208,6 +208,19 @@ public actor JujutsuBackend: VCSBackendWithWarnings {
         nil
     }
 
+    public func getRepositoryStatus(at repoURL: URL) async throws -> VCSRepositoryStatus {
+        async let branch = getCurrentBranch(at: repoURL)
+        async let workingStatus = getWorkingStatus(at: repoURL)
+        return try await VCSRepositoryStatus(
+            branch: branch,
+            headID: nil,
+            upstream: nil,
+            ahead: nil,
+            behind: nil,
+            workingStatus: workingStatus
+        )
+    }
+
     public func getWorkingStatus(at repoURL: URL) async throws -> VCSWorkingStatus {
         // jj has no staging area and no untracked concept in the same way as git.
         // Provide a best-effort \"modified\" list from `jj diff --summary`.

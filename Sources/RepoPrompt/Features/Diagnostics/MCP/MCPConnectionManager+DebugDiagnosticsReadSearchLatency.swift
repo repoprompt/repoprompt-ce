@@ -2,6 +2,7 @@
 
 import Foundation
 import MCP
+import RepoPromptShared
 
 #if DEBUG
     extension ServerNetworkManager {
@@ -20,6 +21,8 @@ import MCP
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "`max_samples` must be an integer between 100 and 100000.")
             }
 
+            MCPResponseDeliveryTracer.resetDebugEvents()
+            MCPToolWorkCountDiagnostics.resetDebugHistory()
             switch EditFlowPerf.beginDebugCapture(label: label, maxSamples: maxSamples) {
             case let .started(snapshot):
                 return debugDiagnosticsResult([
@@ -43,7 +46,8 @@ import MCP
             return debugDiagnosticsResult([
                 "ok": true,
                 "op": op,
-                "capture": snapshot.payload(includeTimeline: includeTimeline)
+                "capture": snapshot.payload(includeTimeline: includeTimeline),
+                "delivery_events": MCPResponseDeliveryTracer.debugEventSnapshot().map(\.payload)
             ])
         }
 
@@ -238,12 +242,27 @@ import MCP
             }
 
             var windows: [[String: Any]] = []
+            var duplicationByPhysicalRoot: [String: DebugPhysicalRootDuplicationAccumulator] = [:]
             windows.reserveCapacity(targets.count)
             for target in targets {
                 let snapshots = await target.store.readSearchRootDiagnosticsSnapshot(
                     recentPublicationLimit: recentPublicationLimit
                 )
+                let storeWork = await target.store.storeWorkDiagnosticsSnapshot()
+                let searchWork = await target.searchService.workDiagnosticsSnapshot()
                 let ordered = snapshots.sorted { $0.rootToken.uuidString < $1.rootToken.uuidString }
+                for root in ordered {
+                    var duplication = duplicationByPhysicalRoot[root.rootPath]
+                        ?? DebugPhysicalRootDuplicationAccumulator(rootKinds: [])
+                    duplication.windowIDs.insert(target.windowID)
+                    duplication.rootKinds.insert(root.rootKind)
+                    duplication.watcherCount += root.watcherActive ? 1 : 0
+                    duplication.crawlCount += root.crawlCount
+                    duplication.currentFreshnessFlightCount += (root.barrier.active == nil ? 0 : 1)
+                        + (root.barrier.pending == nil ? 0 : 1)
+                    duplication.totalFreshnessFlightLaunchCount += root.barrier.launchCount
+                    duplicationByPhysicalRoot[root.rootPath] = duplication
+                }
                 let included = Array(ordered.prefix(rootLimit))
                 windows.append([
                     "window_id": target.windowID,
@@ -254,6 +273,9 @@ import MCP
                     "projection_direct_folder_id_lookup_count": target.projection.directFolderIDLookupCount,
                     "projection_direct_id_lookup_miss_count": target.projection.directIDLookupMissCount,
                     "projection_canonical_resync_count": target.projection.canonicalResyncCount,
+                    "ui_index_rebuild": uiIndexRebuildPayload(target.projection),
+                    "store_work": storeWorkPayload(storeWork),
+                    "search_rebuild": searchRebuildPayload(searchWork),
                     "read_file_auto_selection": readFileAutoSelectionPayload(target.readFileAutoSelection),
                     "roots": included.map { root in
                         readSearchRuntimeRootPayload(
@@ -264,6 +286,7 @@ import MCP
                 ])
             }
 
+            let toolWork = MCPToolWorkCountDiagnostics.debugSnapshots()
             let targetConnectionID = requestedConnectionID ?? connectionID
             let limiter = await connectionLimiterDiagnosticsSnapshot(connectionID: targetConnectionID)
             var limiterPayload = limiter.map { readSearchLimiterPayload($0) } ?? ["found": false]
@@ -279,7 +302,17 @@ import MCP
                         "tool_event_observer_count": toolEventObserverCount()
                     ],
                     "window_count": windows.count,
-                    "windows": windows
+                    "windows": windows,
+                    "physical_root_duplication": duplicationByPhysicalRoot.keys.sorted().map { rootPath in
+                        physicalRootDuplicationPayload(
+                            rootPath: rootPath,
+                            accumulator: duplicationByPhysicalRoot[rootPath]!
+                        )
+                    },
+                    "tool_work": [
+                        "git_invocations": toolWork.git.map(gitWorkPayload),
+                        "read_file_invocations": toolWork.readFile.map(readFileWorkPayload)
+                    ]
                 ]
             ])
         }
@@ -287,8 +320,18 @@ import MCP
         private struct DebugReadSearchRuntimeTarget {
             let windowID: Int
             let store: WorkspaceFileContextStore
+            let searchService: WorkspaceSearchService
             let projection: WorkspaceFilesViewModel.AppliedIndexProjectionDiagnosticsSnapshot
             let readFileAutoSelection: MCPReadFileAutoSelectionCoordinator.DebugSnapshot
+        }
+
+        private struct DebugPhysicalRootDuplicationAccumulator {
+            var windowIDs = Set<Int>()
+            var rootKinds: Set<String>
+            var watcherCount = 0
+            var crawlCount = 0
+            var currentFreshnessFlightCount = 0
+            var totalFreshnessFlightLaunchCount = 0
         }
 
         private enum DebugSearchLaneWindowIDResult {
@@ -322,11 +365,152 @@ import MCP
                         DebugReadSearchRuntimeTarget(
                             windowID: window.windowID,
                             store: window.workspaceFileContextStore,
+                            searchService: window.workspaceSearchService,
                             projection: window.workspaceFilesViewModel.appliedIndexProjectionDiagnosticsSnapshot(),
                             readFileAutoSelection: window.mcpServer.readFileAutoSelectionDiagnosticsSnapshot()
                         )
                     }
             }
+        }
+
+        private func storeWorkPayload(
+            _ snapshot: WorkspaceFileContextStore.StoreWorkDiagnosticsSnapshot
+        ) -> [String: Any] {
+            [
+                "invalidations": snapshot.invalidations.map { event in
+                    [
+                        "sequence": event.sequence,
+                        "reasons": event.reasons,
+                        "affected_root_ids": event.affectedRootIDs.map(\.uuidString),
+                        "affected_root_kinds": event.affectedRootKinds,
+                        "evicted_scopes": event.evictedScopes
+                    ]
+                },
+                "catalog_rebuild": [
+                    "count": snapshot.catalogRebuild.rebuildCount,
+                    "filter_us": snapshot.catalogRebuild.filterMicroseconds,
+                    "sort_us": snapshot.catalogRebuild.sortMicroseconds,
+                    "materialization_us": snapshot.catalogRebuild.materializationMicroseconds,
+                    "total_us": snapshot.catalogRebuild.totalMicroseconds,
+                    "last_file_count": snapshot.catalogRebuild.lastFileCount,
+                    "last_root_count": snapshot.catalogRebuild.lastRootCount
+                ],
+                "root_catalog_shards": [
+                    "live_generation_cap_per_root": snapshot.rootCatalogShards.liveGenerationCapPerRoot,
+                    "max_patch_logical_mutation_count": snapshot.rootCatalogShards.maxPatchLogicalMutationCount,
+                    "published_shard_count": snapshot.rootCatalogShards.publishedShardCount,
+                    "total_build_count": snapshot.rootCatalogShards.totalBuildCount,
+                    "total_backstop_count": snapshot.rootCatalogShards.totalBackstopCount,
+                    "shadow_comparison_count": snapshot.rootCatalogShards.shadowComparisonCount,
+                    "shadow_mismatch_count": snapshot.rootCatalogShards.shadowMismatchCount,
+                    "last_shadow_byte_count": snapshot.rootCatalogShards.lastShadowByteCount,
+                    "roots": snapshot.rootCatalogShards.roots.map { root in
+                        [
+                            "root_id": root.rootID.uuidString,
+                            "published_topology_generation": root.publishedTopologyGeneration.map { $0 as Any } ?? NSNull(),
+                            "live_topology_generations": root.liveTopologyGenerations,
+                            "retained_topology_generations": root.retainedTopologyGenerations,
+                            "build_count": root.buildCount,
+                            "patch_count": root.patchCount,
+                            "authoritative_rebuild_count": root.authoritativeRebuildCount,
+                            "fallback_reason_counts": root.fallbackReasonCounts,
+                            "last_applied_index_generation": root.lastAppliedIndexGeneration.map { $0 as Any } ?? NSNull(),
+                            "delta_state_dirty": root.deltaStateDirty,
+                            "backstop_count": root.backstopCount,
+                            "max_live_generation_count": root.maxLiveGenerationCount
+                        ]
+                    }
+                ]
+            ]
+        }
+
+        private func searchRebuildPayload(
+            _ snapshot: WorkspaceSearchService.RebuildWorkDiagnosticsSnapshot
+        ) -> [String: Any] {
+            [
+                "count": snapshot.rebuildCount,
+                "order_us": snapshot.orderMicroseconds,
+                "materialization_us": snapshot.materializationMicroseconds,
+                "c_index_build_us": snapshot.cIndexBuildMicroseconds,
+                "total_us": snapshot.totalMicroseconds,
+                "debounce_cancellation_count": snapshot.debounceCancellationCount,
+                "stale_discarded_count": snapshot.staleDiscardedCount,
+                "last_entry_count": snapshot.lastEntryCount
+            ]
+        }
+
+        private func uiIndexRebuildPayload(
+            _ snapshot: WorkspaceFilesViewModel.AppliedIndexProjectionDiagnosticsSnapshot
+        ) -> [String: Any] {
+            [
+                "count": snapshot.indexRebuildCount,
+                "total_duration_ms": snapshot.indexRebuildTotalDurationMS,
+                "traversal_duration_ms": snapshot.indexRebuildTraversalDurationMS,
+                "visited_folder_count": snapshot.indexRebuildVisitedFolderCount,
+                "visited_file_count": snapshot.indexRebuildVisitedFileCount
+            ]
+        }
+
+        private func physicalRootDuplicationPayload(
+            rootPath: String,
+            accumulator: DebugPhysicalRootDuplicationAccumulator
+        ) -> [String: Any] {
+            [
+                "physical_root": rootPath,
+                "root_kinds": accumulator.rootKinds.sorted(),
+                "window_count": accumulator.windowIDs.count,
+                "window_ids": accumulator.windowIDs.sorted(),
+                "watcher_count": accumulator.watcherCount,
+                "crawl_count": accumulator.crawlCount,
+                "current_freshness_flight_count": accumulator.currentFreshnessFlightCount,
+                "total_freshness_flight_launch_count": accumulator.totalFreshnessFlightLaunchCount
+            ]
+        }
+
+        private func gitWorkPayload(
+            _ snapshot: MCPToolWorkCountDiagnostics.GitInvocationSnapshot
+        ) -> [String: Any] {
+            [
+                "operation": snapshot.operation,
+                "request_identity": workRequestIdentityPayload(snapshot.requestIdentity),
+                "repositories": snapshot.repositories,
+                "command_count": snapshot.commandCount,
+                "command_counts_by_repository": snapshot.commandCountsByRepository,
+                "process_global_limit": GitProcessAdmissionController.defaultGlobalLimit,
+                "process_per_repository_limit": GitProcessAdmissionController.defaultPerRepositoryLimit,
+                "process_queue_wait_us": snapshot.processQueueWaitMicroseconds,
+                "spawn_us": snapshot.spawnMicroseconds,
+                "output_bytes": snapshot.outputBytes,
+                "parse_us": snapshot.parseMicroseconds,
+                "commands": snapshot.commands,
+                "outcome": snapshot.outcome
+            ]
+        }
+
+        private func readFileWorkPayload(
+            _ snapshot: MCPToolWorkCountDiagnostics.ReadFileInvocationSnapshot
+        ) -> [String: Any] {
+            [
+                "request_identity": workRequestIdentityPayload(snapshot.requestIdentity),
+                "source": snapshot.source,
+                "read_bytes": snapshot.readBytes,
+                "returned_bytes": snapshot.returnedBytes,
+                "returned_lines": snapshot.returnedLines,
+                "decode_us": snapshot.decodeMicroseconds,
+                "cache_hit": snapshot.cacheHit,
+                "outcome": snapshot.outcome
+            ]
+        }
+
+        private func workRequestIdentityPayload(_ identity: MCPRequestTimelineIdentity?) -> Any {
+            guard let identity else { return NSNull() }
+            return [
+                "jsonrpc_request_id": Self.debugOptionalValue(identity.jsonRPCRequestID?.description),
+                "connection_id": Self.debugOptionalValue(identity.connectionID),
+                "connection_generation": Self.debugOptionalValue(identity.connectionGeneration),
+                "app_invocation_id": Self.debugOptionalValue(identity.appInvocationID),
+                "request_ordinal": Self.debugOptionalValue(identity.requestOrdinal)
+            ] as [String: Any]
         }
 
         private func readFileAutoSelectionPayload(
@@ -360,6 +544,9 @@ import MCP
                 "is_idle": snapshot.isIdle,
                 "lanes": [
                     MCPConnectionCallLane.ordinary.rawValue: readSearchLimiterLanePayload(snapshot.ordinary),
+                    MCPConnectionCallLane.control.rawValue: readSearchLimiterLanePayload(snapshot.control),
+                    MCPConnectionCallLane.smallRead.rawValue: readSearchLimiterLanePayload(snapshot.smallRead),
+                    MCPConnectionCallLane.gitRead.rawValue: readSearchLimiterLanePayload(snapshot.gitRead),
                     MCPConnectionCallLane.fileSearch.rawValue: readSearchLimiterLanePayload(snapshot.fileSearch)
                 ]
             ]
@@ -388,9 +575,15 @@ import MCP
                 ? producedGeneration - handledGeneration
                 : 0
             return [
+                "root_id": root.rootID.uuidString,
                 "root_token": root.rootToken.uuidString,
+                "root_path": root.rootPath,
+                "root_kind": root.rootKind,
+                "crawl_count": root.crawlCount,
+                "watcher_active": root.watcherActive,
                 "ingress": readSearchIngressPayload(root.ingress),
                 "barrier": readSearchBarrierPayload(root.barrier),
+                "freshness": readSearchFreshnessPayload(root.freshness),
                 "invalidation": readSearchInvalidationPayload(root.invalidation),
                 "projection": [
                     "produced_generation": producedGeneration,
@@ -453,9 +646,26 @@ import MCP
                 "successor_count": snapshot.successorCount,
                 "coalesced_successor_count": snapshot.coalescedSuccessorCount,
                 "completion_count": snapshot.completionCount,
+                "noop_count": snapshot.noopCount,
+                "total_wait_ms": snapshot.totalWaitMilliseconds,
+                "max_wait_ms": snapshot.maxWaitMilliseconds,
                 "active": Self.debugOptionalValue(active),
                 "pending": Self.debugOptionalValue(pending),
                 "last_completed": Self.debugOptionalValue(completed)
+            ]
+        }
+
+        private func readSearchFreshnessPayload(
+            _ snapshot: FileSystemService.FreshnessWorkDiagnosticsSnapshot
+        ) -> [String: Any] {
+            [
+                "flush_call_count": snapshot.flushCallCount,
+                "noop_flush_count": snapshot.noopFlushCount,
+                "debounce_cancellation_count": snapshot.debounceCancellationCount,
+                "watcher_batch_count": snapshot.watcherBatchCount,
+                "watcher_batch_event_count": snapshot.watcherBatchEventCount,
+                "last_watcher_batch_size": snapshot.lastWatcherBatchSize,
+                "max_watcher_batch_size": snapshot.maxWatcherBatchSize
             ]
         }
 

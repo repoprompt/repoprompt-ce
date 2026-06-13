@@ -113,7 +113,7 @@ final class AgentFileTagSuggestionService {
         guard !trimmed.isEmpty else { return Array(entries.prefix(boundedLimit)) }
 
         let indexedPaths = entries.map { searchHaystack(for: $0, lookupContext: lookupContext) }
-        let index = await PathSearchIndex(paths: indexedPaths)
+        let index = await PathSearchIndex.build(paths: indexedPaths)
         let hits = await index.search(trimmed, limit: boundedLimit)
         var seenIDs = Set<UUID>()
         var results: [WorkspaceSearchCatalogEntry] = []

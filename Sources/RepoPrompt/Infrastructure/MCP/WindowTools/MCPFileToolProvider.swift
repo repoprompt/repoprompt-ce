@@ -62,6 +62,8 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["action", "path"]
             )
         ) { [self] _, args in
+            try Task.checkCancellation()
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks)
             guard let action = args["action"]?.stringValue,
                   let path = args["path"]?.stringValue
             else { throw MCPError.invalidParams("missing required fields") }
@@ -69,15 +71,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let content = args["content"]?.stringValue
             let newPath = args["new_path"]?.stringValue
             let ifExists = args["if_exists"]?.stringValue?.lowercased() ?? "error"
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsPreMutationChecks, transition: .completed)
+            try Task.checkCancellation()
 
             let warning = try await dependencies.performFileAction(action, path, content, newPath, ifExists)
-            return try Value(ToolResultDTOs.FileActionReply(
+            try Task.checkCancellation()
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction)
+            let value = try Value(ToolResultDTOs.FileActionReply(
                 status: "ok",
                 action: action,
                 path: path,
                 newPath: newPath,
                 warning: warning
             ))
+            await MCPToolExecutionHandlerPhaseContext.report(.fileActionsReplyConstruction, transition: .completed)
+            try Task.checkCancellation()
+            return value
         }
     }
 
@@ -129,7 +138,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
 
             switch scope {
             case "selected":
-                await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
+                    throw CancellationError()
+                }
                 try Task.checkCancellation()
                 let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
                 try Task.checkCancellation()
@@ -250,7 +261,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
                 _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 if mode.lowercased() == "selected" {
-                    await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection)
+                    guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
+                        throw CancellationError()
+                    }
                 }
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
                 let resultAndRootCount = try await dependencies.buildStoreBackedFileTreeResult(mode, maxDepth, args["path"]?.stringValue, lookupContext)
@@ -341,22 +354,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             try await dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)
         }
         try Task.checkCancellation()
-        readResult = EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
-            let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
-            }
-            return (
-                ToolResultDTOs.ReadFileReply(
-                    content: readResult.reply.content,
-                    totalLines: readResult.reply.totalLines,
-                    firstLine: readResult.reply.firstLine,
-                    lastLine: readResult.reply.lastLine,
-                    message: readResult.reply.message,
-                    displayPath: projectedDisplayPath,
-                    worktreeScope: worktreeScope
-                ),
-                readResult.shouldAutoSelect
+        let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in
+            lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: displayPath) ?? displayPath
+        }
+        readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
+            let reply = try await MCPReadFileToolProjection.projectReply(
+                readResult.reply,
+                displayPath: projectedDisplayPath,
+                worktreeScope: worktreeScope
             )
+            return (reply, readResult.shouldAutoSelect)
         }
         try Task.checkCancellation()
         await EditFlowPerf.measure(
@@ -368,8 +375,11 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             }
         }
         try Task.checkCancellation()
-        let value = try EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
-            try Value(readResult.reply)
+        let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
+            try await MCPProviderProjectionWorker.encode(
+                readResult.reply,
+                toolName: MCPWindowToolName.readFile
+            )
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
         return value

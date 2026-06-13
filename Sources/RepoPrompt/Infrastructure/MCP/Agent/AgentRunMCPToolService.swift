@@ -12,6 +12,21 @@ struct OracleExportDestination: Equatable {
     let windowID: Int
     let tabID: UUID?
     let primaryRootPath: String
+    let rootScope: WorkspaceLookupRootScope
+
+    init(
+        workspaceID: UUID,
+        windowID: Int,
+        tabID: UUID?,
+        primaryRootPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) {
+        self.workspaceID = workspaceID
+        self.windowID = windowID
+        self.tabID = tabID
+        self.primaryRootPath = primaryRootPath
+        self.rootScope = rootScope
+    }
 }
 
 struct OracleExportRequest {

@@ -16,6 +16,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         super.tearDown()
     }
 
+    func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let invocationID = UUID()
+        session.setItemsSilently([
+            .user("prior", sequenceIndex: 0),
+            .assistant("done", sequenceIndex: 1),
+            .user("active", sequenceIndex: 2),
+            .toolCall(
+                name: "read_file",
+                invocationID: invocationID,
+                argsJSON: #"{"path":"Sources/Active.swift"}"#,
+                sequenceIndex: 3
+            )
+        ], reason: .persistedSessionHydration)
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.correlationIndex")
+
+        var completed = try XCTUnwrap(session.items.last)
+        completed.kind = .toolResult
+        completed.toolResultJSON = #"{"content":"ok"}"#
+        completed.text = completed.toolResultJSON ?? ""
+        session.replaceItem(at: 3, with: completed)
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.correlationIndex",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.indexedToolItemIndices(invocationID: invocationID), [3])
+        XCTAssertEqual(session.liveItemIDs, Set(session.items.map(\.id)))
+        session.testAssertSourceItemDerivedStateIsConsistent()
+    }
+
     func testStartupFailureTransitionsBeforeProviderDispatch() async {
         for agent in [AgentProviderKind.codexExec, .claudeCode, .openCode] {
             let recorder = LifecycleRecorder()

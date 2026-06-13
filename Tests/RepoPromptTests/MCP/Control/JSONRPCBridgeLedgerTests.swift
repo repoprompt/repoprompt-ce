@@ -335,6 +335,25 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertTrue(activeFailureWasTerminal)
         reconnectSnapshot = await ledger.snapshot()
         XCTAssertFalse(reconnectSnapshot.canReconnect)
+
+        let preparedLedger = try await makeLedger()
+        _ = try await preparedLedger.prepare(
+            frame: line(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            direction: .clientToServer
+        )
+        let preparedSnapshot = await preparedLedger.snapshot()
+        XCTAssertEqual(preparedSnapshot.activeRequestCount, 0)
+        XCTAssertEqual(preparedSnapshot.pendingTransactionCount, 1)
+        XCTAssertFalse(preparedSnapshot.hasForwardedProtocolFrame)
+        XCTAssertFalse(preparedSnapshot.canReconnect)
+
+        let preparedFailureWasTerminal = await preparedLedger.recordConnectionFailure(
+            "socket_reset_with_prepared_transaction"
+        )
+        XCTAssertTrue(preparedFailureWasTerminal)
+        let terminalPreparedSnapshot = await preparedLedger.snapshot()
+        XCTAssertEqual(terminalPreparedSnapshot.terminalReason, "socket_reset_with_prepared_transaction")
+        XCTAssertFalse(terminalPreparedSnapshot.canReconnect)
     }
 
     func testTraceMetadataContainsHashAndNeverPayload() async throws {

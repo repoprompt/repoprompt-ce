@@ -208,16 +208,85 @@ final class AgentToolTrackingController {
             await tracker.registerEnhancedObserver(
                 runID: runID,
                 onCalled: { [weak self] invocationID, toolName, args in
-                    await MainActor.run { [weak self] in
-                        guard let self, shouldDeliverCallback(for: runID) else { return }
-                        onCalled(invocationID, toolName, args)
-                    }
+                    #if DEBUG
+                        let scheduledAt = DispatchTime.now().uptimeNanoseconds
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorScheduled,
+                            EditFlowPerf.Dimensions(toolName: toolName, observerType: "event_call", runID: runID.uuidString)
+                        )
+                    #endif
+                    #if DEBUG
+                        let bodyDurationMicroseconds = await MainActor.run { [weak self] in
+                            let enteredAt = DispatchTime.now().uptimeNanoseconds
+                            EditFlowPerf.lifecycleEvent(
+                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                EditFlowPerf.Dimensions(
+                                    toolName: toolName,
+                                    observerType: "event_call",
+                                    queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                    runID: runID.uuidString
+                                )
+                            )
+                            guard let self, shouldDeliverCallback(for: runID) else { return 0 }
+                            onCalled(invocationID, toolName, args)
+                            return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
+                        }
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
+                            EditFlowPerf.Dimensions(
+                                toolName: toolName,
+                                observerType: "event_call",
+                                durationMicroseconds: bodyDurationMicroseconds,
+                                runID: runID.uuidString
+                            )
+                        )
+                    #else
+                        await MainActor.run { [weak self] in
+                            guard let self, shouldDeliverCallback(for: runID) else { return }
+                            onCalled(invocationID, toolName, args)
+                        }
+                    #endif
                 },
                 onCompleted: { [weak self] invocationID, toolName, args, resultJSON, isError in
-                    await MainActor.run { [weak self] in
-                        guard let self, shouldDeliverCallback(for: runID) else { return }
-                        onCompleted(invocationID, toolName, args, resultJSON, isError)
-                    }
+                    #if DEBUG
+                        let scheduledAt = DispatchTime.now().uptimeNanoseconds
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorScheduled,
+                            EditFlowPerf.Dimensions(toolName: toolName, observerType: "event_completion", runID: runID.uuidString)
+                        )
+                    #endif
+                    #if DEBUG
+                        let bodyDurationMicroseconds = await MainActor.run { [weak self] in
+                            let enteredAt = DispatchTime.now().uptimeNanoseconds
+                            EditFlowPerf.lifecycleEvent(
+                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                EditFlowPerf.Dimensions(
+                                    toolName: toolName,
+                                    observerType: "event_completion",
+                                    queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                    runID: runID.uuidString
+                                )
+                            )
+                            guard let self, shouldDeliverCallback(for: runID) else { return 0 }
+                            onCompleted(invocationID, toolName, args, resultJSON, isError)
+                            return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
+                        }
+                        EditFlowPerf.lifecycleEvent(
+                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
+                            EditFlowPerf.Dimensions(
+                                toolName: toolName,
+                                observerType: "event_completion",
+                                durationMicroseconds: bodyDurationMicroseconds,
+                                resultBytes: resultJSON.utf8.count,
+                                runID: runID.uuidString
+                            )
+                        )
+                    #else
+                        await MainActor.run { [weak self] in
+                            guard let self, shouldDeliverCallback(for: runID) else { return }
+                            onCompleted(invocationID, toolName, args, resultJSON, isError)
+                        }
+                    #endif
                 }
             )
         }
