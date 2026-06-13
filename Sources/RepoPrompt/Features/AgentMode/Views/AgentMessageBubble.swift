@@ -339,7 +339,10 @@ struct AgentMessageBubble: View {
                     if !item.taggedFileAttachments.isEmpty {
                         TaggedFilesBadge(attachments: item.taggedFileAttachments)
                     }
-                    CollapsibleUserMessage(text: item.text)
+                    CollapsibleUserMessage(
+                        text: item.text,
+                        bareURLLinkificationPolicy: .httpHTTPSOnly
+                    )
                 }
                 .padding(12)
                 .background(BubbleColors.lightBlue)
@@ -448,12 +451,17 @@ struct AgentMessageBubble: View {
     @ViewBuilder
     private var assistantContent: some View {
         if shouldShowCollapsedAssistantView {
-            CollapsibleAssistantTranscriptContent(text: item.text)
+            CollapsibleAssistantTranscriptContent(
+                text: item.text,
+                bareURLLinkificationPolicy: .httpHTTPSOnly
+            )
         } else {
             MarkdownTextView(
                 text: item.text,
                 isMarkdown: true,
                 allowInteraction: true,
+                bareURLLinkificationPolicy: .httpHTTPSOnly,
+                suppressBareLinksTouchingEndBoundary: item.isStreaming,
                 renderCadence: item.isStreaming ? .streamingCoalesced : .immediate
             )
         }
@@ -885,7 +893,8 @@ struct AgentMessageBubble: View {
                 text: item.text,
                 isMarkdown: true,
                 allowInteraction: true,
-                forceTextColor: .secondary.opacity(0.85)
+                forceTextColor: .secondary.opacity(0.85),
+                bareURLLinkificationPolicy: .httpHTTPSOnly
             )
             .padding(.vertical, 6)
             .padding(.leading, 10)
@@ -1431,6 +1440,7 @@ enum AgentAssistantLineDerivation {
 
 private struct CollapsibleAssistantTranscriptContent: View {
     let text: String
+    var bareURLLinkificationPolicy: BareURLLinkificationPolicy = .disabled
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -1438,6 +1448,12 @@ private struct CollapsibleAssistantTranscriptContent: View {
 
     @State private var isExpanded = false
     private let previewLineCount = 10
+
+    private var collapsedPreviewMaxHeight: CGFloat {
+        let font = fontPreset.nsFont
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        return max(lineHeight, 1) * CGFloat(previewLineCount)
+    }
 
     private var lineSummary: AgentAssistantLineDerivation.PreviewSummary {
         #if DEBUG
@@ -1468,13 +1484,28 @@ private struct CollapsibleAssistantTranscriptContent: View {
         let summary = lineSummary
         VStack(alignment: .leading, spacing: 6) {
             if isExpanded || !summary.needsCollapse {
-                MarkdownTextView(text: text, isMarkdown: true, allowInteraction: true)
+                MarkdownTextView(
+                    text: text,
+                    isMarkdown: true,
+                    allowInteraction: true,
+                    bareURLLinkificationPolicy: bareURLLinkificationPolicy
+                )
+            } else if bareURLLinkificationPolicy.isEnabled, BareURLLinkifier.containsHTTPHTTPSURLSignal(in: summary.previewText) {
+                MarkdownTextView(
+                    text: summary.previewText,
+                    isMarkdown: true,
+                    allowInteraction: true,
+                    bareURLLinkificationPolicy: bareURLLinkificationPolicy,
+                    suppressBareLinksTouchingEndBoundary: true
+                )
+                .frame(maxHeight: collapsedPreviewMaxHeight, alignment: .top)
+                .clipped()
             } else {
                 Text(summary.previewText)
                     .font(fontPreset.standardFont)
                     .foregroundColor(.primary)
-                    .textSelection(.enabled)
                     .lineLimit(previewLineCount)
+                    .textSelection(.enabled)
             }
 
             if summary.needsCollapse {

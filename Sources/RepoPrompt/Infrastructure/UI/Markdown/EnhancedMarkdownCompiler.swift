@@ -23,6 +23,8 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     var forceTextColor: Color?
     var fontSize: CGFloat = 16.0
     var useMonospaced: Bool = false
+    var bareURLLinkificationPolicy: BareURLLinkificationPolicy = .disabled
+    var suppressBareLinksTouchingEndBoundary = false
 
     private static let maxTextTableRowsForInlineLayout = 300
     private static let maxTextTableCharactersForInlineLayout = 50000
@@ -33,6 +35,9 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
 
     mutating func attributedString(from markup: Markdown.Markup) -> NSAttributedString {
         let result = visit(markup).mutableCopy() as! NSMutableAttributedString
+        if suppressBareLinksTouchingEndBoundary {
+            removeBareLinksTouchingEndBoundary(from: result)
+        }
         guard useMonospaced else {
             return result
         }
@@ -57,6 +62,21 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         return result
     }
 
+    private func removeBareLinksTouchingEndBoundary(from result: NSMutableAttributedString) {
+        guard result.length > 0 else { return }
+
+        var range = NSRange(location: 0, length: 0)
+        guard result.attribute(.repoPromptBareURLLink, at: result.length - 1, effectiveRange: &range) != nil else {
+            return
+        }
+
+        let normalTextColor = NSColor(forceTextColor ?? Color.primary)
+        result.removeAttribute(.link, range: range)
+        result.removeAttribute(.underlineStyle, range: range)
+        result.removeAttribute(.repoPromptBareURLLink, range: range)
+        result.addAttribute(.foregroundColor, value: normalTextColor, range: range)
+    }
+
     private func attributes(
         font: NSFont? = nil,
         paragraphStyle: NSParagraphStyle? = nil,
@@ -78,7 +98,11 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
     }
 
     mutating func visitText(_ text: Markdown.Text) -> NSAttributedString {
-        NSAttributedString(string: text.plainText, attributes: attributes())
+        BareURLLinkifier.attributedString(
+            text: text.plainText,
+            attributes: attributes(),
+            policy: bareURLLinkificationPolicy
+        )
     }
 
     mutating func visitParagraph(_ paragraph: Markdown.Paragraph) -> NSAttributedString {
@@ -233,17 +257,16 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         }
 
         let fullRange = NSRange(location: 0, length: result.length)
+        result.removeAttribute(.repoPromptBareURLLink, range: fullRange)
         result.addAttribute(.markdownRawLink, value: destination, range: fullRange)
         if let url = URL(string: destination),
            let scheme = url.scheme?.lowercased(),
            ["http", "https", "mailto"].contains(scheme)
         {
-            result.addAttribute(.link, value: url, range: fullRange)
+            result.addRepoPromptLink(url, range: fullRange)
         } else {
-            result.addAttribute(.link, value: destination, range: fullRange)
+            result.addRepoPromptLink(destination, range: fullRange)
         }
-        result.addAttribute(.foregroundColor, value: NSColor.linkColor, range: fullRange)
-        result.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: fullRange)
         return result
     }
 
@@ -276,13 +299,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
             // Use a dynamic system color so quoted text stays readable in both
             // light and dark appearances (NSColor.gray is a fixed mid-gray and
             // becomes hard to read on dark backgrounds).
-            childString.enumerateAttribute(.link, in: NSRange(location: 0, length: childString.length)) { value, range, _ in
-                if value == nil { // Not a link
-                    childString.addAttribute(.foregroundColor, value: NSColor.secondaryLabelColor, range: range)
-                } else { // Is a link, ensure linkColor
-                    childString.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
-                }
-            }
+            childString.applyForegroundColor(.secondaryLabelColor, preservingLinkRanges: true)
             result.append(childString)
         }
 
@@ -516,8 +533,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         if let source = image.source, let url = URL(string: source) {
             text += " (\(url.host ?? source))"
             let result = NSMutableAttributedString(string: text, attributes: attributes())
-            result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
-            result.addAttribute(.foregroundColor, value: NSColor.linkColor, range: NSRange(location: 0, length: result.length))
+            result.addRepoPromptLink(url, range: NSRange(location: 0, length: result.length))
             return result
         }
         return NSAttributedString(string: text, attributes: attributes())
@@ -880,8 +896,7 @@ struct EnhancedMarkdownCompiler: Markdown.MarkupVisitor {
         let text = symbolLink.destination ?? "SymbolLink"
         let result = NSMutableAttributedString(string: text, attributes: attributes())
         if let dest = symbolLink.destination, let url = URL(string: dest) { // Assuming destination can be a URL
-            result.addAttribute(.link, value: url, range: NSRange(location: 0, length: result.length))
-            result.addAttribute(.foregroundColor, value: NSColor.linkColor, range: NSRange(location: 0, length: result.length))
+            result.addRepoPromptLink(url, range: NSRange(location: 0, length: result.length))
         }
         return result
     }
