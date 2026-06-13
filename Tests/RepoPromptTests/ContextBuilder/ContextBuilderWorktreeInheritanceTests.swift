@@ -132,6 +132,13 @@ import XCTest
 
                     let runs = state.runs
                     XCTAssertEqual(runs.count, 2)
+                    XCTAssertEqual(runs[0].selectionBeforeRead, .empty)
+                    XCTAssertEqual(runs[0].selectionAfterRead, .empty)
+                    XCTAssertEqual(
+                        runs[1].selectionBeforeRead,
+                        .init(fullPaths: [logicalFile.path], slicePaths: [])
+                    )
+                    XCTAssertEqual(runs[1].selectionAfterRead, runs[1].selectionBeforeRead)
                     let logicalRelativeFilePath = String(
                         logicalFile.standardizedFileURL.path.dropFirst(logicalRoot.standardizedFileURL.path.count)
                     ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -545,6 +552,16 @@ import XCTest
             )
             self.endpoint = endpoint
 
+            let selectionBeforeRead = try await selectionObservation(endpoint.callTool(
+                name: MCPWindowToolName.manageSelection,
+                arguments: [
+                    "op": "get",
+                    "view": "files",
+                    "path_display": "full",
+                    "_rawJSON": true
+                ],
+                timeoutSeconds: 20
+            ))
             let tree = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.getFileTree,
                 arguments: [:],
@@ -553,6 +570,16 @@ import XCTest
             let read = try await toolResultText(endpoint.callTool(
                 name: MCPWindowToolName.readFile,
                 arguments: ["path": logicalFilePath],
+                timeoutSeconds: 20
+            ))
+            let selectionAfterRead = try await selectionObservation(endpoint.callTool(
+                name: MCPWindowToolName.manageSelection,
+                arguments: [
+                    "op": "get",
+                    "view": "files",
+                    "path_display": "full",
+                    "_rawJSON": true
+                ],
                 timeoutSeconds: 20
             ))
             let search = try await toolResultText(endpoint.callTool(
@@ -590,8 +617,10 @@ import XCTest
             await state.recordRun(ContextBuilderWorktreeProbeState.Run(
                 workspacePath: workspacePath,
                 userMessage: message.userMessage,
+                selectionBeforeRead: selectionBeforeRead,
                 tree: tree,
                 read: read,
+                selectionAfterRead: selectionAfterRead,
                 search: search,
                 codeStructure: codeStructure,
                 selection: selection,
@@ -623,6 +652,21 @@ import XCTest
             activeRunID = nil
         }
 
+        private func selectionObservation(
+            _ response: PersistentMCPTestRPCResponse
+        ) throws -> ContextBuilderWorktreeProbeState.SelectionObservation {
+            let text = try toolResultText(response)
+            let data = try XCTUnwrap(text.data(using: .utf8))
+            let reply = try JSONDecoder().decode(ToolResultDTOs.SelectionReply.self, from: data)
+            return ContextBuilderWorktreeProbeState.SelectionObservation(
+                fullPaths: (reply.files ?? [])
+                    .filter { $0.renderMode == "full" }
+                    .map(\.path)
+                    .sorted(),
+                slicePaths: (reply.fileSlices ?? []).map(\.path).sorted()
+            )
+        }
+
         private func toolResultText(
             _ response: PersistentMCPTestRPCResponse
         ) throws -> String {
@@ -636,11 +680,20 @@ import XCTest
 
     @MainActor
     private final class ContextBuilderWorktreeProbeState {
+        struct SelectionObservation: Equatable {
+            let fullPaths: [String]
+            let slicePaths: [String]
+
+            static let empty = SelectionObservation(fullPaths: [], slicePaths: [])
+        }
+
         struct Run {
             let workspacePath: String?
             let userMessage: String
+            let selectionBeforeRead: SelectionObservation
             let tree: String
             let read: String
+            let selectionAfterRead: SelectionObservation
             let search: String
             let codeStructure: String
             let selection: String
