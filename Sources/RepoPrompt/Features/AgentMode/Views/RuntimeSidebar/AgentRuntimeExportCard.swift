@@ -310,8 +310,14 @@ struct AgentExportCard: View {
     @MainActor
     private func persistSelection(_ selection: StoredSelection, source: AgentContextExportSource) async {
         guard let selectionCoordinator else { return }
-        if let tabID = source.tabID {
-            _ = await selectionCoordinator.persistSelection(selection, for: tabID, source: .runtimeMutation)
+        if let tabID = source.tabID,
+           let workspaceID = selectionCoordinator.activeSelectionIdentity()?.workspaceID
+        {
+            _ = await selectionCoordinator.persistSelection(
+                selection,
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+                source: .runtimeMutation
+            )
         }
     }
 

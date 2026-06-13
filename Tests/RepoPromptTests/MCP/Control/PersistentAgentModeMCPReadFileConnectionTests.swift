@@ -257,6 +257,9 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
 
             let baseline = await fixture.retainedConnectionSnapshot()
             Self.assertStableAgentModeSnapshot(baseline, fixture: fixture)
+            if scenario == .agentOwnedNoRangeNonEmptyWorktreeFile {
+                try await fixture.installPeerWindowLookupSnapshot()
+            }
 
             if scenario.requiresSerialReadPrelude {
                 var firstFormattedRead: String?
@@ -337,8 +340,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             assertCanonicalSelection(
                 fixture: fixture,
                 selectedPaths: [fixture.liveFileURL.path],
-                slices: [:],
-                expectHeaderMirror: false
+                slices: [:]
             )
 
             try await clearSelection(fixture: fixture, id: 8)
@@ -361,15 +363,21 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 method: "tools/call",
                 params: [
                     "name": MCPWindowToolName.manageSelection,
-                    "arguments": ["op": "get", "view": "files"]
+                    "arguments": [
+                        "op": "get",
+                        "view": "files",
+                        "_rawJSON": true
+                    ]
                 ]
             )
-            try Self.assertSuccessfulResponse(rangedGet, id: 10)
+            let rangedSelectionText = try Self.readFileText(from: rangedGet, id: 10)
+            XCTAssertTrue(rangedSelectionText.contains("\"full_count\":0"), rangedSelectionText)
+            XCTAssertTrue(rangedSelectionText.contains("\"slice_count\":1"), rangedSelectionText)
+            XCTAssertTrue(rangedSelectionText.contains("\"render_mode\":\"slice\""), rangedSelectionText)
             assertCanonicalSelection(
                 fixture: fixture,
                 selectedPaths: [fixture.liveFileURL.path],
-                slices: [fixture.liveFileURL.path: [LineRange(start: 2, end: 3)]],
-                expectHeaderMirror: false
+                slices: [fixture.liveFileURL.path: [LineRange(start: 2, end: 3)]]
             )
 
             try await clearSelection(fixture: fixture, id: 11)
@@ -460,27 +468,99 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 assertCanonicalSelection(
                     fixture: fixture,
                     selectedPaths: [fixture.liveFileURL.path],
-                    slices: [:],
-                    expectHeaderMirror: false
+                    slices: [:]
                 )
 
-                let committed = await fixture.window.mcpServer.commitAndClearTabContext(
-                    connectionID: handover.connectionID,
-                    expectedRunID: Fixture.runID
+                let addWorktreeOnly = try await handover.socketClient.request(
+                    id: 4,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.manageSelection,
+                        "arguments": [
+                            "op": "add",
+                            "paths": [Fixture.worktreeOnlyRelativePath],
+                            "view": "files"
+                        ]
+                    ]
                 )
-                XCTAssertTrue(committed)
+                try Self.assertSuccessfulResponse(addWorktreeOnly, id: 4)
+                try await Task.sleep(for: .milliseconds(250))
+                let expectedPeerSelection = StoredSelection(
+                    selectedPaths: [fixture.liveFileURL.path, fixture.worktreeOnlyLogicalURL.path]
+                )
+                XCTAssertEqual(
+                    Set(fixture.window.workspaceManager.composeTab(
+                        for: WorkspaceSelectionIdentity(
+                            workspaceID: fixture.workspaceID,
+                            tabID: Fixture.tabID
+                        )
+                    )?.selection.selectedPaths ?? []),
+                    Set(expectedPeerSelection.selectedPaths)
+                )
+                fixture.assertPeerIsolationAndLifecycle(expectedSelection: expectedPeerSelection)
+
+                // Match the completed child lifecycle: terminal cleanup drops run affinity,
+                // then the provider-owned connection tears down without a Context Builder commit.
+                await fixture.networkManager.cleanupRunRoutingState(
+                    for: Fixture.runID,
+                    windowID: fixture.windowID
+                )
+                await handover.cleanup()
                 XCTAssertNil(fixture.window.mcpServer.tabContextByConnectionID[handover.connectionID])
                 XCTAssertTrue(
                     fixture.window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
                         connectionID: handover.connectionID
                     ).isEmpty
                 )
-                assertCanonicalSelection(
-                    fixture: fixture,
-                    selectedPaths: [fixture.liveFileURL.path],
-                    slices: [:],
-                    expectHeaderMirror: false
+                let completedSelection = StoredSelection(
+                    selectedPaths: [fixture.liveFileURL.path, fixture.worktreeOnlyLogicalURL.path]
                 )
+                XCTAssertEqual(
+                    Set(fixture.window.workspaceManager.composeTab(
+                        for: WorkspaceSelectionIdentity(
+                            workspaceID: fixture.workspaceID,
+                            tabID: Fixture.tabID
+                        )
+                    )?.selection.selectedPaths ?? []),
+                    Set(completedSelection.selectedPaths)
+                )
+                fixture.assertPeerIsolationAndLifecycle(expectedSelection: completedSelection)
+
+                let independent = try await fixture.makeIndependentPeerConnection()
+                do {
+                    let independentGet = try await independent.socketClient.request(
+                        id: 4,
+                        method: "tools/call",
+                        params: [
+                            "name": MCPWindowToolName.manageSelection,
+                            "arguments": [
+                                "op": "get",
+                                "view": "files",
+                                "path_display": "full",
+                                "_rawJSON": true
+                            ]
+                        ]
+                    )
+                    let independentSelectionText = try Self.readFileText(from: independentGet, id: 4)
+                    XCTAssertTrue(
+                        independentSelectionText.contains(fixture.liveFileURL.path),
+                        independentSelectionText
+                    )
+                    XCTAssertTrue(
+                        independentSelectionText.contains(fixture.worktreeOnlyLogicalURL.path),
+                        independentSelectionText
+                    )
+                    XCTAssertTrue(
+                        independentSelectionText.contains("\"full_count\":1"),
+                        independentSelectionText
+                    )
+                    let totalTokens = try Self.totalTokens(fromSelectionText: independentSelectionText)
+                    XCTAssertGreaterThan(totalTokens, 0, independentSelectionText)
+                } catch {
+                    await independent.cleanup()
+                    throw error
+                }
+                await independent.cleanup()
             } catch {
                 await handover.cleanup()
                 throw error
@@ -1131,6 +1211,14 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             return content.compactMap { $0["text"] as? String }.joined()
         }
 
+        static func totalTokens(fromSelectionText text: String) throws -> Int {
+            let regex = try NSRegularExpression(pattern: #"\"total_tokens\"\s*:\s*(\d+)"#)
+            let range = NSRange(text.startIndex ..< text.endIndex, in: text)
+            let match = try XCTUnwrap(regex.firstMatch(in: text, range: range))
+            let valueRange = try XCTUnwrap(Range(match.range(at: 1), in: text))
+            return try XCTUnwrap(Int(text[valueRange]))
+        }
+
         static func responseObject(from rawJSON: String, id: Int) throws -> [String: Any] {
             let data = try XCTUnwrap(rawJSON.data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -1179,6 +1267,35 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
     }
 
     @MainActor
+    private final class IndependentConnection {
+        let connectionID: UUID
+        let socketClient: SocketPairJSONRPCClient
+        let manager: BootstrapSocketConnectionManager
+        let networkManager: ServerNetworkManager
+        private var cleanedUp = false
+
+        init(
+            connectionID: UUID,
+            socketClient: SocketPairJSONRPCClient,
+            manager: BootstrapSocketConnectionManager,
+            networkManager: ServerNetworkManager
+        ) {
+            self.connectionID = connectionID
+            self.socketClient = socketClient
+            self.manager = manager
+            self.networkManager = networkManager
+        }
+
+        func cleanup() async {
+            guard !cleanedUp else { return }
+            cleanedUp = true
+            socketClient.close()
+            await manager.stop()
+            await networkManager.debugRemoveConnection(connectionID)
+        }
+    }
+
+    @MainActor
     private final class Fixture {
         static let runID = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
         static let tabID = UUID(uuidString: "22222222-2222-4222-8222-222222222222")!
@@ -1186,6 +1303,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         static let gateID = UUID(uuidString: "33333333-3333-4333-8333-333333333333")!
         static let connectionID = UUID(uuidString: "44444444-4444-4444-8444-444444444444")!
         static let handoverConnectionID = UUID(uuidString: "44444444-4444-4444-8444-555555555555")!
+        static let independentConnectionID = UUID(uuidString: "44444444-4444-4444-8444-666666666666")!
+        static let peerUnrelatedWorkspaceID = UUID(uuidString: "88888888-8888-4888-8888-888888888888")!
         static let parentRunID = UUID(uuidString: "55555555-5555-4555-8555-555555555555")!
         static let parentConnectionID = UUID(uuidString: "66666666-6666-4666-8666-666666666666")!
         static let agentSessionID = UUID(uuidString: "77777777-7777-4777-8777-777777777777")!
@@ -1197,6 +1316,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         let persistentAgentModeLineFour = 4
         """
         static let liveRelativePath = "Tests/RepoPromptTests/MCP/GeneratedOracleExportFileWriterTests.swift"
+        static let worktreeOnlyRelativePath = "Tests/RepoPromptTests/MCP/WorktreeOnlySelection.swift"
         static func liveContents() throws -> (logical: String, worktree: String) {
             let targetURL = URL(fileURLWithPath: #filePath)
                 .deletingLastPathComponent()
@@ -1229,6 +1349,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         private var worktreeRootID: UUID?
         private var auxiliaryRootURL: URL?
         private var auxiliaryRootID: UUID?
+        private var peerRootID: UUID?
+        private var peerTargetStateVersionBeforeSelection: Int?
+        private var peerUnrelatedStateVersionBeforeSelection: Int?
+        private var peerCatalogService: MCPWindowToolCatalogService?
+        private var ownedRoutingService: WindowRoutingService?
         private var cleanedUp = false
 
         private init(
@@ -1520,6 +1645,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             self.worktreeRootURL = worktreeRootURL
             let worktreeFileURL = worktreeRootURL.appendingPathComponent("Sources/PersistentAgentModeFixture.swift")
             let worktreeLiveFileURL = worktreeRootURL.appendingPathComponent(Self.liveRelativePath)
+            let worktreeOnlyFileURL = worktreeRootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
             try FileManager.default.createDirectory(
                 at: worktreeFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
@@ -1528,9 +1654,18 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 at: worktreeLiveFileURL.deletingLastPathComponent(),
                 withIntermediateDirectories: true
             )
+            try FileManager.default.createDirectory(
+                at: worktreeOnlyFileURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
             let liveContents = try Self.liveContents()
             try Self.sentinelContent.write(to: worktreeFileURL, atomically: true, encoding: .utf8)
             try liveContents.worktree.write(to: worktreeLiveFileURL, atomically: true, encoding: .utf8)
+            try "let worktreeOnlySelection = true\n".write(
+                to: worktreeOnlyFileURL,
+                atomically: true,
+                encoding: .utf8
+            )
             let worktreeRoot = try await window.workspaceFileContextStore.loadRoot(
                 path: worktreeRootURL.path,
                 kind: .sessionWorktree
@@ -1553,6 +1688,226 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
                 guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return [] }
                 return [binding]
+            }
+        }
+
+        func installPeerWindowLookupSnapshot() async throws {
+            var peerWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            peerWorkspace.activeComposeTabID = Self.tabID
+            let unrelatedSelection = StoredSelection(selectedPaths: ["/tmp/unrelated-workspace.swift"])
+            let unrelatedWorkspace = WorkspaceModel(
+                id: Self.peerUnrelatedWorkspaceID,
+                name: "Unrelated Duplicate Tab Workspace",
+                repoPaths: [],
+                ephemeralFlag: true,
+                composeTabs: [
+                    ComposeTabState(
+                        id: Self.tabID,
+                        name: "Unrelated Duplicate Tab",
+                        selection: unrelatedSelection
+                    )
+                ],
+                activeComposeTabID: Self.tabID
+            )
+            routingGuardWindow.workspaceManager.workspaces.append(unrelatedWorkspace)
+            routingGuardWindow.workspaceManager.workspaces.append(peerWorkspace)
+            await routingGuardWindow.workspaceManager.switchWorkspace(
+                to: peerWorkspace,
+                saveState: false,
+                reason: "persistentAgentModeMCPPeerSelectionTest"
+            )
+            routingGuardWindow.promptManager.loadComposeTabsFromWorkspace(
+                peerWorkspace,
+                syncPromptText: true
+            )
+            let unrelatedIdentity = WorkspaceSelectionIdentity(
+                workspaceID: Self.peerUnrelatedWorkspaceID,
+                tabID: Self.tabID
+            )
+            var unrelatedTab = try XCTUnwrap(
+                routingGuardWindow.workspaceManager.composeTab(for: unrelatedIdentity)
+            )
+            unrelatedTab.selection = unrelatedSelection
+            XCTAssertTrue(
+                routingGuardWindow.workspaceManager.updateComposeTabStoredOnly(
+                    unrelatedTab,
+                    inWorkspaceID: Self.peerUnrelatedWorkspaceID
+                )
+            )
+
+            let root = try await routingGuardWindow.workspaceFileContextStore.loadRoot(path: rootURL.path)
+            peerRootID = root.id
+            peerTargetStateVersionBeforeSelection = routingGuardWindow.workspaceManager
+                .debugStateVersionForWorkspace(workspaceID)
+            peerUnrelatedStateVersionBeforeSelection = routingGuardWindow.workspaceManager
+                .debugStateVersionForWorkspace(Self.peerUnrelatedWorkspaceID)
+
+            let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+            XCTAssertNotNil(window.workspaceManager.composeTab(for: targetIdentity))
+            XCTAssertNotNil(routingGuardWindow.workspaceManager.composeTab(for: targetIdentity))
+            XCTAssertEqual(
+                routingGuardWindow.workspaceManager.composeTab(for: unrelatedIdentity)?.selection,
+                unrelatedSelection
+            )
+            XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.id, workspaceID)
+            XCTAssertEqual(routingGuardWindow.workspaceManager.activeWorkspace?.activeComposeTabID, Self.tabID)
+        }
+
+        func makeIndependentPeerConnection() async throws -> IndependentConnection {
+            let routingService = WindowRoutingService(windowStates: .shared, networkMgr: networkManager)
+            ownedRoutingService = routingService
+            for _ in 0 ..< 100 {
+                let registered = ServiceRegistry.services.contains {
+                    $0 as AnyObject === routingService as AnyObject
+                }
+                let names = await routingService.tools.map(\.name)
+                if registered, names.contains(MCPGlobalToolName.bindContext) { break }
+                try await Task.sleep(for: .milliseconds(10))
+            }
+            if peerCatalogService == nil {
+                let service = routingGuardWindow.mcpServer.windowMCPToolCatalogService
+                peerCatalogService = service
+                ServiceRegistry.register(service)
+            }
+            var socketFDs = [Int32](repeating: -1, count: 2)
+            guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
+                throw SocketPairJSONRPCClient.ClientError.posix(operation: "socketpair", code: errno)
+            }
+            var noSigPipe: Int32 = 1
+            guard Darwin.setsockopt(
+                socketFDs[0],
+                SOL_SOCKET,
+                SO_NOSIGPIPE,
+                &noSigPipe,
+                socklen_t(MemoryLayout.size(ofValue: noSigPipe))
+            ) == 0 else {
+                let code = errno
+                Darwin.close(socketFDs[0])
+                Darwin.close(socketFDs[1])
+                throw SocketPairJSONRPCClient.ClientError.posix(operation: "setsockopt(SO_NOSIGPIPE)", code: code)
+            }
+
+            let socketClient = SocketPairJSONRPCClient(fd: socketFDs[0])
+            let manager: BootstrapSocketConnectionManager
+            do {
+                manager = try BootstrapSocketConnectionManager(
+                    connectionID: Self.independentConnectionID,
+                    sessionToken: Self.sessionToken + "-independent",
+                    clientPid: Int(getpid()),
+                    clientName: "RepoPrompt Independent Selection Test",
+                    purpose: .unknown,
+                    codeMapsDisabled: false,
+                    connectedFD: socketFDs[1],
+                    parentManager: networkManager
+                )
+            } catch {
+                socketClient.close()
+                Darwin.close(socketFDs[1])
+                throw error
+            }
+            await networkManager.debugRegisterConnectionForSocketFixture(
+                connectionID: Self.independentConnectionID,
+                connection: manager,
+                clientName: "RepoPrompt Independent Selection Test",
+                sessionToken: Self.sessionToken + "-independent"
+            )
+            let startTask = Task {
+                try await manager.start { _ in true }
+            }
+            do {
+                let initialize = try await socketClient.request(
+                    id: 1,
+                    method: "initialize",
+                    params: [
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": [:],
+                        "clientInfo": [
+                            "name": "RepoPrompt Independent Selection Test",
+                            "version": "post-completion-selection-lookup"
+                        ]
+                    ]
+                )
+                try PersistentAgentModeMCPReadFileConnectionTests.assertSuccessfulResponse(initialize, id: 1)
+                try await startTask.value
+                try socketClient.sendNotification(method: "notifications/initialized", params: [:])
+                let tools = try await socketClient.request(id: 2, method: "tools/list", params: [:])
+                let toolNames = try PersistentAgentModeMCPReadFileConnectionTests.toolNames(from: tools)
+                XCTAssertTrue(toolNames.contains(MCPGlobalToolName.bindContext))
+                let bind = try await socketClient.request(
+                    id: 3,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPGlobalToolName.bindContext,
+                        "arguments": [
+                            "op": "bind",
+                            "window_id": routingGuardWindow.windowID
+                        ]
+                    ]
+                )
+                try PersistentAgentModeMCPReadFileConnectionTests.assertSuccessfulResponse(bind, id: 3)
+                return IndependentConnection(
+                    connectionID: Self.independentConnectionID,
+                    socketClient: socketClient,
+                    manager: manager,
+                    networkManager: networkManager
+                )
+            } catch {
+                startTask.cancel()
+                socketClient.close()
+                await manager.stop()
+                await networkManager.debugRemoveConnection(Self.independentConnectionID)
+                _ = try? await startTask.value
+                throw error
+            }
+        }
+
+        var worktreeOnlyLogicalURL: URL {
+            rootURL.appendingPathComponent(Self.worktreeOnlyRelativePath)
+        }
+
+        func peerCanonicalSelection() -> StoredSelection? {
+            routingGuardWindow.workspaceManager.composeTab(
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+            )?.selection
+        }
+
+        func peerUnrelatedSelection() -> StoredSelection? {
+            routingGuardWindow.workspaceManager.composeTab(
+                for: WorkspaceSelectionIdentity(
+                    workspaceID: Self.peerUnrelatedWorkspaceID,
+                    tabID: Self.tabID
+                )
+            )?.selection
+        }
+
+        func assertPeerIsolationAndLifecycle(expectedSelection: StoredSelection) {
+            XCTAssertEqual(peerCanonicalSelection(), expectedSelection)
+            XCTAssertEqual(
+                peerUnrelatedSelection(),
+                StoredSelection(selectedPaths: ["/tmp/unrelated-workspace.swift"])
+            )
+            let peerUIPaths = Set(
+                routingGuardWindow.workspaceManager.fileManager.snapshotSelection().selectedPaths
+            )
+            XCTAssertTrue(peerUIPaths.isEmpty)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: worktreeOnlyLogicalURL.path))
+            XCTAssertNotNil(WindowStatesManager.shared.window(withID: routingGuardWindow.windowID))
+            XCTAssertNotNil(
+                routingGuardWindow.workspaceManager.composeTab(
+                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: Self.tabID)
+                )
+            )
+            if let peerTargetStateVersionBeforeSelection {
+                XCTAssertGreaterThan(
+                    routingGuardWindow.workspaceManager.debugStateVersionForWorkspace(workspaceID),
+                    peerTargetStateVersionBeforeSelection
+                )
+            }
+            if let peerUnrelatedStateVersionBeforeSelection {
+                XCTAssertEqual(
+                    routingGuardWindow.workspaceManager.debugStateVersionForWorkspace(Self.peerUnrelatedWorkspaceID),
+                    peerUnrelatedStateVersionBeforeSelection
+                )
             }
         }
 
@@ -1765,7 +2120,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 runID: Self.runID
             )
             ServiceRegistry.unregister(catalogService)
+            if let peerCatalogService {
+                ServiceRegistry.unregister(peerCatalogService)
+            }
+            if let ownedRoutingService {
+                ServiceRegistry.unregister(ownedRoutingService)
+            }
             await window.workspaceFileContextStore.unloadRoot(id: rootID)
+            if let peerRootID {
+                await routingGuardWindow.workspaceFileContextStore.unloadRoot(id: peerRootID)
+            }
             if let worktreeRootID {
                 await window.workspaceFileContextStore.unloadRoot(id: worktreeRootID)
             }

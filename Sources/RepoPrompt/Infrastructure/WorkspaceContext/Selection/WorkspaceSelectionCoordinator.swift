@@ -1,11 +1,42 @@
 import Combine
 import Foundation
 
-private struct WorkspaceSelectionMirrorTarget: Equatable {
+struct WorkspaceSelectionIdentity: Hashable {
     let workspaceID: UUID
     let tabID: UUID
+}
+
+struct MCPSelectionPropagationRegistration: Equatable {
+    let sourceRevision: UInt64
+    let peerHostIDs: Set<UUID>
+}
+
+struct MCPSelectionPeerPropagation: Equatable {
+    let identity: WorkspaceSelectionIdentity
+    let selection: StoredSelection
+    let sourceRevision: UInt64
+    let peerHostIDs: Set<UUID>
+    let mirrorToUIIfActive: Bool
+}
+
+/// Identifies the exact peer manager generation allowed to receive one propagation.
+/// The host revalidates registration and closing state at each commit/apply boundary.
+struct MCPSelectionPeerMutationFence: Equatable {
+    let hostID: UUID
+}
+
+private struct WorkspaceSelectionMirrorTarget: Equatable {
+    let identity: WorkspaceSelectionIdentity
     let selection: StoredSelection
     let contextRevision: UInt64
+
+    var workspaceID: UUID {
+        identity.workspaceID
+    }
+
+    var tabID: UUID {
+        identity.tabID
+    }
 }
 
 @MainActor
@@ -14,9 +45,17 @@ protocol WorkspaceSelectionHost: AnyObject {
     var selectionMirrorContextRevision: UInt64 { get }
     var liveUISelectionRevision: UInt64 { get }
     func composeTab(with id: UUID) -> ComposeTabState?
+    func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState?
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool)
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState)
-    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID)
+    @discardableResult
+    func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, for identity: WorkspaceSelectionIdentity)
+    func registerMCPSelectionSourceMutation(
+        for identity: WorkspaceSelectionIdentity
+    ) -> MCPSelectionPropagationRegistration
+    func acceptMCPPeerSelectionRevision(_ revision: UInt64, for identity: WorkspaceSelectionIdentity) -> Bool
+    func canCommitMCPSelectionPeerMutation(_ fence: MCPSelectionPeerMutationFence) -> Bool
+    func propagateMCPSelectionToPeerHosts(_ propagation: MCPSelectionPeerPropagation) async
     func applySelectionMirrorAttempt(
         _ selection: StoredSelection,
         forTabID tabID: UUID,
@@ -29,7 +68,23 @@ extension WorkspaceSelectionHost {
         0
     }
 
-    func updateComposeTabSelectionPresentation(_: StoredSelection, forTabID _: UUID) {}
+    func updateComposeTabSelectionPresentation(_: StoredSelection, for _: WorkspaceSelectionIdentity) {}
+
+    func registerMCPSelectionSourceMutation(
+        for _: WorkspaceSelectionIdentity
+    ) -> MCPSelectionPropagationRegistration {
+        MCPSelectionPropagationRegistration(sourceRevision: 0, peerHostIDs: [])
+    }
+
+    func acceptMCPPeerSelectionRevision(_: UInt64, for _: WorkspaceSelectionIdentity) -> Bool {
+        true
+    }
+
+    func canCommitMCPSelectionPeerMutation(_: MCPSelectionPeerMutationFence) -> Bool {
+        false
+    }
+
+    func propagateMCPSelectionToPeerHosts(_: MCPSelectionPeerPropagation) async {}
 }
 
 private extension WorkspaceSelectionHost {
@@ -39,8 +94,7 @@ private extension WorkspaceSelectionHost {
               let tab = workspace.composeTabs.first(where: { $0.id == tabID })
         else { return nil }
         return WorkspaceSelectionMirrorTarget(
-            workspaceID: workspace.id,
-            tabID: tabID,
+            identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID),
             selection: tab.selection,
             contextRevision: selectionMirrorContextRevision
         )
@@ -70,7 +124,12 @@ final class WorkspaceSelectionCoordinator {
         case runtimeMutation
         case virtual
         case mcpTabContext
+        case mcpPeerContext
         case mirror
+
+        var isMCPSelectionSource: Bool {
+            self == .mcpTabContext || self == .mcpPeerContext
+        }
     }
 
     private weak var workspaceManager: (any WorkspaceSelectionHost)?
@@ -91,8 +150,8 @@ final class WorkspaceSelectionCoordinator {
     }
 
     private var nextSelectionRevision: UInt64 = 0
-    private var selectionRevisionByTabID: [UUID: UInt64] = [:]
-    private var deferredUISelectionFenceByTabID: [UUID: DeferredUISelectionFence] = [:]
+    private var selectionRevisionByIdentity: [WorkspaceSelectionIdentity: UInt64] = [:]
+    private var deferredUISelectionFenceByIdentity: [WorkspaceSelectionIdentity: DeferredUISelectionFence] = [:]
     private var nextSelectionMirrorTaskID: UInt64 = 0
     private var mcpSelectionMirrorTail: MCPSelectionMirrorTail?
 
@@ -118,22 +177,27 @@ final class WorkspaceSelectionCoordinator {
         self.workspaceManager = workspaceManager
     }
 
+    func activeSelectionIdentity() -> WorkspaceSelectionIdentity? {
+        guard let workspace = workspaceManager?.activeWorkspace,
+              let tabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
+        else { return nil }
+        return WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tabID)
+    }
+
     func activeTabID() -> UUID? {
-        guard let workspaceManager else { return nil }
-        return workspaceManager.activeWorkspace?.activeComposeTabID
-            ?? workspaceManager.activeWorkspace?.composeTabs.first?.id
+        activeSelectionIdentity()?.tabID
     }
 
     func activeSelectionSnapshot(flushPendingUI: Bool = true) -> Snapshot {
         if flushPendingUI {
             flushPendingUISelectionToActiveTab()
         }
-        guard let workspaceManager, let tabID = activeTabID() else {
+        guard let workspaceManager, let identity = activeSelectionIdentity() else {
             return Snapshot(tabID: nil, selection: StoredSelection(), isVirtual: false)
         }
         return Snapshot(
-            tabID: tabID,
-            selection: workspaceManager.composeTab(with: tabID)?.selection ?? StoredSelection(),
+            tabID: identity.tabID,
+            selection: workspaceManager.composeTab(for: identity)?.selection ?? StoredSelection(),
             isVirtual: false
         )
     }
@@ -147,16 +211,18 @@ final class WorkspaceSelectionCoordinator {
     /// `liveUISelectionRevision` and is allowed to become canonical, including ABA transitions.
     func selectionForActiveUISnapshot(_ liveUISelection: StoredSelection, tabID: UUID) -> StoredSelection {
         guard let workspaceManager,
-              let fence = deferredUISelectionFenceByTabID[tabID]
+              let identity = activeSelectionIdentity(),
+              identity.tabID == tabID,
+              let fence = deferredUISelectionFenceByIdentity[identity]
         else { return liveUISelection }
 
-        guard workspaceManager.composeTab(with: tabID)?.selection == fence.selection else {
-            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+        guard workspaceManager.composeTab(for: identity)?.selection == fence.selection else {
+            deferredUISelectionFenceByIdentity.removeValue(forKey: identity)
             return liveUISelection
         }
 
         guard workspaceManager.liveUISelectionRevision == fence.liveUISelectionRevision else {
-            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+            deferredUISelectionFenceByIdentity.removeValue(forKey: identity)
             return liveUISelection
         }
 
@@ -167,32 +233,45 @@ final class WorkspaceSelectionCoordinator {
     /// This keeps tab-switch/restore work from masquerading as a newer manual UI mutation.
     func refreshDeferredUISelectionFence(forTabID tabID: UUID) {
         guard let workspaceManager,
-              let fence = deferredUISelectionFenceByTabID[tabID],
-              workspaceManager.composeTab(with: tabID)?.selection == fence.selection
+              let identity = activeSelectionIdentity(),
+              identity.tabID == tabID,
+              let fence = deferredUISelectionFenceByIdentity[identity],
+              workspaceManager.composeTab(for: identity)?.selection == fence.selection
         else { return }
-        deferredUISelectionFenceByTabID[tabID] = DeferredUISelectionFence(
+        deferredUISelectionFenceByIdentity[identity] = DeferredUISelectionFence(
             selection: fence.selection,
             liveUISelectionRevision: workspaceManager.liveUISelectionRevision
         )
     }
 
-    func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
-        if tabID == activeTabID() {
+    func selectionSnapshot(
+        for identity: WorkspaceSelectionIdentity,
+        flushPendingUIIfActive: Bool = true
+    ) -> Snapshot? {
+        if identity == activeSelectionIdentity() {
             return activeSelectionSnapshot(flushPendingUI: flushPendingUIIfActive)
         }
-        guard let selection = workspaceManager?.composeTab(with: tabID)?.selection else { return nil }
-        return Snapshot(tabID: tabID, selection: selection, isVirtual: true)
+        guard let selection = workspaceManager?.composeTab(for: identity)?.selection else { return nil }
+        return Snapshot(tabID: identity.tabID, selection: selection, isVirtual: true)
+    }
+
+    func selectionSnapshot(for tabID: UUID, flushPendingUIIfActive: Bool = true) -> Snapshot? {
+        guard let workspaceID = workspaceManager?.activeWorkspace?.id else { return nil }
+        return selectionSnapshot(
+            for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+            flushPendingUIIfActive: flushPendingUIIfActive
+        )
     }
 
     func flushPendingUISelectionToActiveTab() {
         guard !isApplyingSelectionMirror, let workspaceManager else { return }
-        let previousTabID = activeTabID()
-        let previousSelection = previousTabID.flatMap { workspaceManager.composeTab(with: $0)?.selection } ?? StoredSelection()
+        let previousIdentity = activeSelectionIdentity()
+        let previousSelection = previousIdentity.flatMap { workspaceManager.composeTab(for: $0)?.selection } ?? StoredSelection()
         workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
         let snapshot = activeSelectionSnapshot(flushPendingUI: false)
-        guard snapshot.tabID != previousTabID || snapshot.selection != previousSelection else { return }
-        if let tabID = snapshot.tabID {
-            recordSelectionRevision(for: tabID)
+        guard snapshot.tabID != previousIdentity?.tabID || snapshot.selection != previousSelection else { return }
+        if let identity = activeSelectionIdentity() {
+            recordSelectionRevision(for: identity)
         }
         changeSubject.send(Change(tabID: snapshot.tabID, selection: snapshot.selection, source: .uiFlush))
     }
@@ -203,36 +282,106 @@ final class WorkspaceSelectionCoordinator {
         source: Source = .runtimeMutation,
         mirrorToUI: Bool = true
     ) async -> StoredSelection {
-        guard let workspaceManager, let tabID = activeTabID() else { return selection }
-        if workspaceManager.composeTab(with: tabID)?.selection == selection {
-            if source == .mcpTabContext {
+        guard let identity = activeSelectionIdentity() else { return selection }
+        return await persistSelection(
+            selection,
+            for: identity,
+            source: source,
+            mirrorToUIIfActive: mirrorToUI
+        )
+    }
+
+    @discardableResult
+    func persistSelection(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        source: Source = .runtimeMutation,
+        mirrorToUIIfActive: Bool = true,
+        peerSourceRevision: UInt64? = nil,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+    ) async -> StoredSelection {
+        guard let workspaceManager,
+              let currentSelection = workspaceManager.composeTab(for: identity)?.selection
+        else { return selection }
+        if source == .mcpPeerContext {
+            guard let peerSourceRevision,
+                  let peerMutationFence,
+                  workspaceManager.canCommitMCPSelectionPeerMutation(peerMutationFence),
+                  workspaceManager.acceptMCPPeerSelectionRevision(peerSourceRevision, for: identity)
+            else { return currentSelection }
+        }
+
+        let propagationRegistration = source == .mcpTabContext
+            ? workspaceManager.registerMCPSelectionSourceMutation(for: identity)
+            : nil
+        let isActive = identity == activeSelectionIdentity()
+        let mirrorToUI = isActive && mirrorToUIIfActive
+
+        if currentSelection == selection {
+            guard canCommitPeerMutation(
+                peerMutationFence,
+                source: source,
+                workspaceManager: workspaceManager
+            ) else { return currentSelection }
+            if source.isMCPSelectionSource {
                 updateMCPSelectionPresentation(
                     selection,
-                    forTabID: tabID,
+                    for: identity,
                     mirrorToUI: mirrorToUI,
                     workspaceManager: workspaceManager
                 )
             }
-            if mirrorToUI, source == .mcpTabContext {
-                let revision = recordSelectionRevision(for: tabID)
-                await enqueueMCPSelectionMirror(selection, forTabID: tabID, revision: revision)
+            if mirrorToUI, source.isMCPSelectionSource {
+                let revision = recordSelectionRevision(for: identity)
+                await enqueueMCPSelectionMirror(
+                    selection,
+                    for: identity,
+                    revision: revision,
+                    peerMutationFence: peerMutationFence
+                )
+            }
+            if let propagationRegistration {
+                await workspaceManager.propagateMCPSelectionToPeerHosts(
+                    MCPSelectionPeerPropagation(
+                        identity: identity,
+                        selection: selection,
+                        sourceRevision: propagationRegistration.sourceRevision,
+                        peerHostIDs: propagationRegistration.peerHostIDs,
+                        mirrorToUIIfActive: mirrorToUIIfActive
+                    )
+                )
             }
             return selection
         }
 
-        guard let revision = persist(selection, for: tabID, markDirty: true) else { return selection }
-        if source == .mcpTabContext {
+        let requiredPeerMutationFence = source == .mcpPeerContext ? peerMutationFence : nil
+        guard let revision = persist(
+            selection,
+            for: identity,
+            peerMutationFence: requiredPeerMutationFence
+        ) else { return currentSelection }
+        guard canCommitPeerMutation(
+            peerMutationFence,
+            source: source,
+            workspaceManager: workspaceManager
+        ) else { return selection }
+        if source.isMCPSelectionSource {
             updateMCPSelectionPresentation(
                 selection,
-                forTabID: tabID,
+                for: identity,
                 mirrorToUI: mirrorToUI,
                 workspaceManager: workspaceManager
             )
         }
-        let change = Change(tabID: tabID, selection: selection, source: source)
-        if mirrorToUI, source == .mcpTabContext {
+        let change = Change(tabID: identity.tabID, selection: selection, source: source)
+        if mirrorToUI, source.isMCPSelectionSource {
             changeSubject.send(change)
-            await enqueueMCPSelectionMirror(selection, forTabID: tabID, revision: revision)
+            await enqueueMCPSelectionMirror(
+                selection,
+                for: identity,
+                revision: revision,
+                peerMutationFence: peerMutationFence
+            )
         } else if mirrorToUI {
             await applySelectionMirror {
                 changeSubject.send(change)
@@ -240,31 +389,32 @@ final class WorkspaceSelectionCoordinator {
         } else {
             changeSubject.send(change)
         }
-        return selection
-    }
-
-    @discardableResult
-    func persistSelection(
-        _ selection: StoredSelection,
-        for tabID: UUID,
-        source: Source = .runtimeMutation,
-        mirrorToUIIfActive: Bool = true
-    ) async -> StoredSelection {
-        if tabID == activeTabID() {
-            return await persistActiveSelection(selection, source: source, mirrorToUI: mirrorToUIIfActive)
+        if let propagationRegistration {
+            await workspaceManager.propagateMCPSelectionToPeerHosts(
+                MCPSelectionPeerPropagation(
+                    identity: identity,
+                    selection: selection,
+                    sourceRevision: propagationRegistration.sourceRevision,
+                    peerHostIDs: propagationRegistration.peerHostIDs,
+                    mirrorToUIIfActive: mirrorToUIIfActive
+                )
+            )
         }
-        return persistVirtualSelection(selection, for: tabID, source: source)
+        return selection
     }
 
     @discardableResult
     func persistVirtualSelection(
         _ selection: StoredSelection,
-        for tabID: UUID,
+        for identity: WorkspaceSelectionIdentity,
         source: Source = .virtual
-    ) -> StoredSelection {
-        guard persist(selection, for: tabID, markDirty: true) != nil else { return selection }
-        changeSubject.send(Change(tabID: tabID, selection: selection, source: source))
-        return selection
+    ) async -> StoredSelection {
+        await persistSelection(
+            selection,
+            for: identity,
+            source: source,
+            mirrorToUIIfActive: false
+        )
     }
 
     @discardableResult
@@ -330,26 +480,32 @@ final class WorkspaceSelectionCoordinator {
               target.tabID == tabID,
               target.selection == selection
         else { return }
-        let revision = selectionRevisionByTabID[tabID]
+        let revision = selectionRevisionByIdentity[target.identity]
         await enqueueSelectionMirror(target, selectionRevision: revision == 0 ? nil : revision)
     }
 
     private func enqueueMCPSelectionMirror(
         _ selection: StoredSelection,
-        forTabID tabID: UUID,
-        revision: UInt64
+        for identity: WorkspaceSelectionIdentity,
+        revision: UInt64,
+        peerMutationFence: MCPSelectionPeerMutationFence?
     ) async {
         guard let workspaceManager,
               let target = workspaceManager.activeSelectionMirrorTarget(),
-              target.tabID == tabID,
+              target.identity == identity,
               target.selection == selection
         else { return }
-        await enqueueSelectionMirror(target, selectionRevision: revision)
+        await enqueueSelectionMirror(
+            target,
+            selectionRevision: revision,
+            peerMutationFence: peerMutationFence
+        )
     }
 
     private func enqueueSelectionMirror(
         _ target: WorkspaceSelectionMirrorTarget,
-        selectionRevision: UInt64?
+        selectionRevision: UInt64?,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil
     ) async {
         let predecessor = mcpSelectionMirrorTail?.task
         let taskID = allocateSelectionMirrorTaskID()
@@ -358,9 +514,13 @@ final class WorkspaceSelectionCoordinator {
         let task = Task { @MainActor [weak self, weak workspaceManager] in
             await predecessor?.value
             guard let self, let workspaceManager else { return }
+            guard canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager) else {
+                discardSelectionMirrorTask(taskID)
+                return
+            }
 
             let revisionIsCurrent = selectionRevision.map {
-                selectionRevisionByTabID[target.tabID] == $0
+                self.selectionRevisionByIdentity[target.identity] == $0
             } ?? true
             var attemptedTarget: WorkspaceSelectionMirrorTarget?
             if revisionIsCurrent,
@@ -375,7 +535,11 @@ final class WorkspaceSelectionCoordinator {
                     )
                 }
             }
-            finishSelectionMirrorTask(taskID, attemptedTarget: attemptedTarget)
+            finishSelectionMirrorTask(
+                taskID,
+                attemptedTarget: attemptedTarget,
+                peerMutationFence: peerMutationFence
+            )
         }
         mcpSelectionMirrorTail = MCPSelectionMirrorTail(id: taskID, target: target, task: task)
         await task.value
@@ -383,11 +547,18 @@ final class WorkspaceSelectionCoordinator {
 
     /// Coalesces post-suspension churn into one latest-target successor. The completed request
     /// does not await this repair, so sustained switching cannot wedge the MCP drain.
-    private func scheduleSelectionMirrorRepair(after predecessor: Task<Void, Never>?) {
+    private func scheduleSelectionMirrorRepair(
+        after predecessor: Task<Void, Never>?,
+        peerMutationFence: MCPSelectionPeerMutationFence?
+    ) {
         let taskID = allocateSelectionMirrorTaskID()
         let task = Task { @MainActor [weak self, weak workspaceManager] in
             await predecessor?.value
             guard let self, let workspaceManager else { return }
+            guard canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager) else {
+                discardSelectionMirrorTask(taskID)
+                return
+            }
 
             let target = workspaceManager.activeSelectionMirrorTarget()
             if let target {
@@ -399,16 +570,27 @@ final class WorkspaceSelectionCoordinator {
                     )
                 }
             }
-            finishSelectionMirrorTask(taskID, attemptedTarget: target)
+            finishSelectionMirrorTask(
+                taskID,
+                attemptedTarget: target,
+                peerMutationFence: peerMutationFence
+            )
         }
         mcpSelectionMirrorTail = MCPSelectionMirrorTail(id: taskID, target: nil, task: task)
     }
 
     private func finishSelectionMirrorTask(
         _ taskID: UInt64,
-        attemptedTarget: WorkspaceSelectionMirrorTarget?
+        attemptedTarget: WorkspaceSelectionMirrorTarget?,
+        peerMutationFence: MCPSelectionPeerMutationFence?
     ) {
-        let currentTarget = workspaceManager?.activeSelectionMirrorTarget()
+        guard let workspaceManager,
+              canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager)
+        else {
+            discardSelectionMirrorTask(taskID)
+            return
+        }
+        let currentTarget = workspaceManager.activeSelectionMirrorTarget()
         if currentTarget == attemptedTarget {
             if mcpSelectionMirrorTail?.id == taskID {
                 mcpSelectionMirrorTail = nil
@@ -419,29 +601,59 @@ final class WorkspaceSelectionCoordinator {
         if let successor = mcpSelectionMirrorTail, successor.id != taskID {
             // An exact canonical successor or an existing latest-target repair already owns it.
             guard successor.target != currentTarget, successor.target != nil else { return }
-            scheduleSelectionMirrorRepair(after: successor.task)
+            scheduleSelectionMirrorRepair(
+                after: successor.task,
+                peerMutationFence: peerMutationFence
+            )
         } else if currentTarget != nil {
-            scheduleSelectionMirrorRepair(after: nil)
+            scheduleSelectionMirrorRepair(
+                after: nil,
+                peerMutationFence: peerMutationFence
+            )
         } else if mcpSelectionMirrorTail?.id == taskID {
             mcpSelectionMirrorTail = nil
         }
     }
 
+    private func discardSelectionMirrorTask(_ taskID: UInt64) {
+        if mcpSelectionMirrorTail?.id == taskID {
+            mcpSelectionMirrorTail = nil
+        }
+    }
+
+    private func canCommitPeerMutation(
+        _ fence: MCPSelectionPeerMutationFence?,
+        source: Source,
+        workspaceManager: any WorkspaceSelectionHost
+    ) -> Bool {
+        guard source == .mcpPeerContext else { return true }
+        guard let fence else { return false }
+        return workspaceManager.canCommitMCPSelectionPeerMutation(fence)
+    }
+
+    private func canApplyPeerMirror(
+        _ fence: MCPSelectionPeerMutationFence?,
+        workspaceManager: any WorkspaceSelectionHost
+    ) -> Bool {
+        guard let fence else { return true }
+        return workspaceManager.canCommitMCPSelectionPeerMutation(fence)
+    }
+
     private func updateMCPSelectionPresentation(
         _ selection: StoredSelection,
-        forTabID tabID: UUID,
+        for identity: WorkspaceSelectionIdentity,
         mirrorToUI: Bool,
         workspaceManager: any WorkspaceSelectionHost
     ) {
         if mirrorToUI {
-            deferredUISelectionFenceByTabID.removeValue(forKey: tabID)
+            deferredUISelectionFenceByIdentity.removeValue(forKey: identity)
         } else {
-            deferredUISelectionFenceByTabID[tabID] = DeferredUISelectionFence(
+            deferredUISelectionFenceByIdentity[identity] = DeferredUISelectionFence(
                 selection: selection,
                 liveUISelectionRevision: workspaceManager.liveUISelectionRevision
             )
         }
-        workspaceManager.updateComposeTabSelectionPresentation(selection, forTabID: tabID)
+        workspaceManager.updateComposeTabSelectionPresentation(selection, for: identity)
     }
 
     private func allocateSelectionMirrorTaskID() -> UInt64 {
@@ -450,18 +662,23 @@ final class WorkspaceSelectionCoordinator {
     }
 
     @discardableResult
-    private func recordSelectionRevision(for tabID: UUID) -> UInt64 {
+    private func recordSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
         nextSelectionRevision &+= 1
-        selectionRevisionByTabID[tabID] = nextSelectionRevision
+        selectionRevisionByIdentity[identity] = nextSelectionRevision
         return nextSelectionRevision
     }
 
-    private func persist(_ selection: StoredSelection, for tabID: UUID, markDirty: Bool) -> UInt64? {
-        guard let workspaceManager, var tab = workspaceManager.composeTab(with: tabID) else { return nil }
+    private func persist(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+    ) -> UInt64? {
+        guard let workspaceManager, var tab = workspaceManager.composeTab(for: identity) else { return nil }
         guard tab.selection != selection else { return nil }
+        guard canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager) else { return nil }
         tab.selection = selection
         tab.lastModified = Date()
-        workspaceManager.updateComposeTabStoredOnly(tab)
-        return recordSelectionRevision(for: tabID)
+        guard workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID) else { return nil }
+        return recordSelectionRevision(for: identity)
     }
 }

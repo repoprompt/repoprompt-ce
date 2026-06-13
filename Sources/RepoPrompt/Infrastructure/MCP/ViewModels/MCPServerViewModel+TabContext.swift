@@ -1378,16 +1378,20 @@ extension MCPServerViewModel {
     static func persistMCPSelectionThroughCoordinator(
         _ selection: StoredSelection,
         for tabID: UUID,
+        workspaceID: UUID?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
         mirrorToUIIfActive: Bool = true
     ) async -> MCPSelectionCoordinatorPersistenceResult {
-        guard let selectionCoordinator,
-              let current = selectionCoordinator.selectionSnapshot(for: tabID, flushPendingUIIfActive: false)
-        else { return .unavailable }
+        guard let workspaceID, let selectionCoordinator else { return .unavailable }
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        guard let current = selectionCoordinator.selectionSnapshot(
+            for: identity,
+            flushPendingUIIfActive: false
+        ) else { return .unavailable }
         let outcome: MCPSelectionCoordinatorPersistenceResult = current.selection == selection ? .unchanged : .persisted
         _ = await selectionCoordinator.persistSelection(
             selection,
-            for: tabID,
+            for: identity,
             source: .mcpTabContext,
             mirrorToUIIfActive: mirrorToUIIfActive
         )
@@ -1398,18 +1402,25 @@ extension MCPServerViewModel {
     static func persistMCPSelectionAndVerifyThroughCoordinator(
         _ selection: StoredSelection,
         for tabID: UUID,
+        workspaceID: UUID?,
         selectionCoordinator: WorkspaceSelectionCoordinator?,
         mirrorToUIIfActive: Bool = true
     ) async -> MCPSelectionPersistenceVerification {
         let outcome = await persistMCPSelectionThroughCoordinator(
             selection,
             for: tabID,
+            workspaceID: workspaceID,
             selectionCoordinator: selectionCoordinator,
             mirrorToUIIfActive: mirrorToUIIfActive
         )
-        let canonicalSelection = selectionCoordinator?
-            .selectionSnapshot(for: tabID, flushPendingUIIfActive: false)?
-            .selection
+        let canonicalSelection = workspaceID.flatMap { workspaceID in
+            selectionCoordinator?
+                .selectionSnapshot(
+                    for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+                    flushPendingUIIfActive: false
+                )?
+                .selection
+        }
         return MCPSelectionPersistenceVerification(
             outcome: outcome,
             expectedSelection: selection,
@@ -1418,11 +1429,19 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func canonicalPersistedSelection(for tabID: UUID) -> StoredSelection? {
-        if let selection = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: false)?.selection {
+    private func canonicalPersistedSelection(
+        for tabID: UUID,
+        workspaceID: UUID?
+    ) -> StoredSelection? {
+        guard let workspaceID else { return nil }
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        if let selection = selectionCoordinator?
+            .selectionSnapshot(for: identity, flushPendingUIIfActive: false)?
+            .selection
+        {
             return selection
         }
-        return workspaceManager?.composeTab(with: tabID)?.selection
+        return workspaceManager?.composeTab(for: identity)?.selection
     }
 
     @MainActor
@@ -1447,6 +1466,7 @@ extension MCPServerViewModel {
         var verification = await Self.persistMCPSelectionAndVerifyThroughCoordinator(
             context.selection,
             for: context.tabID,
+            workspaceID: context.workspaceID,
             selectionCoordinator: selectionCoordinator,
             mirrorToUIIfActive: context.worktreeBindings.isEmpty
         )
@@ -1455,7 +1475,10 @@ extension MCPServerViewModel {
             verification = MCPSelectionPersistenceVerification(
                 outcome: .unavailable,
                 expectedSelection: context.selection,
-                canonicalSelection: canonicalPersistedSelection(for: context.tabID)
+                canonicalSelection: canonicalPersistedSelection(
+                    for: context.tabID,
+                    workspaceID: context.workspaceID
+                )
             )
         }
 
@@ -1517,14 +1540,18 @@ extension MCPServerViewModel {
     @MainActor
     private func currentReadFileAutoSelectionTab(
         for contextKey: MCPReadFileAutoSelectionCoordinator.ContextKey
-    ) -> (manager: WorkspaceManagerViewModel, tab: ComposeTabState)? {
+    ) -> (manager: WorkspaceManagerViewModel, identity: WorkspaceSelectionIdentity, tab: ComposeTabState)? {
         guard isReadFileAutoSelectionContextCurrent(contextKey),
               let manager = workspaceManager,
               let workspaceID = contextKey.workspaceID,
               let workspace = manager.workspaces.first(where: { $0.id == workspaceID }),
               let tab = workspace.composeTabs.first(where: { $0.id == contextKey.tabID })
         else { return nil }
-        return (manager, tab)
+        return (
+            manager,
+            WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: contextKey.tabID),
+            tab
+        )
     }
 
     @MainActor
@@ -1552,6 +1579,7 @@ extension MCPServerViewModel {
             await Self.persistMCPSelectionThroughCoordinator(
                 persistedSelection,
                 for: contextKey.tabID,
+                workspaceID: contextKey.workspaceID,
                 selectionCoordinator: selectionCoordinator,
                 mirrorToUIIfActive: false
             )
@@ -1562,7 +1590,10 @@ extension MCPServerViewModel {
             updatedTab.selection = persistedSelection
             updatedTab.lastModified = Date()
             await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
-                refreshedTarget.manager.updateComposeTabStoredOnly(updatedTab)
+                _ = refreshedTarget.manager.updateComposeTabStoredOnly(
+                    updatedTab,
+                    inWorkspaceID: refreshedTarget.identity.workspaceID
+                )
             }
         }
         return true
@@ -2733,7 +2764,7 @@ extension MCPServerViewModel {
 
         // 1) Persist to backing store without publishing UI snapshots (prevents tool echo)
         guard isStillCurrent(), !Task.isCancelled else { return false }
-        manager.updateComposeTabStoredOnly(updatedTab)
+        _ = manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID)
         tabContextLog("commitTabContext stored selection/prompt tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil") workspaceID=\(workspaceID)")
 
         // 2) Apply to live UI ONLY if this tab is the active tab and the run still owns commit.

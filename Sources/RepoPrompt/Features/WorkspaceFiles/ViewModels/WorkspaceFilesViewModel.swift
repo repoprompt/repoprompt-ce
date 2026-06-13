@@ -1123,10 +1123,18 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionCoordinatorCancellable?.cancel()
         selectionCoordinatorCancellable = coordinator.changes
             .sink { [weak self, weak coordinator] change in
-                guard change.source != .uiFlush, change.source != .mcpTabContext else { return }
+                guard change.source != .uiFlush, !change.source.isMCPSelectionSource else { return }
                 Task { @MainActor [weak self, weak coordinator] in
                     guard let self, let coordinator else { return }
-                    guard change.tabID == nil || change.tabID == currentTabID else { return }
+                    if let changeTabID = change.tabID {
+                        guard let activeIdentity = coordinator.activeSelectionIdentity(),
+                              activeIdentity.tabID == changeTabID,
+                              coordinator.selectionSnapshot(
+                                  for: activeIdentity,
+                                  flushPendingUIIfActive: false
+                              )?.selection == change.selection
+                        else { return }
+                    }
                     let current = snapshotSelection()
                     guard current != change.selection else { return }
                     await coordinator.withApplyingSelectionMirror {
