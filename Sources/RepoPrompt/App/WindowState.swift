@@ -942,7 +942,7 @@ class WindowState: ObservableObject {
 
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              comps.scheme == "repoprompt"
+              AppDeepLinkURLScheme.isSupported(comps.scheme)
         else {
             return
         }
@@ -986,7 +986,7 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match repoprompt://open/~/MyProject
+        // Require host == "open" to match repoprompt-ce://open/~/MyProject
         guard let host = comps.host?.lowercased(), host == "open" else {
             return
         }
