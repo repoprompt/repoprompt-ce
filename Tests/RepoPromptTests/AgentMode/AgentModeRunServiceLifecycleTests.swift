@@ -1155,7 +1155,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 }
                 assertOrderedEvents(["mcp-cancel", "commit:", "headless:dispose"], in: recorder, row: row.rawValue, prefixMatches: true)
             case .acp:
-                let scriptURL = try makeFakeACPServerScript()
+                let scriptURL = try makeBootstrapOnlyACPServerScript()
                 let provider = LifecycleFakeACPProvider(providerID: .openCode, commandPath: scriptURL.path)
                 let request = makeACPRunRequest(workspacePath: FileManager.default.temporaryDirectory.path)
                 let controller = try makeACPController(provider: provider, request: request, recorder: recorder)
@@ -1643,6 +1643,24 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 })
             else:
                 respond(request.get("id"), {})
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
+    private func makeBootstrapOnlyACPServerScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("fake_acp_bootstrap_server.sh")
+        let script = #"""
+        #!/bin/sh
+        IFS= read -r _
+        printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"agentCapabilities":{"loadSession":true},"authMethods":[]}}'
+        IFS= read -r _
+        printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"lifecycle-session"}}'
+        while IFS= read -r _; do
+            :
+        done
         """#
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
