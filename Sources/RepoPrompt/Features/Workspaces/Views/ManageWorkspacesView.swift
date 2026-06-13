@@ -17,6 +17,8 @@ struct ManageWorkspacesView: View {
     @State private var showDuplicateCleanupConfirmation = false
     @State private var duplicateCleanupResultMessage: String?
     @State private var isRunningDuplicateCleanup = false
+    @State private var isImportingClassicRepoPrompt = false
+    @State private var classicRepoPromptImportResultMessage: String?
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -45,6 +47,7 @@ struct ManageWorkspacesView: View {
             headerSection
             autoRestoreToggle
             duplicateCleanupCallout
+            classicRepoPromptImportCallout
 
             // Collapsible Global Storage Management Section
             DisclosureGroup(
@@ -136,6 +139,23 @@ struct ManageWorkspacesView: View {
         } message: {
             Text(duplicateCleanupResultMessage ?? "")
         }
+        .alert(
+            "Classic RepoPrompt Import",
+            isPresented: Binding(
+                get: { classicRepoPromptImportResultMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        classicRepoPromptImportResultMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("OK") {
+                classicRepoPromptImportResultMessage = nil
+            }
+        } message: {
+            Text(classicRepoPromptImportResultMessage ?? "")
+        }
     }
 
     // MARK: - Header
@@ -171,6 +191,62 @@ struct ManageWorkspacesView: View {
             .padding(.horizontal, 16)
             .padding(.vertical, 6)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private var classicRepoPromptImportCallout: some View {
+        if classicRepoPromptSourceExists {
+            HStack(alignment: .center, spacing: 10) {
+                Image(systemName: "square.and.arrow.down")
+                    .foregroundColor(.secondary)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 18))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Classic RepoPrompt")
+                        .font(fontPreset.subheadlineFont)
+                        .fontWeight(.medium)
+                    Text("Import workspaces, sessions, settings, presets, prompts, models, workflows, and CLI/provider settings")
+                        .font(fontPreset.captionFont)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+
+                Spacer()
+
+                Button {
+                    runClassicRepoPromptImport()
+                } label: {
+                    if isImportingClassicRepoPrompt {
+                        HStack(spacing: 6) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Importing...")
+                        }
+                    } else {
+                        Text("Import...")
+                    }
+                }
+                .buttonStyle(CustomButtonStyle(verticalPadding: 6, horizontalPadding: 12, height: fontPreset.scaledMetric(32)))
+                .disabled(isImportingClassicRepoPrompt)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private var classicRepoPromptSourceExists: Bool {
+        ClassicRepoPromptImportService().defaultClassicSourceExists()
+    }
+
+    private func runClassicRepoPromptImport() {
+        guard !isImportingClassicRepoPrompt else { return }
+        isImportingClassicRepoPrompt = true
+
+        Task { @MainActor in
+            let result = await workspaceManager.importClassicRepoPromptData()
+            isImportingClassicRepoPrompt = false
+            classicRepoPromptImportResultMessage = result.userFacingSummary()
+        }
     }
 
     @ViewBuilder
