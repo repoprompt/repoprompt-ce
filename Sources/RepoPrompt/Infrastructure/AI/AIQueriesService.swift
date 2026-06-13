@@ -601,6 +601,16 @@ public class AIQueriesService {
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
     }
 
+    func testZAICodingPlanAPI(with apiKey: String? = nil) async throws -> Bool {
+        let key: String = if let apiKey {
+            apiKey
+        } else {
+            try await keyManager.getAPIKey(for: .zAI) ?? ""
+        }
+        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
+        return try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
+    }
+
     private func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {
         try await withThrowingTaskGroup(of: T.self) { group in
             group.addTask {

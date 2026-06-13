@@ -2076,6 +2076,26 @@ public class APISettingsViewModel: ObservableObject {
         return ok
     }
 
+    func validateZAICodingPlanKey() async throws -> Bool {
+        let trimmed = zaiApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ok = try await aiQueriesService.testZAICodingPlanAPI(with: trimmed)
+        if ok {
+            try await keyManager.saveAPIKey(trimmed, for: .zAI)
+            invalidateCompatibleBackendTestResult(for: .glmZAI)
+            hasStoredZAIKey = true
+            zaiApiKey = trimmed
+            isZaiKeyValid = true
+            availableZAIModels = defaultZAIModels
+            refreshClaudeCodeGLMAvailability()
+            await updateAvailableModels()
+        } else {
+            isZaiKeyValid = false
+            availableZAIModels = []
+            refreshClaudeCodeGLMAvailability()
+        }
+        return ok
+    }
+
     // MARK: - Custom Provider (OpenAI-compatible)
 
     func validateCustomProvider() async throws -> Bool {

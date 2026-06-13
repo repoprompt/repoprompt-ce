@@ -1893,13 +1893,13 @@ struct CLIProvidersSettingsView: View {
         isLoadingZAI = true
         Task {
             do {
-                let isValid = try await viewModel.validateZAIKey()
+                let isValid = try await viewModel.validateZAICodingPlanKey()
                 await MainActor.run {
                     isLoadingZAI = false
                     if isValid {
                         onAPIKeyUpdated?()
                     } else {
-                        alertMessage = "Unable to validate Z.ai API Key. Please check that your key is correct and that you have funds available in your account."
+                        alertMessage = "Unable to validate Z.ai Coding Plan. Please check that your key is correct and that your GLM Coding Plan subscription is active."
                         showAlert = true
                     }
                 }
