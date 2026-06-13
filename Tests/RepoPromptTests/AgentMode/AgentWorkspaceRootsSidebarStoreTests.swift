@@ -15,6 +15,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows.map(\.name), ["A", "B", "C"])
         XCTAssertEqual(rows.map(\.fullPath), ["/tmp/A", "/tmp/B", "/tmp/C"])
         XCTAssertEqual(rows.map(\.isPrimary), [true, false, false])
+        XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [rootA.id])
         XCTAssertEqual(rows.map(\.canMoveUp), [false, true, true])
         XCTAssertEqual(rows.map(\.canMoveDown), [true, true, false])
         XCTAssertEqual(rows.map(\.standardizedFullPath), [rootA.standardizedFullPath, rootB.standardizedFullPath, rootC.standardizedFullPath])
@@ -38,6 +39,27 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 canMoveDown: false
             )
         ])
+        XCTAssertTrue(rows.filter(\.isPrimary).isEmpty)
+    }
+
+    func testRowsDoNotMarkPrimaryWhenWorkspaceHasNoRoots() {
+        let rows = AgentWorkspaceRootsSidebarStore.rows(from: [])
+
+        XCTAssertTrue(rows.isEmpty)
+        XCTAssertEqual(rows.filter(\.isPrimary).count, 0)
+    }
+
+    func testRowsMarkExactlyFirstRootAsPrimaryAcrossMultiRootCounts() {
+        for rootCount in 2 ... 5 {
+            let projections = (0 ..< rootCount).map { index in
+                makeProjection(name: "Root\(index)", path: "/tmp/Root\(index)")
+            }
+
+            let rows = AgentWorkspaceRootsSidebarStore.rows(from: projections)
+
+            XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [projections[0].id])
+            XCTAssertEqual(rows.dropFirst().filter(\.isPrimary).count, 0)
+        }
     }
 
     func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
@@ -183,6 +205,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         )
 
         XCTAssertFalse(indicator.isAvailable)
+        XCTAssertEqual(indicator.capsuleText, "WT feature-x")
         XCTAssertTrue(indicator.tooltipText.contains("unavailable"))
         XCTAssertTrue(indicator.tooltipText.contains("feature-x"))
         XCTAssertTrue(indicator.accessibilityText.contains("unavailable"))
