@@ -388,6 +388,19 @@ class WindowState: ObservableObject {
                 requestWindowTitleUpdate(reason: .activeComposeTabChanged)
             }
             .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .composeTabNameChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID,
+                      let tabID = notification.userInfo?["tabID"] as? UUID,
+                      tabID == promptManager.activeComposeTabID
+                else { return }
+                requestWindowTitleUpdate(reason: .agentSessionNameChanged)
+            }
+            .store(in: &cancellables)
     }
 
     private func setupMCPAutoStart() {

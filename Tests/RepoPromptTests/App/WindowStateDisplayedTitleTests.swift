@@ -39,6 +39,42 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
         await cleanup(window: window, rootURL: rootURL)
     }
 
+    func testDisplayedWindowTitleRefreshesWhenActiveAgentSessionIsRenamedThroughAgentMode() async throws {
+        let rootURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WindowStateDisplayedTitleTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
+
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        await window.workspaceManager.awaitInitialized()
+
+        do {
+            let workspaceName = "Rename Title \(UUID().uuidString.prefix(8))"
+            let workspace = window.workspaceManager.createWorkspace(
+                name: workspaceName,
+                repoPaths: [rootURL.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "windowStateDisplayedTitleRenameTests"
+            )
+            let activeTabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
+
+            window.agentModeViewModel.renameSession(tabID: activeTabID, to: "Renamed Agent Session")
+
+            try await waitForDisplayedTitle(window, expected: "Renamed Agent Session — \(workspaceName)")
+        } catch {
+            await cleanup(window: window, rootURL: rootURL)
+            throw error
+        }
+        await cleanup(window: window, rootURL: rootURL)
+    }
+
     private func cleanup(window: WindowState, rootURL: URL) async {
         window.beginClose()
         await window.tearDown()
