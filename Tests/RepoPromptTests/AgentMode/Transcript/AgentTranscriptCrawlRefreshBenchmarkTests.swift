@@ -5,6 +5,64 @@
 
     @MainActor
     final class AgentTranscriptCrawlRefreshBenchmarkTests: XCTestCase {
+        func testPermitCorrelatedToolCompletionWorkCountDoesNotScaleWithTranscriptLength() throws {
+            let shortInvocation = try codexCompletionAttributionSample(priorTurnCount: 1, includeInvocationID: true)
+            let longInvocation = try codexCompletionAttributionSample(priorTurnCount: 2000, includeInvocationID: true)
+            let shortSignature = try codexCompletionAttributionSample(priorTurnCount: 1, includeInvocationID: false)
+            let longSignature = try codexCompletionAttributionSample(priorTurnCount: 2000, includeInvocationID: false)
+
+            XCTAssertEqual(shortInvocation.correlationPath, "invocation_id")
+            XCTAssertEqual(longInvocation.correlationPath, "invocation_id")
+            XCTAssertEqual(shortInvocation.scannedItemCount, 1)
+            XCTAssertEqual(longInvocation.scannedItemCount, 1)
+            XCTAssertEqual(shortSignature.correlationPath, "signature")
+            XCTAssertEqual(longSignature.correlationPath, "signature")
+            XCTAssertEqual(shortSignature.scannedItemCount, 1)
+            XCTAssertEqual(longSignature.scannedItemCount, 1)
+        }
+
+        private func codexCompletionAttributionSample(
+            priorTurnCount: Int,
+            includeInvocationID: Bool
+        ) throws -> MCPToolObserverAttribution {
+            let viewModel = makeViewModel()
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            var items: [AgentChatItem] = []
+            items.reserveCapacity(priorTurnCount * 2 + 2)
+            var sequenceIndex = 0
+            for turn in 0 ..< priorTurnCount {
+                items.append(.user("historical user \(turn)", sequenceIndex: sequenceIndex))
+                sequenceIndex += 1
+                items.append(.assistant("historical assistant \(turn)", sequenceIndex: sequenceIndex))
+                sequenceIndex += 1
+            }
+            items.append(.user("active user", sequenceIndex: sequenceIndex))
+            sequenceIndex += 1
+            let invocationID = includeInvocationID ? UUID() : nil
+            items.append(.toolCall(
+                name: "read_file",
+                invocationID: invocationID,
+                argsJSON: nil,
+                sequenceIndex: sequenceIndex
+            ))
+            session.setItemsSilently(items, reason: .testOverride)
+
+            let recorder = MCPToolObserverAttributionRecorder()
+            MCPToolObserverAttributionContext.$recorder.withValue(recorder) {
+                viewModel.test_codexCoordinator.testSimulateRepoPromptToolResult(
+                    invocationID: invocationID,
+                    toolName: "read_file",
+                    args: nil,
+                    resultJSON: #"{"content":"ok"}"#,
+                    isError: false,
+                    session: session
+                )
+            }
+
+            XCTAssertEqual(session.items.last?.kind, .toolResult)
+            return try XCTUnwrap(recorder.snapshot())
+        }
+
         func testLongActiveCrawlFinalTurnRefreshBenchmarkReport() async throws {
             try XCTSkipUnless(
                 ProcessInfo.processInfo.environment["RP_RUN_TRANSCRIPT_METRICS"] == "1"

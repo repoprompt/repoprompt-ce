@@ -33,6 +33,71 @@ final class MCPResponseDeliveryTracerSafetyTests: XCTestCase {
         XCTAssertEqual(received, payload)
     }
 
+    func testNonBlockingWriterRestoresBlockingAndSIGPIPEFlagsAfterSuccessfulWrite() throws {
+        var pipe = try makePipe()
+        let duplicateWriteFD = dup(pipe.writeFD)
+        guard duplicateWriteFD >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer {
+            closeIfOpen(duplicateWriteFD)
+            closeIfOpen(pipe.readFD)
+            closeIfOpen(pipe.writeFD)
+        }
+
+        let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
+        let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
+        XCTAssertFalse(originalNonBlocking)
+
+        let payload = Data("diagnostic\n".utf8)
+        XCTAssertTrue(BestEffortStderrWriter.writeNonBlocking(payload, to: pipe.writeFD))
+        XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking)
+        XCTAssertEqual(try descriptorIsNonBlocking(duplicateWriteFD), originalNonBlocking)
+        XCTAssertEqual(try descriptorNoSIGPIPE(pipe.writeFD), originalNoSIGPIPE)
+
+        var buffer = [UInt8](repeating: 0, count: payload.count)
+        XCTAssertEqual(read(pipe.readFD, &buffer, buffer.count), payload.count)
+        XCTAssertEqual(Data(buffer), payload)
+    }
+
+    func testNonBlockingWriterRestoresFlagsWhenPipeIsFull() throws {
+        var pipe = try makePipe()
+        defer {
+            closeIfOpen(pipe.readFD)
+            closeIfOpen(pipe.writeFD)
+        }
+
+        let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
+        let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
+        XCTAssertFalse(originalNonBlocking)
+        try fillPipeToCapacity(pipe.writeFD)
+        XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking)
+
+        let writeFD = pipe.writeFD
+        let writeQueue = DispatchQueue(label: "tracer-safety-test-full-pipe-writer")
+        let writeDone = DispatchGroup()
+        nonisolated(unsafe) var writeResult: Bool?
+        writeDone.enter()
+        writeQueue.async {
+            writeResult = BestEffortStderrWriter.writeNonBlocking(
+                Data("dropped\n".utf8),
+                to: writeFD
+            )
+            writeDone.leave()
+        }
+
+        let completed = writeDone.wait(timeout: .now() + 1) == .success
+        if !completed {
+            closeIfOpen(pipe.readFD)
+            pipe.readFD = -1
+            writeDone.wait()
+        }
+        XCTAssertTrue(completed, "Nonblocking diagnostic write hung on a full unread pipe")
+        XCTAssertEqual(writeResult, false)
+        XCTAssertEqual(try descriptorIsNonBlocking(writeFD), originalNonBlocking)
+        XCTAssertEqual(try descriptorNoSIGPIPE(writeFD), originalNoSIGPIPE)
+    }
+
     func testWriterDropsDataOnBrokenPipeWithoutRaising() throws {
         let writeFD = try makeBrokenPipeWriteEnd()
         defer { close(writeFD) }
@@ -120,6 +185,49 @@ private extension MCPResponseDeliveryTracerSafetyTests {
             throw XCTSkip("pipe(2) failed with errno \(errno)")
         }
         return (fds[0], fds[1])
+    }
+
+    func descriptorFlags(_ fd: Int32) throws -> Int32 {
+        let flags = fcntl(fd, F_GETFL)
+        guard flags >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return flags
+    }
+
+    func descriptorIsNonBlocking(_ fd: Int32) throws -> Bool {
+        try descriptorFlags(fd) & O_NONBLOCK != 0
+    }
+
+    func descriptorNoSIGPIPE(_ fd: Int32) throws -> Int32 {
+        let value = fcntl(fd, F_GETNOSIGPIPE)
+        guard value >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        return value
+    }
+
+    func fillPipeToCapacity(_ fd: Int32) throws {
+        let originalFlags = try descriptorFlags(fd)
+        guard fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK) >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { _ = fcntl(fd, F_SETFL, originalFlags) }
+
+        let payload = [UInt8](repeating: 0x58, count: 4096)
+        while true {
+            let result = payload.withUnsafeBytes { bytes in
+                write(fd, bytes.baseAddress, bytes.count)
+            }
+            if result > 0 { continue }
+            if result < 0, errno == EINTR { continue }
+            if result < 0, errno == EAGAIN || errno == EWOULDBLOCK { return }
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+    }
+
+    func closeIfOpen(_ fd: Int32) {
+        if fd >= 0 { close(fd) }
     }
 
     func makeBrokenPipeWriteEnd() throws -> Int32 {

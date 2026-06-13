@@ -51,7 +51,25 @@ actor GitDiffDataMaintenance {
         let versionUpgraded: Bool
     }
 
+    private struct SnapshotRetentionEntry: Codable, Equatable {
+        let repoKey: String
+        let snapshotID: String
+        let generatedAt: Date
+
+        var identity: String {
+            "\(repoKey)\u{0}\(snapshotID)"
+        }
+    }
+
+    private struct SnapshotRetentionIndex: Codable {
+        let version: Int
+        let entries: [SnapshotRetentionEntry]
+    }
+
+    private static let retentionIndexVersion = 1
+
     private let store = GitDiffSnapshotStore()
+    private var retentionEntriesByWorkspace: [String: [SnapshotRetentionEntry]] = [:]
 
     private init() {}
 
@@ -123,9 +141,24 @@ actor GitDiffDataMaintenance {
 
     /// Run lightweight retention after a snapshot is published.
     /// Only enforces max count (FIFO deletion) - age-based expiry runs on workspace open.
-    func runAfterSnapshotPublish(workspaceDirectory: URL, policy: Policy = .default) async {
-        // Only enforce max count for efficiency - age-based cleanup runs on workspace open
-        _ = enforceMaxCount(maxCount: policy.maxSnapshotsPerWorkspace, workspaceDirectory: workspaceDirectory)
+    func runAfterSnapshotPublish(
+        workspaceDirectory: URL,
+        repoKey: String,
+        snapshotID: String,
+        generatedAt: Date,
+        policy: Policy = .default
+    ) async {
+        var entries = retentionEntries(workspaceDirectory: workspaceDirectory)
+        let published = SnapshotRetentionEntry(repoKey: repoKey, snapshotID: snapshotID, generatedAt: generatedAt)
+        entries.removeAll { $0.identity == published.identity }
+        entries.append(published)
+
+        _ = enforceMaxCount(
+            maxCount: policy.maxSnapshotsPerWorkspace,
+            workspaceDirectory: workspaceDirectory,
+            entries: &entries
+        )
+        writeRetentionIndex(entries, workspaceDirectory: workspaceDirectory)
     }
 
     /// Delete all snapshots associated with a specific tab.
@@ -163,6 +196,7 @@ actor GitDiffDataMaintenance {
         cleanupEmptyDirectories(workspaceDirectory: workspaceDirectory, affectedRepos: affectedRepos)
 
         if deletedCount > 0 {
+            invalidateRetentionIndex(workspaceDirectory: workspaceDirectory)
             gitDiffDataMaintenanceDebugLog("Deleted \(deletedCount) snapshot(s) for closed tab \(tabID.uuidString.prefix(8))")
         }
 
@@ -206,6 +240,7 @@ actor GitDiffDataMaintenance {
         cleanupEmptyDirectories(workspaceDirectory: workspaceDirectory, affectedRepos: affectedRepos)
 
         if deletedCount > 0 {
+            invalidateRetentionIndex(workspaceDirectory: workspaceDirectory)
             gitDiffDataMaintenanceDebugLog("Deleted \(deletedCount) snapshot(s) for \(tabIDs.count) closed tab(s)")
         }
 
@@ -225,6 +260,7 @@ actor GitDiffDataMaintenance {
 
         do {
             try fileManager.removeItem(at: gitDataDir)
+            retentionEntriesByWorkspace.removeValue(forKey: workspaceKey(workspaceDirectory))
             gitDiffDataMaintenanceDebugLog("Deleted all git data for workspace at \(workspaceDirectory.lastPathComponent)")
             return true
         } catch {
@@ -248,8 +284,14 @@ actor GitDiffDataMaintenance {
         let cutoffDate = Calendar.current.date(byAdding: .day, value: -policy.maxAgeDays, to: Date()) ?? Date()
         expiredDeleted = deleteSnapshotsOlderThan(cutoffDate: cutoffDate, workspaceDirectory: workspaceDirectory)
 
-        // Step 2: Enforce max count (FIFO - delete oldest first)
-        excessDeleted = enforceMaxCount(maxCount: policy.maxSnapshotsPerWorkspace, workspaceDirectory: workspaceDirectory)
+        // Step 2: Rebuild the lightweight index once, then enforce max count from it.
+        var entries = rebuildRetentionEntries(workspaceDirectory: workspaceDirectory)
+        excessDeleted = enforceMaxCount(
+            maxCount: policy.maxSnapshotsPerWorkspace,
+            workspaceDirectory: workspaceDirectory,
+            entries: &entries
+        )
+        writeRetentionIndex(entries, workspaceDirectory: workspaceDirectory)
 
         if expiredDeleted > 0 || excessDeleted > 0 {
             gitDiffDataMaintenanceDebugLog("Retention cleanup: expired=\(expiredDeleted), excess=\(excessDeleted)")
@@ -289,67 +331,124 @@ actor GitDiffDataMaintenance {
         return deletedCount
     }
 
-    private func enforceMaxCount(maxCount: Int, workspaceDirectory: URL) -> Int {
-        // Collect all entries across all repos with their full context
-        struct SnapshotInfo {
-            let repoKey: String
-            let snapshotID: String
-            let generatedAt: Date
-        }
+    private func enforceMaxCount(
+        maxCount: Int,
+        workspaceDirectory: URL,
+        entries: inout [SnapshotRetentionEntry]
+    ) -> Int {
+        guard entries.count > maxCount else { return 0 }
 
-        var allSnapshots: [SnapshotInfo] = []
-        let repoKeys = store.listRepoKeys(workspaceDirectory: workspaceDirectory)
-
-        for repoKey in repoKeys {
-            guard let entries = try? store.listSnapshotEntries(workspaceDirectory: workspaceDirectory, repoKey: repoKey) else {
-                continue
-            }
-            for entry in entries {
-                allSnapshots.append(SnapshotInfo(
-                    repoKey: repoKey,
-                    snapshotID: entry.snapshotID,
-                    generatedAt: entry.manifest.generatedAt
-                ))
-            }
-        }
-
-        // If within limit, nothing to do
-        guard allSnapshots.count > maxCount else {
-            return 0
-        }
-
-        // Sort by age (oldest first) with deterministic tie-breaking
-        let sorted = allSnapshots.sorted { lhs, rhs in
+        let sorted = entries.sorted { lhs, rhs in
             if lhs.generatedAt != rhs.generatedAt {
                 return lhs.generatedAt < rhs.generatedAt
             }
-            // Tie-break by repoKey, then snapshotID for deterministic ordering
             if lhs.repoKey != rhs.repoKey {
                 return lhs.repoKey < rhs.repoKey
             }
             return lhs.snapshotID < rhs.snapshotID
         }
-        let toDelete = sorted.prefix(allSnapshots.count - maxCount)
+        let toDelete = sorted.prefix(entries.count - maxCount)
 
         var deletedCount = 0
+        var deletedIdentities: Set<String> = []
         var affectedRepos: Set<String> = []
-
-        for info in toDelete {
-            if (try? store.deleteSnapshot(workspaceDirectory: workspaceDirectory, repoKey: info.repoKey, snapshotID: info.snapshotID)) == true {
+        for entry in toDelete {
+            if (try? store.deleteSnapshot(
+                workspaceDirectory: workspaceDirectory,
+                repoKey: entry.repoKey,
+                snapshotID: entry.snapshotID
+            )) == true {
                 deletedCount += 1
-                affectedRepos.insert(info.repoKey)
+                deletedIdentities.insert(entry.identity)
+                affectedRepos.insert(entry.repoKey)
             }
         }
+        entries.removeAll { deletedIdentities.contains($0.identity) }
 
-        // Update CURRENT pointers for affected repos
         for repoKey in affectedRepos {
             try? store.updateCurrentToNewest(workspaceDirectory: workspaceDirectory, repoKey: repoKey)
         }
-
-        // Clean up empty directories
         cleanupEmptyDirectories(workspaceDirectory: workspaceDirectory, affectedRepos: affectedRepos)
-
         return deletedCount
+    }
+
+    private func retentionEntries(workspaceDirectory: URL) -> [SnapshotRetentionEntry] {
+        let key = workspaceKey(workspaceDirectory)
+        if let cached = retentionEntriesByWorkspace[key] { return cached }
+        if let persisted = readRetentionIndex(workspaceDirectory: workspaceDirectory) {
+            retentionEntriesByWorkspace[key] = persisted
+            return persisted
+        }
+        let rebuilt = rebuildRetentionEntries(workspaceDirectory: workspaceDirectory)
+        writeRetentionIndex(rebuilt, workspaceDirectory: workspaceDirectory)
+        return rebuilt
+    }
+
+    private func rebuildRetentionEntries(workspaceDirectory: URL) -> [SnapshotRetentionEntry] {
+        var entries: [SnapshotRetentionEntry] = []
+        for repoKey in store.listRepoKeys(workspaceDirectory: workspaceDirectory) {
+            guard let snapshots = try? store.listSnapshotEntries(
+                workspaceDirectory: workspaceDirectory,
+                repoKey: repoKey
+            ) else {
+                continue
+            }
+            entries.append(contentsOf: snapshots.map {
+                SnapshotRetentionEntry(
+                    repoKey: repoKey,
+                    snapshotID: $0.snapshotID,
+                    generatedAt: $0.manifest.generatedAt
+                )
+            })
+        }
+        return entries
+    }
+
+    private func retentionIndexURL(workspaceDirectory: URL) -> URL {
+        store.gitDataRoot(workspaceDirectory: workspaceDirectory)
+            .appendingPathComponent("retention-index.json")
+    }
+
+    private func readRetentionIndex(workspaceDirectory: URL) -> [SnapshotRetentionEntry]? {
+        let url = retentionIndexURL(workspaceDirectory: workspaceDirectory)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let index = try? decoder.decode(SnapshotRetentionIndex.self, from: data),
+              index.version == Self.retentionIndexVersion
+        else {
+            return nil
+        }
+        return index.entries
+    }
+
+    private func writeRetentionIndex(_ entries: [SnapshotRetentionEntry], workspaceDirectory: URL) {
+        let key = workspaceKey(workspaceDirectory)
+        retentionEntriesByWorkspace[key] = entries
+        let gitDataRoot = store.gitDataRoot(workspaceDirectory: workspaceDirectory)
+        guard FileManager.default.fileExists(atPath: gitDataRoot.path) else { return }
+
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(SnapshotRetentionIndex(
+                version: Self.retentionIndexVersion,
+                entries: entries
+            ))
+            try data.write(to: retentionIndexURL(workspaceDirectory: workspaceDirectory), options: .atomic)
+        } catch {
+            gitDiffDataMaintenanceDebugLog("Failed to write retention index: \(error.localizedDescription)")
+        }
+    }
+
+    private func invalidateRetentionIndex(workspaceDirectory: URL) {
+        retentionEntriesByWorkspace.removeValue(forKey: workspaceKey(workspaceDirectory))
+        try? FileManager.default.removeItem(at: retentionIndexURL(workspaceDirectory: workspaceDirectory))
+    }
+
+    private func workspaceKey(_ workspaceDirectory: URL) -> String {
+        workspaceDirectory.standardizedFileURL.path
     }
 
     // MARK: - Directory Cleanup

@@ -15,12 +15,8 @@ extension AgentModeViewModel {
         /// history lives in `transcript` and should not be rehydrated back into this array.
         @Published var items: [AgentChatItem] = [] {
             didSet {
-                syncNextSequenceIndexFromItems()
                 guard !suppressSourceItemsChanged else { return }
-                replaceEphemeralToolResultPayloadMap(
-                    AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: items),
-                    liveItemIDs: Set(items.map(\.id))
-                )
+                rebuildSourceItemDerivedState()
                 onSourceItemsChanged?(self, .structural)
             }
         }
@@ -40,6 +36,8 @@ extension AgentModeViewModel {
         var transcriptPerformanceSnapshot: AgentTranscriptPerformanceSnapshot = .empty
         var ephemeralToolResultPayloadByItemID: [UUID: String] = [:]
         var ephemeralToolResultPayloadRevisionByItemID: [UUID: Int] = [:]
+        private(set) var liveItemIDs: Set<UUID> = []
+        private var toolCorrelationIndexes = ToolCorrelationIndexes()
         private var nextEphemeralToolResultPayloadRevision: Int = 1
         var rawToolResultPayloadRenderRevision: Int = 0
         var onSourceItemsChanged: ((TabSession, SourceItemsMutation) -> Void)?
@@ -883,6 +881,107 @@ extension AgentModeViewModel {
             shouldSurfaceInteractionsInUI ? pendingWorktreeMergeReview : nil
         }
 
+        struct ToolCorrelationScanResult {
+            let indices: [Int]
+            let scannedItemCount: Int
+
+            var lastIndex: Int? {
+                indices.last
+            }
+        }
+
+        private enum ToolCorrelationBoundary: Equatable {
+            case start
+            case after(itemID: UUID, sequenceIndex: Int)
+        }
+
+        private struct ToolCorrelationIndexes: Equatable {
+            var activeTurnBoundary: ToolCorrelationBoundary = .start
+            var activeTurnStartIndex: Int = 0
+            var itemIndicesByInvocationID: [UUID: Set<Int>] = [:]
+            var itemIndicesBySignature: [String: Set<Int>] = [:]
+            var pendingCallIndicesBySignature: [String: Set<Int>] = [:]
+            var nilInvocationItemIndicesByName: [String: Set<Int>] = [:]
+        }
+
+        static func normalizedToolCorrelationName(_ toolName: String?) -> String {
+            let normalized = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName ?? "")
+            if !normalized.isEmpty {
+                return normalized
+            }
+            return toolName?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        }
+
+        static func canonicalToolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
+            let normalizedToolName = normalizedToolCorrelationName(toolName)
+            let normalizedArgs: String = {
+                guard let raw = argsJSON?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+                      let data = raw.data(using: .utf8),
+                      let object = try? JSONSerialization.jsonObject(with: data),
+                      JSONSerialization.isValidJSONObject(object),
+                      let canonicalData = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+                      let canonical = String(data: canonicalData, encoding: .utf8)
+                else {
+                    return argsJSON?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                }
+                return canonical
+            }()
+            return "\(normalizedToolName)|\(normalizedArgs)"
+        }
+
+        func indexedToolItemIndices(invocationID: UUID) -> [Int] {
+            sortedValidToolItemIndices(toolCorrelationIndexes.itemIndicesByInvocationID[invocationID] ?? [])
+        }
+
+        func indexedToolItemIndices(signature: String, pendingCallsOnly: Bool = false) -> [Int] {
+            let indices = pendingCallsOnly
+                ? toolCorrelationIndexes.pendingCallIndicesBySignature[signature] ?? []
+                : toolCorrelationIndexes.itemIndicesBySignature[signature] ?? []
+            return sortedValidToolItemIndices(indices)
+        }
+
+        func indexedNilInvocationToolItemIndices(normalizedToolName: String) -> [Int] {
+            sortedValidToolItemIndices(
+                toolCorrelationIndexes.nilInvocationItemIndicesByName[normalizedToolName] ?? []
+            )
+        }
+
+        func activeTurnToolItemIndices(
+            where predicate: (AgentChatItem) -> Bool
+        ) -> ToolCorrelationScanResult {
+            var matches: [Int] = []
+            var scannedItemCount = 0
+            guard toolCorrelationIndexes.activeTurnStartIndex < items.endIndex else {
+                return ToolCorrelationScanResult(indices: [], scannedItemCount: 0)
+            }
+            for index in stride(
+                from: items.index(before: items.endIndex),
+                through: toolCorrelationIndexes.activeTurnStartIndex,
+                by: -1
+            ) {
+                scannedItemCount += 1
+                if predicate(items[index]) {
+                    matches.append(index)
+                }
+            }
+            matches.reverse()
+            return ToolCorrelationScanResult(indices: matches, scannedItemCount: scannedItemCount)
+        }
+
+        private func sortedValidToolItemIndices(_ indices: Set<Int>) -> [Int] {
+            indices.lazy
+                .filter { index in
+                    self.items.indices.contains(index)
+                        && index >= self.toolCorrelationIndexes.activeTurnStartIndex
+                        && Self.isToolCorrelationItem(self.items[index])
+                }
+                .sorted()
+        }
+
+        private static func isToolCorrelationItem(_ item: AgentChatItem) -> Bool {
+            item.kind == .toolCall || item.kind == .toolResult
+        }
+
         private func syncNextSequenceIndexFromItems() {
             let maxSequenceIndex = items.map(\.sequenceIndex).max() ?? -1
             nextSequenceIndex = max(nextSequenceIndex, maxSequenceIndex + 1)
@@ -897,80 +996,174 @@ extension AgentModeViewModel {
             _ newItems: [AgentChatItem],
             dispatch: SourceItemsDispatch
         ) {
-            let previousItems = items
-            let mutation: AgentModeViewModel.SourceItemsMutation? = {
-                if case let .notify(mutation) = dispatch { return mutation }
-                return nil
-            }()
-            reconcileEphemeralPayloadMap(
-                previousItems: previousItems,
-                updatedItems: newItems,
-                mutation: mutation
-            )
-            sourceItemsRevision &+= 1
-            derivedTranscriptSyncState = nil
             suppressSourceItemsChanged = true
             items = newItems
             suppressSourceItemsChanged = false
+            rebuildSourceItemDerivedState()
+            sourceItemsRevision &+= 1
+            derivedTranscriptSyncState = nil
             if case let .notify(mutation) = dispatch {
                 onSourceItemsChanged?(self, mutation)
             }
         }
 
-        private func reconcileEphemeralPayloadMap(
-            previousItems: [AgentChatItem],
-            updatedItems: [AgentChatItem],
-            mutation: AgentModeViewModel.SourceItemsMutation?
+        private func rebuildSourceItemDerivedState() {
+            syncNextSequenceIndexFromItems()
+            liveItemIDs = Set(items.map(\.id))
+            replaceEphemeralToolResultPayloadMap(
+                AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: items),
+                liveItemIDs: liveItemIDs
+            )
+            rebuildToolCorrelationIndexes()
+            assertSourceItemDerivedStateIsConsistent()
+        }
+
+        private func rebuildToolCorrelationIndexes() {
+            let activeTurnBoundaryOverride = runState.isActive ? toolCorrelationIndexes.activeTurnBoundary : nil
+            toolCorrelationIndexes = Self.makeToolCorrelationIndexes(
+                for: items,
+                activeTurnBoundaryOverride: activeTurnBoundaryOverride
+            )
+        }
+
+        private static func makeToolCorrelationIndexes(
+            for items: [AgentChatItem],
+            activeTurnBoundaryOverride: ToolCorrelationBoundary? = nil
+        ) -> ToolCorrelationIndexes {
+            var indexes = ToolCorrelationIndexes()
+            let boundary: ToolCorrelationBoundary = if let activeTurnBoundaryOverride {
+                activeTurnBoundaryOverride
+            } else if let lastUserIndex = items.lastIndex(where: { $0.kind == .user }) {
+                .after(
+                    itemID: items[lastUserIndex].id,
+                    sequenceIndex: items[lastUserIndex].sequenceIndex
+                )
+            } else {
+                .start
+            }
+            indexes.activeTurnBoundary = boundary
+            indexes.activeTurnStartIndex = resolvedToolCorrelationStartIndex(for: items, boundary: boundary)
+            guard indexes.activeTurnStartIndex < items.endIndex else { return indexes }
+            for index in indexes.activeTurnStartIndex ..< items.endIndex {
+                addToolCorrelationItem(items[index], at: index, to: &indexes)
+            }
+            return indexes
+        }
+
+        private static func resolvedToolCorrelationStartIndex(
+            for items: [AgentChatItem],
+            boundary: ToolCorrelationBoundary
+        ) -> Int {
+            switch boundary {
+            case .start:
+                return items.startIndex
+            case let .after(itemID, sequenceIndex):
+                if let anchorIndex = items.firstIndex(where: { $0.id == itemID }) {
+                    return items.index(after: anchorIndex)
+                }
+                return items.firstIndex(where: { $0.sequenceIndex > sequenceIndex }) ?? items.endIndex
+            }
+        }
+
+        private static func addToolCorrelationItem(
+            _ item: AgentChatItem,
+            at index: Int,
+            to indexes: inout ToolCorrelationIndexes
         ) {
-            let liveItemIDs = Set(updatedItems.map(\.id))
-            guard let mutation else {
-                replaceEphemeralToolResultPayloadMap(
-                    AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: updatedItems),
-                    liveItemIDs: liveItemIDs
+            guard isToolCorrelationItem(item), index >= indexes.activeTurnStartIndex else { return }
+            if let invocationID = item.toolInvocationID {
+                indexes.itemIndicesByInvocationID[invocationID, default: []].insert(index)
+            }
+            let signature = canonicalToolInvocationSignature(
+                toolName: item.toolName,
+                argsJSON: item.toolArgsJSON
+            )
+            indexes.itemIndicesBySignature[signature, default: []].insert(index)
+            if item.kind == .toolCall {
+                indexes.pendingCallIndicesBySignature[signature, default: []].insert(index)
+            }
+            if item.toolInvocationID == nil {
+                let normalizedName = normalizedToolCorrelationName(item.toolName)
+                indexes.nilInvocationItemIndicesByName[normalizedName, default: []].insert(index)
+            }
+        }
+
+        private static func removeToolCorrelationItem(
+            _ item: AgentChatItem,
+            at index: Int,
+            from indexes: inout ToolCorrelationIndexes
+        ) {
+            guard isToolCorrelationItem(item), index >= indexes.activeTurnStartIndex else { return }
+            if let invocationID = item.toolInvocationID {
+                remove(index, from: &indexes.itemIndicesByInvocationID, key: invocationID)
+            }
+            let signature = canonicalToolInvocationSignature(
+                toolName: item.toolName,
+                argsJSON: item.toolArgsJSON
+            )
+            remove(index, from: &indexes.itemIndicesBySignature, key: signature)
+            if item.kind == .toolCall {
+                remove(index, from: &indexes.pendingCallIndicesBySignature, key: signature)
+            }
+            if item.toolInvocationID == nil {
+                let normalizedName = normalizedToolCorrelationName(item.toolName)
+                remove(index, from: &indexes.nilInvocationItemIndicesByName, key: normalizedName)
+            }
+        }
+
+        private static func remove<Key: Hashable>(
+            _ index: Int,
+            from map: inout [Key: Set<Int>],
+            key: Key
+        ) {
+            guard var indices = map[key] else { return }
+            indices.remove(index)
+            map[key] = indices.isEmpty ? nil : indices
+        }
+
+        private func updateToolCorrelationIndexes(
+            previousItem: AgentChatItem,
+            updatedItem: AgentChatItem,
+            at index: Int
+        ) {
+            guard previousItem.kind != .user, updatedItem.kind != .user else {
+                rebuildToolCorrelationIndexes()
+                return
+            }
+            Self.removeToolCorrelationItem(previousItem, at: index, from: &toolCorrelationIndexes)
+            Self.addToolCorrelationItem(updatedItem, at: index, to: &toolCorrelationIndexes)
+        }
+
+        private func appendToolCorrelationIndexes(for item: AgentChatItem, at index: Int) {
+            if item.kind == .user {
+                guard !runState.isActive else { return }
+                toolCorrelationIndexes = ToolCorrelationIndexes(
+                    activeTurnBoundary: .after(itemID: item.id, sequenceIndex: item.sequenceIndex),
+                    activeTurnStartIndex: index + 1
                 )
                 return
             }
-            switch mutation {
-            case let .append(index, _):
-                if updatedItems.indices.contains(index) {
-                    refreshEphemeralPayload(for: updatedItems[index], liveItemIDs: liveItemIDs)
-                } else {
-                    replaceEphemeralToolResultPayloadMap(
-                        AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: updatedItems),
-                        liveItemIDs: liveItemIDs
-                    )
-                }
-            case let .replace(index, _, _), let .mutate(index, _):
-                if previousItems.indices.contains(index),
-                   updatedItems.indices.contains(index),
-                   previousItems[index].id != updatedItems[index].id
-                {
-                    setEphemeralToolResultPayload(nil, for: previousItems[index].id)
-                }
-                if updatedItems.indices.contains(index) {
-                    refreshEphemeralPayload(for: updatedItems[index], liveItemIDs: liveItemIDs)
-                } else {
-                    replaceEphemeralToolResultPayloadMap(
-                        AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: updatedItems),
-                        liveItemIDs: liveItemIDs
-                    )
-                }
-                pruneEphemeralToolResultPayloadRevisions(liveItemIDs: liveItemIDs)
-            case let .remove(index, _):
-                if previousItems.indices.contains(index) {
-                    ephemeralToolResultPayloadByItemID.removeValue(forKey: previousItems[index].id)
-                } else {
-                    replaceEphemeralToolResultPayloadMap(
-                        AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: updatedItems),
-                        liveItemIDs: liveItemIDs
-                    )
-                }
-                pruneEphemeralToolResultPayloadRevisions(liveItemIDs: liveItemIDs)
-            case .replaceAll, .structural:
-                replaceEphemeralToolResultPayloadMap(
-                    AgentModeViewModel.rebuildEphemeralToolResultPayloadMap(from: updatedItems),
-                    liveItemIDs: liveItemIDs
-                )
+            Self.addToolCorrelationItem(item, at: index, to: &toolCorrelationIndexes)
+        }
+
+        private func reconcileIncrementalEphemeralPayload(
+            previousItem: AgentChatItem?,
+            updatedItem: AgentChatItem?
+        ) {
+            if let previousItem, previousItem.id != updatedItem?.id {
+                liveItemIDs.remove(previousItem.id)
+                setEphemeralToolResultPayload(nil, for: previousItem.id)
+            }
+            guard let updatedItem else { return }
+            liveItemIDs.insert(updatedItem.id)
+            refreshEphemeralPayload(for: updatedItem)
+        }
+
+        private func refreshEphemeralPayload(for item: AgentChatItem) {
+            if let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item) {
+                setEphemeralToolResultPayload(retainedPayload, for: item.id)
+            } else {
+                setEphemeralToolResultPayload(nil, for: item.id)
             }
         }
 
@@ -987,15 +1180,6 @@ extension AgentModeViewModel {
                 } else {
                     ephemeralToolResultPayloadRevisionByItemID.removeValue(forKey: itemID)
                 }
-            }
-            pruneEphemeralToolResultPayloadRevisions(liveItemIDs: liveItemIDs)
-        }
-
-        private func refreshEphemeralPayload(for item: AgentChatItem, liveItemIDs: Set<UUID>) {
-            if let retainedPayload = AgentToolResultPersistencePolicy.retainedEphemeralRawPayload(for: item) {
-                setEphemeralToolResultPayload(retainedPayload, for: item.id)
-            } else {
-                setEphemeralToolResultPayload(nil, for: item.id)
             }
             pruneEphemeralToolResultPayloadRevisions(liveItemIDs: liveItemIDs)
         }
@@ -1025,13 +1209,42 @@ extension AgentModeViewModel {
             }
         }
 
-        private func mutateSourceItems(
-            dispatch: SourceItemsDispatch,
-            _ body: (inout [AgentChatItem]) -> Void
+        private func finishIncrementalSourceItemsMutation(
+            _ mutation: AgentModeViewModel.SourceItemsMutation
         ) {
-            var updatedItems = items
-            body(&updatedItems)
-            commitSourceItems(updatedItems, dispatch: dispatch)
+            sourceItemsRevision &+= 1
+            derivedTranscriptSyncState = nil
+            onSourceItemsChanged?(self, mutation)
+        }
+
+        #if DEBUG
+            func testAssertSourceItemDerivedStateIsConsistent() {
+                assertSourceItemDerivedStateIsConsistent()
+            }
+        #endif
+
+        private func assertSourceItemDerivedStateIsConsistent(
+            file: StaticString = #fileID,
+            line: UInt = #line
+        ) {
+            #if DEBUG
+                assert(liveItemIDs == Set(items.map(\.id)), "live item ID index desynchronized", file: file, line: line)
+                assert(
+                    ephemeralToolResultPayloadByItemID.keys.allSatisfy { liveItemIDs.contains($0) },
+                    "ephemeral payload map contains non-live item IDs",
+                    file: file,
+                    line: line
+                )
+                assert(
+                    toolCorrelationIndexes == Self.makeToolCorrelationIndexes(
+                        for: items,
+                        activeTurnBoundaryOverride: runState.isActive ? toolCorrelationIndexes.activeTurnBoundary : nil
+                    ),
+                    "tool correlation index desynchronized",
+                    file: file,
+                    line: line
+                )
+            #endif
         }
 
         @discardableResult
@@ -1148,8 +1361,12 @@ extension AgentModeViewModel {
                 suppressSourceItemsChanged = true
                 items = alignedItems
                 suppressSourceItemsChanged = false
+                syncNextSequenceIndexFromItems()
+                liveItemIDs = Set(alignedItems.map(\.id))
+                rebuildToolCorrelationIndexes()
             }
-            replaceEphemeralToolResultPayloadMap(alignedMap, liveItemIDs: Set(alignedItems.map(\.id)))
+            replaceEphemeralToolResultPayloadMap(alignedMap, liveItemIDs: liveItemIDs)
+            assertSourceItemDerivedStateIsConsistent()
         }
 
         func clearDerivedTranscriptCaches() {
@@ -1185,11 +1402,12 @@ extension AgentModeViewModel {
             newItem.sequenceIndex = nextSequenceIndex
             nextSequenceIndex += 1
             let appendedIndex = items.count
-            mutateSourceItems(
-                dispatch: .notify(.append(index: appendedIndex, itemKind: newItem.kind))
-            ) { items in
-                items.append(newItem)
-            }
+            suppressSourceItemsChanged = true
+            items.append(newItem)
+            suppressSourceItemsChanged = false
+            reconcileIncrementalEphemeralPayload(previousItem: nil, updatedItem: newItem)
+            appendToolCorrelationIndexes(for: newItem, at: appendedIndex)
+            finishIncrementalSourceItemsMutation(.append(index: appendedIndex, itemKind: newItem.kind))
             if newItem.kind == .user {
                 hasSentFirstMessage = true
                 lastUserMessageAt = newItem.timestamp
@@ -1202,11 +1420,15 @@ extension AgentModeViewModel {
             guard items.indices.contains(index) else { return }
             let previousItem = items[index]
             guard updatedItem != previousItem else { return }
-            mutateSourceItems(
-                dispatch: .notify(.replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind))
-            ) { items in
-                items[index] = updatedItem
-            }
+            suppressSourceItemsChanged = true
+            items[index] = updatedItem
+            suppressSourceItemsChanged = false
+            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+            finishIncrementalSourceItemsMutation(
+                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            )
             lastActivityAt = Date()
             isDirty = true
         }
@@ -1217,11 +1439,13 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            mutateSourceItems(
-                dispatch: .notify(.mutate(index: index, itemKind: updatedItem.kind))
-            ) { items in
-                items[index] = updatedItem
-            }
+            suppressSourceItemsChanged = true
+            items[index] = updatedItem
+            suppressSourceItemsChanged = false
+            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+            finishIncrementalSourceItemsMutation(.mutate(index: index, itemKind: updatedItem.kind))
             lastActivityAt = Date()
             isDirty = true
         }
@@ -1230,11 +1454,12 @@ extension AgentModeViewModel {
         func removeItem(at index: Int) -> AgentChatItem? {
             guard items.indices.contains(index) else { return nil }
             let removed = items[index]
-            mutateSourceItems(
-                dispatch: .notify(.remove(index: index, itemKind: removed.kind))
-            ) { items in
-                items.remove(at: index)
-            }
+            suppressSourceItemsChanged = true
+            items.remove(at: index)
+            suppressSourceItemsChanged = false
+            reconcileIncrementalEphemeralPayload(previousItem: removed, updatedItem: nil)
+            rebuildToolCorrelationIndexes()
+            finishIncrementalSourceItemsMutation(.remove(index: index, itemKind: removed.kind))
             lastActivityAt = Date()
             isDirty = true
             return removed
@@ -1247,11 +1472,15 @@ extension AgentModeViewModel {
             var updatedItem = previousItem
             mutate(&updatedItem)
             guard updatedItem != previousItem else { return }
-            mutateSourceItems(
-                dispatch: .notify(.replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind))
-            ) { items in
-                items[index] = updatedItem
-            }
+            suppressSourceItemsChanged = true
+            items[index] = updatedItem
+            suppressSourceItemsChanged = false
+            nextSequenceIndex = max(nextSequenceIndex, updatedItem.sequenceIndex + 1)
+            reconcileIncrementalEphemeralPayload(previousItem: previousItem, updatedItem: updatedItem)
+            updateToolCorrelationIndexes(previousItem: previousItem, updatedItem: updatedItem, at: index)
+            finishIncrementalSourceItemsMutation(
+                .replace(index: index, previousKind: previousItem.kind, currentKind: updatedItem.kind)
+            )
             lastActivityAt = Date()
             isDirty = true
         }

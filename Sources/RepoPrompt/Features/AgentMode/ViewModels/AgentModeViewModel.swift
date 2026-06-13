@@ -1301,15 +1301,14 @@ final class AgentModeViewModel: ObservableObject {
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, computerUseEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
-            let shellToolEnabledOverride: Bool? = taskLabelKind == .explore ? false : nil
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: shellToolEnabledOverride,
+                shellToolEnabled: nil,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )

@@ -230,16 +230,26 @@ actor TaskManager {
 }
 
 public class AIQueriesService {
+    typealias SendPromptOverride = @Sendable (
+        _ message: AIMessage,
+        _ model: AIModel
+    ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>)
+
     private let taskManager = TaskManager()
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool
     private let keyManager: KeyManager
+    private let sendPromptOverride: SendPromptOverride?
     private var currentModel: AIModel
 
-    init(keyManager: KeyManager) {
+    init(
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil
+    ) {
         currentModel = .claude4Sonnet
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -247,10 +257,12 @@ public class AIQueriesService {
         model: AIModel,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
-        keyManager: KeyManager
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil
     ) {
         currentModel = model
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -290,6 +302,10 @@ public class AIQueriesService {
         _ aiMessage: AIMessage,
         model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>) {
+        if let sendPromptOverride {
+            return try await sendPromptOverride(aiMessage, model)
+        }
+
         let taskId = UUID()
         await taskManager.createPartialBuffer(for: taskId)
 

@@ -990,6 +990,10 @@ extension FileSystemService {
                 throw FileContentValidationError.fingerprintChanged
             }
             workerBodyFileBytes = telemetryFileBytes(validated.fileSize)
+            MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+                bytes: workerBodyFileBytes ?? 0,
+                decodeMicroseconds: 0
+            )
             let result: ContentReadResult = switch request.mode {
             case .automatic:
                 try await readAutomaticContent(
@@ -1063,7 +1067,13 @@ extension FileSystemService {
                     required: requireStableIdentity
                 )
             }
+            let decodeStart = DispatchTime.now().uptimeNanoseconds
             let detected = try decodeSmallFileData(data)
+            let decodeEnd = DispatchTime.now().uptimeNanoseconds
+            MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+                bytes: 0,
+                decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
+            )
             try Task.checkCancellation()
             return try validateOpenContentHandle(
                 handle,
@@ -1178,12 +1188,19 @@ extension FileSystemService {
         } else {
             .utf8
         }
+        let decodeStart = DispatchTime.now().uptimeNanoseconds
+        let decodedContent = String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]"
+        let decodeEnd = DispatchTime.now().uptimeNanoseconds
+        MCPToolWorkCountDiagnostics.recordReadFileDiskRead(
+            bytes: 0,
+            decodeMicroseconds: Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
+        )
         return try validateOpenContentHandle(
             handle,
             validated: validated,
             result: ContentReadResult(
                 absolutePath: request.absolutePath,
-                content: String(data: fullData, encoding: encoding) ?? "[Binary data or unknown encoding]",
+                content: decodedContent,
                 detectedEncodingRawValue: encoding.rawValue,
                 modificationDate: validated.modificationDate,
                 fingerprint: validated.fingerprint,

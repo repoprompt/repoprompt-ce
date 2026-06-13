@@ -72,8 +72,8 @@ class LifecycleTestCase(unittest.TestCase):
 
 
 class LifecycleQueueTests(LifecycleTestCase):
-    def test_protocol_version_bump_replaces_protocol_3_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 4)
+    def test_protocol_version_bump_replaces_older_daemons(self) -> None:
+        self.assertEqual(conductor.PROTOCOL_VERSION, 5)
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -634,7 +634,7 @@ class SmokeOperationTests(unittest.TestCase):
 
 
 class RunScriptTransitionTests(unittest.TestCase):
-    def test_guarded_failed_relaunch_does_not_stop_existing_app_before_packaging_succeeds(self) -> None:
+    def test_guarded_failed_relaunch_does_not_inspect_or_stop_before_packaging_succeeds(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             scripts = root / "Scripts"
@@ -645,29 +645,148 @@ class RunScriptTransitionTests(unittest.TestCase):
             package_script = scripts / "package_app.sh"
             package_script.write_text("#!/usr/bin/env bash\necho package failed\nexit 23\n", encoding="utf-8")
             package_script.chmod(0o755)
-            bin_dir = root / "bin"
-            bin_dir.mkdir()
-            (bin_dir / "pgrep").write_text("#!/usr/bin/env bash\necho 4242\n", encoding="utf-8")
-            (bin_dir / "pkill").write_text("#!/usr/bin/env bash\necho invoked > \"$PKILL_MARKER\"\n", encoding="utf-8")
-            (bin_dir / "pgrep").chmod(0o755)
-            (bin_dir / "pkill").chmod(0o755)
-            marker = root / "pkill-invoked"
+            marker = root / "process-helper-invoked"
+            helper = scripts / "debug_app_process.py"
+            helper.write_text(
+                "from pathlib import Path\nimport os\nPath(os.environ['PROCESS_HELPER_MARKER']).write_text('invoked')\n",
+                encoding="utf-8",
+            )
             env = os.environ.copy()
             env.update(
                 {
-                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
-                    "PKILL_MARKER": str(marker),
+                    "PROCESS_HELPER_MARKER": str(marker),
                     "REPOPROMPT_GUARD_DELAYED_LAUNCH": "1",
                 }
             )
 
             result = subprocess.run(["bash", str(run_script)], env=env, text=True, capture_output=True, timeout=2)
-            pkill_invoked = marker.exists()
+            helper_invoked = marker.exists()
 
         self.assertEqual(result.returncode, 23)
         self.assertIn("Packaging debug app", result.stdout)
-        self.assertNotIn("Stopping existing RepoPrompt instance", result.stdout)
-        self.assertFalse(pkill_invoked)
+        self.assertNotIn("Stopping existing RepoPrompt CE debug app instance", result.stdout)
+        self.assertFalse(helper_invoked)
+
+    def test_successful_relaunch_uses_debug_executable_for_stop_and_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scripts = root / "Scripts"
+            scripts.mkdir()
+            run_script = scripts / "run.sh"
+            shutil.copy2(SCRIPT_DIR / "run.sh", run_script)
+            run_script.chmod(0o755)
+            event_log = root / "events.log"
+            launched_marker = root / "launched"
+            app_bundle = root / "DebugApps" / "RepoPrompt.app"
+            app_executable = app_bundle / "Contents" / "MacOS" / "RepoPrompt"
+            package_script = scripts / "package_app.sh"
+            package_script.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -e
+                    echo package >> "$EVENT_LOG"
+                    mkdir -p "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS"
+                    printf binary > "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
+                    chmod +x "$REPOPROMPT_DEBUG_APP_BUNDLE/Contents/MacOS/RepoPrompt"
+                    """
+                ),
+                encoding="utf-8",
+            )
+            package_script.chmod(0o755)
+            helper = scripts / "debug_app_process.py"
+            helper.write_text(
+                textwrap.dedent(
+                    """\
+                    import os
+                    import sys
+                    from pathlib import Path
+
+                    operation = sys.argv[1]
+                    executable = sys.argv[sys.argv.index("--executable") + 1]
+                    state = "launched" if Path(os.environ["LAUNCHED_MARKER"]).exists() else "stopped"
+                    with Path(os.environ["EVENT_LOG"]).open("a", encoding="utf-8") as handle:
+                        handle.write(f"{operation}:{state}:{executable}\\n")
+                    if operation == "list" and state == "launched":
+                        print("4242")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "codesign").write_text("#!/usr/bin/env bash\necho TeamIdentifier=TEST >&2\n", encoding="utf-8")
+            (bin_dir / "plutil").write_text("#!/usr/bin/env bash\necho memory\n", encoding="utf-8")
+            (bin_dir / "open").write_text(
+                "#!/usr/bin/env bash\necho open >> \"$EVENT_LOG\"\ntouch \"$LAUNCHED_MARKER\"\n",
+                encoding="utf-8",
+            )
+            for command in ["codesign", "plutil", "open"]:
+                (bin_dir / command).chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "EVENT_LOG": str(event_log),
+                    "LAUNCHED_MARKER": str(launched_marker),
+                    "REPOPROMPT_DEBUG_APP_BUNDLE": str(app_bundle),
+                }
+            )
+
+            result = subprocess.run(["bash", str(run_script), "--demo"], env=env, text=True, capture_output=True, timeout=5)
+            events = event_log.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected_suffix = f":{app_executable}"
+        self.assertEqual(events[0], "package")
+        self.assertEqual(events[1], f"terminate:stopped:{app_executable}")
+        self.assertEqual(events[2], f"list:stopped:{app_executable}")
+        self.assertEqual(events[3], "open")
+        self.assertEqual(events[4], f"list:launched:{app_executable}")
+        self.assertTrue(all(event.endswith(expected_suffix) for event in events if event.startswith(("list:", "terminate:"))))
+        source = (SCRIPT_DIR / "run.sh").read_text(encoding="utf-8")
+        self.assertIn("Observed launched RepoPrompt CE debug PID(s): 4242", result.stdout)
+        self.assertNotIn("pgrep", source)
+        self.assertNotIn("pkill", source)
+
+
+class AppStatusIdentityTests(unittest.TestCase):
+    def test_status_treats_missing_debug_executable_as_not_installed(self) -> None:
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ,
+            {"REPOPROMPT_DEBUG_APP_BUNDLE": str(Path(tmp) / "missing" / "RepoPrompt.app")},
+        ), mock.patch.object(conductor, "run_operation_command", return_value=(0, "", "")), contextlib.redirect_stdout(output):
+            code = conductor.operation_app_status(Path("/tmp/repo"))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Running matching debug app PIDs: none", output.getvalue())
+        self.assertIn("Bundle exists: no", output.getvalue())
+
+    def test_status_reports_only_path_validated_debug_pids(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(conductor, "find_debug_app_pids", return_value=["501"]), mock.patch.object(
+            conductor, "run_operation_command", return_value=(0, "", "")
+        ), mock.patch.dict(os.environ, {"REPOPROMPT_DEBUG_APP_BUNDLE": "/tmp/missing-debug/RepoPrompt.app"}), contextlib.redirect_stdout(
+            output
+        ):
+            code = conductor.operation_app_status(Path("/tmp/repo"))
+
+        self.assertEqual(code, 0)
+        self.assertIn("Running matching debug app PIDs: 501", output.getvalue())
+
+    def test_status_identity_failure_is_reported_as_unknown(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(
+            conductor,
+            "find_debug_app_pids",
+            side_effect=conductor.ProcessIdentityError("identity unavailable"),
+        ), mock.patch.object(conductor, "run_operation_command") as cli_status, contextlib.redirect_stdout(output):
+            code = conductor.operation_app_status(Path("/tmp/repo"))
+
+        self.assertEqual(code, 1)
+        self.assertIn("Running matching debug app PIDs: unknown", output.getvalue())
+        cli_status.assert_not_called()
 
 
 class StopConfirmationTests(unittest.TestCase):
@@ -697,9 +816,19 @@ class StopConfirmationTests(unittest.TestCase):
         ), mock.patch.object(conductor.time, "sleep", side_effect=fake_sleep):
             yield
 
+    def test_missing_debug_executable_is_confirmed_already_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, self.patched_timing(), mock.patch.dict(
+            os.environ,
+            {"REPOPROMPT_DEBUG_APP_BUNDLE": str(Path(tmp) / "missing" / "RepoPrompt.app")},
+        ), contextlib.redirect_stdout(io.StringIO()) as output:
+            code = conductor.operation_app_stop(Path.cwd(), {})
+
+        self.assertEqual(code, 0)
+        self.assertIn("already stopped", output.getvalue())
+
     def test_already_stopped_is_confirmed_without_termination(self) -> None:
-        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", return_value=[]), mock.patch.object(
-            conductor, "run_operation_command"
+        with self.patched_timing(), mock.patch.object(conductor, "find_debug_app_pids", return_value=[]), mock.patch.object(
+            conductor, "terminate_debug_app_processes"
         ) as terminate, contextlib.redirect_stdout(io.StringIO()):
             code = conductor.operation_app_stop(Path.cwd(), {})
 
@@ -708,13 +837,13 @@ class StopConfirmationTests(unittest.TestCase):
 
     def test_running_process_is_terminated_then_confirmed_absent(self) -> None:
         probes = iter([["101"], [], [], [], []])
-        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", side_effect=lambda: next(probes, [])), mock.patch.object(
-            conductor, "run_operation_command", return_value=(0, "", "")
+        with self.patched_timing(), mock.patch.object(conductor, "find_debug_app_pids", side_effect=lambda: next(probes, [])), mock.patch.object(
+            conductor, "terminate_debug_app_processes", return_value=["101"]
         ) as terminate, contextlib.redirect_stdout(io.StringIO()):
             code = conductor.operation_app_stop(Path.cwd(), {})
 
         self.assertEqual(code, 0)
-        terminate.assert_called_once()
+        terminate.assert_called_once_with()
 
     def test_guarded_stop_terminates_delayed_process_appearance(self) -> None:
         calls = 0
@@ -724,17 +853,28 @@ class StopConfirmationTests(unittest.TestCase):
             calls += 1
             return ["202"] if calls == 2 else []
 
-        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", side_effect=probe), mock.patch.object(
-            conductor, "run_operation_command", return_value=(0, "", "")
+        with self.patched_timing(), mock.patch.object(conductor, "find_debug_app_pids", side_effect=probe), mock.patch.object(
+            conductor, "terminate_debug_app_processes", return_value=["202"]
         ) as terminate, contextlib.redirect_stdout(io.StringIO()):
             code = conductor.operation_app_stop(Path.cwd(), {"guardDelayedLaunch": True})
 
         self.assertEqual(code, 0)
-        terminate.assert_called_once()
+        terminate.assert_called_once_with()
+
+    def test_identity_failure_aborts_without_name_based_fallback(self) -> None:
+        with self.patched_timing(), mock.patch.object(
+            conductor,
+            "find_debug_app_pids",
+            side_effect=conductor.ProcessIdentityError("identity unavailable"),
+        ), mock.patch.object(conductor, "terminate_debug_app_processes") as terminate, contextlib.redirect_stdout(io.StringIO()):
+            code = conductor.operation_app_stop(Path.cwd(), {})
+
+        self.assertEqual(code, 1)
+        terminate.assert_not_called()
 
     def test_persistent_process_fails_confirmation_without_force_kill(self) -> None:
-        with self.patched_timing(), mock.patch.object(conductor, "find_repoprompt_pids", return_value=["303"]), mock.patch.object(
-            conductor, "run_operation_command", return_value=(0, "", "")
+        with self.patched_timing(), mock.patch.object(conductor, "find_debug_app_pids", return_value=["303"]), mock.patch.object(
+            conductor, "terminate_debug_app_processes", return_value=["303"]
         ) as terminate, contextlib.redirect_stdout(io.StringIO()):
             code = conductor.operation_app_stop(Path.cwd(), {})
 

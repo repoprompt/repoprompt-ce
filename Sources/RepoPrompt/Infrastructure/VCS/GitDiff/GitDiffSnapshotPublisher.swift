@@ -71,7 +71,7 @@ actor GitDiffSnapshotPublisher {
         snapshotIDOverride: String?,
         tabID: UUID?
     ) async throws -> GitDiffSnapshotManifest {
-        let summaryInputs = try await engine.buildSnapshotInputs(
+        let inputs = try await engine.buildSnapshotInputs(
             compare: compare,
             scope: scope,
             selectedAbsolutePaths: selectedAbsolutePaths,
@@ -79,23 +79,8 @@ actor GitDiffSnapshotPublisher {
             contextLines: contextLines,
             detectRenames: detectRenames,
             includeUntrackedInUnstaged: true,
-            generateDiffText: false
+            generateDiffText: mode != .quick
         )
-
-        let inputs: GitDiffEngine.GitDiffSnapshotBuildResult = if mode == .quick {
-            summaryInputs
-        } else {
-            try await engine.buildSnapshotInputs(
-                compare: compare,
-                scope: scope,
-                selectedAbsolutePaths: selectedAbsolutePaths,
-                repoURL: repo.rootURL,
-                contextLines: contextLines,
-                detectRenames: detectRenames,
-                includeUntrackedInUnstaged: true,
-                generateDiffText: true
-            )
-        }
 
         let snapshotID = resolveSnapshotID(
             override: snapshotIDOverride,
@@ -127,7 +112,12 @@ actor GitDiffSnapshotPublisher {
         try store.writeCurrentSnapshotID(snapshotID, workspaceDirectory: workspaceDirectory, repoKey: repo.repoKey)
 
         // Trigger retention enforcement after publishing
-        await GitDiffDataMaintenance.shared.runAfterSnapshotPublish(workspaceDirectory: workspaceDirectory)
+        await GitDiffDataMaintenance.shared.runAfterSnapshotPublish(
+            workspaceDirectory: workspaceDirectory,
+            repoKey: repo.repoKey,
+            snapshotID: manifest.snapshotID,
+            generatedAt: manifest.generatedAt
+        )
 
         return manifest
     }

@@ -1,10 +1,135 @@
 import Foundation
 import MCP
 @testable import RepoPromptMCP
+import RepoPromptShared
 import XCTest
 
 #if DEBUG
     final class InteractiveMCPClientSessionCancellationTests: XCTestCase {
+        func testContextBuilderAndAskOracleDefaultsHaveNoClientDeadline() async {
+            let session = makeUnconnectedSession()
+
+            let contextBuilderTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "context_builder"
+            )
+            let askOracleTimeout = await session.test_resolvedToolCallTimeout(
+                toolName: "ask_oracle"
+            )
+
+            XCTAssertNil(contextBuilderTimeout)
+            XCTAssertNil(askOracleTimeout)
+        }
+
+        func testOrdinaryToolRetains300SecondClientDeadline() async {
+            let session = makeUnconnectedSession()
+
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "read_file"
+            )
+
+            XCTAssertEqual(timeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
+        }
+
+        func testAgentRun600SecondWaitUsesRequestedWaitPlusDeliveryMargin() async {
+            let session = makeUnconnectedSession()
+
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string(UUID().uuidString),
+                    "timeout": .double(600)
+                ]
+            )
+
+            XCTAssertEqual(
+                timeout,
+                600 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+            XCTAssertNotEqual(timeout, MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds)
+        }
+
+        func testAnotherControlToolWaitUsesRequestedWaitPlusDeliveryMargin() async {
+            let session = makeUnconnectedSession()
+
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "wait_for_next_user_instruction",
+                arguments: ["timeout_seconds": .int(900)]
+            )
+
+            XCTAssertEqual(
+                timeout,
+                900 + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+            )
+        }
+
+        func testExplicitCLITimeoutPolicyOverridesToolDefaults() async {
+            let session = makeUnconnectedSession()
+            await session.setDefaultToolCallTimeout(.seconds(450))
+
+            let explicitDeadline = await session.test_resolvedToolCallTimeout(
+                toolName: "context_builder"
+            )
+            XCTAssertEqual(explicitDeadline, 450)
+
+            await session.setDefaultToolCallTimeout(.none)
+            let explicitNone = await session.test_resolvedToolCallTimeout(
+                toolName: "read_file"
+            )
+            XCTAssertNil(explicitNone)
+        }
+
+        func testExplicitPerCallTimeoutPolicyOverridesSemanticWait() async {
+            let session = makeUnconnectedSession()
+            let arguments: [String: Value] = [
+                "op": .string("wait"),
+                "session_id": .string(UUID().uuidString),
+                "timeout": .double(1200)
+            ]
+
+            let explicitDeadline = await session.test_resolvedToolCallTimeout(
+                .seconds(777),
+                toolName: "agent_run",
+                arguments: arguments
+            )
+            let explicitNone = await session.test_resolvedToolCallTimeout(
+                .none,
+                toolName: "agent_run",
+                arguments: arguments
+            )
+            let explicitZero = await session.test_resolvedToolCallTimeout(
+                .seconds(0),
+                toolName: "agent_run",
+                arguments: arguments
+            )
+
+            XCTAssertEqual(explicitDeadline, 777)
+            XCTAssertNil(explicitNone)
+            XCTAssertNil(explicitZero)
+        }
+
+        func testZeroSemanticWaitLeavesClientDeadlineUnbounded() async {
+            let session = makeUnconnectedSession()
+
+            let timeout = await session.test_resolvedToolCallTimeout(
+                toolName: "agent_run",
+                arguments: [
+                    "op": .string("wait"),
+                    "session_id": .string(UUID().uuidString),
+                    "timeout": .int(0)
+                ]
+            )
+
+            XCTAssertNil(timeout)
+        }
+
+        private func makeUnconnectedSession() -> InteractiveMCPClientSession {
+            InteractiveMCPClientSession(
+                sessionToken: "timeout-contract-test",
+                clientName: "timeout-contract-test"
+            )
+        }
+
         func testImmediateTimeoutRegistersAndSendsBeforeCancellationWithoutWaitingForHandlerStartup() async throws {
             let fixture = try await makeFixture(
                 cancellationBehavior: .ignoreUntilReleased,

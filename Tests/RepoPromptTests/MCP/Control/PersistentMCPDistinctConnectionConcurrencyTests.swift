@@ -45,6 +45,42 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         #endif
     }
 
+    func testInteractivePartialReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                do {
+                    try await runReadSelectionPersistenceCheckpoint(fixture: fixture, shape: .partial)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        #else
+            throw XCTSkip("Read-file selection persistence socketpair integration requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
+    func testInteractiveFullReadSelectionPersistsAcrossConnectionTeardownAndFreshRebind() async throws {
+        #if DEBUG
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                do {
+                    try await runReadSelectionPersistenceCheckpoint(fixture: fixture, shape: .full)
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        #else
+            throw XCTSkip("Read-file selection persistence socketpair integration requires DEBUG diagnostics helpers.")
+        #endif
+    }
+
     func testClearPersistedRoutingSessionHiddenDispatchIsExactAndRestoresState() async throws {
         #if DEBUG
             let networkManager = ServerNetworkManager.shared
@@ -65,6 +101,119 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
 
 #if DEBUG
     private extension PersistentMCPDistinctConnectionConcurrencyTests {
+        enum ReadSelectionShape {
+            case partial
+            case full
+        }
+
+        func runReadSelectionPersistenceCheckpoint(
+            fixture: PersistentMCPTestFixture,
+            shape: ReadSelectionShape
+        ) async throws {
+            let readEndpoint = try fixture.endpointA()
+            let freshEndpoint = try fixture.endpointARead()
+            let context = fixture.contextA
+            let workspace = try XCTUnwrap(
+                context.window.workspaceManager.workspaces.first(where: { $0.id == context.workspaceID })
+            )
+            await context.window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "readSelectionPersistenceCheckpoint"
+            )
+            context.window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
+            try await Self.bind(readEndpoint, to: context.tabID)
+            _ = try await readEndpoint.callTool(
+                name: MCPWindowToolName.manageSelection,
+                arguments: ["op": "clear"]
+            )
+
+            let gate = SearchAdmissionGate {}
+            context.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+            defer {
+                context.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+                Task { await gate.release() }
+            }
+
+            var readArguments: [String: Any] = ["path": context.fileURL.path]
+            if shape == .partial {
+                readArguments["start_line"] = 1
+                readArguments["limit"] = 1
+            }
+            let readCompletion = PersistentMCPTaskResultBox<PersistentMCPTestRPCResponse>()
+            let readTask = Task {
+                do {
+                    let response = try await readEndpoint.callTool(
+                        name: MCPWindowToolName.readFile,
+                        arguments: readArguments
+                    )
+                    readCompletion.store(.success(response))
+                    return response
+                } catch {
+                    readCompletion.store(.failure(error))
+                    throw error
+                }
+            }
+            let autoSelectionStarted = await gate.waitUntilStarted()
+            XCTAssertTrue(autoSelectionStarted)
+            XCTAssertNil(
+                readCompletion.load(),
+                "Interactive read_file returned before its auto-selection reached the provider durability barrier."
+            )
+            await gate.release()
+            let readResponse = try await Self.boundedTaskValue(
+                readTask,
+                description: "interactive read_file selection durability"
+            )
+            try Self.assertReadResult(
+                readResponse,
+                contains: context.sentinel,
+                excludes: fixture.contextB.sentinel
+            )
+
+            readEndpoint.client.close()
+            await fixture.networkManager.debugRemoveConnection(readEndpoint.connectionID)
+            context.window.mcpServer.setReadFileAutoSelectionCanonicalApplyGateForTesting(nil)
+
+            try await Self.bind(freshEndpoint, to: context.tabID)
+            let freshSelectionResponse = try await freshEndpoint.callTool(
+                name: MCPWindowToolName.manageSelection,
+                arguments: [
+                    "op": "get",
+                    "view": "files",
+                    "path_display": "full"
+                ]
+            )
+            let freshSelectionText = try Self.toolText(from: freshSelectionResponse)
+            XCTAssertTrue(freshSelectionText.contains(context.fileURL.lastPathComponent), freshSelectionText)
+
+            let expectedSlices: [String: [LineRange]] = switch shape {
+            case .partial:
+                [context.fileURL.path: [LineRange(start: 1, end: 1)]]
+            case .full:
+                [:]
+            }
+            let storedSelection = try XCTUnwrap(
+                context.window.workspaceManager.composeTab(with: context.tabID)?.selection
+            )
+            XCTAssertEqual(storedSelection.selectedPaths, [context.fileURL.path])
+            XCTAssertEqual(storedSelection.slices, expectedSlices)
+            XCTAssertEqual(
+                context.window.promptManager.currentComposeTabs
+                    .first(where: { $0.id == context.tabID })?
+                    .selection,
+                storedSelection
+            )
+            switch shape {
+            case .partial:
+                XCTAssertTrue(freshSelectionText.contains("lines 1"), freshSelectionText)
+            case .full:
+                XCTAssertFalse(freshSelectionText.contains("lines 1"), freshSelectionText)
+            }
+        }
+
         func runK12SharedWindowSearchCheckpoint(fixture: PersistentMCPTestFixture) async throws {
             let primary = try fixture.endpointA()
             var endpoints = [primary]

@@ -169,7 +169,7 @@ actor InteractiveMCPClientSession {
     private var requestSendBarrier: MCPRequestSendBarrier?
     private var cachedTools: [MCP.Tool] = []
     private var toolListFetched = false
-    private var defaultToolCallTimeout: ToolCallTimeoutPolicy = .seconds(300)
+    private var defaultToolCallTimeout: ToolCallTimeoutPolicy = .default
     private(set) var toolsDirty = false
 
     #if DEBUG
@@ -483,7 +483,11 @@ actor InteractiveMCPClientSession {
             name: name,
             arguments: args.isEmpty ? nil : args
         )
-        let effectiveTimeout = resolvedTimeout(timeout)
+        let effectiveTimeout = resolvedTimeout(
+            timeout,
+            toolName: name,
+            arguments: args
+        )
         let result = try await awaitToolCallResult(
             registeredCall,
             client: client,
@@ -609,23 +613,89 @@ actor InteractiveMCPClientSession {
         return UInt64((clampedSeconds * 1_000_000_000).rounded(.up))
     }
 
-    private func resolvedTimeout(_ policy: ToolCallTimeoutPolicy) -> TimeInterval? {
+    private func resolvedTimeout(
+        _ policy: ToolCallTimeoutPolicy,
+        toolName: String,
+        arguments: [String: Value]
+    ) -> TimeInterval? {
         let effectivePolicy: ToolCallTimeoutPolicy = switch policy {
         case .default:
             defaultToolCallTimeout
         case .seconds, .none:
             policy
         }
-
         switch effectivePolicy {
         case .default:
-            return 300
+            if MCPTimeoutPolicy.cliDefaultUnboundedToolNames.contains(toolName) {
+                return nil
+            }
+            if let semanticWaitSeconds = Self.explicitSemanticWaitSeconds(
+                toolName: toolName,
+                arguments: arguments
+            ) {
+                guard semanticWaitSeconds > 0 else { return nil }
+                return max(
+                    MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds,
+                    semanticWaitSeconds + MCPTimeoutPolicy.cliSemanticWaitResponseMarginSeconds
+                )
+            }
+            return MCPTimeoutPolicy.cliDefaultToolCallTimeoutSeconds
         case let .seconds(seconds):
             return seconds.isFinite && seconds > 0 ? seconds : nil
         case .none:
             return nil
         }
     }
+
+    private static func explicitSemanticWaitSeconds(
+        toolName: String,
+        arguments: [String: Value]
+    ) -> TimeInterval? {
+        let timeoutKey: String
+        switch toolName {
+        case "agent_run", "agent_explore":
+            let operation = arguments["op"]?.stringValue?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            switch operation {
+            case "start", "wait":
+                timeoutKey = "timeout"
+            case "steer" where toolName == "agent_run":
+                guard arguments["wait"]?.boolValue != false else { return nil }
+                timeoutKey = "timeout_seconds"
+            default:
+                return nil
+            }
+        case "ask_user", "wait_for_next_user_instruction":
+            timeoutKey = "timeout_seconds"
+        default:
+            return nil
+        }
+
+        guard let value = arguments[timeoutKey] else { return nil }
+        let seconds: TimeInterval? = switch value {
+        case let .int(value):
+            TimeInterval(value)
+        case let .double(value):
+            value
+        case let .string(value):
+            Double(value)
+        default:
+            nil
+        }
+        guard let seconds, seconds.isFinite, seconds >= 0 else { return nil }
+        return seconds
+    }
+
+    #if DEBUG
+        func test_resolvedToolCallTimeout(
+            _ policy: ToolCallTimeoutPolicy = .default,
+            toolName: String,
+            arguments: [String: Value] = [:]
+        ) -> TimeInterval? {
+            resolvedTimeout(policy, toolName: toolName, arguments: arguments)
+        }
+    #endif
 
     private func shouldSuppressWindowInjection(toolName: String, args: [String: Value]) -> Bool {
         guard toolName != "bind_context" else { return true }

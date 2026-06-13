@@ -175,6 +175,284 @@ final class TabContextRoutingTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testPendingPolicyReadSelectionLineagePreservesRapidReplacementOrder() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let unrelatedRunID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let thirdConnectionID = UUID()
+        let unrelatedConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        window.mcpServer.installTabContext(
+            clientID: unrelatedConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: unrelatedRunID,
+            signalRouting: false
+        )
+        let secondToken = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+        let thirdToken = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: thirdConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+
+        XCTAssertEqual(secondToken.displacedConnectionID, firstConnectionID)
+        XCTAssertEqual(thirdToken.displacedConnectionID, secondConnectionID)
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: thirdConnectionID
+            ),
+            [firstConnectionID, secondConnectionID]
+        )
+        XCTAssertFalse(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: thirdConnectionID
+            ).contains(unrelatedConnectionID)
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageSurvivesSameConnectionTokenSupersession() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        let supersedingToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+        XCTAssertNil(supersedingToken.displacedConnectionID)
+        XCTAssertEqual(supersedingToken.displacedConnectionRunID, runID)
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        var staleGenerationContext = try XCTUnwrap(
+            window.mcpServer.tabContextByConnectionID[secondConnectionID]
+        )
+        staleGenerationContext.readFileAutoSelectionGeneration &+= 1
+        window.mcpServer.tabContextByConnectionID[secondConnectionID] = staleGenerationContext
+        _ = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageRejectsStaleDisplacedReverseOwner() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let otherRunID = UUID()
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let firstConnectionID = UUID()
+        let secondConnectionID = UUID()
+        let snapshot = ComposeTabState(id: tabID, name: "Agent")
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: secondConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            snapshot: snapshot,
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        XCTAssertEqual(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ),
+            [firstConnectionID]
+        )
+
+        window.mcpServer.connectionIDByRunID[runID] = firstConnectionID
+        window.mcpServer.connectionIDByRunID[otherRunID] = firstConnectionID
+        window.mcpServer.connectionIDToRunID[firstConnectionID] = otherRunID
+        let staleOwnerToken = try XCTUnwrap(window.mcpServer.registerPendingPolicyRunIDMapping(
+            connectionID: secondConnectionID,
+            runID: runID,
+            windowID: window.windowID
+        ))
+
+        XCTAssertEqual(staleOwnerToken.displacedConnectionID, firstConnectionID)
+        XCTAssertEqual(staleOwnerToken.displacedConnectionRunID, otherRunID)
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: secondConnectionID
+            ).isEmpty
+        )
+    }
+
+    @MainActor
+    func testPendingPolicyReadSelectionLineageRejectsCrossTabAndWorkspaceDisplacement() throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let runID = UUID()
+        let firstConnectionID = UUID()
+        let crossTabConnectionID = UUID()
+        let crossWorkspaceConnectionID = UUID()
+        let firstWorkspaceID = UUID()
+        let secondWorkspaceID = UUID()
+        let firstTabID = UUID()
+        let secondTabID = UUID()
+
+        window.mcpServer.installTabContext(
+            clientID: firstConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: firstWorkspaceID,
+            snapshot: ComposeTabState(id: firstTabID, name: "First"),
+            runID: runID,
+            signalRouting: false
+        )
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: crossTabConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: firstWorkspaceID,
+            snapshot: ComposeTabState(id: secondTabID, name: "Second"),
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+        _ = try XCTUnwrap(window.mcpServer.installTabContext(
+            clientID: crossWorkspaceConnectionID.uuidString,
+            clientName: "agent",
+            windowID: window.windowID,
+            workspaceID: secondWorkspaceID,
+            snapshot: ComposeTabState(id: secondTabID, name: "Second Workspace"),
+            runID: runID,
+            signalRouting: false,
+            deferRunIDReplacementForPendingPolicy: true
+        ))
+
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: crossTabConnectionID
+            ).isEmpty
+        )
+        XCTAssertTrue(
+            window.mcpServer.readFileAutoSelectionHandoverPredecessorConnectionIDsForTesting(
+                connectionID: crossWorkspaceConnectionID
+            ).isEmpty
+        )
+    }
+
     func testActiveTabCompatibilityDecisionAllowsOnlyLegacyNonRunScopedCallers() {
         XCTAssertEqual(
             MCPServerViewModel.activeTabCompatibilityFallbackDecision(
@@ -421,6 +699,227 @@ final class TabContextRoutingTests: XCTestCase {
     }
 
     @MainActor
+    func testExactSelectionPersistenceTargetsDuplicateTabInInactiveWorkspaceAndDirtiesOnlyTarget() async throws {
+        let duplicateTabID = UUID()
+        let activeSelection = StoredSelection(selectedPaths: ["/tmp/active-workspace.swift"])
+        let targetSelection = StoredSelection(selectedPaths: ["/tmp/target-before.swift"])
+        let nextSelection = StoredSelection(selectedPaths: ["/tmp/target-after.swift"])
+        let activeWorkspace = WorkspaceModel(
+            name: "Active Workspace",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: duplicateTabID, name: "Duplicate", selection: activeSelection)
+            ],
+            activeComposeTabID: duplicateTabID
+        )
+        let targetWorkspace = WorkspaceModel(
+            name: "Inactive Target Workspace",
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: duplicateTabID, name: "Duplicate", selection: targetSelection)
+            ],
+            activeComposeTabID: duplicateTabID
+        )
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        window.workspaceManager.workspaces = [activeWorkspace, targetWorkspace]
+        await window.workspaceManager.switchWorkspace(
+            to: activeWorkspace,
+            saveState: false,
+            reason: "exactSelectionPersistenceTest"
+        )
+        let activeIdentity = WorkspaceSelectionIdentity(
+            workspaceID: activeWorkspace.id,
+            tabID: duplicateTabID
+        )
+        let targetIdentity = WorkspaceSelectionIdentity(
+            workspaceID: targetWorkspace.id,
+            tabID: duplicateTabID
+        )
+        var activeTab = try XCTUnwrap(window.workspaceManager.composeTab(for: activeIdentity))
+        activeTab.selection = activeSelection
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                activeTab,
+                inWorkspaceID: activeWorkspace.id
+            )
+        )
+        var targetTab = try XCTUnwrap(window.workspaceManager.composeTab(for: targetIdentity))
+        targetTab.selection = targetSelection
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                targetTab,
+                inWorkspaceID: targetWorkspace.id
+            )
+        )
+        let activeVersionBefore = window.workspaceManager.debugStateVersionForWorkspace(activeWorkspace.id)
+        let targetVersionBefore = window.workspaceManager.debugStateVersionForWorkspace(targetWorkspace.id)
+
+        _ = await window.selectionCoordinator.persistSelection(
+            nextSelection,
+            for: targetIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: false
+        )
+
+        XCTAssertEqual(
+            window.workspaceManager.composeTab(for: activeIdentity)?.selection,
+            activeSelection
+        )
+        XCTAssertEqual(window.workspaceManager.composeTab(for: targetIdentity)?.selection, nextSelection)
+        XCTAssertEqual(
+            window.workspaceManager.debugStateVersionForWorkspace(activeWorkspace.id),
+            activeVersionBefore
+        )
+        XCTAssertGreaterThan(
+            window.workspaceManager.debugStateVersionForWorkspace(targetWorkspace.id),
+            targetVersionBefore
+        )
+    }
+
+    @MainActor
+    func testDelayedPropagationDoesNotCrossPeerWindowReplacementOrReopen() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let sourceWindow = WindowState()
+        let originalPeerWindow = WindowState()
+        let reopenedPeerWindow = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+
+        WindowStatesManager.shared.registerWindowState(sourceWindow)
+        WindowStatesManager.shared.registerWindowState(originalPeerWindow)
+        defer {
+            WindowStatesManager.shared.unregisterWindowState(reopenedPeerWindow)
+            WindowStatesManager.shared.unregisterWindowState(originalPeerWindow)
+            WindowStatesManager.shared.unregisterWindowState(sourceWindow)
+        }
+
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let stale = StoredSelection(selectedPaths: ["/tmp/stale-pre-close.swift"])
+        let reopenedCanonical = StoredSelection(selectedPaths: ["/tmp/reopened-canonical.swift"])
+        await installSelectionWorkspace(
+            in: sourceWindow,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: stale,
+            name: "Source"
+        )
+        await installSelectionWorkspace(
+            in: originalPeerWindow,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: initial,
+            name: "Original Peer"
+        )
+
+        let registration = sourceWindow.workspaceManager.registerMCPSelectionSourceMutation(for: identity)
+        XCTAssertEqual(
+            registration.peerHostIDs,
+            [originalPeerWindow.workspaceManager.mcpSelectionPropagationHostID]
+        )
+
+        originalPeerWindow.beginClose()
+        WindowStatesManager.shared.unregisterWindowState(originalPeerWindow)
+        await installSelectionWorkspace(
+            in: reopenedPeerWindow,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: reopenedCanonical,
+            name: "Reopened Peer"
+        )
+        WindowStatesManager.shared.registerWindowState(reopenedPeerWindow)
+
+        await sourceWindow.workspaceManager.propagateMCPSelectionToPeerHosts(
+            MCPSelectionPeerPropagation(
+                identity: identity,
+                selection: stale,
+                sourceRevision: registration.sourceRevision,
+                peerHostIDs: registration.peerHostIDs,
+                mirrorToUIIfActive: true
+            )
+        )
+
+        XCTAssertEqual(
+            reopenedPeerWindow.workspaceManager.composeTab(for: identity)?.selection,
+            reopenedCanonical
+        )
+        XCTAssertNotEqual(
+            reopenedPeerWindow.workspaceManager.mcpSelectionPropagationHostID,
+            originalPeerWindow.workspaceManager.mcpSelectionPropagationHostID
+        )
+    }
+
+    @MainActor
+    func testPropagationSkipsPeerAfterClosingFinalSaveBoundaryBegins() async {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let sourceWindow = WindowState()
+        let closingPeerWindow = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+
+        WindowStatesManager.shared.registerWindowState(sourceWindow)
+        WindowStatesManager.shared.registerWindowState(closingPeerWindow)
+        defer {
+            WindowStatesManager.shared.unregisterWindowState(closingPeerWindow)
+            WindowStatesManager.shared.unregisterWindowState(sourceWindow)
+        }
+
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        let sourceSelection = StoredSelection(selectedPaths: ["/tmp/source.swift"])
+        let peerSelection = StoredSelection(selectedPaths: ["/tmp/peer-at-close.swift"])
+        let delayedSelection = StoredSelection(selectedPaths: ["/tmp/delayed-after-close.swift"])
+        await installSelectionWorkspace(
+            in: sourceWindow,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: sourceSelection,
+            name: "Source"
+        )
+        await installSelectionWorkspace(
+            in: closingPeerWindow,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: peerSelection,
+            name: "Closing Peer"
+        )
+
+        let registration = sourceWindow.workspaceManager.registerMCPSelectionSourceMutation(for: identity)
+        XCTAssertEqual(
+            registration.peerHostIDs,
+            [closingPeerWindow.workspaceManager.mcpSelectionPropagationHostID]
+        )
+
+        closingPeerWindow.beginClose()
+        XCTAssertTrue(closingPeerWindow.isClosing)
+        let selectionAtCloseBoundary = closingPeerWindow.workspaceManager.composeTab(for: identity)?.selection
+
+        await sourceWindow.workspaceManager.propagateMCPSelectionToPeerHosts(
+            MCPSelectionPeerPropagation(
+                identity: identity,
+                selection: delayedSelection,
+                sourceRevision: registration.sourceRevision,
+                peerHostIDs: registration.peerHostIDs,
+                mirrorToUIIfActive: true
+            )
+        )
+
+        XCTAssertEqual(selectionAtCloseBoundary, peerSelection)
+        XCTAssertEqual(
+            closingPeerWindow.workspaceManager.composeTab(for: identity)?.selection,
+            selectionAtCloseBoundary
+        )
+    }
+
+    @MainActor
     func testMCPSelectionPersistenceWritesInactiveTabThroughCoordinator() async {
         let activeTabID = UUID()
         let inactiveTabID = UUID()
@@ -449,6 +948,7 @@ final class TabContextRoutingTests: XCTestCase {
         let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
             nextSelection,
             for: inactiveTabID,
+            workspaceID: manager.activeWorkspace?.id,
             selectionCoordinator: coordinator
         )
 
@@ -483,11 +983,46 @@ final class TabContextRoutingTests: XCTestCase {
         let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
             inactiveSelection,
             for: inactiveTabID,
+            workspaceID: manager.activeWorkspace?.id,
             selectionCoordinator: coordinator
         )
 
         XCTAssertEqual(result, .unchanged)
         XCTAssertEqual(manager.composeTab(with: inactiveTabID)?.selection, inactiveSelection)
+        XCTAssertTrue(changes.isEmpty)
+    }
+
+    @MainActor
+    func testMCPSelectionPersistenceUnchangedActiveSelectionReconcilesStaleUI() async {
+        let activeTabID = UUID()
+        let canonical = StoredSelection(selectedPaths: ["/tmp/canonical.swift"], codemapAutoEnabled: false)
+        let staleUI = StoredSelection(selectedPaths: ["/tmp/stale-ui.swift"])
+        let manager = FakeMCPSelectionManager(
+            tabs: [ComposeTabState(id: activeTabID, name: "Active", selection: canonical)],
+            activeTabID: activeTabID
+        )
+        manager.mirroredSelection = staleUI
+        let coordinator = WorkspaceSelectionCoordinator(
+            workspaceManager: manager,
+            store: WorkspaceFileContextStore()
+        )
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes
+            .sink { changes.append($0) }
+            .store(in: &cancellables)
+
+        let result = await MCPServerViewModel.persistMCPSelectionThroughCoordinator(
+            canonical,
+            for: activeTabID,
+            workspaceID: manager.activeWorkspace?.id,
+            selectionCoordinator: coordinator,
+            mirrorToUIIfActive: true
+        )
+
+        XCTAssertEqual(result, .unchanged)
+        XCTAssertEqual(manager.composeTab(with: activeTabID)?.selection, canonical)
+        XCTAssertEqual(manager.mirrorAttempts, [canonical])
+        XCTAssertEqual(manager.mirroredSelection, canonical)
         XCTAssertTrue(changes.isEmpty)
     }
 
@@ -517,6 +1052,7 @@ final class TabContextRoutingTests: XCTestCase {
         let result = await MCPServerViewModel.persistMCPSelectionAndVerifyThroughCoordinator(
             requestedSelection,
             for: inactiveTabID,
+            workspaceID: manager.activeWorkspace?.id,
             selectionCoordinator: coordinator
         )
 
@@ -776,6 +1312,44 @@ final class TabContextRoutingTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    private func installSelectionWorkspace(
+        in window: WindowState,
+        workspaceID: UUID,
+        tabID: UUID,
+        selection: StoredSelection,
+        name: String
+    ) async {
+        let workspace = WorkspaceModel(
+            id: workspaceID,
+            name: name,
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: [
+                ComposeTabState(id: tabID, name: "Agent", selection: selection)
+            ],
+            activeComposeTabID: tabID
+        )
+        window.workspaceManager.workspaces = [workspace]
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "selectionPropagationLifecycleTest"
+        )
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        guard var installedTab = window.workspaceManager.composeTab(for: identity) else {
+            XCTFail("Expected installed selection tab")
+            return
+        }
+        installedTab.selection = selection
+        XCTAssertTrue(
+            window.workspaceManager.updateComposeTabStoredOnly(
+                installedTab,
+                inWorkspaceID: workspaceID
+            )
+        )
+    }
+
     private func selectedPaths(from value: Value) throws -> [String] {
         let object = try XCTUnwrap(value.objectValue)
         let files = try XCTUnwrap(object["files"]?.arrayValue)
@@ -862,8 +1436,11 @@ final class TabContextRoutingTests: XCTestCase {
 @MainActor
 private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    private(set) var selectionMirrorContextRevision: UInt64 = 0
 
     private let ignoreStoredOnlyUpdates: Bool
+    private(set) var mirrorAttempts: [StoredSelection] = []
+    var mirroredSelection: StoredSelection?
 
     init(tabs: [ComposeTabState], activeTabID: UUID, ignoreStoredOnlyUpdates: Bool = false) {
         self.ignoreStoredOnlyUpdates = ignoreStoredOnlyUpdates
@@ -879,15 +1456,34 @@ private final class FakeMCPSelectionManager: WorkspaceSelectionHost {
         activeWorkspace?.composeTabs.first(where: { $0.id == id })
     }
 
+    func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
+        guard activeWorkspace?.id == identity.workspaceID else { return nil }
+        return activeWorkspace?.composeTabs.first(where: { $0.id == identity.tabID })
+    }
+
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool) {}
 
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState) {
-        guard !ignoreStoredOnlyUpdates else { return }
-        guard var workspace = activeWorkspace,
-              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
+    func applySelectionMirrorAttempt(
+        _ selection: StoredSelection,
+        forTabID tabID: UUID,
+        workspaceID: UUID
+    ) async {
+        guard activeWorkspace?.id == workspaceID,
+              activeWorkspace?.activeComposeTabID == tabID
         else { return }
+        mirrorAttempts.append(selection)
+        mirroredSelection = selection
+    }
+
+    func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
+        guard !ignoreStoredOnlyUpdates else { return false }
+        guard var workspace = activeWorkspace,
+              workspace.id == workspaceID,
+              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
+        else { return false }
         workspace.composeTabs[index] = tab
         activeWorkspace = workspace
+        return true
     }
 }
 

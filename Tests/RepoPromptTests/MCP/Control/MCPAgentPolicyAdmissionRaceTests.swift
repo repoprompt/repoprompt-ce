@@ -339,6 +339,278 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         #endif
     }
 
+    func testAuthoritativePIDOwnedAgentModeRouteReplacesLiveAffinityForEveryRole() async throws {
+        #if DEBUG
+            let roles: [AgentModelCatalog.TaskLabelKind?] = [nil] + AgentModelCatalog.TaskLabelKind.allCases
+                .map(Optional.some)
+            for (index, role) in roles.enumerated() {
+                let sessionKey = "authoritative-role-agnostic-\(index)-\(UUID().uuidString)"
+                let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61100 + index * 2)
+                let runID = UUID()
+                let connectionID = UUID()
+                let windowID = 61101 + index * 2
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: UUID(),
+                    windowID: windowID,
+                    taskLabelKind: role
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+
+                let result = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: sessionKey,
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: false
+                )
+
+                XCTAssertEqual(result.outcome, "applied", "role=\(role?.rawValue ?? "nil")")
+                XCTAssertEqual(result.runID, runID)
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: windowID,
+                    expectedPID: getpid()
+                )
+                await cleanup(
+                    runID: affinity.runID,
+                    connectionID: affinity.connectionID,
+                    windowID: affinity.windowID,
+                    expectedPID: nil
+                )
+            }
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testAuthoritativeRouteCannotReplaceLiveAffinityForMismatchedPID() async throws {
+        #if DEBUG
+            let expectedTree = try makeSleepingProcessTree()
+            let unrelatedTree = try makeSleepingProcessTree()
+            defer {
+                expectedTree.terminate()
+                unrelatedTree.terminate()
+            }
+            let sessionKey = "authoritative-pid-mismatch-\(UUID().uuidString)"
+            let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61120)
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = 61121
+            await installAuthoritativePolicy(runID: runID, tabID: UUID(), windowID: windowID)
+            await manager.registerExpectedAgentPID(expectedTree.parentPID, for: clientName, runID: runID)
+
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(unrelatedTree.childPID),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.05,
+                requireRunRouting: false
+            )
+
+            XCTAssertEqual(result.outcome, "rejected:ownership_timeout")
+            let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pending.contains { $0.runID == runID })
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID,
+                expectedPID: expectedTree.parentPID
+            )
+            await cleanup(
+                runID: affinity.runID,
+                connectionID: affinity.connectionID,
+                windowID: affinity.windowID,
+                expectedPID: nil
+            )
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testStaleLifecycleCannotReplaceLiveAffinityWithAuthoritativeRoute() async throws {
+        #if DEBUG
+            let sessionKey = "authoritative-stale-generation-\(UUID().uuidString)"
+            let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61122)
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = 61123
+            await installAuthoritativePolicy(runID: runID, tabID: UUID(), windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false,
+                expectedLifecycleGeneration: .max
+            )
+
+            XCTAssertEqual(result.outcome, "rejected:session_token_bound_to_other_run")
+            let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pending.contains { $0.runID == runID })
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await cleanup(
+                runID: affinity.runID,
+                connectionID: affinity.connectionID,
+                windowID: affinity.windowID,
+                expectedPID: nil
+            )
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testUnreservedAgentModePolicyCannotReplaceLiveAffinity() async throws {
+        #if DEBUG
+            let sessionKey = "authoritative-unreserved-\(UUID().uuidString)"
+            let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61124)
+            let runID = UUID()
+            let connectionID = UUID()
+            let windowID = 61125
+            await installAuthoritativePolicy(
+                runID: runID,
+                tabID: UUID(),
+                windowID: windowID,
+                oneShot: false
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+
+            XCTAssertEqual(result.outcome, "rejected:session_token_bound_to_other_run")
+            let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pending.contains { $0.runID == runID })
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await cleanup(
+                runID: affinity.runID,
+                connectionID: affinity.connectionID,
+                windowID: affinity.windowID,
+                expectedPID: nil
+            )
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testSameTokenReconnectWithoutConsumablePolicyRestoresLiveAffinity() async throws {
+        #if DEBUG
+            let sessionKey = "ordinary-live-affinity-reconnect-\(UUID().uuidString)"
+            let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61126)
+            let reconnectConnectionID = UUID()
+
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: reconnectConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.05,
+                requireRunRouting: false
+            )
+
+            XCTAssertEqual(result.outcome, "fallback")
+            let restoredRunID = await manager.runIDForConnection(reconnectConnectionID)
+            XCTAssertEqual(restoredRunID, affinity.runID)
+            await manager.removeConnection(reconnectConnectionID)
+            await cleanup(
+                runID: affinity.runID,
+                connectionID: affinity.connectionID,
+                windowID: affinity.windowID,
+                expectedPID: nil
+            )
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testAuthoritativeRouteFailurePreservesPriorLiveAffinityForReconnect() async throws {
+        #if DEBUG
+            let sessionKey = "authoritative-route-rollback-\(UUID().uuidString)"
+            let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61127)
+            let childRunID = UUID()
+            let childConnectionID = UUID()
+            let missingWindowID = 61997
+            await installAuthoritativePolicy(
+                runID: childRunID,
+                tabID: UUID(),
+                windowID: missingWindowID
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: childRunID)
+
+            let failedChild = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: childConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+
+            XCTAssertEqual(failedChild.outcome, "rejected:route_mapping_failed")
+            let pendingAfterFailure = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertTrue(pendingAfterFailure.contains { $0.runID == childRunID })
+
+            await cleanup(
+                runID: childRunID,
+                connectionID: childConnectionID,
+                windowID: missingWindowID,
+                expectedPID: getpid()
+            )
+
+            let reconnectConnectionID = UUID()
+            let reconnect = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: reconnectConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.05,
+                requireRunRouting: false
+            )
+
+            XCTAssertEqual(reconnect.outcome, "fallback")
+            let restoredRunID = await manager.runIDForConnection(reconnectConnectionID)
+            XCTAssertEqual(restoredRunID, affinity.runID)
+            await manager.removeConnection(reconnectConnectionID)
+            await cleanup(
+                runID: affinity.runID,
+                connectionID: affinity.connectionID,
+                windowID: affinity.windowID,
+                expectedPID: nil
+            )
+        #else
+            throw XCTSkip("Token/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     func testRouteMappingFailureRejectsAndRestoresOneShotPolicy() async throws {
         #if DEBUG
             let runID = UUID()
@@ -1084,6 +1356,53 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 allowsAgentExternalControlTools: false,
                 requiresExpectedAgentPID: true
             )
+        }
+
+        private func installAuthoritativePolicy(
+            runID: UUID,
+            tabID: UUID,
+            windowID: Int,
+            oneShot: Bool = true,
+            taskLabelKind: AgentModelCatalog.TaskLabelKind? = nil
+        ) async {
+            await manager.installClientConnectionPolicy(
+                for: clientName,
+                windowID: windowID,
+                restrictedTools: AgentModeMCPToolPolicy.restrictedTools,
+                oneShot: oneShot,
+                reason: "Authoritative PID-owned route test",
+                ttl: 10,
+                tabID: tabID,
+                runID: runID,
+                additionalTools: nil,
+                purpose: .agentModeRun,
+                taskLabelKind: taskLabelKind,
+                allowsAgentExternalControlTools: false,
+                requiresExpectedAgentPID: true
+            )
+        }
+
+        private func seedLiveAffinity(
+            sessionKey: String,
+            windowID: Int
+        ) async -> (runID: UUID, connectionID: UUID, windowID: Int) {
+            let runID = UUID()
+            let connectionID = UUID()
+            await installPolicy(runID: runID, windowID: windowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            let result = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+            XCTAssertEqual(result.outcome, "applied")
+            XCTAssertEqual(result.runID, runID)
+            await manager.clearExpectedAgentPID(getpid(), for: clientName, runID: runID)
+            return (runID, connectionID, windowID)
         }
 
         private func cleanup(

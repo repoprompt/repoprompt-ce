@@ -147,6 +147,33 @@ final class WorkspaceGitDiffSelectionResolverTests: XCTestCase {
         XCTAssertEqual(paths, [])
     }
 
+    func testPrimaryGitArtifactsAutoSelectFromGitDataRoot() async throws {
+        let visibleRoot = try makeTemporaryRoot(name: "GitArtifactSelectionVisible")
+        let gitDataRoot = try makeTemporaryRoot(name: "GitArtifactSelectionData")
+        let visibleFile = visibleRoot.appendingPathComponent("Visible.swift")
+        let mapFile = gitDataRoot.appendingPathComponent("repos/repo/snapshot/MAP.txt")
+        let patchFile = gitDataRoot.appendingPathComponent("repos/repo/snapshot/diff/all.patch")
+        try FileSystemTestSupport.write("visible\n", to: visibleFile)
+        try FileSystemTestSupport.write("map\n", to: mapFile)
+        try FileSystemTestSupport.write("patch\n", to: patchFile)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: visibleRoot.path)
+        _ = try await store.loadRoot(path: gitDataRoot.path, kind: .workspaceGitData)
+        let existing = StoredSelection(selectedPaths: [visibleFile.path], codemapAutoEnabled: false)
+
+        let result = await WorkspaceGitDiffArtifactSelectionService(store: store).addPrimaryArtifacts(
+            existing: existing,
+            paths: [mapFile.path, patchFile.path]
+        )
+
+        XCTAssertEqual(
+            Set(result.selection.selectedPaths),
+            Set([visibleFile.standardizedFileURL.path, mapFile.standardizedFileURL.path, patchFile.standardizedFileURL.path])
+        )
+        XCTAssertEqual(result.autoSelectedPaths, [mapFile.path, patchFile.path])
+    }
+
     private func makeTemporaryRoot(name: String) throws -> URL {
         try temporaryRoots.makeRoot(suiteName: name)
     }

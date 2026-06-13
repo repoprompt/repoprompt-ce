@@ -1,5 +1,12 @@
 import Foundation
 
+enum WorkspaceReadableFileResolution {
+    case readable(WorkspaceReadableFileHandle)
+    case folder(displayPath: String)
+    case issue(PathResolutionIssue)
+    case noCandidate
+}
+
 struct WorkspaceReadableFileService {
     let store: WorkspaceFileContextStore
     let homeDirectoryURL: URL
@@ -16,6 +23,14 @@ struct WorkspaceReadableFileService {
         _ userPath: String,
         fallbackScope: WorkspaceLookupRootScope
     ) async throws {
+        let roots = await store.rootRefs(scope: fallbackScope)
+        try await awaitFreshnessForExplicitRequest(userPath, rootRefs: roots)
+    }
+
+    func awaitFreshnessForExplicitRequest(
+        _ userPath: String,
+        rootRefs: [WorkspaceRootRef]
+    ) async throws {
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.ReadFile.explicitFreshnessBegan,
@@ -24,7 +39,7 @@ struct WorkspaceReadableFileService {
         let freshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitIngressFreshnessWait)
         let samples = await store.awaitAppliedIngressForExplicitRequest(
             userPath: userPath,
-            fallbackScope: fallbackScope
+            fallbackRootRefs: rootRefs
         )
         try Task.checkCancellation()
         EditFlowPerf.end(
@@ -78,10 +93,36 @@ struct WorkspaceReadableFileService {
         profile: PathLocateProfile = .mcpRead,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceReadableFileHandle? {
+        let roots = await store.rootRefs(scope: rootScope)
+        let resolution = await resolveReadFileRequest(
+            userPath,
+            profile: profile,
+            rootScope: rootScope,
+            rootRefs: roots
+        )
+        guard case let .readable(handle) = resolution else { return nil }
+        return handle
+    }
+
+    func resolveReadFileRequest(
+        _ userPath: String,
+        profile: PathLocateProfile,
+        rootScope: WorkspaceLookupRootScope,
+        rootRefs roots: [WorkspaceRootRef]
+    ) async -> WorkspaceReadableFileResolution {
         let trimmed = normalizedInput(userPath)
-        guard !trimmed.isEmpty else { return nil }
+        guard !trimmed.isEmpty else { return .issue(.emptyInput) }
+
+        if let issue = await store.exactPathResolutionIssue(
+            for: trimmed,
+            kind: .either,
+            rootRefs: roots
+        ) {
+            return .issue(issue)
+        }
+
         let exactCatalogLookupAwait = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait)
-        let exactCatalogLookup = await store.lookupCatalogFileForExplicitRequest(trimmed, rootScope: rootScope)
+        let exactCatalogLookup = await store.lookupCatalogFileForExplicitRequest(trimmed, rootRefs: roots)
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.exactCatalogLookupAwait,
             exactCatalogLookupAwait,
@@ -100,14 +141,42 @@ struct WorkspaceReadableFileService {
         )
         switch exactCatalogLookup {
         case let .matched(file):
-            return .workspace(file)
+            return .readable(.workspace(file))
         case .ambiguous, .blocked:
-            return nil
+            return .noCandidate
         case .noCandidate:
             break
         }
+
+        let folderResolution = await store.resolveFolderInput(
+            trimmed,
+            rootScope: rootScope,
+            profile: profile,
+            rootRefs: roots,
+            validateIssue: false,
+            allowGeneralLookupFallback: false
+        )
+        if let issue = folderResolution.issue {
+            return .issue(issue)
+        }
+        if let folder = folderResolution.folder {
+            let displayPath = folderResolution.displayPath
+                ?? ClientPathFormatter.displayAbsolutePath(
+                    fullPath: folder.standardizedFullPath,
+                    visibleRoots: roots
+                )
+            return .folder(displayPath: displayPath)
+        }
+
+        if let externalFolderPath = resolveAlwaysReadableExternalFolderDisplayPath(trimmed) {
+            return .folder(displayPath: externalFolderPath)
+        }
+
         let explicitMaterialization = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.explicitMaterialization)
-        let materialization = try? await store.materializeExplicitlyRequestedFile(trimmed, rootScope: rootScope)
+        let materialization = try? await store.materializeExplicitlyRequestedFile(
+            trimmed,
+            rootRefs: roots
+        )
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.explicitMaterialization,
             explicitMaterialization,
@@ -128,25 +197,46 @@ struct WorkspaceReadableFileService {
         )
         switch materialization {
         case let .some(.materialized(file)):
-            return .workspace(file)
+            return .readable(.workspace(file))
         case .some(.ambiguous), .some(.blocked):
-            return nil
+            return .noCandidate
         case .some(.noCandidate), .none:
             break
         }
+
         let generalLookupFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.generalLookupFallback)
-        let workspaceFile = await store.lookupPath(
-            WorkspacePathLookupRequest(userPath: trimmed, profile: profile, rootScope: rootScope)
-        )?.file
+        let lookup = await store.lookupPath(
+            WorkspacePathLookupRequest(
+                userPath: trimmed,
+                profile: profile,
+                rootScope: rootScope
+            ),
+            rootRefs: roots
+        )
         EditFlowPerf.end(
             EditFlowPerf.Stage.ReadFile.generalLookupFallback,
             generalLookupFallback,
-            EditFlowPerf.Dimensions(outcome: workspaceFile == nil ? "noCandidate" : "matched")
+            EditFlowPerf.Dimensions(outcome: {
+                if lookup?.file != nil { return "file" }
+                if lookup?.folder != nil { return "folder" }
+                return "noCandidate"
+            }())
         )
-        if let workspaceFile {
-            return .workspace(workspaceFile)
+        if let file = lookup?.file {
+            return .readable(.workspace(file))
         }
-        guard trimmed.hasPrefix("/") else { return nil }
+        if let folder = lookup?.folder {
+            let displayPath = roots.first(where: { $0.id == folder.rootID }).map { root in
+                ClientPathFormatter.displayPath(
+                    root: root,
+                    relativePath: folder.standardizedRelativePath,
+                    visibleRoots: roots
+                )
+            } ?? folder.standardizedFullPath
+            return .folder(displayPath: displayPath)
+        }
+
+        guard trimmed.hasPrefix("/") else { return .noCandidate }
         let externalFileFallback = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.externalFileFallback)
         let externalFile = resolveAlwaysReadableExternalFile(atAbsolutePath: trimmed)
         EditFlowPerf.end(
@@ -154,7 +244,7 @@ struct WorkspaceReadableFileService {
             externalFileFallback,
             EditFlowPerf.Dimensions(outcome: externalFile == nil ? "noCandidate" : "external")
         )
-        return externalFile.map { .external($0) }
+        return externalFile.map { .readable(.external($0)) } ?? .noCandidate
     }
 
     func resolveAlwaysReadableExternalFolderDisplayPath(_ userPath: String) -> String? {
@@ -182,12 +272,24 @@ struct WorkspaceReadableFileService {
 
     func readAlwaysReadableExternalFile(_ file: WorkspaceExternalReadableFile) async throws -> String {
         let path = file.absolutePath
+        let workRecorder = MCPToolWorkCountDiagnostics.readFileExternalRecorder()
         return try await Task.detached(priority: .userInitiated) {
             let url = URL(fileURLWithPath: path)
             let data = try Data(contentsOf: url)
-            if let decoded = String(data: data, encoding: .utf8) { return decoded }
-            if let decoded = String(data: data, encoding: .unicode) { return decoded }
-            return String(decoding: data, as: UTF8.self)
+            let decodeStart = DispatchTime.now().uptimeNanoseconds
+            let decoded: String = if let utf8 = String(data: data, encoding: .utf8) {
+                utf8
+            } else if let unicode = String(data: data, encoding: .unicode) {
+                unicode
+            } else {
+                String(decoding: data, as: UTF8.self)
+            }
+            let decodeEnd = DispatchTime.now().uptimeNanoseconds
+            workRecorder(
+                data.count,
+                Int(clamping: decodeEnd >= decodeStart ? (decodeEnd - decodeStart) / 1000 : 0)
+            )
+            return decoded
         }.value
     }
 

@@ -2305,6 +2305,16 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
+        guard let index = currentComposeTabs.firstIndex(where: { $0.id == tabID }),
+              currentComposeTabs[index].selection != selection
+        else { return }
+        var updatedTabs = currentComposeTabs
+        updatedTabs[index].selection = selection
+        currentComposeTabs = updatedTabs
+    }
+
+    @MainActor
     func loadComposeTabsFromWorkspace(_ workspace: WorkspaceModel, syncPromptText: Bool = false) {
         currentComposeTabs = workspace.composeTabs
         activeComposeTabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id

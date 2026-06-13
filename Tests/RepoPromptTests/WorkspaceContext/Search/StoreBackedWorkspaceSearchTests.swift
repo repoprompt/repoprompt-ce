@@ -182,6 +182,21 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         XCTAssertFalse(StoreBackedWorkspaceSearch.requiresBroadSearchAdmission(pattern: "needle", mode: .content, paths: ["Sources/A.swift"]))
     }
 
+    func testMutationAfterCatalogCrawlBeforeWatcherStartIsVisibleToFreshSearch() async throws {
+        let root = try makeTemporaryRoot(name: "WatcherStartupReplay")
+        try write("let seed = true\n", to: root.appendingPathComponent("Seed.swift"))
+        let lateFileURL = root.appendingPathComponent("Late.swift")
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        try write("let startupGapNeedle = true\n", to: lateFileURL)
+        try await store.startWatchingRoot(id: record.id)
+
+        let result = try await searchContent(pattern: "startupGapNeedle", store: store)
+        XCTAssertEqual(result.matches?.map(\.filePath), [lateFileURL.path])
+        await store.stopWatchingRoot(id: record.id)
+    }
+
     #if DEBUG
         func testSameStoreBroadLaneRunsOneQueuesOneAndRejectsThirdWhilePreservingResults() async throws {
             let root = try makeTemporaryRoot(name: "BroadLaneOneActiveOneQueued")

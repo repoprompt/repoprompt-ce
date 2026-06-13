@@ -8,16 +8,18 @@ struct GeneratedOracleExportFileWriter {
     func write(path rawPath: String, content: String, destination: OracleExportDestination) async throws -> String {
         let resolvedPath = try resolvedAbsoluteExportPath(rawPath, destination: destination)
         let destinationRootPath = StandardizedPath.absolute(destination.primaryRootPath)
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        guard let visibleRoot = visibleRoots.first(where: { $0.standardizedFullPath == destinationRootPath }) else {
-            let loadedRoots = visibleRoots.map(\.standardizedFullPath).joined(separator: ", ")
+        let readableRoots = await store.rootRefs(scope: destination.rootScope)
+        guard let readableRoot = readableRoots.first(where: { $0.standardizedFullPath == destinationRootPath }) else {
+            let loadedRoots = readableRoots.map(\.standardizedFullPath).joined(separator: ", ")
             throw MCPError.invalidParams(
-                "Cannot create generated Oracle export at '\(resolvedPath)': workspace primary root '\(destinationRootPath)' is not loaded in the current read_file workspace scope. Loaded visible roots: \(loadedRoots.isEmpty ? "none" : loadedRoots)."
+                "Cannot create generated Oracle export at '\(resolvedPath)': workspace primary root '\(destinationRootPath)' is not loaded in the current read_file workspace scope. Loaded readable roots: \(loadedRoots.isEmpty ? "none" : loadedRoots)."
             )
         }
-        guard resolvedPath == visibleRoot.standardizedFullPath || StandardizedPath.isDescendant(resolvedPath, of: visibleRoot.standardizedFullPath) else {
+        guard resolvedPath == readableRoot.standardizedFullPath
+            || StandardizedPath.isDescendant(resolvedPath, of: readableRoot.standardizedFullPath)
+        else {
             throw MCPError.invalidParams(
-                "Cannot create generated Oracle export at '\(resolvedPath)': target path is outside the visible workspace root '\(visibleRoot.standardizedFullPath)'."
+                "Cannot create generated Oracle export at '\(resolvedPath)': target path is outside the current read_file workspace root '\(readableRoot.standardizedFullPath)'."
             )
         }
 
@@ -31,7 +33,7 @@ struct GeneratedOracleExportFileWriter {
             let writeResult = try await mutationService.createFileWithPostcondition(
                 userPath: resolvedPath,
                 content: content,
-                rootScope: .visibleWorkspace,
+                rootScope: destination.rootScope,
                 pathResolutionPolicy: .literalPreferredIfStronger
             )
 
@@ -48,20 +50,36 @@ struct GeneratedOracleExportFileWriter {
 
             _ = await store.awaitAppliedIngressForExplicitRequest(
                 userPath: resolvedPath,
-                fallbackScope: .visibleWorkspace
+                fallbackScope: destination.rootScope
             )
-            try await assertReadFileCanReadExport(path: resolvedPath, expectedContent: content)
+            try await assertReadFileCanReadExport(
+                path: resolvedPath,
+                expectedContent: content,
+                rootScope: destination.rootScope
+            )
             return resolvedPath
         } catch let error as MCPError {
-            await cleanupCreatedExportIfPresent(path: resolvedPath, root: visibleRoot)
+            await cleanupCreatedExportIfPresent(
+                path: resolvedPath,
+                root: readableRoot,
+                rootScope: destination.rootScope
+            )
             throw error
         } catch let error as FileManagerError {
-            await cleanupCreatedExportIfPresent(path: resolvedPath, root: visibleRoot)
+            await cleanupCreatedExportIfPresent(
+                path: resolvedPath,
+                root: readableRoot,
+                rootScope: destination.rootScope
+            )
             throw MCPError.invalidParams(
                 "Cannot create generated Oracle export at '\(resolvedPath)': \(error.localizedDescription)"
             )
         } catch {
-            await cleanupCreatedExportIfPresent(path: resolvedPath, root: visibleRoot)
+            await cleanupCreatedExportIfPresent(
+                path: resolvedPath,
+                root: readableRoot,
+                rootScope: destination.rootScope
+            )
             throw MCPError.invalidParams(
                 "Cannot create generated Oracle export at '\(resolvedPath)': \(error.localizedDescription)"
             )
@@ -85,7 +103,11 @@ struct GeneratedOracleExportFileWriter {
         return resolvedPath
     }
 
-    private func cleanupCreatedExportIfPresent(path resolvedPath: String, root: WorkspaceRootRef) async {
+    private func cleanupCreatedExportIfPresent(
+        path resolvedPath: String,
+        root: WorkspaceRootRef,
+        rootScope: WorkspaceLookupRootScope
+    ) async {
         guard FileManager.default.fileExists(atPath: resolvedPath) else { return }
         try? FileManager.default.removeItem(atPath: resolvedPath)
         let rootPrefix = root.standardizedFullPath.hasSuffix("/") ? root.standardizedFullPath : root.standardizedFullPath + "/"
@@ -94,16 +116,20 @@ struct GeneratedOracleExportFileWriter {
         await store.replayObservedFileSystemDeltas(rootID: root.id, deltas: [.fileRemoved(relativePath)])
         _ = await store.awaitAppliedIngressForExplicitRequest(
             userPath: resolvedPath,
-            fallbackScope: .visibleWorkspace
+            fallbackScope: rootScope
         )
     }
 
-    private func assertReadFileCanReadExport(path resolvedPath: String, expectedContent: String) async throws {
+    private func assertReadFileCanReadExport(
+        path resolvedPath: String,
+        expectedContent: String,
+        rootScope: WorkspaceLookupRootScope
+    ) async throws {
         let readableService = WorkspaceReadableFileService(store: store)
         let readable = await readableService.resolveReadableFile(
             resolvedPath,
             profile: .mcpRead,
-            rootScope: .visibleWorkspace
+            rootScope: rootScope
         )
         guard case let .workspace(file) = readable else {
             throw MCPError.invalidParams(

@@ -411,9 +411,36 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
     #if DEBUG
         struct RunTestHooks {
+            typealias MCPFollowUpModelSelection = (
+                model: AIModel,
+                chatPresetID: UUID?,
+                mcpControlInfo: String?
+            )
+            typealias MCPFollowUpRunner = @MainActor @Sendable (
+                _ mode: HeadlessMode,
+                _ prompt: String,
+                _ selection: StoredSelection
+            ) async throws -> ChatSendReply
+
             let beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?
             let providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?
             let teardownCompleted: ((_ runID: UUID) -> Void)?
+            let resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)?
+            let runMCPFollowUp: MCPFollowUpRunner?
+
+            init(
+                beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
+                providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?,
+                teardownCompleted: ((_ runID: UUID) -> Void)?,
+                resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)? = nil,
+                runMCPFollowUp: MCPFollowUpRunner? = nil
+            ) {
+                self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
+                self.providerEventDisposition = providerEventDisposition
+                self.teardownCompleted = teardownCompleted
+                self.resolveMCPFollowUpModel = resolveMCPFollowUpModel
+                self.runMCPFollowUp = runMCPFollowUp
+            }
         }
 
         private var runTestHooks: RunTestHooks?
@@ -1546,7 +1573,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         modelOverrideRaw: String? = nil,
         responseType: String? = nil,
         planModelName: String? = nil,
-        mcpControlToken: UUID
+        mcpControlToken: UUID,
+        progressReporter: ContextBuilderMCPProgressReporter? = nil
     ) async throws -> ContextBuilderRunSnapshot {
         let session = session(for: tabID)
         if lastProcessedTabID != tabID {
@@ -1678,7 +1706,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     agentKind: runAgent,
                     modelRaw: runModelRaw,
                     continuation: continuation,
-                    restoreConfiguration: restoreConfiguration
+                    restoreConfiguration: restoreConfiguration,
+                    progressReporter: progressReporter
                 )
 
                 guard runRegistry.register(record) else {
@@ -1749,6 +1778,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let task = Task { @MainActor [weak self, weak record] in
             guard let self, let record else { return }
             let outcome = await performContextBuilderAgentRun(record: record)
+            await record.reportProgress(.runFinalization)
             finalizeContextBuilderRun(
                 record,
                 outcome: outcome,
@@ -2461,32 +2491,55 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let agentConnections = await agentConnectionIDs(for: runID, agent: agent)
         guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else { return false }
 
-        for cid in agentConnections {
-            guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else { return false }
-            debugLog("commitTabContextForAgent: terminating agent connection \(cid) runID=\(runID)")
-            await ServerNetworkManager.shared.terminateConnection(
-                cid,
-                reason: .runCompleted,
-                message: "context builder run completed successfully"
-            )
-            guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else { return false }
-
-            await mcpServer.commitAndClearTabContext(
-                connectionID: cid,
-                expectedRunID: runID,
-                isStillCurrent: { [weak self, weak record] in
-                    guard let self, let record else { return false }
-                    return acceptsEvents(from: record)
+        let finalizedConnections = await ContextBuilderChildConnectionFinalizer.finalize(
+            connectionIDs: agentConnections,
+            commitContext: { [weak self, weak record] cid in
+                guard let self, let record,
+                      activeAgentRuns.contains(runID),
+                      acceptsEvents(from: record)
+                else {
+                    return false
                 }
-            )
-            guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else { return false }
-            mcpServer.removeTabContext(
-                forConnectionID: cid,
-                clientName: agentClientName,
-                windowID: nil,
-                runID: runID
-            )
-        }
+                let committed = await mcpServer.commitAndClearTabContext(
+                    connectionID: cid,
+                    expectedRunID: runID,
+                    isStillCurrent: { [weak self, weak record] in
+                        guard let self, let record else { return false }
+                        return acceptsEvents(from: record)
+                    },
+                    progressReporter: record.progressReporter,
+                    deferRunMappingCleanupUntilCaller: true
+                )
+                return committed && activeAgentRuns.contains(runID) && acceptsEvents(from: record)
+            },
+            beforeTerminationRequest: {
+                await record.reportProgress(.childConnectionTermination)
+            },
+            requestTermination: { [weak self] cid in
+                guard let self else { return Task {} }
+                debugLog("commitTabContextForAgent: requesting termination for agent connection \(cid) runID=\(runID)")
+                return Task {
+                    await ServerNetworkManager.shared.terminateConnection(
+                        cid,
+                        reason: .runCompleted,
+                        message: "context builder run completed successfully"
+                    )
+                }
+            },
+            beforeTerminationJoin: {
+                await record.reportProgress(.childConnectionTerminationJoin)
+            },
+            cleanupMapping: { [weak self] cid in
+                guard let self else { return }
+                mcpServer.removeTabContext(
+                    forConnectionID: cid,
+                    clientName: agentClientName,
+                    windowID: nil,
+                    runID: runID
+                )
+            }
+        )
+        guard finalizedConnections else { return false }
 
         guard activeAgentRuns.remove(runID) != nil, acceptsEvents(from: record) else { return false }
         if let clientName = agentClientName {
@@ -3348,54 +3401,39 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    private enum FollowUpFinalizationResult {
-        case finalised
-        case timedOut
-        case cancelled
-    }
-
     private func waitForFollowUpFinalization(
         in oracleViewModel: OracleViewModel,
         queryID: UUID,
         sessionID: UUID,
-        timeout: Duration = .seconds(4 * 60 * 60)
+        progressReporter: ContextBuilderMCPProgressReporter?,
+        activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws {
-        let result = await withTaskGroup(of: FollowUpFinalizationResult.self) { group in
-            group.addTask {
-                do {
-                    try await oracleViewModel.waitUntilMessageFinalised(queryID)
-                    return .finalised
-                } catch is CancellationError {
-                    return .cancelled
-                } catch {
-                    return .cancelled
-                }
-            }
-            group.addTask {
-                do {
-                    try await Task.sleep(for: timeout)
-                    await oracleViewModel.cancelStreaming(in: sessionID)
-                    return .timedOut
-                } catch is CancellationError {
-                    return .cancelled
-                } catch {
-                    return .cancelled
-                }
-            }
-
-            let firstResult = await group.next() ?? .cancelled
-            group.cancelAll()
-            return firstResult
+        let (activityEvents, activityContinuation) = AsyncStream<OracleMessageLifecycleActivityEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(32)
+        )
+        let observerID = oracleViewModel.addMessageLifecycleActivityObserver(for: queryID) { event in
+            activityContinuation.yield(event)
+        }
+        defer {
+            oracleViewModel.removeMessageLifecycleActivityObserver(for: queryID, observerID: observerID)
+            activityContinuation.finish()
         }
 
-        switch result {
-        case .finalised:
-            return
-        case .timedOut:
-            throw ChatToolError.internalError("Follow-up response timed out before finalization")
-        case .cancelled:
-            try Task.checkCancellation()
-        }
+        try await ContextBuilderFollowUpFinalizationMonitor.wait(
+            activityEvents: activityEvents,
+            waitForFinalization: {
+                try await oracleViewModel.waitUntilMessageFinalised(queryID)
+            },
+            cancelStreaming: {
+                await oracleViewModel.cancelStreaming(in: sessionID)
+            },
+            reportPhase: { phase in
+                await progressReporter?(phase)
+            },
+            reportActivity: { phase, message in
+                await activityReporter?(phase, message)
+            }
+        )
     }
 
     /// Unified follow-up generator that always streams in a real chat session.
@@ -3412,7 +3450,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         chatPresetID: UUID?,
         mcpSessionUIState: OracleViewModel.MCPSessionUIState? = nil,
         gitScopeOverride: GitInclusion? = nil,
-        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
+        onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil,
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) async throws -> ChatSendReply {
         let session = session(for: tabID)
 
@@ -3440,6 +3480,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
 
+            await progressReporter?(.payloadPackaging)
             let aiMessage = await promptManager.buildHeadlessAIMessage(
                 from: HeadlessContextSnapshot(
                     tabID: tabID,
@@ -3456,6 +3497,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
 
+            await progressReporter?(.sessionCreationAndPersist)
             let createdSession = try await oracleViewModel.createSession(
                 named: chatName,
                 tabID: tabID,
@@ -3483,6 +3525,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 throw CancellationError()
             }
 
+            await progressReporter?(.messageSend)
             await oracleViewModel.sendMessage(
                 prompt,
                 sessionID: createdSession.id,
@@ -3507,13 +3550,17 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             guard session.isBackgroundPlanGenerating else {
                 throw CancellationError()
             }
+            await progressReporter?(.activeQueryAcquisition)
             guard let queryId = oracleViewModel.activeQueryId(for: createdSession.id) else {
                 throw ChatToolError.internalError("Failed to start follow-up stream")
             }
+            await progressReporter?(.streaming)
             try await waitForFollowUpFinalization(
                 in: oracleViewModel,
                 queryID: queryId,
-                sessionID: createdSession.id
+                sessionID: createdSession.id,
+                progressReporter: progressReporter,
+                activityReporter: activityReporter
             )
             guard session.isBackgroundPlanGenerating else {
                 throw CancellationError()
@@ -3581,10 +3628,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         mode: HeadlessMode,
         prompt: String,
         selection: StoredSelection,
-        gitScopeOverride: GitInclusion? = nil
+        gitScopeOverride: GitInclusion? = nil,
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        activityReporter: ContextBuilderMCPActivityReporter? = nil
     ) async throws -> ChatSendReply {
+        #if DEBUG
+            if let runner = runTestHooks?.runMCPFollowUp {
+                return try await runner(mode, prompt, selection)
+            }
+        #endif
+
         let modeName = mode.mcpModeName
-        let modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(mode: modeName)
+        await progressReporter?(.modelResolution)
+        let modelSelection: (
+            model: AIModel,
+            chatPresetID: UUID?,
+            mcpControlInfo: String?
+        )
+        #if DEBUG
+            if let resolver = runTestHooks?.resolveMCPFollowUpModel {
+                modelSelection = try await resolver(modeName)
+            } else {
+                modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(mode: modeName)
+            }
+        #else
+            modelSelection = try await oracleViewModel.resolveMCPFollowUpModel(mode: modeName)
+        #endif
         let mcpSessionUIState: OracleViewModel.MCPSessionUIState? = {
             guard let mcpModelInfo = modelSelection.mcpControlInfo else { return nil }
             let overrideChatPresetName = modelSelection.chatPresetID
@@ -3606,7 +3675,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,
             mcpSessionUIState: mcpSessionUIState,
-            gitScopeOverride: gitScopeOverride
+            gitScopeOverride: gitScopeOverride,
+            progressReporter: progressReporter,
+            activityReporter: activityReporter
         )
     }
 

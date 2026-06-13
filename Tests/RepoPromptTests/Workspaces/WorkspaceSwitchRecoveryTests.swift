@@ -587,6 +587,43 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertEqual(roots.map(\.standardizedFullPath), [rootB.standardizedFileURL.path])
     }
 
+    func testWatcherActivationFailureDegradesWorkspaceReadiness() async throws {
+        let root = try makeTemporaryDirectory(named: "WatcherActivationFailure")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "let activationFailure = true\n".write(
+            to: root.appendingPathComponent("Activation.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let store = WorkspaceFileContextStore()
+        await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
+        let composition = makeComposition(store: store)
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+        let target = manager.createWorkspace(
+            name: "Watcher Activation Failure \(UUID().uuidString.prefix(8))",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+
+        let result = await manager.switchWorkspace(to: target, saveState: false)
+        XCTAssertTrue(result.didSwitch)
+        guard case let .degraded(workspaceID, _, _, _, failures, _) = manager.workspaceSearchReadinessState else {
+            return XCTFail("Expected watcher activation failure to degrade workspace readiness")
+        }
+        XCTAssertEqual(workspaceID, target.id)
+        XCTAssertEqual(failures.count, 1)
+        XCTAssertEqual(failures.first?.standardizedRootPath, root.path)
+        XCTAssertTrue(failures.first?.errorDescription.contains("Failed to start FSEvent stream") == true)
+
+        let roots = await store.roots()
+        let loadedRoot = try XCTUnwrap(roots.first)
+        let watcherIsActive = try await store.rootWatcherIsActiveForTesting(rootID: loadedRoot.id)
+        XCTAssertFalse(watcherIsActive)
+        await store.setWatcherActivationFailureForNewServicesForTesting(nil)
+    }
+
     func testSessionCancellationAdvancesBackToPreparationBeforeSwitchCleanup() async throws {
         let composition = makeComposition()
         let manager = composition.workspaceManager
@@ -621,6 +658,61 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         XCTAssertGreaterThan(phases.count, cancellingIndex + 1)
         XCTAssertEqual(phases[cancellingIndex + 1], .preparing)
         manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting(nil)
+    }
+
+    func testWatcherActivationFailureStillHydratesSelectionSlicesAndSurfacesFailure() async throws {
+        let root = try makeTemporaryDirectory(named: "WatcherFailureSliceHydration")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "one\ntwo\nthree\n".write(
+            to: root.appendingPathComponent("Sliced.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let store = WorkspaceFileContextStore()
+        await store.setWatcherActivationFailureForNewServicesForTesting(.streamStart)
+        let composition = makeComposition(store: store)
+        let manager = composition.workspaceManager
+        await manager.awaitInitialized()
+
+        let workspace = manager.createWorkspace(
+            name: "Watcher Failure Slices \(UUID().uuidString.prefix(8))",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+
+        let seededRanges = [LineRange(start: 1, end: 2)]
+        let seedScope = PartitionScope(workspaceID: workspace.id)
+        let seedCoordinator = SelectionSliceCoordinator()
+        try await seedCoordinator.applySliceUpdates(
+            groupedByRootPath: [root.path: [SelectionSliceCoordinator.SliceUpdate(
+                relativePath: "Sliced.swift",
+                ranges: seededRanges,
+                fileModificationTime: nil
+            )]],
+            scope: seedScope,
+            mode: .set
+        )
+        addTeardownBlock {
+            _ = try? await seedCoordinator.clearSlices(forRootPaths: [root.path], scope: seedScope)
+        }
+
+        let result = await manager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "watcherFailureSliceHydration"
+        )
+        XCTAssertTrue(result.didSwitch)
+
+        try await waitUntil {
+            if case let .degraded(_, _, _, _, failures, _) = manager.workspaceSearchReadinessState {
+                return failures.contains { $0.rootPath == root.path }
+            }
+            return false
+        }
+
+        let hydratedSlices = composition.workspaceFilesViewModel.currentSlicesByRootForTesting()
+        XCTAssertEqual(hydratedSlices[root.path]?["Sliced.swift"]?.ranges, seededRanges)
     }
 
     private func makeComposition(

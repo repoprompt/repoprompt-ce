@@ -94,6 +94,22 @@ actor GitBackend: VCSBackend {
         try await gitService.getAheadBehind(vs: ref, at: repoURL)
     }
 
+    func getRepositoryStatus(at repoURL: URL) async throws -> VCSRepositoryStatus {
+        let status = try await gitService.getRepositoryStatus(at: repoURL)
+        return VCSRepositoryStatus(
+            branch: status.branch,
+            headID: status.headID,
+            upstream: status.upstream,
+            ahead: status.ahead,
+            behind: status.behind,
+            workingStatus: VCSWorkingStatus(
+                staged: status.workingStatus.staged,
+                modified: status.workingStatus.modified,
+                untracked: status.workingStatus.untracked
+            )
+        )
+    }
+
     func getWorkingStatus(at repoURL: URL) async throws -> VCSWorkingStatus {
         let status = try await gitService.getWorkingStatus(at: repoURL)
         return VCSWorkingStatus(
