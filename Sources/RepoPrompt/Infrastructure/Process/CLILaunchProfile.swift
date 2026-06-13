@@ -11,7 +11,9 @@ enum CLILaunchProfiles {
         "~/.claude/local"
     ]
 
-    static let openCodeProviderSpecificPaths: [String] = []
+    static let openCodeProviderSpecificPaths: [String] = [
+        "~/.opencode/bin"
+    ]
     static let cursorProviderSpecificPaths: [String] = []
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager
@@ -49,17 +51,21 @@ enum CLILaunchProfiles {
     static let openCode = CLILaunchProfile(
         commandName: "opencode",
         preferredBasenames: ["opencode"],
-        supplementalSearchPaths: nativeDefaultsSupplemented(with: openCodeProviderSpecificPaths)
+        supplementalSearchPaths: providerSpecificPathsSupplementedWithNativeDefaults(openCodeProviderSpecificPaths)
     )
 
     static let cursor = CLILaunchProfile(
         commandName: "cursor-agent",
-        preferredBasenames: ["cursor-agent", "cursor"],
+        preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
     )
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
         orderedUnique(CLINativePathDefaults.defaultAdditionalPaths + providerSpecificPaths)
+    }
+
+    static func providerSpecificPathsSupplementedWithNativeDefaults(_ providerSpecificPaths: [String]) -> [String] {
+        orderedUnique(providerSpecificPaths + CLINativePathDefaults.defaultAdditionalPaths)
     }
 
     private static func orderedUnique(_ paths: [String]) -> [String] {

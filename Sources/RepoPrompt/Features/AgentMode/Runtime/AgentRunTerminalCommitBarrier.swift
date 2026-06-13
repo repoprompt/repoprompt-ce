@@ -15,10 +15,20 @@ struct AgentRunTerminalCommitRevision: Equatable {
     let providerDrainGeneration: UInt64
     let mcpPublicationEnvelope: AgentRunTerminalPublicationEnvelope?
     let successorKind: AgentRunEpochTransitionKind?
+    let providerSuccessorID: UUID?
 }
 
 @MainActor
 final class AgentRunTerminalCommitBarrier {
+    struct ProviderSuccessor {
+        let id: UUID
+        let transitionKind: AgentRunEpochTransitionKind
+        let consumeAfterPublication: (
+            AgentRunTerminalCommitRevision,
+            AgentRunTerminalPublicationResult
+        ) -> Bool
+    }
+
     struct Request {
         let session: AgentModeViewModel.TabSession
         let ownership: AgentRunOwnership
@@ -31,6 +41,7 @@ final class AgentRunTerminalCommitBarrier {
         let attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition
         let finalizeNonCodexUsage: Bool
         let supportsFollowUp: Bool
+        let providerSuccessor: ProviderSuccessor?
         let notifyTurnComplete: Bool
         let providerDrainGeneration: UInt64
         let providerBuffersAreDrained: () -> Bool
@@ -49,6 +60,7 @@ final class AgentRunTerminalCommitBarrier {
             attachmentDisposition: AgentModeViewModel.AttachmentTurnDisposition,
             finalizeNonCodexUsage: Bool,
             supportsFollowUp: Bool,
+            providerSuccessor: ProviderSuccessor? = nil,
             notifyTurnComplete: Bool,
             providerDrainGeneration: UInt64 = 0,
             providerBuffersAreDrained: @escaping () -> Bool = { true },
@@ -66,6 +78,7 @@ final class AgentRunTerminalCommitBarrier {
             self.attachmentDisposition = attachmentDisposition
             self.finalizeNonCodexUsage = finalizeNonCodexUsage
             self.supportsFollowUp = supportsFollowUp
+            self.providerSuccessor = providerSuccessor
             self.notifyTurnComplete = notifyTurnComplete
             self.providerDrainGeneration = providerDrainGeneration
             self.providerBuffersAreDrained = providerBuffersAreDrained
@@ -74,8 +87,29 @@ final class AgentRunTerminalCommitBarrier {
         }
     }
 
+    private func recordTerminalBarrierState(_ active: Bool, request: Request) {
+        #if DEBUG
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                EditFlowPerf.Dimensions(
+                    status: "terminal_barrier",
+                    outcome: request.terminalState.rawValue,
+                    runID: request.expectedRunID?.uuidString,
+                    providerActive: false,
+                    networkScopeActive: false,
+                    permitActive: false,
+                    publicationPending: active,
+                    terminalBarrier: active
+                )
+            )
+        #endif
+    }
+
     private let hooks: AgentModeRunService.Hooks
     private var terminalTeardownTasks: [AgentRunOwnership: Task<Void, Never>] = [:]
+    private var consumedProviderSuccessorIDs: Set<UUID> = []
+    private var consumedProviderSuccessorOrder: [UUID] = []
+    private let maxConsumedProviderSuccessorTombstones = 512
 
     init(hooks: AgentModeRunService.Hooks) {
         self.hooks = hooks
@@ -113,6 +147,16 @@ final class AgentRunTerminalCommitBarrier {
             ) {
                 hooks.startFollowUpRun(session.tabID, followUpInstruction)
             }
+            if let providerSuccessor = request.providerSuccessor,
+               providerSuccessor.id == existingRevision.providerSuccessorID,
+               let publicationResult = session.lastTerminalPublicationResult
+            {
+                notifyProviderSuccessor(
+                    providerSuccessor,
+                    revision: existingRevision,
+                    publicationResult: publicationResult
+                )
+            }
             return existingRevision
         }
         guard validatesOwnership(request) else {
@@ -130,9 +174,11 @@ final class AgentRunTerminalCommitBarrier {
         }
 
         session.terminalCommitInProgress = true
+        recordTerminalBarrierState(true, request: request)
         hooks.flushPendingAssistantDelta(session)
         guard validatesOwnership(request) else {
             session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_changed_during_drain", request: request)
             return nil
         }
@@ -146,7 +192,14 @@ final class AgentRunTerminalCommitBarrier {
         let queuedInstruction = request.terminalState == .completed && request.supportsFollowUp
             ? session.pendingInstructions.first
             : nil
-        if queuedInstruction != nil {
+        let providerSuccessor = request.terminalState == .completed
+            ? request.providerSuccessor
+            : nil
+        assert(
+            queuedInstruction == nil || providerSuccessor == nil,
+            "Generic and provider-specific successors must not drain from the same terminal commit"
+        )
+        if queuedInstruction != nil || providerSuccessor != nil {
             session.mcpFollowUpRunPending = true
         }
 
@@ -181,6 +234,7 @@ final class AgentRunTerminalCommitBarrier {
               request.providerBuffersAreDrained()
         else {
             session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_or_drain_changed_before_commit", request: request)
             return nil
         }
@@ -207,7 +261,11 @@ final class AgentRunTerminalCommitBarrier {
         hooks.setAgentRunActive(session.tabID, false)
         hooks.prepareTerminalPublication(session)
 
-        let successorKind: AgentRunEpochTransitionKind? = queuedInstruction == nil ? nil : .relatedFollowUp
+        let successorKind: AgentRunEpochTransitionKind? = if queuedInstruction != nil {
+            .relatedFollowUp
+        } else {
+            providerSuccessor?.transitionKind
+        }
         let revision = AgentRunTerminalCommitRevision(
             commitID: UUID(),
             ownership: request.ownership,
@@ -220,7 +278,8 @@ final class AgentRunTerminalCommitBarrier {
                 request.ownership,
                 request.terminalState
             ),
-            successorKind: successorKind
+            successorKind: successorKind,
+            providerSuccessorID: providerSuccessor?.id
         )
         session.lastTerminalCommitRevision = revision
         session.lastTerminalPublicationResult = nil
@@ -240,12 +299,22 @@ final class AgentRunTerminalCommitBarrier {
             revision: revision,
             publicationResult: session.lastTerminalPublicationResult
         )
+        if let providerSuccessor,
+           let publicationResult = session.lastTerminalPublicationResult
+        {
+            notifyProviderSuccessor(
+                providerSuccessor,
+                revision: revision,
+                publicationResult: publicationResult
+            )
+        }
         let teardownTask = registerTerminalTeardown(
             teardown,
             ownership: request.ownership,
             tabID: session.tabID
         )
         session.terminalCommitInProgress = false
+        recordTerminalBarrierState(false, request: request)
         request.postCommit()
 
         if let followUpInstruction {
@@ -265,12 +334,36 @@ final class AgentRunTerminalCommitBarrier {
         return revision
     }
 
+    private func notifyProviderSuccessor(
+        _ providerSuccessor: ProviderSuccessor,
+        revision: AgentRunTerminalCommitRevision,
+        publicationResult: AgentRunTerminalPublicationResult
+    ) {
+        if case .accepted = publicationResult {
+            guard !consumedProviderSuccessorIDs.contains(providerSuccessor.id) else {
+                return
+            }
+            guard providerSuccessor.consumeAfterPublication(revision, publicationResult) else {
+                return
+            }
+            consumedProviderSuccessorIDs.insert(providerSuccessor.id)
+            consumedProviderSuccessorOrder.append(providerSuccessor.id)
+            while consumedProviderSuccessorOrder.count > maxConsumedProviderSuccessorTombstones {
+                let expiredID = consumedProviderSuccessorOrder.removeFirst()
+                consumedProviderSuccessorIDs.remove(expiredID)
+            }
+            return
+        }
+        _ = providerSuccessor.consumeAfterPublication(revision, publicationResult)
+    }
+
     private func takeQueuedFollowUpIfReady(
         session: AgentModeViewModel.TabSession,
         revision: AgentRunTerminalCommitRevision,
         publicationResult: AgentRunTerminalPublicationResult?
     ) -> String? {
         guard revision.successorKind != nil,
+              revision.providerSuccessorID == nil,
               let publicationResult
         else { return nil }
         switch publicationResult {

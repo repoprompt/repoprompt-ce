@@ -20,7 +20,8 @@ final class CodexIntegratedAgentModeRunner {
         tabID: UUID,
         session: AgentModeViewModel.TabSession,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentImageAttachment],
+        fallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext?
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome {
         let ownership: AgentRunOwnership
         let createdOwnership: Bool
@@ -51,6 +52,7 @@ final class CodexIntegratedAgentModeRunner {
                 session: session,
                 text: initialMessageForRun,
                 attachments: attachments,
+                fallbackContext: fallbackContext,
                 attachmentReservationID: attachmentReservationID,
                 terminalizeRejectedSend: createdOwnership
             )
@@ -62,6 +64,8 @@ final class CodexIntegratedAgentModeRunner {
                 if createdOwnership {
                     session.endRunAttempt(ifCurrent: ownership, source: "codex.sendRejected")
                 }
+            case .queuedFallback:
+                break
             }
             return outcome
         }

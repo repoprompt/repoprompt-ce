@@ -121,7 +121,7 @@ final class CursorCLIProvider: AIProvider {
             enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
             modelString: modelName,
             includeRepoPromptMCPServer: false,
-            cleanupProjectMCPConfig: true,
+            cleanupProjectMCPApproval: true,
             sessionModeID: CursorAgentConfig.promptOnlySessionModeID
         )
     }

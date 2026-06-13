@@ -82,7 +82,52 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
         let newerRunID = UUID()
         session.runID = newerRunID
+
+        let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
+
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(cancelledRunIDs.isEmpty)
+    }
+
+    func testGuardedCancelRejectsStaleTargetAfterAgentSessionReplacement() async throws {
+        var cancelledRunIDs: [UUID] = []
+        let vm = makeViewModel { runID, _ in
+            cancelledRunIDs.append(runID)
+            return 0
+        }
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.runState = .running
+        session.runID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.beginRunAttempt(source: "test")
+        let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+
+        let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
+
+        XCTAssertFalse(accepted)
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertTrue(cancelledRunIDs.isEmpty)
+    }
+
+    func testGuardedCancelRejectsStaleTargetAfterRunAttemptRotation() async throws {
+        var cancelledRunIDs: [UUID] = []
+        let vm = makeViewModel { runID, _ in
+            cancelledRunIDs.append(runID)
+            return 0
+        }
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.runState = .running
+        session.runID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.beginRunAttempt(source: "test")
+        let staleTarget = vm.makeRunCancelTarget(tabID: tabID, session: session)
+        session.beginRunAttempt(source: "test.rotated")
 
         let accepted = await vm.cancelAgentRun(target: staleTarget, completion: .terminalPublished)
 
@@ -103,7 +148,10 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         otherSession.hasLoadedPersistedState = true
         targetSession.selectedAgent = .codexExec
         otherSession.selectedAgent = .codexExec
+        targetSession.testInstallPersistentSessionBinding(sessionID: UUID())
+        otherSession.testInstallPersistentSessionBinding(sessionID: UUID())
         let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: targetTabID, session: targetSession))
+        XCTAssertEqual(target.route, .existingAgentSession)
         vm.test_setCurrentTabIDOverride(otherTabID)
         defer { vm.test_setCurrentTabIDOverride(nil) }
 
@@ -121,36 +169,383 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         XCTAssertTrue(otherSession.items.isEmpty)
     }
 
-    func testGuardedSubmitRejectsMismatchedRunIdentityAndPreservesDraft() async throws {
-        let vm = makeViewModel()
+    func testGuardedExistingSessionSubmitAcceptsLiveRunStartedAfterTargetCaptureExactlyOnce() async throws {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
         let tabID = UUID()
         vm.ensureSession(for: tabID)
         let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        XCTAssertEqual(target.route, .existingAgentSession)
+        XCTAssertEqual(target.expectedRunState, .idle)
+        XCTAssertNil(target.expectedRunID)
+        XCTAssertNil(target.expectedRunAttemptID)
+        XCTAssertNil(target.expectedInitialStartLocation)
+
+        let liveRunID = UUID()
+        let liveAttemptID = UUID()
+        session.runState = .running
+        session.runID = liveRunID
+        session.beginRunAttempt(source: "test.liveRunStarted", attemptID: liveAttemptID)
+        let result = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send to live run", target: target)
+
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["send to live run"])
+        XCTAssertNotNil(session.runID)
+        XCTAssertNotNil(session.activeRunAttemptID)
+    }
+
+    func testGuardedExistingSessionSubmitAcceptsRotatedCodexAttemptExactlyOnce() async throws {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.runState = .running
+        let liveRunID = UUID()
+        session.runID = liveRunID
+        let firstOwnership = session.beginRunAttempt(source: "test.firstAttempt", attemptID: UUID())
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        XCTAssertEqual(target.route, .existingAgentSession)
+        XCTAssertEqual(target.expectedRunAttemptID, firstOwnership.attemptID)
+
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: firstOwnership, source: "test.rotateAttempt"))
+        let liveAttemptID = UUID()
+        session.beginRunAttempt(source: "test.secondAttempt", attemptID: liveAttemptID)
+        let result = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send after attempt rotation", target: target)
+
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["send after attempt rotation"])
+        XCTAssertNotNil(session.runID)
+        XCTAssertNotNil(session.activeRunAttemptID)
+        XCTAssertNotEqual(session.activeRunAttemptID, firstOwnership.attemptID)
+    }
+
+    func testGuardedExistingSessionSubmitRejectsReusedRenderTargetAfterFirstTurnIsAccepted() async throws {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
         session.runState = .running
         session.runID = UUID()
         session.beginRunAttempt(source: "test")
-        vm.storeDraftText(for: tabID, "stale steering")
-        let staleTarget = AgentComposerSubmitTarget(
-            tabID: tabID,
-            route: .existingAgentSession,
-            expectedSourceAgentSessionID: session.activeAgentSessionID,
-            expectedRunState: .running,
-            expectedRunID: UUID(),
-            expectedRunAttemptID: session.activeRunAttemptID,
-            expectedInitialStartLocation: nil
-        )
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let firstResult = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send once", target: target)
+        let reusedResult = await vm.submitUserTurnCreatingSessionIfNeeded(text: "send once", target: target)
 
-        let result = await vm.submitUserTurnCreatingSessionIfNeeded(text: "stale steering", target: staleTarget)
-
-        guard case let .blocked(message) = result else {
-            return XCTFail("Expected stale target to be blocked")
+        XCTAssertEqual(firstResult, .submitted)
+        guard case let .blocked(message) = reusedResult else {
+            return XCTFail("Expected reused render target to be blocked")
         }
         XCTAssertFalse(message.isEmpty)
-        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "stale steering")
+        XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["send once"])
+    }
+
+    func testGuardedExistingSessionSubmitRejectsReusedControlCommandTargetWithoutUserBubble() async throws {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.selectedAgent = .codexExec
+        session.codexConversationID = "noop"
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let firstResult = await vm.submitUserTurnCreatingSessionIfNeeded(text: "/compact", target: target)
+        let reusedResult = await vm.submitUserTurnCreatingSessionIfNeeded(text: "/compact", target: target)
+        try await waitUntil { recorder.compactionInvocationCount() == 1 }
+
+        XCTAssertEqual(firstResult, .submitted)
+        guard case let .blocked(message) = reusedResult else {
+            return XCTFail("Expected reused control-command target to be blocked")
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertTrue(session.items.filter { $0.kind == .user }.isEmpty)
+        XCTAssertEqual(recorder.compactionInvocationCount(), 1)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 2,
+        _ predicate: @escaping () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if predicate() { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTFail("Timed out waiting for asynchronous Codex submission")
+    }
+
+    func testGuardedFirstSendRejectsReusedSourceTargetBeforeCreatingAnotherDestination() async throws {
+        let vm = makeViewModel()
+        let sourceTabID = UUID()
+        let destinationTabID = UUID()
+        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        sourceSession.selectedAgent = .codexExec
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession))
+        XCTAssertEqual(target.route, .createAgentSessionFromSourceTab)
+        var createCount = 0
+
+        let firstResult = await vm.submitUserTurnCreatingSessionIfNeeded(
+            text: "create once",
+            target: target,
+            createAndActivateSessionTab: {
+                createCount += 1
+                XCTAssertNil(vm.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession))
+                return destinationTabID
+            }
+        )
+        let reusedResult = await vm.submitUserTurnCreatingSessionIfNeeded(
+            text: "create twice",
+            target: target,
+            createAndActivateSessionTab: {
+                createCount += 1
+                return UUID()
+            }
+        )
+
+        XCTAssertEqual(firstResult, .submitted)
+        guard case let .blocked(message) = reusedResult else {
+            return XCTFail("Expected reused first-send target to be blocked")
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertEqual(createCount, 1)
+        let destinationSession = try XCTUnwrap(vm.sessions[destinationTabID])
+        XCTAssertEqual(destinationSession.items.filter { $0.kind == .user }.map(\.text), ["create once"])
+    }
+
+    func testGuardedExistingSessionSubmitRejectsPersistentSessionReplacementAndPreservesDraft() async throws {
+        let recorder = StopSubmitSendRecorder()
+        let controller = StopSubmitNoopCodexController(recorder: recorder, hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.selectedAgent = .codexExec
+        let originalSessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: originalSessionID)
+        let staleTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        XCTAssertEqual(staleTarget.route, .existingAgentSession)
+        XCTAssertEqual(staleTarget.expectedSourceAgentSessionID, originalSessionID)
+        vm.storeDraftText(for: tabID, "draft survives replacement")
+
+        let replacementSessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: replacementSessionID)
+        let result = await vm.submitUserTurnCreatingSessionIfNeeded(
+            text: "draft survives replacement",
+            target: staleTarget
+        )
+
+        guard case let .blocked(message) = result else {
+            return XCTFail("Expected replaced persistent session target to be blocked")
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertEqual(session.activeAgentSessionID, replacementSessionID)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "draft survives replacement")
         XCTAssertTrue(session.items.isEmpty)
         XCTAssertTrue(session.pendingInstructions.isEmpty)
         XCTAssertTrue(session.pendingClaudeSteeringInstructions.isEmpty)
         XCTAssertTrue(session.pendingACPSteeringInstructions.isEmpty)
+        XCTAssertTrue(recorder.sentTexts().isEmpty)
+    }
+
+    func testComposerClaimPublishesNilImmediatelyAndRejectsSecondClaimAsExisting() async throws {
+        let vm = makeViewModel()
+        let tabID = UUID()
+        let session = await vm.ensureSessionReady(tabID: tabID)
+        vm.test_setCurrentTabIDOverride(tabID)
+        defer { vm.test_setCurrentTabIDOverride(nil) }
+        vm.storeDraftText(for: tabID, "claim draft")
+        vm.syncComposerUIState(tabID: tabID)
+        let target = try XCTUnwrap(vm.ui.composer.props.submitTarget)
+        let originalToken = target.expectedSubmissionToken
+        let originalRevision = vm.ui.composer.revision
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 42,
+            noticeRevision: 7,
+            rawDraftSnapshot: "claim draft"
+        )
+
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch vm.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected claim, got rejection: \(rejection)")
+        }
+
+        XCTAssertEqual(session.activeComposerSubmitAttempt?.id, attempt.id)
+        XCTAssertTrue(session.isComposerSubmissionInFlight)
+        XCTAssertNotEqual(session.composerSubmissionToken, originalToken)
+        XCTAssertNil(vm.ui.composer.props.submitTarget)
+        XCTAssertGreaterThan(vm.ui.composer.revision, originalRevision)
+        XCTAssertEqual(claim.attempt.inputRevision, 42)
+        XCTAssertEqual(claim.attempt.capturedSubmissionToken, originalToken)
+
+        let duplicateAttempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 42,
+            noticeRevision: 7,
+            rawDraftSnapshot: "claim draft"
+        )
+        switch vm.claimComposerSubmitAttempt(duplicateAttempt) {
+        case .claimed:
+            XCTFail("Expected the active claim to reject a duplicate")
+        case let .rejected(rejection):
+            XCTAssertEqual(rejection, .activeAttemptExists(activeAttemptID: attempt.id))
+        }
+
+        XCTAssertTrue(vm.releaseComposerSubmitClaim(claim))
+        XCTAssertFalse(session.isComposerSubmissionInFlight)
+        XCTAssertNotNil(vm.ui.composer.props.submitTarget)
+    }
+
+    func testStaleComposerClaimReleaseCannotClearNewerClaim() async throws {
+        let vm = makeViewModel()
+        let tabID = UUID()
+        let session = await vm.ensureSessionReady(tabID: tabID)
+        vm.test_setCurrentTabIDOverride(tabID)
+        defer { vm.test_setCurrentTabIDOverride(nil) }
+
+        let firstTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let firstAttempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: firstTarget,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: "first"
+        )
+        let firstClaim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch vm.claimComposerSubmitAttempt(firstAttempt) {
+        case let .claimed(claim):
+            firstClaim = claim
+        case let .rejected(rejection):
+            return XCTFail("Expected first claim, got rejection: \(rejection)")
+        }
+        XCTAssertTrue(vm.releaseComposerSubmitClaim(firstClaim))
+
+        let secondTarget = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let secondAttempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: secondTarget,
+            inputRevision: 2,
+            noticeRevision: 0,
+            rawDraftSnapshot: "second"
+        )
+        let secondClaim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch vm.claimComposerSubmitAttempt(secondAttempt) {
+        case let .claimed(claim):
+            secondClaim = claim
+        case let .rejected(rejection):
+            return XCTFail("Expected second claim, got rejection: \(rejection)")
+        }
+
+        XCTAssertFalse(vm.releaseComposerSubmitClaim(firstClaim))
+        XCTAssertEqual(session.activeComposerSubmitAttempt?.id, secondAttempt.id)
+        XCTAssertTrue(vm.releaseComposerSubmitClaim(secondClaim))
+    }
+
+    func testComposerClaimedSubmitPreservesNewerStoredDraft() async throws {
+        let controller = StopSubmitNoopCodexController(hasActiveThread: true)
+        let vm = makeViewModel(codexController: controller)
+        let tabID = UUID()
+        vm.ensureSession(for: tabID)
+        let session = try XCTUnwrap(vm.sessions[tabID])
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.selectedAgent = .codexExec
+        session.testInstallPersistentSessionBinding(sessionID: UUID())
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test")
+        vm.storeDraftText(for: tabID, "submitted draft")
+        let target = try XCTUnwrap(vm.makeComposerSubmitTarget(tabID: tabID, session: session))
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 1,
+            noticeRevision: 0,
+            rawDraftSnapshot: "submitted draft"
+        )
+        let claim: AgentModeViewModel.AgentComposerSubmitClaim
+        switch vm.claimComposerSubmitAttempt(attempt) {
+        case let .claimed(acceptedClaim):
+            claim = acceptedClaim
+        case let .rejected(rejection):
+            return XCTFail("Expected claim, got rejection: \(rejection)")
+        }
+        vm.storeDraftText(for: tabID, "newer draft")
+
+        let result = await vm.executeComposerSubmitAttempt(text: "submitted draft", claim: claim)
+
+        XCTAssertEqual(result, .submitted)
+        XCTAssertEqual(vm.retrieveDraftText(for: tabID), "newer draft")
+    }
+
+    func testGuardedFirstSendRejectsUnprovenCreateToExistingTransitionAndPreservesDraft() async throws {
+        let vm = makeViewModel()
+        let sourceTabID = UUID()
+        let sourceSession = await vm.ensureSessionReady(tabID: sourceTabID)
+        sourceSession.selectedAgent = .codexExec
+        sourceSession.pendingImageAttachments = [
+            AgentImageAttachment(
+                source: .localFile(path: "/tmp/create-to-existing.png"),
+                title: "create-to-existing.png"
+            )
+        ]
+        vm.storeDraftText(for: sourceTabID, "draft must survive")
+        let staleCreateTarget = try XCTUnwrap(
+            vm.makeComposerSubmitTarget(tabID: sourceTabID, session: sourceSession)
+        )
+        XCTAssertEqual(staleCreateTarget.route, .createAgentSessionFromSourceTab)
+
+        let linkedSessionID = UUID()
+        sourceSession.testInstallPersistentSessionBinding(sessionID: linkedSessionID)
+        sourceSession.runState = .running
+        sourceSession.runID = UUID()
+        sourceSession.beginRunAttempt(source: "test.linked")
+        var createCalled = false
+
+        let result = await vm.submitUserTurnCreatingSessionIfNeeded(
+            text: "draft must survive",
+            target: staleCreateTarget,
+            createAndActivateSessionTab: {
+                createCalled = true
+                return UUID()
+            }
+        )
+
+        guard case let .blocked(message) = result else {
+            return XCTFail("Expected unproven create-to-existing transition to remain blocked")
+        }
+        XCTAssertFalse(message.isEmpty)
+        XCTAssertFalse(createCalled)
+        XCTAssertEqual(sourceSession.activeAgentSessionID, linkedSessionID)
+        XCTAssertEqual(vm.retrieveDraftText(for: sourceTabID), "draft must survive")
+        XCTAssertEqual(sourceSession.pendingImageAttachments.count, 1)
+        XCTAssertTrue(sourceSession.items.isEmpty)
     }
 
     func testFreshManualThreadProjectsAndUpdatesInitialStartLocation() async {
@@ -423,24 +818,77 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
     }
 
     private func makeViewModel(
-        onCancelTools: @escaping AgentModeViewModel.MCPRunToolCanceller = { _, _ in 0 }
+        onCancelTools: @escaping AgentModeViewModel.MCPRunToolCanceller = { _, _ in 0 },
+        codexController: StopSubmitNoopCodexController? = nil
     ) -> AgentModeViewModel {
         AgentModeViewModel(
             testWindowID: 1,
             testWorkspacePath: FileManager.default.currentDirectoryPath,
-            codexControllerFactory: { _, _, _, _, _, _ in StopSubmitNoopCodexController() },
+            codexControllerFactory: { _, _, _, _, _, _ in
+                codexController ?? StopSubmitNoopCodexController()
+            },
             mcpRunToolCanceller: onCancelTools
         )
     }
 }
 
+private final class StopSubmitSendRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var texts: [String] = []
+    private var compactionInvocations = 0
+
+    func record(_ text: String) {
+        lock.lock()
+        texts.append(text)
+        lock.unlock()
+    }
+
+    func sentTexts() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return texts
+    }
+
+    func recordCompaction() {
+        lock.lock()
+        compactionInvocations += 1
+        lock.unlock()
+    }
+
+    func compactionInvocationCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return compactionInvocations
+    }
+}
+
 private final class StopSubmitNoopCodexController: CodexSessionControlling {
+    private let recorder: StopSubmitSendRecorder?
+    private let activeThread: Bool
+    private let eventStream: AsyncStream<CodexNativeSessionController.Event>
+    private let eventContinuation: AsyncStream<CodexNativeSessionController.Event>.Continuation
+
+    init(recorder: StopSubmitSendRecorder? = nil, hasActiveThread: Bool = false) {
+        self.recorder = recorder
+        activeThread = hasActiveThread
+        var continuation: AsyncStream<CodexNativeSessionController.Event>.Continuation?
+        eventStream = AsyncStream { continuation = $0 }
+        eventContinuation = continuation!
+        if !hasActiveThread {
+            eventContinuation.finish()
+        }
+    }
+
+    deinit {
+        eventContinuation.finish()
+    }
+
     var hasActiveThread: Bool {
-        false
+        activeThread
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
-        AsyncStream { continuation in continuation.finish() }
+        eventStream
     }
 
     func ensureEventsStreamReady() {}
@@ -470,11 +918,24 @@ private final class StopSubmitNoopCodexController: CodexSessionControlling {
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {}
-    func compactThread() async throws {}
+    func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
+        recorder?.record(text)
+        return CodexTurnStartReceipt(provisionalSubmissionID: "stop-submit-submission")
+    }
+
+    func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
+        recorder?.record(text)
+        return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+    }
+
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+    }
+
+    func compactThread() async throws {
+        recorder?.recordCompaction()
+    }
+
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil
     }

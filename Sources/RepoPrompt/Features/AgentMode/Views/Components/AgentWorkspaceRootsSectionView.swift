@@ -357,12 +357,15 @@ struct AgentWorkspaceRootsSectionView: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .layoutPriority(1)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(2)
 
             if row.isPrimary {
                 Text("PRIMARY")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
                     .foregroundColor(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
                     .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
                     .background(
@@ -373,12 +376,11 @@ struct AgentWorkspaceRootsSectionView: View {
 
             if let gitContext = row.gitContext {
                 gitContextCapsule(gitContext, row: row)
-                    .layoutPriority(3)
+                    .layoutPriority(1)
             }
 
             if let worktree = row.worktree {
                 worktreeCapsule(worktree)
-                    .fixedSize(horizontal: true, vertical: false)
                     .layoutPriority(0)
             }
 
@@ -470,6 +472,7 @@ struct AgentWorkspaceRootsSectionView: View {
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: worktreeCapsuleLabelMaxWidth, alignment: .leading)
         }
         .foregroundColor(tint)

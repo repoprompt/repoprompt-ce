@@ -658,7 +658,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     }
 }
 
-private final class InactiveRefreshFakeCodexController: CodexSessionControlling {
+private final class InactiveRefreshFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     var hasActiveThread: Bool {
         false
     }
@@ -694,10 +694,6 @@ private final class InactiveRefreshFakeCodexController: CodexSessionControlling 
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {}
     func compactThread() async throws {}
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

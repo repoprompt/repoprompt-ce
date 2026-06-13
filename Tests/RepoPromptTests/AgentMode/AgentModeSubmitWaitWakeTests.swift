@@ -23,4 +23,14 @@ final class AgentModeSubmitWaitWakeTests: XCTestCase {
             codexCompactionInFlight: false
         ))
     }
+
+    func testCodexDeliverySignalWaitsForProviderAcceptanceOrDurableQueueInsertion() {
+        XCTAssertEqual(
+            AgentModeViewModel.test_mcpActiveInstructionDeliverySignalTiming(
+                selectedAgent: .codexExec,
+                hasNativeSteeringRoute: false
+            ),
+            .afterProviderSend
+        )
+    }
 }

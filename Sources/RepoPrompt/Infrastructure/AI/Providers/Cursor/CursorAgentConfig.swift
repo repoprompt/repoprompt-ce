@@ -8,7 +8,7 @@ struct CursorAgentConfig {
     let enableDebugLogging: Bool
     let modelString: String?
     let includeRepoPromptMCPServer: Bool
-    let cleanupProjectMCPConfig: Bool
+    let cleanupProjectMCPApproval: Bool
     let sessionModeID: String?
 
     init(
@@ -17,7 +17,7 @@ struct CursorAgentConfig {
         enableDebugLogging: Bool = false,
         modelString: String? = nil,
         includeRepoPromptMCPServer: Bool = true,
-        cleanupProjectMCPConfig: Bool = true,
+        cleanupProjectMCPApproval: Bool = true,
         sessionModeID: String? = nil
     ) {
         self.commandName = commandName
@@ -25,7 +25,7 @@ struct CursorAgentConfig {
         self.enableDebugLogging = enableDebugLogging
         self.modelString = modelString
         self.includeRepoPromptMCPServer = includeRepoPromptMCPServer
-        self.cleanupProjectMCPConfig = cleanupProjectMCPConfig
+        self.cleanupProjectMCPApproval = cleanupProjectMCPApproval
         self.sessionModeID = sessionModeID
     }
 }

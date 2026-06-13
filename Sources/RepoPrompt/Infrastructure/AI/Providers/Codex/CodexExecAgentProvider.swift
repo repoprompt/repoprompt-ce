@@ -221,11 +221,26 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
                                         print("[DEBUG] CodexExec: Starting stream with timeout 6000s")
                                     }
 
+                                    let expectedPIDRunID = context.runID
                                     let stream = try await self.runner.runStreaming(
                                         args: args,
                                         stdin: combinedPrompt,
                                         outputMode: .none,
-                                        timeout: 6000
+                                        timeout: 6000,
+                                        onProcessStarted: { pid in
+                                            await ServerNetworkManager.shared.registerExpectedAgentPID(
+                                                pid,
+                                                for: Self.codexMCPClientID,
+                                                runID: expectedPIDRunID
+                                            )
+                                        },
+                                        onProcessTerminated: { pid in
+                                            await ServerNetworkManager.shared.clearExpectedAgentPID(
+                                                pid,
+                                                for: Self.codexMCPClientID,
+                                                runID: expectedPIDRunID
+                                            )
+                                        }
                                     )
 
                                     var framer = LineFramer()

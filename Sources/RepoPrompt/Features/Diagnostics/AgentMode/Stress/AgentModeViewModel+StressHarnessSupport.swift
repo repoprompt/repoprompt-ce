@@ -93,9 +93,14 @@
             session.pendingInstructions = []
             session.pendingClaudeSteeringInstructions = []
             session.pendingACPSteeringInstructions = []
-            session.pendingCodexCompactionInstructions = []
+            session.codexFallbackPumpTask?.cancel()
+            session.codexFallbackPumpTask = nil
+            session.codexFallbackQueue = []
+            session.codexFallbackDispatchInFlight = nil
             session.codexPendingTurnKind = nil
-            session.codexTurnKindsByID = [:]
+            session.codexAuthoritativeActiveTurn = nil
+            session.codexAnonymousActiveTurn = nil
+            session.codexRoutingObservedTurnID = nil
             session.pendingCommandRunningByKey = [:]
             session.pendingCommandRunningFlushTask?.cancel()
             session.pendingCommandRunningFlushTask = nil

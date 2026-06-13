@@ -169,8 +169,8 @@ final class ClaudeAgentToolTrackingHandler {
 
         // Suppress orphan placeholder tool names.
         if MCPIntegrationHelper.normalizedRepoPromptToolName(toolName) == "tool",
-           call.invocationID != nil,
-           session.items.lastIndex(where: { $0.toolInvocationID == call.invocationID }) == nil
+           let invocationID = call.invocationID,
+           session.indexedToolItemIndices(invocationID: invocationID).isEmpty
         {
             return true
         }
@@ -234,8 +234,8 @@ final class ClaudeAgentToolTrackingHandler {
 
         // Suppress orphan placeholder tool results.
         if MCPIntegrationHelper.normalizedRepoPromptToolName(toolName) == "tool",
-           result.invocationID != nil,
-           session.items.lastIndex(where: { $0.toolInvocationID == result.invocationID }) == nil
+           let invocationID = result.invocationID,
+           session.indexedToolItemIndices(invocationID: invocationID).isEmpty
         {
             return true
         }
@@ -287,18 +287,33 @@ final class ClaudeAgentToolTrackingHandler {
             item.kind == .toolCall && item.sequenceIndex >= turnStart
         }
         let placeholderIndex: Int? = {
-            if let invocationID,
-               let byInvocation = session.items.lastIndex(where: { item in
-                   isEligible(item) && item.toolInvocationID == invocationID
-               })
-            {
-                return byInvocation
+            if let invocationID {
+                let indexed = session.indexedToolItemIndices(invocationID: invocationID)
+                if let byInvocation = indexed.last(where: { isEligible(session.items[$0]) }) {
+                    return byInvocation
+                }
+                let fallback = session.activeTurnToolItemIndices(where: {
+                    isEligible($0) && $0.toolInvocationID == invocationID
+                })
+                if let byInvocation = fallback.lastIndex {
+                    return byInvocation
+                }
             }
-            return session.items.lastIndex(where: { item in
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+            let indexed = session.indexedNilInvocationToolItemIndices(
+                normalizedToolName: normalizedToolName
+            )
+            if let byName = indexed.last(where: { index in
+                let item = session.items[index]
+                return isEligible(item) && item.toolName == toolName
+            }) {
+                return byName
+            }
+            return session.activeTurnToolItemIndices(where: { item in
                 isEligible(item)
                     && item.toolName == toolName
                     && item.toolInvocationID == nil
-            })
+            }).lastIndex
         }()
         guard let placeholderIndex else { return }
         session.removeItem(at: placeholderIndex)
@@ -447,7 +462,7 @@ final class ClaudeAgentToolTrackingHandler {
                 session: session
             )
             let matchingProviderItemCount = invocationID.map { providerInvocationID in
-                session.items.count(where: { $0.toolInvocationID == providerInvocationID })
+                session.indexedToolItemIndices(invocationID: providerInvocationID).count
             } ?? 0
             diagnosticLog(
                 "suppressing explicit RepoPrompt provider tool_result tab=\(session.tabID.uuidString) " +
@@ -462,8 +477,8 @@ final class ClaudeAgentToolTrackingHandler {
            AgentToolTrackingSupport.isRepoPromptTool(toolName),
            outputJSON.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
            argsJSON == nil,
-           invocationID != nil,
-           session.items.lastIndex(where: { $0.toolInvocationID == invocationID }) == nil
+           let invocationID,
+           session.indexedToolItemIndices(invocationID: invocationID).isEmpty
         {
             return true
         }
@@ -480,13 +495,20 @@ final class ClaudeAgentToolTrackingHandler {
     ) -> Bool {
         guard let providerInvocationID = invocationID else { return false }
         let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
-        guard let index = session.items.lastIndex(where: { item in
-            item.kind == .toolCall
-                && item.toolInvocationID == providerInvocationID
+        let indexedCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
+        let indexedMatch = indexedCandidates.last(where: { index in
+            let item = session.items[index]
+            return item.kind == .toolCall
                 && MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "") == normalizedToolName
-        }) else {
-            return false
-        }
+        })
+        let fallbackMatch = indexedMatch == nil
+            ? session.activeTurnToolItemIndices(where: { item in
+                item.kind == .toolCall
+                    && item.toolInvocationID == providerInvocationID
+                    && MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "") == normalizedToolName
+            }).lastIndex
+            : nil
+        guard let index = indexedMatch ?? fallbackMatch else { return false }
 
         var updated = session.items[index]
         updated.kind = .toolResult
@@ -527,7 +549,11 @@ final class ClaudeAgentToolTrackingHandler {
                     "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
             )
             providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
-            if let index = session.items.lastIndex(where: { $0.toolInvocationID == providerInvocationID }) {
+            let indexedCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
+            let fallback = indexedCandidates.isEmpty
+                ? session.activeTurnToolItemIndices(where: { $0.toolInvocationID == providerInvocationID })
+                : .init(indices: [], scannedItemCount: 0)
+            if let index = indexedCandidates.last ?? fallback.lastIndex {
                 var updated = session.items[index]
                 updated.toolName = storedToolName
                 updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
@@ -542,18 +568,36 @@ final class ClaudeAgentToolTrackingHandler {
                 session.appendItem(toolItem)
             }
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: fallback.lastIndex == nil ? "signature_pending_map" : "signature_pending_map_active_turn_scan",
+                scannedItemCount: indexedCandidates.count + fallback.scannedItemCount
+            )
             return
         }
 
-        // Only match pending .toolCall items — matching already-completed .toolResult
-        // items would incorrectly correlate with finalized tools from previous turns
-        // during followup runs, leaving the new tool call orphaned and eventually
-        // marked as failed by finalizePendingToolCalls.
-        let matchingProviderBackedSignatureIndices = session.items.indices.filter { index in
-            let item = session.items[index]
-            return item.kind == .toolCall
-                && item.toolInvocationID != nil
-                && Self.repoPromptInvocationSignature(toolName: item.toolName ?? "", argsJSON: item.toolArgsJSON) == signature
+        var inspectedItemCount = 0
+        let indexedSignatureCandidates = session.indexedToolItemIndices(
+            signature: signature,
+            pendingCallsOnly: true
+        )
+        inspectedItemCount += indexedSignatureCandidates.count
+        var signatureCandidates = indexedSignatureCandidates
+        var signatureUsedFallback = false
+        if signatureCandidates.isEmpty {
+            let fallback = session.activeTurnToolItemIndices(where: { item in
+                item.kind == .toolCall
+                    && Self.repoPromptInvocationSignature(
+                        toolName: item.toolName ?? "",
+                        argsJSON: item.toolArgsJSON
+                    ) == signature
+            })
+            inspectedItemCount += fallback.scannedItemCount
+            signatureCandidates = fallback.indices
+            signatureUsedFallback = !fallback.indices.isEmpty
+        }
+
+        let matchingProviderBackedSignatureIndices = signatureCandidates.filter {
+            session.items[$0].toolInvocationID != nil
         }
         if matchingProviderBackedSignatureIndices.count > 1 {
             diagnosticLog(
@@ -576,14 +620,15 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: existingInvocationIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: signatureUsedFallback ? "signature_active_turn_scan" : "signature",
+                scannedItemCount: inspectedItemCount
+            )
             return
         }
 
-        let matchingNilIDSignatureIndices = session.items.indices.filter { index in
-            let item = session.items[index]
-            return item.kind == .toolCall
-                && item.toolInvocationID == nil
-                && Self.repoPromptInvocationSignature(toolName: item.toolName ?? "", argsJSON: item.toolArgsJSON) == signature
+        let matchingNilIDSignatureIndices = signatureCandidates.filter {
+            session.items[$0].toolInvocationID == nil
         }
         if matchingNilIDSignatureIndices.count > 1 {
             diagnosticLog(
@@ -604,16 +649,33 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: fallbackIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: signatureUsedFallback ? "signature_nil_id_active_turn_scan" : "signature_nil_id",
+                scannedItemCount: inspectedItemCount
+            )
             return
         }
 
-        // Tool-name-only fallback: only match items with no invocationID (true placeholders).
-        let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
-        let matchingNilIDNameIndices = session.items.indices.filter { index in
+        let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+        let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
+            normalizedToolName: normalizedToolName
+        )
+        inspectedItemCount += indexedNameCandidates.count
+        var matchingNilIDNameIndices = indexedNameCandidates.filter { index in
             let item = session.items[index]
             return item.kind == .toolCall
-                && item.toolInvocationID == nil
-                && MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "") == normalizedToolName
+                && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+        }
+        var nameUsedFallback = false
+        if matchingNilIDNameIndices.isEmpty {
+            let fallback = session.activeTurnToolItemIndices(where: { item in
+                item.kind == .toolCall
+                    && item.toolInvocationID == nil
+                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+            })
+            inspectedItemCount += fallback.scannedItemCount
+            matchingNilIDNameIndices = fallback.indices
+            nameUsedFallback = !fallback.indices.isEmpty
         }
         if matchingNilIDNameIndices.count > 1 {
             diagnosticLog(
@@ -636,6 +698,10 @@ final class ClaudeAgentToolTrackingHandler {
             updated.toolArgsJSON = argsJSON ?? updated.toolArgsJSON
             session.replaceItem(at: fallbackByNameIndex, with: updated)
             hooks.requestUIRefresh(session.tabID, false)
+            MCPToolObserverAttributionContext.record(
+                correlationPath: nameUsedFallback ? "name_active_turn_scan" : "name_fallback",
+                scannedItemCount: inspectedItemCount
+            )
             return
         }
 
@@ -647,6 +713,10 @@ final class ClaudeAgentToolTrackingHandler {
         )
         session.appendItem(toolItem)
         hooks.requestUIRefresh(session.tabID, false)
+        MCPToolObserverAttributionContext.record(
+            correlationPath: "new_item",
+            scannedItemCount: inspectedItemCount
+        )
     }
 
     func handleTrackerToolResult(
@@ -669,26 +739,64 @@ final class ClaudeAgentToolTrackingHandler {
         let resolvedInvocationID = providerInvocationByTrackerInvocationID[invocationID] ?? invocationID
         providerInvocationByTrackerInvocationID.removeValue(forKey: invocationID)
 
+        var correlationPath = "none"
+        var inspectedItemCount = 0
         let targetIndex: Int? = {
-            if let byInvocation = session.items.lastIndex(where: { $0.toolInvocationID == resolvedInvocationID }) {
+            let invocationCandidates = session.indexedToolItemIndices(invocationID: resolvedInvocationID)
+            inspectedItemCount += invocationCandidates.count
+            if let byInvocation = invocationCandidates.last {
+                correlationPath = "invocation_id"
+                return byInvocation
+            }
+            let invocationFallback = session.activeTurnToolItemIndices(where: {
+                $0.toolInvocationID == resolvedInvocationID
+            })
+            inspectedItemCount += invocationFallback.scannedItemCount
+            if let byInvocation = invocationFallback.lastIndex {
+                correlationPath = "invocation_id_active_turn_scan"
                 return byInvocation
             }
             if let providerInvocationID = consumePendingProviderInvocationID(
                 forSignature: signature,
                 session: session
-            ), let byProviderInvocation = session.items.lastIndex(where: { $0.toolInvocationID == providerInvocationID }) {
-                diagnosticLog(
-                    "tracker result consumed pending provider fallback tab=\(session.tabID.uuidString) " +
-                        "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
-                        "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
-                )
-                providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
-                return byProviderInvocation
+            ) {
+                let providerCandidates = session.indexedToolItemIndices(invocationID: providerInvocationID)
+                inspectedItemCount += providerCandidates.count
+                let providerFallback = providerCandidates.isEmpty
+                    ? session.activeTurnToolItemIndices(where: { $0.toolInvocationID == providerInvocationID })
+                    : .init(indices: [], scannedItemCount: 0)
+                inspectedItemCount += providerFallback.scannedItemCount
+                if let byProviderInvocation = providerCandidates.last ?? providerFallback.lastIndex {
+                    diagnosticLog(
+                        "tracker result consumed pending provider fallback tab=\(session.tabID.uuidString) " +
+                            "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
+                            "providerInvocation=\(providerInvocationID.uuidString) signature=\(Self.diagnosticSignature(signature))"
+                    )
+                    providerInvocationByTrackerInvocationID[invocationID] = providerInvocationID
+                    correlationPath = providerFallback.lastIndex == nil
+                        ? "signature_pending_map"
+                        : "signature_pending_map_active_turn_scan"
+                    return byProviderInvocation
+                }
             }
-            let matchingPendingSignatureIndices = session.items.indices.filter { index in
-                let item = session.items[index]
-                return item.kind == .toolCall
-                    && Self.repoPromptInvocationSignature(toolName: item.toolName ?? "", argsJSON: item.toolArgsJSON) == signature
+            let indexedSignatureCandidates = session.indexedToolItemIndices(
+                signature: signature,
+                pendingCallsOnly: true
+            )
+            inspectedItemCount += indexedSignatureCandidates.count
+            var matchingPendingSignatureIndices = indexedSignatureCandidates
+            var signatureUsedFallback = false
+            if matchingPendingSignatureIndices.isEmpty {
+                let fallback = session.activeTurnToolItemIndices(where: { item in
+                    item.kind == .toolCall
+                        && Self.repoPromptInvocationSignature(
+                            toolName: item.toolName ?? "",
+                            argsJSON: item.toolArgsJSON
+                        ) == signature
+                })
+                inspectedItemCount += fallback.scannedItemCount
+                matchingPendingSignatureIndices = fallback.indices
+                signatureUsedFallback = !fallback.indices.isEmpty
             }
             if matchingPendingSignatureIndices.count > 1 {
                 diagnosticLog(
@@ -704,14 +812,27 @@ final class ClaudeAgentToolTrackingHandler {
                         "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                         "resolvedInvocation=\(resolvedInvocationID.uuidString) matches=\(matchingPendingSignatureIndices.count)"
                 )
+                correlationPath = signatureUsedFallback ? "signature_active_turn_scan" : "signature"
                 return byPendingCallSignature
             }
-            let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
-            let matchingPendingNameIndices = session.items.indices.filter { index in
-                let item = session.items[index]
-                return item.kind == .toolCall
-                    && item.toolInvocationID == nil
-                    && MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "") == normalizedToolName
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
+            let indexedNameCandidates = session.indexedNilInvocationToolItemIndices(
+                normalizedToolName: normalizedToolName
+            )
+            inspectedItemCount += indexedNameCandidates.count
+            var matchingPendingNameIndices = indexedNameCandidates.filter {
+                session.items[$0].kind == .toolCall
+            }
+            var nameUsedFallback = false
+            if matchingPendingNameIndices.isEmpty {
+                let fallback = session.activeTurnToolItemIndices(where: { item in
+                    item.kind == .toolCall
+                        && item.toolInvocationID == nil
+                        && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+                })
+                inspectedItemCount += fallback.scannedItemCount
+                matchingPendingNameIndices = fallback.indices
+                nameUsedFallback = !fallback.indices.isEmpty
             }
             if matchingPendingNameIndices.count > 1 {
                 diagnosticLog(
@@ -726,15 +847,18 @@ final class ClaudeAgentToolTrackingHandler {
                         "tool=\(toolName) trackerInvocation=\(invocationID.uuidString) " +
                         "matches=\(matchingPendingNameIndices.count)"
                 )
+                correlationPath = nameUsedFallback ? "name_active_turn_scan" : "name_fallback"
                 return byPendingCallName
             }
             return nil
         }()
+        MCPToolObserverAttributionContext.record(
+            correlationPath: correlationPath,
+            scannedItemCount: inspectedItemCount
+        )
 
         let trimmedResult = resultJSON.trimmingCharacters(in: .whitespacesAndNewlines)
         if isError, trimmedResult.isEmpty {
-            // Claude can emit tracker completions for cancelled/superseded tool attempts
-            // with no payload. Do not surface these as failed bubbles.
             if let index = targetIndex, session.items[index].kind == .toolCall {
                 session.removeItem(at: index)
                 hooks.requestUIRefresh(session.tabID, false)
@@ -897,40 +1021,63 @@ final class ClaudeAgentToolTrackingHandler {
         session: AgentModeViewModel.TabSession
     ) -> Int? {
         let turnStartSequenceIndex = toolCorrelationStartSequenceIndex
-        let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
+        let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(toolName)
         func isEligible(_ item: AgentChatItem) -> Bool {
             item.sequenceIndex >= turnStartSequenceIndex
                 && (item.kind == .toolCall || item.kind == .toolResult)
         }
 
-        if let invocationID,
-           let byInvocationID = session.items.lastIndex(where: { item in
-               isEligible(item) && item.toolInvocationID == invocationID
-           })
-        {
-            return byInvocationID
+        if let invocationID {
+            let indexed = session.indexedToolItemIndices(invocationID: invocationID)
+            if let match = indexed.last(where: { isEligible(session.items[$0]) }) {
+                return match
+            }
+            let fallback = session.activeTurnToolItemIndices(where: {
+                isEligible($0) && $0.toolInvocationID == invocationID
+            })
+            if let match = fallback.lastIndex {
+                return match
+            }
         }
 
-        if let bySignature = session.items.lastIndex(where: { item in
-            isEligible(item)
-                && Self.repoPromptInvocationSignature(toolName: item.toolName ?? "", argsJSON: item.toolArgsJSON) == signature
-        }) {
+        let signatureCandidates = session.indexedToolItemIndices(signature: signature)
+        if let bySignature = signatureCandidates.last(where: { isEligible(session.items[$0]) }) {
+            return bySignature
+        }
+        let signatureFallback = session.activeTurnToolItemIndices(where: {
+            isEligible($0)
+                && Self.repoPromptInvocationSignature(
+                    toolName: $0.toolName ?? "",
+                    argsJSON: $0.toolArgsJSON
+                ) == signature
+        })
+        if let bySignature = signatureFallback.lastIndex {
             return bySignature
         }
 
-        return session.items.lastIndex(where: { item in
+        let nameCandidates = session.indexedNilInvocationToolItemIndices(
+            normalizedToolName: normalizedToolName
+        )
+        if let byName = nameCandidates.last(where: { index in
+            let item = session.items[index]
             guard isEligible(item) else { return false }
-            guard MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "") == normalizedToolName else {
+            if item.kind == .toolCall {
+                return true
+            }
+            return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+        }) {
+            return byName
+        }
+        return session.activeTurnToolItemIndices(where: { item in
+            guard isEligible(item) else { return false }
+            guard AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName else {
                 return false
             }
             if item.kind == .toolCall {
                 return item.toolInvocationID == nil
             }
-            if item.kind == .toolResult {
-                return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
-            }
-            return false
-        })
+            return item.toolArgsJSON?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+        }).lastIndex
     }
 
     private func consumePendingProviderInvocationID(
@@ -942,7 +1089,10 @@ final class ClaudeAgentToolTrackingHandler {
         }
         while !queue.isEmpty {
             let candidate = queue.removeFirst()
-            if session.items.contains(where: { $0.toolInvocationID == candidate }) {
+            let indexedCandidates = session.indexedToolItemIndices(invocationID: candidate)
+            let exists = !indexedCandidates.isEmpty
+                || session.activeTurnToolItemIndices(where: { $0.toolInvocationID == candidate }).lastIndex != nil
+            if exists {
                 pendingProviderRepoPromptInvocationsBySignature[signature] = queue.isEmpty ? nil : queue
                 return candidate
             }
@@ -958,25 +1108,9 @@ final class ClaudeAgentToolTrackingHandler {
     }
 
     private static func repoPromptInvocationSignature(toolName: String, argsJSON: String?) -> String {
-        let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName)
-        let normalizedArgs = canonicalizedJSON(argsJSON) ?? ""
-        return "\(normalizedToolName)|\(normalizedArgs)"
-    }
-
-    private static func canonicalizedJSON(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
-              let data = raw.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data)
-        else {
-            return raw?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-
-        guard JSONSerialization.isValidJSONObject(object),
-              let canonicalData = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
-              let canonical = String(data: canonicalData, encoding: .utf8)
-        else {
-            return raw
-        }
-        return canonical
+        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+            toolName: toolName,
+            argsJSON: argsJSON
+        )
     }
 }

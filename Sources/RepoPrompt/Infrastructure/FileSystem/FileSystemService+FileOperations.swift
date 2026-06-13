@@ -66,98 +66,163 @@ extension FileSystemService {
         }
     }
 
+    /// Starts filesystem I/O that cannot be cancelled safely once handed to Foundation.
+    ///
+    /// Reconciliation contract: request cancellation only removes and resumes the actor-owned
+    /// waiter. The detached monitor remains the sole completion owner and always reconciles the
+    /// service caches plus synthetic delta publication against the eventual on-disk result.
+    private func startUncancellableMutation(
+        _ operation: FileSystemUncancellableMutation,
+        io: @escaping @Sendable () throws -> Void
+    ) -> (id: UUID, task: Task<Void, any Error>) {
+        let id = UUID()
+        #if DEBUG
+            let willBegin = mutationIOWillBeginHandler
+        #else
+            let willBegin: (@Sendable (FileSystemUncancellableMutation) async -> Void)? = nil
+        #endif
+        let task = Task.detached(priority: .utility) {
+            if let willBegin {
+                await willBegin(operation)
+            }
+            try io()
+        }
+        return (id, task)
+    }
+
+    private func awaitUncancellableMutation(_ id: UUID) async throws {
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, any Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    mutationWaiters[id] = FileSystemMutationWaiter(continuation: continuation)
+                }
+            }
+        } onCancel: {
+            Task { [weak self] in
+                await self?.cancelMutationWaiter(id)
+            }
+        }
+    }
+
+    private func cancelMutationWaiter(_ id: UUID) {
+        guard let waiter = mutationWaiters.removeValue(forKey: id) else { return }
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func completeMutationWaiter(_ id: UUID, error: (any Error)? = nil) {
+        guard let waiter = mutationWaiters.removeValue(forKey: id) else { return }
+        if let error {
+            waiter.continuation.resume(throwing: error)
+        } else {
+            waiter.continuation.resume()
+        }
+    }
+
     /// Atomically move/rename a **file** inside the same root.
     func moveFile(
         atRelativePath oldRelPath: String,
         toRelativePath newRelPath: String
     ) async throws {
-        let fm = fm // Cache for multiple calls in this method
-
-        // --- prepare -----------------------------------------------------
-        // ── 0. Validate that both paths stay inside the loaded root ─────────────
+        try Task.checkCancellation()
+        let fm = fm
         let oldTarget = try mutationTarget(forRelativePath: oldRelPath)
         let newTarget = try mutationTarget(forRelativePath: newRelPath)
         let oldFull = oldTarget.url.path
         let newFull = newTarget.url.path
         try await requireRegularMutationSource(relativePath: oldTarget.relativePath)
+        try Task.checkCancellation()
 
-        // 1) Source must exist
         guard fm.fileExists(atPath: oldFull, isDirectory: nil) else {
             throw FileSystemError.fileNotFound
         }
-
-        // 2) Destination must not exist
         guard !fm.fileExists(atPath: newFull, isDirectory: nil) else {
             throw FileSystemError.fileAlreadyExists
         }
 
-        // 3) Ensure parent folder exists (this is fast, keep it in-actor)
         let destDir = (newFull as NSString).deletingLastPathComponent
-        try fm.createDirectory(
-            atPath: destDir,
-            withIntermediateDirectories: true,
-            attributes: nil
-        )
+        try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: newTarget.relativePath)
 
-        // --- 1. do I/O off-actor ----------------------------------------
-        // 4) Perform the move on disk
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
-            }.value // bubbles error
-        } catch {
-            throw FileSystemError.failedToCreateFile(error)
+        let mutation = startUncancellableMutation(.move) {
+            try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
         }
+        Task.detached { [weak self] in
+            do {
+                try await mutation.task.value
+                await self?.reconcileMovedFile(
+                    mutationID: mutation.id,
+                    oldRelativePath: oldTarget.relativePath,
+                    newRelativePath: newTarget.relativePath,
+                    oldFullPath: oldFull,
+                    newFullPath: newFull
+                )
+            } catch {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.failedToCreateFile(error)
+                )
+            }
+        }
+        try await awaitUncancellableMutation(mutation.id)
+    }
 
-        let destinationEligibility = await catalogRegularFileEligibility(relativePath: newTarget.relativePath)
-        switch destinationEligibility {
+    private func reconcileMovedFile(
+        mutationID: UUID,
+        oldRelativePath: String,
+        newRelativePath: String,
+        oldFullPath: String,
+        newFullPath: String
+    ) async {
+        switch await catalogRegularFileEligibility(relativePath: newRelativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            try? FileManager.default.moveItem(atPath: newFull, toPath: oldFull)
-            throw FileSystemError.invalidRelativePath
+            do {
+                try await Task.detached(priority: .utility) {
+                    try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+                }.value
+            } catch {
+                forgetTrackedPath(oldRelativePath)
+                publishFileSystemDeltas(
+                    [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
+                    source: .syntheticMutation
+                )
+            }
+            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            return
         }
 
-        // --- 2. in-memory bookkeeping (still inside actor) --------------
-        // 5) Immediate in‑memory bookkeeping (fixes race window) ───────────────
-        let stdOld = oldTarget.relativePath
-        let stdNew = newTarget.relativePath
-
-        if let wasDir = visitedItems.removeValue(forKey: stdOld) {
-            visitedItems[stdNew] = wasDir // will be 'false' for files
+        if let wasDirectory = visitedItems.removeValue(forKey: oldRelativePath) {
+            visitedItems[newRelativePath] = wasDirectory
         }
-        visitedPaths.remove(stdOld)
-        visitedPaths.insert(stdNew)
-
-        // Transfer encoding if we have it
-        if let encoding = encodingMap[stdOld] {
-            encodingMap.removeValue(forKey: stdOld)
-            encodingMap[stdNew] = encoding
+        visitedPaths.remove(oldRelativePath)
+        visitedPaths.insert(newRelativePath)
+        if let encoding = encodingMap.removeValue(forKey: oldRelativePath) {
+            encodingMap[newRelativePath] = encoding
         }
-
-        // 6) Emit synthetic deltas so the UI updates before FSEvents arrive
-        publishFileSystemDeltas([.fileRemoved(stdOld), .fileAdded(stdNew)], source: .syntheticMutation)
+        publishFileSystemDeltas(
+            [.fileRemoved(oldRelativePath), .fileAdded(newRelativePath)],
+            source: .syntheticMutation
+        )
+        completeMutationWaiter(mutationID)
     }
 
     func createFile(atRelativePath relativePath: String, content: String) async throws {
-        let fm = fm // Cache for multiple calls in this method
-        // --- prepare -----------------------------------------------------
+        try Task.checkCancellation()
+        let fm = fm
         let target = try mutationTarget(forRelativePath: relativePath)
         let fullPath = target.url.path
         let fullURL = target.url
 
-        // Ensure directory exists (this is fast, keep it in-actor)
         let directoryURL = fullURL.deletingLastPathComponent()
         try fm.createDirectory(at: directoryURL, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: target.relativePath)
-
-        // Check if file already exists
-        if fm.fileExists(atPath: fullPath, isDirectory: nil) {
+        guard !fm.fileExists(atPath: fullPath, isDirectory: nil) else {
             throw FileSystemError.fileAlreadyExists
         }
-
-        // Prepare data with UTF-8 encoding
         guard let data = content.data(using: .utf8) else {
             throw FileSystemError.failedToCreateFile(
                 NSError(
@@ -168,85 +233,139 @@ extension FileSystemService {
             )
         }
 
-        // --- 1. do I/O off-actor ----------------------------------------
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileSystemService.writeFileRobust(to: fullURL, data: data)
-            }.value // bubbles error
-            fileSystemDebugLog("File created at \(fullURL.path)")
-        } catch {
-            throw FileSystemError.failedToCreateFile(error)
+        let mutation = startUncancellableMutation(.create) {
+            try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
+        Task.detached { [weak self] in
+            do {
+                try await mutation.task.value
+                await self?.reconcileCreatedFile(
+                    mutationID: mutation.id,
+                    relativePath: target.relativePath,
+                    url: fullURL
+                )
+            } catch {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.failedToCreateFile(error)
+                )
+            }
+        }
+        try await awaitUncancellableMutation(mutation.id)
+    }
 
-        switch await catalogRegularFileEligibility(relativePath: target.relativePath) {
+    private func reconcileCreatedFile(
+        mutationID: UUID,
+        relativePath: String,
+        url: URL
+    ) async {
+        fileSystemDebugLog("File created at \(url.path)")
+        switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            try? fm.removeItem(at: fullURL)
-            forgetTrackedPath(target.relativePath)
-            throw FileSystemError.invalidRelativePath
+            _ = try? await Task.detached(priority: .utility) {
+                try FileManager.default.removeItem(at: url)
+            }.value
+            forgetTrackedPath(relativePath)
+            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            return
         }
 
-        // --- 2. in-memory bookkeeping (still inside actor) --------------
-        // update encoding cache (new files default to UTF-8)
-        encodingMap[target.relativePath] = .utf8
-
-        // update visited* sets
-        if !visitedPaths.contains(target.relativePath) {
-            visitedPaths.insert(target.relativePath)
-            visitedItems[target.relativePath] = false
-        }
-
-        // emit a *synthetic* delta so the UI updates immediately
-        publishFileSystemDeltas([.fileAdded(target.relativePath)], source: .syntheticMutation)
+        encodingMap[relativePath] = .utf8
+        visitedPaths.insert(relativePath)
+        visitedItems[relativePath] = false
+        publishFileSystemDeltas([.fileAdded(relativePath)], source: .syntheticMutation)
+        completeMutationWaiter(mutationID)
     }
 
     func deleteFile(atRelativePath relativePath: String) async throws {
+        try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
         try await requireRegularMutationSource(relativePath: target.relativePath)
+        try Task.checkCancellation()
         let url = target.url
-        do {
-            try fm.removeItem(at: url)
-            fileSystemDebugLog("File deleted at \(url.path)")
-        } catch {
-            throw FileSystemError.failedToDeleteFile(error)
+        let mutation = startUncancellableMutation(.delete) {
+            try FileManager.default.removeItem(at: url)
         }
-        forgetTrackedPath(target.relativePath)
-        publishFileSystemDeltas([.fileRemoved(target.relativePath)], source: .syntheticMutation)
+        Task.detached { [weak self] in
+            do {
+                try await mutation.task.value
+                await self?.reconcileDeletedFile(
+                    mutationID: mutation.id,
+                    relativePath: target.relativePath,
+                    url: url
+                )
+            } catch {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.failedToDeleteFile(error)
+                )
+            }
+        }
+        try await awaitUncancellableMutation(mutation.id)
+    }
+
+    private func reconcileDeletedFile(mutationID: UUID, relativePath: String, url: URL) {
+        fileSystemDebugLog("File deleted at \(url.path)")
+        forgetTrackedPath(relativePath)
+        publishFileSystemDeltas([.fileRemoved(relativePath)], source: .syntheticMutation)
+        completeMutationWaiter(mutationID)
     }
 
     func moveItemToTrash(atRelativePath relativePath: String) async throws {
+        try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
         let normalizedRelativePath = target.relativePath
         let url = target.url
-        let fullPath = url.path
-
         var isDirectory = ObjCBool(false)
-        guard fm.fileExists(atPath: fullPath, isDirectory: &isDirectory) else {
+        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             throw FileSystemError.fileNotFound
         }
+        let wasDirectory = isDirectory.boolValue
 
-        do {
-            _ = try moveURLToTrash(url)
-            fileSystemDebugLog("File moved to Trash at \(url.path)")
-        } catch {
-            throw FileSystemError.failedToDeleteFile(error)
+        let mutation = startUncancellableMutation(.trash) {
+            _ = try Self.moveURLToTrashOffActor(url)
         }
+        Task.detached { [weak self] in
+            do {
+                try await mutation.task.value
+                await self?.reconcileTrashedItem(
+                    mutationID: mutation.id,
+                    relativePath: normalizedRelativePath,
+                    url: url,
+                    wasDirectory: wasDirectory
+                )
+            } catch {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.failedToDeleteFile(error)
+                )
+            }
+        }
+        try await awaitUncancellableMutation(mutation.id)
+    }
 
+    private func reconcileTrashedItem(
+        mutationID: UUID,
+        relativePath: String,
+        url: URL,
+        wasDirectory: Bool
+    ) {
+        fileSystemDebugLog("File moved to Trash at \(url.path)")
         let keysToForget = encodingMap.keys.filter {
-            $0 == normalizedRelativePath || $0.hasPrefix(normalizedRelativePath + "/")
+            $0 == relativePath || $0.hasPrefix(relativePath + "/")
         }
         for key in keysToForget {
             encodingMap.removeValue(forKey: key)
         }
 
-        var deltas = removeSubtree(for: normalizedRelativePath)
+        var deltas = removeSubtree(for: relativePath)
         if deltas.isEmpty {
-            deltas = [isDirectory.boolValue ? .folderRemoved(normalizedRelativePath) : .fileRemoved(normalizedRelativePath)]
+            deltas = [wasDirectory ? .folderRemoved(relativePath) : .fileRemoved(relativePath)]
         }
-        if !deltas.isEmpty {
-            publishFileSystemDeltas(deltas, source: .syntheticMutation)
-        }
+        publishFileSystemDeltas(deltas, source: .syntheticMutation)
+        completeMutationWaiter(mutationID)
     }
 
     private func forgetTrackedPath(_ relativePath: String) {
@@ -255,19 +374,14 @@ extension FileSystemService {
         visitedItems.removeValue(forKey: relativePath)
     }
 
-    private func moveURLToTrash(_ url: URL) throws -> URL? {
-        #if DEBUG
-            return try fm.moveItemToTrash(at: url)
-        #else
-            var resultingItemURL: NSURL?
-            try fm.trashItem(at: url, resultingItemURL: &resultingItemURL)
-            return resultingItemURL as URL?
-        #endif
+    private nonisolated static func moveURLToTrashOffActor(_ url: URL) throws -> URL? {
+        var resultingItemURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingItemURL)
+        return resultingItemURL as URL?
     }
 
-    /// Re-written non-blocking version
     func editFile(atRelativePath relativePath: String, newContent: String) async throws {
-        // --- prepare -----------------------------------------------------
+        try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
         let fullPath = target.url.path
         let fullURL = target.url
@@ -282,46 +396,61 @@ extension FileSystemService {
         case .ineligible:
             throw FileSystemError.invalidRelativePath
         }
-        let enc = encodingMap[target.relativePath] ?? .utf8
-        guard let data = newContent.data(using: enc) else {
+        try Task.checkCancellation()
+
+        let encoding = encodingMap[target.relativePath] ?? .utf8
+        guard let data = newContent.data(using: encoding) else {
             throw FileSystemError.failedToEditFile(
                 NSError(
                     domain: "encoding",
                     code: -1,
-                    userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as \(enc)"]
+                    userInfo: [NSLocalizedDescriptionKey: "Unable to encode text as \(encoding)"]
                 )
             )
         }
 
-        // --- 1. do I/O off-actor ----------------------------------------
-        do {
-            try await Task.detached(priority: .utility) {
-                try FileSystemService.writeFileRobust(to: fullURL, data: data)
-            }.value // bubbles error
-        } catch {
-            throw FileSystemError.failedToEditFile(error)
+        let mutation = startUncancellableMutation(.edit) {
+            try FileSystemService.writeFileRobust(to: fullURL, data: data)
         }
+        Task.detached { [weak self] in
+            do {
+                try await mutation.task.value
+                await self?.reconcileEditedFile(
+                    mutationID: mutation.id,
+                    relativePath: target.relativePath,
+                    encoding: encoding
+                )
+            } catch {
+                await self?.completeMutationWaiter(
+                    mutation.id,
+                    error: FileSystemError.failedToEditFile(error)
+                )
+            }
+        }
+        try await awaitUncancellableMutation(mutation.id)
+    }
 
-        switch await catalogRegularFileEligibility(relativePath: target.relativePath) {
+    private func reconcileEditedFile(
+        mutationID: UUID,
+        relativePath: String,
+        encoding: String.Encoding
+    ) async {
+        switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
-            throw FileSystemError.invalidRelativePath
+            forgetTrackedPath(relativePath)
+            publishFileSystemDeltas([.fileRemoved(relativePath)], source: .syntheticMutation)
+            completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
+            return
         }
 
-        // --- 2. in-memory bookkeeping (still inside actor) --------------
-        // refresh encoding cache
-        encodingMap[target.relativePath] = enc
-
-        // update visited* sets so later FSEvents don't look "new"
-        if !visitedPaths.contains(target.relativePath) {
-            visitedPaths.insert(target.relativePath)
-            visitedItems[target.relativePath] = false
-        }
-
-        // emit a *synthetic* delta so the UI updates immediately, with mtime if available
-        let mdate = try? await getFileModificationDate(atRelativePath: target.relativePath)
-        publishFileSystemDeltas([.fileModified(target.relativePath, mdate)], source: .syntheticMutation)
+        encodingMap[relativePath] = encoding
+        visitedPaths.insert(relativePath)
+        visitedItems[relativePath] = false
+        let modificationDate = try? await getFileModificationDate(atRelativePath: relativePath)
+        publishFileSystemDeltas([.fileModified(relativePath, modificationDate)], source: .syntheticMutation)
+        completeMutationWaiter(mutationID)
     }
 
     func checkFilePermissions(atRelativePath relativePath: String) -> Bool {

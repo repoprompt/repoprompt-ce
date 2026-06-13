@@ -54,7 +54,8 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,
             mcpPublicationEnvelope: envelope,
-            successorKind: nil
+            successorKind: nil,
+            providerSuccessorID: nil
         )
         let oldPublication = await viewModel.test_publishTerminalCommit(
             revision,
@@ -239,7 +240,8 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,
             mcpPublicationEnvelope: nil,
-            successorKind: nil
+            successorKind: nil,
+            providerSuccessorID: nil
         )
 
         let result = await viewModel.test_publishTerminalCommit(
@@ -335,7 +337,7 @@ private actor EpochBeginGate {
     }
 }
 
-private final class EpochTestCodexController: CodexSessionControlling {
+private final class EpochTestCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     var hasActiveThread: Bool {
         false
     }
@@ -371,10 +373,6 @@ private final class EpochTestCodexController: CodexSessionControlling {
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {}
     func compactThread() async throws {}
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

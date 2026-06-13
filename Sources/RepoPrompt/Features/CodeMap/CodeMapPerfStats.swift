@@ -461,7 +461,8 @@ enum CodeMapPerfRuntime {
     static let instrumentationEnvironmentKey = "REPOPROMPT_CODEMAP_PERF"
     static let benchmarkEnvironmentKey = "REPOPROMPT_RUN_CODEMAP_BENCHMARKS"
     static let benchmarkIterationsEnvironmentKey = "REPOPROMPT_CODEMAP_BENCHMARK_ITERATIONS"
-    static let benchmarkMarkerPath = "/tmp/repoprompt-run-codemap-benchmarks"
+    static let benchmarkMarkerURL = MCPFilesystemConstants.identity.temporaryRootURL()
+        .appendingPathComponent("run-codemap-benchmarks", isDirectory: false)
 
     #if DEBUG || CODEMAP_PERF
         static let isCompiledIn = true
@@ -471,7 +472,7 @@ enum CodeMapPerfRuntime {
 
     private static var benchmarkMarkerEnabled: Bool {
         guard isCompiledIn else { return false }
-        return !isRunningInCI && FileManager.default.fileExists(atPath: benchmarkMarkerPath)
+        return !isRunningInCI && FileManager.default.fileExists(atPath: benchmarkMarkerURL.path)
     }
 
     private static var benchmarkRequested: Bool {

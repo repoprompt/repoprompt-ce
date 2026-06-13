@@ -49,6 +49,7 @@ final actor ServerController: ObservableObject {
         "claude-code",
         "codex-mcp-client",
         "gemini-cli-mcp-client",
+        "opencode",
         "cursor",
         "cursor-mcp-client",
         "claude-ai"

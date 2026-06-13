@@ -2,12 +2,12 @@ import Foundation
 
 struct OpenCodeACPAgentProvider: ACPAgentProvider {
     private enum LaunchContract {
-        static let acpSubcommand = "acp"
         static let configContentEnvironmentKey = "OPENCODE_CONFIG_CONTENT"
     }
 
     private let config: OpenCodeAgentConfig
     private let repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration
+    private let launchResolver: OpenCodeACPLaunchResolver
 
     #if DEBUG
         var test_config: OpenCodeAgentConfig {
@@ -17,55 +17,25 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
     init(
         config: OpenCodeAgentConfig,
-        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt
+        repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
+        launchResolver: OpenCodeACPLaunchResolver = OpenCodeACPLaunchResolver()
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
+        self.launchResolver = launchResolver
     }
 
     var providerID: ACPProviderID {
         .openCode
     }
 
-    func support(for request: ACPRunRequest) async -> ACPSupportResult {
-        var processConfig = CLIProcessConfiguration(
-            command: config.commandName,
-            enableDebugLogging: config.enableDebugLogging
-        )
-        processConfig.ensureAdditionalPaths(config.additionalPathHints)
-        let runner = CLIProcessRunner(config: processConfig)
-
-        do {
-            let result = try await runner.run(
-                args: [LaunchContract.acpSubcommand, "--help"],
-                stdin: nil,
-                outputMode: .none,
-                timeout: 10
-            )
-            let stdout = String(data: result.stdout, encoding: .utf8) ?? ""
-            let stderr = String(data: result.stderr, encoding: .utf8) ?? ""
-            let combined = "\(stdout)\n\(stderr)"
-            guard result.status == 0 else {
-                return .unsupported(reason: "OpenCode ACP preflight failed before startup.")
-            }
-            guard combined.localizedCaseInsensitiveContains("acp") else {
-                return .unsupported(reason: "Installed OpenCode CLI does not advertise ACP support.")
-            }
-            return .supported
-        } catch let error as CLIProcessRunnerError {
-            switch error {
-            case .commandNotFound:
-                return .unsupported(reason: "OpenCode CLI was not found for ACP preflight.")
-            default:
-                return .unsupported(reason: "OpenCode ACP preflight failed: \(error.localizedDescription)")
-            }
-        } catch {
-            return .unsupported(reason: "OpenCode ACP preflight failed: \(error.localizedDescription)")
-        }
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        try await launchResolver.probeSupport(for: config)
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = standardizedWorkingDirectory(from: request.workspacePath)
+        let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
         var environment: [String: String] = [:]
 
         if config.includeManagedConfigOverlay {
@@ -87,12 +57,13 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
 
         return ACPLaunchConfiguration(
             providerID: providerID,
-            command: config.commandName,
-            arguments: [LaunchContract.acpSubcommand],
+            command: resolvedLaunch.command,
+            arguments: resolvedLaunch.arguments,
             environment: environment,
             workingDirectory: workingDirectory,
-            additionalPathHints: CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints),
-            enableDebugLogging: config.enableDebugLogging
+            additionalPathHints: resolvedLaunch.additionalPathHints,
+            enableDebugLogging: config.enableDebugLogging,
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity
         )
     }
 
@@ -153,6 +124,9 @@ struct OpenCodeACPAgentProvider: ACPAgentProvider {
            case .commandNotFound = runnerError
         {
             return AIProviderError.invalidConfiguration(detail: "OpenCode CLI not found. Install it and ensure `opencode` is available on PATH.")
+        }
+        if error is OpenCodeACPLaunchResolutionError || error is ExecutableFileIdentityError {
+            return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
         if (error as NSError).domain == NSCocoaErrorDomain {
             return AIProviderError.invalidConfiguration(detail: "Unable to prepare OpenCode ACP config: \(error.localizedDescription)")

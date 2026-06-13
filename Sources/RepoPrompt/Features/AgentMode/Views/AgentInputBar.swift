@@ -13,7 +13,8 @@ import UniformTypeIdentifiers
 struct AgentComposerActions {
     let storeDraft: (_ tabID: UUID, _ text: String) -> Void
     let retrieveDraft: (_ tabID: UUID) -> String
-    let submit: (_ target: AgentComposerSubmitTarget, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
+    let claimSubmit: (_ attempt: AgentComposerSubmitAttempt) -> AgentModeViewModel.AgentComposerSubmitClaimResult
+    let executeSubmit: (_ claim: AgentModeViewModel.AgentComposerSubmitClaim, _ text: String) async -> AgentModeViewModel.UserTurnSubmissionResult
     let cancelRun: (_ target: AgentRunCancelTarget) async -> Void
     let attachImages: (_ tabID: UUID, _ urls: [URL]) -> Void
     let removeImage: (_ tabID: UUID, _ attachmentID: UUID) -> Void
@@ -112,7 +113,10 @@ struct AgentInputBar: View {
         AgentComposerActions(
             storeDraft: { tabID, text in agentModeVM.storeDraftText(for: tabID, text) },
             retrieveDraft: { tabID in agentModeVM.retrieveDraftText(for: tabID) },
-            submit: { target, text in await agentModeVM.submitUserTurnCreatingSessionIfNeeded(text: text, target: target) },
+            claimSubmit: { attempt in agentModeVM.claimComposerSubmitAttempt(attempt) },
+            executeSubmit: { claim, text in
+                await agentModeVM.executeComposerSubmitAttempt(text: text, claim: claim)
+            },
             cancelRun: { target in _ = await agentModeVM.cancelAgentRun(target: target) },
             attachImages: { tabID, urls in agentModeVM.attachImages(tabID: tabID, urls: urls) },
             removeImage: { tabID, attachmentID in agentModeVM.removePendingImage(tabID: tabID, attachmentID: attachmentID) },
@@ -266,6 +270,7 @@ struct AgentComposerView: View, Equatable {
     @FocusState var isFocused: Bool
 
     @State private var localInputText: String = ""
+    @State private var submissionLatch = AgentComposerSubmissionLatch()
     @State private var editorTextFieldHeight: CGFloat = ResizableTextField.height(forPresetIndex: 0, preset: .normal)
     @State private var isInputEmpty: Bool = true
     @State private var chromeOcclusion: CGFloat = 0
@@ -325,7 +330,16 @@ struct AgentComposerView: View, Equatable {
     }
 
     private var canSubmitToRenderedTarget: Bool {
-        props.canSendWithCurrentProvider && renderedSubmitTarget != nil
+        props.canSendWithCurrentProvider
+            && renderedSubmitTarget != nil
+            && !submissionLatch.isLatched(for: currentTabID)
+    }
+
+    private var localInputTextBinding: Binding<String> {
+        Binding(
+            get: { localInputText },
+            set: { setLocalInputText($0) }
+        )
     }
 
     private var isCurrentTabMCPControlled: Bool {
@@ -482,6 +496,7 @@ struct AgentComposerView: View, Equatable {
         .onChange(of: props.draftRestorationEvent) { _, event in
             guard let event, event.tabID == currentTabID else { return }
             isSyncingDraftFromSession = true
+            let restoredText: String
             switch event.strategy {
             case .replaceIfEmpty:
                 let trimmed = localInputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -489,16 +504,17 @@ struct AgentComposerView: View, Equatable {
                     isSyncingDraftFromSession = false
                     return
                 }
-                localInputText = event.text
+                restoredText = event.text
             case .prependAlways:
                 let existing = localInputText.trimmingCharacters(in: .whitespacesAndNewlines)
                 if existing.isEmpty {
-                    localInputText = event.text
+                    restoredText = event.text
                 } else {
-                    localInputText = event.text + "\n" + existing
+                    restoredText = event.text + "\n" + existing
                 }
             }
-            isInputEmpty = localInputText.isEmpty
+            setLocalInputText(restoredText, forceRevision: true)
+            actions.storeDraft(event.tabID, restoredText)
             DispatchQueue.main.async {
                 isSyncingDraftFromSession = false
             }
@@ -558,7 +574,7 @@ struct AgentComposerView: View, Equatable {
             }
 
             ResizableTextField(
-                text: $localInputText,
+                text: localInputTextBinding,
                 placeholder: placeholderText,
                 onReturn: sendMessage,
                 resetTrigger: $resetTextFieldTrigger,
@@ -1384,6 +1400,10 @@ struct AgentComposerView: View, Equatable {
     // MARK: - Actions
 
     private func sendMessage() {
+        guard !submissionLatch.isLatched(for: currentTabID) else {
+            logViewSubmitRejection(reason: "local_attempt_latched", target: renderedSubmitTarget)
+            return
+        }
         guard props.canSendWithCurrentProvider else {
             if props.hasAvailableAgentProviders {
                 showSteeringUnsupportedNotice(props.unavailableSelectedAgentMessage ?? "Connect this agent provider in Settings before sending.")
@@ -1392,27 +1412,58 @@ struct AgentComposerView: View, Equatable {
             }
             return
         }
-        let trimmed = localInputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawDraftSnapshot = localInputText
+        let trimmed = rawDraftSnapshot.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || hasPendingAttachments else { return }
         guard let submitTarget = renderedSubmitTarget else {
+            logViewSubmitRejection(reason: "view_nil_target", target: props.submitTarget)
             showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
             return
         }
+        guard let attempt = submissionLatch.begin(
+            target: submitTarget,
+            rawDraftSnapshot: rawDraftSnapshot
+        ) else {
+            logViewSubmitRejection(reason: "local_attempt_latched", target: submitTarget)
+            return
+        }
 
-        Task { @MainActor in
-            let submissionResult = await actions.submit(submitTarget, trimmed)
-            switch submissionResult {
-            case .submitted:
-                localInputText = ""
-                resetTextFieldTrigger.toggle()
-            case let .blocked(message):
-                showSteeringUnsupportedNotice(message)
+        actions.storeDraft(attempt.sourceTabID, rawDraftSnapshot)
+        switch actions.claimSubmit(attempt) {
+        case let .claimed(claim):
+            Task { @MainActor in
+                let submissionResult = await actions.executeSubmit(claim, trimmed)
+                let effects = submissionLatch.complete(
+                    attempt,
+                    result: submissionResult,
+                    currentTabID: currentTabID,
+                    currentRawDraft: localInputText
+                )
+                guard effects.matchedAttempt else {
+                    logViewSubmitRejection(reason: "stale_completion", target: attempt.target)
+                    return
+                }
+                if effects.shouldClearInput {
+                    setLocalInputText("")
+                    resetTextFieldTrigger.toggle()
+                }
+                if let blockedMessage = effects.blockedMessage {
+                    showSteeringUnsupportedNotice(blockedMessage)
+                }
             }
+        case let .rejected(rejection):
+            submissionLatch.cancel(attempt)
+            if case .activeAttemptExists = rejection {
+                return
+            }
+            showSteeringUnsupportedNotice(Self.staleSubmitTargetMessage)
         }
     }
 
     private func showSteeringUnsupportedNotice(_ message: String) {
         guard !message.isEmpty else { return }
+        submissionLatch.advanceNoticeRevision()
+        let noticeRevision = submissionLatch.noticeRevision
         steeringUnsupportedDismissTask?.cancel()
         withAnimation(.easeInOut(duration: 0.15)) {
             steeringUnsupportedMessage = message
@@ -1421,12 +1472,36 @@ struct AgentComposerView: View, Equatable {
             try? await Task.sleep(nanoseconds: 3_000_000_000)
             guard !Task.isCancelled else { return }
             await MainActor.run {
+                guard submissionLatch.noticeRevision == noticeRevision,
+                      steeringUnsupportedMessage == message
+                else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
                     steeringUnsupportedMessage = nil
                 }
                 steeringUnsupportedDismissTask = nil
             }
         }
+    }
+
+    private func logViewSubmitRejection(reason: String, target: AgentComposerSubmitTarget?) {
+        #if DEBUG
+            AgentModePerfDiagnostics.event(
+                "agent.composer.submit.rejected",
+                tabID: currentTabID,
+                fields: [
+                    "reason": reason,
+                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "propsTabID": AgentModePerfDiagnostics.shortID(props.currentTabID),
+                    "targetTabID": AgentModePerfDiagnostics.shortID(target?.tabID),
+                    "attemptID": AgentModePerfDiagnostics.shortID(submissionLatch.activeAttemptID(for: currentTabID)),
+                    "inputRevision": String(submissionLatch.inputRevision),
+                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target?.expectedSubmissionToken),
+                    "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target?.expectedSourceAgentSessionID),
+                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target?.expectedPersistentBindingIdentity?.generation),
+                    "expectedBindingTransitionGeneration": target.map { String($0.expectedBindingTransitionGeneration) } ?? "nil"
+                ]
+            )
+        #endif
     }
 
     private func cancelRun(_ target: AgentRunCancelTarget) {
@@ -1465,10 +1540,12 @@ struct AgentComposerView: View, Equatable {
             .first(where: { $0.id == attachmentID })
         actions.removeTaggedFile(tabID, attachmentID)
         if let attachment {
-            localInputText = AgentFileMentionText.removingTaggedMention(
-                displayName: attachment.displayName,
-                relativePath: attachment.relativePath,
-                from: localInputText
+            setLocalInputText(
+                AgentFileMentionText.removingTaggedMention(
+                    displayName: attachment.displayName,
+                    relativePath: attachment.relativePath,
+                    from: localInputText
+                )
             )
         }
     }
@@ -1510,10 +1587,19 @@ struct AgentComposerView: View, Equatable {
         value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
+    private func setLocalInputText(_ newValue: String, forceRevision: Bool = false) {
+        guard forceRevision || localInputText != newValue else {
+            isInputEmpty = newValue.isEmpty
+            return
+        }
+        submissionLatch.advanceInputRevision()
+        localInputText = newValue
+        isInputEmpty = newValue.isEmpty
+    }
+
     private func loadDraftFromSession(for tabID: UUID) {
         isSyncingDraftFromSession = true
-        localInputText = actions.retrieveDraft(tabID)
-        isInputEmpty = localInputText.isEmpty
+        setLocalInputText(actions.retrieveDraft(tabID), forceRevision: true)
         DispatchQueue.main.async {
             isSyncingDraftFromSession = false
         }
@@ -1544,8 +1630,8 @@ struct AgentImageInputAdapter {
     init(fileManager: FileManager = .default, temporaryRoot: URL? = nil) {
         self.fileManager = fileManager
         self.temporaryRoot = temporaryRoot
-            ?? fileManager.temporaryDirectory
-            .appendingPathComponent("RepoPromptAgentImageInput", isDirectory: true)
+            ?? MCPFilesystemConstants.identity.temporaryRootURL(fileManager: fileManager)
+            .appendingPathComponent("AgentImageInput", isDirectory: true)
             .standardizedFileURL
     }
 

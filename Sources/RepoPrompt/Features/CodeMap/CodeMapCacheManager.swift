@@ -313,13 +313,10 @@ class CodeMapCacheManager {
 
     // MARK: - Private Helpers
 
-    /// Returns the base directory: ~/Library/Application Support/RepoPrompt/CodeMapCaches
+    /// Returns the base directory: ~/Library/Application Support/RepoPrompt CE/CodeMapCaches
     private func baseCacheDirectory() -> URL {
-        guard let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            // Fallback to home directory if something unexpected
-            return FileManager.default.homeDirectoryForCurrentUser
-        }
-        let codeMapDir = appSupport.appendingPathComponent("RepoPrompt/CodeMapCaches", isDirectory: true)
+        let codeMapDir = MCPFilesystemConstants.identity.applicationSupportRootURL()
+            .appendingPathComponent("CodeMapCaches", isDirectory: true)
         try? FileManager.default.createDirectory(at: codeMapDir, withIntermediateDirectories: true)
         return codeMapDir
     }

@@ -6,6 +6,26 @@ struct WorkspaceSearchContentCacheKey: Hashable {
     let standardizedRelativePath: String
 }
 
+struct WorkspaceSearchContentInvalidationBatch {
+    private(set) var maximumEpochsByKey: [WorkspaceSearchContentCacheKey: UInt64] = [:]
+
+    var isEmpty: Bool {
+        maximumEpochsByKey.isEmpty
+    }
+
+    var count: Int {
+        maximumEpochsByKey.count
+    }
+
+    mutating func record(_ key: WorkspaceSearchContentCacheKey, through invalidationEpoch: UInt64) {
+        maximumEpochsByKey[key] = max(maximumEpochsByKey[key] ?? 0, invalidationEpoch)
+    }
+
+    func maximumEpoch(for key: WorkspaceSearchContentCacheKey) -> UInt64? {
+        maximumEpochsByKey[key]
+    }
+}
+
 struct WorkspaceSearchDecodedContentEntry {
     let content: String?
     let modificationDate: Date
@@ -114,11 +134,21 @@ actor WorkspaceSearchDecodedContentCache {
     }
 
     func invalidate(_ key: WorkspaceSearchContentCacheKey, through invalidationEpoch: UInt64) {
-        if let entry = entries[key], entry.invalidationEpoch <= invalidationEpoch {
-            removeEntry(for: key)
+        var batch = WorkspaceSearchContentInvalidationBatch()
+        batch.record(key, through: invalidationEpoch)
+        invalidate(batch)
+    }
+
+    func invalidate(_ batch: WorkspaceSearchContentInvalidationBatch) {
+        guard !batch.isEmpty else { return }
+        for (key, invalidationEpoch) in batch.maximumEpochsByKey {
+            if let entry = entries[key], entry.invalidationEpoch <= invalidationEpoch {
+                removeEntry(for: key)
+            }
         }
-        markFlightsNonPublishable {
-            $0.cacheKey == key && $0.invalidationEpoch <= invalidationEpoch
+        markFlightsNonPublishable { flightKey in
+            guard let invalidationEpoch = batch.maximumEpoch(for: flightKey.cacheKey) else { return false }
+            return flightKey.invalidationEpoch <= invalidationEpoch
         }
     }
 

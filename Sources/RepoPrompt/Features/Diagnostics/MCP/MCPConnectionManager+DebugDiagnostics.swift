@@ -35,6 +35,8 @@ import MCP
                 return await debugRoutingSnapshotToolPayload(op: op, connectionID: connectionID, arguments: arguments)
             case "connection_history":
                 return debugConnectionHistoryToolPayload(op: op, arguments: arguments)
+            case "run_routing_history":
+                return debugRunRoutingHistoryToolPayload(op: op, arguments: arguments)
             case "clear_connection_history":
                 return debugClearConnectionHistoryToolPayload(op: op, arguments: arguments)
             case "wait_for_reconnect":
@@ -150,6 +152,16 @@ import MCP
                     return await debugMCPReadSearchContentReadSchedulerSnapshotPayload(op: op)
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_content_read_scheduler_snapshot` is only available in DEBUG builds.")
+                #endif
+            case "mcp_read_search_runtime_snapshot":
+                #if DEBUG
+                    return await debugMCPReadSearchRuntimeSnapshotPayload(
+                        op: op,
+                        connectionID: connectionID,
+                        arguments: arguments
+                    )
+                #else
+                    return debugDiagnosticsError(op: op, code: "unavailable", message: "`mcp_read_search_runtime_snapshot` is only available in DEBUG builds.")
                 #endif
             case "bootstrap_diagnostics":
                 return await debugBootstrapDiagnosticsPayload(op: op)

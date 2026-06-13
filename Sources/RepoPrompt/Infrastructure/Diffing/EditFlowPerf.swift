@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptShared
 #if DEBUG
     import Synchronization
 #endif
@@ -17,6 +18,7 @@ enum EditFlowPerf {
     struct LifecycleCorrelation {
         let id: UUID
         let captureEpoch: UInt64?
+        let requestIdentity: MCPRequestTimelineIdentity?
     }
 
     @TaskLocal
@@ -117,6 +119,22 @@ enum EditFlowPerf {
         var waiterCount: Int?
         var ingressSequence: UInt64?
         var barrierSequence: UInt64?
+        var observerToken: String?
+        var observerType: String?
+        var serialPosition: Int?
+        var queueDelayMicroseconds: Int?
+        var durationMicroseconds: Int?
+        var correlationPath: String?
+        var scannedItemCount: Int?
+        var resultBytes: Int?
+        var windowID: Int?
+        var runID: String?
+        var ownerResource: String?
+        var providerActive: Bool?
+        var networkScopeActive: Bool?
+        var permitActive: Bool?
+        var publicationPending: Bool?
+        var terminalBarrier: Bool?
 
         init(
             toolName: String? = nil,
@@ -196,7 +214,23 @@ enum EditFlowPerf {
             queueDepth: Int? = nil,
             waiterCount: Int? = nil,
             ingressSequence: UInt64? = nil,
-            barrierSequence: UInt64? = nil
+            barrierSequence: UInt64? = nil,
+            observerToken: String? = nil,
+            observerType: String? = nil,
+            serialPosition: Int? = nil,
+            queueDelayMicroseconds: Int? = nil,
+            durationMicroseconds: Int? = nil,
+            correlationPath: String? = nil,
+            scannedItemCount: Int? = nil,
+            resultBytes: Int? = nil,
+            windowID: Int? = nil,
+            runID: String? = nil,
+            ownerResource: String? = nil,
+            providerActive: Bool? = nil,
+            networkScopeActive: Bool? = nil,
+            permitActive: Bool? = nil,
+            publicationPending: Bool? = nil,
+            terminalBarrier: Bool? = nil
         ) {
             self.toolName = Self.sanitizedLabel(toolName)
             self.runPurpose = Self.sanitizedLabel(runPurpose)
@@ -276,6 +310,22 @@ enum EditFlowPerf {
             self.waiterCount = Self.nonNegative(waiterCount)
             self.ingressSequence = ingressSequence
             self.barrierSequence = barrierSequence
+            self.observerToken = Self.sanitizedLabel(observerToken)
+            self.observerType = Self.sanitizedLabel(observerType)
+            self.serialPosition = Self.nonNegative(serialPosition)
+            self.queueDelayMicroseconds = Self.nonNegative(queueDelayMicroseconds)
+            self.durationMicroseconds = Self.nonNegative(durationMicroseconds)
+            self.correlationPath = Self.sanitizedLabel(correlationPath)
+            self.scannedItemCount = Self.nonNegative(scannedItemCount)
+            self.resultBytes = Self.nonNegative(resultBytes)
+            self.windowID = Self.nonNegative(windowID)
+            self.runID = Self.sanitizedLabel(runID)
+            self.ownerResource = Self.sanitizedLabel(ownerResource)
+            self.providerActive = providerActive
+            self.networkScopeActive = networkScopeActive
+            self.permitActive = permitActive
+            self.publicationPending = publicationPending
+            self.terminalBarrier = terminalBarrier
         }
 
         fileprivate var logDescription: String {
@@ -358,6 +408,22 @@ enum EditFlowPerf {
             append("waiterCount", waiterCount, to: &parts)
             append("ingressSequence", ingressSequence, to: &parts)
             append("barrierSequence", barrierSequence, to: &parts)
+            append("observerToken", observerToken, to: &parts)
+            append("observerType", observerType, to: &parts)
+            append("serialPosition", serialPosition, to: &parts)
+            append("queueDelayUs", queueDelayMicroseconds, to: &parts)
+            append("durationUs", durationMicroseconds, to: &parts)
+            append("correlationPath", correlationPath, to: &parts)
+            append("scannedItemCount", scannedItemCount, to: &parts)
+            append("resultBytes", resultBytes, to: &parts)
+            append("windowID", windowID, to: &parts)
+            append("runID", runID, to: &parts)
+            append("ownerResource", ownerResource, to: &parts)
+            append("providerActive", providerActive, to: &parts)
+            append("networkScopeActive", networkScopeActive, to: &parts)
+            append("permitActive", permitActive, to: &parts)
+            append("publicationPending", publicationPending, to: &parts)
+            append("terminalBarrier", terminalBarrier, to: &parts)
             return parts.joined(separator: " ")
         }
 
@@ -649,6 +715,12 @@ enum EditFlowPerf {
 
         enum Git {
             static let hunkParsing: StaticString = "EditFlow.Git.HunkParsing"
+            static let mapLoadingExcerpting: StaticString = "EditFlow.Git.MapLoadingExcerpting"
+            static let dtoConstruction: StaticString = "EditFlow.Git.DTOConstruction"
+        }
+
+        enum MCPProviderProjection {
+            static let workerBody: StaticString = "EditFlow.MCPProviderProjection.WorkerBody"
         }
     }
 
@@ -658,6 +730,16 @@ enum EditFlowPerf {
             static let routingSnapshotCompleted: StaticString = "MCP.ToolCall.RoutingSnapshotCompleted"
             static let limiterWaitBegan: StaticString = "MCP.ToolCall.LimiterWaitBegan"
             static let limiterAcquired: StaticString = "MCP.ToolCall.LimiterAcquired"
+            static let permitQueued: StaticString = "MCP.ToolCall.PermitQueued"
+            static let permitAcquired: StaticString = "MCP.ToolCall.PermitAcquired"
+            static let permitReleased: StaticString = "MCP.ToolCall.PermitReleased"
+            static let observerScheduled: StaticString = "MCP.ToolCall.ObserverScheduled"
+            static let observerEntered: StaticString = "MCP.ToolCall.ObserverEntered"
+            static let observerExited: StaticString = "MCP.ToolCall.ObserverExited"
+            static let mainActorScheduled: StaticString = "MCP.ToolCall.MainActorScheduled"
+            static let mainActorEntered: StaticString = "MCP.ToolCall.MainActorEntered"
+            static let mainActorExited: StaticString = "MCP.ToolCall.MainActorExited"
+            static let publicationOwnershipState: StaticString = "MCP.ToolCall.PublicationOwnershipState"
             static let completionObserverReturned: StaticString = "MCP.ToolCall.CompletionObserverReturned"
             static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
             static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
@@ -801,6 +883,7 @@ enum EditFlowPerf {
             let offsetMS: Double
             let eventName: String
             let correlationID: String
+            let requestIdentity: MCPRequestTimelineIdentity?
             let sanitizedDimensions: String
 
             var payload: [String: Any] {
@@ -809,7 +892,18 @@ enum EditFlowPerf {
                     "offset_ms": Self.roundedMS(offsetMS),
                     "event_name": eventName,
                     "correlation_id": correlationID,
+                    "request_identity": requestIdentity.map(Self.requestIdentityPayload) ?? NSNull(),
                     "sanitized_dimensions": sanitizedDimensions
+                ]
+            }
+
+            private static func requestIdentityPayload(_ identity: MCPRequestTimelineIdentity) -> [String: Any] {
+                [
+                    "jsonrpc_request_id": identity.jsonRPCRequestID?.description ?? NSNull(),
+                    "connection_id": identity.connectionID ?? NSNull(),
+                    "connection_generation": identity.connectionGeneration ?? NSNull(),
+                    "app_invocation_id": identity.appInvocationID ?? NSNull(),
+                    "request_ordinal": identity.requestOrdinal ?? NSNull()
                 ]
             }
 
@@ -845,13 +939,43 @@ enum EditFlowPerf {
                     "max_lifecycle_events": maxLifecycleEvents,
                     "retained_lifecycle_event_count": retainedLifecycleEventCount,
                     "dropped_lifecycle_event_count": droppedLifecycleEventCount,
-                    "timeline_included": includeTimeline
+                    "timeline_included": includeTimeline,
+                    "request_timeline_count": requestTimelinePayloads.count,
+                    "request_timelines": requestTimelinePayloads,
+                    "workload_matrix_catalog": Self.workloadMatrixCatalog
                 ]
                 if includeTimeline {
                     result["lifecycle_events"] = lifecycleEvents.map(\.payload)
                 }
                 return result
             }
+
+            private var requestTimelinePayloads: [[String: Any]] {
+                let grouped = Dictionary(grouping: lifecycleEvents) { event in
+                    event.requestIdentity?.appInvocationID ?? event.correlationID
+                }
+                return grouped.keys.sorted().compactMap { key in
+                    guard let events = grouped[key]?.sorted(by: { $0.ordinal < $1.ordinal }),
+                          let first = events.first
+                    else { return nil }
+                    return [
+                        "join_key": key,
+                        "request_identity": first.payload["request_identity"] ?? NSNull(),
+                        "event_count": events.count,
+                        "event_names": events.map(\.eventName),
+                        "first_offset_ms": events.first?.payload["offset_ms"] ?? NSNull(),
+                        "last_offset_ms": events.last?.payload["offset_ms"] ?? NSNull()
+                    ]
+                }
+            }
+
+            private static let workloadMatrixCatalog: [[String: Any]] = [
+                ["id": "same_connection_ordinary_burst", "connections": 1, "windows": 1, "transcript": "short"],
+                ["id": "same_connection_mixed_ordinary_search", "connections": 1, "windows": 1, "transcript": "short"],
+                ["id": "distinct_connections_one_window", "connections": 2, "windows": 1, "transcript": "short"],
+                ["id": "distinct_windows", "connections": 2, "windows": 2, "transcript": "short"],
+                ["id": "agent_transcript_short_vs_long", "connections": 1, "windows": 1, "transcript": "short_and_long"]
+            ]
         }
 
         enum DebugCaptureBeginResult {
@@ -1032,6 +1156,7 @@ enum EditFlowPerf {
                     offsetMS: Double(elapsedNanoseconds) / 1_000_000.0,
                     eventName: eventName,
                     correlationID: correlation.id.uuidString,
+                    requestIdentity: correlation.requestIdentity,
                     sanitizedDimensions: sanitizedDimensions
                 ))
                 retainedLifecycleEventCount += 1
@@ -1237,14 +1362,24 @@ enum EditFlowPerf {
             signposter.emitEvent(name)
         }
 
-        static func makeLifecycleCorrelationIfActive() -> LifecycleCorrelation? {
+        static func makeLifecycleCorrelationIfActive(
+            requestIdentity: MCPRequestTimelineIdentity? = MCPRequestTimelineContext.current
+        ) -> LifecycleCorrelation? {
             #if DEBUG
                 let captureEpoch = debugCaptureRecorder.activeEpochIfActive()
                 guard isEnabled || captureEpoch != nil else { return nil }
-                return LifecycleCorrelation(id: UUID(), captureEpoch: captureEpoch)
+                return LifecycleCorrelation(
+                    id: UUID(),
+                    captureEpoch: captureEpoch,
+                    requestIdentity: requestIdentity
+                )
             #else
                 guard isEnabled else { return nil }
-                return LifecycleCorrelation(id: UUID(), captureEpoch: nil)
+                return LifecycleCorrelation(
+                    id: UUID(),
+                    captureEpoch: nil,
+                    requestIdentity: requestIdentity
+                )
             #endif
         }
 

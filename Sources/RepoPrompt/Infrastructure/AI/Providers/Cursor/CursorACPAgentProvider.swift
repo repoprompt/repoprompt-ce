@@ -14,7 +14,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
     init(
         config: CursorAgentConfig,
         repoPromptMCPConfiguration: RepoPromptMCPServerConfiguration = .repoPrompt,
-        launchResolver: CursorACPLaunchResolver = .shared
+        launchResolver: CursorACPLaunchResolver = CursorACPLaunchResolver()
     ) {
         self.config = config
         self.repoPromptMCPConfiguration = repoPromptMCPConfiguration
@@ -25,27 +25,39 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         .cursor
     }
 
-    func support(for _: ACPRunRequest) async -> ACPSupportResult {
-        await launchResolver.probeSupport(for: config)
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        try await launchResolver.probeSupport(for: config)
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
         let workingDirectory = try standardizedWorkingDirectory(from: request.workspacePath)
-        let effectiveHints = CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints)
-        let resolvedLaunch = launchResolver.resolvedLaunch(for: config)
-            ?? CursorACPResolvedLaunch.fallback(
-                commandName: config.commandName,
-                additionalPathHints: effectiveHints
+        let resolvedLaunch = try launchResolver.resolvedLaunch(for: config)
+        var environment: [String: String] = [:]
+        var cleanupArtifact: ACPLaunchCleanupArtifact?
+        if config.includeRepoPromptMCPServer {
+            let cursorDataDirectory = CursorIntegrationConfiguration.cursorDataDirectoryURL(
+                workingDirectory: workingDirectory,
+                environment: resolvedLaunch.environment
             )
+            environment["CURSOR_DATA_DIR"] = cursorDataDirectory.path
+            cleanupArtifact = try CursorIntegrationConfiguration.prepareProjectMCPApproval(
+                workingDirectory: workingDirectory,
+                cursorDataDirectory: cursorDataDirectory,
+                repoPromptMCPConfiguration: repoPromptMCPConfiguration,
+                cleanupAfterRun: config.cleanupProjectMCPApproval
+            )
+        }
 
         return ACPLaunchConfiguration(
             providerID: providerID,
             command: resolvedLaunch.command,
             arguments: resolvedLaunch.arguments,
-            environment: [:],
+            environment: environment,
             workingDirectory: workingDirectory,
             additionalPathHints: resolvedLaunch.additionalPathHints,
-            enableDebugLogging: config.enableDebugLogging
+            enableDebugLogging: config.enableDebugLogging,
+            cleanupArtifact: cleanupArtifact,
+            expectedExecutableIdentity: resolvedLaunch.executableIdentity
         )
     }
 
@@ -118,7 +130,7 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         else {
             return
         }
-        CursorIntegrationConfiguration.cleanupProjectMCPConfig(leaseID: artifact.id)
+        CursorIntegrationConfiguration.cleanupProjectMCPApproval(leaseID: artifact.id)
     }
 
     func normalizeError(_ error: Error) -> Error {
@@ -128,14 +140,20 @@ struct CursorACPAgentProvider: ACPAgentProvider {
         if let runnerError = error as? CLIProcessRunnerError,
            case .commandNotFound = runnerError
         {
-            return AIProviderError.invalidConfiguration(detail: "Cursor CLI ACP server not found. Install Cursor CLI and ensure `cursor-agent acp` or `cursor agent acp` is available on PATH.")
+            return AIProviderError.invalidConfiguration(detail: "Cursor Agent CLI ACP server not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available.")
+        }
+        if error is CursorACPLaunchResolutionError || error is ExecutableFileIdentityError {
+            return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
         if (error as NSError).domain == NSCocoaErrorDomain {
-            return AIProviderError.invalidConfiguration(detail: "Unable to prepare Cursor ACP config: \(error.localizedDescription)")
+            return AIProviderError.invalidConfiguration(detail: "Unable to prepare Cursor MCP approval: \(error.localizedDescription)")
         }
         let description = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
         let lower = description.lowercased()
-        if lower.contains("session mode") || lower.contains("session/set_mode") {
+        if lower.contains("session mode")
+            || lower.contains("session/set_config_option")
+            || lower.contains("mode config option")
+        {
             return AIProviderError.invalidConfiguration(detail: description)
         }
         return AIProviderError.apiError(source: error)

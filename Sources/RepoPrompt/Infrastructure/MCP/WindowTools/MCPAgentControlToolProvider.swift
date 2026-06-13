@@ -32,6 +32,8 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             description: """
             Short-lived, read-only explore child agents for narrow codebase probes. Each child runs in a fresh session with its own context window. Always uses the `explore` role; no custom `model_id`, workflows, session reuse, `steer`, or `respond`.
 
+            Explore children inherit the caller's worktree bindings by default; pass `inherit_worktree=false` to opt out. Start-only worktree controls can bind an existing worktree or create one before provider startup, overriding an inherited primary-root binding. Multi-message creates produce one worktree per child when branch/path are implicit and reject a shared explicit branch or path.
+
             **Operations**: start | poll | wait | cancel
 
             - `start`: Launch one or more fresh explore sessions. Provide `message` for one probe or `messages` for multiple probes. Batch starts wait for the first referenced session to finish or need input unless `detach=true`.
@@ -46,7 +48,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 description: """
                 Provide `op` plus operation-specific fields.
 
-                **start**: message or messages (required, mutually exclusive), detach?, timeout?
+                **start**: message or messages (required, mutually exclusive), detach?, timeout?, inherit_worktree?, worktree|worktree_id|worktree_create? and worktree_* args
                 **poll / wait**: session_id or session_ids (mutually exclusive), timeout? (wait only)
                 **cancel**: session_id (required)
                 """,
@@ -56,6 +58,17 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                     "messages": .array(description: "[start] Array of exploration instruction strings. Mutually exclusive with message. Starts one fresh explore child per entry.", items: .string()),
                     "detach": .boolean(description: "[start] Return immediately instead of waiting. Default false."),
                     "timeout": .number(description: "[start, wait] Max wait seconds. 0 = poll. Default \(defaultWaitSeconds)."),
+                    "worktree": .string(description: "[start] Existing worktree selector to bind before provider startup: @current, @main, @branch:<name>, name, branch, path, or @id:<worktree_id>. Mutually exclusive with worktree_id and worktree_create."),
+                    "worktree_id": .string(description: "[start] Durable worktree ID to bind before provider startup. Mutually exclusive with worktree and worktree_create."),
+                    "worktree_create": .boolean(description: "[start] Create an app-managed Git worktree, bind it to the new session, materialize its hidden root, then start the provider. Mutually exclusive with worktree/worktree_id."),
+                    "inherit_worktree": .boolean(description: "[start] When started from an Agent Mode run, inherit the source session's worktree bindings before provider startup. Default true. Set false to keep parent session threading but skip worktree inheritance; explicit worktree/worktree_id/worktree_create args still bind the requested worktree."),
+                    "worktree_repo_root": .string(description: "[start] Repo/logical root selector for worktree resolution or creation. Defaults to the first loaded Git repo."),
+                    "worktree_branch": .string(description: "[start + worktree_create] Optional branch name for the new worktree. Defaults to an rp/agent/<session>-... branch."),
+                    "worktree_base_ref": .string(description: "[start + worktree_create] Optional base ref/commit for the new worktree."),
+                    "worktree_path": .string(description: "[start + worktree_create] Optional explicit absolute path (or ~/...). External paths require allow_external_worktree_path=true."),
+                    "worktree_label": .string(description: "[start] Optional visual label to persist for the bound worktree."),
+                    "worktree_color": .string(description: "[start] Optional visual color to persist for the bound worktree as #RRGGBB."),
+                    "allow_external_worktree_path": .boolean(description: "[start + worktree_create] Allow explicit worktree_path outside RepoPrompt's app-managed worktree container."),
                     "session_id": .string(description: "[poll, wait, cancel] Explore child session UUID returned by start."),
                     "session_ids": .array(description: "[wait, poll] Array of explore child session UUIDs. Mutually exclusive with session_id.", items: .string())
                 ],

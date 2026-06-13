@@ -596,6 +596,11 @@ final class AgentModeViewModel: ObservableObject {
         private var test_currentTabIDOverride: UUID?
         private var test_allowsScheduledDerivedTranscriptRefreshWithoutPromptManager = false
         private var test_afterMCPStoreEpochBegan: (@MainActor () async -> Void)?
+        private var test_terminalPublicationOverride: ((
+            AgentRunTerminalCommitRevision,
+            AgentRunEpochTransitionKind?,
+            TabSession
+        ) async -> AgentRunTerminalPublicationResult)?
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
@@ -646,6 +651,16 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setAfterMCPStoreEpochBegan(_ hook: (@MainActor () async -> Void)?) {
             test_afterMCPStoreEpochBegan = hook
+        }
+
+        func test_setTerminalPublicationOverride(
+            _ hook: ((
+                AgentRunTerminalCommitRevision,
+                AgentRunEpochTransitionKind?,
+                TabSession
+            ) async -> AgentRunTerminalPublicationResult)?
+        ) {
+            test_terminalPublicationOverride = hook
         }
 
         func test_makeTerminalPublicationEnvelope(
@@ -1286,15 +1301,14 @@ final class AgentModeViewModel: ObservableObject {
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, computerUseEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
-            let shellToolEnabledOverride: Bool? = taskLabelKind == .explore ? false : nil
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: shellToolEnabledOverride,
+                shellToolEnabled: nil,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
@@ -4015,6 +4029,10 @@ final class AgentModeViewModel: ObservableObject {
         publishChanges: Bool = true,
         deactivateLiveControlContext: Bool = true
     ) async {
+        codexCoordinator.handleMCPControlReset(
+            for: session,
+            reason: "Codex queued follow-up was cancelled because MCP control was torn down."
+        )
         session.mcpControlActivationGeneration &+= 1
         if let context = session.mcpControlContext {
             if deactivateLiveControlContext {
@@ -4041,6 +4059,19 @@ final class AgentModeViewModel: ObservableObject {
 
     func publishMCPStateChange(for session: TabSession) {
         handleObservedMCPStateChange(for: session)
+    }
+
+    func signalCodexInstructionDelivered(for session: TabSession) async {
+        await signalMCPInstructionDelivered(for: session)
+    }
+
+    func restoreCodexFallbackDraft(tabID: UUID, text: String, message: String) {
+        restoreComposerDraft(
+            tabID: tabID,
+            text: text,
+            message: message,
+            strategy: .prependAlways
+        )
     }
 
     func publishRunInteractionStateChange(
@@ -4126,6 +4157,15 @@ final class AgentModeViewModel: ObservableObject {
         successorKind: AgentRunEpochTransitionKind?,
         for session: TabSession
     ) async -> AgentRunTerminalPublicationResult {
+        #if DEBUG
+            if let test_terminalPublicationOverride {
+                return await test_terminalPublicationOverride(
+                    revision,
+                    successorKind,
+                    session
+                )
+            }
+        #endif
         guard let envelope = revision.mcpPublicationEnvelope else {
             return session.mcpControlContext == nil
                 ? .accepted(successorEpoch: nil)
@@ -5636,6 +5676,12 @@ final class AgentModeViewModel: ObservableObject {
         }
         let existingContext = session.mcpControlContext
         let activationID = UUID()
+        if existingContext != nil {
+            codexCoordinator.handleMCPControlReset(
+                for: session,
+                reason: "Codex queued follow-up was cancelled because MCP control was replaced."
+            )
+        }
         if let existingSessionID = existingContext?.sessionID,
            existingSessionID != sessionID
         {
@@ -5746,6 +5792,10 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
+        codexCoordinator.handleMCPControlReset(
+            for: session,
+            reason: "Codex queued follow-up was cancelled because MCP control was deactivated."
+        )
         session.mcpControlActivationGeneration &+= 1
         session.mcpControlCleanupTask?.cancel()
         session.mcpControlCleanupTask = nil
@@ -5797,29 +5847,29 @@ final class AgentModeViewModel: ObservableObject {
         session: TabSession,
         attemptID: UUID
     ) async throws -> MCPInstructionDispatch {
-        let ack = await session.codexSteerAckTracker.awaitAck(attemptID: attemptID)
-        switch ack {
-        case .queuedFollowUp:
+        let state = await session.codexSteerAckTracker.awaitTerminalState(attemptID: attemptID)
+        switch state {
+        case .durablyQueued:
             return .queuedFollowUp
-        case let .sendOutcome(outcome):
-            switch outcome {
-            case .sent:
-                return .dispatchedCodexTurn
-            case let .stale(reason):
-                throw MCPError.internalError(
-                    reason.isEmpty
-                        ? "Codex steer was dropped because the active run changed before delivery."
-                        : reason
-                )
-            case .cancelled:
-                throw MCPError.invalidParams("Codex steer was cancelled before it reached the active run.")
-            case let .failed(message):
-                throw MCPError.internalError(
-                    message.isEmpty
-                        ? "Codex steer failed before reaching the active run."
-                        : message
-                )
+        case .steerAccepted, .startAccepted, .controlAccepted:
+            return .dispatchedCodexTurn
+        case let .failed(message):
+            throw MCPError.internalError(
+                message.isEmpty
+                    ? "Codex steer failed before reaching the active run."
+                    : message
+            )
+        case .cancelled:
+            if Task.isCancelled {
+                throw CancellationError()
             }
+            throw MCPError.invalidParams("Codex steer was cancelled before it reached the active run.")
+        case let .stale(reason):
+            throw MCPError.internalError(
+                reason.isEmpty
+                    ? "Codex steer was dropped because the active run changed before delivery."
+                    : reason
+            )
         case .timedOut:
             throw MCPError.internalError(
                 "Timed out waiting for Codex to acknowledge the steer message. The run may have changed state."
@@ -5946,6 +5996,11 @@ final class AgentModeViewModel: ObservableObject {
             codexAttemptID = nil
             signalsDeliveryAfterDispatch = false
         }
+        defer {
+            if Task.isCancelled, let codexAttemptID {
+                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+            }
+        }
 
         let submission: UserTurnSubmissionResult
         session.isMCPInstructionDispatchInProgress = true
@@ -5961,10 +6016,15 @@ final class AgentModeViewModel: ObservableObject {
                     attachmentsToSend: [],
                     taggedFilesToSend: [],
                     activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                    nativePreparedTurn: nativePreparedTurn
+                    nativePreparedTurn: nativePreparedTurn,
+                    codexAttemptID: codexAttemptID
                 )
             }
-            return submitUserTurn(text: trimmedText, tabID: session.tabID)
+            return submitUserTurn(
+                text: trimmedText,
+                tabID: session.tabID,
+                codexAttemptID: codexAttemptID
+            )
         }
         switch submission {
         case .submitted:
@@ -5977,6 +6037,7 @@ final class AgentModeViewModel: ObservableObject {
                 await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
             }
             if let codexAttemptID {
+                session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
                 delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
             }
             if signalsDeliveryAfterDispatch {
@@ -9947,21 +10008,67 @@ final class AgentModeViewModel: ObservableObject {
         target: AgentComposerSubmitTarget,
         createAndActivateSessionTab: () async -> UUID?
     ) async -> UserTurnSubmissionResult {
-        if let rejectionReason = submitTargetRejectionReason(target, session: sessions[target.tabID]) {
-            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
-            resyncAfterRejectedSubmitTarget(target)
+        let attempt = AgentComposerSubmitAttempt(
+            id: UUID(),
+            target: target,
+            inputRevision: 0,
+            noticeRevision: 0,
+            rawDraftSnapshot: text
+        )
+        switch claimComposerSubmitAttempt(attempt) {
+        case let .claimed(claim):
+            return await executeComposerSubmitAttempt(
+                text: text,
+                claim: claim,
+                createAndActivateSessionTab: createAndActivateSessionTab
+            )
+        case .rejected:
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
         }
-        if sessions[target.tabID]?.isPreparingInitialWorktree == true {
-            logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "initial_worktree_preparation_in_progress")
-            resyncAfterRejectedSubmitTarget(target)
+    }
+
+    @discardableResult
+    func executeComposerSubmitAttempt(
+        text: String,
+        claim: AgentComposerSubmitClaim
+    ) async -> UserTurnSubmissionResult {
+        await executeComposerSubmitAttempt(
+            text: text,
+            claim: claim,
+            createAndActivateSessionTab: { [weak self] in
+                await self?.createAndActivateSessionTab()
+            }
+        )
+    }
+
+    @discardableResult
+    func executeComposerSubmitAttempt(
+        text: String,
+        claim: AgentComposerSubmitClaim,
+        createAndActivateSessionTab: () async -> UUID?
+    ) async -> UserTurnSubmissionResult {
+        let target = claim.attempt.target
+        let claimedSourceSession = claim.sourceSession
+        guard composerSubmitClaimIsCurrent(claim) else {
             return .blocked(message: Self.staleComposerSubmitTargetMessage)
+        }
+        defer {
+            releaseComposerSubmitClaim(claim)
         }
 
         switch target.route {
         case .existingAgentSession:
             let preparedSession = await ensureSessionReady(tabID: target.tabID)
-            if let rejectionReason = submitTargetRejectionReason(target, session: preparedSession) {
+            guard preparedSession === claimedSourceSession,
+                  composerSubmitClaimIsCurrent(claim)
+            else {
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+            if let rejectionReason = submitTargetRejectionReason(
+                target,
+                session: preparedSession,
+                validateSubmissionToken: false
+            ) {
                 logRejectedSubmitTarget(target, session: preparedSession, reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
@@ -9971,7 +10078,11 @@ final class AgentModeViewModel: ObservableObject {
                   initialLocation != .local,
                   pendingState.initialStartLocation == initialLocation
             else {
-                return submitUserTurn(text: text, tabID: target.tabID)
+                let result = submitUserTurn(text: text, tabID: target.tabID)
+                if result == .submitted {
+                    clearComposerDraftIfUnchanged(for: claim)
+                }
+                return result
             }
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: preparedSession,
@@ -9996,14 +10107,27 @@ final class AgentModeViewModel: ObservableObject {
             do {
                 try await prepareInitialExecutionLocation(initialLocation, for: preparedSession) {
                     !Task.isCancelled
+                        && self.composerSubmitClaimIsCurrent(claim)
                         && self.sessions[target.tabID] === preparedSession
+                        && self.composerSourceAgentSessionID(
+                            tabID: target.tabID,
+                            session: preparedSession
+                        ) == target.expectedSourceAgentSessionID
                         && sourceSnapshot.matches(self.sessions[target.tabID])
                         && Self.pendingUserTurnState(from: preparedSession) == pendingState
                 }
             } catch {
                 return .blocked(message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
             }
+            guard composerSourceAgentSessionID(tabID: target.tabID, session: preparedSession)
+                == target.expectedSourceAgentSessionID
+            else {
+                logRejectedSubmitTarget(target, session: preparedSession, reason: "agent_session_id_mismatch")
+                resyncAfterRejectedSubmitTarget(target)
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
             guard !Task.isCancelled,
+                  composerSubmitClaimIsCurrent(claim),
                   sessions[target.tabID] === preparedSession,
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: preparedSession) == pendingState
@@ -10017,9 +10141,13 @@ final class AgentModeViewModel: ObservableObject {
             if target.tabID == currentTabID {
                 applySessionToBindings(preparedSession)
             }
-            return submitUserTurn(text: text, tabID: target.tabID)
+            let result = submitUserTurn(text: text, tabID: target.tabID)
+            if result == .submitted {
+                clearComposerDraftIfUnchanged(for: claim)
+            }
+            return result
         case .createAgentSessionFromSourceTab:
-            let sourceSession = session(for: target.tabID, createIfNeeded: false)
+            let sourceSession = claimedSourceSession
             let sourceSnapshot = FirstSendSourceSnapshot(
                 session: sourceSession,
                 fallbackSelectedAgent: selectedAgent,
@@ -10030,13 +10158,13 @@ final class AgentModeViewModel: ObservableObject {
             let pendingState = Self.pendingUserTurnState(from: sourceSession)
             let preparesExecutionLocation = pendingState.initialStartLocation != .local
             if preparesExecutionLocation {
-                sourceSession?.isPreparingInitialWorktree = true
+                sourceSession.isPreparingInitialWorktree = true
                 syncComposerUIState(tabID: target.tabID)
                 syncStatusPillsUIState()
             }
             defer {
                 if preparesExecutionLocation {
-                    sourceSession?.isPreparingInitialWorktree = false
+                    sourceSession.isPreparingInitialWorktree = false
                     if target.tabID == currentTabID {
                         syncComposerUIState(tabID: target.tabID)
                         syncStatusPillsUIState()
@@ -10046,17 +10174,29 @@ final class AgentModeViewModel: ObservableObject {
             guard let destinationTabID = await createAndActivateSessionTab() else {
                 return .blocked(message: "Failed to create a new agent session.")
             }
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled,
+                  composerSubmitClaimIsCurrent(claim)
+            else {
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
-            if let rejectionReason = submitTargetRejectionReason(target, session: sessions[target.tabID]) {
+            guard sessions[target.tabID] === sourceSession else {
+                await discardFreshFirstSendDestinationIfPossible(destinationTabID)
+                return .blocked(message: Self.staleComposerSubmitTargetMessage)
+            }
+            if let rejectionReason = submitTargetRejectionReason(
+                target,
+                session: sourceSession,
+                validateSubmissionToken: false
+            ) {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: rejectionReason)
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
                 return .blocked(message: Self.staleComposerSubmitTargetMessage)
             }
-            guard sourceSnapshot.matches(sessions[target.tabID]) else {
+            guard composerSubmitClaimIsCurrent(claim),
+                  sourceSnapshot.matches(sessions[target.tabID])
+            else {
                 logRejectedSubmitTarget(target, session: sessions[target.tabID], reason: "source_pending_state_changed")
                 resyncAfterRejectedSubmitTarget(target)
                 await discardFreshFirstSendDestinationIfPossible(destinationTabID)
@@ -10100,7 +10240,9 @@ final class AgentModeViewModel: ObservableObject {
                 do {
                     try await prepareInitialExecutionLocation(pendingState.initialStartLocation, for: destinationSession) {
                         !Task.isCancelled
+                            && self.composerSubmitClaimIsCurrent(claim)
                             && self.sessions[destinationTabID] === destinationSession
+                            && self.sessions[target.tabID] === sourceSession
                             && sourceSnapshot.matches(self.sessions[target.tabID])
                             && Self.pendingUserTurnState(from: destinationSession) == pendingState
                     }
@@ -10111,7 +10253,9 @@ final class AgentModeViewModel: ObservableObject {
                 }
             }
             guard !Task.isCancelled,
+                  composerSubmitClaimIsCurrent(claim),
                   sessions[destinationTabID] === destinationSession,
+                  sessions[target.tabID] === sourceSession,
                   sourceSnapshot.matches(sessions[target.tabID]),
                   Self.pendingUserTurnState(from: destinationSession) == pendingState
             else {
@@ -10132,7 +10276,7 @@ final class AgentModeViewModel: ObservableObject {
                 return result
             }
             clearPendingUserTurnState(on: sourceSession)
-            storeDraftText(for: target.tabID, "")
+            clearComposerDraftIfUnchanged(for: claim)
             return result
         }
     }
@@ -10241,12 +10385,6 @@ final class AgentModeViewModel: ObservableObject {
            let validationFailure = validateSlashSkillUsage(in: trimmedText, activeWorkflow: workflow)
         {
             return validationFailure
-        }
-        if session.selectedAgent == .codexExec,
-           codexCoordinator.isCodexCompactionInFlight(session: session),
-           !session.pendingCodexCompactionInstructions.isEmpty
-        {
-            return .blocked(message: "Wait for Codex compaction to finish before sending another follow-up.")
         }
         return nil
     }
@@ -10437,7 +10575,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
-    func submitUserTurn(text: String, tabID: UUID) -> UserTurnSubmissionResult {
+    func submitUserTurn(
+        text: String,
+        tabID: UUID,
+        codexAttemptID: UUID? = nil
+    ) -> UserTurnSubmissionResult {
         let session = session(for: tabID)
         let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachmentsToSend = session.pendingImageAttachments
@@ -10465,9 +10607,6 @@ final class AgentModeViewModel: ObservableObject {
             }
             switch nativeSlashCommand.command.behavior {
             case .controlPlane:
-                let codexAttemptID = session.selectedAgent == .codexExec
-                    ? session.codexSteerAckTracker.takePendingAttempt()
-                    : nil
                 let goalAction: CodexAgentModeCoordinator.GoalSlashAction? = nativeSlashCommand.command == .goal
                     ? CodexAgentModeCoordinator.goalSlashAction(from: nativeSlashCommand.argumentsText)
                     : nil
@@ -10483,6 +10622,11 @@ final class AgentModeViewModel: ObservableObject {
                 )
                 Task { [weak self] in
                     guard let self else { return }
+                    if let codexAttemptID {
+                        guard await session.codexSteerAckTracker.awaitDispatchAuthorization(
+                            attemptID: codexAttemptID
+                        ) else { return }
+                    }
                     let result = await submitNativeSlashCommandAfterHydration(
                         tabID: tabID,
                         invocation: nativeSlashCommand,
@@ -10490,15 +10634,15 @@ final class AgentModeViewModel: ObservableObject {
                         progressRestoreState: progressRestoreState
                     )
                     guard let codexAttemptID else { return }
-                    let ack: CodexSteerAckTracker.Ack = switch result {
+                    let state: CodexSteerAckTracker.TerminalState = switch result {
                     case .succeeded:
-                        .sendOutcome(.sent)
+                        .controlAccepted
                     case let .failed(message):
-                        .sendOutcome(.failed(message: message))
+                        .failed(message: message)
                     case nil:
-                        .sendOutcome(.failed(message: "Native Codex slash command could not be delivered because the session changed before execution."))
+                        .stale(reason: "Native Codex slash command could not be delivered because the session changed before execution.")
                     }
-                    session.codexSteerAckTracker.resolve(attemptID: codexAttemptID, ack: ack)
+                    session.codexSteerAckTracker.resolve(attemptID: codexAttemptID, state: state)
                 }
                 return .submitted
             case .userTurnWrapper:
@@ -10524,15 +10668,6 @@ final class AgentModeViewModel: ObservableObject {
             return invocation.definition.asBubbleWorkflowDefinition()
         }()
 
-        let codexCompactionInFlight = session.selectedAgent == .codexExec
-            && codexCoordinator.isCodexCompactionInFlight(session: session)
-        if codexCompactionInFlight,
-           !session.pendingCodexCompactionInstructions.isEmpty
-        {
-            storeDraftText(for: tabID, trimmedText)
-            return .blocked(message: "Wait for Codex compaction to finish before sending another follow-up.")
-        }
-
         // Capture and clear workflow before sending
         session.selectedWorkflow = nil
         selectedWorkflow = nil
@@ -10549,7 +10684,8 @@ final class AgentModeViewModel: ObservableObject {
                     attachmentsToSend: attachmentsToSend,
                     taggedFilesToSend: taggedFilesToSend,
                     activeWorkflow: bubbleWorkflow,
-                    nativePreparedTurn: nativePreparedTurn
+                    nativePreparedTurn: nativePreparedTurn,
+                    codexAttemptID: codexAttemptID
                 )
             }
             return .submitted
@@ -10562,7 +10698,8 @@ final class AgentModeViewModel: ObservableObject {
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: bubbleWorkflow,
-            nativePreparedTurn: nativePreparedTurn
+            nativePreparedTurn: nativePreparedTurn,
+            codexAttemptID: codexAttemptID
         )
     }
 
@@ -10572,7 +10709,8 @@ final class AgentModeViewModel: ObservableObject {
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil
+        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
+        codexAttemptID: UUID? = nil
     ) async {
         guard let session = sessions[tabID] else { return }
         await prepareSessionForRunStart(tabID: tabID, session: session)
@@ -10584,7 +10722,8 @@ final class AgentModeViewModel: ObservableObject {
             attachmentsToSend: attachmentsToSend,
             taggedFilesToSend: taggedFilesToSend,
             activeWorkflow: activeWorkflow,
-            nativePreparedTurn: nativePreparedTurn
+            nativePreparedTurn: nativePreparedTurn,
+            codexAttemptID: codexAttemptID
         )
     }
 
@@ -10615,7 +10754,8 @@ final class AgentModeViewModel: ObservableObject {
         attachmentsToSend: [AgentImageAttachment],
         taggedFilesToSend: [AgentTaggedFileAttachment],
         activeWorkflow: AgentWorkflowDefinition?,
-        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil
+        nativePreparedTurn: NativeSlashPreparedUserTurn? = nil,
+        codexAttemptID: UUID? = nil
     ) -> UserTurnSubmissionResult {
         Self.logCodexDebug("[AgentModeVM] submitUserTurn: tabID=\(tabID), selectedAgent=\(session.selectedAgent), attachments=\(attachmentsToSend.count), taggedFiles=\(taggedFilesToSend.count), workflow=\(activeWorkflow?.displayName ?? "none")")
 
@@ -10737,20 +10877,36 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         if session.selectedAgent == .codexExec {
-            let codexAttemptID = session.codexSteerAckTracker.takePendingAttempt()
-            if codexCompactionInFlight {
-                session.pendingCodexCompactionInstructions = [wrappedText]
-                if let codexAttemptID {
-                    session.codexSteerAckTracker.resolve(attemptID: codexAttemptID, ack: .queuedFollowUp)
-                }
-                return UserTurnSubmissionResult.submitted
-            }
+            let dispatchTicket = session.codexDispatchSerialGate.issueTicket()
+            let fallbackContext = TabSession.CodexFallbackSubmissionContext(
+                queueID: UUID(),
+                providerText: wrappedText,
+                images: attachmentsToSend,
+                taggedFileAttachments: taggedFilesToSend,
+                draftText: trimmedText,
+                optimisticUserItemID: userItem.id,
+                origin: codexAttemptID.map(TabSession.CodexFallbackOrigin.mcp) ?? .manual,
+                dispatchTicket: dispatchTicket
+            )
             Task {
+                var handedOffToSerialDispatch = false
+                defer {
+                    if !handedOffToSerialDispatch {
+                        session.codexDispatchSerialGate.cancel(dispatchTicket)
+                    }
+                }
+                if let codexAttemptID {
+                    guard await session.codexSteerAckTracker.awaitDispatchAuthorization(
+                        attemptID: codexAttemptID
+                    ) else { return }
+                }
+                handedOffToSerialDispatch = true
                 let sendOutcome = await self.startAgentRun(
                     tabID: tabID,
                     initialMessage: wrappedText,
                     attachments: attachmentsToSend,
-                    taggedFileAttachments: taggedFilesToSend
+                    taggedFileAttachments: taggedFilesToSend,
+                    codexFallbackContext: fallbackContext
                 )
                 if sendOutcome?.didSend != true {
                     self.clearPendingCodexComputerUseActivationIfMatched(
@@ -10759,9 +10915,24 @@ final class AgentModeViewModel: ObservableObject {
                     )
                 }
                 guard let codexAttemptID else { return }
-                let resolvedOutcome = sendOutcome
-                    ?? .failed(message: "Codex steer could not be delivered because the runtime changed before send started.")
-                session.codexSteerAckTracker.resolve(attemptID: codexAttemptID, ack: .sendOutcome(resolvedOutcome))
+                let terminalState: CodexSteerAckTracker.TerminalState = switch sendOutcome {
+                case .sent:
+                    .steerAccepted
+                case let .queuedFallback(queueID, _):
+                    .durablyQueued(queueID: queueID)
+                case let .stale(reason):
+                    .stale(reason: reason)
+                case .cancelled:
+                    .cancelled
+                case let .failed(message):
+                    .failed(message: message)
+                case nil:
+                    .stale(reason: "Codex steer could not be delivered because the runtime changed before send started.")
+                }
+                session.codexSteerAckTracker.resolve(
+                    attemptID: codexAttemptID,
+                    state: terminalState
+                )
             }
             return UserTurnSubmissionResult.submitted
         }
@@ -11352,9 +11523,25 @@ final class AgentModeViewModel: ObservableObject {
         case .claudeNativeInterrupt, .acpPrompt:
             .afterProviderSend
         case nil:
-            .afterOptimisticSubmit
+            session.selectedAgent == .codexExec
+                ? .afterProviderSend
+                : .afterOptimisticSubmit
         }
     }
+
+    #if DEBUG
+        static func test_mcpActiveInstructionDeliverySignalTiming(
+            selectedAgent: AgentProviderKind,
+            hasNativeSteeringRoute: Bool
+        ) -> MCPActiveInstructionDeliverySignalTiming {
+            if hasNativeSteeringRoute {
+                return .afterProviderSend
+            }
+            return selectedAgent == .codexExec
+                ? .afterProviderSend
+                : .afterOptimisticSubmit
+        }
+    #endif
 
     func renderProviderMessage(
         text: String,
@@ -12054,9 +12241,21 @@ final class AgentModeViewModel: ObservableObject {
         tabID: UUID,
         initialMessage: String,
         attachments: [AgentImageAttachment] = [],
-        taggedFileAttachments: [AgentTaggedFileAttachment] = []
+        taggedFileAttachments: [AgentTaggedFileAttachment] = [],
+        codexFallbackContext: TabSession.CodexFallbackSubmissionContext? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         let session = session(for: tabID)
+        let codexDispatchTicket = codexFallbackContext?.dispatchTicket
+        if let codexDispatchTicket {
+            guard await session.codexDispatchSerialGate.awaitTurn(codexDispatchTicket) else {
+                return .cancelled
+            }
+        }
+        defer {
+            if let codexDispatchTicket {
+                session.codexDispatchSerialGate.finish(codexDispatchTicket)
+            }
+        }
         guard AgentModelCatalog.isAgentAvailable(session.selectedAgent, availability: agentAvailabilityContext) else {
             if session.mcpFollowUpRunPending {
                 session.mcpFollowUpRunPending = false
@@ -12086,13 +12285,26 @@ final class AgentModeViewModel: ObservableObject {
             session: session,
             initialMessage: augmentedInitialMessage
         )
+        let preparedCodexFallbackContext = codexFallbackContext.map { context in
+            TabSession.CodexFallbackSubmissionContext(
+                queueID: context.queueID,
+                providerText: initialMessageForRun,
+                images: context.images,
+                taggedFileAttachments: context.taggedFileAttachments,
+                draftText: context.draftText,
+                optimisticUserItemID: context.optimisticUserItemID,
+                origin: context.origin,
+                dispatchTicket: context.dispatchTicket
+            )
+        }
 
         return await runService.startRun(
             tabID: tabID,
             session: session,
             initialUserMessage: augmentedInitialMessage,
             initialMessageForRun: initialMessageForRun,
-            attachments: attachments
+            attachments: attachments,
+            codexFallbackContext: preparedCodexFallbackContext
         )
     }
 
@@ -13004,7 +13216,110 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func submitTargetRejectionReason(_ target: AgentComposerSubmitTarget, session: TabSession?) -> String? {
+    func claimComposerSubmitAttempt(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaimResult {
+        let target = attempt.target
+        guard let session = sessions[target.tabID] else {
+            let rejection = AgentComposerSubmitClaimRejection.missingSession
+            logRejectedSubmitTarget(target, session: nil, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity else {
+            let rejection = AgentComposerSubmitClaimRejection.sourceSessionIdentityMismatch
+            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if let activeAttempt = session.activeComposerSubmitAttempt {
+            let rejection = AgentComposerSubmitClaimRejection.activeAttemptExists(activeAttemptID: activeAttempt.id)
+            logRejectedSubmitTarget(
+                target,
+                session: session,
+                reason: rejection.diagnosticReason,
+                attempt: attempt,
+                activeAttempt: activeAttempt
+            )
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if let rejectionReason = submitTargetRejectionReason(target, session: session) {
+            let rejection = AgentComposerSubmitClaimRejection.targetRejected(reason: rejectionReason)
+            logRejectedSubmitTarget(target, session: session, reason: rejectionReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if session.isPreparingInitialWorktree {
+            let rejection = AgentComposerSubmitClaimRejection.initialWorktreePreparationInProgress
+            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+        if session.isChangingExecutionLocation {
+            let rejection = AgentComposerSubmitClaimRejection.executionLocationChangeInProgress
+            logRejectedSubmitTarget(target, session: session, reason: rejection.diagnosticReason, attempt: attempt)
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
+
+        session.activeComposerSubmitAttempt = attempt
+        session.composerSubmissionToken = UUID()
+        let claim = AgentComposerSubmitClaim(
+            attempt: attempt,
+            sourceSession: session,
+            draftMutationGeneration: session.draftMutationGeneration
+        )
+        if currentTabID == target.tabID {
+            syncComposerUIState(tabID: target.tabID)
+        }
+        requestUIRefresh(tabID: target.tabID, urgent: true)
+        logComposerSubmitClaimAccepted(claim)
+        return .claimed(claim)
+    }
+
+    private func composerSubmitClaimIsCurrent(_ claim: AgentComposerSubmitClaim) -> Bool {
+        let attempt = claim.attempt
+        return ObjectIdentifier(claim.sourceSession) == attempt.sourceTabSessionIdentity
+            && sessions[attempt.sourceTabID] === claim.sourceSession
+            && claim.sourceSession.activeComposerSubmitAttempt?.id == attempt.id
+    }
+
+    @discardableResult
+    func releaseComposerSubmitClaim(_ claim: AgentComposerSubmitClaim) -> Bool {
+        let attempt = claim.attempt
+        let sourceSession = claim.sourceSession
+        guard ObjectIdentifier(sourceSession) == attempt.sourceTabSessionIdentity,
+              sourceSession.activeComposerSubmitAttempt?.id == attempt.id
+        else {
+            logComposerSubmitClaimRelease(claim, accepted: false)
+            return false
+        }
+
+        sourceSession.activeComposerSubmitAttempt = nil
+        if sessions[attempt.sourceTabID] === sourceSession,
+           currentTabID == attempt.sourceTabID
+        {
+            syncComposerUIState(tabID: attempt.sourceTabID)
+        }
+        requestUIRefresh(tabID: attempt.sourceTabID, urgent: true)
+        logComposerSubmitClaimRelease(claim, accepted: true)
+        return true
+    }
+
+    private func clearComposerDraftIfUnchanged(for claim: AgentComposerSubmitClaim) {
+        let attempt = claim.attempt
+        let session = claim.sourceSession
+        guard ObjectIdentifier(session) == attempt.sourceTabSessionIdentity,
+              session.draftMutationGeneration == claim.draftMutationGeneration,
+              session.draftText == attempt.rawDraftSnapshot
+        else { return }
+        storeDraftText(for: attempt.sourceTabID, "")
+    }
+
+    private func submitTargetRejectionReason(
+        _ target: AgentComposerSubmitTarget,
+        session: TabSession?,
+        validateSubmissionToken: Bool = true
+    ) -> String? {
         let liveHasLinkedSession = hasLinkedAgentSession(for: target.tabID)
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
         let liveRunState = session?.runState ?? .idle
@@ -13012,42 +13327,67 @@ final class AgentModeViewModel: ObservableObject {
         let liveRunAttemptID = session?.activeRunAttemptID
         let liveInitialStartLocation = initialStartLocationProps(tabID: target.tabID)?.selection
 
+        if let session,
+           ObjectIdentifier(session) != target.expectedSourceTabSessionIdentity
+        {
+            return "source_session_identity_mismatch"
+        }
+        if validateSubmissionToken, session?.composerSubmissionToken != target.expectedSubmissionToken {
+            return "submission_token_mismatch"
+        }
+
         switch target.route {
         case .existingAgentSession:
             guard liveHasLinkedSession else { return "linked_state_mismatch" }
+            guard let expectedSourceAgentSessionID = target.expectedSourceAgentSessionID else {
+                return "missing_expected_agent_session_id"
+            }
+            guard liveSourceAgentSessionID == expectedSourceAgentSessionID else {
+                return "agent_session_id_mismatch"
+            }
+            guard liveInitialStartLocation == target.expectedInitialStartLocation else {
+                return "initial_start_location_mismatch"
+            }
+            return nil
         case .createAgentSessionFromSourceTab:
             guard !liveHasLinkedSession else { return "linked_state_mismatch" }
+            guard liveSourceAgentSessionID == target.expectedSourceAgentSessionID else {
+                return "agent_session_id_mismatch"
+            }
+            guard liveRunState == target.expectedRunState else {
+                return "run_state_mismatch"
+            }
+            if liveRunState.isActive, target.expectedRunID == nil {
+                return "missing_expected_run_id"
+            }
+            guard liveRunID == target.expectedRunID else {
+                return "run_id_mismatch"
+            }
+            guard liveRunAttemptID == target.expectedRunAttemptID else {
+                return "run_attempt_id_mismatch"
+            }
+            guard liveInitialStartLocation == target.expectedInitialStartLocation else {
+                return "initial_start_location_mismatch"
+            }
+            if liveSourceAgentSessionID != nil || liveRunState.isActive || liveRunID != nil || liveRunAttemptID != nil {
+                return "unlinked_source_has_run_identity"
+            }
+            return nil
         }
-        guard liveSourceAgentSessionID == target.expectedSourceAgentSessionID else {
-            return "agent_session_id_mismatch"
-        }
-        guard liveRunState == target.expectedRunState else {
-            return "run_state_mismatch"
-        }
-        if liveRunState.isActive, target.expectedRunID == nil {
-            return "missing_expected_run_id"
-        }
-        guard liveRunID == target.expectedRunID else {
-            return "run_id_mismatch"
-        }
-        guard liveRunAttemptID == target.expectedRunAttemptID else {
-            return "run_attempt_id_mismatch"
-        }
-        guard liveInitialStartLocation == target.expectedInitialStartLocation else {
-            return "initial_start_location_mismatch"
-        }
-        if target.route == .createAgentSessionFromSourceTab,
-           liveSourceAgentSessionID != nil || liveRunState.isActive || liveRunID != nil || liveRunAttemptID != nil
-        {
-            return "unlinked_source_has_run_identity"
-        }
-        return nil
     }
 
-    private func logRejectedSubmitTarget(_ target: AgentComposerSubmitTarget, session: TabSession?, reason: String) {
+    private func logRejectedSubmitTarget(
+        _ target: AgentComposerSubmitTarget,
+        session: TabSession?,
+        reason: String,
+        attempt: AgentComposerSubmitAttempt? = nil,
+        activeAttempt: AgentComposerSubmitAttempt? = nil
+    ) {
         let liveSourceAgentSessionID = composerSourceAgentSessionID(tabID: target.tabID, session: session)
+        let reportedAttempt = attempt ?? session?.activeComposerSubmitAttempt
+        let reportedActiveAttempt = activeAttempt ?? session?.activeComposerSubmitAttempt
         Self.steeringDebugLog(
-            "[AgentSubmitTarget] rejected reason=\(reason) route=\(target.route.rawValue) targetTab=\(target.tabID) expectedRun=\(target.expectedRunID?.uuidString ?? "nil") liveRun=\(session?.runID?.uuidString ?? "nil")"
+            "[AgentSubmitTarget] rejected reason=\(reason) attempt=\(reportedAttempt?.id.uuidString ?? "nil") activeClaim=\(reportedActiveAttempt?.id.uuidString ?? "nil") route=\(target.route.rawValue) targetTab=\(target.tabID) expectedRun=\(target.expectedRunID?.uuidString ?? "nil") liveRun=\(session?.runID?.uuidString ?? "nil")"
         )
         #if DEBUG
             AgentModePerfDiagnostics.event(
@@ -13055,17 +13395,74 @@ final class AgentModeViewModel: ObservableObject {
                 tabID: target.tabID,
                 fields: [
                     "reason": reason,
+                    "attemptID": AgentModePerfDiagnostics.shortID(reportedAttempt?.id),
+                    "activeClaimID": AgentModePerfDiagnostics.shortID(reportedActiveAttempt?.id),
                     "route": target.route.rawValue,
                     "targetTabID": AgentModePerfDiagnostics.shortID(target.tabID),
                     "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID),
+                    "expectedSourceTabSessionIdentity": String(describing: target.expectedSourceTabSessionIdentity),
+                    "liveSourceTabSessionIdentity": session.map { String(describing: ObjectIdentifier($0)) } ?? "nil",
                     "expectedSourceAgentSessionID": AgentModePerfDiagnostics.shortID(target.expectedSourceAgentSessionID),
                     "liveSourceAgentSessionID": AgentModePerfDiagnostics.shortID(liveSourceAgentSessionID),
+                    "expectedPersistentBindingSessionID": AgentModePerfDiagnostics.shortID(target.expectedPersistentBindingIdentity?.sessionID),
+                    "livePersistentBindingSessionID": AgentModePerfDiagnostics.shortID(session?.persistentSessionBindingIdentity?.sessionID),
+                    "expectedPersistentBindingGeneration": AgentModePerfDiagnostics.shortID(target.expectedPersistentBindingIdentity?.generation),
+                    "livePersistentBindingGeneration": AgentModePerfDiagnostics.shortID(session?.persistentSessionBindingIdentity?.generation),
+                    "expectedBindingTransitionGeneration": String(target.expectedBindingTransitionGeneration),
+                    "liveBindingTransitionGeneration": session.map { String($0.bindingTransitionGeneration) } ?? "nil",
+                    "liveBindingTransitionInProgress": String(session?.bindingTransitionInProgress ?? false),
                     "expectedRunState": target.expectedRunState.rawValue,
                     "liveRunState": session?.runState.rawValue ?? "idle",
                     "expectedRunID": AgentModePerfDiagnostics.shortID(target.expectedRunID),
                     "liveRunID": AgentModePerfDiagnostics.shortID(session?.runID),
                     "expectedRunAttemptID": AgentModePerfDiagnostics.shortID(target.expectedRunAttemptID),
-                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID)
+                    "liveRunAttemptID": AgentModePerfDiagnostics.shortID(session?.activeRunAttemptID),
+                    "expectedSubmissionToken": AgentModePerfDiagnostics.shortID(target.expectedSubmissionToken),
+                    "liveSubmissionToken": AgentModePerfDiagnostics.shortID(session?.composerSubmissionToken)
+                ]
+            )
+        #endif
+    }
+
+    private func logComposerSubmitClaimAccepted(_ claim: AgentComposerSubmitClaim) {
+        let attempt = claim.attempt
+        Self.steeringDebugLog(
+            "[AgentSubmitClaim] accepted attempt=\(attempt.id) targetTab=\(attempt.sourceTabID) token=\(attempt.capturedSubmissionToken)"
+        )
+        #if DEBUG
+            AgentModePerfDiagnostics.event(
+                "agent.submitClaim.accepted",
+                tabID: attempt.sourceTabID,
+                fields: [
+                    "attemptID": AgentModePerfDiagnostics.shortID(attempt.id),
+                    "sourceTabSessionIdentity": String(describing: attempt.sourceTabSessionIdentity),
+                    "capturedSubmissionToken": AgentModePerfDiagnostics.shortID(attempt.capturedSubmissionToken),
+                    "liveSubmissionToken": AgentModePerfDiagnostics.shortID(claim.sourceSession.composerSubmissionToken),
+                    "inputRevision": String(attempt.inputRevision),
+                    "persistentBindingSessionID": AgentModePerfDiagnostics.shortID(claim.sourceSession.persistentSessionBindingIdentity?.sessionID),
+                    "persistentBindingGeneration": AgentModePerfDiagnostics.shortID(claim.sourceSession.persistentSessionBindingIdentity?.generation),
+                    "bindingTransitionGeneration": String(claim.sourceSession.bindingTransitionGeneration),
+                    "composerTargetPublishedNil": String(currentTabID != attempt.sourceTabID || ui.composer.props.submitTarget == nil)
+                ]
+            )
+        #endif
+    }
+
+    private func logComposerSubmitClaimRelease(_ claim: AgentComposerSubmitClaim, accepted: Bool) {
+        let attempt = claim.attempt
+        Self.steeringDebugLog(
+            "[AgentSubmitClaim] release accepted=\(accepted) attempt=\(attempt.id) targetTab=\(attempt.sourceTabID) activeClaim=\(claim.sourceSession.activeComposerSubmitAttempt?.id.uuidString ?? "nil")"
+        )
+        #if DEBUG
+            AgentModePerfDiagnostics.event(
+                accepted ? "agent.submitClaim.released" : "agent.submitClaim.releaseSkipped",
+                tabID: attempt.sourceTabID,
+                fields: [
+                    "attemptID": AgentModePerfDiagnostics.shortID(attempt.id),
+                    "activeClaimID": AgentModePerfDiagnostics.shortID(claim.sourceSession.activeComposerSubmitAttempt?.id),
+                    "sourceTabSessionIdentity": String(describing: attempt.sourceTabSessionIdentity),
+                    "liveSourceTabSessionIdentity": String(describing: ObjectIdentifier(claim.sourceSession)),
+                    "currentTabID": AgentModePerfDiagnostics.shortID(currentTabID)
                 ]
             )
         #endif
@@ -13856,9 +14253,6 @@ final class AgentModeViewModel: ObservableObject {
         session.activeNonCodexTurnTokenAccumulator = nil
         session.contextUsageSnapshot = nil
         session.contextCompactedAt = nil
-        session.codexPendingTurnKind = nil
-        session.codexTurnKindsByID.removeAll()
-        session.pendingCodexCompactionInstructions.removeAll()
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.clearClaudeReasoningStatus(clearDisplayedStatus: true)

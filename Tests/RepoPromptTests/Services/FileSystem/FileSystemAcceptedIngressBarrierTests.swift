@@ -74,6 +74,108 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    func testIgnoredEventsBeyondMailboxCapAreFilteredBeforeOverflow() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressEarlyIgnore")
+        try ".build/\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let service = try await makeService(
+            root: root,
+            maxPendingWatcherIngressEntries: 2,
+            respectGitignore: true
+        )
+
+        for eventID in 1 ... 10 {
+            let accepted = await service.acceptWatcherPayloadForTesting([
+                (
+                    absolutePath: root.appendingPathComponent(".build/churn-\(eventID).o").path,
+                    flags: createdFileFlags,
+                    eventId: FSEventStreamEventId(eventID)
+                )
+            ], scheduleDrain: false)
+            XCTAssertNil(accepted)
+        }
+
+        let mailbox = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertFalse(mailbox.hasOverflowRootRescan)
+        XCTAssertEqual(mailbox.queuedPayloadCount, 0)
+        XCTAssertEqual(mailbox.queuedRawEntryCount, 0)
+        XCTAssertEqual(mailbox.acceptedHighWatermark, .zero)
+        let filter = await service.watcherEarlyFilterSnapshotForTesting()
+        XCTAssertTrue(filter.isValid)
+        XCTAssertEqual(filter.filteredEntryCount, 10)
+    }
+
+    func testMixedIgnoredAndVisibleEventsPreserveVisibleOrderingAndWatermarks() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressEarlyMixed")
+        try ".build/\n".write(
+            to: root.appendingPathComponent(".gitignore"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let service = try await makeService(root: root, respectGitignore: true)
+        let firstVisiblePath = root.appendingPathComponent("Sources/First.swift").path
+        let secondVisiblePath = root.appendingPathComponent("Sources/Second.swift").path
+
+        let firstAccepted = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: root.appendingPathComponent(".build/first.o").path, flags: createdFileFlags, eventId: 1),
+            (absolutePath: firstVisiblePath, flags: createdFileFlags, eventId: 2)
+        ], scheduleDrain: false)
+        let firstWatermark = try XCTUnwrap(firstAccepted)
+        let secondAccepted = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: root.appendingPathComponent(".build/second.o").path, flags: createdFileFlags, eventId: 3),
+            (absolutePath: secondVisiblePath, flags: createdFileFlags, eventId: 4)
+        ], scheduleDrain: false)
+        let secondWatermark = try XCTUnwrap(secondAccepted)
+
+        XCTAssertLessThan(firstWatermark, secondWatermark)
+        let firstPayload = try XCTUnwrap(service.watcherIngressMailbox.takeNextAcceptedPayload())
+        let secondPayload = try XCTUnwrap(service.watcherIngressMailbox.takeNextAcceptedPayload())
+        guard case let .entries(firstEntries) = firstPayload.contents,
+              case let .entries(secondEntries) = secondPayload.contents
+        else {
+            return XCTFail("Expected visible entries to remain as ordered mailbox payloads")
+        }
+        XCTAssertEqual(firstEntries.map(\.path), [firstVisiblePath])
+        XCTAssertEqual(secondEntries.map(\.path), [secondVisiblePath])
+        XCTAssertEqual(firstPayload.acceptedHighWatermark, firstWatermark)
+        XCTAssertEqual(secondPayload.acceptedHighWatermark, secondWatermark)
+    }
+
+    func testIgnoreControlEventsInvalidateFilterAndEnterIngressUnchanged() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressEarlyIgnoreChange")
+        let ignoreURL = root.appendingPathComponent(".gitignore")
+        try ".build/\n".write(to: ignoreURL, atomically: true, encoding: .utf8)
+        let service = try await makeService(root: root, respectGitignore: true)
+        let ignoredPath = root.appendingPathComponent(".build/generated.o").path
+
+        let initiallyIgnored = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: ignoredPath, flags: createdFileFlags, eventId: 1)
+        ], scheduleDrain: false)
+        XCTAssertNil(initiallyIgnored)
+
+        let changeAccepted = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: ignoreURL.path, flags: modifiedFileFlags, eventId: 2),
+            (absolutePath: ignoredPath, flags: createdFileFlags, eventId: 3)
+        ], scheduleDrain: false)
+        let changeWatermark = try XCTUnwrap(changeAccepted)
+        let followingAccepted = await service.acceptWatcherPayloadForTesting([
+            (absolutePath: root.appendingPathComponent(".build/following.o").path, flags: createdFileFlags, eventId: 4)
+        ], scheduleDrain: false)
+        let followingWatermark = try XCTUnwrap(followingAccepted)
+
+        XCTAssertLessThan(changeWatermark, followingWatermark)
+        let mailbox = await service.watcherIngressMailboxSnapshotForTesting()
+        XCTAssertEqual(mailbox.queuedPayloadCount, 2)
+        XCTAssertEqual(mailbox.queuedRawEntryCount, 3)
+        XCTAssertFalse(mailbox.hasOverflowRootRescan)
+        let filter = await service.watcherEarlyFilterSnapshotForTesting()
+        XCTAssertFalse(filter.isValid)
+        XCTAssertEqual(filter.filteredEntryCount, 1)
+    }
+
     func testMailboxOverflowRootRescanPreservesHighestAcceptedWatermark() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemAcceptedIngressOverflow")
         let service = try await makeService(root: root, maxPendingWatcherIngressEntries: 2)
@@ -93,6 +195,8 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         XCTAssertEqual(mailbox.queuedPayloadCount, 1)
         XCTAssertEqual(mailbox.queuedRawEntryCount, 1)
         XCTAssertEqual(mailbox.acceptedHighWatermark, highest)
+        let filter = await service.watcherEarlyFilterSnapshotForTesting()
+        XCTAssertEqual(filter.filteredEntryCount, 0)
 
         _ = await service.flushPendingEventsNow(throughAcceptedWatcherWatermark: highest)
         let publication = try XCTUnwrap(publications.snapshot().last)
@@ -237,11 +341,12 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
 
     private func makeService(
         root: URL,
-        maxPendingWatcherIngressEntries: Int? = nil
+        maxPendingWatcherIngressEntries: Int? = nil,
+        respectGitignore: Bool = false
     ) async throws -> FileSystemService {
         try await FileSystemService(
             path: root.path,
-            respectGitignore: false,
+            respectGitignore: respectGitignore,
             respectRepoIgnore: false,
             respectCursorignore: false,
             skipSymlinks: true,

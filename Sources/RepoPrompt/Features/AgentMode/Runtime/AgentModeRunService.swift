@@ -158,7 +158,8 @@ final class AgentModeRunService {
         session: AgentModeViewModel.TabSession,
         initialUserMessage: String,
         initialMessageForRun: String,
-        attachments: [AgentImageAttachment]
+        attachments: [AgentImageAttachment],
+        codexFallbackContext: AgentModeViewModel.TabSession.CodexFallbackSubmissionContext? = nil
     ) async -> CodexAgentModeCoordinator.NativeSendOutcome? {
         assert(session.tabID == tabID, "AgentModeRunService.startRun requires the originating tab ID to match the TabSession tab ID")
         let selectedAgent = session.selectedAgent
@@ -180,7 +181,8 @@ final class AgentModeRunService {
                 tabID: tabID,
                 session: session,
                 initialMessageForRun: initialMessageForRun,
-                attachments: attachments
+                attachments: attachments,
+                fallbackContext: codexFallbackContext
             )
         }
 
@@ -1014,6 +1016,12 @@ final class AgentModeRunService {
         let provider = session.provider
         let acpController = session.acpController
         let hasAttemptTerminalResources = session.runAttemptTerminalResources?.ownership == ownership
+        let codexCancellationTarget = session.selectedAgent == .codexExec
+            ? dependencies.codexCoordinator.captureCodexCancellationTarget(
+                session,
+                expectedRunID: expectedRunID
+            )
+            : nil
         session.agentTask?.cancel()
 
         if session.selectedAgent == .codexExec {
@@ -1040,7 +1048,8 @@ final class AgentModeRunService {
                 if session.selectedAgent == .codexExec {
                     return dependencies.codexCoordinator.prepareCodexCancellationTeardown(
                         session,
-                        expectedRunID: expectedRunID
+                        expectedRunID: expectedRunID,
+                        capturedTarget: codexCancellationTarget
                     )
                 }
                 if session.selectedAgent.usesClaudeNativeRuntime {

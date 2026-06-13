@@ -213,6 +213,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         let window = Self.makeWindowWithoutAutoStart()
         let tools = await window.mcpServer.windowMCPTools
         let manageWorktree = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.manageWorktree })
+        let agentExplore = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentExplore })
         let agentRun = try XCTUnwrap(tools.first { $0.name == MCPWindowToolName.agentRun })
 
         let manageProperties = try Self.schemaProperties(for: manageWorktree)
@@ -251,8 +252,9 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(manageOpEnum.contains("continue"))
         XCTAssertTrue(manageOpEnum.contains("abort"))
 
+        let agentExploreProperties = try Self.schemaProperties(for: agentExplore)
         let agentRunProperties = try Self.schemaProperties(for: agentRun)
-        for field in [
+        let worktreeFields = [
             "worktree",
             "worktree_id",
             "worktree_create",
@@ -264,8 +266,29 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             "worktree_color",
             "allow_external_worktree_path",
             "inherit_worktree"
-        ] {
+        ]
+        for field in worktreeFields {
             XCTAssertNotNil(agentRunProperties[field], "agent_run schema should advertise property \(field)")
+            XCTAssertNotNil(agentExploreProperties[field], "agent_explore schema should advertise property \(field)")
+        }
+
+        let exploreOpEnum = agentExploreProperties["op"]?.objectValue?["enum"]?.arrayValue?.compactMap(\.stringValue) ?? []
+        XCTAssertEqual(exploreOpEnum, ["start", "poll", "wait", "cancel"])
+        for field in [
+            "model_id",
+            "workflow_id",
+            "workflow_name",
+            "session_name",
+            "wait",
+            "timeout_seconds",
+            "interaction_id",
+            "response",
+            "answers",
+            "content",
+            "meta",
+            "amendment"
+        ] {
+            XCTAssertNil(agentExploreProperties[field], "agent_explore schema must not advertise run-only property \(field)")
         }
     }
 
@@ -421,7 +444,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
-        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=7375413b02af599e638a547a904baf1e8aaea4a2b779e52be0d389e86f62fb7b|schema=5bac60ce7f08078da601b2c17a2f060be7a6fa97c4e2f6302146c036a1d8f68f",
+        "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=52ef9e56d0aa35f1523bb6700ce9ced3512749401b4ea409d0de8cf3d007855b|schema=e2b5bce34fa512aca293fffec7eaa46a9639feb4e840546c12d3554b8a2d514b",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",

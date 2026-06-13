@@ -294,7 +294,7 @@ public class APISettingsViewModel: ObservableObject {
     @Published var openCodeError: String? = nil
     @Published private(set) var availableOpenCodeModelOptions: [AgentModelOption] = []
     private var openCodeLogCollector: CLIProcessLogCollector?
-    // Cursor CLI / ACP
+    // Cursor Agent CLI / ACP
     @Published var isCursorConnected: Bool = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
@@ -430,11 +430,14 @@ public class APISettingsViewModel: ObservableObject {
         Task { await updateAvailableModels() }
     }
 
-    private func publishClaudeCodeGLMAvailability() {
-        let didChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
+    @discardableResult
+    private func publishClaudeCodeGLMAvailability() -> Bool {
+        let previousSecretPresent = compatibleBackendSecretPresence[.glmZAI] ?? false
+        let configuredDidChange = ClaudeCodeGLMIntegration.setConfigured(hasStoredZAIKey)
         compatibleBackendSecretPresence[.glmZAI] = hasStoredZAIKey
-        guard didChange else { return }
+        guard configuredDidChange || previousSecretPresent != hasStoredZAIKey else { return false }
         NotificationCenter.default.post(name: .claudeCodeGLMAvailabilityChanged, object: nil)
+        return true
     }
 
     // MARK: - Claude Code-compatible backends ------------------------------------------------
@@ -740,6 +743,7 @@ public class APISettingsViewModel: ObservableObject {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         invalidateCompatibleBackendTestResult(for: id)
         let trimmed = secret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let postedAvailabilityChange: Bool
         if id == .glmZAI {
             // Share the existing Z.ai API Provider key.
             try await keyManager.saveAPIKey(trimmed, for: .zAI)
@@ -747,12 +751,15 @@ public class APISettingsViewModel: ObservableObject {
             hasStoredZAIKey = !trimmed.isEmpty
             isZaiKeyValid = hasStoredZAIKey
             availableZAIModels = hasStoredZAIKey ? defaultZAIModels : []
-            publishClaudeCodeGLMAvailability()
+            postedAvailabilityChange = publishClaudeCodeGLMAvailability()
         } else {
             try await compatibleBackendStore.saveSecret(trimmed, for: id)
             compatibleBackendSecretPresence[id] = !trimmed.isEmpty
+            postedAvailabilityChange = false
         }
-        postCompatibleBackendAvailabilityChanged()
+        if id != .glmZAI, !postedAvailabilityChange {
+            postCompatibleBackendAvailabilityChanged()
+        }
         if id == .glmZAI {
             await updateAvailableModels()
         } else {
@@ -768,20 +775,24 @@ public class APISettingsViewModel: ObservableObject {
     ) async throws {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         invalidateCompatibleBackendTestResult(for: id)
+        let postedAvailabilityChange: Bool
         if id == .glmZAI {
             try await keyManager.deleteAPIKey(for: .zAI)
             hasStoredZAIKey = false
             zaiApiKey = ""
             isZaiKeyValid = false
             availableZAIModels = []
-            publishClaudeCodeGLMAvailability()
+            postedAvailabilityChange = publishClaudeCodeGLMAvailability()
             zaiCustomModel = ""
             UserDefaults.standard.removeObject(forKey: "customModelZAI")
         } else {
             try await compatibleBackendStore.deleteSecret(for: id)
             compatibleBackendSecretPresence[id] = false
+            postedAvailabilityChange = false
         }
-        postCompatibleBackendAvailabilityChanged()
+        if id != .glmZAI, !postedAvailabilityChange {
+            postCompatibleBackendAvailabilityChanged()
+        }
         if id == .glmZAI {
             await updateAvailableModels()
             resetPreferredModelIfNeeded(for: .zAI)
@@ -2921,7 +2932,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func testCursorConnection() async throws -> Bool {
         let collector = CLIProcessLogCollector()
-        collector.append("Cursor CLI connection test started")
+        collector.append("Cursor Agent CLI connection test started")
         collector.append("Preferred Cursor model fallback: \(AgentModel.cursorAuto.rawValue)")
         cursorLogCollector = collector
 
@@ -2947,7 +2958,7 @@ public class APISettingsViewModel: ObservableObject {
             UserDefaults.standard.set(true, forKey: "CursorCLIConnected")
             startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
             await updateAvailableModels()
-            collector.append("Cursor CLI marked as connected")
+            collector.append("Cursor Agent CLI marked as connected")
             cursorLogCollector = nil
             NotificationCenter.default.post(
                 name: .cursorConnectionChanged,
@@ -2995,7 +3006,7 @@ public class APISettingsViewModel: ObservableObject {
             case let .invalidConfiguration(detail):
                 return detail
             case let .apiError(source):
-                return source?.localizedDescription ?? "Unknown Cursor CLI error"
+                return source?.localizedDescription ?? "Unknown Cursor Agent CLI error"
             default:
                 return error.localizedDescription
             }
@@ -3003,16 +3014,16 @@ public class APISettingsViewModel: ObservableObject {
         let message = error.localizedDescription
         let lowered = message.lowercased()
         if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
-            return "Cursor CLI ACP server was not found. Install Cursor CLI and ensure `cursor-agent acp` or `cursor agent acp` is available on PATH."
+            return "Cursor Agent CLI ACP server was not found. Install Cursor Agent CLI and ensure `cursor-agent acp` is available."
         }
         if lowered.contains("permission denied") {
             return "Permission denied. Ensure the `cursor-agent` executable is accessible."
         }
         if lowered.contains("unauthorized") || lowered.contains("not authenticated") || lowered.contains("login") {
-            return "Cursor CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
+            return "Cursor Agent CLI is not authenticated. Set `CURSOR_API_KEY`/`CURSOR_AUTH_TOKEN` or complete Cursor login."
         }
         if lowered.contains("does not advertise acp") || lowered.contains("acp support") {
-            return "Installed Cursor CLI does not support ACP mode. Update Cursor CLI and ensure `cursor-agent acp --help` works."
+            return "Installed Cursor Agent CLI does not support ACP mode. Update Cursor Agent CLI and ensure `cursor-agent acp --help` works."
         }
         return message
     }
@@ -3029,7 +3040,7 @@ public class APISettingsViewModel: ObservableObject {
         let exportDate = Date()
         let url = try collector.writeMarkdownToDownloads(
             baseFilename: "RepoPrompt-CursorTrace",
-            title: "Cursor CLI Connection Trace",
+            title: "Cursor Agent CLI Connection Trace",
             timestamp: exportDate
         )
         collector.append("Trace exported to \(url.lastPathComponent)")

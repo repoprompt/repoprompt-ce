@@ -12,6 +12,21 @@ struct OracleExportDestination: Equatable {
     let windowID: Int
     let tabID: UUID?
     let primaryRootPath: String
+    let rootScope: WorkspaceLookupRootScope
+
+    init(
+        workspaceID: UUID,
+        windowID: Int,
+        tabID: UUID?,
+        primaryRootPath: String,
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+    ) {
+        self.workspaceID = workspaceID
+        self.windowID = windowID
+        self.tabID = tabID
+        self.primaryRootPath = primaryRootPath
+        self.rootScope = rootScope
+    }
 }
 
 struct OracleExportRequest {
@@ -205,9 +220,17 @@ struct AgentRunMCPToolService {
     var vcsService: VCSService = .shared
     var gitTargetResolver: GitRepoTargetResolver = .init()
 
+    private var startWorktreeCoordinator: AgentMCPStartWorktreeCoordinator {
+        AgentMCPStartWorktreeCoordinator(
+            operationName: "agent_run.start",
+            vcsService: vcsService,
+            gitTargetResolver: gitTargetResolver
+        )
+    }
+
     func execute(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "wait"
-        if op != "start", containsStartWorktreeArguments(args) {
+        if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
         switch op {
@@ -231,7 +254,7 @@ struct AgentRunMCPToolService {
     private func executeStart(args: [String: Value]) async throws -> Value {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
-        let worktreeStartRequest = try parseStartWorktreeRequest(args: args)
+        let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -309,11 +332,10 @@ struct AgentRunMCPToolService {
             inheritWorktreeBindings: worktreeStartRequest.inheritParentWorktreeBindings
         )
         do {
-            try await prepareWorktreeBindingIfNeeded(
+            try await startWorktreeCoordinator.prepare(
                 request: worktreeStartRequest,
                 target: target,
-                targetWindow: targetWindow,
-                metadata: metadata
+                targetWindow: targetWindow
             )
         } catch {
             await agentModeVM.mcpDiscardSessionTarget(target)
@@ -346,7 +368,7 @@ struct AgentRunMCPToolService {
                 workflow
             )
         } catch {
-            let decoratedError = worktreeAwareProviderStartError(
+            let decoratedError = startWorktreeCoordinator.providerStartError(
                 error,
                 targetSessionID: target.sessionID,
                 agentModeVM: agentModeVM
@@ -1736,405 +1758,6 @@ struct AgentRunMCPToolService {
             throw MCPError.invalidParams("Session '\(reference)' was not found in the active workspace.")
         }
         return sessionID
-    }
-
-    private struct StartWorktreeRequest {
-        enum Mode: Equatable {
-            case none
-            case existing(selector: String)
-            case create
-        }
-
-        let mode: Mode
-        let repoRoot: String?
-        let branch: String?
-        let baseRef: String?
-        let path: URL?
-        let label: String?
-        let color: String?
-        let allowExternalPath: Bool
-        let inheritParentWorktreeBindings: Bool
-
-        var hasExplicitWorktreeArgs: Bool {
-            switch mode {
-            case .none:
-                false
-            case .existing, .create:
-                true
-            }
-        }
-    }
-
-    private struct StartWorktreeRepositoryContext {
-        let repo: GitRepoDescriptor
-        let allRepos: [GitRepoDescriptor]
-        let visibleRoots: [WorkspaceRootRef]
-        let logicalRoot: WorkspaceRootRef
-    }
-
-    private func containsStartWorktreeArguments(_ args: [String: Value]) -> Bool {
-        [
-            "worktree",
-            "worktree_id",
-            "worktree_create",
-            "worktree_repo_root",
-            "worktree_branch",
-            "worktree_base_ref",
-            "worktree_path",
-            "worktree_label",
-            "worktree_color",
-            "allow_external_worktree_path",
-            "inherit_worktree"
-        ].contains { args[$0] != nil }
-    }
-
-    private func parseStartWorktreeRequest(args: [String: Value]) throws -> StartWorktreeRequest {
-        let worktree = normalizedString(args["worktree"])
-        let worktreeID = normalizedString(args["worktree_id"])
-        let create = parseBool(args["worktree_create"]) ?? false
-        if worktree != nil, worktreeID != nil {
-            throw MCPError.invalidParams("worktree and worktree_id are mutually exclusive for agent_run.start.")
-        }
-        if create, worktree != nil || worktreeID != nil {
-            throw MCPError.invalidParams("worktree_create is mutually exclusive with worktree and worktree_id for agent_run.start.")
-        }
-        let repoRoot = normalizedString(args["worktree_repo_root"])
-        let branch = normalizedString(args["worktree_branch"])
-        let baseRef = normalizedString(args["worktree_base_ref"])
-        let label = normalizedString(args["worktree_label"])
-        let color = normalizedString(args["worktree_color"])
-        let allowExternalPath = parseBool(args["allow_external_worktree_path"]) ?? false
-        let inheritParentWorktreeBindings = try parseOptionalStartBool(
-            args["inherit_worktree"],
-            name: "inherit_worktree"
-        ) ?? true
-        if let color, !GlobalSettingsStore.isValidWorktreeColorHex(color) {
-            throw MCPError.invalidParams("worktree_color must be a valid #RRGGBB value.")
-        }
-        let path = try explicitStartWorktreePath(from: args["worktree_path"])
-        let selector: String? = if let worktreeID {
-            "@id:\(worktreeID)"
-        } else {
-            worktree
-        }
-        let mode: StartWorktreeRequest.Mode = if create {
-            .create
-        } else if let selector {
-            .existing(selector: selector)
-        } else {
-            .none
-        }
-        if !create, path != nil {
-            throw MCPError.invalidParams("worktree_path is only valid with worktree_create=true for agent_run.start.")
-        }
-        if !create, branch != nil || baseRef != nil {
-            throw MCPError.invalidParams("worktree_branch and worktree_base_ref are only valid with worktree_create=true for agent_run.start.")
-        }
-        if !create, allowExternalPath {
-            throw MCPError.invalidParams("allow_external_worktree_path is only valid with worktree_create=true for agent_run.start.")
-        }
-        if case .none = mode,
-           repoRoot != nil || label != nil || color != nil
-        {
-            throw MCPError.invalidParams("worktree_repo_root, worktree_label, and worktree_color require worktree, worktree_id, or worktree_create=true for agent_run.start.")
-        }
-        return StartWorktreeRequest(
-            mode: mode,
-            repoRoot: repoRoot,
-            branch: branch,
-            baseRef: baseRef,
-            path: path,
-            label: label,
-            color: color,
-            allowExternalPath: allowExternalPath,
-            inheritParentWorktreeBindings: inheritParentWorktreeBindings
-        )
-    }
-
-    private func parseOptionalStartBool(_ value: Value?, name: String) throws -> Bool? {
-        guard let value else { return nil }
-        switch value {
-        case .null:
-            return nil
-        default:
-            if let parsed = parseBool(value) {
-                return parsed
-            }
-            throw MCPError.invalidParams("\(name) must be a boolean.")
-        }
-    }
-
-    private func prepareWorktreeBindingIfNeeded(
-        request: StartWorktreeRequest,
-        target: AgentModeViewModel.MCPSessionTarget,
-        targetWindow: WindowState,
-        metadata _: RequestMetadata
-    ) async throws {
-        guard let targetSessionID = target.sessionID else {
-            throw MCPError.internalError("agent_run.start target did not resolve a session ID for worktree binding.")
-        }
-        let agentModeVM = targetWindow.agentModeViewModel
-        if request.hasExplicitWorktreeArgs {
-            do {
-                let context = try await resolveStartWorktreeRepositoryContext(
-                    request: request,
-                    targetWindow: targetWindow
-                )
-                try validateStartWorktreeRuntimeRoot(context.logicalRoot, targetWindow: targetWindow)
-                let worktree: GitWorktreeDescriptor
-                switch request.mode {
-                case .none:
-                    throw MCPError.internalError("agent_run.start worktree preparation reached an unexpected empty worktree mode.")
-                case let .existing(selector):
-                    do {
-                        worktree = try await gitTargetResolver.resolveWorktree(
-                            selector: selector,
-                            repo: context.repo,
-                            allRepos: context.allRepos
-                        )
-                    } catch let error as GitRepoTargetResolverError {
-                        throw MCPError.invalidParams(error.message)
-                    }
-                case .create:
-                    worktree = try await createStartWorktree(request: request, context: context, sessionID: targetSessionID)
-                }
-                let identity = try persistStartVisualIdentity(for: worktree, request: request)
-                let binding = makeStartWorktreeBinding(
-                    worktree: worktree,
-                    logicalRoot: context.logicalRoot,
-                    visualIdentity: identity,
-                    replacing: agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID).first {
-                        standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
-                    }
-                )
-                _ = try agentModeVM.applyWorktreeBinding(binding, toSessionID: targetSessionID)
-            } catch {
-                throw worktreePreparationError(error)
-            }
-        }
-
-        let bindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID, tabID: target.tabID)
-        if !bindings.isEmpty {
-            try await materializeStartWorktreeRoots(
-                bindings: bindings,
-                sessionID: targetSessionID,
-                targetWindow: targetWindow
-            )
-        }
-    }
-
-    private func materializeStartWorktreeRoots(
-        bindings: [AgentSessionWorktreeBinding],
-        sessionID: UUID,
-        targetWindow: WindowState
-    ) async throws {
-        let projection = await targetWindow.mcpServer.materializeWorkspaceBindingProjection(
-            sessionID: sessionID,
-            bindings: bindings
-        )
-        guard let projection, !projection.isEmpty else {
-            throw MCPError.invalidParams("Failed to materialize the bound worktree root for agent_run.start.")
-        }
-        let loadedRoots = await targetWindow.promptManager.workspaceFileContextStore.rootRefs(scope: projection.lookupRootScope)
-        let loadedPaths = Set(loadedRoots.map { standardizedPath($0.standardizedFullPath) })
-        let missing = projection.physicalRootRefs.filter { !loadedPaths.contains(standardizedPath($0.standardizedFullPath)) }
-        guard missing.isEmpty else {
-            let paths = missing.map(\.standardizedFullPath).joined(separator: ", ")
-            throw MCPError.invalidParams("Failed to load bound worktree root(s) for agent_run.start: \(paths)")
-        }
-    }
-
-    private func resolveStartWorktreeRepositoryContext(
-        request: StartWorktreeRequest,
-        targetWindow: WindowState
-    ) async throws -> StartWorktreeRepositoryContext {
-        let store = targetWindow.promptManager.workspaceFileContextStore
-        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        var repos: [GitRepoDescriptor] = []
-        var seen = Set<String>()
-        for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
-                let descriptor = GitRepoDescriptor(rootURL: resolved.rootURL)
-                if seen.insert(descriptor.rootPath.lowercased()).inserted {
-                    repos.append(descriptor)
-                }
-            }
-        }
-        guard let defaultRepo = repos.first else {
-            throw MCPError.invalidParams("No Git repository found in loaded roots for agent_run.start worktree binding.")
-        }
-        let repo: GitRepoDescriptor
-        var explicitLogicalRoot: WorkspaceRootRef?
-        if let rawRepoRoot = request.repoRoot {
-            if !rawRepoRoot.hasPrefix("@") {
-                explicitLogicalRoot = explicitLogicalRootRef(for: rawRepoRoot, visibleRoots: visibleRoots)
-            }
-            do {
-                repo = try await gitTargetResolver.resolveRepoRootToken(
-                    rawRepoRoot,
-                    allRepos: repos,
-                    visibleRoots: visibleRoots,
-                    defaultRepo: defaultRepo
-                )
-            } catch let error as GitRepoTargetResolverError {
-                throw MCPError.invalidParams(error.message)
-            }
-        } else {
-            repo = defaultRepo
-        }
-        let logicalRoot = try await logicalRoot(for: repo, explicitLogicalRoot: explicitLogicalRoot, visibleRoots: visibleRoots)
-        return StartWorktreeRepositoryContext(repo: repo, allRepos: repos, visibleRoots: visibleRoots, logicalRoot: logicalRoot)
-    }
-
-    private func validateStartWorktreeRuntimeRoot(_ logicalRoot: WorkspaceRootRef, targetWindow: WindowState) throws {
-        guard let primaryRoot = targetWindow.workspaceManager.activeWorkspace?.repoPaths.first else {
-            return
-        }
-        let primary = standardizedPath((primaryRoot as NSString).expandingTildeInPath)
-        guard standardizedPath(logicalRoot.standardizedFullPath) == primary else {
-            throw MCPError.invalidParams(
-                "agent_run.start worktree binding currently supports the primary workspace root only. Requested root '\(logicalRoot.name)' at \(logicalRoot.standardizedFullPath), but the provider runtime cwd resolves from primary root \(primary)."
-            )
-        }
-    }
-
-    private func createStartWorktree(
-        request: StartWorktreeRequest,
-        context: StartWorktreeRepositoryContext,
-        sessionID: UUID
-    ) async throws -> GitWorktreeDescriptor {
-        let existingWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
-        let mainRootPath = existingWorktrees.first(where: \.isMain)?.path ?? context.repo.rootPath
-        let plan = try GitWorktreeDefaultPathPlanner.plan(
-            GitWorktreeDefaultPathPlanner.Request(
-                mainWorktreeRoot: URL(fileURLWithPath: mainRootPath),
-                existingWorktreeRoots: existingWorktrees.map { URL(fileURLWithPath: $0.path) },
-                explicitPath: request.path,
-                branch: request.branch,
-                baseRef: request.baseRef,
-                detach: false,
-                force: false,
-                allowExternalPath: request.allowExternalPath,
-                purpose: .agentStart(sessionID: sessionID.uuidString)
-            )
-        )
-        return try await vcsService.createGitWorktree(request: plan.createRequest, at: context.repo.rootURL)
-    }
-
-    private func persistStartVisualIdentity(
-        for worktree: GitWorktreeDescriptor,
-        request: StartWorktreeRequest
-    ) throws -> WorktreeVisualIdentity {
-        let label = request.label ?? fallbackLabel(for: worktree)
-        do {
-            return try GlobalSettingsStore.shared.ensureWorktreeVisualIdentity(
-                repositoryID: worktree.repository.repositoryID,
-                worktreeID: worktree.worktreeID,
-                label: label,
-                colorHex: request.color
-            )
-        } catch let error as GlobalSettingsStore.WorktreeVisualIdentityError {
-            throw MCPError.invalidParams("Invalid worktree visual identity: \(error)")
-        }
-    }
-
-    private func makeStartWorktreeBinding(
-        worktree: GitWorktreeDescriptor,
-        logicalRoot: WorkspaceRootRef,
-        visualIdentity: WorktreeVisualIdentity,
-        replacing previous: AgentSessionWorktreeBinding?
-    ) -> AgentSessionWorktreeBinding {
-        AgentSessionWorktreeBinding(
-            id: previous?.id ?? UUID().uuidString,
-            repositoryID: worktree.repository.repositoryID,
-            repoKey: worktree.repository.repoKey,
-            logicalRootPath: logicalRoot.standardizedFullPath,
-            logicalRootName: logicalRoot.name,
-            worktreeID: worktree.worktreeID,
-            worktreeRootPath: worktree.path,
-            worktreeName: worktree.name,
-            branch: worktree.branch,
-            head: worktree.head,
-            visualLabel: visualIdentity.label,
-            visualColorHex: visualIdentity.colorHex,
-            boundAt: previous?.worktreeID == worktree.worktreeID ? previous?.boundAt ?? Date() : Date(),
-            source: "agent_run.start"
-        )
-    }
-
-    private func worktreePreparationError(_ error: Error) -> Error {
-        if error is MCPError { return error }
-        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        return MCPError.invalidParams("agent_run.start worktree preparation failed: \(message)")
-    }
-
-    private func worktreeAwareProviderStartError(
-        _ error: Error,
-        targetSessionID: UUID?,
-        agentModeVM: AgentModeViewModel
-    ) -> Error {
-        guard let targetSessionID else { return error }
-        let bindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
-        guard let binding = bindings.first else { return error }
-        let label = binding.visualLabel ?? binding.worktreeName ?? binding.branch ?? binding.worktreeID
-        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-        return MCPError.invalidParams(
-            "Agent provider start failed after binding worktree '\(label)' at \(binding.worktreeRootPath). The worktree was not removed; use manage_worktree list to inspect or recover it. Error: \(message)"
-        )
-    }
-
-    private func logicalRoot(
-        for repo: GitRepoDescriptor,
-        explicitLogicalRoot: WorkspaceRootRef?,
-        visibleRoots: [WorkspaceRootRef]
-    ) async throws -> WorkspaceRootRef {
-        if let explicitLogicalRoot {
-            return explicitLogicalRoot
-        }
-        for root in visibleRoots {
-            if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)),
-               GitRepoRootAuthorization.canonicalPath(resolved.rootURL.path) == GitRepoRootAuthorization.canonicalPath(repo.rootPath)
-            {
-                return root
-            }
-        }
-        if let exact = visibleRoots.first(where: { standardizedPath($0.standardizedFullPath) == standardizedPath(repo.rootPath) }) {
-            return exact
-        }
-        if let first = visibleRoots.first {
-            return first
-        }
-        throw MCPError.invalidParams("No visible workspace root is available for agent_run.start worktree binding.")
-    }
-
-    private func explicitLogicalRootRef(for rawRepoRoot: String, visibleRoots: [WorkspaceRootRef]) -> WorkspaceRootRef? {
-        let canonical = standardizedPath((rawRepoRoot as NSString).expandingTildeInPath)
-        let lowered = rawRepoRoot.lowercased()
-        return visibleRoots.first { root in
-            root.name.lowercased() == lowered
-                || standardizedPath(root.standardizedFullPath) == canonical
-                || standardizedPath(root.fullPath) == canonical
-        }
-    }
-
-    private func explicitStartWorktreePath(from value: Value?) throws -> URL? {
-        guard let raw = normalizedString(value) else { return nil }
-        let expanded = (raw as NSString).expandingTildeInPath
-        let standardized = (expanded as NSString).standardizingPath
-        guard standardized.hasPrefix("/") else {
-            throw MCPError.invalidParams("worktree_path must be absolute or use ~/ for agent_run.start.")
-        }
-        return URL(fileURLWithPath: standardized)
-    }
-
-    private func fallbackLabel(for worktree: GitWorktreeDescriptor) -> String? {
-        if let name = worktree.name, !name.isEmpty { return name }
-        if let branch = worktree.branch, !branch.isEmpty { return branch }
-        return worktree.isMain ? "main" : nil
-    }
-
-    private func standardizedPath(_ path: String) -> String {
-        (path as NSString).standardizingPath
     }
 
     private func resolveWorkflow(args: [String: Value]) throws -> AgentWorkflowDefinition? {

@@ -77,7 +77,8 @@ final class AgentRunCoordinator {
             reason: reason ?? "\(spec.type)",
             ttl: spec.connectionTTL,
             tabID: tabID,
-            purpose: runPurpose(for: spec.type)
+            purpose: runPurpose(for: spec.type),
+            requiresExpectedAgentPID: spec.agentKind.requiresExpectedPIDOwnedAgentModeMCPRouting
         )
 
         let lease = MCPBootstrapLease(spec: leaseSpec)

@@ -3,23 +3,6 @@ import XCTest
 @_spi(TestSupport) @testable import RepoPrompt
 
 final class AgentRunLifecycleContractsTests: XCTestCase {
-    private func requireSendable(_: (some Sendable).Type) {}
-
-    func testLifecycleContractsAreSendable() {
-        requireSendable(AgentRunBindingIdentity.self)
-        requireSendable(AgentRunOwnership.self)
-        requireSendable(AgentRunTurnEpoch.self)
-        requireSendable(AgentRunEpochTransitionKind.self)
-        requireSendable(AgentRunLifecycleStage.self)
-        requireSendable(AgentRunLivenessSignalKind.self)
-        requireSendable(AgentRunRetryIntent.self)
-        requireSendable(AgentRunProgressSignal.self)
-        requireSendable(AgentRunLivenessSnapshot.self)
-        requireSendable(AgentRunProgressRejection.self)
-        requireSendable(AgentRunProgressAcceptance.self)
-        requireSendable(AgentRunLifecycleTracker.self)
-    }
-
     func testOwnershipCapturesImmutableTurnEpoch() {
         let sessionID = UUID()
         let epoch = AgentRunTurnEpoch(

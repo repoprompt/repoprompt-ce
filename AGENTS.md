@@ -157,7 +157,7 @@ Daemon output defaults are intentionally concise for agent use: synchronous `dev
 
 Behavior notes:
 
-- `make dev-run` (daemon `run`) still delegates to the debug launch flow and stops any existing `RepoPrompt`, same as `make run`; it remains FIFO and does not supersede older lifecycle work.
+- `make dev-run` (daemon `run`) still delegates to the debug launch flow and stops only the running process whose resolved executable matches the target CE debug app, same as `make run`; it remains FIFO and does not supersede older lifecycle work.
 - `./conductor app relaunch` is the overriding interactive relaunch used by the Finder launcher; like `app stop`, it can cancel older active or queued `liveApp` work. It builds/packages before replacing the visible app, so a failure before lifecycle work begins does not itself stop or reopen an already-running app.
 - Do not assume an in-flight `run`, `smoke`, or diagnostics job will complete if another operator issues `app stop` or interactive `app relaunch`.
 - `make dev-smoke` is the non-disruptive live-only check: it assumes the CE debug app is already running and the debug CLI is installed/resolvable.
@@ -166,7 +166,7 @@ Behavior notes:
 - Style checks (`make dev-format-check`, `make dev-lint`) are non-mutating and do not auto-install tools; `make dev-install-format-tools` is the explicit install path.
 - Do not run `make dev-format` unless formatting mutation is intended. If a format job is canceled after starting, inspect `git diff` and rerun format or restore files as needed.
 
-Direct / uncoordinated commands — use only when the daemon is unavailable (for example, no `python3`):
+Direct / uncoordinated commands — use only when the daemon is unavailable but required tooling, including `python3`, remains available:
 
 ```bash
 make build
@@ -174,7 +174,7 @@ make run
 make test
 ```
 
-These do not claim daemon lanes or lifecycle supersession, so when multiple agents are active they can build, launch, or run style tooling over each other; a direct launch may reopen the app after a coordinated stop. The Finder launcher also falls back to this direct behavior when `python3` is unavailable, with process-only status/stop controls. Prefer the `dev-*` aliases when the daemon is available. The manual `rpce-cli-debug` commands above remain valid for direct live MCP validation.
+These do not claim daemon lanes or lifecycle supersession, so when multiple agents are active they can build, launch, or run style tooling over each other; a direct launch may reopen the app after a coordinated stop. The Finder launcher requires `python3` and does not provide an uncoordinated no-Python fallback because safe lifecycle actions require exact debug-executable identity checks. Prefer the `dev-*` aliases when the daemon is available. The manual `rpce-cli-debug` commands above remain valid for direct live MCP validation.
 
 ## Source placement rules
 

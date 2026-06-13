@@ -127,15 +127,6 @@ struct MCPOracleToolService {
         let tabID = try await resolveTabIDForAgentMode(args, connectionID)
         let requestContext = try? await requireCurrentTabContext(askOracleToolName)
         let virtualContext = (requestContext?.tabID == tabID) ? requestContext : nil
-        let exportDestination: OracleExportDestination? = if exportResponse {
-            try MCPServerViewModel.makeOracleExportDestination(
-                workspace: targetWindow.workspaceManager.activeWorkspace,
-                windowID: targetWindow.windowID,
-                tabID: tabID
-            )
-        } else {
-            nil
-        }
 
         if let normalizedChatID {
             guard let session = oracleVM.resolveSession(id: normalizedChatID) else {
@@ -176,6 +167,17 @@ struct MCPOracleToolService {
                 agentModeSessionID: owner.agentSessionID,
                 agentModeRunID: owner.runID
             )
+        }
+
+        let exportDestination: OracleExportDestination? = if exportResponse {
+            try MCPServerViewModel.makeOracleExportDestination(
+                workspace: targetWindow.workspaceManager.activeWorkspace,
+                windowID: targetWindow.windowID,
+                tabID: tabID,
+                lookupContext: tabContext.lookupContext ?? .visibleWorkspace
+            )
+        } else {
+            nil
         }
 
         var chatArgs: [String: Value] = [
@@ -273,7 +275,8 @@ struct MCPOracleToolService {
             try MCPServerViewModel.makeOracleExportDestination(
                 workspace: targetWindow.workspaceManager.activeWorkspace,
                 windowID: targetWindow.windowID,
-                tabID: tabContext?.tabID
+                tabID: tabContext?.tabID,
+                lookupContext: tabContext?.lookupContext ?? .visibleWorkspace
             )
         } else {
             nil

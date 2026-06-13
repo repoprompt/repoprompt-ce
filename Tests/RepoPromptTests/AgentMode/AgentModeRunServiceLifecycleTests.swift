@@ -16,6 +16,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         super.tearDown()
     }
 
+    func testTerminalCommitPreservesRebuiltToolCorrelationIndexes() async throws {
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let invocationID = UUID()
+        session.setItemsSilently([
+            .user("prior", sequenceIndex: 0),
+            .assistant("done", sequenceIndex: 1),
+            .user("active", sequenceIndex: 2),
+            .toolCall(
+                name: "read_file",
+                invocationID: invocationID,
+                argsJSON: #"{"path":"Sources/Active.swift"}"#,
+                sequenceIndex: 3
+            )
+        ], reason: .persistedSessionHydration)
+        session.runID = UUID()
+        session.runState = .running
+        let ownership = session.beginRunAttempt(source: "test.correlationIndex")
+
+        var completed = try XCTUnwrap(session.items.last)
+        completed.kind = .toolResult
+        completed.toolResultJSON = #"{"content":"ok"}"#
+        completed.text = completed.toolResultJSON ?? ""
+        session.replaceItem(at: 3, with: completed)
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.correlationIndex",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNotNil(revision)
+        XCTAssertEqual(session.indexedToolItemIndices(invocationID: invocationID), [3])
+        XCTAssertEqual(session.liveItemIDs, Set(session.items.map(\.id)))
+        session.testAssertSourceItemDerivedStateIsConsistent()
+    }
+
     func testStartupFailureTransitionsBeforeProviderDispatch() async {
         for agent in [AgentProviderKind.codexExec, .claudeCode, .openCode] {
             let recorder = LifecycleRecorder()
@@ -94,7 +137,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         session.endRunAttempt(ifCurrent: reusedOwnership, source: "test.cleanup")
     }
 
-    func testCodexRejectedSendVariantsPreserveReusedOwnership() async {
+    func testCodexFallbackAndRejectedSendVariantsPreserveReusedOwnership() async {
         let rows: [(LifecycleNoopCodexController.SendBehavior, Bool)] = [
             (.failure, true),
             (.cancellation, true),
@@ -123,10 +166,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 attachments: []
             )
 
-            switch behavior {
-            case .cancellation:
-                XCTAssertEqual(outcome, .cancelled)
-            case .failure, .success:
+            if activatesThread {
+                guard case .queuedFallback? = outcome else {
+                    return XCTFail("Expected durable Codex fallback for \(behavior)")
+                }
+            } else {
                 guard case .failed? = outcome else {
                     return XCTFail("Expected rejected Codex send for \(behavior)")
                 }
@@ -199,7 +243,11 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
         do {
             let recorder = LifecycleRecorder()
-            let provider = LifecycleFakeACPProvider(providerID: .openCode, commandPath: "/usr/bin/true")
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                recorder: recorder
+            )
             let harness = makeHarness(
                 recorder: recorder,
                 acpProviderFactory: { _, _ in
@@ -226,9 +274,87 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             XCTAssertEqual(session.runState, .failed)
             XCTAssertNil(session.activeRunOwnership)
             XCTAssertTrue(recorder.contains("factory:acp-provider"))
+            XCTAssertTrue(recorder.contains("provider:support"))
             XCTAssertTrue(recorder.contains("factory:acp-controller"))
+            assertOrderedEvents(["factory:acp-provider", "provider:support", "factory:acp-controller"], in: recorder)
             XCTAssertFalse(recorder.contains("factory:claude"))
             XCTAssertFalse(recorder.contains("factory:headless"))
+        }
+
+        do {
+            let recorder = LifecycleRecorder()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                supportResult: .unsupported(reason: "fixture unsupported"),
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in
+                    recorder.record("factory:acp-provider")
+                    return provider
+                },
+                acpControllerFactory: { _, _ in
+                    recorder.record("factory:acp-controller")
+                    throw LifecycleTestError.expectedACPDispatchStop
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "unsupported acp",
+                initialMessageForRun: "unsupported acp",
+                attachments: []
+            )
+
+            XCTAssertNil(outcome)
+            XCTAssertEqual(session.runState, .failed)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(recorder.contains("factory:acp-provider"))
+            XCTAssertTrue(recorder.contains("provider:support"))
+            XCTAssertFalse(recorder.contains("factory:acp-controller"))
+        }
+
+        do {
+            let recorder = LifecycleRecorder()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: "/usr/bin/true",
+                cancelSupport: true,
+                recorder: recorder
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                acpProviderFactory: { _, _ in
+                    recorder.record("factory:acp-provider")
+                    return provider
+                },
+                acpControllerFactory: { _, _ in
+                    recorder.record("factory:acp-controller")
+                    throw LifecycleTestError.unexpectedACPControllerCreation
+                }
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "cancelled support",
+                initialMessageForRun: "cancelled support",
+                attachments: []
+            )
+
+            XCTAssertNil(outcome)
+            XCTAssertEqual(session.runState, .cancelled)
+            XCTAssertNil(session.activeRunOwnership)
+            XCTAssertTrue(session.items.filter { $0.kind == .error }.isEmpty)
+            XCTAssertTrue(recorder.contains("provider:support"))
+            XCTAssertFalse(recorder.contains("factory:acp-controller"))
         }
     }
 
@@ -358,6 +484,110 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 XCTAssertFalse(recorder.contains("delivered"))
             }
         }
+    }
+
+    func testCursorACPSubmitsInitialPromptWhenMCPRoutingIsDeferredUntilPrompt() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("cursor-deferred-routing.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .cursor)
+                recorder.record("factory:acp-provider")
+                return provider
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor prompt",
+            initialMessageForRun: "Cursor prompt",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("Cursor ACP deferred routing run") {
+            await session.agentTask?.value
+        }
+
+        let methods = recordedOpenCodeFlowRequests(at: recordURL).map(\.method)
+        XCTAssertTrue(methods.contains("session/new"))
+        XCTAssertTrue(methods.contains("session/prompt"))
+        XCTAssertFalse(session.items.contains { $0.text.contains("MCP routing did not complete") })
+        XCTAssertEqual(session.runState, .completed)
+    }
+
+    func testCursorACPReusedSessionInstallsDeferredPolicyForFollowUpPrompt() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("cursor-deferred-follow-up-routing.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .cursor,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .cursor)
+                recorder.record("factory:acp-provider")
+                return provider
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .cursor
+
+        let firstOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor prompt one",
+            initialMessageForRun: "Cursor prompt one",
+            attachments: []
+        )
+        XCTAssertNil(firstOutcome)
+        try await withLifecycleTimeout("Cursor ACP initial deferred routing run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let firstRunID = try XCTUnwrap(session.runID)
+
+        let secondOutcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Cursor prompt two",
+            initialMessageForRun: "Cursor prompt two",
+            attachments: []
+        )
+        XCTAssertNil(secondOutcome)
+        try await withLifecycleTimeout("Cursor ACP deferred routing follow-up run") {
+            await session.agentTask?.value
+        }
+
+        let methods = recordedOpenCodeFlowRequests(at: recordURL).map(\.method)
+        XCTAssertEqual(methods.count(where: { $0 == "session/new" }), 1)
+        XCTAssertEqual(methods.count(where: { $0 == "session/prompt" }), 2)
+        XCTAssertEqual(session.runID, firstRunID)
+        XCTAssertFalse(session.items.contains { $0.text.contains("MCP routing did not complete") })
+        XCTAssertEqual(session.runState, .completed)
+
+        let policyEvents = recorder.events.filter { $0.hasPrefix("policy:cursor:") }
+        XCTAssertEqual(policyEvents.count, 2)
+        XCTAssertEqual(Set(policyEvents).count, 1)
     }
 
     func testTerminalBarrierRejectsStaleOwnership() async {
@@ -573,6 +803,60 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertTrue(session.pendingInstructions.isEmpty)
         XCTAssertEqual(recorder.events.count(where: { $0 == "follow-up:continue" }), 1)
         XCTAssertEqual(session.lastTerminalPublicationResult, .accepted(successorEpoch: successor))
+    }
+
+    func testProviderSuccessorConsumesOnceAfterAcceptedPublicationWithoutTouchingGenericQueue() async {
+        let recorder = LifecycleRecorder()
+        var publicationAttempts = 0
+        var consumedRevisions: [UUID] = []
+        let hooks = makeHooks(
+            recorder: recorder,
+            publishTerminalCommitResult: { _, _, _ in
+                publicationAttempts += 1
+                return publicationAttempts == 1
+                    ? .rejected(reason: "transient")
+                    : .accepted(successorEpoch: nil)
+            }
+        )
+        let barrier = AgentRunTerminalCommitBarrier(hooks: hooks)
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.runID = UUID()
+        session.runState = .running
+        session.pendingInstructions = ["unrelated generic instruction"]
+        let ownership = session.beginRunAttempt(source: "test.providerSuccessor")
+        let successorID = UUID()
+        let request = AgentRunTerminalCommitBarrier.Request(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.providerSuccessor",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: false,
+            supportsFollowUp: false,
+            providerSuccessor: .init(
+                id: successorID,
+                transitionKind: .relatedFollowUp,
+                consumeAfterPublication: { revision, result in
+                    if case .accepted = result {
+                        consumedRevisions.append(revision.commitID)
+                        return true
+                    }
+                    return false
+                }
+            ),
+            notifyTurnComplete: false
+        )
+
+        _ = await barrier.commit(request)
+        XCTAssertTrue(consumedRevisions.isEmpty)
+        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+
+        _ = await barrier.commit(request)
+        _ = await barrier.commit(request)
+        XCTAssertEqual(consumedRevisions.count, 1)
+        XCTAssertEqual(session.pendingInstructions, ["unrelated generic instruction"])
+        XCTAssertEqual(session.lastTerminalCommitRevision?.providerSuccessorID, successorID)
     }
 
     func testConcurrentPublicationOnlyCancellationWaitsForCanonicalPublication() async throws {
@@ -911,6 +1195,129 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
+    func testCancelRunInterruptsCapturedSessionOwnedCodexTurnByExactID() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        let harness = makeHarness(
+            recorder: recorder,
+            codexController: controller
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        let runID = UUID()
+        session.selectedAgent = .codexExec
+        session.runID = runID
+        session.runState = .running
+        session.codexConversationID = "lifecycle"
+        session.codexController = controller
+        session.beginRunAttempt(source: "test.codexExactCancellation")
+        session.codexAuthoritativeActiveTurn = try .init(
+            threadID: "lifecycle",
+            turnID: "owned-turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: XCTUnwrap(session.activeRunAttemptID)
+        )
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalTeardownCompleted
+        )
+
+        XCTAssertTrue(recorder.contains("codex:interrupt:owned-turn"))
+        XCTAssertFalse(recorder.contains("codex:cancel"))
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        assertOrderedEvents(
+            ["commit:", "codex:interrupt:owned-turn", "codex:shutdown"],
+            in: recorder,
+            prefixMatches: true
+        )
+    }
+
+    func testOpenCodePermissionModesUseModernConfigAfterModelAndBeforePrompt() async throws {
+        let rows: [(OpenCodeAgentToolPreferences.PermissionLevel, String)] = [
+            (.managedDefault, OpenCodeAgentConfig.managedSessionModeID),
+            (.fullAccess, OpenCodeAgentConfig.managedFullAccessSessionModeID)
+        ]
+
+        for (level, expectedMode) in rows {
+            let recorder = LifecycleRecorder()
+            let directory = try makeTemporaryDirectory()
+            let recordURL = directory.appendingPathComponent("opencode-flow-\(level.rawValue).jsonl")
+            let scriptURL = try makeOpenCodeModeFlowServerScript()
+            let provider = LifecycleFakeACPProvider(
+                providerID: .openCode,
+                commandPath: scriptURL.path,
+                environment: ["ACP_RECORD_PATH": recordURL.path]
+            )
+            let harness = makeHarness(
+                recorder: recorder,
+                workspacePathProvider: { _ in directory.path },
+                acpProviderFactory: { agent, _ in
+                    XCTAssertEqual(agent, .openCode)
+                    return provider
+                },
+                autoSignalACPRouting: true
+            )
+            let session = AgentModeViewModel.TabSession(tabID: UUID())
+            session.selectedAgent = .openCode
+            session.selectedModelRaw = "model-b"
+            session.permissionProfile = .providerOverride(.openCode(level))
+
+            let outcome = await harness.service.startRun(
+                tabID: session.tabID,
+                session: session,
+                initialUserMessage: "OpenCode flow",
+                initialMessageForRun: "OpenCode flow",
+                attachments: []
+            )
+            XCTAssertNil(outcome, level.rawValue)
+            await session.agentTask?.value
+
+            let requests = recordedOpenCodeFlowRequests(at: recordURL)
+            let relevant = requests.filter { request in
+                request.method == "session/new"
+                    || request.method == "session/set_config_option"
+                    || request.method == "session/prompt"
+            }
+            XCTAssertEqual(
+                relevant.map(\.method),
+                ["session/new", "session/set_config_option", "session/set_config_option", "session/prompt"],
+                level.rawValue
+            )
+            XCTAssertEqual(relevant[1].params["configId"] as? String, "model", level.rawValue)
+            XCTAssertEqual(relevant[1].params["value"] as? String, "model-b", level.rawValue)
+            XCTAssertEqual(relevant[2].params["configId"] as? String, "mode", level.rawValue)
+            XCTAssertEqual(relevant[2].params["value"] as? String, expectedMode, level.rawValue)
+            XCTAssertFalse(session.items.contains { $0.kind == .error }, level.rawValue)
+
+            await harness.service.cancelRun(tabID: session.tabID, session: session)
+        }
+    }
+
+    private struct RecordedOpenCodeFlowRequest {
+        let method: String
+        let params: [String: Any]
+    }
+
+    private func recordedOpenCodeFlowRequests(at url: URL) -> [RecordedOpenCodeFlowRequest] {
+        guard let data = try? Data(contentsOf: url),
+              let text = String(data: data, encoding: .utf8)
+        else { return [] }
+        return text.split(whereSeparator: { $0.isNewline }).compactMap { line in
+            guard let data = String(line).data(using: .utf8),
+                  let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let method = object["method"] as? String
+            else { return nil }
+            return RecordedOpenCodeFlowRequest(
+                method: method,
+                params: object["params"] as? [String: Any] ?? [:]
+            )
+        }
+    }
+
     private func makeHarness(
         recorder: LifecycleRecorder,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String? = { _ in FileManager.default.currentDirectoryPath },
@@ -922,7 +1329,8 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         acpProviderFactory: AgentModeViewModel.ACPProviderFactory? = nil,
         acpControllerFactory: AgentModeViewModel.ACPControllerFactory? = nil,
         flushPendingAssistantDelta: ((AgentModeViewModel.TabSession) -> Void)? = nil,
-        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil
+        publishTerminalCommit: ((AgentModeViewModel.TabSession, AgentRunTerminalCommitRevision) async -> Void)? = nil,
+        autoSignalACPRouting: Bool = false
     ) -> LifecycleHarness {
         let codexController = codexController ?? LifecycleNoopCodexController(recorder: recorder)
         let claudeController = claudeController ?? LifecycleFakeNativeController(recorder: recorder)
@@ -938,7 +1346,12 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             recorder.record("factory:acp-controller")
             return try ACPAgentSessionController(provider: provider, runRequest: request)
         }
-        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { _, _, _, _, _, _, _, _, _, _, _, _, _ in }
+        let policyInstaller: AgentModeViewModel.ConnectionPolicyInstaller = { clientName, _, _, _, _, _, _, runID, _, _, _, _, _ in
+            recorder.record("policy:\(clientName):\(runID?.uuidString ?? "nil")")
+            if autoSignalACPRouting, let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
+        }
         let serverEnabler: AgentModeViewModel.MCPServerEnabler = {}
         let host = AgentModeViewModel(
             testWindowID: 1,
@@ -1149,6 +1562,93 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return url
     }
 
+    private func makeOpenCodeModeFlowServerScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("fake_opencode_mode_flow_server.py")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import os
+        import sys
+
+        record_path = os.environ.get("ACP_RECORD_PATH")
+        current_model = "model-a"
+        current_mode = "ask"
+
+        def record(method, params):
+            if not record_path:
+                return
+            with open(record_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"method": method, "params": params}) + "\n")
+
+        def config_options():
+            return [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": current_model,
+                    "options": [
+                        {"value": "model-a", "name": "Model A"},
+                        {"value": "model-b", "name": "Model B"}
+                    ]
+                },
+                {
+                    "id": "mode",
+                    "name": "Session Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": current_mode,
+                    "options": [
+                        {"value": "ask", "name": "Ask"},
+                        {"value": "repoprompt_acp", "name": "RepoPrompt"},
+                        {"value": "repoprompt_acp_full_access", "name": "RepoPrompt Full Access"}
+                    ]
+                }
+            ]
+
+        def respond(request_id, result=None):
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result if result is not None else {}
+            }), flush=True)
+
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except Exception:
+                continue
+            method = request.get("method")
+            params = request.get("params") or {}
+            record(method, params)
+            if method == "initialize":
+                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+            elif method == "session/new":
+                respond(request.get("id"), {
+                    "sessionId": "opencode-mode-flow",
+                    "configOptions": config_options()
+                })
+            elif method == "session/set_config_option":
+                if params.get("configId") == "model":
+                    current_model = params.get("value")
+                elif params.get("configId") == "mode":
+                    current_mode = params.get("value")
+                respond(request.get("id"), {"configOptions": config_options()})
+            elif method == "session/prompt":
+                respond(request.get("id"), {
+                    "stopReason": "end_turn",
+                    "usage": {"inputTokens": 1, "outputTokens": 1}
+                })
+            else:
+                respond(request.get("id"), {})
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     private func makeFakeACPServerScript() throws -> URL {
         let directory = try makeTemporaryDirectory()
         let scriptURL = directory.appendingPathComponent("fake_acp_server.py")
@@ -1347,6 +1847,7 @@ private enum LifecycleCancellationRow: String, CaseIterable {
 private enum LifecycleTestError: LocalizedError {
     case workspaceMissing
     case expectedACPDispatchStop
+    case unexpectedACPControllerCreation
     case expectedClaudeSendFailure
     case expectedCodexSendFailure
 
@@ -1356,6 +1857,8 @@ private enum LifecycleTestError: LocalizedError {
             "Lifecycle test workspace is missing."
         case .expectedACPDispatchStop:
             "Expected ACP dispatch stop."
+        case .unexpectedACPControllerCreation:
+            "ACP controller creation was not expected."
         case .expectedClaudeSendFailure:
             "Expected Claude send failure."
         case .expectedCodexSendFailure:
@@ -1518,20 +2021,19 @@ private final class LifecycleNoopCodexController: CodexSessionControlling {
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {
+    func startUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws -> CodexTurnStartReceipt {
         try recordCodexSend()
+        return CodexTurnStartReceipt(provisionalSubmissionID: "lifecycle-submission")
     }
 
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {
+    func steerUserTurn(text: String, images: [AgentImageAttachment], expectedTurnID: String) async throws -> CodexTurnSteerReceipt {
         try recordCodexSend()
+        return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
     }
 
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {
-        try recordCodexSend()
-    }
-
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {
-        try recordCodexSend()
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        recorder.record("codex:interrupt:\(expectedTurnID)")
+        return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
     }
 
     private func recordCodexSend() throws {
@@ -1646,9 +2148,17 @@ private actor LifecycleFakeNativeController: NativeAgentRuntimeControlling {
 private struct LifecycleFakeACPProvider: ACPAgentProvider {
     let providerID: ACPProviderID
     let commandPath: String
+    var environment: [String: String] = [:]
+    var supportResult: ACPSupportResult = .supported
+    var cancelSupport = false
+    var recorder: LifecycleRecorder?
 
-    func support(for request: ACPRunRequest) async -> ACPSupportResult {
-        .supported
+    func support(for _: ACPRunRequest) async throws -> ACPSupportResult {
+        recorder?.record("provider:support")
+        if cancelSupport {
+            throw CancellationError()
+        }
+        return supportResult
     }
 
     func makeLaunchConfiguration(for request: ACPRunRequest) throws -> ACPLaunchConfiguration {
@@ -1656,7 +2166,7 @@ private struct LifecycleFakeACPProvider: ACPAgentProvider {
             providerID: providerID,
             command: commandPath,
             arguments: [],
-            environment: [:],
+            environment: environment,
             workingDirectory: request.workspacePath,
             additionalPathHints: [],
             enableDebugLogging: false

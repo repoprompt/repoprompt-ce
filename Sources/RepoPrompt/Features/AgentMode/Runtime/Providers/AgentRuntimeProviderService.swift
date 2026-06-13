@@ -125,6 +125,15 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         }
     }
 
+    var requiresPrePromptAgentModeMCPRouting: Bool {
+        switch self {
+        case .cursor:
+            false
+        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            true
+        }
+    }
+
     /// Human-readable description for MCP discovery (list_agents).
     var agentDescription: String {
         switch self {
@@ -275,7 +284,7 @@ final class AgentRuntimeProviderService {
                 enableDebugLogging: Self.enableDebugLogging,
                 modelString: modelString,
                 includeRepoPromptMCPServer: true,
-                cleanupProjectMCPConfig: true
+                cleanupProjectMCPApproval: true
             )
             if Self.enableDebugLogging {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")

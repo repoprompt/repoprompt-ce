@@ -44,18 +44,48 @@ public enum FileSystemDelta: Sendable, Equatable {
     case folderModified(String, Date? = nil) // observed disk mtime when available
 }
 
+enum FileSystemWatcherActivationError: LocalizedError, Equatable {
+    case streamCreationFailed(path: String)
+    case streamStartFailed(path: String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .streamCreationFailed(path):
+            "Failed to create FSEvent stream for \(path)"
+        case let .streamStartFailed(path):
+            "Failed to start FSEvent stream for \(path)"
+        }
+    }
+}
+
 enum FileSystemDeltaPublicationSource: String {
     case watcher
     case syntheticMutation
     case watcherBarrierNoop
     case overflowRootRescan
+    case recoveryFullResync
 }
 
 struct FileSystemDeltaPublication {
     let servicePublicationSequence: UInt64
     let source: FileSystemDeltaPublicationSource
     let watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?
+    let requiresFullResync: Bool
     let deltas: [FileSystemDelta]
+
+    init(
+        servicePublicationSequence: UInt64,
+        source: FileSystemDeltaPublicationSource,
+        watcherAcceptedWatermark: FileSystemWatcherIngressMailbox.Watermark?,
+        requiresFullResync: Bool = false,
+        deltas: [FileSystemDelta]
+    ) {
+        self.servicePublicationSequence = servicePublicationSequence
+        self.source = source
+        self.watcherAcceptedWatermark = watcherAcceptedWatermark
+        self.requiresFullResync = requiresFullResync
+        self.deltas = deltas
+    }
 }
 
 typealias PendingFSEvent = (path: String, flags: FSEventStreamEventFlags, id: FSEventStreamEventId)

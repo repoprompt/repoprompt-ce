@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 import RepoPromptShared
 
 enum MCPToolExecutionContract: Equatable {
@@ -47,6 +48,11 @@ enum MCPToolExecutionDispatchError: Error, Equatable {
 }
 
 enum MCPToolExecutionContractCatalog {
+    private static let workspaceSwitchContract = MCPToolExecutionContract.bounded(
+        deadline: MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline,
+        cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+    )
+
     static let orderedAdvertisedToolNames = MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames
 
     static let contracts: [String: MCPToolExecutionContract] = {
@@ -96,5 +102,35 @@ enum MCPToolExecutionContractCatalog {
 
     static func contract(for toolName: String) -> MCPToolExecutionContract? {
         contracts[toolName]
+    }
+
+    static func contract(
+        for toolName: String,
+        arguments: [String: Value]
+    ) -> MCPToolExecutionContract? {
+        guard let baseContract = contract(for: toolName) else { return nil }
+        guard toolName == MCPGlobalToolName.manageWorkspaces else { return baseContract }
+        guard let rawAction = arguments["action"]?.stringValue else {
+            return baseContract
+        }
+        let action = rawAction
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        let producesWorkspaceSwitch: Bool = switch action {
+        case "switch":
+            true
+        case "create":
+            // Mirror the handler's `args["switch_to_created"]?.boolValue ?? true`: an
+            // omitted or malformed flag still performs the switch, so it must stay
+            // under the workspace-switch deadline.
+            arguments["switch_to_created"]?.boolValue ?? true
+        case "delete":
+            arguments["close_window"]?.boolValue == true
+        default:
+            false
+        }
+
+        return producesWorkspaceSwitch ? workspaceSwitchContract : baseContract
     }
 }

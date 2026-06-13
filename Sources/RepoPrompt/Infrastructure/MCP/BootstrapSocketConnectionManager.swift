@@ -96,6 +96,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         // Create transport with existing connected FD
         transport = try UnixSocketMCPTransport(
             connectedFD: connectedFD,
+            connectionID: connectionID,
+            correlationConnectionID: sessionToken,
             logger: bootstrapLog,
             receiveBufferCapacity: receiveBufferCapacity
         )

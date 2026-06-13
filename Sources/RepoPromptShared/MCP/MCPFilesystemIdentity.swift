@@ -143,6 +143,11 @@ public struct MCPFilesystemIdentity: Equatable, Sendable {
             .appendingPathComponent(applicationSupportDirectoryName, isDirectory: true)
     }
 
+    public func temporaryRootURL(fileManager: FileManager = .default) -> URL {
+        fileManager.temporaryDirectory
+            .appendingPathComponent(applicationSupportDirectoryName, isDirectory: true)
+    }
+
     public func configDirectoryURL(fileManager: FileManager = .default) -> URL {
         applicationSupportRootURL(fileManager: fileManager)
             .appendingPathComponent("MCP", isDirectory: true)

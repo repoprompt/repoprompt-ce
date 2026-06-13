@@ -31,7 +31,9 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
-PROTOCOL_VERSION = 4
+from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
+
+PROTOCOL_VERSION = 5
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -449,7 +451,7 @@ class OutputSummarizer:
         r"^(Created:|APP_BUNDLE=|COMPAT_APP_BUNDLE=|CLI_PATH=|Output written to:|Agent Mode diagnostics enabled|Resolved rpce-cli-debug:)"
     )
     APP_LIFECYCLE_RE = re.compile(
-        r"(Stopping existing RepoPrompt instance|Waiting for existing RepoPrompt process to exit|Launching .*RepoPrompt\.app|Confirming launched RepoPrompt process|Observed launched RepoPrompt PID|Guarding against a delayed RepoPrompt launch|Delayed launch guard confirmed|RepoPrompt stop confirmed|RepoPrompt was (not running|already stopped))"
+        r"(Stopping existing RepoPrompt|Waiting for existing RepoPrompt|Launching .*RepoPrompt\.app|Confirming launched RepoPrompt|Observed launched RepoPrompt|Guarding against a delayed RepoPrompt|Delayed launch guard confirmed|RepoPrompt(?: CE debug app)? stop confirmed|RepoPrompt was (not running|already stopped))"
     )
     SOURCE_CHANGED_DURING_BUILD_RE = re.compile(r"input file .* was modified during the build", re.IGNORECASE)
 
@@ -515,12 +517,12 @@ class OutputSummarizer:
             line = clean_summary_line(str(raw_line))
             tail.append(line)
 
-            if "Stopping existing RepoPrompt instance" in line:
+            if "Stopping existing RepoPrompt" in line:
                 launch_lifecycle["transitionStarted"] = True
             if "Launching " in line and "RepoPrompt.app" in line:
                 launch_lifecycle["transitionStarted"] = True
                 launch_lifecycle["launchRequested"] = True
-            if "Observed launched RepoPrompt PID" in line:
+            if "Observed launched RepoPrompt" in line:
                 launch_lifecycle["launchConfirmed"] = True
             if cls.SOURCE_CHANGED_DURING_BUILD_RE.search(line):
                 launch_lifecycle["sourceChangedDuringBuild"] = True
@@ -2578,18 +2580,30 @@ def debug_app_bundle_path() -> Path:
     return Path(os.environ.get("REPOPROMPT_DEBUG_APP_BUNDLE", str(Path(root) / "RepoPrompt.app")))
 
 
-def find_repoprompt_pids() -> List[str]:
-    pgrep = subprocess.run(["pgrep", "-x", "RepoPrompt"], text=True, capture_output=True)
-    return [line.strip() for line in pgrep.stdout.splitlines() if line.strip()]
+def debug_app_executable_path() -> Path:
+    return debug_app_bundle_path() / "Contents" / "MacOS" / "RepoPrompt"
+
+
+def find_debug_app_pids() -> List[str]:
+    return [str(pid) for pid in matching_processes(debug_app_executable_path())]
+
+
+def terminate_debug_app_processes() -> List[str]:
+    return [str(pid) for pid in terminate_matching_processes(debug_app_executable_path())]
 
 
 def operation_app_status(repo_root: Path) -> int:
     bundle = debug_app_bundle_path()
     print("RepoPrompt CE debug app status")
-    print(f"  Running RepoPrompt PIDs: ", end="")
-    pids = find_repoprompt_pids()
-    print(", ".join(pids) if pids else "none")
     print(f"  Debug app bundle: {bundle}")
+    print("  Running matching debug app PIDs: ", end="")
+    try:
+        pids = find_debug_app_pids()
+    except ProcessIdentityError as exc:
+        print("unknown")
+        print(f"ERROR: could not safely identify the debug app process: {exc}")
+        return 1
+    print(", ".join(pids) if pids else "none")
     print(f"  Bundle exists: {'yes' if bundle.exists() else 'no'}")
     if bundle.exists():
         # Keep the signing/storage probes aligned with Scripts/run.sh launch diagnostics.
@@ -2624,18 +2638,22 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
     quiet_since: Optional[float] = None
     observed_process = False
     if guard_delayed_launch:
-        print("Guarding against a delayed RepoPrompt launch from superseded app work.", flush=True)
+        print("Guarding against a delayed RepoPrompt CE debug app launch from superseded app work.", flush=True)
     while True:
-        pids = find_repoprompt_pids()
+        try:
+            pids = find_debug_app_pids()
+        except ProcessIdentityError as exc:
+            print(f"ERROR: could not safely identify the debug app process: {exc}", flush=True)
+            return 1
         if pids:
             observed_process = True
             quiet_since = None
-            print(f"Observed running RepoPrompt PID(s): {', '.join(pids)}", flush=True)
-            code, _stdout, _stderr = run_operation_command(
-                "stop RepoPrompt", ["pkill", "-x", "RepoPrompt"], repo_root, allow_exit_codes={0, 1}
-            )
-            if code not in {0, 1}:
-                return code
+            print(f"Observed running RepoPrompt CE debug PID(s): {', '.join(pids)}", flush=True)
+            try:
+                terminate_debug_app_processes()
+            except ProcessIdentityError as exc:
+                print(f"ERROR: refused to signal a process without validated debug app identity: {exc}", flush=True)
+                return 1
         else:
             if quiet_since is None:
                 quiet_since = now()

@@ -49,18 +49,23 @@ enum StoreBackedWorkspaceSearch {
         try await ensureRootScopeAvailable(rootScope, store: store)
         try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
 
-        let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
-        _ = await store.awaitAppliedIngress(rootScope: rootScope)
-        EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
-        try Task.checkCancellation()
-
         let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode
         let admissionClass = broadSearchAdmissionClass(pattern: pattern, mode: mode, paths: paths)
         return try await store.withStoreBackedSearchAccess(
             searchMode: effectiveMode,
             admissionClass: admissionClass
         ) { fileSearchActor in
-            try await performSearch(
+            if admissionClass != nil {
+                try await ensureRootScopeAvailable(rootScope, store: store)
+                try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
+            }
+
+            let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
+            _ = await store.awaitAppliedIngress(rootScope: rootScope)
+            EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
+            try Task.checkCancellation()
+
+            return try await performSearch(
                 pattern: pattern,
                 mode: mode,
                 effectiveMode: effectiveMode,

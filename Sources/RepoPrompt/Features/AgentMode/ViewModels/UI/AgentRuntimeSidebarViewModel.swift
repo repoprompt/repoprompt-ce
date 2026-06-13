@@ -35,13 +35,18 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var selectedModelRaw: String?
 
         /// Context window with agent-specific fallback when the provider hasn't reported one yet.
+        /// With a known agent, encoded selections (`base:effort`) resolve through
+        /// `resolvedModel(forRaw:agentKind:)`; without one, only an exact raw match
+        /// can be trusted because the specifier grammar is agent-specific.
         var effectiveContextWindowTokens: Int {
             if let contextWindowTokens { return contextWindowTokens }
-            if let selectedModelRaw,
-               let model = AgentModel(rawValue: selectedModelRaw),
-               model.isExtendedContext
-            {
-                return 1_000_000
+            let model: AgentModel? = if let selectedAgent {
+                AgentModel.resolvedModel(forRaw: selectedModelRaw, agentKind: selectedAgent)
+            } else {
+                selectedModelRaw.flatMap(AgentModel.init(rawValue:))
+            }
+            if let modelContextWindow = model?.contextWindowTokens {
+                return modelContextWindow
             }
             switch selectedAgent {
             case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: return 200_000

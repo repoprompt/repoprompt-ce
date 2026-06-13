@@ -149,6 +149,7 @@ struct GitContextBranchSwitchCapsule: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: capsuleLabelMaxWidth, alignment: .leading)
                 Image(systemName: "chevron.down")
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 6, weight: .semibold))
@@ -156,8 +157,6 @@ struct GitContextBranchSwitchCapsule: View {
             .foregroundColor(.secondary)
             .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
             .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
-            // Stay content-sized for short branch names while the text still caps and truncates long names.
-            .fixedSize(horizontal: true, vertical: false)
             .background(Capsule().fill(Color.secondary.opacity(0.10)))
             .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75))
         }

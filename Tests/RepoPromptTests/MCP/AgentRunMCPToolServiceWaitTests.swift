@@ -469,7 +469,7 @@ private actor LiveSnapshots {
     }
 }
 
-private final class WaitTestCodexController: CodexSessionControlling {
+private final class WaitTestCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     var hasActiveThread: Bool {
         false
     }
@@ -525,23 +525,6 @@ private final class WaitTestCodexController: CodexSessionControlling {
     }
 
     func setThreadName(_: String, threadID _: String?) async throws {}
-    func sendUserMessage(_: String) async throws {}
-    func sendUserTurn(text _: String, images _: [AgentImageAttachment]) async throws {}
-    func sendUserTurn(
-        text _: String,
-        images _: [AgentImageAttachment],
-        model _: String?,
-        reasoningEffort _: String?
-    ) async throws {}
-
-    func sendUserTurn(
-        text _: String,
-        images _: [AgentImageAttachment],
-        model _: String?,
-        reasoningEffort _: String?,
-        serviceTier _: String?
-    ) async throws {}
-
     func compactThread() async throws {}
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

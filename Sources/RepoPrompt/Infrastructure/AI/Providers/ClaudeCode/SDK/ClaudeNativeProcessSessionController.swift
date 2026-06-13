@@ -2186,8 +2186,7 @@ final actor ClaudeNativeProcessSessionController {
                 let expanded = NSString(string: overridePath).expandingTildeInPath
                 return URL(fileURLWithPath: expanded, isDirectory: true)
             }
-            return FileManager.default.temporaryDirectory
-                .appendingPathComponent("RepoPrompt", isDirectory: true)
+            return MCPFilesystemConstants.identity.temporaryRootURL()
                 .appendingPathComponent("ClaudeRawEvents", isDirectory: true)
         }()
         do {

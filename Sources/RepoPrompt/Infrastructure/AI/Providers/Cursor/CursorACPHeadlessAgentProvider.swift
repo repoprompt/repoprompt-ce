@@ -52,11 +52,11 @@ final class CursorACPHeadlessAgentProvider: HeadlessAgentProvider {
             },
             makeController: controllerFactory,
             beforePrompt: { controller, _ in
-                if let sessionMode = Self.sessionModeToApply(config: config) {
-                    try await controller.setSessionMode(sessionMode)
-                }
                 if let model = Self.selectedModelToApply(config: config) {
                     try await controller.setSessionModel(model)
+                }
+                if let sessionMode = Self.sessionModeToApply(config: config) {
+                    try await controller.setSessionMode(sessionMode)
                 }
             },
             approvalPolicy: .declineUnsupported

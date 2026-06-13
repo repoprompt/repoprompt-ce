@@ -224,7 +224,7 @@ public struct VCSTag: Sendable {
 // MARK: - VCS Status Types
 
 /// Structured working directory status.
-public struct VCSWorkingStatus: Sendable {
+public struct VCSWorkingStatus: Sendable, Equatable {
     /// Files staged for commit (git only; empty for jujutsu).
     public let staged: [String]
 
@@ -242,6 +242,32 @@ public struct VCSWorkingStatus: Sendable {
 
     /// Empty working status.
     public static let empty = VCSWorkingStatus(staged: [], modified: [], untracked: [])
+}
+
+/// One coherent repository status observation.
+public struct VCSRepositoryStatus: Sendable, Equatable {
+    public let branch: String?
+    public let headID: String?
+    public let upstream: String?
+    public let ahead: Int?
+    public let behind: Int?
+    public let workingStatus: VCSWorkingStatus
+
+    public init(
+        branch: String?,
+        headID: String?,
+        upstream: String?,
+        ahead: Int?,
+        behind: Int?,
+        workingStatus: VCSWorkingStatus
+    ) {
+        self.branch = branch
+        self.headID = headID
+        self.upstream = upstream
+        self.ahead = ahead
+        self.behind = behind
+        self.workingStatus = workingStatus
+    }
 }
 
 // MARK: - VCS Commit Types

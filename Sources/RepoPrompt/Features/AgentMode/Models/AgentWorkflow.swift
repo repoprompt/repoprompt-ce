@@ -198,7 +198,7 @@ public enum AgentWorkflow: String, Codable, CaseIterable, Sendable, Identifiable
 ///
 /// Related:
 /// - Built-in catalog: `AgentWorkflow` enum (above)
-/// - Storage: `AgentWorkflowStore` loads custom workflows from `~/Library/Application Support/RepoPrompt/Workflows/`
+/// - Storage: `AgentWorkflowStore` loads custom workflows from `~/Library/Application Support/RepoPrompt CE/Workflows/`
 /// - UI: `AgentWorkflowsPopoverView` displays both built-in and custom workflows
 public struct AgentWorkflowDefinition: Sendable, Identifiable, Equatable, Hashable {
     // MARK: Source

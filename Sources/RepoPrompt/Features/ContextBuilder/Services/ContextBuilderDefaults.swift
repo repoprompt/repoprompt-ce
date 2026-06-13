@@ -35,6 +35,12 @@ enum ContextBuilderDefaults {
     /// Default timeout (in seconds) for user responses to clarifying questions
     static let questionTimeoutSeconds = MCPTimeoutPolicy.askUserDefaultTimeoutSeconds
 
+    /// Deadline for the provider's run-scoped MCP client to route after stream creation.
+    static let mcpRoutingTimeoutMilliseconds = 10000
+
+    /// Keeps the one-shot routing policy alive through the routing deadline, with a five-second margin.
+    static let mcpBootstrapConnectionTTL = TimeInterval((mcpRoutingTimeoutMilliseconds / 1000) + 5)
+
     // MARK: - Plan Generation
 
     /// Whether to auto-generate a plan after Context Builder completes
