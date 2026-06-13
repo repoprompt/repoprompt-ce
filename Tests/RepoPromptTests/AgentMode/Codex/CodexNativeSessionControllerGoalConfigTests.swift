@@ -57,6 +57,47 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testSafeManagedMCPOverridesSuppressThirdPartyServers() {
+        let repoPromptName = MCPIntegrationHelper.repoPromptMCPServerName
+        let entries = [
+            MCPIntegrationHelper.CodexServerEntry(
+                rawName: repoPromptName,
+                normalizedName: repoPromptName,
+                cliPathComponent: repoPromptName
+            ),
+            MCPIntegrationHelper.CodexServerEntry(
+                rawName: "external-tools",
+                normalizedName: "external-tools",
+                cliPathComponent: "external-tools"
+            ),
+            MCPIntegrationHelper.CodexServerEntry(
+                rawName: "computer-use",
+                normalizedName: "computer-use",
+                cliPathComponent: "computer-use"
+            )
+        ]
+        let enabledNames: Set<String> = [repoPromptName, "external-tools"]
+
+        let safeManaged = CodexNativeSessionController.appServerMCPServerOverrides(
+            serverEntries: entries,
+            enabledMCPServerNames: enabledNames,
+            suppressThirdPartyMCPServers: true,
+            computerUseEnabled: false
+        )
+        XCTAssertEqual(safeManaged["mcp_servers.\(repoPromptName).enabled"] as? Bool, true)
+        XCTAssertEqual(safeManaged["mcp_servers.external-tools.enabled"] as? Bool, false)
+        XCTAssertEqual(safeManaged["mcp_servers.computer-use.enabled"] as? Bool, false)
+
+        let safeManagedComputerUse = CodexNativeSessionController.appServerMCPServerOverrides(
+            serverEntries: entries,
+            enabledMCPServerNames: enabledNames,
+            suppressThirdPartyMCPServers: true,
+            computerUseEnabled: true
+        )
+        XCTAssertEqual(safeManagedComputerUse["mcp_servers.external-tools.enabled"] as? Bool, false)
+        XCTAssertEqual(safeManagedComputerUse["mcp_servers.computer-use.enabled"] as? Bool, true)
+    }
+
     private func assertStartAndResumeGoalConfig(
         options: CodexNativeSessionController.Options,
         expectedGoalSupportEnabled: Bool

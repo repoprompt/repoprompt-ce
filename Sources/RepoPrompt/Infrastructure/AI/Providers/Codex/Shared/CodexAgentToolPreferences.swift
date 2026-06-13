@@ -422,7 +422,7 @@ enum CodexAgentToolPreferences {
         guard let raw = defaults.string(forKey: approvalReviewerKey),
               let reviewer = ApprovalReviewer(storedValue: raw)
         else {
-            return .user
+            return .autoReview
         }
         return reviewer
     }

@@ -68,9 +68,10 @@ struct AgentPermissionCapabilitySummaryBuilder {
                     ? ["Sandbox is Danger Full Access — agents can modify files outside the workspace."]
                     : []
             case .mcpSafeDefaults:
-                bash = false
-                approval = CodexAgentToolPreferences.PermissionLevel.defaultPermission.approvalPolicy.displayName
-                sandbox = CodexAgentToolPreferences.PermissionLevel.defaultPermission.sandboxMode.displayName
+                let level = CodexAgentToolPreferences.PermissionLevel.autoReview
+                bash = true
+                approval = level.displayName
+                sandbox = level.sandboxMode.displayName
                 warnings = []
             case .providerOverride:
                 let level = codexPermissionLevel(profile: profile)
@@ -207,7 +208,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .userConfigured:
             CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
-            .defaultPermission
+            .autoReview
         case let .providerOverride(.codex(level)):
             level
         case .providerOverride:

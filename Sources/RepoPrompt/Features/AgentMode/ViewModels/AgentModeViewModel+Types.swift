@@ -244,6 +244,23 @@ extension AgentModeViewModel {
         /// The task label kind for this MCP-controlled run (e.g. explore, engineer).
         /// Used to customize tool advertisement and system prompts for role-specific behavior.
         let taskLabelKind: AgentModelCatalog.TaskLabelKind?
+
+        func replacingRegistration(_ registration: AgentRunSessionStore.Registration) -> Self {
+            Self(
+                sessionID: sessionID,
+                activationID: activationID,
+                registration: registration,
+                currentEpoch: currentEpoch,
+                preparedEpoch: preparedEpoch,
+                pendingEpochTransition: pendingEpochTransition,
+                originatingConnectionID: originatingConnectionID,
+                interactionTransport: interactionTransport,
+                suppressUserNotifications: suppressUserNotifications,
+                forceAutoEditEnabled: forceAutoEditEnabled,
+                autoEditEnabledBeforeOverride: autoEditEnabledBeforeOverride,
+                taskLabelKind: taskLabelKind
+            )
+        }
     }
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.

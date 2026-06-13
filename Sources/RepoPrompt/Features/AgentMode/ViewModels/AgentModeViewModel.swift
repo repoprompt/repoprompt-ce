@@ -1308,7 +1308,8 @@ final class AgentModeViewModel: ObservableObject {
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: nil,
+                shellToolEnabled: permissionProfile.codexBashToolEnabled(),
+                suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
@@ -4443,23 +4444,61 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             .unrelated
         }
-        let result = await AgentRunSessionStore.beginEpoch(
-            registration: originalContext.registration,
+        let activationGeneration = session.mcpControlActivationGeneration
+        var registration = originalContext.registration
+        var result = await AgentRunSessionStore.beginEpoch(
+            registration: registration,
             activationID: originalContext.activationID,
             expectedCurrentEpoch: originalContext.currentEpoch,
             transitionKind: transitionKind
         )
+        // A stale result means the existing record advanced to another epoch; only rejected
+        // results are eligible for missing-record recovery through registerIfMissing.
+        if case .rejected = result {
+            guard session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch,
+                  let recoveredRegistration = await AgentRunSessionStore.registerIfMissing(
+                      sessionID: originalContext.sessionID
+                  )
+            else {
+                return
+            }
+            guard session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch
+            else {
+                await AgentRunSessionStore.cleanup(registration: recoveredRegistration)
+                return
+            }
+            registration = recoveredRegistration
+            result = await AgentRunSessionStore.beginEpoch(
+                registration: registration,
+                activationID: originalContext.activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: transitionKind
+            )
+        }
         #if DEBUG
             await test_afterMCPStoreEpochBegan?()
         #endif
         guard case let .accepted(epoch) = result,
+              session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
               context.activationID == originalContext.activationID,
               context.registration == originalContext.registration,
               context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
         else {
+            if registration != originalContext.registration {
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
             return
         }
+        context = context.replacingRegistration(registration)
         context.currentEpoch = epoch
         context.preparedEpoch = epoch
         let pendingTransitionToken = context.pendingEpochTransition?.token

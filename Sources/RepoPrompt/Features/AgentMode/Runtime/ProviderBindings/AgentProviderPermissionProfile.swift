@@ -20,7 +20,7 @@ extension AgentProviderPermissionProfile {
         case .userConfigured:
             CodexAgentToolPreferences.sandboxMode()
         case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.defaultPermission.sandboxMode
+            CodexAgentToolPreferences.PermissionLevel.autoReview.sandboxMode
         case let .providerOverride(.codex(level)):
             level.sandboxMode
         case .providerOverride:
@@ -33,7 +33,7 @@ extension AgentProviderPermissionProfile {
         case .userConfigured:
             CodexAgentToolPreferences.approvalPolicy()
         case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.defaultPermission.approvalPolicy
+            CodexAgentToolPreferences.PermissionLevel.autoReview.approvalPolicy
         case let .providerOverride(.codex(level)):
             level.approvalPolicy
         case .providerOverride:
@@ -46,11 +46,31 @@ extension AgentProviderPermissionProfile {
         case .userConfigured:
             CodexAgentToolPreferences.approvalReviewer()
         case .mcpSafeDefaults:
-            CodexAgentToolPreferences.PermissionLevel.defaultPermission.approvalReviewer
+            CodexAgentToolPreferences.PermissionLevel.autoReview.approvalReviewer
         case let .providerOverride(.codex(level)):
             level.approvalReviewer
         case .providerOverride:
             CodexAgentToolPreferences.PermissionLevel.defaultPermission.approvalReviewer
+        }
+    }
+
+    func codexBashToolEnabled(
+        userConfigured: Bool = CodexAgentToolPreferences.bashToolEnabled()
+    ) -> Bool {
+        switch self {
+        case .mcpSafeDefaults:
+            true
+        case .userConfigured, .providerOverride:
+            userConfigured
+        }
+    }
+
+    var codexSuppressesThirdPartyMCPServers: Bool {
+        switch self {
+        case .mcpSafeDefaults:
+            true
+        case .userConfigured, .providerOverride:
+            false
         }
     }
 
@@ -59,7 +79,7 @@ extension AgentProviderPermissionProfile {
     ) -> CodexAgentToolPreferences.PermissionLevel {
         switch self {
         case .userConfigured: userConfigured
-        case .mcpSafeDefaults: .defaultPermission
+        case .mcpSafeDefaults: .autoReview
         case let .providerOverride(.codex(level)): level
         case .providerOverride: .defaultPermission
         }

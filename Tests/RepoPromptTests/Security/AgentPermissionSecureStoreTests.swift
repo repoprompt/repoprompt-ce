@@ -33,23 +33,178 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertNil(store.diagnostic(for: .codex))
     }
 
-    func testMissingPlainDocumentCreatesAndSavesFailClosedPlainDocument() throws {
+    func testMissingSubagentDocumentCreatesAndSavesSafeManagedPolicy() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.subagentPolicy(), .safeManaged)
+        XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
+        XCTAssertEqual(secureStrings.plainSaveAccessModes, [.nonInteractive(reason: .permissionDecision)])
+
+        let saved = try decode(SecureSubagentPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.globalPolicy(), .safeManaged)
+        XCTAssertNil(store.diagnostic(for: .subagent))
+    }
+
+    func testMissingSubagentPolicyFieldNormalizesToSafeManagedPolicy() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        secureStrings.plainValues[key] = try encode(
+            SecureSubagentPermissionDocument(globalPolicyRaw: nil)
+        )
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.subagentPolicy(), .safeManaged)
+
+        let saved = try decode(SecureSubagentPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.globalPolicy(), .safeManaged)
+        XCTAssertNil(store.diagnostic(for: .subagent))
+    }
+
+    func testMissingPlainDocumentCreatesAndSavesProductDefaults() throws {
         let secureStrings = FakeSecurePlainStringStore()
         let key = AgentPermissionSecureDomain.codex.storageKey
         let store = makeStore(secureStrings: secureStrings)
 
         let permissions = store.codexPermissions()
 
-        XCTAssertEqual(permissions.permissionLevel(), .defaultPermission)
-        XCTAssertEqual(permissions.bashToolEnabled, false)
+        XCTAssertEqual(permissions.permissionLevel(), .autoReview)
+        XCTAssertEqual(permissions.bashToolEnabled, true)
         XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
         XCTAssertEqual(secureStrings.plainSaveAccessModes, [.nonInteractive(reason: .permissionDecision)])
         XCTAssertTrue(secureStrings.savedPlainValues.contains { $0.key == key })
 
         let saved = try decode(SecureCodexPermissionDocument.self, from: secureStrings.plainValues[key])
-        XCTAssertEqual(saved.permissionLevel(), .defaultPermission)
-        XCTAssertEqual(saved.bashToolEnabled, false)
+        XCTAssertEqual(saved.permissionLevel(), .autoReview)
+        XCTAssertEqual(saved.bashToolEnabled, true)
         XCTAssertNil(store.diagnostic(for: .codex))
+    }
+
+    func testMissingCodexFieldsNormalizeToProductDefaults() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.codex.storageKey
+        secureStrings.plainValues[key] = try encode(
+            SecureCodexPermissionDocument(
+                approvalReviewerRaw: nil,
+                bashToolEnabled: nil
+            )
+        )
+        let store = makeStore(secureStrings: secureStrings)
+
+        let permissions = store.codexPermissions()
+
+        XCTAssertEqual(permissions.permissionLevel(), .autoReview)
+        XCTAssertEqual(permissions.bashToolEnabled, true)
+        XCTAssertNil(store.diagnostic(for: .codex))
+
+        let saved = try decode(SecureCodexPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.permissionLevel(), .autoReview)
+        XCTAssertEqual(saved.bashToolEnabled, true)
+    }
+
+    func testNoSecureStoreFallbackUsesProductDefaults() throws {
+        let suiteName = "AgentPermissionSecureStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        XCTAssertEqual(AgentModePermissionPreferences.subagentPermissionPolicy(defaults: defaults), .safeManaged)
+        XCTAssertTrue(CodexAgentToolPreferences.bashToolEnabled(defaults: defaults))
+        XCTAssertEqual(CodexAgentToolPreferences.permissionLevel(defaults: defaults), .autoReview)
+    }
+
+    @MainActor
+    func testProductDefaultsFlowThroughTopLevelSettingsSnapshot() throws {
+        let suiteName = "AgentPermissionSecureStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let secureStrings = FakeSecurePlainStringStore()
+        let secureStore = makeStore(secureStrings: secureStrings)
+        let snapshots = AgentProviderPreferenceSnapshotStore(
+            defaults: defaults,
+            securePermissions: secureStore,
+            codexMCPServerEntries: { [] }
+        )
+
+        let binding = snapshots.topLevelSettingsControlsBinding(providerID: .codex)
+
+        XCTAssertEqual(binding.permission.displayName, CodexAgentToolPreferences.PermissionLevel.autoReview.displayName)
+        XCTAssertEqual(binding.runtimePermission.codexApprovalReviewer, .autoReview)
+        XCTAssertEqual(binding.codexTools?.bashToolEnabled, true)
+    }
+
+    func testSuccessfulResetPersistsProductDefaultsAcrossRelaunch() throws {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.codex.storageKey
+        secureStrings.plainValues[key] = try encode(
+            SecureCodexPermissionDocument(
+                approvalPolicyRaw: CodexAgentToolPreferences.ApprovalPolicy.never.persistedValue,
+                sandboxModeRaw: CodexAgentToolPreferences.SandboxMode.dangerFullAccess.persistedValue,
+                approvalReviewerRaw: CodexAgentToolPreferences.ApprovalReviewer.user.persistedValue,
+                bashToolEnabled: false
+            )
+        )
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertTrue(store.resetAgentPermissionsToSafeDefaults().succeeded)
+        XCTAssertEqual(store.subagentPolicy(), .safeManaged)
+        XCTAssertEqual(store.codexPermissions().permissionLevel(), .autoReview)
+        XCTAssertEqual(store.codexPermissions().bashToolEnabled, true)
+
+        let saved = try decode(SecureCodexPermissionDocument.self, from: secureStrings.plainValues[key])
+        XCTAssertEqual(saved.permissionLevel(), .autoReview)
+        XCTAssertEqual(saved.bashToolEnabled, true)
+
+        let restartedStore = makeStore(secureStrings: secureStrings)
+        XCTAssertEqual(restartedStore.codexPermissions().permissionLevel(), .autoReview)
+        XCTAssertEqual(restartedStore.codexPermissions().bashToolEnabled, true)
+    }
+
+    func testMissingPlainDocumentWriteFailureFailsClosed() {
+        let secureStrings = FakeSecurePlainStringStore(saveError: KeychainService.KeychainError.invalidData)
+        let store = makeStore(secureStrings: secureStrings)
+
+        let permissions = store.codexPermissions()
+
+        XCTAssertEqual(permissions.permissionLevel(), .defaultPermission)
+        XCTAssertEqual(permissions.bashToolEnabled, false)
+        XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .keychainWriteFailed)
+    }
+
+    func testMalformedSubagentPlainDocumentFailsClosed() {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.subagent.storageKey
+        secureStrings.plainValues[key] = "{not-json"
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.subagentPolicy(), .safeManaged)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertEqual(store.diagnostic(for: .subagent)?.kind, .decodeFailed)
+    }
+
+    func testSubagentReadFailureFailsClosed() {
+        let secureStrings = FakeSecurePlainStringStore(plainGetError: KeychainService.KeychainError.interactionNotAllowed)
+        let store = makeStore(secureStrings: secureStrings)
+
+        XCTAssertEqual(store.subagentPolicy(), .safeManaged)
+        XCTAssertEqual(store.diagnostic(for: .subagent)?.kind, .keychainInteractionNotAllowed)
+    }
+
+    func testMalformedCodexPlainDocumentFailsClosed() {
+        let secureStrings = FakeSecurePlainStringStore()
+        let key = AgentPermissionSecureDomain.codex.storageKey
+        secureStrings.plainValues[key] = "{not-json"
+        let store = makeStore(secureStrings: secureStrings)
+
+        let permissions = store.codexPermissions()
+
+        XCTAssertEqual(permissions.permissionLevel(), .defaultPermission)
+        XCTAssertEqual(permissions.bashToolEnabled, false)
+        XCTAssertTrue(secureStrings.savedPlainValues.isEmpty)
+        XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .decodeFailed)
     }
 
     func testMalformedPlainDocumentFailsClosed() {
@@ -95,6 +250,7 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
 
         let permissions = store.codexPermissions()
 
+        XCTAssertEqual(permissions.permissionLevel(), .defaultPermission)
         XCTAssertEqual(permissions.bashToolEnabled, false)
         XCTAssertEqual(secureStrings.plainGetAccessModes, [.nonInteractive(reason: .permissionDecision)])
 
@@ -132,12 +288,16 @@ final class AgentPermissionSecureStoreTests: XCTestCase {
         XCTAssertFalse(resetResult.succeeded)
         XCTAssertEqual(Set(resetResult.failedDomains), Set(AgentPermissionSecureDomain.allCases))
         XCTAssertEqual(secureStrings.plainDeleteAccessModes, Array(repeating: .interactive, count: AgentPermissionSecureDomain.allCases.count))
+        XCTAssertEqual(store.codexPermissions().permissionLevel(), .defaultPermission)
+        XCTAssertEqual(store.codexPermissions().bashToolEnabled, false)
+        XCTAssertEqual(store.diagnostic(for: .codex)?.kind, .keychainWriteFailed)
 
         secureStrings.failSaveKeys.removeAll()
         let restartedStore = makeStore(secureStrings: secureStrings)
         let restartedPermissions = restartedStore.codexPermissions()
-        XCTAssertEqual(restartedPermissions.permissionLevel(), .defaultPermission)
-        XCTAssertEqual(restartedPermissions.bashToolEnabled, false)
+        XCTAssertEqual(restartedPermissions.permissionLevel(), .autoReview)
+        XCTAssertEqual(restartedPermissions.bashToolEnabled, true)
+        XCTAssertNil(restartedStore.diagnostic(for: .codex))
     }
 
     func testUpdateWriteFailureForcesEffectiveCacheFailClosed() throws {

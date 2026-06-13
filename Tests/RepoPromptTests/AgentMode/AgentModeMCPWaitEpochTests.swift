@@ -197,6 +197,181 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testInactiveSteeringReRegistersWaitTrackingAfterTerminalRecordExpires() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        _ = session.beginRunAttempt(source: "test.expiredSteering")
+        let initialContext = try XCTUnwrap(session.mcpControlContext)
+        let initialEpoch = try XCTUnwrap(initialContext.currentEpoch)
+        session.runState = .completed
+        session.mcpFollowUpRunPending = false
+
+        let terminal = makeSnapshot(sessionID: sessionID, status: .completed)
+        let publication = await AgentRunSessionStore.publishTerminal(
+            .init(epoch: initialEpoch, snapshot: terminal),
+            registration: initialContext.registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+        XCTAssertEqual(publication, .accepted(successorEpoch: nil))
+        await AgentRunSessionStore.shared.test_expire(
+            cursor: .init(registration: initialContext.registration, epoch: initialEpoch)
+        )
+        let hasExpiredRegistration = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+        XCTAssertFalse(hasExpiredRegistration)
+
+        try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        }
+
+        let steeringContext = try XCTUnwrap(session.mcpControlContext)
+        let steeringEpoch = try XCTUnwrap(steeringContext.currentEpoch)
+        XCTAssertEqual(steeringContext.activationID, initialContext.activationID)
+        XCTAssertNotEqual(steeringContext.registration, initialContext.registration)
+        XCTAssertEqual(steeringEpoch.transitionKind, .steering)
+        XCTAssertEqual(steeringEpoch.registrationGeneration, steeringContext.registration.generation)
+        XCTAssertNil(steeringContext.pendingEpochTransition)
+
+        let steeringCursor = AgentRunSessionStore.WaitCursor(
+            registration: steeringContext.registration,
+            epoch: steeringEpoch
+        )
+        let waitTask = Task {
+            await AgentRunMCPToolService.test_waitUntilActionableDisposition(
+                sessionID: sessionID,
+                timeoutSeconds: 1
+            )
+        }
+        try await waitForWaiter(registration: steeringContext.registration)
+        let actionable = makeSnapshot(sessionID: sessionID, status: .waitingForInput)
+        await AgentRunSessionStore.signalSnapshot(actionable, cursor: steeringCursor)
+        let waitResult = await waitTask.value
+        XCTAssertEqual(waitResult.disposition, "actionable")
+        XCTAssertEqual(waitResult.snapshotStatus, AgentRunMCPSnapshot.Status.waitingForInput.rawValue)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testExpiredRegistrationRecoveryCannotOverwriteReplacementActivation() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        _ = session.beginRunAttempt(source: "test.expiredActivationRace")
+        let initialContext = try XCTUnwrap(session.mcpControlContext)
+        let initialEpoch = try XCTUnwrap(initialContext.currentEpoch)
+        session.runState = .completed
+        session.mcpFollowUpRunPending = false
+        _ = await AgentRunSessionStore.publishTerminal(
+            .init(
+                epoch: initialEpoch,
+                snapshot: makeSnapshot(sessionID: sessionID, status: .completed)
+            ),
+            registration: initialContext.registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+        await AgentRunSessionStore.shared.test_expire(
+            cursor: .init(registration: initialContext.registration, epoch: initialEpoch)
+        )
+
+        let gate = EpochBeginGate()
+        viewModel.test_setAfterMCPStoreEpochBegan {
+            await gate.pause()
+        }
+        defer { viewModel.test_setAfterMCPStoreEpochBegan(nil) }
+        let recoveryTask = Task {
+            try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+                await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            }
+        }
+        await gate.waitUntilPaused()
+
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: UUID()
+        )
+        let replacementContext = try XCTUnwrap(session.mcpControlContext)
+        XCTAssertNotEqual(replacementContext.activationID, initialContext.activationID)
+        XCTAssertNotEqual(replacementContext.registration, initialContext.registration)
+
+        await gate.open()
+        try await recoveryTask.value
+
+        let finalContext = try XCTUnwrap(session.mcpControlContext)
+        let currentRegistration = await AgentRunSessionStore.currentRegistration(for: sessionID)
+        XCTAssertEqual(finalContext, replacementContext)
+        XCTAssertEqual(currentRegistration, replacementContext.registration)
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+    }
+
+    func testExpiredRegistrationRecoveryCleansStoreRecordAfterDeactivation() async throws {
+        let viewModel = makeViewModel()
+        let sessionID = UUID()
+        let session = await viewModel.ensureSessionReady(tabID: UUID())
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: session.tabID,
+            sessionID: sessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        _ = session.beginRunAttempt(source: "test.expiredDeactivationRace")
+        let initialContext = try XCTUnwrap(session.mcpControlContext)
+        let initialEpoch = try XCTUnwrap(initialContext.currentEpoch)
+        session.runState = .completed
+        session.mcpFollowUpRunPending = false
+        _ = await AgentRunSessionStore.publishTerminal(
+            .init(
+                epoch: initialEpoch,
+                snapshot: makeSnapshot(sessionID: sessionID, status: .completed)
+            ),
+            registration: initialContext.registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+        await AgentRunSessionStore.shared.test_expire(
+            cursor: .init(registration: initialContext.registration, epoch: initialEpoch)
+        )
+
+        let gate = EpochBeginGate()
+        viewModel.test_setAfterMCPStoreEpochBegan {
+            await gate.pause()
+        }
+        defer { viewModel.test_setAfterMCPStoreEpochBegan(nil) }
+        let recoveryTask = Task {
+            try await viewModel.withMCPRunEpochTransition(sessionID: sessionID, kind: .steering) {
+                await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            }
+        }
+        await gate.waitUntilPaused()
+
+        await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        await gate.open()
+        try await recoveryTask.value
+
+        XCTAssertNil(session.mcpControlContext)
+        let hasActiveRegistration = await AgentRunSessionStore.hasActiveRegistration(sessionID: sessionID)
+        XCTAssertFalse(hasActiveRegistration)
+    }
+
     func testActiveRunPreparationDoesNotCreateSteeringEpoch() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()

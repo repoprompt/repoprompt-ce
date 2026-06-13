@@ -386,6 +386,7 @@ final class CodexNativeSessionController {
             sandboxModeProvider: @escaping () -> CodexAgentToolPreferences.SandboxMode = { CodexAgentToolPreferences.sandboxMode() },
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
+            suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
@@ -404,6 +405,7 @@ final class CodexNativeSessionController {
                         sandboxMode: sandboxModeProvider(),
                         approvalReviewer: approvalReviewerProvider(),
                         shellToolEnabled: shellToolEnabled,
+                        suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled
                     )
@@ -7322,6 +7324,7 @@ final class CodexNativeSessionController {
         sandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
         approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         shellToolEnabled: Bool? = nil,
+        suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
         computerUseEnabled: Bool = false
     ) -> [String: Any] {
@@ -7342,19 +7345,11 @@ final class CodexNativeSessionController {
             toolPolicy: toolPolicy,
             featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
         )
-        var enabledMCPServerNames = preferences.enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: { $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame })
-        {
-            enabledMCPServerNames.insert(Self.computerUseMCPServerName)
-        }
-        let mcpOverrides = CodexOverrides.appServerMCPServerMap(
-            entries: serverEntries,
-            policy: .enableSelected(
-                enabledNormalizedNames: enabledMCPServerNames,
-                repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
-                exceptBroken: []
-            )
+        let mcpOverrides = appServerMCPServerOverrides(
+            serverEntries: serverEntries,
+            enabledMCPServerNames: preferences.enabledMCPServerNames,
+            suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
+            computerUseEnabled: computerUseEnabled
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
@@ -7366,6 +7361,32 @@ final class CodexNativeSessionController {
         overrides["sandbox_mode"] = effectiveSandboxMode.appServerConfigOverrideValue
         overrides["approvals_reviewer"] = effectiveApprovalReviewer.appServerConfigOverrideValue
         return overrides
+    }
+
+    static func appServerMCPServerOverrides(
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry],
+        enabledMCPServerNames: Set<String>,
+        suppressThirdPartyMCPServers: Bool,
+        computerUseEnabled: Bool
+    ) -> [String: Any] {
+        var effectiveEnabledNames = suppressThirdPartyMCPServers
+            ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
+            : enabledMCPServerNames
+        if computerUseEnabled,
+           serverEntries.contains(where: {
+               $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
+           })
+        {
+            effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        }
+        return CodexOverrides.appServerMCPServerMap(
+            entries: serverEntries,
+            policy: .enableSelected(
+                enabledNormalizedNames: effectiveEnabledNames,
+                repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
+                exceptBroken: []
+            )
+        )
     }
 }
 
