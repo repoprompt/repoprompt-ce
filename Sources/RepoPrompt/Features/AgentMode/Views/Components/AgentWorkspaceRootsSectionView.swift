@@ -100,19 +100,15 @@ struct AgentWorkspaceRootsSectionView: View {
     }
 
     private var rootLineSpacing: CGFloat {
-        fontPreset.scaledClamped(3, max: 5)
+        fontPreset.scaledClamped(2, max: 3)
     }
 
     private var rootFolderIconWidth: CGFloat {
         fontPreset.scaledClamped(14, min: 14, max: 18)
     }
 
-    private var rootContextIndent: CGFloat {
-        rootFolderIconWidth + rootRowSpacing
-    }
-
     private var rootContextRowMinHeight: CGFloat {
-        fontPreset.scaledClamped(43, min: 40, max: 58)
+        fontPreset.scaledClamped(39, min: 38, max: 52)
     }
 
     private var rootActionOverlaySpacing: CGFloat {
@@ -124,7 +120,7 @@ struct AgentWorkspaceRootsSectionView: View {
     }
 
     private var rootRowVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(5, max: 7)
+        fontPreset.scaledClamped(4, max: 5)
     }
 
     private var rootRowCornerRadius: CGFloat {
@@ -454,9 +450,6 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private func rootContextLine(_ row: AgentWorkspaceRootRow) -> some View {
         HStack(spacing: rootContextSpacing) {
-            Color.clear
-                .frame(width: rootContextIndent, height: 1)
-
             if let gitContext = row.gitContext {
                 gitContextCapsule(gitContext, row: row)
                     .layoutPriority(3)
