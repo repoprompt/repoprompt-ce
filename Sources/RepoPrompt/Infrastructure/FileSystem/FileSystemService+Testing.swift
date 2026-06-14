@@ -207,6 +207,18 @@ import Foundation
             contentReadChunkHandler = handler
         }
 
+        func resetContentFingerprintRequestCountForTesting() {
+            contentFingerprintRequestCountForTesting = 0
+        }
+
+        func contentFingerprintRequestCountSnapshotForTesting() -> Int {
+            contentFingerprintRequestCountForTesting
+        }
+
+        func setCachedSearchContentWatcherActiveOverrideForTesting(_ isActive: Bool?) {
+            cachedSearchContentWatcherActiveOverrideForTesting = isActive
+        }
+
         func setParallelFolderEnumerationHookForTesting(
             _ handler: (@Sendable (String) async throws -> Void)?
         ) {

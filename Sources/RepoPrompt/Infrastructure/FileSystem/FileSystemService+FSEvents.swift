@@ -179,6 +179,32 @@ extension FileSystemService {
         watcherIngressMailbox.captureAcceptedWatermark()
     }
 
+    /// Qualifies cache reuse against the store's accepted-ingress freshness contract.
+    /// Undelivered macOS FSEvents remain outside that contract, matching `awaitAppliedIngress`.
+    func canUseCachedSearchContent(afterAppliedWatcherWatermark appliedWatcherWatermark: UInt64) -> Bool {
+        #if DEBUG
+            let watcherIsActive = cachedSearchContentWatcherActiveOverrideForTesting ?? (fseventStreamRef != nil)
+        #else
+            let watcherIsActive = fseventStreamRef != nil
+        #endif
+        guard watcherIsActive,
+              captureAcceptedWatcherWatermark().rawValue <= appliedWatcherWatermark,
+              pendingFSEvents.isEmpty,
+              pendingWatcherAcceptedHighWatermark == nil,
+              !hasPendingOverflowRescan,
+              coalescingTask == nil,
+              watcherBatchProcessingTask == nil,
+              pendingScanTargets.isEmpty,
+              pendingQuietFolderScanTargets.isEmpty,
+              dirtyRecoveryScanTargets.isEmpty,
+              recoveryScanFailureCountByFolder.isEmpty,
+              recoveryScanRetryTask == nil
+        else {
+            return false
+        }
+        return true
+    }
+
     public func flushPendingEventsNow() async {
         _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: captureAcceptedWatcherWatermark())
     }
