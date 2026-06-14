@@ -244,14 +244,8 @@ enum CommandPathResolver {
                 }
 
                 if shouldAcceptImmediately {
-                    if isExecutableRegularFile(expanded) {
-                        return (expanded, candidate.isAliasTarget)
-                    }
-                    // Shell returned a path-like or preferred candidate that doesn't exist on disk.
-                    // Store as fallback but continue searching — locateInSearchPaths may find it.
-                    if fallbackCandidate == nil {
-                        fallbackCandidate = (expanded, candidate.isAliasTarget)
-                    }
+                    if isExecutableRegularFile(expanded) { return (expanded, candidate.isAliasTarget) }
+                    return (expanded, candidate.isAliasTarget)
                 }
             }
             if let fallbackCandidate {
