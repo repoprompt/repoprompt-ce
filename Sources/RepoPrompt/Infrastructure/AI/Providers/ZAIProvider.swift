@@ -1,11 +1,27 @@
 import Foundation
 
 final class ZAIProvider: OpenAIProvider {
-    init(apiKey: String) {
-        let baseURL = URL(string: "https://api.z.ai/api/coding/paas")!
+    enum Endpoint: Equatable {
+        case generalAPI
+        case codingPlan
+
+        var baseURL: URL {
+            switch self {
+            case .generalAPI:
+                URL(string: "https://api.z.ai/api/paas")!
+            case .codingPlan:
+                URL(string: "https://api.z.ai/api/coding/paas")!
+            }
+        }
+    }
+
+    let endpoint: Endpoint
+
+    init(apiKey: String, endpoint: Endpoint = .generalAPI) {
+        self.endpoint = endpoint
         super.init(
             apiKey: apiKey,
-            baseURL: baseURL,
+            baseURL: endpoint.baseURL,
             configuredMaxTokens: nil,
             overrideVersion: "v4"
         )

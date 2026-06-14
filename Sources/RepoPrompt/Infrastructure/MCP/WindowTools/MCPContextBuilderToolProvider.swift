@@ -188,7 +188,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
 
         let targetWindow = try dependencies.requireTargetWindow()
-        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
         let preferredAgent = targetWindow.promptManager.contextBuilderAgent
@@ -200,6 +200,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             connectionID
         )
         let finalTabID = tabResolution.tabID
+        let workspace = tabResolution.workspaceID.flatMap { workspaceID in
+            targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
+        } ?? activeWorkspace
+        let workspaceContext = tabResolution.workspaceContext
+        let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -221,7 +226,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 workspace,
                 targetWindow.windowID,
                 finalTabID,
-                tabResolution.lookupContext
+                lookupContext
             )
         } else {
             capturedOracleExportDestination = nil
@@ -328,6 +333,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             modelOverrideRaw: preferredModelRaw,
                             responseType: responseType?.rawValue,
                             planModelName: planModelName,
+                            workspaceContext: workspaceContext,
                             mcpControlToken: mcpControlToken,
                             progressReporter: progressReporter
                         )
@@ -358,6 +364,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 default: "completed"
                 }
 
+                try workspaceContext?.validateAvailability()
                 let sel = resultTab.selection
                 let fileCount = sel.selectedPaths.count + sel.autoCodemapPaths.count
 
@@ -365,7 +372,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     sel,
                     false,
                     .relative,
-                    .auto
+                    .auto,
+                    lookupContext
                 )
                 let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
 
@@ -405,6 +413,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 mode,
                                 effectivePrompt,
                                 sel,
+                                lookupContext,
                                 progressReporter,
                                 activityReporter
                             )

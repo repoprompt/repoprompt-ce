@@ -4,6 +4,76 @@ import XCTest
 
 @MainActor
 final class AgentModeChatSwitchActivationTests: XCTestCase {
+    func testHandoffRebindsComposerAndRejectsStaleSourceSubmitTarget() async throws {
+        try await withFixture { fixture in
+            let sourceTarget = try XCTUnwrap(fixture.viewModel.ui.composer.props.submitTarget)
+            XCTAssertEqual(sourceTarget.tabID, fixture.tabAID)
+            let cutoffItemID = try XCTUnwrap(fixture.sessionA.items.last?.id)
+
+            let destinationTabID = try await fixture.viewModel.prepareHandoffToNewTab(
+                upToItemID: cutoffItemID,
+                destinationAgent: fixture.sessionA.selectedAgent,
+                destinationModelRaw: fixture.sessionA.selectedModelRaw,
+                destinationReasoningEffortRaw: fixture.sessionA.selectedReasoningEffortRaw
+            )
+
+            let destinationSession = try XCTUnwrap(fixture.viewModel.sessions[destinationTabID])
+            let destinationSessionID = try XCTUnwrap(destinationSession.activeAgentSessionID)
+            XCTAssertEqual(fixture.window.promptManager.activeComposeTabID, destinationTabID)
+            XCTAssertEqual(fixture.window.workspaceManager.activeAgentSessionID(forTabID: destinationTabID), destinationSessionID)
+            XCTAssertNotEqual(destinationSessionID, fixture.sessionAID)
+            XCTAssertEqual(destinationSession.items.map(\.text), fixture.tabATexts)
+            XCTAssertTrue(destinationSession.pendingHandoff.hasPayload)
+            XCTAssertEqual(destinationSession.pendingHandoff.sourceItemID, cutoffItemID)
+
+            let composerProps = fixture.viewModel.ui.composer.props
+            XCTAssertEqual(composerProps.currentTabID, destinationTabID)
+            let destinationTarget = try XCTUnwrap(composerProps.submitTarget)
+            XCTAssertEqual(destinationTarget.tabID, destinationTabID)
+            XCTAssertEqual(destinationTarget.expectedSourceAgentSessionID, destinationSessionID)
+            XCTAssertEqual(
+                destinationTarget.expectedSourceTabSessionIdentity,
+                ObjectIdentifier(destinationSession)
+            )
+
+            let staleAttempt = AgentComposerSubmitAttempt(
+                id: UUID(),
+                target: sourceTarget,
+                inputRevision: 0,
+                noticeRevision: 0,
+                rawDraftSnapshot: "must not reach the source"
+            )
+            switch fixture.viewModel.claimComposerSubmitAttempt(staleAttempt) {
+            case .claimed:
+                XCTFail("The source composer target must not survive destination activation")
+            case let .rejected(rejection):
+                XCTAssertEqual(
+                    rejection,
+                    .targetRejected(reason: "inactive_composer_tab")
+                )
+            }
+            XCTAssertNil(fixture.sessionA.activeComposerSubmitAttempt)
+            XCTAssertEqual(fixture.viewModel.ui.composer.props.currentTabID, destinationTabID)
+
+            let destinationAttempt = try AgentComposerSubmitAttempt(
+                id: UUID(),
+                target: XCTUnwrap(fixture.viewModel.ui.composer.props.submitTarget),
+                inputRevision: 0,
+                noticeRevision: 0,
+                rawDraftSnapshot: "destination draft"
+            )
+            let destinationClaim: AgentModeViewModel.AgentComposerSubmitClaim
+            switch fixture.viewModel.claimComposerSubmitAttempt(destinationAttempt) {
+            case let .claimed(claim):
+                destinationClaim = claim
+            case let .rejected(rejection):
+                return XCTFail("Expected destination composer recovery, got \(rejection)")
+            }
+            XCTAssertTrue(fixture.viewModel.releaseComposerSubmitClaim(destinationClaim))
+            XCTAssertNotNil(fixture.viewModel.ui.composer.props.submitTarget)
+        }
+    }
+
     func testWarmSwitchPublishesDestinationTranscriptBeforeSwitchReturns() async throws {
         try await withFixture { fixture in
             assertPresentation(

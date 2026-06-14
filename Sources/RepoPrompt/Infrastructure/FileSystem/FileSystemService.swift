@@ -130,12 +130,17 @@ actor FileSystemService {
 
         /// Test-only hook invoked inside the real-filesystem off-actor content worker before each read.
         var contentReadChunkHandler: (@Sendable (String) async -> Void)?
+        var contentFingerprintRequestCountForTesting = 0
+        var cachedSearchContentWatcherActiveOverrideForTesting: Bool?
 
         /// Test-only hook invoked inside each real-filesystem parallel folder enumeration worker.
         var parallelFolderEnumerationHookForTesting: (@Sendable (String) async throws -> Void)?
 
         /// Test-only gate invoked from the detached mutation worker immediately before filesystem I/O.
         var mutationIOWillBeginHandler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
+
+        /// Test-only replacement for the real Finder Trash operation.
+        var moveItemToTrashIOForTesting: (@Sendable (URL) throws -> Void)?
 
         enum WatcherActivationFailurePoint {
             case streamCreation
@@ -350,6 +355,10 @@ actor FileSystemService {
             _ handler: (@Sendable (FileSystemUncancellableMutation) async -> Void)?
         ) {
             mutationIOWillBeginHandler = handler
+        }
+
+        func setMoveItemToTrashIOForTesting(_ operation: (@Sendable (URL) throws -> Void)?) {
+            moveItemToTrashIOForTesting = operation
         }
 
         func pendingMutationWaiterCountForTesting() -> Int {

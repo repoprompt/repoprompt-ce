@@ -1,3 +1,4 @@
+import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -112,7 +113,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         let visibleWorktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleWorktreeHit)
         let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-            logicalRootPaths: [logicalRoot.path],
+            canonicalRootPaths: [],
             physicalRootPaths: [worktreeRoot.path]
         )
         let worktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: sessionScope)
@@ -198,6 +199,229 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     }
 
     #if DEBUG
+        func testWatcherQualifiedWarmSearchSkipsPerFileMetadataValidation() async throws {
+            let root = try makeTemporaryRoot(name: "WatcherQualifiedWarmSearch")
+            let fileCount = 48
+            for index in 0 ..< fileCount {
+                try write(
+                    "let watcherQualifiedNeedle\(index) = true\n",
+                    to: root.appendingPathComponent(String(format: "Sources/File-%03d.swift", index))
+                )
+            }
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, true)
+            addTeardownBlock {
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            let cold = try await searchContent(pattern: "watcherQualifiedNeedle", store: store)
+            let cacheAfterCold = await store.searchDecodedContentCacheSnapshotForTesting()
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: record.id)
+            _ = startedCapture(label: "watcher-qualified-warm-search", maxSamples: 2000)
+
+            let warm = try await searchContent(pattern: "watcherQualifiedNeedle", store: store)
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let fingerprintRequestCount = try await store.searchContentFingerprintRequestCountForTesting(rootID: record.id)
+            let cacheAfterWarm = await store.searchDecodedContentCacheSnapshotForTesting()
+            let freshnessRows = capture.stages.filter {
+                $0.stageName == String(describing: EditFlowPerf.Stage.Search.contentFreshnessValidation)
+            }
+
+            XCTAssertEqual(cold.matches?.count, fileCount)
+            XCTAssertEqual(warm.matches, cold.matches)
+            XCTAssertEqual(fingerprintRequestCount, 0)
+            XCTAssertEqual(cacheAfterWarm.loadCount, cacheAfterCold.loadCount)
+            XCTAssertEqual(cacheAfterWarm.acceptedLoadCount, cacheAfterCold.acceptedLoadCount)
+            XCTAssertFalse(freshnessRows.isEmpty)
+            XCTAssertTrue(freshnessRows.allSatisfy {
+                $0.sanitizedDimensions.contains("freshnessPolicy=cachedMetadata")
+            })
+            XCTAssertEqual(
+                capture.stages
+                    .filter { $0.stageName == String(describing: EditFlowPerf.Stage.FileSystem.contentReadWorkerBody) }
+                    .reduce(0) { $0 + $1.sampleCount },
+                0
+            )
+        }
+
+        func testWatcherQualifiedWarmSearchReloadsAppliedModificationBeforeMatching() async throws {
+            let root = try makeTemporaryRoot(name: "WatcherQualifiedModification")
+            let fileURL = root.appendingPathComponent("A.swift")
+            try write("let oldWatcherNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, true)
+            addTeardownBlock {
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            let cold = try await searchContent(pattern: "oldWatcherNeedle", store: store)
+            XCTAssertEqual(cold.matches?.map(\.filePath), [fileURL.path])
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: record.id)
+
+            try write("let newWatcherNeedle = true\n", to: fileURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileModified("A.swift", Date())]
+            )
+            let refreshed = try await searchContent(pattern: "newWatcherNeedle", store: store)
+            let old = try await searchContent(pattern: "oldWatcherNeedle", store: store)
+            let fingerprintRequestCount = try await store.searchContentFingerprintRequestCountForTesting(rootID: record.id)
+
+            XCTAssertEqual(refreshed.matches?.map(\.filePath), [fileURL.path])
+            XCTAssertTrue((old.matches ?? []).isEmpty)
+            XCTAssertEqual(fingerprintRequestCount, 1)
+        }
+
+        func testOverflowCompletionInvalidatesRetainedWarmContentBeforeWatermarkReuse() async throws {
+            let root = try makeTemporaryRoot(name: "OverflowRetainedContent")
+            let fileURL = root.appendingPathComponent("A.swift")
+            try write("let oldOverflowNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, true)
+            addTeardownBlock {
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            let cold = try await searchContent(pattern: "oldOverflowNeedle", store: store)
+            XCTAssertEqual(cold.matches?.map(\.filePath), [fileURL.path])
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: record.id)
+            let warm = try await searchContent(pattern: "oldOverflowNeedle", store: store)
+            let warmFingerprintRequestCount = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: record.id)
+            XCTAssertEqual(warm.matches?.map(\.filePath), [fileURL.path])
+            XCTAssertEqual(warmFingerprintRequestCount, 0)
+
+            try write("let newOverflowNeedle = true\n", to: fileURL)
+            let optionalService = await store.fileSystemServiceForTesting(rootID: record.id)
+            let service = try XCTUnwrap(optionalService)
+            let eventID: FSEventStreamEventId = 1
+            let optionalAccepted = await service.acceptWatcherPayloadForTesting(
+                [(
+                    absolutePath: fileURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: eventID
+                )],
+                scheduleDrain: false
+            )
+            let accepted = try XCTUnwrap(optionalAccepted)
+            await service.collapsePendingEventsToRootRescan(
+                upTo: eventID,
+                acceptedHighWatermark: accepted
+            )
+            _ = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: record.id)
+            let refreshed = try await searchContent(pattern: "newOverflowNeedle", store: store)
+            let stale = try await searchContent(pattern: "oldOverflowNeedle", store: store)
+            let refreshedFingerprintRequestCount = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: record.id)
+            XCTAssertEqual(refreshed.matches?.map(\.filePath), [fileURL.path])
+            XCTAssertTrue((stale.matches ?? []).isEmpty)
+            XCTAssertEqual(refreshedFingerprintRequestCount, 1)
+
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: record.id)
+            let rewarmed = try await searchContent(pattern: "newOverflowNeedle", store: store)
+            let rewarmedFingerprintRequestCount = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: record.id)
+            XCTAssertEqual(rewarmed.matches?.map(\.filePath), [fileURL.path])
+            XCTAssertEqual(rewarmedFingerprintRequestCount, 0)
+        }
+
+        func testWatcherAcceptedAfterBarrierForcesStrictMetadataFallback() async throws {
+            let root = try makeTemporaryRoot(name: "WatcherFreshnessGap")
+            let fileURL = root.appendingPathComponent("A.swift")
+            try write("let watcherGapNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, true)
+            addTeardownBlock {
+                _ = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            let accepted = try await store.acceptWatcherPayloadForTesting(
+                rootID: record.id,
+                events: [(
+                    absolutePath: fileURL.path,
+                    flags: FSEventStreamEventFlags(
+                        kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
+                    ),
+                    eventId: 1
+                )],
+                scheduleDrain: false
+            )
+            XCTAssertNotNil(accepted)
+
+            let policy = await store.contentSearchFreshnessPolicy(
+                rootScope: .visibleWorkspace,
+                appliedIngressSamples: samples
+            )
+            guard case .validateDiskMetadata = policy else {
+                return XCTFail("Accepted watcher ingress beyond the applied barrier must retain strict metadata validation")
+            }
+        }
+
+        func testPublisherIngressAcceptedAfterBarrierForcesStrictMetadataFallback() async throws {
+            let root = try makeTemporaryRoot(name: "PublisherFreshnessGap")
+            let fileURL = root.appendingPathComponent("A.swift")
+            try write("let publisherGapNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: record.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, true)
+
+            let sinkGate = AsyncGate()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(rootID: record.id, nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            let samples = await store.awaitAppliedIngress(rootScope: .visibleWorkspace)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileModified("A.swift", Date())]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let policy = await store.contentSearchFreshnessPolicy(
+                rootScope: .visibleWorkspace,
+                appliedIngressSamples: samples
+            )
+            guard case .validateDiskMetadata = policy else {
+                return XCTFail("Publisher ingress beyond the applied barrier must retain strict metadata validation")
+            }
+        }
+
         func testSameStoreBroadLaneRunsOneQueuesOneAndRejectsThirdWhilePreservingResults() async throws {
             let root = try makeTemporaryRoot(name: "BroadLaneOneActiveOneQueued")
             let alphaURL = root.appendingPathComponent("A.swift")
@@ -936,7 +1160,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                 await permitSignal.mark()
             }
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [missingPhysicalRoot.standardizedFileURL.path]
             )
 
@@ -979,7 +1203,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let held = Task { try await self.searchContent(pattern: "baseNeedle", store: store) }
             await assertAsyncTrue(gate.waitUntilStartedCount(1))
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [physicalRoot.standardizedFileURL.path]
             )
             let queued = Task {
@@ -1024,7 +1248,9 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "return try await store.withStoreBackedSearchAccess(",
             "try await ensureRootScopeAvailable(rootScope, store: store)",
             "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
-            "_ = await store.awaitAppliedIngress(rootScope: rootScope)",
+            "let appliedIngressSamples = await store.awaitAppliedIngress(rootScope: rootScope)",
+            "try Task.checkCancellation()",
+            "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
             "try Task.checkCancellation()",
             "try await performSearch("
         ], in: source)

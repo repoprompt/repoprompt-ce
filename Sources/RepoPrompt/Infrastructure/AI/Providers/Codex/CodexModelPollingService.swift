@@ -27,7 +27,8 @@ extension CodexAppServerClient: CodexModelListingClient {}
 actor CodexModelPollingService {
     static let shared = CodexModelPollingService(
         client: CodexProviderHelpers.makeOwnedNonAgentAppServerClient(),
-        stopClientOnShutdown: true
+        stopClientOnShutdown: true,
+        stopClientWhenIdle: true
     )
 
     struct Snapshot: Equatable {
@@ -38,27 +39,37 @@ actor CodexModelPollingService {
     private let client: any CodexModelListingClient
     private let intervalNanos: UInt64
     private let stopClientOnShutdown: Bool
+    private let stopClientWhenIdle: Bool
 
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     private var latest: Snapshot?
     private var isShutdown = false
+    private var isStoppingClientForIdle = false
 
     init(
         client: any CodexModelListingClient,
         intervalNanos: UInt64 = 60_000_000_000,
-        stopClientOnShutdown: Bool = false
+        stopClientOnShutdown: Bool = false,
+        stopClientWhenIdle: Bool = false
     ) {
         self.client = client
         self.intervalNanos = intervalNanos
         self.stopClientOnShutdown = stopClientOnShutdown
+        self.stopClientWhenIdle = stopClientWhenIdle
     }
 
     /// Returns the most recent snapshot if available (non-blocking).
     func latestSnapshot() -> Snapshot? {
         latest
     }
+
+    #if DEBUG
+        func test_subscriberCount() -> Int {
+            continuations.count
+        }
+    #endif
 
     /// Subscribe to model snapshot updates.
     ///
@@ -122,6 +133,7 @@ actor CodexModelPollingService {
 
     private func startPollingIfNeeded() {
         guard !isShutdown else { return }
+        guard !isStoppingClientForIdle else { return }
         guard pollingTask == nil else { return }
         pollingTask = Task { [weak self] in
             guard let self else { return }
@@ -136,15 +148,29 @@ actor CodexModelPollingService {
         }
     }
 
-    private func stopPollingIfIdle() {
+    private func stopPollingIfIdle() async {
         guard continuations.isEmpty else { return }
         pollingTask?.cancel()
         pollingTask = nil
+        guard stopClientWhenIdle else { return }
+        guard !isStoppingClientForIdle else { return }
+
+        isStoppingClientForIdle = true
+        if let inFlightRefresh {
+            inFlightRefresh.cancel()
+            await inFlightRefresh.value
+        }
+        await client.stop()
+        isStoppingClientForIdle = false
+
+        if !isShutdown, !continuations.isEmpty {
+            startPollingIfNeeded()
+        }
     }
 
-    private func removeSubscriber(_ id: UUID) {
+    private func removeSubscriber(_ id: UUID) async {
         continuations.removeValue(forKey: id)
-        stopPollingIfIdle()
+        await stopPollingIfIdle()
     }
 
     private func performRefresh() async {

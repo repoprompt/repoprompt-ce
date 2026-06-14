@@ -199,7 +199,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                             hintInputs.append(candidate)
                         }
                     }
-                    let hint = await dependencies.makeSelectionHintError(hintInputs, "preview", lookupRootScope)
+                    let hint = await dependencies.makeSelectionHintError(hintInputs, "preview", lookupContext)
                     throw MCPError.invalidParams(hint)
                 }
             }
@@ -276,14 +276,14 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 let resolvedAnything = pathMutated || !resolvedMap.isEmpty || sliceResolved || sliceMutated
                 if strict, !resolvedAnything {
                     if !selectionPaths.isEmpty {
-                        let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupRootScope)
+                        let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupContext)
                         throw MCPError.invalidParams(hint)
                     } else if !sliceInvalid {
                         throw MCPError.invalidParams("Provided slices did not match any files")
                     }
                 }
             } else if strict, !pathMutated, resolvedMap.isEmpty {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupRootScope)
+                let hint = await dependencies.makeSelectionHintError(rawPaths, "add", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
             var combinedInvalid = invalid
@@ -335,7 +335,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 throw MCPError.invalidParams(detail)
             }
             if strict, !(pathMutated || !resolvedMap.isEmpty || sliceResolved || sliceMutated), !selectionPaths.isEmpty {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "remove", lookupRootScope)
+                let hint = await dependencies.makeSelectionHintError(rawPaths, "remove", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
             var combinedInvalid = invalid
@@ -358,7 +358,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 combinedInvalid.append(error)
             }
             if strict, !mutated {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "promote", lookupRootScope)
+                let hint = await dependencies.makeSelectionHintError(rawPaths, "promote", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
             return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: newSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
@@ -377,7 +377,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 combinedInvalid.append(msg)
             }
             if strict, !demoteResult.mutated {
-                let hint = await dependencies.makeSelectionHintError(rawPaths, "demote", lookupRootScope)
+                let hint = await dependencies.makeSelectionHintError(rawPaths, "demote", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
             return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)

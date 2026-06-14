@@ -324,8 +324,17 @@ extension FileSystemService {
         }
         let wasDirectory = isDirectory.boolValue
 
+        #if DEBUG
+            let moveItemToTrashIO = moveItemToTrashIOForTesting ?? { url in
+                _ = try Self.moveURLToTrashOffActor(url)
+            }
+        #else
+            let moveItemToTrashIO: @Sendable (URL) throws -> Void = { url in
+                _ = try Self.moveURLToTrashOffActor(url)
+            }
+        #endif
         let mutation = startUncancellableMutation(.trash) {
-            _ = try Self.moveURLToTrashOffActor(url)
+            try moveItemToTrashIO(url)
         }
         Task.detached { [weak self] in
             do {

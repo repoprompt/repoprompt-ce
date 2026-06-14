@@ -125,6 +125,11 @@ private actor CodeScanAsyncLimiter {
 }
 
 actor CodeScanActor {
+    struct SelfHealingScanRequestResult {
+        let submittedFileIDs: Set<UUID>
+        let alreadyScheduledFileIDs: Set<UUID>
+    }
+
     /// Conservative default scan concurrency: scale modestly with CPU, capped to avoid parser/generator memory spikes.
     private static var defaultMaxConcurrentScans: Int {
         let cpu = ProcessInfo.processInfo.activeProcessorCount
@@ -153,6 +158,10 @@ actor CodeScanActor {
 
     /// Tracks all active scanning tasks so we can cancel them if needed
     private var scanTasks = Set<ScanningTask>()
+
+    #if DEBUG
+        private var scanWillStartHandlerForTesting: (@Sendable (UUID) async -> Void)?
+    #endif
 
     /// Tracks how many scans remain (queued + active)
     private var outstandingScans = 0
@@ -239,6 +248,7 @@ actor CodeScanActor {
     /// -------------------------------------
     enum ScanBatchPurpose {
         case initialRootLoad
+        case selfHealing
         case adhoc
     }
 
@@ -475,6 +485,11 @@ actor CodeScanActor {
     private func rootHasQueuedOrActiveWork(forRootKey rootKey: String) -> Bool {
         queue.contains { canonicalRoot($0.rootFolderPath) == rootKey } ||
             scanTasks.contains { canonicalRoot($0.request.rootFolderPath) == rootKey }
+    }
+
+    private func hasQueuedOrActiveScan(for fileID: UUID) -> Bool {
+        queue.contains { $0.fileID == fileID } ||
+            scanTasks.contains { $0.request.fileID == fileID }
     }
 
     private func evictCleanIdleRootCachesIfNeeded() {
@@ -820,12 +835,13 @@ actor CodeScanActor {
         scheduleNextScan()
     }
 
+    @discardableResult
     func requestScans(
         _ requests: [ScanRequest],
         purpose: ScanBatchPurpose = .adhoc,
         rootFolderPaths: [String] = [],
         purgeCachesOnEmptyInitialRequests: Bool = false
-    ) async {
+    ) async -> Set<UUID> {
         let ingestStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
         defer {
             if let ingestStart {
@@ -835,7 +851,7 @@ actor CodeScanActor {
         let shouldHandleEmptyInitial = purpose == .initialRootLoad &&
             !rootFolderPaths.isEmpty &&
             purgeCachesOnEmptyInitialRequests
-        if requests.isEmpty, !shouldHandleEmptyInitial { return }
+        if requests.isEmpty, !shouldHandleEmptyInitial { return [] }
 
         let rootsFromRequests = Set(requests.map { canonicalRoot($0.rootFolderPath) })
         let rootsFromArgs = Set(rootFolderPaths.map { canonicalRoot($0) })
@@ -856,7 +872,7 @@ actor CodeScanActor {
                     startMS: cacheRebuildStartMS
                 )
             #endif
-            guard rootGenerationsStillMatch(expectedRootGenerations) else { return }
+            guard rootGenerationsStillMatch(expectedRootGenerations) else { return [] }
         } else {
             initialRootLookupByRoot = [:]
         }
@@ -871,23 +887,31 @@ actor CodeScanActor {
                 clearRebuildLookups(forRoots: rootsForRebuild)
                 if queue.isEmpty, activeScans == 0 { performCacheCleanup() }
             }
-            return
+            return []
         }
 
         var requestsToQueue = [ScanRequest]()
+        var seenSelfHealingFileIDs = Set<UUID>()
 
         for request in requests {
             let rootKey = canonicalRoot(request.rootFolderPath)
 
-            // Skip if we have a known date >= this request (except during initial root load).
-            if purpose != .initialRootLoad,
-               let knownDate = latestFileModDates[request.fileID],
-               knownDate >= request.modificationDate
-            {
-                continue
+            // Self-healing never replaces queued or active work: it only submits genuinely idle files.
+            if purpose == .selfHealing {
+                guard seenSelfHealingFileIDs.insert(request.fileID).inserted,
+                      !hasQueuedOrActiveScan(for: request.fileID)
+                else { continue }
+            } else {
+                // Ad hoc scans may skip unchanged files; initial loads must requeue them.
+                if purpose == .adhoc,
+                   let knownDate = latestFileModDates[request.fileID],
+                   knownDate >= request.modificationDate
+                {
+                    continue
+                }
+                removeQueuedRequest(for: request.fileID)
             }
 
-            removeQueuedRequest(for: request.fileID)
             latestFileModDates[request.fileID] = request.modificationDate
             trackFileID(request.fileID, forRootKey: rootKey)
             requestsToQueue.append(request)
@@ -905,8 +929,11 @@ actor CodeScanActor {
             } else if queue.isEmpty, activeScans == 0 {
                 evictCleanIdleRootCachesIfNeeded()
             }
-            return
+            return []
         }
+
+        let submittedFileIDs = Set(requestsToQueue.map(\.fileID))
+        var droppedFileIDs = Set<UUID>()
 
         // Determine how many of these requests are for new files.
         let newFilesCount = requestsToQueue.count(where: { !acceptedAPIFileIDs.contains($0.fileID) })
@@ -933,6 +960,7 @@ actor CodeScanActor {
             let expectedGeneration = expectedRootGenerations[rootKey]
             guard rootGenerationMatches(rootKey: rootKey, expected: expectedGeneration) else {
                 removeTrackingForDroppedRequest(request)
+                droppedFileIDs.insert(request.fileID)
                 droppedRequests += 1
                 continue
             }
@@ -949,6 +977,7 @@ actor CodeScanActor {
                 finalQueue.append(request)
             case .staleRoot:
                 removeTrackingForDroppedRequest(request)
+                droppedFileIDs.insert(request.fileID)
                 droppedRequests += 1
             }
         }
@@ -958,6 +987,7 @@ actor CodeScanActor {
             let shouldQueue = rootGenerationMatches(rootKey: rootKey, expected: expectedRootGenerations[rootKey])
             if !shouldQueue {
                 removeTrackingForDroppedRequest(request)
+                droppedFileIDs.insert(request.fileID)
             }
             return shouldQueue
         }
@@ -1019,6 +1049,24 @@ actor CodeScanActor {
         } else if queueableRequests.isEmpty, queue.isEmpty, activeScans == 0 {
             evictCleanIdleRootCachesIfNeeded()
         }
+        return submittedFileIDs.subtracting(droppedFileIDs)
+    }
+
+    func requestSelfHealingScans(
+        _ requests: [ScanRequest],
+        rootFolderPaths: [String] = []
+    ) async -> SelfHealingScanRequestResult {
+        let requestedFileIDs = Set(requests.map(\.fileID))
+        let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { hasQueuedOrActiveScan(for: $0) })
+        let submittedFileIDs = await requestScans(
+            requests,
+            purpose: .selfHealing,
+            rootFolderPaths: rootFolderPaths
+        )
+        return SelfHealingScanRequestResult(
+            submittedFileIDs: submittedFileIDs,
+            alreadyScheduledFileIDs: alreadyScheduledFileIDs
+        )
     }
 
     // -------------------------------------------------------
@@ -1067,9 +1115,15 @@ actor CodeScanActor {
 
             let uniqueTaskID = UUID()
             let treeSitterParseLimiter = treeSitterParseLimiter
+            #if DEBUG
+                let scanWillStartHandlerForTesting = scanWillStartHandlerForTesting
+            #endif
             let scanTask = Task<Void, Never> { [request, treeSitterParseLimiter] in
                 var fileAPI: FileAPI?
                 do {
+                    #if DEBUG
+                        await scanWillStartHandlerForTesting?(request.fileID)
+                    #endif
                     try Task.checkCancellation()
                     let parseStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
                     let namedRanges = try await treeSitterParseLimiter.withPermit {
@@ -1474,6 +1528,12 @@ actor CodeScanActor {
                 resultBatchBufferFileAPICount: resultBatchBufferFileAPICount,
                 actorRetainedFileAPILikeEntryCount: actorRetainedFileAPILikeEntryCount
             )
+        }
+
+        func setScanWillStartHandlerForTesting(
+            _ handler: (@Sendable (UUID) async -> Void)?
+        ) {
+            scanWillStartHandlerForTesting = handler
         }
 
         func scanStateForTesting() -> (

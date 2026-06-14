@@ -15,6 +15,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows.map(\.name), ["A", "B", "C"])
         XCTAssertEqual(rows.map(\.fullPath), ["/tmp/A", "/tmp/B", "/tmp/C"])
         XCTAssertEqual(rows.map(\.isPrimary), [true, false, false])
+        XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [rootA.id])
         XCTAssertEqual(rows.map(\.canMoveUp), [false, true, true])
         XCTAssertEqual(rows.map(\.canMoveDown), [true, true, false])
         XCTAssertEqual(rows.map(\.standardizedFullPath), [rootA.standardizedFullPath, rootB.standardizedFullPath, rootC.standardizedFullPath])
@@ -38,6 +39,27 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 canMoveDown: false
             )
         ])
+        XCTAssertTrue(rows.filter(\.isPrimary).isEmpty)
+    }
+
+    func testRowsDoNotMarkPrimaryWhenWorkspaceHasNoRoots() {
+        let rows = AgentWorkspaceRootsSidebarStore.rows(from: [])
+
+        XCTAssertTrue(rows.isEmpty)
+        XCTAssertEqual(rows.filter(\.isPrimary).count, 0)
+    }
+
+    func testRowsMarkExactlyFirstRootAsPrimaryAcrossMultiRootCounts() {
+        for rootCount in 2 ... 5 {
+            let projections = (0 ..< rootCount).map { index in
+                makeProjection(name: "Root\(index)", path: "/tmp/Root\(index)")
+            }
+
+            let rows = AgentWorkspaceRootsSidebarStore.rows(from: projections)
+
+            XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [projections[0].id])
+            XCTAssertEqual(rows.dropFirst().filter(\.isPrimary).count, 0)
+        }
     }
 
     func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
@@ -126,6 +148,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(indicator.markerStyle, .ring)
         XCTAssertTrue(indicator.isAvailable)
         XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertTrue(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     func testIndicatorMakeFallsBackToResolvedIdentityForMissingOrInvalidFields() {
@@ -173,7 +197,11 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
     }
 
     func testIndicatorUnavailableSurfacesStaleStateInTooltipAndAccessibility() {
-        let summary = makeSummary(visualLabel: "feature-x", visualColorHex: "#112233")
+        let summary = makeSummary(
+            visualLabel: "feature-x",
+            visualColorHex: "#112233",
+            worktreeRootPath: "  /tmp/Repo-missing  \n"
+        )
         let identity = WorktreeVisualIdentity(colorHex: "#112233")
 
         let indicator = AgentWorktreeIndicator.make(
@@ -183,16 +211,31 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         )
 
         XCTAssertFalse(indicator.isAvailable)
+        XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertEqual(indicator.missingWorktreePath, "/tmp/Repo-missing")
         XCTAssertTrue(indicator.tooltipText.contains("unavailable"))
         XCTAssertTrue(indicator.tooltipText.contains("feature-x"))
         XCTAssertTrue(indicator.accessibilityText.contains("unavailable"))
+    }
+
+    func testUnavailableIndicatorOmitsBlankRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  \n\t  "),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: false
+        )
+
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",
         worktreeName: String? = "wt-name",
-        branch: String? = "main"
+        branch: String? = "main",
+        worktreeRootPath: String = "/tmp/Repo-wt"
     ) -> AgentSessionWorktreeBindingSummary {
         AgentSessionWorktreeBindingSummary(
             id: "binding-1",
@@ -201,7 +244,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             logicalRootPath: "/tmp/Repo",
             logicalRootName: "Repo",
             worktreeID: "wt_0123456789abcdef",
-            worktreeRootPath: "/tmp/Repo-wt",
+            worktreeRootPath: worktreeRootPath,
             worktreeName: worktreeName,
             branch: branch,
             visualLabel: visualLabel,

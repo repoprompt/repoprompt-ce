@@ -68,7 +68,8 @@ extension MCPServerViewModel {
     @MainActor
     func evaluateVirtualPromptEntries(
         for selection: StoredSelection,
-        codeMapUsage: CodeMapUsage
+        codeMapUsage: CodeMapUsage,
+        rootScope: WorkspaceLookupRootScope = .allLoaded
     ) async -> PromptEntriesEvaluation {
         let store = promptVM.workspaceFileContextStore
         let accountingService = PromptContextAccountingService()
@@ -76,7 +77,7 @@ extension MCPServerViewModel {
             selection: selection,
             codeMapUsage: codeMapUsage,
             filePathDisplay: promptVM.filePathDisplayOption,
-            rootScope: .allLoaded,
+            rootScope: rootScope,
             pathLocateProfile: .uiAssisted
         )
         let accounting = await accountingService.calculatePromptStats(request: request, store: store)
@@ -87,22 +88,24 @@ extension MCPServerViewModel {
     @MainActor
     private func virtualSelectionFileTreeText(
         selection: StoredSelection,
-        resolvedContext: PromptContextResolved
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext
     ) async -> String {
         guard resolvedContext.rendersFileTree else { return "" }
         let store = promptVM.workspaceFileContextStore
-        let snapshot = await store.makeFileTreeSelectionSnapshot(
-            selection: selection,
+        let rawSnapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: lookupContext.physicalizeSelection(selection),
             request: WorkspaceFileTreeSnapshotRequest(
                 mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: resolvedContext.effectiveFileTreeMode),
                 filePathDisplay: promptVM.filePathDisplayOption,
                 onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
                 includeLegend: true,
                 showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                rootScope: .allLoaded
+                rootScope: lookupContext.rootScope
             ),
             profile: .uiAssisted
         )
+        let snapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawSnapshot) ?? rawSnapshot
         return await Task.detached(priority: .userInitiated) {
             CodeMapExtractor.generateFileTree(using: snapshot)
         }.value
@@ -111,22 +114,26 @@ extension MCPServerViewModel {
     @MainActor
     private func virtualSelectionGitDiffText(
         for selection: StoredSelection,
-        resolvedContext: PromptContextResolved
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext
     ) async -> String? {
         switch resolvedContext.gitInclusion {
         case .none:
             return nil
         case .selected:
             let selectedPaths = await WorkspaceGitDiffSelectionResolver.selectedGitDiffPaths(
-                for: selection,
+                for: lookupContext.physicalizeSelection(selection),
                 store: promptVM.workspaceFileContextStore,
-                rootScope: .allLoaded,
+                rootScope: lookupContext.rootScope,
                 folderPolicy: .filesOnly,
                 profile: .mcpSelection,
-                allowFilesystemFallback: WorkspaceLookupRootScope.allLoaded.allowsSelectedGitDiffFilesystemFallback
+                allowFilesystemFallback: lookupContext.rootScope.allowsSelectedGitDiffFilesystemFallback
             )
             return await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
         case .complete:
+            guard lookupContext.bindingProjection == nil else {
+                return PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage
+            }
             return await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
         }
     }
@@ -136,7 +143,8 @@ extension MCPServerViewModel {
         for context: TabScopedContext,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
-        codemapFiles: [WorkspaceFileRecord]
+        codemapFiles: [WorkspaceFileRecord],
+        lookupContext: WorkspaceLookupContext
     ) async -> TokenComponentBreakdown {
         let selectedInstructionsText = promptVM.metaInstructions(
             for: resolvedContext,
@@ -146,10 +154,18 @@ extension MCPServerViewModel {
         .joined(separator: "\n\n")
         let isActiveWorkspaceBound = context.workspaceID == nil || context.workspaceID == workspaceManager?.activeWorkspace?.id
         let fileTreeText = isActiveWorkspaceBound
-            ? await virtualSelectionFileTreeText(selection: context.selection, resolvedContext: resolvedContext)
+            ? await virtualSelectionFileTreeText(
+                selection: context.selection,
+                resolvedContext: resolvedContext,
+                lookupContext: lookupContext
+            )
             : ""
         let gitDiffText = isActiveWorkspaceBound
-            ? await virtualSelectionGitDiffText(for: context.selection, resolvedContext: resolvedContext)
+            ? await virtualSelectionGitDiffText(
+                for: context.selection,
+                resolvedContext: resolvedContext,
+                lookupContext: lookupContext
+            )
             : nil
         let promptText = resolvedContext.includeUserPrompt ? context.promptText : ""
         let duplicateUserPrompt = resolvedContext.includeUserPrompt ? promptVM.duplicateUserInstructionsAtTop : false
@@ -169,7 +185,8 @@ extension MCPServerViewModel {
         filesReply: ToolResultDTOs.SelectedFilesReply,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
-        codemapFiles: [WorkspaceFileRecord]
+        codemapFiles: [WorkspaceFileRecord],
+        lookupContext: WorkspaceLookupContext
     ) async -> ToolResultDTOs.TokenStats {
         let filesContentTokens = (filesReply.summary?.fullTokens ?? 0) + (filesReply.summary?.sliceTokens ?? 0)
         let codemapsTokens = filesReply.summary?.codemapTokens ?? 0
@@ -177,7 +194,8 @@ extension MCPServerViewModel {
             for: context,
             resolvedContext: resolvedContext,
             selectedFiles: selectedFiles,
-            codemapFiles: codemapFiles
+            codemapFiles: codemapFiles,
+            lookupContext: lookupContext
         )
         return Self.makeTokenStats(
             filesTokens: filesReply.totalTokens,
@@ -265,12 +283,14 @@ extension MCPServerViewModel {
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }
+        _ = await promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
         let effectiveSelection = lookupContext.physicalizeSelection(selection)
         let source = StoredSelectionSource(stored: effectiveSelection, codeMapUsage: effectiveOverride)
         let collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
         let evaluation = await evaluateVirtualPromptEntries(
             for: effectiveSelection,
-            codeMapUsage: collections.codeMapUsage
+            codeMapUsage: collections.codeMapUsage,
+            rootScope: lookupContext.rootScope
         )
         let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
         let tokens = TokenServices(owner: self)
@@ -299,7 +319,8 @@ extension MCPServerViewModel {
                 filesReply: filesReply,
                 resolvedContext: promptVM.resolvePromptContext(),
                 selectedFiles: selectedFiles,
-                codemapFiles: codemapFiles
+                codemapFiles: codemapFiles,
+                lookupContext: lookupContext
             )
         } else {
             tokenStatsOverride = nil
@@ -435,7 +456,8 @@ extension MCPServerViewModel {
             fileCount: 0,
             content: "",
             unmappedPaths: unmapped,
-            omittedCount: nil
+            omittedCount: nil,
+            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection)
         )
     }
 }

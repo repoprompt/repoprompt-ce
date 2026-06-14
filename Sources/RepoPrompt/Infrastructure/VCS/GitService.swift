@@ -2397,8 +2397,12 @@ actor GitService {
         // Build async streams for stdout/stderr and single consumer tasks to collect data.
         // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
         // so a final chunk cannot be read by a callback and then dropped after stream closure.
-        let (outStream, outDrain) = GitProcessPipeDrain.makeStream()
-        let (errStream, errDrain) = GitProcessPipeDrain.makeStream()
+        let (outStream, outDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: outPipe.fileHandleForReading
+        )
+        let (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: errPipe.fileHandleForReading
+        )
 
         let processMetrics = GitProcessMetricsBox()
         let outCollector = Task(priority: .userInitiated) { () -> Data in
@@ -2420,11 +2424,15 @@ actor GitService {
             try await withCheckedThrowingContinuation { continuation in
                 // Drain stdout
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
-                    outDrain.consumeAvailableData(from: handle)
+                    if outDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
                 // Drain stderr
                 errPipe.fileHandleForReading.readabilityHandler = { handle in
-                    errDrain.consumeAvailableData(from: handle)
+                    if errDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
 
                 process.terminationHandler = { proc in
@@ -2436,8 +2444,8 @@ actor GitService {
 
                     // Drain bytes that arrived between the last readability callback and
                     // process termination, then close each stream after any in-flight callback.
-                    outDrain.finishReading(from: outPipe.fileHandleForReading)
-                    errDrain.finishReading(from: errPipe.fileHandleForReading)
+                    outDrain.finishReading()
+                    errDrain.finishReading()
 
                     Task {
                         let stdoutData = await outCollector.value
@@ -2935,31 +2943,101 @@ private final class GitProcessMetricsBox: @unchecked Sendable {
 
 ///
 /// `FileHandle.readabilityHandler` may already be executing when a process termination
-/// handler clears it. Without this lock, that callback can read the final bytes, lose the
-/// race to stream closure, and have its subsequent yield discarded.
+/// handler clears it. Foundation may also invalidate its file handle before a queued callback
+/// runs. The drain owns a close-on-exec duplicate descriptor so all reads and closure are
+/// serialized independently of the `FileHandle` lifecycle.
 final class GitProcessPipeDrain: @unchecked Sendable {
+    private enum DescriptorReadResult {
+        case data(Data)
+        case unavailable
+        case terminal
+    }
+
+    private static let readBufferSize = 64 * 1024
+
     private let lock = NSLock()
     private let continuation: AsyncStream<Data>.Continuation
+    private var ownedDescriptor: Int32?
     private var isFinished = false
 
-    private init(continuation: AsyncStream<Data>.Continuation) {
+    private init(
+        continuation: AsyncStream<Data>.Continuation,
+        ownedDescriptor: Int32? = nil
+    ) {
         self.continuation = continuation
+        self.ownedDescriptor = ownedDescriptor
+    }
+
+    deinit {
+        if let ownedDescriptor {
+            _ = Darwin.close(ownedDescriptor)
+        }
     }
 
     static func makeStream() -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        makeStream(ownedDescriptor: nil)
+    }
+
+    static func makeStream(
+        readingFrom handle: FileHandle
+    ) throws -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        let duplicateDescriptor = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicateDescriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+
+        let statusFlags = fcntl(duplicateDescriptor, F_GETFL)
+        guard statusFlags >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+        guard fcntl(duplicateDescriptor, F_SETFL, statusFlags | O_NONBLOCK) >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+
+        return makeStream(ownedDescriptor: duplicateDescriptor)
+    }
+
+    private static func makeStream(
+        ownedDescriptor: Int32?
+    ) -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
         var drain: GitProcessPipeDrain?
         let stream = AsyncStream<Data>(bufferingPolicy: .unbounded) { continuation in
-            drain = GitProcessPipeDrain(continuation: continuation)
+            drain = GitProcessPipeDrain(
+                continuation: continuation,
+                ownedDescriptor: ownedDescriptor
+            )
         }
         return (stream, drain!)
     }
 
-    func consumeAvailableData(from handle: FileHandle) {
-        consume { handle.availableData }
+    /// Returns true when the `FileHandle` should stop monitoring readability.
+    @discardableResult
+    func consumeAvailableData() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished, let ownedDescriptor else { return true }
+
+        switch Self.readChunk(from: ownedDescriptor) {
+        case let .data(data):
+            continuation.yield(data)
+            return false
+        case .unavailable:
+            return false
+        case .terminal:
+            finishLocked()
+            return true
+        }
     }
 
-    func finishReading(from handle: FileHandle) {
-        finish { handle.readDataToEndOfFile() }
+    func finishReading() {
+        finish { [self] in
+            guard let ownedDescriptor else { return Data() }
+            return Self.readToEnd(from: ownedDescriptor)
+        }
     }
 
     func consume(read: () -> Data) {
@@ -2986,8 +3064,7 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         if !data.isEmpty {
             continuation.yield(data)
         }
-        isFinished = true
-        continuation.finish()
+        finishLocked()
     }
 
     func cancel() {
@@ -2995,8 +3072,50 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         defer { lock.unlock() }
         guard !isFinished else { return }
 
+        finishLocked()
+    }
+
+    private func finishLocked() {
         isFinished = true
+        if let ownedDescriptor {
+            self.ownedDescriptor = nil
+            _ = Darwin.close(ownedDescriptor)
+        }
         continuation.finish()
+    }
+
+    private static func readToEnd(from descriptor: Int32) -> Data {
+        var result = Data()
+        while true {
+            switch readChunk(from: descriptor) {
+            case let .data(data):
+                result.append(data)
+            case .unavailable, .terminal:
+                return result
+            }
+        }
+    }
+
+    private static func readChunk(from descriptor: Int32) -> DescriptorReadResult {
+        var buffer = [UInt8](repeating: 0, count: readBufferSize)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count > 0 {
+                return .data(Data(buffer.prefix(Int(count))))
+            }
+            if count == 0 {
+                return .terminal
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .unavailable
+            }
+            return .terminal
+        }
     }
 }
 

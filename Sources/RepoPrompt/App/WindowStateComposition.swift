@@ -32,7 +32,9 @@ enum WindowStateCompositionFactory {
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
-        workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production
+        workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
+        loadStoredAPISettingsDataOnInit: Bool = true,
+        codexModelPollingService: CodexModelPollingService = .shared
     ) -> WindowStateComposition {
         // 1) Workspace file context store + visible file-tree UI adapter
         let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? WorkspaceFileContextStore()
@@ -45,7 +47,12 @@ enum WindowStateCompositionFactory {
             ?? AIQueriesService(keyManager: keyManager)
 
         // 3) API Settings
-        let apiSettingsViewModel = APISettingsViewModel(aiQueriesService: aiQueriesService, keyManager: keyManager)
+        let apiSettingsViewModel = APISettingsViewModel(
+            aiQueriesService: aiQueriesService,
+            keyManager: keyManager,
+            loadStoredDataOnInit: loadStoredAPISettingsDataOnInit,
+            codexModelPollingService: codexModelPollingService
+        )
 
         // 5) Settings Manager (per-window overlay)
         let settingsManager = WindowSettingsManager(windowID: windowID)
@@ -126,7 +133,8 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             mcpServer: mcpServer,
             oracleViewModel: oracleViewModel,
-            providerFactory: contextBuilderProviderFactory
+            providerFactory: contextBuilderProviderFactory,
+            codexModelPollingService: codexModelPollingService
         )
 
         // 13) Agent mode (for minimal agent UI)

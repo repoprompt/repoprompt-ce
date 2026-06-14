@@ -507,6 +507,9 @@ extension FileSystemService {
     #endif
 
     func contentFingerprint(ofRelativePath relativePath: String) async throws -> FileContentFingerprint {
+        #if DEBUG
+            contentFingerprintRequestCountForTesting += 1
+        #endif
         let request = try makeContentReadRequest(
             cacheKey: relativePath,
             chunkSize: 1_048_576,

@@ -305,7 +305,9 @@ final class AgentModeViewModel: ObservableObject {
                 isRestoringState = false
                 return
             }
-            UserDefaults.standard.set(selectedAgent.rawValue, forKey: Self.lastUsedAgentKey)
+            if usesProductionAgentDefaultsAndModelPolling {
+                UserDefaults.standard.set(selectedAgent.rawValue, forKey: Self.lastUsedAgentKey)
+            }
             if let session = activeSession {
                 let previousAgent = session.selectedAgent
                 if previousAgent != selectedAgent {
@@ -544,6 +546,7 @@ final class AgentModeViewModel: ObservableObject {
     let providerBindingService: AgentModeProviderBindingService
     private weak var runInteractionStateObserver: (any AgentModeRunInteractionStateObserving)?
     private let shouldManageCodexTooling: Bool
+    private let usesProductionAgentDefaultsAndModelPolling: Bool
     let clearConsumedAttachmentsAfterProviderConsumption: Bool
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     private lazy var runService: AgentModeRunService = makeRunService()
@@ -905,6 +908,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func persistLastUsedModelIfNeeded(agent: AgentProviderKind, modelRaw: String) {
+        guard usesProductionAgentDefaultsAndModelPolling else { return }
         guard shouldPersistLastUsedModel(agent: agent, modelRaw: modelRaw) else { return }
         Self.persistModelForAgent(agentRaw: agent.rawValue, modelRaw: modelRaw)
     }
@@ -1059,10 +1063,6 @@ final class AgentModeViewModel: ObservableObject {
         syncComposerUIState()
     }
 
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged()
-    }
-
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         if let activeSession,
@@ -1089,6 +1089,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func updateDynamicModelPolling(startCursorPolling: Bool = true) {
+        guard usesProductionAgentDefaultsAndModelPolling else { return }
         codexCoordinator.updateCodexModelPolling()
         updateOpenCodeModelPolling()
         updateCursorModelPolling(startPolling: startCursorPolling)
@@ -1374,6 +1375,7 @@ final class AgentModeViewModel: ObservableObject {
             mcpServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
         }
         shouldManageCodexTooling = true
+        usesProductionAgentDefaultsAndModelPolling = true
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
@@ -1426,8 +1428,8 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator.attach(viewModel: self)
         runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
-            guard let self else { return [] }
-            return worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
+            guard let self else { return .unavailable }
+            return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
         }
 
         refreshAvailableAgents()
@@ -1438,9 +1440,7 @@ final class AgentModeViewModel: ObservableObject {
         setupObservers()
         updateDynamicModelPolling(startCursorPolling: false)
         syncAllActiveUIState()
-        Task { [weak self] in
-            await self?.refreshSkillCatalog(force: true)
-        }
+        scheduleInitialSkillCatalogRefresh()
     }
 
     #if DEBUG
@@ -1510,7 +1510,8 @@ final class AgentModeViewModel: ObservableObject {
             testCodexStallWatchdogProbeThreshold: TimeInterval? = nil,
             testCodexStallWatchdogRecoveryThreshold: TimeInterval? = nil,
             testCodexStallWatchdogInactivityThreshold: TimeInterval? = nil,
-            testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil
+            testCodexTransportClosedRecoveryGraceInterval: TimeInterval? = nil,
+            testUsesProductionAgentDefaultsAndModelPolling: Bool = false
         ) {
             windowID = testWindowID
             promptManager = nil
@@ -1548,6 +1549,7 @@ final class AgentModeViewModel: ObservableObject {
                     testMCPServer?.cancelActiveToolsForRun(runID: runID, reason: reason) ?? 0
                 }
             self.shouldManageCodexTooling = shouldManageCodexTooling
+            usesProductionAgentDefaultsAndModelPolling = testUsesProductionAgentDefaultsAndModelPolling
             let legacyWatchdogThreshold = testCodexStallWatchdogInactivityThreshold
             let testWatchdogProbeThreshold = testCodexStallWatchdogProbeThreshold ?? legacyWatchdogThreshold ?? 0
             let testWatchdogRecoveryThreshold: TimeInterval = if let explicitRecoveryThreshold = testCodexStallWatchdogRecoveryThreshold {
@@ -1610,16 +1612,16 @@ final class AgentModeViewModel: ObservableObject {
             claudeCoordinator.attach(viewModel: self)
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
-                guard let self else { return [] }
-                return worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
+                guard let self else { return .unavailable }
+                return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
             }
             refreshAvailableAgents()
-            restoreLastUsedAgentSelectionIfNeeded()
-            updateDynamicModelPolling(startCursorPolling: false)
-            syncAllActiveUIState()
-            Task { [weak self] in
-                await self?.refreshSkillCatalog(force: true)
+            if usesProductionAgentDefaultsAndModelPolling {
+                restoreLastUsedAgentSelectionIfNeeded()
+                updateDynamicModelPolling(startCursorPolling: false)
             }
+            syncAllActiveUIState()
+            scheduleInitialSkillCatalogRefresh()
         }
     #endif
 
@@ -1734,42 +1736,24 @@ final class AgentModeViewModel: ObservableObject {
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?
     ) -> AgentSessionWorktreeBinding? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        return primaryWorkspacePath.flatMap { primaryPath in
-            bindings.first { binding in
-                standardizedWorkspacePath(binding.logicalRootPath) == primaryPath
-            }
-        } ?? (primaryWorkspacePath == nil && bindings.count == 1 ? bindings[0] : nil)
+        AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+            in: bindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func effectiveWorkspacePath(
         for session: TabSession,
         fallbackWorkspacePath: String?
     ) throws -> String? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        let binding = primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: fallbackWorkspacePath)
-
-        guard let binding else {
-            return primaryWorkspacePath
-        }
-        let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath)
-        guard let worktreePath else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: worktreePath, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        return worktreePath
+        try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func standardizedWorkspacePath(_ path: String?) -> String? {
-        guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty
-        else {
-            return nil
-        }
-        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL.path
+        AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(path)
     }
 
     private func currentWorkspacePath() -> String? {
@@ -1798,6 +1782,15 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         await skillCatalog.refreshIfNeeded(workspacePaths: paths, agentKind: agent)
+    }
+
+    private func scheduleInitialSkillCatalogRefresh() {
+        let catalog = skillCatalog
+        let paths = currentWorkspacePaths()
+        let agent = activeSession?.selectedAgent ?? selectedAgent
+        Task {
+            await catalog.refresh(workspacePaths: paths, agentKind: agent)
+        }
     }
 
     private func scheduleSkillCatalogRefresh(agentKind: AgentProviderKind? = nil) {
@@ -2122,25 +2115,16 @@ final class AgentModeViewModel: ObservableObject {
             persistCurrentSession()
         }
 
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
-
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
-            Publishers.MergeMany([
-                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
-            ])
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleAgentProviderAvailabilityChanged()
-            }
-            .store(in: &cancellables)
+            // Level-triggered: the current availability is replayed on subscription and
+            // later changes arrive deduplicated by value.
+            apiSettingsViewModel.$agentAvailability
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.handleAgentProviderAvailabilityChanged()
+                }
+                .store(in: &cancellables)
         }
 
         // Observe workspace file-system deltas and invalidate the skill catalog
@@ -2999,14 +2983,14 @@ final class AgentModeViewModel: ObservableObject {
         let tabID = session.tabID
         let scope = applyEditsScope(for: tabID)
         let initialAutoEditEnabled = session.autoEditEnabled
+        let approvalStore = applyEditsApprovalStore
         session.applyEditsApprovalSubscriptionTask = Task { [weak self] in
-            guard let self else { return }
-            await applyEditsApprovalStore.setAutoEditEnabled(
+            await approvalStore.setAutoEditEnabled(
                 initialAutoEditEnabled,
                 for: scope,
                 updateGlobalDefault: false
             )
-            let (subscriptionID, stream) = await applyEditsApprovalStore.subscribe(scope: scope)
+            let (subscriptionID, stream) = await approvalStore.subscribe(scope: scope)
             await MainActor.run { [weak self] in
                 guard let self, let liveSession = sessions[tabID] else { return }
                 liveSession.applyEditsApprovalSubscriptionID = subscriptionID
@@ -5052,14 +5036,30 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
-        if let live = try? authoritativeLiveSession(for: sessionID) {
-            return live.worktreeBindings
+    func worktreeBindingState(
+        forAgentSessionID sessionID: UUID,
+        tabID: UUID? = nil
+    ) -> AgentSessionWorktreeBindingState {
+        do {
+            if let live = try authoritativeLiveSession(for: sessionID) {
+                return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
+            }
+        } catch {
+            return .unavailable
         }
         if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
-            return live.worktreeBindings
+            return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
         }
-        return []
+        switch persistentBindingResolution(for: sessionID) {
+        case .unique:
+            return .unhydrated
+        case .notFound, .ambiguous:
+            return .unavailable
+        }
+    }
+
+    func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
+        worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID).bindings ?? []
     }
 
     @discardableResult
@@ -5227,12 +5227,39 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let previousBindings = session.worktreeBindings
-        let previousDestination = executionDestinationPath(in: previousBindings)
-        let nextDestination = executionDestinationPath(in: desiredBindings)
-        guard previousDestination != nextDestination else {
+        guard previousBindings != desiredBindings else { return previousBindings }
+        let previousDestination = executionDestinationIdentity(in: previousBindings)
+        let nextDestination = executionDestinationIdentity(in: desiredBindings)
+        let changedDuringActiveRun = session.runState.isActive
+
+        if changedDuringActiveRun, previousDestination != nextDestination {
+            switch intent {
+            case .userExecutionLocationChange(confirmation: .activeRunStop):
+                break
+            case .userExecutionLocationChange:
+                throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
+            case .externalManagement:
+                throw MCPError.invalidParams(
+                    "Stop the active Agent run before changing its execution worktree. The in-flight prompt will not be migrated or replayed automatically."
+                )
+            case .initialSend:
+                throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
+            }
+        }
+
+        try await materializeWorktreeBindingsForTransition(desiredBindings, sessionID: sessionID)
+        guard sessions[session.tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              session.worktreeBindings == previousBindings,
+              session.runState.isActive == changedDuringActiveRun
+        else {
+            throw ExecutionLocationTransitionError.stale
+        }
+
+        if previousDestination == nextDestination {
             return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
         }
-        let changedDuringActiveRun = session.runState.isActive
+
         if changedDuringActiveRun {
             switch intent {
             case .userExecutionLocationChange(confirmation: .activeRunStop):
@@ -5245,14 +5272,8 @@ final class AgentModeViewModel: ObservableObject {
                     intent: .executionLocationChange,
                     completion: .terminalPublished
                 )
-            case .userExecutionLocationChange:
-                throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
-            case .externalManagement:
-                throw MCPError.invalidParams(
-                    "Stop the active Agent run before changing its execution worktree. The in-flight prompt will not be migrated or replayed automatically."
-                )
-            case .initialSend:
-                throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
+            case .userExecutionLocationChange, .externalManagement, .initialSend:
+                throw ExecutionLocationTransitionError.stale
             }
         }
         guard sessions[session.tabID] === session,
@@ -5276,9 +5297,49 @@ final class AgentModeViewModel: ObservableObject {
         return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
     }
 
-    private func executionDestinationPath(in bindings: [AgentSessionWorktreeBinding]) -> String? {
+    private struct ExecutionDestinationIdentity: Equatable {
+        let repositoryID: String?
+        let worktreeID: String?
+        let path: String?
+    }
+
+    private func executionDestinationIdentity(in bindings: [AgentSessionWorktreeBinding]) -> ExecutionDestinationIdentity {
         let binding = Self.primaryExecutionBinding(in: bindings, fallbackWorkspacePath: workspacePathProvider())
-        return Self.standardizedWorkspacePath(binding?.worktreeRootPath) ?? Self.standardizedWorkspacePath(workspacePathProvider())
+        return ExecutionDestinationIdentity(
+            repositoryID: binding?.repositoryID,
+            worktreeID: binding?.worktreeID,
+            path: Self.standardizedWorkspacePath(binding?.worktreeRootPath)
+                ?? Self.standardizedWorkspacePath(workspacePathProvider())
+        )
+    }
+
+    private func materializeWorktreeBindingsForTransition(
+        _ bindings: [AgentSessionWorktreeBinding],
+        sessionID: UUID
+    ) async throws {
+        guard !bindings.isEmpty else { return }
+        guard let promptManager else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+        guard let projection = await WorkspaceRootBindingProjectionMaterializer(
+            store: promptManager.workspaceFileContextStore
+        ).materialize(sessionID: sessionID, bindings: bindings), !projection.isEmpty else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+
+        let availability = await promptManager.workspaceFileContextStore.rootScopeAvailability(projection.lookupRootScope)
+        guard case .available = availability else {
+            let missingPaths: [String] = switch availability {
+            case .available:
+                []
+            case let .sessionWorktreeUnavailable(paths):
+                paths
+            }
+            let suffix = missingPaths.isEmpty ? "" : ": \(missingPaths.joined(separator: ", "))"
+            throw ExecutionLocationTransitionError.unavailable(
+                "The selected worktree roots are unavailable\(suffix). The thread was not switched to the canonical checkout."
+            )
+        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {
@@ -10054,7 +10115,7 @@ final class AgentModeViewModel: ObservableObject {
             noticeRevision: 0,
             rawDraftSnapshot: text
         )
-        switch claimComposerSubmitAttempt(attempt) {
+        switch claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) {
         case let .claimed(claim):
             return await executeComposerSubmitAttempt(
                 text: text,
@@ -13256,7 +13317,25 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func claimComposerSubmitAttempt(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaimResult {
+        claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: true)
+    }
+
+    private func claimComposerSubmitAttempt(
+        _ attempt: AgentComposerSubmitAttempt,
+        requireActiveTabOwnership: Bool
+    ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
+        if requireActiveTabOwnership, currentTabID != target.tabID {
+            let rejection = AgentComposerSubmitClaimRejection.targetRejected(reason: "inactive_composer_tab")
+            logRejectedSubmitTarget(
+                target,
+                session: sessions[target.tabID],
+                reason: rejection.diagnosticReason,
+                attempt: attempt
+            )
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
         guard let session = sessions[target.tabID] else {
             let rejection = AgentComposerSubmitClaimRejection.missingSession
             logRejectedSubmitTarget(target, session: nil, reason: rejection.diagnosticReason, attempt: attempt)
@@ -13508,12 +13587,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resyncAfterRejectedSubmitTarget(_ target: AgentComposerSubmitTarget) {
-        if let currentTabID, currentTabID == target.tabID {
+        if let currentTabID {
             syncActiveUIState(tabID: currentTabID, invalidation: [.composer, .runInteraction])
         }
-        requestUIRefresh(tabID: target.tabID, urgent: true)
-        if let currentTabID, currentTabID != target.tabID {
-            requestUIRefresh(tabID: currentTabID, urgent: true)
+        if currentTabID != target.tabID {
+            requestUIRefresh(tabID: target.tabID, urgent: true)
         }
     }
 

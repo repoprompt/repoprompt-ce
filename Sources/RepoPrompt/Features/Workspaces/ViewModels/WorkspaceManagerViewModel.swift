@@ -1279,7 +1279,8 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileManager: WorkspaceFilesViewModel,
         promptViewModel: PromptViewModel,
         workspaceSearchService: WorkspaceSearchService = WorkspaceSearchService(),
-        switchTimingPolicy: WorkspaceSwitchTimingPolicy = .production
+        switchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
+        performInitialWorkspaceActivation: Bool = true
     ) {
         #if DEBUG
             let initStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -1461,7 +1462,9 @@ class WorkspaceManagerViewModel: ObservableObject {
             }
         }
 
-        if activeWorkspace == nil {
+        if !performInitialWorkspaceActivation {
+            completeInitialization()
+        } else if activeWorkspace == nil {
             if let defaultWS = findOrCreateDefaultWorkspace() {
                 Task {
                     await switchWorkspace(to: defaultWS, saveState: false)
@@ -1537,12 +1540,36 @@ class WorkspaceManagerViewModel: ObservableObject {
         postCatalogRootWorkTasks.removeAll()
     }
 
+    func prepareForWindowClose() {
+        stopPollTimer()
+        reloadWorkspacesTask?.cancel()
+        reloadWorkspacesTask = nil
+        reloadPresetsTask?.cancel()
+        reloadPresetsTask = nil
+        codeMapPurgeTask?.cancel()
+        codeMapPurgeTask = nil
+        composeTabApplyTask?.cancel()
+        composeTabApplyTask = nil
+        postSwitchGitDataLoadTask?.cancel()
+        postSwitchGitDataLoadTask = nil
+        for tasks in postCatalogRootWorkTasks.values {
+            tasks.forEach { $0.cancel() }
+        }
+        postCatalogRootWorkTasks.removeAll()
+        cancellables.removeAll()
+    }
+
+    #if DEBUG
+        var test_isPollTimerActive: Bool {
+            pollTimer?.isValid == true
+        }
+    #endif
+
     // MARK: - Private Timer Control
 
     private func startPollTimer() {
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: pollInterval, repeats: true) { [weak self] _ in
-            guard let self else { return }
             Task { @MainActor [weak self] in
                 guard let self else { return }
 

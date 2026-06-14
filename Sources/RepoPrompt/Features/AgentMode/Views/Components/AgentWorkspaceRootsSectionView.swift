@@ -29,12 +29,24 @@ struct AgentWorkspaceRootsSectionView: View {
 
     @State private var addFolderError: String?
     @State private var hoveredRootID: UUID?
+    @FocusState private var focusedRootAction: RootActionFocus?
     @State private var showModelsPopover = false
     @State private var showPermissionsPopover = false
     @State private var isAddFolderHovered = false
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
+    }
+
+    private struct RootActionFocus: Hashable {
+        enum Action: Hashable {
+            case moveUp
+            case moveDown
+            case remove
+        }
+
+        let rowID: UUID
+        let action: Action
     }
 
     private static let estimatedFolderRowHeight: CGFloat = 28
@@ -95,12 +107,32 @@ struct AgentWorkspaceRootsSectionView: View {
         fontPreset.scaledClamped(6, max: 8)
     }
 
+    private var rootContextSpacing: CGFloat {
+        fontPreset.scaledClamped(5, max: 7)
+    }
+
+    private var rootLineSpacing: CGFloat {
+        fontPreset.scaledClamped(2, max: 3)
+    }
+
+    private var rootFolderIconWidth: CGFloat {
+        fontPreset.scaledClamped(14, min: 14, max: 18)
+    }
+
+    private var rootContextRowMinHeight: CGFloat {
+        fontPreset.scaledClamped(39, min: 38, max: 52)
+    }
+
+    private var rootActionOverlaySpacing: CGFloat {
+        fontPreset.scaledClamped(2, max: 3)
+    }
+
     private var rootRowHorizontalPadding: CGFloat {
         fontPreset.scaledClamped(8, max: 12)
     }
 
     private var rootRowVerticalPadding: CGFloat {
-        fontPreset.scaledClamped(5, max: 7)
+        fontPreset.scaledClamped(4, max: 5)
     }
 
     private var rootRowCornerRadius: CGFloat {
@@ -140,7 +172,11 @@ struct AgentWorkspaceRootsSectionView: View {
     }
 
     private var worktreeCapsuleLabelMaxWidth: CGFloat {
-        fontPreset.scaledClamped(128, min: 82, max: 170)
+        fontPreset.scaledClamped(118, min: 62, max: 154)
+    }
+
+    private var mergeCapsuleLabelMaxWidth: CGFloat {
+        fontPreset.scaledClamped(92, min: 44, max: 126)
     }
 
     private var roots: [AgentWorkspaceRootRow] {
@@ -167,8 +203,14 @@ struct AgentWorkspaceRootsSectionView: View {
 
     private var estimatedFolderListHeight: CGFloat {
         guard !roots.isEmpty else { return 0 }
-        return CGFloat(roots.count) * estimatedFolderRowHeight
-            + CGFloat(max(roots.count - 1, 0)) * folderRowSpacing
+        let rowHeights = roots.reduce(CGFloat(0)) { total, row in
+            total + (rowHasContextLine(row) ? rootContextRowMinHeight : estimatedFolderRowHeight)
+        }
+        return rowHeights + CGFloat(max(roots.count - 1, 0)) * folderRowSpacing
+    }
+
+    private func rowHasContextLine(_ row: AgentWorkspaceRootRow) -> Bool {
+        row.gitContext != nil || row.worktree != nil || mergeAttention(for: row) != nil
     }
 
     private var shouldScrollFolderList: Bool {
@@ -225,30 +267,29 @@ struct AgentWorkspaceRootsSectionView: View {
     // MARK: - Header
 
     private var headerSection: some View {
-        VStack(alignment: .leading, spacing: headerVerticalSpacing) {
+        HStack(spacing: headerButtonSpacing) {
             Text("Workspace")
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 11, weight: .medium))
                 .foregroundColor(.secondary)
+                .fixedSize(horizontal: true, vertical: false)
 
-            HStack(spacing: headerButtonSpacing) {
-                workspaceDropdown
+            workspaceDropdown
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
 
-                Button(action: {
-                    Task { await rootsStore.exitWorkspace() }
-                }) {
-                    HStack(spacing: fontPreset.scaledClamped(4, max: 6)) {
-                        Image(systemName: "rectangle.portrait.and.arrow.right")
-                        Text("Exit")
-                            .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                    }
+            Button(action: {
+                Task { await rootsStore.exitWorkspace() }
+            }) {
+                HStack(spacing: fontPreset.scaledClamped(4, max: 6)) {
+                    Image(systemName: "rectangle.portrait.and.arrow.right")
+                    Text("Exit")
+                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
                 }
-                .buttonStyle(CustomButtonStyle(verticalPadding: 0, horizontalPadding: 8, height: 26))
-                .hoverTooltip("Exit Workspace", .top)
-                .disabled(rootsStore.isExitDisabled)
-                .opacity(rootsStore.isExitDisabled ? 0.5 : 1)
-
-                Spacer()
             }
+            .buttonStyle(CustomButtonStyle(verticalPadding: 0, horizontalPadding: 8, height: 26))
+            .hoverTooltip("Exit Workspace", .top)
+            .disabled(rootsStore.isExitDisabled)
+            .opacity(rootsStore.isExitDisabled ? 0.5 : 1)
         }
     }
 
@@ -348,91 +389,26 @@ struct AgentWorkspaceRootsSectionView: View {
     private func rootRow(_ row: AgentWorkspaceRootRow) -> some View {
         let hasMultipleRoots = roots.count > 1
         let isHovered = hoveredRootID == row.id
+        let hasFocusedAction = focusedRootAction?.rowID == row.id
+        let hasContextLine = rowHasContextLine(row)
 
-        return HStack(spacing: rootRowSpacing) {
-            Image(systemName: "folder.fill")
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                .foregroundColor(.secondary)
+        return VStack(alignment: .leading, spacing: rootLineSpacing) {
+            rootIdentityLine(row)
 
-            Text(row.name)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .fixedSize(horizontal: false, vertical: true)
-                .layoutPriority(2)
-
-            if row.isPrimary {
-                Text("PRIMARY")
-                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
-                    .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
-                    .background(
-                        Capsule()
-                            .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75)
-                    )
+            if hasContextLine {
+                rootContextLine(row)
             }
-
-            if let gitContext = row.gitContext {
-                gitContextCapsule(gitContext, row: row)
-                    .layoutPriority(1)
-            }
-
-            if let worktree = row.worktree {
-                worktreeCapsule(worktree)
-                    .layoutPriority(0)
-            }
-
-            if let attention = mergeAttention(for: row) {
-                mergeAttentionCapsule(attention)
-            }
-
-            Spacer()
-
-            if hasMultipleRoots, isHovered {
-                HStack(spacing: fontPreset.scaledClamped(2, max: 3)) {
-                    RootIconButton(
-                        systemName: "chevron.up",
-                        tooltip: "Move up",
-                        size: rootIconButtonSize,
-                        iconSize: rootIconButtonIconSize,
-                        cornerRadius: rootIconButtonCornerRadius
-                    ) {
-                        rootsStore.moveRootUp(rowID: row.id)
-                    }
-                    .disabled(!row.canMoveUp)
-                    .opacity(row.canMoveUp ? 1 : 0.3)
-
-                    RootIconButton(
-                        systemName: "chevron.down",
-                        tooltip: "Move down",
-                        size: rootIconButtonSize,
-                        iconSize: rootIconButtonIconSize,
-                        cornerRadius: rootIconButtonCornerRadius
-                    ) {
-                        rootsStore.moveRootDown(rowID: row.id)
-                    }
-                    .disabled(!row.canMoveDown)
-                    .opacity(row.canMoveDown ? 1 : 0.3)
-                }
-            }
-
-            RootIconButton(
-                systemName: "xmark",
-                tooltip: "Remove from workspace",
-                size: rootIconButtonSize,
-                iconSize: rootIconButtonIconSize,
-                cornerRadius: rootIconButtonCornerRadius
-            ) {
-                rootsStore.removeRoot(rowID: row.id)
-            }
-            .opacity(isHovered ? 1 : 0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .trailing) {
+            rootActionsOverlay(row, hasMultipleRoots: hasMultipleRoots)
+                .opacity(isHovered || hasFocusedAction ? 1 : 0)
+                .allowsHitTesting(isHovered)
+                .accessibilityHidden(false)
         }
         .padding(.horizontal, rootRowHorizontalPadding)
         .padding(.vertical, rootRowVerticalPadding)
-        .frame(minHeight: estimatedFolderRowHeight)
+        .frame(minHeight: hasContextLine ? rootContextRowMinHeight : estimatedFolderRowHeight)
         .background(
             RoundedRectangle(cornerRadius: rootRowCornerRadius)
                 .fill(isHovered ? Color(NSColor.quaternaryLabelColor).opacity(0.5) : Color.clear)
@@ -445,6 +421,114 @@ struct AgentWorkspaceRootsSectionView: View {
             hoveredRootID = hovered ? row.id : nil
         }
         .hoverTooltip(row.fullPath, .top)
+    }
+
+    private func rootIdentityLine(_ row: AgentWorkspaceRootRow) -> some View {
+        HStack(spacing: rootRowSpacing) {
+            Image(systemName: "folder.fill")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .foregroundColor(.secondary)
+                .frame(width: rootFolderIconWidth, alignment: .leading)
+
+            Text(row.name)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 12))
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+                .layoutPriority(2)
+
+            if row.isPrimary {
+                primaryBadge
+                    .layoutPriority(1)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var primaryBadge: some View {
+        Text("PRIMARY")
+            .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
+            .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
+            .background(
+                Capsule()
+                    .strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75)
+            )
+    }
+
+    private func rootContextLine(_ row: AgentWorkspaceRootRow) -> some View {
+        HStack(spacing: rootContextSpacing) {
+            if let gitContext = row.gitContext {
+                gitContextCapsule(gitContext, row: row)
+                    .layoutPriority(3)
+            }
+
+            if let worktree = row.worktree {
+                worktreeCapsule(worktree)
+                    .layoutPriority(2)
+            }
+
+            if let attention = mergeAttention(for: row) {
+                mergeAttentionCapsule(attention)
+                    .layoutPriority(0)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func rootActionsOverlay(_ row: AgentWorkspaceRootRow, hasMultipleRoots: Bool) -> some View {
+        HStack(spacing: rootActionOverlaySpacing) {
+            if hasMultipleRoots {
+                RootIconButton(
+                    systemName: "chevron.up",
+                    tooltip: "Move up",
+                    size: rootIconButtonSize,
+                    iconSize: rootIconButtonIconSize,
+                    cornerRadius: rootIconButtonCornerRadius
+                ) {
+                    rootsStore.moveRootUp(rowID: row.id)
+                }
+                .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveUp))
+                .disabled(!row.canMoveUp)
+                .opacity(row.canMoveUp ? 1 : 0.3)
+
+                RootIconButton(
+                    systemName: "chevron.down",
+                    tooltip: "Move down",
+                    size: rootIconButtonSize,
+                    iconSize: rootIconButtonIconSize,
+                    cornerRadius: rootIconButtonCornerRadius
+                ) {
+                    rootsStore.moveRootDown(rowID: row.id)
+                }
+                .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .moveDown))
+                .disabled(!row.canMoveDown)
+                .opacity(row.canMoveDown ? 1 : 0.3)
+            }
+
+            RootIconButton(
+                systemName: "xmark",
+                tooltip: "Remove from workspace",
+                size: rootIconButtonSize,
+                iconSize: rootIconButtonIconSize,
+                cornerRadius: rootIconButtonCornerRadius
+            ) {
+                rootsStore.removeRoot(rowID: row.id)
+            }
+            .focused($focusedRootAction, equals: RootActionFocus(rowID: row.id, action: .remove))
+        }
+        .padding(.horizontal, fontPreset.scaledClamped(3, max: 5))
+        .padding(.vertical, fontPreset.scaledClamped(2, max: 3))
+        .background(
+            RoundedRectangle(cornerRadius: fontPreset.scaledClamped(7, max: 9), style: .continuous)
+                .fill(.regularMaterial)
+                .shadow(color: .black.opacity(0.14), radius: 4, x: 0, y: 1)
+        )
     }
 
     // MARK: - Root Row Context Menu
@@ -556,47 +640,65 @@ struct AgentWorkspaceRootsSectionView: View {
 
     // MARK: - Worktree Capsule
 
-    /// Compact `WT <label>` capsule shown after `PRIMARY` for a workspace root
-    /// bound to a worktree in the active Agent session. Tinted by the global
-    /// per-repo worktree color; missing worktrees render muted with a warning
-    /// glyph so a stale binding stays visible.
+    /// Compact `WT <label>` capsule shown for a workspace root bound to a
+    /// worktree in the active Agent session. Available worktrees keep their
+    /// configured identity color; unavailable worktrees preserve the `WT label`
+    /// text and add warning treatment without changing the saved identity color.
+    @ViewBuilder
     private func worktreeCapsule(_ worktree: AgentWorktreeIndicator) -> some View {
-        let tint = worktree.isAvailable ? worktree.color : Color.secondary
-        let glyph = worktree.isAvailable ? "arrow.triangle.branch" : "exclamationmark.triangle.fill"
-        let label = worktree.isAvailable
-            ? worktree.capsuleText
-            : "\(worktree.capsuleText) (unavailable)"
+        let tint = worktree.isAvailable ? worktree.color : Color.orange
+        Group {
+            if worktree.allowsCompactCapsule {
+                ViewThatFits(in: .horizontal) {
+                    worktreeCapsuleBody(worktree, tint: tint, isCompact: false)
+                    worktreeCapsuleBody(worktree, tint: tint, isCompact: true)
+                }
+            } else {
+                worktreeCapsuleBody(worktree, tint: tint, isCompact: false)
+            }
+        }
+        .hoverTooltip(worktree.tooltipText, .top)
+        .accessibilityLabel(worktree.accessibilityText)
+    }
+
+    private func worktreeCapsuleBody(
+        _ worktree: AgentWorktreeIndicator,
+        tint: Color,
+        isCompact: Bool
+    ) -> some View {
+        let glyph = worktree.isAvailable ? worktree.iconName : "exclamationmark.triangle.fill"
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
             Image(systemName: glyph)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
-            Text(label)
-                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: worktreeCapsuleLabelMaxWidth, alignment: .leading)
+            if isCompact {
+                Text("WT")
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                    .lineLimit(1)
+            } else {
+                Text(worktree.capsuleText)
+                    .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: worktreeCapsuleLabelMaxWidth, alignment: .leading)
+            }
         }
         .foregroundColor(tint)
         .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
         .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
         .background(
-            Capsule().fill(tint.opacity(worktree.isAvailable ? 0.14 : 0.10))
+            Capsule().fill(tint.opacity(worktree.isAvailable ? 0.14 : 0.12))
         )
         .overlay(
-            Capsule().strokeBorder(tint.opacity(0.5), lineWidth: 0.75)
+            Capsule().strokeBorder(tint.opacity(worktree.isAvailable ? 0.5 : 0.7), lineWidth: 0.75)
         )
-        .hoverTooltip(worktree.tooltipText, .top)
-        .accessibilityLabel(worktree.accessibilityText)
     }
 
     // MARK: - Merge Attention Capsule
 
     /// `MERGE → <target>` capsule shown for workspace roots that participate
-    /// in an active worktree merge for the active Agent session. Tints the
-    /// capsule by merge state (awaiting approval / conflicted / awaiting
-    /// commit) and exposes the operation in tooltip + accessibility text.
-    /// Sized to match `worktreeCapsule` so layout stays stable as the badge
-    /// attaches and detaches.
+    /// in an active worktree merge for the active Agent session. It has the
+    /// lowest row priority so it truncates before WT/branch at narrow widths.
     private func mergeAttentionCapsule(_ attention: AgentWorktreeMergeAttention) -> some View {
         let tint: Color = switch attention.kind {
         case .conflicted: .orange
@@ -611,11 +713,21 @@ struct AgentWorkspaceRootsSectionView: View {
         return HStack(spacing: fontPreset.scaledClamped(3, max: 4)) {
             Image(systemName: glyph)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 7, weight: .semibold))
-            Text(attention.capsuleText)
+            Text("MERGE")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Text("→")
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Text(attention.targetLabel)
                 .font(fontPreset.swiftUIFont(sizeAtNormal: 8, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .frame(maxWidth: mergeCapsuleLabelMaxWidth, alignment: .leading)
         }
+        .fixedSize(horizontal: false, vertical: true)
         .foregroundColor(tint)
         .padding(.horizontal, fontPreset.scaledClamped(4, max: 6))
         .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
@@ -719,6 +831,7 @@ private struct RootIconButton: View {
                 )
         }
         .buttonStyle(PlainButtonStyle())
+        .accessibilityLabel(tooltip)
         .onHover { isHovered = $0 }
         .hoverTooltip(tooltip, .top)
     }

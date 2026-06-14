@@ -92,6 +92,24 @@ actor WorkspaceSearchDecodedContentCache {
         self.maxEstimatedCost = maxEstimatedCost
     }
 
+    func cachedSnapshot(
+        for key: WorkspaceSearchContentCacheKey,
+        invalidationEpoch: UInt64
+    ) -> WorkspaceSearchDecodedContentEntry? {
+        guard var cached = entries[key],
+              cached.invalidationEpoch == invalidationEpoch
+        else {
+            return nil
+        }
+        nextAccessOrdinal &+= 1
+        cached.accessOrdinal = nextAccessOrdinal
+        entries[key] = cached
+        #if DEBUG
+            hitCount += 1
+        #endif
+        return cached.value
+    }
+
     func snapshot(
         for key: WorkspaceSearchContentCacheKey,
         fingerprint: FileContentFingerprint,

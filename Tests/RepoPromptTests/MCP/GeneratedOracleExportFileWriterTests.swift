@@ -55,79 +55,51 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         }
     }
 
-    @MainActor
-    func testBoundGeneratedExportUsesWorktreeRootAndIsReadableThroughSameLookupContext() async throws {
-        let logicalRoot = try makeTemporaryRoot(name: "OracleExportBoundLogical")
-        let worktreeRoot = try makeTemporaryRoot(name: "OracleExportBoundWorktree")
+    func testGeneratedExportWriterWritesToBoundWorktreeAndReturnsLogicalPath() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "OracleExportLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "OracleExportWorktree")
         let store = WorkspaceFileContextStore()
-        let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
-        let physicalRecord = try await store.loadRoot(
-            path: worktreeRoot.path,
-            kind: .sessionWorktree
+        _ = try await store.loadRoot(path: logicalRoot.path)
+        let sessionID = UUID()
+        let binding = makeBinding(logicalRoot: logicalRoot, worktreeRoot: worktreeRoot)
+        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: sessionID,
+            bindings: [binding]
         )
-        let logicalRef = WorkspaceRootRef(id: logicalRecord.id, name: "Project", fullPath: logicalRoot.path)
-        let physicalRef = WorkspaceRootRef(id: physicalRecord.id, name: "Project", fullPath: worktreeRoot.path)
-        let projection = WorkspaceRootBindingProjection(
-            sessionID: UUID(),
-            boundRoots: [
-                .init(
-                    logicalRoot: logicalRef,
-                    physicalRoot: physicalRef,
-                    binding: AgentSessionWorktreeBinding(
-                        id: "binding-id",
-                        repositoryID: "repo-id",
-                        repoKey: "repo-key",
-                        logicalRootPath: logicalRoot.path,
-                        logicalRootName: "Project",
-                        worktreeID: "worktree-id",
-                        worktreeRootPath: worktreeRoot.path,
-                        source: "test"
-                    )
-                )
-            ],
-            visibleLogicalRoots: [logicalRef]
-        )
+        let projection = try XCTUnwrap(materializedProjection)
         let lookupContext = WorkspaceLookupContext(
             rootScope: projection.lookupRootScope,
             bindingProjection: projection
         )
-        let workspace = WorkspaceModel(name: "Bound Export", repoPaths: [logicalRoot.path])
-        let destination = try MCPServerViewModel.makeOracleExportDestination(
-            workspace: workspace,
+        let destination = OracleExportDestination(
+            workspaceID: UUID(),
             windowID: 1,
-            tabID: UUID(),
+            tabID: nil,
+            primaryRootPath: logicalRoot.path,
             lookupContext: lookupContext
         )
+        let logicalExportPath = logicalRoot.appendingPathComponent("prompt-exports/oracle-plan-worktree.md").path
+        let physicalExportPath = worktreeRoot.appendingPathComponent("prompt-exports/oracle-plan-worktree.md").path
 
-        XCTAssertEqual(destination.primaryRootPath, worktreeRoot.standardizedFileURL.path)
-        XCTAssertEqual(destination.rootScope, projection.lookupRootScope)
-
-        let logicalExportPath = logicalRoot.appendingPathComponent("prompt-exports/oracle-plan-bound.md").path
-        let physicalExportPath = lookupContext.translateInputPath(logicalExportPath)
         let resolvedPath = try await GeneratedOracleExportFileWriter(store: store).write(
-            path: physicalExportPath,
-            content: "# Bound Oracle Plan\n\nRead me from the worktree",
+            path: logicalExportPath,
+            content: "# Bound Worktree Export",
             destination: destination
         )
 
-        XCTAssertEqual(
-            resolvedPath,
-            worktreeRoot.appendingPathComponent("prompt-exports/oracle-plan-bound.md").path
-        )
+        XCTAssertEqual(resolvedPath, StandardizedPath.absolute(logicalExportPath))
         XCTAssertFalse(FileManager.default.fileExists(atPath: logicalExportPath))
-        let readableService = WorkspaceReadableFileService(store: store)
-        guard case let .workspace(file) = await readableService.resolveReadableFile(
-            lookupContext.translateInputPath(logicalExportPath),
+        XCTAssertTrue(FileManager.default.fileExists(atPath: physicalExportPath))
+        XCTAssertEqual(try String(contentsOfFile: physicalExportPath), "# Bound Worktree Export")
+        let readable = await WorkspaceReadableFileService(store: store).resolveReadableFile(
+            lookupContext.translateInputPath(resolvedPath),
             profile: .mcpRead,
             rootScope: lookupContext.rootScope
-        ) else {
-            return XCTFail("Bound generated export should be readable through the originating lookup context")
-        }
-        let content = try await store.readContent(
-            rootID: file.rootID,
-            relativePath: file.standardizedRelativePath
         )
-        XCTAssertEqual(content, "# Bound Oracle Plan\n\nRead me from the worktree")
+        guard case let .workspace(file) = readable else {
+            return XCTFail("Returned logical export path should translate to a readable bound-worktree file")
+        }
+        XCTAssertEqual(file.standardizedFullPath, StandardizedPath.absolute(physicalExportPath))
     }
 
     func testGeneratedExportWriterRejectsUnloadedPrimaryRootWithoutDirectFileManagerFallback() async throws {
@@ -150,7 +122,7 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
             XCTFail("Expected unloaded generated export root to fail")
         } catch {
             let message = String(describing: error)
-            XCTAssertTrue(message.contains("not loaded in the current read_file workspace scope"), message)
+            XCTAssertTrue(message.contains("not loaded in the bound read_file workspace scope"), message)
         }
         XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), "Generated exports must not direct-write outside loaded read_file roots")
     }
@@ -233,6 +205,21 @@ final class GeneratedOracleExportFileWriterTests: XCTestCase {
         }
 
         XCTAssertFalse(FileManager.default.fileExists(atPath: outsideTarget), "Rejected generated exports should clean up symlinked disk artifacts")
+    }
+
+    private func makeBinding(logicalRoot: URL, worktreeRoot: URL) -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
+            id: "oracle-export-binding",
+            repositoryID: "oracle-export-repo",
+            repoKey: logicalRoot.path,
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: logicalRoot.lastPathComponent,
+            worktreeID: "oracle-export-worktree",
+            worktreeRootPath: worktreeRoot.path,
+            worktreeName: worktreeRoot.lastPathComponent,
+            branch: "feature/oracle-export",
+            source: "test"
+        )
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {

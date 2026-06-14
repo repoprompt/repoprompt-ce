@@ -609,6 +609,7 @@ class WindowStatesManager: ObservableObject {
     }
 
     func unregisterWindowState(_ state: WindowState) {
+        state.beginClose()
         if let idx = allWindows.firstIndex(where: { $0 === state }) {
             allWindows.remove(at: idx)
         }
@@ -914,12 +915,12 @@ class WindowStatesManager: ObservableObject {
     /// Computes a display name for the specified window, appending " (N)" when N ≥ 2.
     func displayName(for window: WindowState) -> String {
         guard let ws = window.workspaceManager.activeWorkspace else {
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         // Default/system workspace: always show the app name and never append the number
         if ws.isSystemWorkspace {
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         let base = ws.name

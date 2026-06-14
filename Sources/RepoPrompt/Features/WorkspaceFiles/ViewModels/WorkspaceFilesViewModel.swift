@@ -7594,11 +7594,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
             rootFolders
-        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
+        case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
-                    && !logicalRootPaths.contains(root.standardizedFullPath)
+                    && canonicalRootPaths.contains(root.standardizedFullPath)
             }
         }
     }

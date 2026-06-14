@@ -156,7 +156,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                     let abs = entry.file.standardizedFullPath
                     if seenPaths.insert(abs).inserted { combined.append(entry.file) }
                 }
-                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext.bindingProjection)
+                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext)
                 try Task.checkCancellation()
                 return try Value(reply)
             default:
@@ -178,7 +178,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 try Task.checkCancellation()
                 let resolvedFiles = try await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
                 try Task.checkCancellation()
-                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext.bindingProjection)
+                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext)
                 try Task.checkCancellation()
                 return try Value(reply)
             }

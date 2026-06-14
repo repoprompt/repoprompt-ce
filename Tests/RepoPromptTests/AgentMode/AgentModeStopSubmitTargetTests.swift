@@ -471,6 +471,8 @@ final class AgentModeStopSubmitTargetTests: XCTestCase {
         let controller = StopSubmitNoopCodexController(hasActiveThread: true)
         let vm = makeViewModel(codexController: controller)
         let tabID = UUID()
+        vm.test_setCurrentTabIDOverride(tabID)
+        defer { vm.test_setCurrentTabIDOverride(nil) }
         vm.ensureSession(for: tabID)
         let session = try XCTUnwrap(vm.sessions[tabID])
         session.hasLoadedPersistedState = true

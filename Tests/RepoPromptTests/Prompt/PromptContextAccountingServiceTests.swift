@@ -39,6 +39,85 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testPhysicalizedSelectionRefreshesSessionBoundBatchLookupAfterWorktreeLoad() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "AccountingLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "AccountingWorktree")
+        let logicalFile = logicalRoot.appendingPathComponent("Sources/App.swift")
+        let worktreeFile = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try write("canonical", to: logicalFile)
+        try write("worktree", to: worktreeFile)
+
+        let store = WorkspaceFileContextStore()
+        let logicalRootRecord = try await store.loadRoot(path: logicalRoot.path)
+        let logicalRootRef = WorkspaceRootRef(
+            id: logicalRootRecord.id,
+            name: logicalRootRecord.name,
+            fullPath: logicalRootRecord.standardizedFullPath
+        )
+        let physicalRootRef = WorkspaceRootRef(
+            id: UUID(),
+            name: logicalRootRecord.name,
+            fullPath: worktreeRoot.path
+        )
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRootRef,
+                    physicalRoot: physicalRootRef,
+                    binding: AgentSessionWorktreeBinding(
+                        id: "accounting-binding",
+                        repositoryID: "accounting-repository",
+                        repoKey: "accounting-repo",
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: logicalRootRecord.name,
+                        worktreeID: "accounting-worktree",
+                        worktreeRootPath: worktreeRoot.path,
+                        source: "test"
+                    )
+                )
+            ],
+            visibleLogicalRoots: [logicalRootRef]
+        )
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        )
+        let logicalSelection = StoredSelection(
+            selectedPaths: [logicalFile.path],
+            codemapAutoEnabled: false
+        )
+        let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+        XCTAssertEqual(physicalSelection.selectedPaths, [worktreeFile.path])
+
+        let request = WorkspacePathLookupRequest(
+            userPath: worktreeFile.path,
+            profile: .uiAssisted,
+            rootScope: lookupContext.rootScope
+        )
+        let generationBeforeWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        let lookupBeforeWorktreeLoad = await store.lookupPaths([request])
+        XCTAssertTrue(lookupBeforeWorktreeLoad.isEmpty)
+
+        let worktreeRootRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+        let generationAfterWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        XCTAssertNotEqual(generationAfterWorktreeLoad, generationBeforeWorktreeLoad)
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: physicalSelection,
+            store: store,
+            rootScope: lookupContext.rootScope,
+            codeMapUsage: .none
+        )
+
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(resolution.entries.count, 1)
+        XCTAssertEqual(entry.file.rootID, worktreeRootRecord.id)
+        XCTAssertEqual(entry.file.standardizedRelativePath, "Sources/App.swift")
+        XCTAssertEqual(entry.loadedContent, "worktree")
+        XCTAssertEqual(resolution.missingPaths, [])
+        XCTAssertEqual(resolution.invalidPaths, [])
+    }
+
     func testDuplicateSelectedPathsPreserveExistingEntryDedupOrder() async throws {
         let root = try makeTemporaryRoot(name: "AccountingDuplicates")
         let fileA = root.appendingPathComponent("A.swift")

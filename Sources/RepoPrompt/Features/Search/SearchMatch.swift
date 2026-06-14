@@ -488,7 +488,10 @@ private struct SearchFileDescriptor {
                 )
             }
             do {
-                let snapshot = try await store.searchContentSnapshot(for: record)
+                let snapshot = try await store.searchContentSnapshot(
+                    for: record,
+                    freshnessPolicy: policy
+                )
                 outcome = snapshot.isFresh ? "current" : "missing"
                 return snapshot
             } catch is CancellationError {

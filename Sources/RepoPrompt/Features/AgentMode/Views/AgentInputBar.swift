@@ -293,8 +293,28 @@ struct AgentComposerView: View, Equatable {
     private let imageInputAdapter = AgentImageInputAdapter()
     private static let staleSubmitTargetMessage = "This composer changed before the message could be sent. Please try again."
 
+    static func hasEquivalentRenderIdentity(
+        lhsProps: AgentComposerProps,
+        lhsPlaceholderText: String,
+        lhsCurrentTabID: UUID?,
+        rhsProps: AgentComposerProps,
+        rhsPlaceholderText: String,
+        rhsCurrentTabID: UUID?
+    ) -> Bool {
+        lhsProps == rhsProps &&
+            lhsPlaceholderText == rhsPlaceholderText &&
+            lhsCurrentTabID == rhsCurrentTabID
+    }
+
     static func == (lhs: AgentComposerView, rhs: AgentComposerView) -> Bool {
-        lhs.props == rhs.props && lhs.placeholderText == rhs.placeholderText
+        hasEquivalentRenderIdentity(
+            lhsProps: lhs.props,
+            lhsPlaceholderText: lhs.placeholderText,
+            lhsCurrentTabID: lhs.currentTabID,
+            rhsProps: rhs.props,
+            rhsPlaceholderText: rhs.placeholderText,
+            rhsCurrentTabID: rhs.currentTabID
+        )
     }
 
     private var hasPendingImageAttachments: Bool {

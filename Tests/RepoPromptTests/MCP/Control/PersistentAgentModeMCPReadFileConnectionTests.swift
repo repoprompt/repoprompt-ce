@@ -1571,6 +1571,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
+            if agentOwned {
+                window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
+                    guard sessionID == agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+                    return .hydrated([])
+                }
+            }
             WindowStatesManager.shared.registerWindowState(window)
             // Keep dispatch in ordinary multi-window routing mode so catalog services retained by
             // earlier tests are filtered by window ID instead of relying on singleton cleanliness.
@@ -1615,7 +1621,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
                 let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-                let rootRecord = try await window.workspaceFileContextStore.loadRoot(path: rootURL.path)
+                let rootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 rootID = rootRecord.id
                 let exactHit = await WorkspaceReadableFileService(store: window.workspaceFileContextStore)
                     .resolveExactAbsoluteWorkspaceCatalogHit(fileURL.path, rootScope: .visibleWorkspace)
@@ -1793,7 +1799,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 atomically: true,
                 encoding: .utf8
             )
-            let auxiliaryRoot = try await window.workspaceFileContextStore.loadRoot(path: auxiliaryRootURL.path)
+            let auxiliaryRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: auxiliaryRootURL.path)
             auxiliaryRootID = auxiliaryRoot.id
 
             let worktreeRootURL = FileManager.default.temporaryDirectory
@@ -1843,8 +1849,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 source: "test"
             )
             window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
-                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return [] }
-                return [binding]
+                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+                return .hydrated([binding])
             }
         }
 
@@ -1892,7 +1898,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 )
             )
 
-            let root = try await routingGuardWindow.workspaceFileContextStore.loadRoot(path: rootURL.path)
+            let root = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: routingGuardWindow, path: rootURL.path)
             peerRootID = root.id
             peerTargetStateVersionBeforeSelection = routingGuardWindow.workspaceManager
                 .debugStateVersionForWorkspace(workspaceID)

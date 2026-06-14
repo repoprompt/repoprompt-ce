@@ -586,6 +586,10 @@ extension AgentModeViewModel {
             self.tabID = tabID
         }
 
+        deinit {
+            applyEditsApprovalSubscriptionTask?.cancel()
+        }
+
         @discardableResult
         func beginPersistentBindingTransition() -> UInt64 {
             bindingTransitionGeneration &+= 1

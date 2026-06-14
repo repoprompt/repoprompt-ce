@@ -212,6 +212,12 @@ actor ApplyEditsApprovalStore: Sendable {
         removeSubscription(scope: scope, id: id, finishContinuation: true)
     }
 
+    #if DEBUG
+        func test_subscriptionCount() -> Int {
+            subscriptions.values.reduce(0) { $0 + $1.count }
+        }
+    #endif
+
     private func resolvePendingReviewIfMatching(
         scope: ApplyEditsApprovalScope,
         reviewID: UUID,

@@ -53,14 +53,23 @@ extension MCPServerViewModel {
         var selectionRevision: UInt64
         /// Selected stored prompt IDs for computing meta tokens in tab-context snapshots.
         var selectedMetaPromptIDs: [UUID]
+        /// Selected Context Builder prompt IDs. These are distinct from StoredPrompt IDs.
+        var selectedContextBuilderPromptIDs: [UUID]
         /// Tab name for MCP metadata block generation.
         var tabName: String
         /// Optional run lease associated with this snapshot.
         var runID: UUID?
         /// Active persisted Agent session bound to this tab, if any.
         var activeAgentSessionID: UUID?
-        /// Worktree bindings for the active Agent session at snapshot time.
-        var worktreeBindings: [AgentSessionWorktreeBinding]
+        /// Hydration-aware worktree binding state for the active Agent session at snapshot time.
+        var worktreeBindingState: AgentSessionWorktreeBindingState
+        var worktreeBindings: [AgentSessionWorktreeBinding] {
+            get { worktreeBindingState.bindings ?? [] }
+            set { worktreeBindingState = .hydrated(newValue) }
+        }
+
+        /// Frozen lookup context inherited by nested run-scoped tools.
+        var frozenLookupContext: WorkspaceLookupContext?
         /// True if this snapshot was created via explicit `bind_context` / `_tabID` binding.
         /// Explicit bindings should persist even when the bound tab is not the active tab.
         let explicitlyBound: Bool
@@ -76,10 +85,13 @@ extension MCPServerViewModel {
             selection: StoredSelection,
             selectionRevision: UInt64 = 0,
             selectedMetaPromptIDs: [UUID],
+            selectedContextBuilderPromptIDs: [UUID] = [],
             tabName: String,
             runID: UUID?,
             activeAgentSessionID: UUID? = nil,
             worktreeBindings: [AgentSessionWorktreeBinding] = [],
+            worktreeBindingState: AgentSessionWorktreeBindingState? = nil,
+            frozenLookupContext: WorkspaceLookupContext? = nil,
             explicitlyBound: Bool,
             readFileAutoSelectionGeneration: UInt64 = 0
         ) {
@@ -90,10 +102,13 @@ extension MCPServerViewModel {
             self.selection = selection
             self.selectionRevision = selectionRevision
             self.selectedMetaPromptIDs = selectedMetaPromptIDs
+            self.selectedContextBuilderPromptIDs = selectedContextBuilderPromptIDs
             self.tabName = tabName
             self.runID = runID
             self.activeAgentSessionID = activeAgentSessionID
-            self.worktreeBindings = worktreeBindings
+            self.worktreeBindingState = worktreeBindingState
+                ?? (activeAgentSessionID == nil ? .notApplicable : .hydrated(worktreeBindings))
+            self.frozenLookupContext = frozenLookupContext
             self.explicitlyBound = explicitlyBound
             self.readFileAutoSelectionGeneration = readFileAutoSelectionGeneration
         }
@@ -775,10 +790,10 @@ extension MCPServerViewModel {
         }
 
         let storedSnapshot = stored.snapshot
-        let worktreeBindings = storedSnapshot.activeAgentSessionID.map {
-            agentWorktreeBindingsProvider?($0, storedSnapshot.id) ?? []
-        } ?? []
-        let preserveStoredSelection = !worktreeBindings.isEmpty
+        let storedWorktreeBindingState = storedSnapshot.activeAgentSessionID.map {
+            agentWorktreeBindingStateProvider?($0, storedSnapshot.id) ?? .unhydrated
+        } ?? .notApplicable
+        let preserveStoredSelection = storedWorktreeBindingState.bindings?.isEmpty == false
         let captured = manager.collectMCPTabContextComposeSnapshot(
             tabID: tabID,
             workspaceID: stored.workspaceID,
@@ -802,10 +817,13 @@ extension MCPServerViewModel {
                 tabID: snapshot.id
             ),
             selectedMetaPromptIDs: snapshot.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: snapshot.contextBuilder.selectedContextBuilderPromptIDs,
             tabName: snapshot.name,
             runID: runID,
             activeAgentSessionID: snapshot.activeAgentSessionID,
-            worktreeBindings: worktreeBindings,
+            worktreeBindingState: snapshot.activeAgentSessionID.map {
+                agentWorktreeBindingStateProvider?($0, snapshot.id) ?? .unhydrated
+            } ?? .notApplicable,
             explicitlyBound: explicitlyBound
         )
     }
@@ -848,10 +866,13 @@ extension MCPServerViewModel {
                     tabID: snapshot.id
                 ) ?? 0,
                 selectedMetaPromptIDs: snapshot.selectedMetaPromptIDs,
+                selectedContextBuilderPromptIDs: snapshot.contextBuilder.selectedContextBuilderPromptIDs,
                 tabName: snapshot.name,
                 runID: runID,
                 activeAgentSessionID: snapshot.activeAgentSessionID,
-                worktreeBindings: snapshot.activeAgentSessionID.map { agentWorktreeBindingsProvider?($0, snapshot.id) ?? [] } ?? [],
+                worktreeBindingState: snapshot.activeAgentSessionID.map {
+                    agentWorktreeBindingStateProvider?($0, snapshot.id) ?? .unhydrated
+                } ?? .notApplicable,
                 explicitlyBound: explicitlyBound
             )
         }
@@ -869,10 +890,13 @@ extension MCPServerViewModel {
                 ) ?? 0
             } ?? 0,
             selectedMetaPromptIDs: composeSnapshot.selectedMetaPromptIDs,
+            selectedContextBuilderPromptIDs: composeSnapshot.contextBuilder.selectedContextBuilderPromptIDs,
             tabName: composeSnapshot.name,
             runID: runID,
             activeAgentSessionID: composeSnapshot.activeAgentSessionID,
-            worktreeBindings: composeSnapshot.activeAgentSessionID.map { agentWorktreeBindingsProvider?($0, composeSnapshot.id) ?? [] } ?? [],
+            worktreeBindingState: composeSnapshot.activeAgentSessionID.map {
+                agentWorktreeBindingStateProvider?($0, composeSnapshot.id) ?? .unhydrated
+            } ?? .notApplicable,
             explicitlyBound: explicitlyBound
         )
     }
@@ -993,7 +1017,7 @@ extension MCPServerViewModel {
             return workspaceManager?.activeWorkspace?.id
         }()
 
-        var context = makeTabContextSnapshot(
+        let context = makeTabContextSnapshot(
             from: snapshot,
             workspaceID: resolvedWorkspaceID,
             windowID: windowID,
@@ -1002,7 +1026,46 @@ extension MCPServerViewModel {
             captureActiveUIState: false,
             flushActiveSelection: false
         )
+        return installTabContext(
+            clientID: clientID,
+            clientName: clientName,
+            windowID: windowID,
+            context: context,
+            signalRouting: signalRouting,
+            deferRunIDReplacementForPendingPolicy: deferRunIDReplacementForPendingPolicy
+        )
+    }
 
+    @MainActor
+    @discardableResult
+    func installFrozenTabContext(
+        clientID: String?,
+        clientName: String?,
+        context: TabContextSnapshot,
+        signalRouting: Bool = true,
+        deferRunIDReplacementForPendingPolicy: Bool = false
+    ) -> PendingPolicyRunIDMappingToken? {
+        tabContextLog("installFrozenTabContext tab=\(context.tabID) window=\(context.windowID) clientID=\(clientID ?? "nil") clientName=\(clientName ?? "nil") runID=\(context.runID?.uuidString ?? "nil")")
+        return installTabContext(
+            clientID: clientID,
+            clientName: clientName,
+            windowID: context.windowID,
+            context: context,
+            signalRouting: signalRouting,
+            deferRunIDReplacementForPendingPolicy: deferRunIDReplacementForPendingPolicy
+        )
+    }
+
+    @MainActor
+    private func installTabContext(
+        clientID: String?,
+        clientName: String?,
+        windowID: Int,
+        context initialContext: TabContextSnapshot,
+        signalRouting: Bool,
+        deferRunIDReplacementForPendingPolicy: Bool
+    ) -> PendingPolicyRunIDMappingToken? {
+        var context = initialContext
         if let clientID,
            let uuid = UUID(uuidString: clientID)
         {
@@ -1346,6 +1409,10 @@ extension MCPServerViewModel {
         }
         var merged = latest
         merged.selection = context.selection
+        merged.selectedContextBuilderPromptIDs = context.selectedContextBuilderPromptIDs
+        merged.activeAgentSessionID = context.activeAgentSessionID
+        merged.worktreeBindingState = context.worktreeBindingState
+        merged.frozenLookupContext = context.frozenLookupContext
         merged.readFileAutoSelectionGeneration = context.readFileAutoSelectionGeneration
         return merged
     }
@@ -1634,18 +1701,23 @@ extension MCPServerViewModel {
             policy: .allowLegacyImplicitRouting
         )
         let baseScope = Self.resolveFileToolLookupRootScope(purpose: purpose, resolvedContext: resolved)
-        guard let resolved,
-              let sessionID = resolved.snapshot.activeAgentSessionID,
-              !resolved.snapshot.worktreeBindings.isEmpty,
-              let projection = await materializeWorkspaceBindingProjection(
-                  sessionID: sessionID,
-                  bindings: resolved.snapshot.worktreeBindings
-              ),
-              !projection.isEmpty
-        else {
+        guard let resolved else {
             return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
         }
-        return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        if let frozenLookupContext = resolved.snapshot.frozenLookupContext {
+            return frozenLookupContext
+        }
+        let lookupContext = await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: resolved.snapshot.activeAgentSessionID,
+                worktreeBindingState: resolved.snapshot.worktreeBindingState
+            ),
+            store: promptVM.workspaceFileContextStore
+        )
+        if lookupContext == .visibleWorkspace, baseScope != .visibleWorkspace {
+            return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
+        }
+        return lookupContext
     }
 
     @MainActor
@@ -1771,8 +1843,14 @@ extension MCPServerViewModel {
         return targetWindow.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
     }
 
-    private static func tabContextRoutingErrorMessage(toolName: String) -> String {
-        "No tab context is bound for \(toolName). To resolve:\n" +
+    nonisolated static func tabContextRoutingErrorMessage(
+        toolName: String,
+        runPurpose: MCPRunPurpose? = nil
+    ) -> String {
+        if runPurpose == .agentModeRun {
+            return agentModeRoutingRecoveryMessage(toolName: toolName)
+        }
+        return "No tab context is bound for \(toolName). To resolve:\n" +
             "• Call 'bind_context' with op='list' to see available windows and context_id values\n" +
             "• Call 'bind_context' with op='bind' and a context_id to bind this connection to a tab context\n" +
             "• Or pass a matching explicit tab context hint for this tool call"
@@ -1785,7 +1863,15 @@ extension MCPServerViewModel {
             "• Or pass a matching context_id/_tabID hint on this tool call"
     }
 
-    private nonisolated static func runScopedActiveTabCompatibilityMessage(toolName: String, runPurpose: MCPRunPurpose?) -> String {
+    private nonisolated static func agentModeRoutingRecoveryMessage(toolName: String) -> String {
+        "RepoPrompt could not route \(toolName) to the active Agent Mode run. " +
+            "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
+    }
+
+    nonisolated static func runScopedActiveTabCompatibilityMessage(toolName: String, runPurpose: MCPRunPurpose?) -> String {
+        if runPurpose == .agentModeRun {
+            return agentModeRoutingRecoveryMessage(toolName: toolName)
+        }
         let purpose = runPurpose?.rawValue ?? "run-scoped"
         return "Active-tab compatibility fallback is not allowed for \(toolName) during \(purpose) execution. " +
             "Bind the MCP connection to its invoking tab context with bind_context/context_id, or retry after run-scoped routing is established."
@@ -1984,7 +2070,7 @@ extension MCPServerViewModel {
         }
 
         // 6) Fail closed with routing guidance.
-        throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName))
+        throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName, runPurpose: runPurpose))
     }
 
     @MainActor
@@ -2008,17 +2094,17 @@ extension MCPServerViewModel {
                 policy: .requireExplicitOrRunScoped
             )
             guard case let .tabContextSnapshot(context, _) = resolution else {
-                throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName))
+                throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(toolName: toolName, runPurpose: purpose))
             }
             windowIDByConnection[connectionID] = context.windowID
             beginMirroringForConnection(connectionID, context: context)
             return (connectionID, context)
         } catch {
             if purpose == .agentModeRun {
-                throw MCPError.invalidParams(
-                    "RepoPrompt could not route this Agent Mode MCP call to the active run. " +
-                        "Retry the tool call once. If it fails again, tell the user the RepoPrompt connection failed and ask them to restart this Agent Mode run."
-                )
+                throw MCPError.invalidParams(Self.tabContextRoutingErrorMessage(
+                    toolName: toolName,
+                    runPurpose: purpose
+                ))
             }
             throw error
         }

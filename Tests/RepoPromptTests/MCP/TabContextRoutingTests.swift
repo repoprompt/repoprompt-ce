@@ -508,6 +508,31 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertTrue(message.contains("disabled"), message)
     }
 
+    func testAgentModeRoutingRecoveryDoesNotRecommendRejectedExplicitContextOverrides() {
+        for message in [
+            MCPServerViewModel.tabContextRoutingErrorMessage(
+                toolName: "context_builder",
+                runPurpose: .agentModeRun
+            ),
+            MCPServerViewModel.runScopedActiveTabCompatibilityMessage(
+                toolName: "context_builder",
+                runPurpose: .agentModeRun
+            )
+        ] {
+            XCTAssertTrue(message.contains("Retry"), message)
+            XCTAssertTrue(message.contains("restart this Agent Mode run"), message)
+            XCTAssertFalse(message.contains("bind_context"), message)
+            XCTAssertFalse(message.contains("context_id"), message)
+        }
+
+        let ordinary = MCPServerViewModel.tabContextRoutingErrorMessage(
+            toolName: "workspace_context",
+            runPurpose: .unknown
+        )
+        XCTAssertTrue(ordinary.contains("bind_context"), ordinary)
+        XCTAssertTrue(ordinary.contains("context_id"), ordinary)
+    }
+
     func testConnectionManagerRoutingPoliciesKeepRunScopedToolsOutOfLegacyGenericBinding() {
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "agent_run"))
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "ask_oracle"))
@@ -639,7 +664,7 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(tabReloadResult, .switched)
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: logicalRoot.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: logicalRoot.path)
 
         var changes: [WorkspaceSelectionCoordinator.Change] = []
         window.selectionCoordinator.changes
@@ -1126,7 +1151,7 @@ final class TabContextRoutingTests: XCTestCase {
             saveState: false,
             reason: "manageSelectionPersistenceTestTabs"
         )
-        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
         let tools = await window.mcpServer.windowMCPTools
         let manageSelection = try XCTUnwrap(
             tools.first { $0.name == MCPWindowToolName.manageSelection }
