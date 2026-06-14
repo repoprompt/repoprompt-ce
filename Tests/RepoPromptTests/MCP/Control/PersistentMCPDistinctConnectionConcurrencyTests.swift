@@ -1597,7 +1597,10 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             ]
             configuredWorkspace.activeComposeTabID = tabID
             window.workspaceManager.workspaces.append(configuredWorkspace)
-            let rootRecord = try await window.workspaceFileContextStore.loadRoot(path: rootURL.path)
+            let rootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: rootURL.path
+            )
             let exactHit = await WorkspaceReadableFileService(store: window.workspaceFileContextStore)
                 .resolveExactAbsoluteWorkspaceCatalogHit(fileURL.path, rootScope: .visibleWorkspace)
             guard exactHit?.standardizedFullPath == fileURL.path else {

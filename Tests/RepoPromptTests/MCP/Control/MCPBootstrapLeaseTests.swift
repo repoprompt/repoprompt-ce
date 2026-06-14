@@ -211,7 +211,7 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 )
                 let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
                 window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-                let loadedRoot = try await window.workspaceFileContextStore.loadRoot(path: rootURL.path)
+                let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: rootURL.path)
                 loadedRootID = loadedRoot.id
 
                 ServiceRegistry.register(catalogService)

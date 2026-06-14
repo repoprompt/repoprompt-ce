@@ -1683,7 +1683,7 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "agentRunWorktreeStartTests")
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
         return window
     }
 
