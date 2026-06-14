@@ -10115,7 +10115,7 @@ final class AgentModeViewModel: ObservableObject {
             noticeRevision: 0,
             rawDraftSnapshot: text
         )
-        switch claimComposerSubmitAttempt(attempt) {
+        switch claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: false) {
         case let .claimed(claim):
             return await executeComposerSubmitAttempt(
                 text: text,
@@ -13317,7 +13317,25 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func claimComposerSubmitAttempt(_ attempt: AgentComposerSubmitAttempt) -> AgentComposerSubmitClaimResult {
+        claimComposerSubmitAttempt(attempt, requireActiveTabOwnership: true)
+    }
+
+    private func claimComposerSubmitAttempt(
+        _ attempt: AgentComposerSubmitAttempt,
+        requireActiveTabOwnership: Bool
+    ) -> AgentComposerSubmitClaimResult {
         let target = attempt.target
+        if requireActiveTabOwnership, currentTabID != target.tabID {
+            let rejection = AgentComposerSubmitClaimRejection.targetRejected(reason: "inactive_composer_tab")
+            logRejectedSubmitTarget(
+                target,
+                session: sessions[target.tabID],
+                reason: rejection.diagnosticReason,
+                attempt: attempt
+            )
+            resyncAfterRejectedSubmitTarget(target)
+            return .rejected(rejection)
+        }
         guard let session = sessions[target.tabID] else {
             let rejection = AgentComposerSubmitClaimRejection.missingSession
             logRejectedSubmitTarget(target, session: nil, reason: rejection.diagnosticReason, attempt: attempt)
@@ -13569,12 +13587,11 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func resyncAfterRejectedSubmitTarget(_ target: AgentComposerSubmitTarget) {
-        if let currentTabID, currentTabID == target.tabID {
+        if let currentTabID {
             syncActiveUIState(tabID: currentTabID, invalidation: [.composer, .runInteraction])
         }
-        requestUIRefresh(tabID: target.tabID, urgent: true)
-        if let currentTabID, currentTabID != target.tabID {
-            requestUIRefresh(tabID: currentTabID, urgent: true)
+        if currentTabID != target.tabID {
+            requestUIRefresh(tabID: target.tabID, urgent: true)
         }
     }
 

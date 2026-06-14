@@ -664,7 +664,7 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(tabReloadResult, .switched)
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: logicalRoot.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: logicalRoot.path)
 
         var changes: [WorkspaceSelectionCoordinator.Change] = []
         window.selectionCoordinator.changes
@@ -1151,7 +1151,7 @@ final class TabContextRoutingTests: XCTestCase {
             saveState: false,
             reason: "manageSelectionPersistenceTestTabs"
         )
-        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
         let tools = await window.mcpServer.windowMCPTools
         let manageSelection = try XCTUnwrap(
             tools.first { $0.name == MCPWindowToolName.manageSelection }

@@ -61,8 +61,13 @@ enum StoreBackedWorkspaceSearch {
             }
 
             let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
-            _ = await store.awaitAppliedIngress(rootScope: rootScope)
+            let appliedIngressSamples = await store.awaitAppliedIngress(rootScope: rootScope)
             EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
+            try Task.checkCancellation()
+            let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(
+                rootScope: rootScope,
+                appliedIngressSamples: appliedIngressSamples
+            )
             try Task.checkCancellation()
 
             return try await performSearch(
@@ -81,6 +86,7 @@ enum StoreBackedWorkspaceSearch {
                 countOnly: countOnly,
                 fuzzySpaceMatching: fuzzySpaceMatching,
                 allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
+                contentFreshnessPolicy: contentFreshnessPolicy,
                 rootScope: rootScope,
                 store: store,
                 fileSearchActor: fileSearchActor
@@ -132,6 +138,7 @@ enum StoreBackedWorkspaceSearch {
         countOnly: Bool,
         fuzzySpaceMatching: Bool,
         allowLiteralUnescapeFallback: Bool,
+        contentFreshnessPolicy: FileContentFreshnessPolicy,
         rootScope: WorkspaceLookupRootScope,
         store: WorkspaceFileContextStore,
         fileSearchActor: FileSearchActor
@@ -234,9 +241,10 @@ enum StoreBackedWorkspaceSearch {
             EditFlowPerf.Dimensions(status: (paths?.isEmpty == false) ? "explicit" : "all", fileCount: filesToSearch.count)
         )
 
-        let contentFreshnessPolicy: FileContentFreshnessPolicy = (effectiveMode == .content || effectiveMode == .both)
-            ? .validateDiskMetadata
-            : .cachedMetadata
+        let effectiveContentFreshnessPolicy: FileContentFreshnessPolicy =
+            (effectiveMode == .content || effectiveMode == .both)
+                ? contentFreshnessPolicy
+                : .cachedMetadata
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
@@ -269,7 +277,7 @@ enum StoreBackedWorkspaceSearch {
                         countOnly: countOnly,
                         fuzzySpaceMatching: fuzzySpaceMatching,
                         allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
-                        contentFreshnessPolicy: contentFreshnessPolicy
+                        contentFreshnessPolicy: effectiveContentFreshnessPolicy
                     ),
                     in: filesToSearch,
                     rootsByID: rootsByID,

@@ -37,7 +37,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let window = try await makeWindow(root: logicalRootURL)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
-        let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
         let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
         let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "worktree")
         let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
@@ -82,7 +85,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
             let window = try await makeWindow(root: logicalRootURL)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }
             let store = window.workspaceFileContextStore
-            let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+            let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: logicalRootURL.path
+            )
             let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
             let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "active")
             let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
@@ -152,7 +158,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let window = try await makeWindow(root: logicalRootURL)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
-        let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
         let logicalRef = WorkspaceRootRef(
             id: logicalRoot.id,
             name: logicalRoot.name,
@@ -233,7 +242,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let window = try await makeWindow(root: logicalRootURL)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
-        let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
         let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
         let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "deleted")
         let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
@@ -287,7 +299,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let window = try await makeWindow(root: logicalRootURL)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
-        let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
         let worktreeRoot = try await store.loadRoot(path: worktreeRootURL.path, kind: .sessionWorktree)
         let projection = makeProjection(logicalRoot: logicalRoot, physicalRoot: worktreeRoot, worktreeID: "bounded")
         let files = try await (1 ... 3).asyncMap { index in
@@ -326,7 +341,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let window = try await makeWindow(root: logicalRootURL)
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
         let store = window.workspaceFileContextStore
-        let logicalRoot = try await store.loadRoot(path: logicalRootURL.path)
+        let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: logicalRootURL.path
+        )
         let logicalRef = WorkspaceRootRef(id: logicalRoot.id, name: logicalRoot.name, fullPath: logicalRoot.standardizedFullPath)
         let missingRef = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: missingWorktreeURL.path)
         let projection = WorkspaceRootBindingProjection(
@@ -398,7 +416,10 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         )
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
         return window
     }
 
