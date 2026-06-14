@@ -1059,10 +1059,6 @@ final class AgentModeViewModel: ObservableObject {
         syncComposerUIState()
     }
 
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged()
-    }
-
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         if let activeSession,
@@ -2104,25 +2100,16 @@ final class AgentModeViewModel: ObservableObject {
             persistCurrentSession()
         }
 
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
-
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
-            Publishers.MergeMany([
-                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
-            ])
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleAgentProviderAvailabilityChanged()
-            }
-            .store(in: &cancellables)
+            // Level-triggered: the current availability is replayed on subscription and
+            // later changes arrive deduplicated by value.
+            apiSettingsViewModel.$agentAvailability
+                .removeDuplicates()
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in
+                    self?.handleAgentProviderAvailabilityChanged()
+                }
+                .store(in: &cancellables)
         }
 
         // Observe workspace file-system deltas and invalidate the skill catalog

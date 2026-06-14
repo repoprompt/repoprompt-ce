@@ -896,19 +896,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
-
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
+            // Level-triggered: `agentAvailability` replays the current provider
+            // availability on subscription, while the Context Builder validation publishers
+            // cover startup verification state that is intentionally not part of that value.
             Publishers.MergeMany([
-                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$agentAvailability.map { _ in () }.eraseToAnyPublisher(),
                 apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
                 apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher()
             ])
@@ -978,10 +971,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             availability: agentAvailabilityContext,
             codexDynamicModels: codexDynamicModels
         )
-    }
-
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged()
     }
 
     private func handleAgentProviderAvailabilityChanged() {

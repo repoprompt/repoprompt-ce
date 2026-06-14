@@ -491,10 +491,6 @@ class PromptViewModel: ObservableObject {
         AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: agentAvailabilityContext)
     }
 
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged(reason: "claudeCodeGLMAvailabilityChanged")
-    }
-
     private func handleAgentProviderAvailabilityChanged(reason: String) {
         refreshAvailableAgentKinds()
         guard let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() else { return }
@@ -2205,13 +2201,6 @@ class PromptViewModel: ObservableObject {
                 syncSettingsFromSettingsManager()
             }
             .store(in: &cancellables)
-
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
@@ -3606,11 +3595,13 @@ class PromptViewModel: ObservableObject {
                 self?.availableModels = models
             }
 
+        // Level-triggered: `agentAvailability` replays the current provider
+        // availability on subscription, so a PromptViewModel wired after startup key
+        // load still initializes correctly. The remaining publishers cover Context
+        // Builder verification/model-option state that is intentionally outside that
+        // availability value.
         Publishers.MergeMany([
-            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$agentAvailability.map { _ in () }.eraseToAnyPublisher(),
             apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher(),
             apiSettingsViewModel.$availableOpenCodeModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher(),
@@ -3618,7 +3609,7 @@ class PromptViewModel: ObservableObject {
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
-            self?.handleAgentProviderAvailabilityChanged(reason: "agentProviderConnectionChanged")
+            self?.handleAgentProviderAvailabilityChanged(reason: "agentAvailabilityChanged")
         }
         .store(in: &apiSettingsCancellables)
     }

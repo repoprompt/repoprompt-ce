@@ -1,7 +1,7 @@
 import Foundation
 
 enum AgentModelCatalog {
-    struct AvailabilityContext {
+    struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool
         let openCodeAvailable: Bool

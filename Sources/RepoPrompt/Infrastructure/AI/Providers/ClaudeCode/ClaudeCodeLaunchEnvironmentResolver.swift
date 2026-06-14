@@ -88,10 +88,6 @@ enum ClaudeCodeGLMIntegration {
     }
 }
 
-extension Notification.Name {
-    static let claudeCodeGLMAvailabilityChanged = Notification.Name("claudeCodeGLMAvailabilityChanged")
-}
-
 struct ClaudeCodeLaunchEnvironment {
     enum Backend: Equatable {
         case defaultClaude
