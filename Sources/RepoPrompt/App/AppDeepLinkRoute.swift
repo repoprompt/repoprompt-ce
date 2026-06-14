@@ -31,7 +31,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
 
     var url: URL {
         var components = URLComponents()
-        components.scheme = "repoprompt"
+        components.scheme = AppDeepLinkScheme.canonical
         components.host = "agent"
         components.path = "/session"
 
@@ -47,7 +47,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
         }
         components.queryItems = queryItems
 
-        return components.url ?? URL(string: "repoprompt://agent/session")!
+        return components.url ?? URL(string: "\(AppDeepLinkScheme.canonical)://agent/session")!
     }
 
     static func parse(notificationUserInfo userInfo: [AnyHashable: Any]) -> AgentSessionDeepLinkRoute? {
@@ -83,7 +83,7 @@ struct AgentSessionDeepLinkRoute: Equatable {
 
     static func parse(url: URL) -> AgentSessionDeepLinkRoute? {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "repoprompt",
+              AppDeepLinkScheme.isAccepted(components.scheme),
               components.host?.lowercased() == "agent",
               components.path == "/session"
         else {
@@ -177,7 +177,7 @@ enum AppDeepLinkRoute: Equatable {
 
     static func parse(url: URL) -> AppDeepLinkURLParseResult {
         guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              components.scheme?.lowercased() == "repoprompt"
+              AppDeepLinkScheme.isAccepted(components.scheme)
         else {
             return .unsupported
         }
@@ -224,6 +224,25 @@ enum AgentSessionRouteResult: Equatable {
     case sessionUnavailable
     case sessionMismatch
     case blockedByActiveDifferentSession
+}
+
+/// URL schemes recognized by the app's deep-link parser.
+///
+/// `repoprompt-ce` is the scheme RepoPrompt CE registers in its app bundle
+/// (`CFBundleURLSchemes`) and is the canonical scheme used when generating
+/// links. The legacy `repoprompt` scheme is still accepted on parse so links
+/// emitted by older builds (or referenced in existing docs/tests) keep
+/// resolving.
+enum AppDeepLinkScheme {
+    static let canonical = "repoprompt-ce"
+    static let legacy = "repoprompt"
+
+    static let accepted: Set<String> = [canonical, legacy]
+
+    static func isAccepted(_ scheme: String?) -> Bool {
+        guard let scheme = scheme?.lowercased() else { return false }
+        return accepted.contains(scheme)
+    }
 }
 
 enum AppDeepLinkRouteUserInfoKey {
