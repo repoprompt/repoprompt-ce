@@ -2678,6 +2678,15 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         loadComposeTabsFromWorkspace(manager.workspaces[index])
+        NotificationCenter.default.post(
+            name: .composeTabNameChanged,
+            object: nil,
+            userInfo: [
+                "tabID": id,
+                "windowID": windowID,
+                "name": trimmed
+            ]
+        )
     }
 
     @MainActor
