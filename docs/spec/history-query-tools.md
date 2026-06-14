@@ -1,8 +1,7 @@
----
-title: History Query Tools
+## Scenarios
 issue: 123
 status: implemented
----
+- Invalid `session_id` filter values (non-UUID strings) return a validation error.
 
 # History Query Tools
 
@@ -49,8 +48,9 @@ This spec proposes a new MCP tool group — **`history`** — that queries past 
 - Registered as a window-scoped MCP tool (in `MCPWindowToolGroup.history`) that queries across all workspaces. Follows the `agent_manage.list_sessions` precedent — window tool registration with cross-workspace behavior.
 - Parameter naming follows existing RP-CE conventions (descriptive snake_case: `date_from`, `agent_kind`, `touched_file`, `session_id`).
 - Duration excludes gaps > 30 minutes between consecutive turns (idle threshold).
+- **Date bounds**: `date_from`/`date_to` accept ISO 8601 datetimes (exact instant) or date-only values (`YYYY-MM-DD`). For date-only values, `date_from` resolves to start-of-day (`00:00:00 UTC`) and `date_to` resolves to end-of-day (`23:59:59 UTC`), so both bounds are inclusive of the named day. An unparseable date string is ignored (treated as no bound) rather than erroring.
+- **Validation**: enum parameters are strict — invalid `sort` (`list_sessions`) and invalid `source` (`search`) return a validation error rather than silently falling back. `group_by` (`time`) and `op` are likewise validated. `search` `query` is trimmed; a whitespace-only query is rejected as empty.
 - Secret sanitization in search snippets deferred to v2 (`MCPResponseSanitizationPolicy` does not exist). Search snippets may expose tool args containing secrets. The risk is bounded (session data is local, only the machine's user sees MCP responses).
-- `file_edits`
 ## Scenarios
 
 ### Scenario: List sessions that touched a specific file
@@ -129,7 +129,6 @@ Session inventory with content-aware filters.
 - `last_run_state`: terminal state of the session's last run — one of `"completed"` | `"cancelled"` | `"failed"` | `"waiting_for_input"`.
 - `request_previews` is omitted from v1.
 
----
 
 ### `history.search`
 
@@ -193,7 +192,6 @@ The search operation prioritizes `conclusionText` (the full, non-truncated concl
 - `request_previews` omitted from `list_sessions` response.
 - `files_touched` depends on persisted summary key paths or persisted `toolExecution.keyPaths`; older sanitized sessions whose tool args were stripped before key path extraction may still have empty file lists.
 - `had_errors` maps to `hasUnknownConversationContent` (semantically broader than "had errors").
-- Invalid `session_id` filter values (non-UUID strings) are silently ignored rather than throwing an error.
 - `time` response `truncated` is always `false` (no limit parameter in v1).
 
 ## Open Questions

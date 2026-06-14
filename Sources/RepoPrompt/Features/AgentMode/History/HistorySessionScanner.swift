@@ -44,6 +44,9 @@ struct HistoryWorkspaceScanResult: Equatable {
     let records: [AgentSessionMetadataRecord]
     /// Whether the index file was missing or unreadable (records will be empty).
     let indexReadFailed: Bool
+    /// Non-nil when the index decoded successfully but its schema version doesn't match
+    /// ``AgentSessionMetadataIndex/currentSchemaVersion``. Records are empty in this case.
+    let indexSchemaVersion: Int?
 }
 
 /// A metadata record paired with its workspace context, ready for filtering.
@@ -148,6 +151,9 @@ actor HistorySessionScanner: HistorySessionScanning {
         var results: [HistoryFilteredSessionRecord] = []
 
         for scan in scanResults {
+            // Skip workspaces whose index schema doesn't match the current version.
+            if scan.indexSchemaVersion != nil { continue }
+
             // Workspace name filter: match against workspace name or workspace ID string
             if let workspace {
                 let nameMatch = scan.workspaceName.localizedCaseInsensitiveContains(workspace)
@@ -248,7 +254,8 @@ actor HistorySessionScanner: HistorySessionScanning {
                 workspaceName: workspaceName,
                 workspaceID: workspaceID,
                 records: [],
-                indexReadFailed: false
+                indexReadFailed: false,
+                indexSchemaVersion: nil
             )
         }
 
@@ -260,7 +267,8 @@ actor HistorySessionScanner: HistorySessionScanning {
                 workspaceName: workspaceName,
                 workspaceID: workspaceID,
                 records: [],
-                indexReadFailed: false
+                indexReadFailed: false,
+                indexSchemaVersion: nil
             )
         }
 
@@ -268,15 +276,28 @@ actor HistorySessionScanner: HistorySessionScanning {
             let data = try Data(contentsOf: indexFile, options: .mappedIfSafe)
             let index = try decoder.decode(AgentSessionMetadataIndex.self, from: data)
 
-            // Accept entries from any schema version — newer fields have backward-compatible defaults.
-            let records = index.entries
+            // Reject stale indexes whose schema version doesn't match the current version.
+            // Older indexes decode successfully but their v4+ fields (keyPaths,
+            // activeDurationSeconds, toolCallCount, etc.) fall back to empty/zero
+            // defaults, producing misleading records.
+            if index.schemaVersion != AgentSessionMetadataIndex.currentSchemaVersion {
+                return HistoryWorkspaceScanResult(
+                    workspaceDir: workspaceDir,
+                    workspaceName: workspaceName,
+                    workspaceID: workspaceID,
+                    records: [],
+                    indexReadFailed: false,
+                    indexSchemaVersion: index.schemaVersion
+                )
+            }
 
             return HistoryWorkspaceScanResult(
                 workspaceDir: workspaceDir,
                 workspaceName: workspaceName,
                 workspaceID: workspaceID,
-                records: records,
-                indexReadFailed: false
+                records: index.entries,
+                indexReadFailed: false,
+                indexSchemaVersion: nil
             )
         } catch {
             return HistoryWorkspaceScanResult(
@@ -284,7 +305,8 @@ actor HistorySessionScanner: HistorySessionScanning {
                 workspaceName: workspaceName,
                 workspaceID: workspaceID,
                 records: [],
-                indexReadFailed: true
+                indexReadFailed: true,
+                indexSchemaVersion: nil
             )
         }
     }

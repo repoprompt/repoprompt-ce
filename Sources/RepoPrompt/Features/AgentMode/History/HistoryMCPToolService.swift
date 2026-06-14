@@ -43,9 +43,12 @@ enum HistoryMCPToolService {
         let agentKindFilter = args["agent_kind"] as? String
         let modelFilter = args["model"] as? String
         let filePathFilter = args["touched_file"] as? String
-        let dateFrom = parseDate(args["date_from"])
-        let dateTo = parseDate(args["date_to"])
+        let dateFrom = parseDateBound(args["date_from"], isUpperBound: false)
+        let dateTo = parseDateBound(args["date_to"], isUpperBound: true)
         let sortRaw = args["sort"] as? String ?? "last_activity"
+        guard ["last_activity", "duration", "turn_count"].contains(sortRaw) else {
+            return errorResponse(message: "Invalid 'sort' value '\(sortRaw)'. Valid values: last_activity, duration, turn_count")
+        }
         let limit = clampLimit(args["limit"], default: 30, max: 100)
 
         let scanResults = try await scanner.scanAllWorkspaces()
@@ -66,21 +69,22 @@ enum HistoryMCPToolService {
         let dateFormatter = ISO8601DateFormatter()
         let sessions: [[String: Any]] = sliced.map { session in
             let r = session.record
-            return [
+            var dict: [String: Any] = [
                 "session_id": r.id.uuidString,
                 "session_name": r.name,
                 "workspace_name": session.workspaceName,
-                "agent_kind": r.agentKindRaw as Any,
-                "agent_model": r.agentModelRaw as Any,
                 "first_activity_at": dateFormatter.string(from: r.firstActivityAt ?? r.activityDate),
                 "last_activity_at": dateFormatter.string(from: r.lastActivityAt ?? r.savedAt),
                 "active_duration_seconds": r.activeDurationSeconds,
                 "turn_count": r.itemCount,
                 "tool_call_count": r.toolCallCount,
                 "files_touched": Array(r.keyPaths).sorted(),
-                "had_errors": r.hasUnknownConversationContent,
-                "last_run_state": r.lastRunStateRaw as Any
+                "had_errors": r.hasUnknownConversationContent
             ]
+            if let agentKindRaw = r.agentKindRaw { dict["agent_kind"] = agentKindRaw }
+            if let agentModelRaw = r.agentModelRaw { dict["agent_model"] = agentModelRaw }
+            if let lastRunStateRaw = r.lastRunStateRaw { dict["last_run_state"] = lastRunStateRaw }
+            return dict
         }
 
         return [
@@ -96,20 +100,31 @@ enum HistoryMCPToolService {
         args: [String: Any],
         scanner: HistorySessionScanning
     ) async throws -> [String: Any] {
-        guard let query = args["query"] as? String, !query.isEmpty else {
+        guard let rawQuery = args["query"] as? String,
+              !rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
             return errorResponse(message: "Missing or empty required parameter 'query'")
         }
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let workspaceFilter = args["workspace"] as? String
         let sessionIDFilter = args["session_id"] as? String
         let sourceFilter = args["source"] as? String ?? "all"
-        let dateFrom = parseDate(args["date_from"])
-        let dateTo = parseDate(args["date_to"])
+        guard ["activities", "summaries", "all"].contains(sourceFilter) else {
+            return errorResponse(message: "Invalid 'source' value '\(sourceFilter)'. Valid values: activities, summaries, all")
+        }
+        let dateFrom = parseDateBound(args["date_from"], isUpperBound: false)
+        let dateTo = parseDateBound(args["date_to"], isUpperBound: true)
         let limit = clampLimit(args["limit"], default: 20, max: 100)
 
         let scanResults = try await scanner.scanAllWorkspaces()
 
-        // If session_id filter is provided, scope to that session across all workspaces.
+        // If session_id filter is provided but invalid, return an error instead of silently broadening scope.
+        if let sessionIDFilter, UUID(uuidString: sessionIDFilter) == nil {
+            return errorResponse(message: "Invalid session_id: expected UUID format")
+        }
+
+        // Scope to that session across all workspaces.
         let filtered: [HistoryFilteredSessionRecord] = if let sessionIDFilter, let uuid = UUID(uuidString: sessionIDFilter) {
             scanner.sessionsMatchingFilters(
                 scanResults,
@@ -187,10 +202,10 @@ enum HistoryMCPToolService {
                         (summary.requestText ?? "", "requestText")
                     ]
 
-                    for (text, _) in summaryTexts where !text.isEmpty {
+                    for (text, field) in summaryTexts where !text.isEmpty {
                         if text.lowercased().contains(queryLower) {
                             let snippet = extractSnippet(text: text, query: queryLower)
-                            let roleString = mapTurnRole(turn: turn)
+                            let roleString = field == "requestText" ? "user" : "assistant"
                             let timestamp = turn.startedAt
                             let match = HistorySearchMatch(
                                 sessionID: session.record.id,
@@ -221,11 +236,6 @@ enum HistoryMCPToolService {
                     allMatches.append(only)
                 }
             }
-
-            if allMatches.count >= limit * 2 {
-                // Early exit: we have far more matches than needed.
-                break
-            }
         }
 
         // Sort matches by timestamp descending.
@@ -236,17 +246,18 @@ enum HistoryMCPToolService {
 
         let dateformatter = ISO8601DateFormatter()
         let results: [[String: Any]] = sliced.map { match in
-            [
+            var dict: [String: Any] = [
                 "session_id": match.sessionID.uuidString,
                 "session_name": match.sessionName,
                 "workspace_name": match.workspaceName,
                 "turn_index": match.turnIndex,
-                "turn_request_text": match.turnRequestText as Any,
                 "role": match.role,
                 "timestamp": dateformatter.string(from: match.timestamp),
                 "snippet": match.snippet,
                 "source": match.source
             ]
+            if let turnRequestText = match.turnRequestText { dict["turn_request_text"] = turnRequestText }
+            return dict
         }
 
         return [
@@ -273,13 +284,18 @@ enum HistoryMCPToolService {
 
         let workspaceFilter = args["workspace"] as? String
         let sessionIDFilter = args["session_id"] as? String
-        let dateFrom = parseDate(args["date_from"])
-        let dateTo = parseDate(args["date_to"])
+        let dateFrom = parseDateBound(args["date_from"], isUpperBound: false)
+        let dateTo = parseDateBound(args["date_to"], isUpperBound: true)
         let includeDetails = args["include_details"] as? Bool ?? false
 
         let scanResults = try await scanner.scanAllWorkspaces()
 
-        // If session_id filter, scope to that session.
+        // If session_id filter is provided but invalid, return an error instead of silently broadening scope.
+        if let sessionIDFilter, UUID(uuidString: sessionIDFilter) == nil {
+            return errorResponse(message: "Invalid session_id: expected UUID format")
+        }
+
+        // Scope to that session.
         let filtered: [HistoryFilteredSessionRecord] = if let sessionIDFilter, let uuid = UUID(uuidString: sessionIDFilter) {
             scanner.sessionsMatchingFilters(
                 scanResults,
@@ -329,7 +345,9 @@ enum HistoryMCPToolService {
         case "last_activity":
             fallthrough
         default:
-            sessions.sorted { $0.record.activityDate > $1.record.activityDate }
+            sessions.sorted {
+                ($0.record.lastActivityAt ?? $0.record.activityDate) > ($1.record.lastActivityAt ?? $1.record.activityDate)
+            }
         }
     }
 
@@ -510,14 +528,17 @@ enum HistoryMCPToolService {
         }
     }
 
-    /// Derive a role string for a turn based on whether it has a user request.
-    private static func mapTurnRole(turn: AgentTranscriptTurn) -> String {
-        turn.request != nil ? "user" : "assistant"
-    }
-
     // MARK: - Helpers
 
     static func parseDate(_ value: Any?) -> Date? {
+        parseDateBound(value, isUpperBound: false)
+    }
+
+    /// Parse a date bound. ISO 8601 datetime values use the exact instant. Date-only
+    /// values (e.g. `"2026-01-15"`) resolve to **start-of-day** (`00:00:00 UTC`) for
+    /// lower bounds and **end-of-day** (`23:59:59 UTC`) for upper bounds, so `date_to`
+    /// is inclusive of the named day rather than excluding it.
+    static func parseDateBound(_ value: Any?, isUpperBound: Bool) -> Date? {
         guard let stringValue = value as? String, !stringValue.isEmpty else { return nil }
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -526,7 +547,16 @@ enum HistoryMCPToolService {
         }
         // Try without fractional seconds.
         formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: stringValue)
+        if let date = formatter.date(from: stringValue) {
+            return date
+        }
+        // Date-only format (e.g. "2026-01-15"). Lower bound = start of day; upper bound
+        // = end of day so the named day is included.
+        let dateOnlyFormatter = DateFormatter()
+        dateOnlyFormatter.dateFormat = "yyyy-MM-dd"
+        dateOnlyFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+        guard let midnight = dateOnlyFormatter.date(from: stringValue) else { return nil }
+        return isUpperBound ? midnight.addingTimeInterval(86399) : midnight
     }
 
     static func clampLimit(_ value: Any?, default defaultValue: Int, max maxValue: Int) -> Int {

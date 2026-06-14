@@ -125,6 +125,15 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(sessions?[1]["session_name"] as? String, "Short")
     }
 
+    func testListSessions_invalidSort_returnsError() async throws {
+        mockScanner.scanResults = []
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "sort": "bogus"],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(result["error"] as? String, "Invalid 'sort' value 'bogus'. Valid values: last_activity, duration, turn_count")
+    }
+
     func testListSessions_sortByTurnCount() async throws {
         let r1 = makeRecord(name: "Few", itemCount: 2)
         let r2 = makeRecord(name: "Many", itemCount: 10)
@@ -267,6 +276,22 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
         XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'query'")
+    }
+
+    func testSearch_whitespaceOnlyQuery_returnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "   \t  "],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'query'")
+    }
+
+    func testSearch_invalidSource_returnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "test", "source": "bogus"],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(result["error"] as? String, "Invalid 'source' value 'bogus'. Valid values: activities, summaries, all")
     }
 
     func testSearch_noMatches() async throws {
@@ -846,6 +871,59 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     // MARK: - time
 
+    func testSearch_passesDateFiltersToScanner() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in .empty }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "search",
+                "query": "test",
+                "date_from": "2026-01-15T00:00:00Z",
+                "date_to": "2026-01-20T00:00:00Z"
+            ],
+            scanner: mockScanner
+        )
+
+        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let request = try XCTUnwrap(mockScanner.filterRequests.first)
+        XCTAssertEqual(request.from, HistoryMCPToolService.parseDate("2026-01-15T00:00:00Z"))
+        XCTAssertEqual(request.to, HistoryMCPToolService.parseDate("2026-01-20T00:00:00Z"))
+        // search passes nil for agentKind, model, filePath
+        XCTAssertNil(request.agentKind)
+        XCTAssertNil(request.model)
+        XCTAssertNil(request.filePath)
+    }
+
+    func testSearch_passesWorkspaceFilterToScanner() async throws {
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in .empty }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: [
+                "op": "search",
+                "query": "test",
+                "workspace": "MyProject"
+            ],
+            scanner: mockScanner
+        )
+
+        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let request = try XCTUnwrap(mockScanner.filterRequests.first)
+        XCTAssertEqual(request.workspace, "MyProject")
+    }
+
+    func testSearch_invalidSessionID_returnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "test", "session_id": "not-a-uuid"],
+            scanner: mockScanner
+        )
+        XCTAssertNotNil(result["error"])
+        XCTAssertEqual(result["error"] as? String, "Invalid session_id: expected UUID format")
+    }
+
     func testTime_missingGroupBy_returnsError() async throws {
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time"],
@@ -860,6 +938,15 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
         XCTAssertEqual(result["error"] as? String, "Invalid 'group_by' value 'year'. Valid values: day, week, month, session, workspace")
+    }
+
+    func testTime_invalidSessionID_returnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "session_id": "not-a-uuid"],
+            scanner: mockScanner
+        )
+        XCTAssertNotNil(result["error"])
+        XCTAssertEqual(result["error"] as? String, "Invalid session_id: expected UUID format")
     }
 
     func testTime_emptyResults() async throws {
@@ -1116,6 +1203,48 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         }
     }
 
+    // MARK: - parseDateBound
+
+    private static func utcMidnight(_ iso: String) -> Date {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f.date(from: iso)!
+    }
+
+    func testParseDateBound_dateOnlyLowerBoundIsStartOfDay() {
+        let bound = HistoryMCPToolService.parseDateBound("2026-06-13", isUpperBound: false)
+        XCTAssertEqual(bound, Self.utcMidnight("2026-06-13T00:00:00Z"))
+    }
+
+    func testParseDateBound_dateOnlyUpperBoundIsEndOfDay() throws {
+        // Upper bound must include the named day (23:59:59), not midnight-start.
+        let bound = try XCTUnwrap(HistoryMCPToolService.parseDateBound("2026-06-13", isUpperBound: true))
+        XCTAssertEqual(bound, Self.utcMidnight("2026-06-13T00:00:00Z").addingTimeInterval(86399))
+    }
+
+    func testParseDateBound_isoDatetimeUsesExactInstantRegardlessOfDirection() {
+        let iso = "2026-06-13T12:00:00Z"
+        XCTAssertEqual(
+            HistoryMCPToolService.parseDateBound(iso, isUpperBound: false),
+            HistoryMCPToolService.parseDateBound(iso, isUpperBound: true)
+        )
+    }
+
+    func testListSessions_dateToDateOnlyIsInclusiveOfNamedDay() async throws {
+        // Two sessions: one on 2026-06-13, one on 2026-06-12. A date-only date_to of
+        // 2026-06-13 must include the June 13 session (regression: it was excluded).
+        let day12 = makeRecord(name: "Jun12", savedAt: Self.utcMidnight("2026-06-12T06:00:00Z"))
+        let day13 = makeRecord(name: "Jun13", savedAt: Self.utcMidnight("2026-06-13T18:00:00Z"))
+        mockScanner.scanResults = [makeScanResult(records: [day12, day13])]
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "date_to": "2026-06-13"],
+            scanner: mockScanner
+        )
+        let names = ((result["sessions"] as? [[String: Any]]) ?? []).compactMap { $0["session_name"] as? String }
+        XCTAssertEqual(Set(names), ["Jun12", "Jun13"], "date_to date-only must include the named day")
+    }
+
     // MARK: - clampLimit
 
     func testClampLimit_appliesDefaultBoundsAndMaximum() {
@@ -1192,7 +1321,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             workspaceName: workspaceName,
             workspaceID: UUID(),
             records: records,
-            indexReadFailed: false
+            indexReadFailed: false,
+            indexSchemaVersion: nil
         )
     }
 }

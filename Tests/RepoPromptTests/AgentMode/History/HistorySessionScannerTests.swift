@@ -441,6 +441,64 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertTrue(dirs.contains(ws2.standardizedFileURL))
     }
 
+    // MARK: - Stale Schema
+
+    func testScanAllWorkspaces_staleSchemaVersion_returnsEmptyRecordsForWorkspace() async throws {
+        let wsDir = try createWorkspaceDir(name: "StaleProject", uuid: UUID())
+        let record = makeMinimalRecord(name: "OldSession")
+
+        // Write an index with schemaVersion 3 (current is 4).
+        let agentSessions = wsDir.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: agentSessions, withIntermediateDirectories: true)
+        let staleIndex = AgentSessionMetadataIndex(
+            schemaVersion: 3,
+            entries: [record]
+        )
+        let data = try encoder.encode(staleIndex)
+        let indexFile = agentSessions.appendingPathComponent("AgentSessionIndex.json")
+        try data.write(to: indexFile, options: .atomic)
+
+        let results = try await scanner.scanAllWorkspaces()
+        XCTAssertEqual(results.count, 1)
+        XCTAssertTrue(results[0].records.isEmpty, "Stale-schema workspace should have empty records")
+        XCTAssertFalse(results[0].indexReadFailed)
+        XCTAssertEqual(results[0].indexSchemaVersion, 3)
+    }
+
+    func testSessionsMatchingFilters_skipsStaleSchemaWorkspace() async throws {
+        // Current-schema workspace with a session.
+        let currentWS = try createWorkspaceDir(name: "CurrentProject", uuid: UUID())
+        let currentRecord = makeMinimalRecord(name: "CurrentSession")
+        try createAgentSessionsIndex(in: currentWS, records: [currentRecord])
+
+        // Stale-schema workspace with a session (should be excluded from filtering).
+        let staleWS = try createWorkspaceDir(name: "StaleProject", uuid: UUID())
+        let staleRecord = makeMinimalRecord(name: "StaleSession")
+        let staleAgentSessions = staleWS.appendingPathComponent("AgentSessions", isDirectory: true)
+        try FileManager.default.createDirectory(at: staleAgentSessions, withIntermediateDirectories: true)
+        let staleIndex = AgentSessionMetadataIndex(schemaVersion: 3, entries: [staleRecord])
+        try encoder.encode(staleIndex).write(
+            to: staleAgentSessions.appendingPathComponent("AgentSessionIndex.json"),
+            options: .atomic
+        )
+
+        let scanResults = try await scanner.scanAllWorkspaces()
+        let filtered = scanner.sessionsMatchingFilters(
+            scanResults,
+            workspace: nil,
+            agentKind: nil,
+            model: nil,
+            filePath: nil,
+            from: nil,
+            to: nil
+        )
+
+        // Only the current-schema workspace's session should appear.
+        XCTAssertEqual(filtered.count, 1)
+        XCTAssertEqual(filtered[0].sessionID, currentRecord.id)
+        XCTAssertEqual(filtered[0].workspaceName, "CurrentProject")
+    }
+
     // MARK: - Helpers
 
     private func createWorkspaceDir(name: String, uuid: UUID) throws -> URL {
