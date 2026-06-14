@@ -18,7 +18,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
 
         let launch = try provider.makeLaunchConfiguration(for: makeRunRequest(workspacePath: directory.path))
 
-        XCTAssertEqual(launch.command, executable.resolvingSymlinksInPath().standardizedFileURL.path)
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
         XCTAssertEqual(launch.arguments, ["--approve-mcps", "acp"])
         XCTAssertEqual(launch.expectedExecutableIdentity?.canonicalPath, launch.command)
     }
@@ -44,7 +44,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let probedPath = try String(contentsOf: probePathRecord, encoding: .utf8)
 
         XCTAssertEqual(support, .supported)
-        XCTAssertEqual(launch.command, executable.resolvingSymlinksInPath().standardizedFileURL.path)
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(executable))
         XCTAssertEqual(probedPath, launch.command)
     }
 
@@ -380,7 +380,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let firstSupport = try await resolver.probeSupport(for: config)
         let firstLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(firstSupport, .supported)
-        XCTAssertEqual(firstLaunch.command, firstExecutable.resolvingSymlinksInPath().path)
+        XCTAssertEqual(firstLaunch.command, try canonicalExecutablePath(firstExecutable))
 
         await environmentBox.set([
             "PATH": secondDirectory.path,
@@ -389,7 +389,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         let secondSupport = try await resolver.probeSupport(for: config)
         let secondLaunch = try resolver.resolvedLaunch(for: config)
         XCTAssertEqual(secondSupport, .supported)
-        XCTAssertEqual(secondLaunch.command, secondExecutable.resolvingSymlinksInPath().path)
+        XCTAssertEqual(secondLaunch.command, try canonicalExecutablePath(secondExecutable))
     }
 
     func testBareCursorAgentWithoutCapturedDiscoveryFailsClosed() {
@@ -405,6 +405,27 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             }
         }
     }
+
+    func testBareCursorAgentFallsBackToAdditionalHintWhenShellCandidateIsUnsafe() async throws {
+        let unsafeDirectory = try makePrivateTemporaryDirectory()
+        let trustedDirectory = try makePrivateTemporaryDirectory()
+        _ = try makeExecutable(named: "cursor-agent", in: unsafeDirectory)
+        try FileManager.default.setAttributes([.posixPermissions: 0o777], ofItemAtPath: unsafeDirectory.path)
+        let trusted = try makeExecutable(named: "cursor-agent", in: trustedDirectory)
+        let environment = [
+            "PATH": unsafeDirectory.path,
+            "SHELL": "/bin/false"
+        ]
+        let resolver = CursorACPLaunchResolver(environmentProvider: { _ in environment })
+        let config = CursorAgentConfig(commandName: "cursor-agent", additionalPathHints: [trustedDirectory.path])
+
+        let support = try await resolver.probeSupport(for: config)
+        XCTAssertEqual(support, .supported)
+        let launch = try resolver.resolvedLaunch(for: config)
+
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(trusted))
+    }
+
 
     func testAbsoluteConfiguredPathIgnoresDecoyCursorAgentEarlierInPath() throws {
         let trustedDirectory = try makeTemporaryDirectory()
@@ -423,7 +444,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
 
         let launch = try resolver.resolvedLaunch(for: config)
 
-        XCTAssertEqual(launch.command, trusted.resolvingSymlinksInPath().standardizedFileURL.path)
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(trusted))
     }
 
     func testSymlinkIsCanonicalizedAndCanonicalWrapperBasenameIsAllowed() throws {
@@ -436,7 +457,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             for: CursorAgentConfig(commandName: link.path, additionalPathHints: [])
         )
 
-        XCTAssertEqual(launch.command, target.resolvingSymlinksInPath().standardizedFileURL.path)
+        XCTAssertEqual(launch.command, try canonicalExecutablePath(target))
     }
 
     func testSymlinkWhoseCanonicalBasenameIsCursorIsRejected() throws {
@@ -595,7 +616,7 @@ final class CursorACPLaunchResolverTests: XCTestCase {
         XCTAssertEqual(replacementSupport, .supported)
         XCTAssertEqual(
             try resolver.resolvedLaunch(for: config).command,
-            replacement.resolvingSymlinksInPath().standardizedFileURL.path
+            try canonicalExecutablePath(replacement)
         )
     }
 
@@ -736,6 +757,21 @@ final class CursorACPLaunchResolverTests: XCTestCase {
             .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         addTeardownBlock {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        return directory
+    }
+
+    private func canonicalExecutablePath(_ url: URL) throws -> String {
+        try ExecutableFileIdentity.capture(atPath: url.path).canonicalPath
+    }
+
+    private func makePrivateTemporaryDirectory() throws -> URL {
+        let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent("CursorACPLaunchResolverTests-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory.path)
             try? FileManager.default.removeItem(at: directory)
         }
         return directory
