@@ -11,8 +11,8 @@ extension EnvironmentValues {
 /// Always rendered inside the bubble layout so the copy button is reliably hoverable.
 ///
 /// Performance notes:
-/// - Static DateFormatter avoids repeated allocations (DateFormatter is expensive)
-/// - Observes FontScaleManager so footer text follows Agent Mode text size
+/// - Uses the shared message timestamp formatter so timestamp labels stay consistent.
+/// - Observes FontScaleManager so footer text follows Agent Mode text size.
 private struct MessageFooterStrip: View {
     let text: String
     let timestamp: Date
@@ -26,16 +26,11 @@ private struct MessageFooterStrip: View {
     @State private var showCopied = false
     @State private var isHoveringHandoff = false
     @State private var showHandoffPopover = false
+    @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
     }
-
-    fileprivate static let timeFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f
-    }()
 
     var body: some View {
         HStack(spacing: 6) {
@@ -59,9 +54,14 @@ private struct MessageFooterStrip: View {
     }
 
     private var timestampText: some View {
-        Text(Self.timeFormatter.string(from: timestamp))
-            .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-            .foregroundColor(.secondary.opacity(0.7))
+        Text(
+            MessageTimestampFormatter.string(
+                from: timestamp,
+                includeDateContext: showDatesInMessageTimestamps
+            )
+        )
+        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
+        .foregroundColor(.secondary.opacity(0.7))
     }
 
     @ViewBuilder
@@ -190,6 +190,7 @@ struct AgentMessageBubble: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.agentRecentAssistantItemIDs) private var recentAssistantItemIDs
     @Environment(\.agentMessageRuntimeFooterByItemID) private var runtimeFooterByItemID
+    @Environment(\.showDatesInMessageTimestamps) private var showDatesInMessageTimestamps
     @ObservedObject private var fontScale = FontScaleManager.shared
     @State private var isStartingCodexManagedLogin = false
     @State private var codexManagedLoginFeedback: String?
@@ -926,7 +927,10 @@ struct AgentMessageBubble: View {
     }
 
     private var formattedTimestamp: String {
-        MessageFooterStrip.timeFormatter.string(from: item.timestamp)
+        MessageTimestampFormatter.string(
+            from: item.timestamp,
+            includeDateContext: showDatesInMessageTimestamps
+        )
     }
 
     private var shouldShowCodexManagedLoginAction: Bool {

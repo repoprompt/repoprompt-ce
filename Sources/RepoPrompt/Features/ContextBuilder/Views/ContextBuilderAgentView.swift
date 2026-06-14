@@ -6,6 +6,8 @@ struct ContextBuilderAgentView: View {
     let windowID: Int
     var availableWidth: CGFloat
 
+    @ObservedObject private var globalSettings = GlobalSettingsStore.shared
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             // Header with agent/model selection
@@ -58,6 +60,7 @@ struct ContextBuilderAgentView: View {
                 currentRunSection
             }
         }
+        .environment(\.showDatesInMessageTimestamps, globalSettings.showDatesInMessageTimestamps())
         .onAppear {
             viewModel.refreshActiveSessionBindings()
         }

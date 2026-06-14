@@ -168,6 +168,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
         var fileMentionPickerStyle: String?
         var enableKeyboardShortcuts: Bool?
         var fontScaleBodySize: Double?
+        var showDatesInMessageTimestamps: Bool?
 
         init(
             appearanceMode: String? = nil,
@@ -177,7 +178,8 @@ struct GlobalScalarPreferences: Codable, Equatable {
             experimentalAttributedTextEditor: Bool? = nil,
             fileMentionPickerStyle: String? = nil,
             enableKeyboardShortcuts: Bool? = nil,
-            fontScaleBodySize: Double? = nil
+            fontScaleBodySize: Double? = nil,
+            showDatesInMessageTimestamps: Bool? = nil
         ) {
             self.appearanceMode = appearanceMode
             self.useTransparency = useTransparency
@@ -187,6 +189,7 @@ struct GlobalScalarPreferences: Codable, Equatable {
             self.fileMentionPickerStyle = fileMentionPickerStyle
             self.enableKeyboardShortcuts = enableKeyboardShortcuts
             self.fontScaleBodySize = fontScaleBodySize
+            self.showDatesInMessageTimestamps = showDatesInMessageTimestamps
         }
     }
 
