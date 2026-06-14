@@ -273,6 +273,53 @@ final class HistorySessionScannerTests: XCTestCase {
         XCTAssertEqual(filtered[0].sessionID, r2.id)
     }
 
+    func testSessionsMatchingFilters_dateRangeUsesTranscriptBoundsNotSidebarDate() async throws {
+        // firstActivityAt/lastActivityAt (transcript bounds) differ from activityDate
+        // (lastUserMessageAt ?? savedAt). The filter must use the transcript bounds so it
+        // agrees with the response's first_activity_at / last_activity_at fields.
+        let ws = try createWorkspaceDir(name: "Project", uuid: UUID())
+        let savedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let record = AgentSessionMetadataRecord(
+            id: UUID(),
+            filename: "AgentSession-bounds.json",
+            workspaceID: nil,
+            composeTabID: nil,
+            name: "S1",
+            savedAt: savedAt,
+            lastUserMessageAt: nil, // → activityDate == savedAt
+            itemCount: 1,
+            transcriptProjectionCounts: nil,
+            hasUnknownConversationContent: false,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            lastRunStateRaw: nil,
+            autoEditEnabled: true,
+            parentSessionID: nil,
+            isMCPOriginated: false,
+            serializationVersion: nil,
+            observedFileSize: nil,
+            observedFileModificationDate: nil,
+            lastIndexedAt: savedAt,
+            firstActivityAt: savedAt.addingTimeInterval(-300), // 5 min before savedAt
+            lastActivityAt: savedAt.addingTimeInterval(-60), // 1 min before savedAt
+            keyPaths: [],
+            activeDurationSeconds: 0,
+            toolCallCount: 0
+        )
+        try createAgentSessionsIndex(in: ws, records: [record])
+        let scanResults = try await scanner.scanAllWorkspaces()
+
+        // Window brackets the transcript activity bounds but excludes savedAt (the old
+        // activityDate-based filter would drop this session).
+        let from = try XCTUnwrap(record.firstActivityAt?.addingTimeInterval(-10))
+        let to = try XCTUnwrap(record.lastActivityAt?.addingTimeInterval(10))
+        let filtered = scanner.sessionsMatchingFilters(scanResults, workspace: nil, agentKind: nil, model: nil, filePath: nil, from: from, to: to)
+
+        XCTAssertEqual(filtered.count, 1, "filter should use transcript activity bounds, not the sidebar date")
+        XCTAssertEqual(filtered.first?.sessionID, record.id)
+    }
+
     func testSessionsMatchingFilters_combinedFilters() async throws {
         let ws = try createWorkspaceDir(name: "Project", uuid: UUID())
         let epoch = Date(timeIntervalSince1970: 1_700_000_000)

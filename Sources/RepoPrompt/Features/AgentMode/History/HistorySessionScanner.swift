@@ -181,12 +181,14 @@ actor HistorySessionScanner: HistorySessionScanning {
                     guard matchesFile else { continue }
                 }
 
-                // Date range filter
+                // Date range filter — use the same bounds surfaced in the response
+                // (first_activity_at = firstActivityAt ?? activityDate,
+                //  last_activity_at = lastActivityAt ?? savedAt) so filter and display agree.
                 if let from {
-                    guard record.activityDate >= from else { continue }
+                    guard (record.firstActivityAt ?? record.activityDate) >= from else { continue }
                 }
                 if let to {
-                    guard record.activityDate <= to else { continue }
+                    guard (record.lastActivityAt ?? record.savedAt) <= to else { continue }
                 }
 
                 results.append(HistoryFilteredSessionRecord(
