@@ -657,8 +657,12 @@ actor PromptContextAccountingService {
                 fields: ["codemapPaths": "\(codemapPaths.count)"]
             )
         #endif
+        let codemapPathLookupRequests = codemapPaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let codemapPathLookupResults = await store.lookupPaths(codemapPathLookupRequests)
         for path in codemapPaths {
-            guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
+            guard let result = codemapPathLookupResults[path] else {
                 missingPaths.append(path)
                 continue
             }

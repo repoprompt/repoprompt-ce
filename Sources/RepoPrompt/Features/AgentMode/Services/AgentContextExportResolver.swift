@@ -16,6 +16,7 @@ struct AgentContextExportSource: Equatable {
     var exportContextIdentity: AgentContextExportIdentity {
         AgentContextExportIdentity(
             tabID: tabID,
+            selection: selection,
             activeAgentSessionID: activeAgentSessionID,
             worktreeBindingFingerprint: Self.worktreeBindingFingerprint(worktreeBindings)
         )
@@ -28,6 +29,7 @@ struct AgentContextExportSource: Equatable {
 
 struct AgentContextExportIdentity: Equatable {
     let tabID: UUID?
+    let selection: StoredSelection
     let activeAgentSessionID: UUID?
     let worktreeBindingFingerprint: String
 }
@@ -149,12 +151,9 @@ enum AgentContextExportResolver {
         let canRemove: Bool
     }
 
-    static func selectionFileCount(_ selection: StoredSelection) -> Int {
+    static func explicitSelectionFileCount(_ selection: StoredSelection) -> Int {
         var seen = Set<String>()
         for path in selection.selectedPaths {
-            seen.insert(normalizedSelectionKey(path))
-        }
-        for path in selection.autoCodemapPaths {
             seen.insert(normalizedSelectionKey(path))
         }
         for (path, ranges) in selection.slices where !ranges.isEmpty {
@@ -164,13 +163,10 @@ enum AgentContextExportResolver {
     }
 
     static func displayFileCount(
-        resolvedModel: AgentContextExportModel?,
+        resolvedModel _: AgentContextExportModel?,
         sourceSelection: StoredSelection
     ) -> Int {
-        if let resolvedModel {
-            return resolvedModel.fileCount
-        }
-        return selectionFileCount(sourceSelection)
+        explicitSelectionFileCount(sourceSelection)
     }
 
     static func lookupContext(
@@ -397,8 +393,19 @@ enum AgentContextExportResolver {
             }
         }
 
+        let slicePaths = selection.slices.compactMap { path, ranges in
+            ranges.isEmpty || selectedLookupResults[path] != nil ? nil : path
+        }
+        let sliceLookupRequests = slicePaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let sliceLookupResults: [String: WorkspacePathLookupResult] = if sliceLookupRequests.isEmpty {
+            [:]
+        } else {
+            await store.lookupPaths(sliceLookupRequests)
+        }
         for (path, ranges) in selection.slices where !ranges.isEmpty {
-            guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
+            guard let result = selectedLookupResults[path] ?? sliceLookupResults[path] else {
                 missingPaths.append(path)
                 continue
             }
@@ -435,8 +442,16 @@ enum AgentContextExportResolver {
             }
         }
 
+        let codemapLookupRequests = codemapPaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let codemapLookupResults: [String: WorkspacePathLookupResult] = if codemapLookupRequests.isEmpty {
+            [:]
+        } else {
+            await store.lookupPaths(codemapLookupRequests)
+        }
         for path in codemapPaths {
-            guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
+            guard let result = codemapLookupResults[path] else {
                 missingPaths.append(path)
                 continue
             }

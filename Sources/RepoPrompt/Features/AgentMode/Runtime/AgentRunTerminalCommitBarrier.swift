@@ -87,6 +87,24 @@ final class AgentRunTerminalCommitBarrier {
         }
     }
 
+    private func recordTerminalBarrierState(_ active: Bool, request: Request) {
+        #if DEBUG
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.MCPToolCall.publicationOwnershipState,
+                EditFlowPerf.Dimensions(
+                    status: "terminal_barrier",
+                    outcome: request.terminalState.rawValue,
+                    runID: request.expectedRunID?.uuidString,
+                    providerActive: false,
+                    networkScopeActive: false,
+                    permitActive: false,
+                    publicationPending: active,
+                    terminalBarrier: active
+                )
+            )
+        #endif
+    }
+
     private let hooks: AgentModeRunService.Hooks
     private var terminalTeardownTasks: [AgentRunOwnership: Task<Void, Never>] = [:]
     private var consumedProviderSuccessorIDs: Set<UUID> = []
@@ -156,9 +174,11 @@ final class AgentRunTerminalCommitBarrier {
         }
 
         session.terminalCommitInProgress = true
+        recordTerminalBarrierState(true, request: request)
         hooks.flushPendingAssistantDelta(session)
         guard validatesOwnership(request) else {
             session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_changed_during_drain", request: request)
             return nil
         }
@@ -214,6 +234,7 @@ final class AgentRunTerminalCommitBarrier {
               request.providerBuffersAreDrained()
         else {
             session.terminalCommitInProgress = false
+            recordTerminalBarrierState(false, request: request)
             recordRejection("ownership_or_drain_changed_before_commit", request: request)
             return nil
         }
@@ -293,6 +314,7 @@ final class AgentRunTerminalCommitBarrier {
             tabID: session.tabID
         )
         session.terminalCommitInProgress = false
+        recordTerminalBarrierState(false, request: request)
         request.postCommit()
 
         if let followUpInstruction {

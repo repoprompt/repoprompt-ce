@@ -78,7 +78,7 @@ actor GitDiffEngine {
         }
     }
 
-    /// Build snapshot inputs with explicit pathspecs (git-relative paths).
+    /// Build snapshot inputs with explicit pathspecs (Git-relative or absolute paths under the checkout).
     /// Pathspecs override scope - if provided, only files matching the pathspecs are included.
     /// Directory pathspecs (ending with `/`) match all files under that directory.
     func buildSnapshotInputs(
@@ -89,8 +89,12 @@ actor GitDiffEngine {
         detectRenames: Bool,
         generateDiffText: Bool
     ) async throws -> GitDiffSnapshotBuildResult {
-        let scope: GitDiffScope = (pathspecs?.isEmpty ?? true) ? .all : .selected
-        let requestedPaths = pathspecs?.isEmpty ?? true ? nil : pathspecs
+        let hasPathspecs = !(pathspecs?.isEmpty ?? true)
+        let normalizedPathspecs = pathspecs.map {
+            GitDiffPathNormalization.gitPathspecs(from: $0, repoRootPath: repoURL.path)
+        }
+        let scope: GitDiffScope = hasPathspecs ? .selected : .all
+        let requestedPaths = hasPathspecs ? normalizedPathspecs : nil
 
         let fingerprint = try await fingerprint(for: compare, repoURL: repoURL)
 
@@ -111,8 +115,8 @@ actor GitDiffEngine {
         )
 
         // Filter by pathspecs if provided
-        let filtered: [VCSUncommittedFile] = if let pathspecs, !pathspecs.isEmpty {
-            filterByPathspecs(changedFiles, pathspecs: pathspecs)
+        let filtered: [VCSUncommittedFile] = if let normalizedPathspecs, !normalizedPathspecs.isEmpty {
+            filterByPathspecs(changedFiles, pathspecs: normalizedPathspecs)
         } else {
             changedFiles
         }
@@ -124,7 +128,7 @@ actor GitDiffEngine {
         var diffText: String?
         var perFile: [String: String]?
         if generateDiffText, !filtered.isEmpty {
-            let pathFilter = pathspecs
+            let pathFilter = normalizedPathspecs
 
             // Get diff text via backend (handles normalization for jj)
             let trackedDiff = try await backend.getDiffText(

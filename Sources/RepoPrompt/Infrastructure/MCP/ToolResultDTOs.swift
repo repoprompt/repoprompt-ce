@@ -271,6 +271,8 @@ enum ToolResultDTOs {
         let content: String
         /// Paths (display-form) that are selected but have **no codemap** available
         let unmappedPaths: [String]?
+        /// Paths still awaiting a codemap after repair scheduling
+        let pendingPaths: [String]?
         /// Number of additional files with codemaps omitted due to `max_results` cap
         let omittedCount: Int?
         /// Total number of codemaps omitted due to all limits
@@ -279,33 +281,40 @@ enum ToolResultDTOs {
         let tokenBudgetOmittedCount: Int?
         /// Indicates the response token budget prevented more codemaps from being emitted
         let tokenBudgetHit: Bool?
+        let worktreeScope: WorktreeScopeDTO?
 
         init(
             fileCount: Int,
             content: String,
             unmappedPaths: [String]? = nil,
+            pendingPaths: [String]? = nil,
             omittedCount: Int? = nil,
             omittedTotal: Int? = nil,
             tokenBudgetOmittedCount: Int? = nil,
-            tokenBudgetHit: Bool? = nil
+            tokenBudgetHit: Bool? = nil,
+            worktreeScope: WorktreeScopeDTO? = nil
         ) {
             self.fileCount = fileCount
             self.content = content
             self.unmappedPaths = unmappedPaths
+            self.pendingPaths = pendingPaths
             self.omittedCount = omittedCount
             self.omittedTotal = omittedTotal
             self.tokenBudgetOmittedCount = tokenBudgetOmittedCount
             self.tokenBudgetHit = tokenBudgetHit
+            self.worktreeScope = worktreeScope
         }
 
         private enum CodingKeys: String, CodingKey {
             case fileCount = "file_count"
             case content
             case unmappedPaths = "unmapped_paths"
+            case pendingPaths = "pending_paths"
             case omittedCount = "codemaps_omitted"
             case omittedTotal = "omitted_total"
             case tokenBudgetOmittedCount = "token_budget_omitted"
             case tokenBudgetHit = "token_budget_hit"
+            case worktreeScope = "worktree_scope"
         }
     }
 

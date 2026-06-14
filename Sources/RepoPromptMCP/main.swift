@@ -9,7 +9,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.0.15"
+let CLI_VERSION = "1.0.16"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -669,6 +669,7 @@ private actor BridgeDrainState {
 
     private let clock: Clock
     private var stdinClosedAt: TimeInterval?
+    private var lastVisibilityLogAt: TimeInterval?
 
     init(clock: @escaping Clock) {
         self.clock = clock
@@ -680,8 +681,21 @@ private actor BridgeDrainState {
         }
     }
 
-    func isStdinClosed() -> Bool {
-        stdinClosedAt != nil
+    func elapsedSinceStdinClosed() -> TimeInterval? {
+        guard let stdinClosedAt else { return nil }
+        return max(0, clock() - stdinClosedAt)
+    }
+
+    func claimVisibilityLog(interval: TimeInterval) -> TimeInterval? {
+        guard let stdinClosedAt else { return nil }
+        let now = clock()
+        if let lastVisibilityLogAt,
+           now - lastVisibilityLogAt < max(0.001, interval)
+        {
+            return nil
+        }
+        lastVisibilityLogAt = now
+        return max(0, now - stdinClosedAt)
     }
 }
 
@@ -695,6 +709,9 @@ extension BootstrapSocketProxy {
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
         drainClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        drainDeadline: TimeInterval = TimeInterval(MCPTimeoutPolicy.postStdinHalfCloseBridgeDrainDeadlineSeconds),
+        drainVisibilityInterval: TimeInterval = 30,
+        drainLogDescriptor: Int32 = STDERR_FILENO,
         onStdinClosed: @escaping @Sendable () async -> Void = {}
     ) async throws {
         let drainState = BridgeDrainState(clock: drainClock)
@@ -718,7 +735,10 @@ extension BootstrapSocketProxy {
                     drainState: drainState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule,
-                    socketPoller: socketPoller
+                    socketPoller: socketPoller,
+                    drainDeadline: drainDeadline,
+                    drainVisibilityInterval: drainVisibilityInterval,
+                    drainLogDescriptor: drainLogDescriptor
                 )
                 return .socketClosed
             }
@@ -738,7 +758,12 @@ extension BootstrapSocketProxy {
                     }
                 }
             } catch {
-                log.error("BootstrapSocketProxy: Bridge task failed: \(error)")
+                let message = "[MCPBridge] task_failed error=\(error)\n"
+                BestEffortStderrWriter.writeNonBlocking(
+                    Data(message.utf8),
+                    to: drainLogDescriptor
+                )
+                debugLog("BootstrapSocketProxy: Bridge task failed: \(error)")
                 group.cancelAll()
                 throw error
             }
@@ -837,13 +862,11 @@ extension BootstrapSocketProxy {
                 ) { framed in
                     try writeToSocket(framed, socketFD: socketFD)
                 }
-                if let delivered = prepared.deliveryFrame {
-                    MCPResponseDeliveryTracer.emitFrame(
+                if prepared.deliveryFrame != nil {
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_app_uds",
                         phase: "socket_write_completed",
-                        frame: delivered,
-                        direction: .clientToServer,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared
                     )
                 }
             }
@@ -945,7 +968,10 @@ extension BootstrapSocketProxy {
         drainState: BridgeDrainState,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
-        socketPoller: BridgeSocketPoller? = nil
+        socketPoller: BridgeSocketPoller? = nil,
+        drainDeadline: TimeInterval,
+        drainVisibilityInterval: TimeInterval,
+        drainLogDescriptor: Int32
     ) async throws {
         var buffer = [UInt8](repeating: 0, count: 8192)
         var pending = Data()
@@ -980,10 +1006,13 @@ extension BootstrapSocketProxy {
             }
 
             guard case let .events(rawEvents) = readiness else {
-                if await shouldFinishSocketDrain(
+                if try await shouldFinishSocketDrain(
                     drainState: drainState,
                     ledger: bridgeLedger,
-                    pendingByteCount: pending.count
+                    pendingByteCount: pending.count,
+                    deadline: drainDeadline,
+                    visibilityInterval: drainVisibilityInterval,
+                    logDescriptor: drainLogDescriptor
                 ) {
                     debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                     return
@@ -1046,7 +1075,7 @@ extension BootstrapSocketProxy {
                     // line and keep the stdout transport alive rather than raising an ObjC
                     // exception that would abort the helper mid-ledger-transaction.
                     if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        let delivered = BestEffortStderrWriter.write(
+                        let delivered = BestEffortStderrWriter.writeNonBlocking(
                             Data("[progress] \(progressMessage)\n".utf8)
                         )
                         if !delivered {
@@ -1070,12 +1099,12 @@ extension BootstrapSocketProxy {
                 if let delivered = prepared.deliveryFrame,
                    Self.extractProgressMessage(from: delivered) == nil
                 {
-                    MCPResponseDeliveryTracer.emitFrame(
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_stdout",
                         phase: "stdout_write_completed",
-                        frame: delivered,
-                        direction: .serverToClient,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared,
+                        publicationPending: false,
+                        terminalBarrier: false
                     )
                 }
             }
@@ -1089,10 +1118,13 @@ extension BootstrapSocketProxy {
                 )
                 return
             }
-            if await shouldFinishSocketDrain(
+            if try await shouldFinishSocketDrain(
                 drainState: drainState,
                 ledger: bridgeLedger,
-                pendingByteCount: pending.count
+                pendingByteCount: pending.count,
+                deadline: drainDeadline,
+                visibilityInterval: drainVisibilityInterval,
+                logDescriptor: drainLogDescriptor
             ) {
                 debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                 return
@@ -1103,13 +1135,34 @@ extension BootstrapSocketProxy {
     private static func shouldFinishSocketDrain(
         drainState: BridgeDrainState,
         ledger: JSONRPCBridgeLedger,
-        pendingByteCount: Int
-    ) async -> Bool {
-        guard pendingByteCount == 0, await drainState.isStdinClosed() else { return false }
+        pendingByteCount: Int,
+        deadline: TimeInterval,
+        visibilityInterval: TimeInterval,
+        logDescriptor: Int32
+    ) async throws -> Bool {
+        guard let elapsed = await drainState.elapsedSinceStdinClosed() else { return false }
         let snapshot = await ledger.snapshot()
-        return snapshot.terminalReason == nil
-            && snapshot.activeRequestCount == 0
-            && snapshot.pendingTransactionCount == 0
+        if snapshot.canFinishSocketDrain(partialByteCount: pendingByteCount) {
+            return true
+        }
+
+        let effectiveDeadline = max(0.001, deadline)
+        if elapsed >= effectiveDeadline {
+            let terminalReason = await ledger.terminalizePostStdinHalfCloseDrainDeadline()
+            let elapsedText = String(format: "%.3fs", elapsed)
+            let deadlineText = String(format: "%.3fs", effectiveDeadline)
+            let blockers = snapshot.socketDrainBlockerDescription(partialByteCount: pendingByteCount)
+            let message = "[MCPBridgeDrain] deadline_exceeded elapsed=\(elapsedText) deadline=\(deadlineText) \(blockers) terminalized_reason=\(terminalReason)\n"
+            BestEffortStderrWriter.writeNonBlocking(Data(message.utf8), to: logDescriptor)
+            throw JSONRPCBridgeLedgerError.terminal(terminalReason)
+        }
+
+        if let visibleElapsed = await drainState.claimVisibilityLog(interval: visibilityInterval) {
+            let elapsedText = String(format: "%.3fs", visibleElapsed)
+            let message = "[MCPBridgeDrain] waiting elapsed=\(elapsedText) \(snapshot.socketDrainBlockerDescription(partialByteCount: pendingByteCount))\n"
+            BestEffortStderrWriter.writeNonBlocking(Data(message.utf8), to: logDescriptor)
+        }
+        return false
     }
 
     private static func requireCleanBridgeStop(
@@ -1235,8 +1288,9 @@ actor MCPService: Service {
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
     init() {
-        sessionToken = UUID().uuidString
-        bridgeLedger = JSONRPCBridgeLedger(traceSink: { event in
+        let sessionToken = UUID().uuidString
+        self.sessionToken = sessionToken
+        bridgeLedger = JSONRPCBridgeLedger(connectionID: sessionToken, traceSink: { event in
             MCPResponseDeliveryTracer.emit(event)
         })
         // No TCP/Bonjour transport – bootstrap socket only
@@ -1672,7 +1726,21 @@ actor MCPService: Service {
 
 // MARK: - Error Handlers
 
+func mcpCLIExitCode(for error: CLIRuntimeError) -> MCPCLIExitCode {
+    switch error {
+    case .connectionFailed:
+        .connectionFailed
+    case .approvalDenied:
+        .approvalDenied
+    case .terminatedByServer:
+        .terminatedByServer
+    case .hostDisconnected:
+        .ok
+    }
+}
+
 func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
+    let exitCode = mcpCLIExitCode(for: err)
     // Log error event to disk for app to surface (respects shouldPersistEvent policy)
     CLIEventLogger.logRuntimeError(err)
 
@@ -1680,20 +1748,20 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
     case let .connectionFailed(underlying):
         log.error("Connection failed: \(underlying)")
         fputs("RepoPrompt MCP: connection failed – \(underlying)\n", stderr)
-        exit(MCPCLIExitCode.connectionFailed.rawValue)
+        exit(exitCode.rawValue)
     case .approvalDenied:
         fputs("RepoPrompt MCP: connection closed immediately. Approval was likely denied or the server is disabled. Check the RepoPrompt approval dialog or MCP settings.\n", stderr)
-        exit(MCPCLIExitCode.approvalDenied.rawValue)
+        exit(exitCode.rawValue)
     case let .terminatedByServer(reason):
         // Clean exit - server explicitly terminated this connection
         let message = reason ?? "Connection terminated by server"
         log.notice("CLI exiting: \(message)")
         fputs("RepoPrompt MCP: \(message)\n", stderr)
-        exit(MCPCLIExitCode.terminatedByServer.rawValue)
+        exit(exitCode.rawValue)
     case .hostDisconnected:
         // Host process died - exit cleanly without retry
         log.notice("CLI exiting: host disconnected")
-        exit(MCPCLIExitCode.ok.rawValue)
+        exit(exitCode.rawValue)
     }
 }
 

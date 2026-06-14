@@ -112,7 +112,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         let visibleWorktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleWorktreeHit)
         let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-            logicalRootPaths: [logicalRoot.path],
+            canonicalRootPaths: [],
             physicalRootPaths: [worktreeRoot.path]
         )
         let worktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: sessionScope)
@@ -180,6 +180,21 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         XCTAssertFalse(StoreBackedWorkspaceSearch.requiresBroadSearchAdmission(pattern: "*.swift", mode: .path, paths: nil))
         XCTAssertFalse(StoreBackedWorkspaceSearch.requiresBroadSearchAdmission(pattern: "*.swift", mode: .auto, paths: nil))
         XCTAssertFalse(StoreBackedWorkspaceSearch.requiresBroadSearchAdmission(pattern: "needle", mode: .content, paths: ["Sources/A.swift"]))
+    }
+
+    func testMutationAfterCatalogCrawlBeforeWatcherStartIsVisibleToFreshSearch() async throws {
+        let root = try makeTemporaryRoot(name: "WatcherStartupReplay")
+        try write("let seed = true\n", to: root.appendingPathComponent("Seed.swift"))
+        let lateFileURL = root.appendingPathComponent("Late.swift")
+        let store = WorkspaceFileContextStore()
+        let record = try await store.loadRoot(path: root.path)
+
+        try write("let startupGapNeedle = true\n", to: lateFileURL)
+        try await store.startWatchingRoot(id: record.id)
+
+        let result = try await searchContent(pattern: "startupGapNeedle", store: store)
+        XCTAssertEqual(result.matches?.map(\.filePath), [lateFileURL.path])
+        await store.stopWatchingRoot(id: record.id)
     }
 
     #if DEBUG
@@ -921,7 +936,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                 await permitSignal.mark()
             }
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [missingPhysicalRoot.standardizedFileURL.path]
             )
 
@@ -964,7 +979,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let held = Task { try await self.searchContent(pattern: "baseNeedle", store: store) }
             await assertAsyncTrue(gate.waitUntilStartedCount(1))
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [physicalRoot.standardizedFileURL.path]
             )
             let queued = Task {

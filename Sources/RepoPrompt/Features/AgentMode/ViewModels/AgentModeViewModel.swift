@@ -1301,15 +1301,15 @@ final class AgentModeViewModel: ObservableObject {
             }
             return FileManager.default.temporaryDirectory
         }
-        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, computerUseEnabled in
+        let codexControllerFactory: CodexAgentModeCoordinator.CodexControllerFactory = { runID, tabID, windowID, workspacePath, permissionProfile, _, computerUseEnabled in
             let client = CodexAppServerClient()
-            let shellToolEnabledOverride: Bool? = taskLabelKind == .explore ? false : nil
             let options = CodexNativeSessionController.Options.agentModeDefault(
                 forceExperimentalSteering: true,
                 approvalPolicyProvider: { permissionProfile.codexApprovalPolicy },
                 sandboxModeProvider: { permissionProfile.codexSandboxMode },
                 approvalReviewerProvider: { permissionProfile.codexApprovalReviewer },
-                shellToolEnabled: shellToolEnabledOverride,
+                shellToolEnabled: permissionProfile.codexBashToolEnabled(),
+                suppressThirdPartyMCPServers: permissionProfile.codexSuppressesThirdPartyMCPServers,
                 goalSupportEnabledProvider: { CodexGoalSupport.isEnabled },
                 computerUseEnabledProvider: { computerUseEnabled }
             )
@@ -1426,8 +1426,8 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator.attach(viewModel: self)
         runInteractionStateObserver = codexCoordinator
         mcpServer.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
-            guard let self else { return [] }
-            return worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
+            guard let self else { return .unavailable }
+            return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
         }
 
         refreshAvailableAgents()
@@ -1610,8 +1610,8 @@ final class AgentModeViewModel: ObservableObject {
             claudeCoordinator.attach(viewModel: self)
             runInteractionStateObserver = codexCoordinator
             testMCPServer?.registerAgentWorktreeBindingsProvider { [weak self] sessionID, tabID in
-                guard let self else { return [] }
-                return worktreeBindings(forAgentSessionID: sessionID, tabID: tabID)
+                guard let self else { return .unavailable }
+                return worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID)
             }
             refreshAvailableAgents()
             restoreLastUsedAgentSelectionIfNeeded()
@@ -1734,42 +1734,24 @@ final class AgentModeViewModel: ObservableObject {
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?
     ) -> AgentSessionWorktreeBinding? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        return primaryWorkspacePath.flatMap { primaryPath in
-            bindings.first { binding in
-                standardizedWorkspacePath(binding.logicalRootPath) == primaryPath
-            }
-        } ?? (primaryWorkspacePath == nil && bindings.count == 1 ? bindings[0] : nil)
+        AgentWorktreeRuntimeWorkspaceResolver.primaryExecutionBinding(
+            in: bindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func effectiveWorkspacePath(
         for session: TabSession,
         fallbackWorkspacePath: String?
     ) throws -> String? {
-        let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath)
-        let binding = primaryExecutionBinding(in: session.worktreeBindings, fallbackWorkspacePath: fallbackWorkspacePath)
-
-        guard let binding else {
-            return primaryWorkspacePath
-        }
-        let worktreePath = standardizedWorkspacePath(binding.worktreeRootPath)
-        guard let worktreePath else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: worktreePath, isDirectory: &isDirectory), isDirectory.boolValue else {
-            throw AgentWorktreeRuntimeWorkspaceError(binding: binding)
-        }
-        return worktreePath
+        try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+            bindings: session.worktreeBindings,
+            fallbackWorkspacePath: fallbackWorkspacePath
+        )
     }
 
     private static func standardizedWorkspacePath(_ path: String?) -> String? {
-        guard let trimmed = path?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !trimmed.isEmpty
-        else {
-            return nil
-        }
-        return URL(fileURLWithPath: NSString(string: trimmed).expandingTildeInPath).standardizedFileURL.path
+        AgentWorktreeRuntimeWorkspaceResolver.standardizedWorkspacePath(path)
     }
 
     private func currentWorkspacePath() -> String? {
@@ -4444,23 +4426,61 @@ final class AgentModeViewModel: ObservableObject {
         } else {
             .unrelated
         }
-        let result = await AgentRunSessionStore.beginEpoch(
-            registration: originalContext.registration,
+        let activationGeneration = session.mcpControlActivationGeneration
+        var registration = originalContext.registration
+        var result = await AgentRunSessionStore.beginEpoch(
+            registration: registration,
             activationID: originalContext.activationID,
             expectedCurrentEpoch: originalContext.currentEpoch,
             transitionKind: transitionKind
         )
+        // A stale result means the existing record advanced to another epoch; only rejected
+        // results are eligible for missing-record recovery through registerIfMissing.
+        if case .rejected = result {
+            guard session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch,
+                  let recoveredRegistration = await AgentRunSessionStore.registerIfMissing(
+                      sessionID: originalContext.sessionID
+                  )
+            else {
+                return
+            }
+            guard session.mcpControlActivationGeneration == activationGeneration,
+                  let context = session.mcpControlContext,
+                  context.activationID == originalContext.activationID,
+                  context.registration == originalContext.registration,
+                  context.currentEpoch == originalContext.currentEpoch
+            else {
+                await AgentRunSessionStore.cleanup(registration: recoveredRegistration)
+                return
+            }
+            registration = recoveredRegistration
+            result = await AgentRunSessionStore.beginEpoch(
+                registration: registration,
+                activationID: originalContext.activationID,
+                expectedCurrentEpoch: nil,
+                transitionKind: transitionKind
+            )
+        }
         #if DEBUG
             await test_afterMCPStoreEpochBegan?()
         #endif
         guard case let .accepted(epoch) = result,
+              session.mcpControlActivationGeneration == activationGeneration,
               var context = session.mcpControlContext,
               context.activationID == originalContext.activationID,
               context.registration == originalContext.registration,
               context.currentEpoch == originalContext.currentEpoch || context.currentEpoch == epoch
         else {
+            if registration != originalContext.registration {
+                await AgentRunSessionStore.cleanup(registration: registration)
+            }
             return
         }
+        context = context.replacingRegistration(registration)
         context.currentEpoch = epoch
         context.preparedEpoch = epoch
         let pendingTransitionToken = context.pendingEpochTransition?.token
@@ -5014,14 +5034,30 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
-    func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
-        if let live = try? authoritativeLiveSession(for: sessionID) {
-            return live.worktreeBindings
+    func worktreeBindingState(
+        forAgentSessionID sessionID: UUID,
+        tabID: UUID? = nil
+    ) -> AgentSessionWorktreeBindingState {
+        do {
+            if let live = try authoritativeLiveSession(for: sessionID) {
+                return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
+            }
+        } catch {
+            return .unavailable
         }
         if let tabID, let live = sessions[tabID], live.activeAgentSessionID == sessionID {
-            return live.worktreeBindings
+            return live.hasLoadedPersistedState ? .hydrated(live.worktreeBindings) : .unhydrated
         }
-        return []
+        switch persistentBindingResolution(for: sessionID) {
+        case .unique:
+            return .unhydrated
+        case .notFound, .ambiguous:
+            return .unavailable
+        }
+    }
+
+    func worktreeBindings(forAgentSessionID sessionID: UUID, tabID: UUID? = nil) -> [AgentSessionWorktreeBinding] {
+        worktreeBindingState(forAgentSessionID: sessionID, tabID: tabID).bindings ?? []
     }
 
     @discardableResult
@@ -5189,12 +5225,39 @@ final class AgentModeViewModel: ObservableObject {
             throw MCPError.invalidParams("The requested agent session is not currently available.")
         }
         let previousBindings = session.worktreeBindings
-        let previousDestination = executionDestinationPath(in: previousBindings)
-        let nextDestination = executionDestinationPath(in: desiredBindings)
-        guard previousDestination != nextDestination else {
+        guard previousBindings != desiredBindings else { return previousBindings }
+        let previousDestination = executionDestinationIdentity(in: previousBindings)
+        let nextDestination = executionDestinationIdentity(in: desiredBindings)
+        let changedDuringActiveRun = session.runState.isActive
+
+        if changedDuringActiveRun, previousDestination != nextDestination {
+            switch intent {
+            case .userExecutionLocationChange(confirmation: .activeRunStop):
+                break
+            case .userExecutionLocationChange:
+                throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
+            case .externalManagement:
+                throw MCPError.invalidParams(
+                    "Stop the active Agent run before changing its execution worktree. The in-flight prompt will not be migrated or replayed automatically."
+                )
+            case .initialSend:
+                throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
+            }
+        }
+
+        try await materializeWorktreeBindingsForTransition(desiredBindings, sessionID: sessionID)
+        guard sessions[session.tabID] === session,
+              session.activeAgentSessionID == sessionID,
+              session.worktreeBindings == previousBindings,
+              session.runState.isActive == changedDuringActiveRun
+        else {
+            throw ExecutionLocationTransitionError.stale
+        }
+
+        if previousDestination == nextDestination {
             return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
         }
-        let changedDuringActiveRun = session.runState.isActive
+
         if changedDuringActiveRun {
             switch intent {
             case .userExecutionLocationChange(confirmation: .activeRunStop):
@@ -5207,14 +5270,8 @@ final class AgentModeViewModel: ObservableObject {
                     intent: .executionLocationChange,
                     completion: .terminalPublished
                 )
-            case .userExecutionLocationChange:
-                throw ExecutionLocationTransitionError.confirmationRequired(.activeRunStop)
-            case .externalManagement:
-                throw MCPError.invalidParams(
-                    "Stop the active Agent run before changing its execution worktree. The in-flight prompt will not be migrated or replayed automatically."
-                )
-            case .initialSend:
-                throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
+            case .userExecutionLocationChange, .externalManagement, .initialSend:
+                throw ExecutionLocationTransitionError.stale
             }
         }
         guard sessions[session.tabID] === session,
@@ -5238,9 +5295,49 @@ final class AgentModeViewModel: ObservableObject {
         return try replaceWorktreeBindings(desiredBindings, forSessionID: sessionID)
     }
 
-    private func executionDestinationPath(in bindings: [AgentSessionWorktreeBinding]) -> String? {
+    private struct ExecutionDestinationIdentity: Equatable {
+        let repositoryID: String?
+        let worktreeID: String?
+        let path: String?
+    }
+
+    private func executionDestinationIdentity(in bindings: [AgentSessionWorktreeBinding]) -> ExecutionDestinationIdentity {
         let binding = Self.primaryExecutionBinding(in: bindings, fallbackWorkspacePath: workspacePathProvider())
-        return Self.standardizedWorkspacePath(binding?.worktreeRootPath) ?? Self.standardizedWorkspacePath(workspacePathProvider())
+        return ExecutionDestinationIdentity(
+            repositoryID: binding?.repositoryID,
+            worktreeID: binding?.worktreeID,
+            path: Self.standardizedWorkspacePath(binding?.worktreeRootPath)
+                ?? Self.standardizedWorkspacePath(workspacePathProvider())
+        )
+    }
+
+    private func materializeWorktreeBindingsForTransition(
+        _ bindings: [AgentSessionWorktreeBinding],
+        sessionID: UUID
+    ) async throws {
+        guard !bindings.isEmpty else { return }
+        guard let promptManager else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+        guard let projection = await WorkspaceRootBindingProjectionMaterializer(
+            store: promptManager.workspaceFileContextStore
+        ).materialize(sessionID: sessionID, bindings: bindings), !projection.isEmpty else {
+            throw ExecutionLocationTransitionError.unavailable("The selected worktree roots could not be prepared for this thread.")
+        }
+
+        let availability = await promptManager.workspaceFileContextStore.rootScopeAvailability(projection.lookupRootScope)
+        guard case .available = availability else {
+            let missingPaths: [String] = switch availability {
+            case .available:
+                []
+            case let .sessionWorktreeUnavailable(paths):
+                paths
+            }
+            let suffix = missingPaths.isEmpty ? "" : ": \(missingPaths.joined(separator: ", "))"
+            throw ExecutionLocationTransitionError.unavailable(
+                "The selected worktree roots are unavailable\(suffix). The thread was not switched to the canonical checkout."
+            )
+        }
     }
 
     private func executionLocationContext() async throws -> ExecutionLocationContext {

@@ -158,16 +158,22 @@ import Foundation
                     FSEventCallbackEntry(path: event.absolutePath, flags: event.flags, id: event.eventId)
                 }
             )
+            let filterResult = watcherEarlyFilter.filter(payload)
+            guard let retainedPayload = filterResult.payload else { return nil }
             let drain: (@Sendable () async -> Void)? = if scheduleDrain {
                 { [weak self] in await self?.drainAcceptedWatcherIngressMailbox() }
             } else {
                 nil
             }
-            return watcherIngressMailbox.accept(payload, lifecycleCorrelation: nil, scheduleDrain: drain)
+            return watcherIngressMailbox.accept(retainedPayload, lifecycleCorrelation: nil, scheduleDrain: drain)
         }
 
         func watcherIngressMailboxSnapshotForTesting() -> FileSystemWatcherIngressMailbox.Snapshot {
             watcherIngressMailbox.snapshotForTesting()
+        }
+
+        func watcherEarlyFilterSnapshotForTesting() -> FileSystemWatcherEarlyFilter.Snapshot {
+            watcherEarlyFilter.snapshotForTesting()
         }
 
         func publicationStateForTesting() -> (
@@ -183,10 +189,28 @@ import Foundation
             watcherBatchWillProcessHandler = handler
         }
 
+        func setWatcherActivationFailureForTesting(_ failurePoint: WatcherActivationFailurePoint?) {
+            watcherActivationFailurePointForTesting = failurePoint
+        }
+
+        func setFolderScanFailureCountForTesting(_ count: Int, folder: String) {
+            if count > 0 {
+                folderScanFailuresRemainingForTesting[folder] = count
+            } else {
+                folderScanFailuresRemainingForTesting.removeValue(forKey: folder)
+            }
+        }
+
         func setContentReadChunkHandlerForTesting(
             _ handler: (@Sendable (String) async -> Void)?
         ) {
             contentReadChunkHandler = handler
+        }
+
+        func setParallelFolderEnumerationHookForTesting(
+            _ handler: (@Sendable (String) async throws -> Void)?
+        ) {
+            parallelFolderEnumerationHookForTesting = handler
         }
 
         func cachedEncodingForTesting(relativePath: String) -> String.Encoding? {
@@ -202,6 +226,9 @@ import Foundation
             hasPendingOverflowRescan: Bool,
             overflowChangedIgnoreDirs: Set<String>,
             pendingScanTargets: [String: FSEventStreamEventId],
+            pendingQuietFolderScanTargets: Set<String>,
+            dirtyRecoveryScanTargets: Set<String>,
+            recoveryScanFailureCountByFolder: [String: Int],
             lastScannedEventIdByFolder: [String: FSEventStreamEventId],
             lastVerifiedAtByFolder: [String: TimeInterval],
             fileEventCountSinceLastScan: [String: Int]
@@ -211,6 +238,9 @@ import Foundation
                 hasPendingOverflowRescan,
                 overflowChangedIgnoreDirs,
                 pendingScanTargets,
+                pendingQuietFolderScanTargets,
+                dirtyRecoveryScanTargets,
+                recoveryScanFailureCountByFolder,
                 lastScannedEventIdByFolder,
                 lastVerifiedAtByFolder,
                 fileEventCountSinceLastScan

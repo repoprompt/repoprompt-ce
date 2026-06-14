@@ -600,12 +600,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    @Published private(set) var selectedFiles: [FileViewModel] = []
-    @Published private(set) var autoCodemapFiles: [FileViewModel] = []
+    private(set) var selectionStateRevision: UInt64 = 0
+
+    @Published private(set) var selectedFiles: [FileViewModel] = [] {
+        didSet {
+            guard selectedFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
+    @Published private(set) var autoCodemapFiles: [FileViewModel] = [] {
+        didSet {
+            guard autoCodemapFiles.map(\.id) != oldValue.map(\.id) else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var autoCodemapFileIDs: Set<UUID> = []
     @Published var codemapAutoEnabled: Bool = true {
         didSet {
             guard codemapAutoEnabled != oldValue else { return }
+            selectionStateRevision &+= 1
             if codemapAutoEnabled {
                 scheduleAutoCodemapSync()
             } else {
@@ -647,7 +662,13 @@ class WorkspaceFilesViewModel: ObservableObject {
 
     private let selectionSliceCoordinator = SelectionSliceCoordinator()
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
-    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:]
+    @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:] {
+        didSet {
+            guard selectionSlicesByFileID != oldValue else { return }
+            selectionStateRevision &+= 1
+        }
+    }
+
     private var sliceSnapshotRebuildDeferralDepth = 0
     private var sliceSnapshotRebuildPending = false
     #if DEBUG
@@ -984,6 +1005,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             let directFolderIDLookupCount: Int
             let directIDLookupMissCount: Int
             let canonicalResyncCount: Int
+            let indexRebuildCount: Int
+            let indexRebuildTotalDurationMS: Double
+            let indexRebuildTraversalDurationMS: Double
+            let indexRebuildVisitedFolderCount: Int
+            let indexRebuildVisitedFileCount: Int
         }
 
         private var appliedIndexProjectionHandledEventCount = 0
@@ -991,6 +1017,11 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionDirectFolderIDLookupCount = 0
         private var appliedIndexProjectionDirectIDLookupMissCount = 0
         private var appliedIndexProjectionCanonicalResyncCount = 0
+        private var appliedIndexProjectionIndexRebuildCount = 0
+        private var appliedIndexProjectionIndexRebuildTotalDurationMS: Double = 0
+        private var appliedIndexProjectionIndexRebuildTraversalDurationMS: Double = 0
+        private var appliedIndexProjectionIndexRebuildVisitedFolderCount = 0
+        private var appliedIndexProjectionIndexRebuildVisitedFileCount = 0
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
 
@@ -1014,7 +1045,12 @@ class WorkspaceFilesViewModel: ObservableObject {
                 directFileIDLookupCount: appliedIndexProjectionDirectFileIDLookupCount,
                 directFolderIDLookupCount: appliedIndexProjectionDirectFolderIDLookupCount,
                 directIDLookupMissCount: appliedIndexProjectionDirectIDLookupMissCount,
-                canonicalResyncCount: appliedIndexProjectionCanonicalResyncCount
+                canonicalResyncCount: appliedIndexProjectionCanonicalResyncCount,
+                indexRebuildCount: appliedIndexProjectionIndexRebuildCount,
+                indexRebuildTotalDurationMS: appliedIndexProjectionIndexRebuildTotalDurationMS,
+                indexRebuildTraversalDurationMS: appliedIndexProjectionIndexRebuildTraversalDurationMS,
+                indexRebuildVisitedFolderCount: appliedIndexProjectionIndexRebuildVisitedFolderCount,
+                indexRebuildVisitedFileCount: appliedIndexProjectionIndexRebuildVisitedFileCount
             )
         }
 
@@ -1087,10 +1123,18 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionCoordinatorCancellable?.cancel()
         selectionCoordinatorCancellable = coordinator.changes
             .sink { [weak self, weak coordinator] change in
-                guard change.source != .uiFlush else { return }
+                guard change.source != .uiFlush, !change.source.isMCPSelectionSource else { return }
                 Task { @MainActor [weak self, weak coordinator] in
                     guard let self, let coordinator else { return }
-                    guard change.tabID == nil || change.tabID == currentTabID else { return }
+                    if let changeTabID = change.tabID {
+                        guard let activeIdentity = coordinator.activeSelectionIdentity(),
+                              activeIdentity.tabID == changeTabID,
+                              coordinator.selectionSnapshot(
+                                  for: activeIdentity,
+                                  flushPendingUIIfActive: false
+                              )?.selection == change.selection
+                        else { return }
+                    }
                     let current = snapshotSelection()
                     guard current != change.selection else { return }
                     await coordinator.withApplyingSelectionMirror {
@@ -2397,7 +2441,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 rootShellLoadedPaths.insert(stdRootPath)
                 invalidateStaticSnapshot(forRootFullPath: rootFolderVM.standardizedFullPath)
 
-                await performPostCatalogRootWork(
+                try await performPostCatalogRootWork(
                     for: workspaceRootRecord,
                     workspace: workspace,
                     rootKind: rootKind
@@ -2425,6 +2469,37 @@ class WorkspaceFilesViewModel: ObservableObject {
                 #endif
             } catch {
                 let tokenIsCurrent = isRootLoadTokenCurrent(loadToken)
+                let loadedRootIsCurrent = loadedWorkspaceRootRecord.map {
+                    workspaceFileContextRootsByRootKey[rootKey]?.id == $0.id
+                } ?? false
+                let shouldRetainLoadedRoot = error is FileSystemWatcherActivationError
+                    && tokenIsCurrent
+                    && loadedRootIsCurrent
+                    && attachedRootFolder != nil
+                if shouldRetainLoadedRoot, let attachedRootFolder {
+                    if refreshRootFolderStateAfterLoad {
+                        refreshRootFolderState()
+                    }
+                    isLoading = false
+                    folderBeingAdded = nil
+                    folderDidFinishLoadingPublisher.send(attachedRootFolder)
+                    #if DEBUG
+                        WorkspaceRestorePerfLog.event(
+                            "folderLoad.total",
+                            fields: [
+                                "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
+                                "rootKind": restorePerfRootKind,
+                                "rootName": restorePerfRootName,
+                                "outcome": "watcherErrorRetained",
+                                "duration": loadFolderTotalStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
+                            ]
+                        )
+                    #endif
+                    print("Loaded folder without active watcher: \(error)")
+                    self.error = .failedToLoadFolder(error)
+                    throw error
+                }
+
                 let lifecycleIsCurrent = rootLoadLifecycleGeneration == loadToken.lifecycleGeneration
                 let currentRootGeneration = rootLoadGenerationByRootKey[rootKey]
                 let hasNewerRootLoadForKey = if lifecycleIsCurrent {
@@ -2524,17 +2599,22 @@ class WorkspaceFilesViewModel: ObservableObject {
         for rootRecord: WorkspaceRootRecord,
         workspace: WorkspaceModel,
         rootKind: RootKind
-    ) async {
+    ) async throws {
         let rootKey = rootKey(forPath: rootRecord.standardizedFullPath)
         guard workspaceFileContextRootsByRootKey[rootKey]?.id == rootRecord.id else { return }
         currentWorkspaceID = workspace.id
 
         let rootReplayIngressGeneration = advanceRootReplayIngressGeneration(forRootKey: rootKey)
         await workspaceFileContextStore.registerDeferredReplayRootGeneration(rootReplayIngressGeneration, forRootKey: rootKey)
+        // A watcher activation failure must still be surfaced to the caller, but it must not
+        // skip persisted selection-slice hydration or codemap kickoff for an otherwise loaded
+        // root, so the throw is deferred until the remaining post-catalog work completes.
+        var deferredWatcherStartError: Error?
         do {
             try await workspaceFileContextStore.startWatchingRoot(id: rootRecord.id)
         } catch {
-            print("Failed to start watcher for root \(rootRecord.standardizedFullPath): \(error)")
+            if error is CancellationError { throw error }
+            deferredWatcherStartError = error
         }
         guard workspaceFileContextRootsByRootKey[rootKey]?.id == rootRecord.id else { return }
 
@@ -2559,6 +2639,10 @@ class WorkspaceFilesViewModel: ObservableObject {
                     purgeCachesOnEmptyInitialRequests: true
                 )
             }
+        }
+
+        if let deferredWatcherStartError {
+            throw deferredWatcherStartError
         }
     }
 
@@ -2931,6 +3015,12 @@ class WorkspaceFilesViewModel: ObservableObject {
             reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey, stats: &stats)
             let reindexTraversalDurationMS = debugPerfElapsedMS(since: traversalStartMS)
 
+            let totalDurationMS = debugPerfElapsedMS(since: totalStartMS)
+            appliedIndexProjectionIndexRebuildCount += 1
+            appliedIndexProjectionIndexRebuildTotalDurationMS += totalDurationMS
+            appliedIndexProjectionIndexRebuildTraversalDurationMS += reindexTraversalDurationMS
+            appliedIndexProjectionIndexRebuildVisitedFolderCount += stats.visitedFolderCount
+            appliedIndexProjectionIndexRebuildVisitedFileCount += stats.visitedFileCount
             lastIndexRebuildPerfSample = IndexRebuildPerfSample(
                 rootKey: rootKey,
                 totalFolderKeysBefore: totalFolderKeysBefore,
@@ -2946,7 +3036,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                 reindexTraversalDurationMS: reindexTraversalDurationMS,
                 reindexVisitedFolderCount: stats.visitedFolderCount,
                 reindexVisitedFileCount: stats.visitedFileCount,
-                totalDurationMS: debugPerfElapsedMS(since: totalStartMS)
+                totalDurationMS: totalDurationMS
             )
         #else
             reindexFolderRecursively(rootFolder, into: &fileHierarchyIndex, rootKey: rootKey)
@@ -7504,11 +7594,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
             rootFolders
-        case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
+        case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
-                    && !logicalRootPaths.contains(root.standardizedFullPath)
+                    && canonicalRootPaths.contains(root.standardizedFullPath)
             }
         }
     }
@@ -8137,6 +8227,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             let folderPathsByID: [UUID: String]
             let fileIDsByPath: [String: UUID]
             let folderIDsByPath: [String: UUID]
+        }
+
+        @MainActor
+        func currentSlicesByRootForTesting() -> [String: [String: PartitionStore.StoredSlices]] {
+            currentSlicesByRoot
         }
 
         @MainActor
@@ -11551,7 +11646,7 @@ extension WorkspaceFilesViewModel {
         }
 
         markdownPathSearchEntries = entries
-        markdownPathSearchIndex = await PathSearchIndex(paths: entries.map(\.queryPath))
+        markdownPathSearchIndex = await PathSearchIndex.build(paths: entries.map(\.queryPath))
         markdownPathSearchGeneration = generation
     }
 

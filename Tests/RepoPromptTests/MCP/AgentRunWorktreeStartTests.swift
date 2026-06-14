@@ -411,6 +411,164 @@ final class AgentRunWorktreeStartTests: XCTestCase {
         XCTAssertEqual(viewModel.executionLocationProps(tabID: tabID)?.selection, .local)
     }
 
+    func testBindingTransitionMaterializesAndInitializesSessionWorktreeCodemap() async throws {
+        let root = try makeTemporaryDirectory(named: "transition-root")
+        let worktree = try makeTemporaryDirectory(named: "transition-worktree")
+        let sourceFile = worktree.appendingPathComponent("Sources/Transition.swift")
+        try FileManager.default.createDirectory(at: sourceFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try "struct TransitionWorktreeType {\n    func transitionMethod() {}\n}\n".write(
+            to: sourceFile,
+            atomically: true,
+            encoding: .utf8
+        )
+        let window = try await makeWindow(root: root)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path, worktreeID: "transition")
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [binding],
+            forSessionID: sessionID,
+            intent: .externalManagement
+        )
+
+        XCTAssertEqual(session.worktreeBindings, [binding])
+        let materializedProjection = await window.mcpServer.materializeWorkspaceBindingProjection(
+            sessionID: sessionID,
+            bindings: [binding]
+        )
+        let projection = try XCTUnwrap(materializedProjection)
+        let physicalRoot = try XCTUnwrap(projection.physicalRootRefs.first)
+        let redundantInitialization = await window.workspaceFileContextStore.initializeCodemapsForSessionWorktreeRoots(
+            rootIDs: [physicalRoot.id]
+        )
+        XCTAssertTrue(redundantInitialization.isEmpty)
+        let result = await window.workspaceFileContextStore.lookupPath(
+            sourceFile.path,
+            profile: .mcpRead,
+            rootScope: projection.lookupRootScope
+        )
+        let file = try XCTUnwrap(result?.file)
+        let repair = try await window.workspaceFileContextStore.repairMissingCodemapSnapshots(
+            for: [file],
+            timeout: .seconds(6)
+        )
+        let immediateSnapshot = repair.snapshotsByFileID[file.id]
+        let snapshot: WorkspaceCodemapSnapshot
+        if immediateSnapshot == nil {
+            XCTAssertEqual(repair.pendingFileIDs, [file.id])
+            snapshot = try await waitForCodemapSnapshot(
+                store: window.workspaceFileContextStore,
+                fileID: file.id
+            )
+        } else {
+            snapshot = try XCTUnwrap(immediateSnapshot)
+        }
+        XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("TransitionWorktreeType") == true)
+    }
+
+    func testBindingTransitionMaterializesChangedSecondaryBindingWithoutRestartingUnchangedPrimaryIdentity() async throws {
+        let primaryRoot = try makeTemporaryDirectory(named: "transition-primary-root")
+        let primaryWorktree = try makeTemporaryDirectory(named: "transition-primary-worktree")
+        let secondaryRoot = try makeTemporaryDirectory(named: "transition-secondary-root")
+        let secondaryWorktree = try makeTemporaryDirectory(named: "transition-secondary-worktree")
+        try "struct SecondaryWorktreeType {}\n".write(
+            to: secondaryWorktree.appendingPathComponent("Secondary.swift"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let window = try await makeWindow(root: primaryRoot)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await window.workspaceFileContextStore.loadRoot(path: secondaryRoot.path)
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        session.hasLoadedPersistedState = true
+        session.runState = .running
+        session.runID = UUID()
+        session.providerSessionID = "stable-provider-identity"
+        session.codexConversationID = "stable-codex-identity"
+        let primaryBinding = makeBinding(
+            logicalRoot: primaryRoot.path,
+            worktreeRoot: primaryWorktree.path,
+            worktreeID: "primary"
+        )
+        let secondaryBinding = makeBinding(
+            logicalRoot: secondaryRoot.path,
+            worktreeRoot: secondaryWorktree.path,
+            worktreeID: "secondary"
+        )
+        session.worktreeBindings = [primaryBinding]
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [primaryBinding, secondaryBinding],
+            forSessionID: sessionID,
+            intent: .externalManagement
+        )
+
+        XCTAssertEqual(session.worktreeBindings, [primaryBinding, secondaryBinding])
+        XCTAssertEqual(session.providerSessionID, "stable-provider-identity")
+        XCTAssertEqual(session.codexConversationID, "stable-codex-identity")
+        let materializedProjection = await window.mcpServer.materializeWorkspaceBindingProjection(
+            sessionID: sessionID,
+            bindings: session.worktreeBindings
+        )
+        let projection = try XCTUnwrap(materializedProjection)
+        XCTAssertEqual(projection.physicalRootPaths, Set([
+            primaryWorktree.standardizedFileURL.path,
+            secondaryWorktree.standardizedFileURL.path
+        ]))
+    }
+
+    func testBindingTransitionRejectsUnavailableSecondaryBindingEvenWhenPrimaryIdentityIsUnchanged() async throws {
+        let primaryRoot = try makeTemporaryDirectory(named: "transition-validation-primary-root")
+        let primaryWorktree = try makeTemporaryDirectory(named: "transition-validation-primary-worktree")
+        let secondaryRoot = try makeTemporaryDirectory(named: "transition-validation-secondary-root")
+        let missingSecondaryWorktree = secondaryRoot.appendingPathComponent("missing-worktree")
+        let window = try await makeWindow(root: primaryRoot)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await window.workspaceFileContextStore.loadRoot(path: secondaryRoot.path)
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        session.hasLoadedPersistedState = true
+        session.providerSessionID = "unchanged-provider-identity"
+        let primaryBinding = makeBinding(
+            logicalRoot: primaryRoot.path,
+            worktreeRoot: primaryWorktree.path,
+            worktreeID: "validation-primary"
+        )
+        let unavailableSecondary = makeBinding(
+            logicalRoot: secondaryRoot.path,
+            worktreeRoot: missingSecondaryWorktree.path,
+            worktreeID: "validation-secondary"
+        )
+        session.worktreeBindings = [primaryBinding]
+
+        do {
+            _ = try await viewModel.transitionWorktreeBindings(
+                [primaryBinding, unavailableSecondary],
+                forSessionID: sessionID,
+                intent: .externalManagement
+            )
+            XCTFail("Expected every changed binding set to be validated before commit")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains(missingSecondaryWorktree.path), error.localizedDescription)
+        }
+        XCTAssertEqual(session.worktreeBindings, [primaryBinding])
+        XCTAssertEqual(session.providerSessionID, "unchanged-provider-identity")
+    }
+
     func testStartedThreadCanCreateNewWorktreeAndReplacePrimaryBinding() async throws {
         let fixture = try makeGitFixture()
         let window = try await makeWindow(root: fixture.repo)
@@ -1491,6 +1649,23 @@ final class AgentRunWorktreeStartTests: XCTestCase {
 
     private func samePath(_ lhs: String, _ rhs: String) -> Bool {
         URL(fileURLWithPath: lhs).standardizedFileURL.path == URL(fileURLWithPath: rhs).standardizedFileURL.path
+    }
+
+    private func waitForCodemapSnapshot(
+        store: WorkspaceFileContextStore,
+        fileID: UUID,
+        timeout: Duration = .seconds(6)
+    ) async throws -> WorkspaceCodemapSnapshot {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let snapshot = await store.codemapSnapshot(fileID: fileID) {
+                return snapshot
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for codemap snapshot")
+        throw NSError(domain: "AgentRunWorktreeStartTests", code: 1)
     }
 
     private func makeWindow(root: URL) async throws -> WindowState {

@@ -5,6 +5,9 @@ import Foundation
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
 actor GitService {
+    private static let gitProcessTimeout: Duration = .seconds(120)
+    private static let gitProcessTerminationGrace: Duration = .seconds(5)
+
     // MARK: - Types
 
     struct GitError: LocalizedError {
@@ -45,6 +48,8 @@ actor GitService {
     }
 
     private let worktreeMutationCoordinator = GitWorktreeMutationCoordinator()
+    private let inheritedProcessEnvironment = ProcessInfo.processInfo.environment
+    private var preparedBaseProcessEnvironment: [String: String]?
 
     struct UncommittedFile: Equatable {
         let path: String
@@ -689,7 +694,11 @@ actor GitService {
     /// Get a status fingerprint for staleness detection.
     func getStatusFingerprint(at repoURL: URL, baseRef: String = "HEAD") async throws -> GitDiffFingerprint {
         let headSHA = try await getHeadSHA(at: repoURL)
-        let baseRefSHA = try await getRefSHA(at: repoURL, ref: baseRef)
+        let baseRefSHA = if baseRef == "HEAD" {
+            headSHA
+        } else {
+            try await getRefSHA(at: repoURL, ref: baseRef)
+        }
         let statusData = try await getStatusPorcelainZ(at: repoURL)
         var fingerprintData = Data()
         fingerprintData.append(statusData)
@@ -698,7 +707,9 @@ actor GitService {
         fingerprintData.append(0)
 
         // Include per-path size/mtime to invalidate cache when modified file content changes.
-        let paths = changedPathsFromPorcelainZ(statusData)
+        let paths = MCPToolWorkCountDiagnostics.measureGitParse {
+            changedPathsFromPorcelainZ(statusData)
+        }
         let fm = FileManager.default
         for path in Set(paths).sorted() {
             fingerprintData.append(Data(path.utf8))
@@ -713,7 +724,9 @@ actor GitService {
             }
             fingerprintData.append(0)
         }
-        let statusHash = sha256Hex(fingerprintData)
+        let statusHash = MCPToolWorkCountDiagnostics.measureGitParse {
+            sha256Hex(fingerprintData)
+        }
         return GitDiffFingerprint(
             headSHA: headSHA,
             baseRef: baseRef,
@@ -1016,25 +1029,64 @@ actor GitService {
         return (Character(scalarValue), nextIndex)
     }
 
-    /// Get diff for untracked files by comparing each file to /dev/null
+    /// Get untracked-file patches in one no-index Git process.
     func getUntrackedDiff(for files: [String], contextLines: Int, at repoURL: URL) async throws -> String {
         guard !files.isEmpty else { return "" }
 
-        var combined = ""
+        let fileManager = FileManager.default
+        let batchRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("RepoPrompt-GitUntrackedDiff-\(UUID().uuidString)", isDirectory: true)
+        let emptyRoot = batchRoot.appendingPathComponent("empty", isDirectory: true)
+        let mirrorRoot = batchRoot.appendingPathComponent("mirror", isDirectory: true)
+        try fileManager.createDirectory(at: emptyRoot, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: mirrorRoot, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: batchRoot) }
+
+        let standardizedRepo = repoURL.standardizedFileURL.path
+        let repoPrefix = standardizedRepo.hasSuffix("/") ? standardizedRepo : standardizedRepo + "/"
         for file in files {
-            let args = ["diff", "--no-index", "--unified=\(contextLines)", "--no-ext-diff", "--color=never", "--", "/dev/null", file]
-            // --no-index doesn't need repo context, so skip GIT_DIR/GIT_WORK_TREE injection
-            let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL, requiresRepoContext: false)
-            guard exitCode == 0 || exitCode == 1 else {
-                throw GitError(message: "git diff --no-index failed: \(stderr)")
+            let source = repoURL.appendingPathComponent(file).standardizedFileURL
+            guard source.path.hasPrefix(repoPrefix) else {
+                throw GitError(message: "untracked diff path escapes repository: \(file)")
             }
-            if !stdout.isEmpty {
-                combined += stdout
-                if !combined.hasSuffix("\n") { combined += "\n" }
-            }
+            let destination = mirrorRoot.appendingPathComponent(file)
+            try fileManager.createDirectory(
+                at: destination.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try fileManager.copyItem(at: source, to: destination)
         }
 
-        return combined
+        let args = [
+            "diff", "--no-index", "--unified=\(contextLines)",
+            "--no-ext-diff", "--no-textconv", "--color=never", "--", "../empty", "."
+        ]
+        let (stdout, stderr, exitCode) = try await runGit(
+            args,
+            at: mirrorRoot,
+            requiresRepoContext: false,
+            budgetRepoURL: repoURL
+        )
+        guard exitCode == 0 || exitCode == 1 else {
+            throw GitError(message: "git diff --no-index failed: \(stderr)")
+        }
+        return Self.normalizeBatchedUntrackedDiffPaths(stdout)
+    }
+
+    nonisolated static func normalizeBatchedUntrackedDiffPaths(_ output: String) -> String {
+        output.split(separator: "\n", omittingEmptySubsequences: false).map { line in
+            let text = String(line)
+            guard text.hasPrefix("diff --git ")
+                || text.hasPrefix("--- ")
+                || text.hasPrefix("+++ ")
+                || text.hasPrefix("Binary files ")
+            else { return text }
+            return text
+                .replacingOccurrences(of: "a/./", with: "a/")
+                .replacingOccurrences(of: "b/./", with: "b/")
+                .replacingOccurrences(of: "\"a/./", with: "\"a/")
+                .replacingOccurrences(of: "\"b/./", with: "\"b/")
+        }.joined(separator: "\n")
     }
 
     /// Get diff for specific files (all uncommitted changes - staged and unstaged)
@@ -1665,8 +1717,9 @@ actor GitService {
         }
 
         // Parse outputs ----------------------------------------------------------
-        let statsMap = parseNumstatOutput(numOut) // path → (add,del)
-        let statusMap = parseNameStatusOutput(nameOut) // path → "M"
+        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
+            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        }
 
         // Merge into unified results --------------------------------------------
         var results: [UncommittedFile] = []
@@ -1803,10 +1856,22 @@ actor GitService {
         detectRenames: Bool = false,
         at repoURL: URL
     ) async throws -> [UncommittedFile] {
-        let numOut = try await getDiffNumstat(compare: compare, detectRenames: detectRenames, at: repoURL)
-        let nameOut = try await getDiffNameStatus(compare: compare, detectRenames: detectRenames, at: repoURL)
-        let statsMap = parseNumstatOutput(numOut)
-        let statusMap = parseNameStatusOutput(nameOut)
+        let includeUntracked = includeUntrackedWhenApplicable && {
+            switch compare {
+            case .uncommitted, .uncommittedMergeBase, .unstaged:
+                true
+            case .staged, .stagedMergeBase, .revspec:
+                false
+            }
+        }()
+
+        async let numOutTask = getDiffNumstat(compare: compare, detectRenames: detectRenames, at: repoURL)
+        async let nameOutTask = getDiffNameStatus(compare: compare, detectRenames: detectRenames, at: repoURL)
+        async let untrackedFilesTask = includeUntracked ? getUntrackedPaths(at: repoURL) : []
+        let (numOut, nameOut, untrackedFiles) = try await (numOutTask, nameOutTask, untrackedFilesTask)
+        let (statsMap, statusMap) = MCPToolWorkCountDiagnostics.measureGitParse {
+            (parseNumstatOutput(numOut), parseNameStatusOutput(nameOut))
+        }
 
         var results: [UncommittedFile] = []
         let allPaths = Set(statsMap.keys).union(statusMap.keys)
@@ -1826,25 +1891,7 @@ actor GitService {
             )
         }
 
-        let includeUntracked = includeUntrackedWhenApplicable && {
-            switch compare {
-            case .uncommitted, .uncommittedMergeBase, .unstaged:
-                true
-            case .staged, .stagedMergeBase, .revspec:
-                false
-            }
-        }()
-
         if includeUntracked {
-            let (untrackedOut, _, untrackedExit) = try await runGit(["ls-files", "--others", "--exclude-standard"], at: repoURL)
-            guard untrackedExit == 0 else {
-                throw GitError(message: "git ls-files failed")
-            }
-            let untrackedFiles = untrackedOut
-                .split(separator: "\n")
-                .map { String($0) }
-                .filter { !$0.isEmpty }
-
             for path in untrackedFiles {
                 if !allPaths.contains(path) {
                     let stats = untrackedLineStats(for: path, repoURL: repoURL)
@@ -1869,6 +1916,17 @@ actor GitService {
             }
             return lhs.original < rhs.original
         }.map(\.file)
+    }
+
+    private func getUntrackedPaths(at repoURL: URL) async throws -> [String] {
+        let (stdout, stderr, exitCode) = try await runGit(
+            ["ls-files", "--others", "--exclude-standard"],
+            at: repoURL
+        )
+        guard exitCode == 0 else {
+            throw GitError(message: "git ls-files failed: \(stderr)")
+        }
+        return stdout.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
     }
 
     func getCommitGraph(maxLines: Int, at repoURL: URL) async throws -> String {
@@ -1920,76 +1978,48 @@ actor GitService {
     }
 
     /// Structured working directory status.
-    struct WorkingStatus {
+    struct WorkingStatus: Equatable {
         let staged: [String]
         let modified: [String]
         let untracked: [String]
     }
 
-    /// Get structured working status with staged, modified, and untracked files.
-    func getWorkingStatus(at repoURL: URL) async throws -> WorkingStatus {
-        let args = ["status", "--porcelain", "-z", "--untracked-files=all"]
+    struct RepositoryStatus: Equatable {
+        let branch: String?
+        let headID: String?
+        let upstream: String?
+        let ahead: Int?
+        let behind: Int?
+        let workingStatus: WorkingStatus
+    }
+
+    /// Read branch metadata and working-tree state from one porcelain-v2 snapshot.
+    func getRepositoryStatus(at repoURL: URL) async throws -> RepositoryStatus {
+        let args = ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=all"]
         let (stdout, stderr, exitCode) = try await runGit(args, at: repoURL)
         guard exitCode == 0 else {
-            throw GitError(message: "git status --porcelain -z failed: \(stderr)")
+            throw GitError(message: "git status --porcelain=v2 failed: \(stderr)")
         }
-
-        var staged: [String] = []
-        var modified: [String] = []
-        var untracked: [String] = []
-
-        // Parse NUL-delimited entries
-        // Format: XY<space>path<NUL>[origPath<NUL> for renames]
-        let entries = stdout.split(separator: "\0", omittingEmptySubsequences: false).map(String.init)
-        var i = 0
-        while i < entries.count {
-            let entry = entries[i]
-            guard entry.count >= 3 else {
-                i += 1
-                continue
-            }
-
-            let indexStatus = entry[entry.startIndex]
-            let workTreeStatus = entry[entry.index(after: entry.startIndex)]
-            let pathStart = entry.index(entry.startIndex, offsetBy: 3)
-            let path = String(entry[pathStart...])
-
-            // Skip empty paths
-            guard !path.isEmpty else {
-                i += 1
-                continue
-            }
-
-            // Untracked
-            if indexStatus == "?" && workTreeStatus == "?" {
-                untracked.append(path)
-                i += 1
-                continue
-            }
-
-            // Staged: X is not space and not ?
-            if indexStatus != " " && indexStatus != "?" {
-                staged.append(path)
-            }
-
-            // Modified in working tree: Y is not space and not ?
-            if workTreeStatus != " " && workTreeStatus != "?" {
-                modified.append(path)
-            }
-
-            // Handle renames/copies which have an additional path
-            if indexStatus == "R" || indexStatus == "C" {
-                i += 2 // Skip the original path
-            } else {
-                i += 1
-            }
+        let parsed = try MCPToolWorkCountDiagnostics.measureGitParse {
+            try GitStatusPorcelainV2Parser.parse(stdout)
         }
-
-        return WorkingStatus(
-            staged: staged.sorted(),
-            modified: modified.sorted(),
-            untracked: untracked.sorted()
+        return RepositoryStatus(
+            branch: parsed.branch,
+            headID: parsed.headID,
+            upstream: parsed.upstream,
+            ahead: parsed.ahead,
+            behind: parsed.behind,
+            workingStatus: WorkingStatus(
+                staged: parsed.staged,
+                modified: parsed.modified,
+                untracked: parsed.untracked
+            )
         )
+    }
+
+    /// Compatibility wrapper for callers that only need working-tree paths.
+    func getWorkingStatus(at repoURL: URL) async throws -> WorkingStatus {
+        try await getRepositoryStatus(at: repoURL).workingStatus
     }
 
     /// Summary of a commit for log output.
@@ -2254,12 +2284,38 @@ actor GitService {
     }
 
     private func processEnvironment() async -> [String: String] {
-        let baseEnvironment = ProcessInfo.processInfo.environment
+        if let preparedBaseProcessEnvironment {
+            return preparedBaseProcessEnvironment
+        }
         let shellEnvironment = await CLIEnvironmentCache.shared.environment(enableLogging: false)
-        return Self.mergedProcessEnvironment(
-            baseEnvironment: baseEnvironment,
+        let environment = Self.mergedProcessEnvironment(
+            baseEnvironment: inheritedProcessEnvironment,
             shellEnvironment: shellEnvironment
         )
+        preparedBaseProcessEnvironment = environment
+        return environment
+    }
+
+    nonisolated static func isVerifiedReadOnlyGitOperation(_ args: [String]) -> Bool {
+        guard let command = args.first else { return false }
+        switch command {
+        case "rev-parse", "status", "ls-files", "diff", "merge-base", "merge-tree",
+             "show-ref", "for-each-ref", "log", "rev-list", "show", "blame", "cat-file":
+            return true
+        case "worktree":
+            return args.dropFirst().first == "list"
+        case "symbolic-ref":
+            return args.contains("--short") && args.last == "HEAD"
+        case "branch":
+            return args == ["branch", "--show-current"]
+        case "config":
+            return args.contains("--get")
+        default:
+            if command == "--git-dir", let configIndex = args.firstIndex(of: "config") {
+                return args[configIndex...].contains("--get")
+            }
+            return false
+        }
     }
 
     private func runGit(
@@ -2267,15 +2323,14 @@ actor GitService {
         at repoURL: URL,
         env: [String: String] = [:],
         stdin: Data? = nil,
-        requiresRepoContext: Bool = true
+        requiresRepoContext: Bool = true,
+        budgetRepoURL: URL? = nil
     ) async throws -> (String, String, Int32) {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
-        process.arguments = args
-        process.currentDirectoryURL = repoURL
-
         var environment = await processEnvironment()
         environment["GIT_TERMINAL_PROMPT"] = "0"
+        if Self.isVerifiedReadOnlyGitOperation(args) {
+            environment["GIT_OPTIONAL_LOCKS"] = "0"
+        }
 
         // For gitfile worktrees, inject GIT_DIR and GIT_WORK_TREE to ensure
         // git commands operate in the correct context.
@@ -2284,8 +2339,44 @@ actor GitService {
             environment["GIT_DIR"] = layout.gitDir.path
             environment["GIT_WORK_TREE"] = layout.workTreeRoot.path
         }
-
         environment.merge(env) { _, new in new }
+
+        let budgetURL = budgetRepoURL ?? repoURL
+        let repositoryKey = getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
+            ?? budgetURL.standardizedFileURL.path
+        let lease = try await GitProcessAdmissionController.shared.acquire(repositoryKey: repositoryKey)
+        do {
+            try Task.checkCancellation()
+            let result = try await runAdmittedGit(
+                args,
+                at: repoURL,
+                environment: environment,
+                stdin: stdin,
+                diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
+                processQueueWaitMicroseconds: lease.queueWaitMicroseconds
+            )
+            await GitProcessAdmissionController.shared.release(lease)
+            return result
+        } catch {
+            await GitProcessAdmissionController.shared.release(lease)
+            throw error
+        }
+    }
+
+    private func runAdmittedGit(
+        _ args: [String],
+        at repoURL: URL,
+        environment: [String: String],
+        stdin: Data?,
+        diagnosticRepositoryPath: String,
+        processQueueWaitMicroseconds: Int
+    ) async throws -> (String, String, Int32) {
+        let process = Process()
+        let timeoutController = GitProcessTimeoutController()
+        let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = args
+        process.currentDirectoryURL = repoURL
         process.environment = environment
 
         let outPipe = Pipe()
@@ -2306,9 +2397,14 @@ actor GitService {
         // Build async streams for stdout/stderr and single consumer tasks to collect data.
         // GitProcessPipeDrain serializes readability callbacks with termination/cancellation
         // so a final chunk cannot be read by a callback and then dropped after stream closure.
-        let (outStream, outDrain) = GitProcessPipeDrain.makeStream()
-        let (errStream, errDrain) = GitProcessPipeDrain.makeStream()
+        let (outStream, outDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: outPipe.fileHandleForReading
+        )
+        let (errStream, errDrain) = try GitProcessPipeDrain.makeStream(
+            readingFrom: errPipe.fileHandleForReading
+        )
 
+        let processMetrics = GitProcessMetricsBox()
         let outCollector = Task(priority: .userInitiated) { () -> Data in
             var buf = Data()
             for await chunk in outStream {
@@ -2328,22 +2424,28 @@ actor GitService {
             try await withCheckedThrowingContinuation { continuation in
                 // Drain stdout
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
-                    outDrain.consumeAvailableData(from: handle)
+                    if outDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
                 // Drain stderr
                 errPipe.fileHandleForReading.readabilityHandler = { handle in
-                    errDrain.consumeAvailableData(from: handle)
+                    if errDrain.consumeAvailableData() {
+                        handle.readabilityHandler = nil
+                    }
                 }
 
                 process.terminationHandler = { proc in
+                    timeoutController.cancel()
+
                     // Stop handlers to break strong reference cycles
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
 
                     // Drain bytes that arrived between the last readability callback and
                     // process termination, then close each stream after any in-flight callback.
-                    outDrain.finishReading(from: outPipe.fileHandleForReading)
-                    errDrain.finishReading(from: errPipe.fileHandleForReading)
+                    outDrain.finishReading()
+                    errDrain.finishReading()
 
                     Task {
                         let stdoutData = await outCollector.value
@@ -2351,13 +2453,32 @@ actor GitService {
 
                         let stdout = String(data: stdoutData, encoding: .utf8) ?? ""
                         let stderr = String(data: stderrData, encoding: .utf8) ?? ""
+                        commandRecorder(
+                            diagnosticRepositoryPath,
+                            args,
+                            processQueueWaitMicroseconds,
+                            processMetrics.spawnMicroseconds,
+                            stdoutData.count + stderrData.count
+                        )
 
                         continuation.resume(returning: (stdout, stderr, proc.terminationStatus))
                     }
                 }
 
                 do {
+                    let spawnStart = DispatchTime.now().uptimeNanoseconds
                     try process.run()
+                    let processIdentifier = process.processIdentifier
+                    timeoutController.schedule(
+                        process: process,
+                        processIdentifier: processIdentifier,
+                        timeout: Self.gitProcessTimeout,
+                        terminationGrace: Self.gitProcessTerminationGrace
+                    )
+                    let spawnEnd = DispatchTime.now().uptimeNanoseconds
+                    processMetrics.spawnMicroseconds = Int(
+                        clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
+                    )
 
                     // If stdin data was provided, write it after the process starts.
                     // Use raw FD writes via FDWriteSupport instead of FileHandle.write()
@@ -2381,7 +2502,15 @@ actor GitService {
                         }
                     }
                 } catch {
+                    commandRecorder(
+                        diagnosticRepositoryPath,
+                        args,
+                        processQueueWaitMicroseconds,
+                        processMetrics.spawnMicroseconds,
+                        0
+                    )
                     // Ensure handlers and collectors are released when launch fails.
+                    timeoutController.cancel()
                     outPipe.fileHandleForReading.readabilityHandler = nil
                     errPipe.fileHandleForReading.readabilityHandler = nil
                     outDrain.cancel()
@@ -2390,6 +2519,7 @@ actor GitService {
                 }
             }
         }, onCancel: {
+            timeoutController.cancel()
             // Stop callbacks and terminate before waiting on a drain lock. A callback may be
             // blocked in FileHandle.availableData until the child closes its pipe.
             outPipe.fileHandleForReading.readabilityHandler = nil
@@ -2793,33 +2923,121 @@ actor GitService {
 }
 
 /// Serializes pipe readability callbacks with process termination and cancellation.
+private final class GitProcessMetricsBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedSpawnMicroseconds = 0
+
+    var spawnMicroseconds: Int {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return storedSpawnMicroseconds
+        }
+        set {
+            lock.lock()
+            storedSpawnMicroseconds = max(0, newValue)
+            lock.unlock()
+        }
+    }
+}
+
 ///
 /// `FileHandle.readabilityHandler` may already be executing when a process termination
-/// handler clears it. Without this lock, that callback can read the final bytes, lose the
-/// race to stream closure, and have its subsequent yield discarded.
+/// handler clears it. Foundation may also invalidate its file handle before a queued callback
+/// runs. The drain owns a close-on-exec duplicate descriptor so all reads and closure are
+/// serialized independently of the `FileHandle` lifecycle.
 final class GitProcessPipeDrain: @unchecked Sendable {
+    private enum DescriptorReadResult {
+        case data(Data)
+        case unavailable
+        case terminal
+    }
+
+    private static let readBufferSize = 64 * 1024
+
     private let lock = NSLock()
     private let continuation: AsyncStream<Data>.Continuation
+    private var ownedDescriptor: Int32?
     private var isFinished = false
 
-    private init(continuation: AsyncStream<Data>.Continuation) {
+    private init(
+        continuation: AsyncStream<Data>.Continuation,
+        ownedDescriptor: Int32? = nil
+    ) {
         self.continuation = continuation
+        self.ownedDescriptor = ownedDescriptor
+    }
+
+    deinit {
+        if let ownedDescriptor {
+            _ = Darwin.close(ownedDescriptor)
+        }
     }
 
     static func makeStream() -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        makeStream(ownedDescriptor: nil)
+    }
+
+    static func makeStream(
+        readingFrom handle: FileHandle
+    ) throws -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
+        let duplicateDescriptor = fcntl(handle.fileDescriptor, F_DUPFD_CLOEXEC, 0)
+        guard duplicateDescriptor >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+
+        let statusFlags = fcntl(duplicateDescriptor, F_GETFL)
+        guard statusFlags >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+        guard fcntl(duplicateDescriptor, F_SETFL, statusFlags | O_NONBLOCK) >= 0 else {
+            let failureErrno = errno
+            _ = Darwin.close(duplicateDescriptor)
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(failureErrno))
+        }
+
+        return makeStream(ownedDescriptor: duplicateDescriptor)
+    }
+
+    private static func makeStream(
+        ownedDescriptor: Int32?
+    ) -> (stream: AsyncStream<Data>, drain: GitProcessPipeDrain) {
         var drain: GitProcessPipeDrain?
         let stream = AsyncStream<Data>(bufferingPolicy: .unbounded) { continuation in
-            drain = GitProcessPipeDrain(continuation: continuation)
+            drain = GitProcessPipeDrain(
+                continuation: continuation,
+                ownedDescriptor: ownedDescriptor
+            )
         }
         return (stream, drain!)
     }
 
-    func consumeAvailableData(from handle: FileHandle) {
-        consume { handle.availableData }
+    /// Returns true when the `FileHandle` should stop monitoring readability.
+    @discardableResult
+    func consumeAvailableData() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !isFinished, let ownedDescriptor else { return true }
+
+        switch Self.readChunk(from: ownedDescriptor) {
+        case let .data(data):
+            continuation.yield(data)
+            return false
+        case .unavailable:
+            return false
+        case .terminal:
+            finishLocked()
+            return true
+        }
     }
 
-    func finishReading(from handle: FileHandle) {
-        finish { handle.readDataToEndOfFile() }
+    func finishReading() {
+        finish { [self] in
+            guard let ownedDescriptor else { return Data() }
+            return Self.readToEnd(from: ownedDescriptor)
+        }
     }
 
     func consume(read: () -> Data) {
@@ -2846,8 +3064,7 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         if !data.isEmpty {
             continuation.yield(data)
         }
-        isFinished = true
-        continuation.finish()
+        finishLocked()
     }
 
     func cancel() {
@@ -2855,8 +3072,50 @@ final class GitProcessPipeDrain: @unchecked Sendable {
         defer { lock.unlock() }
         guard !isFinished else { return }
 
+        finishLocked()
+    }
+
+    private func finishLocked() {
         isFinished = true
+        if let ownedDescriptor {
+            self.ownedDescriptor = nil
+            _ = Darwin.close(ownedDescriptor)
+        }
         continuation.finish()
+    }
+
+    private static func readToEnd(from descriptor: Int32) -> Data {
+        var result = Data()
+        while true {
+            switch readChunk(from: descriptor) {
+            case let .data(data):
+                result.append(data)
+            case .unavailable, .terminal:
+                return result
+            }
+        }
+    }
+
+    private static func readChunk(from descriptor: Int32) -> DescriptorReadResult {
+        var buffer = [UInt8](repeating: 0, count: readBufferSize)
+        while true {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
+            }
+            if count > 0 {
+                return .data(Data(buffer.prefix(Int(count))))
+            }
+            if count == 0 {
+                return .terminal
+            }
+            if errno == EINTR {
+                continue
+            }
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return .unavailable
+            }
+            return .terminal
+        }
     }
 }
 
@@ -2867,6 +3126,41 @@ private extension GitService.WorkingStatus {
 
     var changedPaths: [String] {
         Array(Set(staged + modified + untracked)).sorted()
+    }
+}
+
+private final class GitProcessTimeoutController: @unchecked Sendable {
+    private let lock = NSLock()
+    private var task: Task<Void, Never>?
+
+    func schedule(
+        process: Process,
+        processIdentifier: pid_t,
+        timeout: Duration,
+        terminationGrace: Duration
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        task?.cancel()
+        task = Task {
+            do {
+                try await Task.sleep(for: timeout)
+                guard !Task.isCancelled, process.isRunning else { return }
+                process.terminate()
+                try await Task.sleep(for: terminationGrace)
+                guard !Task.isCancelled, process.isRunning else { return }
+                kill(processIdentifier, SIGKILL)
+            } catch {
+                return
+            }
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        defer { lock.unlock() }
+        task?.cancel()
+        task = nil
     }
 }
 

@@ -1,3 +1,4 @@
+import Foundation
 @testable import RepoPrompt
 import XCTest
 
@@ -121,7 +122,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         await firstGate.waitUntilStarted()
         let drainFinished = CoordinatorAsyncSignal()
         let drainTask = Task { @MainActor in
-            await coordinator.drain(.canonicalSelection, for: key)
+            _ = await coordinator.drain(.canonicalSelection, for: key)
             await drainFinished.mark()
         }
         await Task.yield()
@@ -135,6 +136,201 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         await secondGate.release()
         await drainTask.value
         await coordinator.drain(.canonicalSelection, for: key)
+    }
+
+    func testCancelledCanonicalDrainResumesPromptlyWithoutStoppingWorker() async {
+        let gate = CoordinatorAsyncGate()
+        let coordinator = makeCoordinator(recorder: CoordinatorRecorder()) { _, _ in
+            await gate.markStartedAndWaitForRelease()
+            return .unchanged
+        }
+        let key = contextKey()
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        await gate.waitUntilStarted()
+        let drainTask = Task { @MainActor in
+            await coordinator.drain(.canonicalSelection, for: key)
+        }
+        let canonicalWaiterRegistered = await waitUntil {
+            coordinator.debugSnapshot().canonicalWaiterCount == 1
+        }
+        XCTAssertTrue(canonicalWaiterRegistered)
+
+        drainTask.cancel()
+
+        let canonicalResult = await drainTask.value
+        XCTAssertEqual(canonicalResult, .cancelled)
+        XCTAssertEqual(coordinator.debugSnapshot().canonicalWaiterCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().canonicalWorkerCount, 1)
+
+        await gate.release()
+        let settledCanonicalResult = await coordinator.drain(.canonicalSelection, for: key)
+        XCTAssertEqual(settledCanonicalResult, .completed)
+        let canonicalWorkerStopped = await waitUntil {
+            coordinator.debugSnapshot().canonicalWorkerCount == 0
+        }
+        XCTAssertTrue(canonicalWorkerStopped)
+    }
+
+    func testCancelledMirrorDrainResumesPromptlyWithoutStoppingWorker() async {
+        let mirrorGate = CoordinatorAsyncGate()
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { _ in true },
+            applyCanonical: { key, _ in
+                MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(mirrorKey: key.mirrorKey)
+            },
+            applyMirror: { _ in
+                await mirrorGate.markStartedAndWaitForRelease()
+            }
+        )
+        let key = contextKey()
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        await mirrorGate.waitUntilStarted()
+        let drainTask = Task { @MainActor in
+            await coordinator.drain(.mirroredSelectionAndMetrics, for: key)
+        }
+        let mirrorWaiterRegistered = await waitUntil {
+            coordinator.debugSnapshot().mirrorWaiterCount == 1
+        }
+        XCTAssertTrue(mirrorWaiterRegistered)
+
+        drainTask.cancel()
+
+        let mirrorResult = await drainTask.value
+        XCTAssertEqual(mirrorResult, .cancelled)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorWorkerCount, 1)
+
+        await mirrorGate.release()
+        let settledMirrorResult = await coordinator.drain(.mirroredSelectionAndMetrics, for: key)
+        XCTAssertEqual(settledMirrorResult, .completed)
+        let mirrorWorkerStopped = await waitUntil {
+            coordinator.debugSnapshot().mirrorWorkerCount == 0
+        }
+        XCTAssertTrue(mirrorWorkerStopped)
+    }
+
+    func testCanonicalCompletionCancellationRaceResumesWaiterExactlyOnce() async {
+        for iteration in 0 ..< 20 {
+            let gate = CoordinatorAsyncGate()
+            let coordinator = makeCoordinator(recorder: CoordinatorRecorder()) { _, _ in
+                await gate.markStartedAndWaitForRelease()
+                return .unchanged
+            }
+            let key = contextKey()
+
+            XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/\(iteration).swift"]), for: key))
+            await gate.waitUntilStarted()
+            let drainTask = Task { @MainActor in
+                await coordinator.drain(.canonicalSelection, for: key)
+            }
+            let waiterRegistered = await waitUntil {
+                coordinator.debugSnapshot().canonicalWaiterCount == 1
+            }
+            XCTAssertTrue(waiterRegistered)
+
+            let releaseTask = Task {
+                await gate.release()
+            }
+            drainTask.cancel()
+            await releaseTask.value
+            await drainTask.value
+            await coordinator.drain(.canonicalSelection, for: key)
+            let workerStopped = await waitUntil {
+                coordinator.debugSnapshot().canonicalWorkerCount == 0
+            }
+
+            let snapshot = coordinator.debugSnapshot()
+            XCTAssertTrue(workerStopped, "iteration \(iteration)")
+            XCTAssertEqual(snapshot.canonicalWaiterCount, 0, "iteration \(iteration)")
+        }
+    }
+
+    func testDiagnosticsExposeCanonicalAndMirrorHighWaterWaitersAndWorkers() async throws {
+        let canonicalGate = CoordinatorAsyncGate()
+        let mirrorGate = CoordinatorAsyncGate()
+        let diagnostics = CoordinatorDiagnosticRecorder()
+        let key = contextKey()
+        let coordinator = MCPReadFileAutoSelectionCoordinator(
+            isContextCurrent: { _ in true },
+            applyCanonical: { key, _ in
+                await canonicalGate.markStartedAndWaitForRelease()
+                return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(mirrorKey: key.mirrorKey)
+            },
+            applyMirror: { _ in
+                await mirrorGate.markStartedAndWaitForRelease()
+            }
+        )
+        MCPReadFileAutoSelectionDiagnosticTracer.setTestSink { diagnostics.append($0) }
+        defer { MCPReadFileAutoSelectionDiagnosticTracer.setTestSink(nil) }
+
+        XCTAssertTrue(coordinator.enqueue(intent: .full(paths: ["/tmp/A.swift"]), for: key))
+        await canonicalGate.waitUntilStarted()
+        let drainTask = Task { @MainActor in
+            await coordinator.drain(.mirroredSelectionAndMetrics, for: key)
+        }
+
+        let canonicalRegistered = try await diagnostics.waitFor(kind: .waiterRegistered, lane: .canonical)
+        XCTAssertEqual(canonicalRegistered.target, 1)
+        XCTAssertEqual(canonicalRegistered.acceptedHighWater, 1)
+        XCTAssertEqual(canonicalRegistered.completedHighWater, 0)
+        XCTAssertEqual(canonicalRegistered.waiterCount, 1)
+        XCTAssertTrue(canonicalRegistered.workerActive)
+
+        await canonicalGate.release()
+        await mirrorGate.waitUntilStarted()
+        let mirrorRegistered = try await diagnostics.waitFor(kind: .waiterRegistered, lane: .mirror)
+        XCTAssertEqual(mirrorRegistered.target, 1)
+        XCTAssertEqual(mirrorRegistered.acceptedHighWater, 1)
+        XCTAssertEqual(mirrorRegistered.completedHighWater, 0)
+        XCTAssertEqual(mirrorRegistered.waiterCount, 1)
+        XCTAssertTrue(mirrorRegistered.workerActive)
+
+        await mirrorGate.release()
+        await drainTask.value
+        XCTAssertEqual(coordinator.debugSnapshot().canonicalWaiterCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorWaiterCount, 0)
+        _ = try await diagnostics.waitFor(kind: .workerStopped, lane: .canonical)
+        _ = try await diagnostics.waitFor(kind: .workerStopped, lane: .mirror)
+
+        let events = diagnostics.snapshot()
+        let canonicalResumed = try XCTUnwrap(events.first {
+            $0.kind == .waiterResumed && $0.lane == .canonical
+        })
+        XCTAssertEqual(canonicalResumed.waiterID, canonicalRegistered.waiterID)
+        XCTAssertEqual(canonicalResumed.target, canonicalRegistered.target)
+        XCTAssertEqual(canonicalResumed.completedHighWater, 1)
+        XCTAssertEqual(canonicalResumed.requiredMirrorTicket, 1)
+
+        let mirrorResumed = try XCTUnwrap(events.first {
+            $0.kind == .waiterResumed && $0.lane == .mirror
+        })
+        XCTAssertEqual(mirrorResumed.waiterID, mirrorRegistered.waiterID)
+        XCTAssertEqual(mirrorResumed.target, mirrorRegistered.target)
+        XCTAssertEqual(mirrorResumed.completedHighWater, 1)
+
+        for lane in [
+            MCPReadFileAutoSelectionDiagnosticEvent.Lane.canonical,
+            .mirror
+        ] {
+            let started = try XCTUnwrap(events.first { $0.kind == .workerStarted && $0.lane == lane })
+            let stopped = try XCTUnwrap(events.first { $0.kind == .workerStopped && $0.lane == lane })
+            XCTAssertEqual(started.workerID, stopped.workerID)
+            XCTAssertTrue(started.workerActive)
+            XCTAssertFalse(stopped.workerActive)
+            XCTAssertTrue(events.contains {
+                $0.kind == .acceptedHighWaterAdvanced
+                    && $0.lane == lane
+                    && $0.previousAcceptedHighWater == 0
+                    && $0.acceptedHighWater == 1
+            })
+            XCTAssertTrue(events.contains {
+                $0.kind == .drainHighWaterCaptured
+                    && $0.lane == lane
+                    && $0.target == 1
+            })
+        }
     }
 
     func testInvalidationDropsPendingWorkBeforeStoredCommit() async {
@@ -182,7 +378,8 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertFalse(coordinator.enqueue(intent: .full(paths: ["/tmp/B.swift"]), for: key))
 
         await gate.release()
-        await finishTask.value
+        let finishResult = await finishTask.value
+        XCTAssertEqual(finishResult, .completed)
         let recordedBatches = await recorder.canonicalBatches()
         XCTAssertEqual(recordedBatches.count, 1)
         await Task.yield()
@@ -292,6 +489,21 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertTrue(recordedBatches.isEmpty)
     }
 
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        condition: @MainActor () -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if condition() {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return condition()
+    }
+
     private func makeCoordinator(
         recorder: CoordinatorRecorder,
         applyCanonical: MCPReadFileAutoSelectionCoordinator.ApplyCanonical? = nil
@@ -360,6 +572,46 @@ private actor CoordinatorRecorder {
     }
 }
 
+private final class CoordinatorDiagnosticRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [MCPReadFileAutoSelectionDiagnosticEvent] = []
+
+    func append(_ event: MCPReadFileAutoSelectionDiagnosticEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func snapshot() -> [MCPReadFileAutoSelectionDiagnosticEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
+    }
+
+    func waitFor(
+        kind: MCPReadFileAutoSelectionDiagnosticEvent.Kind,
+        lane: MCPReadFileAutoSelectionDiagnosticEvent.Lane,
+        timeout: Duration = .seconds(10)
+    ) async throws -> MCPReadFileAutoSelectionDiagnosticEvent {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if let event = snapshot().first(where: { $0.kind == kind && $0.lane == lane }) {
+                return event
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw CoordinatorDiagnosticRecorderError.timedOut(kind: kind, lane: lane)
+    }
+
+    private enum CoordinatorDiagnosticRecorderError: Error {
+        case timedOut(
+            kind: MCPReadFileAutoSelectionDiagnosticEvent.Kind,
+            lane: MCPReadFileAutoSelectionDiagnosticEvent.Lane
+        )
+    }
+}
+
 private actor CoordinatorAsyncGate {
     private var started = false
     private var released = false
@@ -399,5 +651,17 @@ private actor CoordinatorAsyncSignal {
 
     func isMarked() -> Bool {
         marked
+    }
+
+    func waitUntilMarked(timeout: Duration = .seconds(2)) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if marked {
+                return true
+            }
+            try? await Task.sleep(for: .milliseconds(1))
+        }
+        return marked
     }
 }

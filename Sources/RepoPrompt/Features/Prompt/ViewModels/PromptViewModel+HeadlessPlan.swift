@@ -22,6 +22,21 @@ struct HeadlessContextSnapshot {
 
     /// Frozen selection from ComposeTabState.selection
     let selection: StoredSelection
+
+    /// Frozen logical-to-physical workspace projection for this request.
+    let lookupContext: WorkspaceLookupContext?
+
+    init(
+        tabID: UUID,
+        promptText: String,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext? = nil
+    ) {
+        self.tabID = tabID
+        self.promptText = promptText
+        self.selection = selection
+        self.lookupContext = lookupContext
+    }
 }
 
 // MARK: - Headless AIMessage Builders
@@ -58,16 +73,23 @@ extension PromptViewModel {
         let preAssembly = await preAssemblePromptContext(
             cfg: headlessConfig,
             selection: snapshot.selection,
-            lookupContext: allLoadedWorkspaceLookupContext(),
+            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
             gitBaseOverride: gitBaseOverride
         )
         let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
-        // 2. Generate file contents
+        // 2. Generate file contents. Preserve legacy formatting unless an authoritative
+        // Agent Mode lookup context requires physical paths to be projected logically.
+        let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
+            { entry in preAssembly.displayPath(for: entry) }
+        } else {
+            nil
+        }
         let fileBlocks = PromptPackagingService.generateFileContents(
             codeEntries,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots
+            codemapSnapshots: preAssembly.codemapSnapshots,
+            displayPathResolver: displayPathResolver
         )
 
         // 3. Use the neutral pre-assembly file tree.

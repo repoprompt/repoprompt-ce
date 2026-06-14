@@ -45,6 +45,8 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(flags, 0)
         XCTAssertGreaterThanOrEqual(fcntl(sentinelFD, F_SETFD, flags & ~FD_CLOEXEC), 0)
         XCTAssertFalse(Self.hasCloseOnExec(sentinelFD))
+        var sentinelIdentityBeforeSpawn = stat()
+        XCTAssertEqual(fstat(sentinelFD, &sentinelIdentityBeforeSpawn), 0)
 
         var environment = ProcessInfo.processInfo.environment
         environment["SENTINEL_FD"] = String(sentinelFD)
@@ -57,6 +59,14 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         )
         defer { Self.cleanup(spawned) }
 
+        // File descriptor numbers are process-global and can be reused by unrelated async cleanup.
+        // Check identity before child I/O so a failure is attributable to the synchronous spawn call.
+        var sentinelIdentityAfterSpawn = stat()
+        XCTAssertEqual(fstat(sentinelFD, &sentinelIdentityAfterSpawn), 0, "Spawn must not close the parent sentinel")
+        XCTAssertEqual(sentinelIdentityAfterSpawn.st_dev, sentinelIdentityBeforeSpawn.st_dev)
+        XCTAssertEqual(sentinelIdentityAfterSpawn.st_ino, sentinelIdentityBeforeSpawn.st_ino)
+        XCTAssertEqual(sentinelIdentityAfterSpawn.st_mode, sentinelIdentityBeforeSpawn.st_mode)
+
         try spawned.stdin?.write(contentsOf: Data("stdio-survives\n".utf8))
         spawned.stdin?.closeFile()
 
@@ -68,7 +78,6 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         XCTAssertTrue(stdout.contains("sentinel:closed\n"), stdout)
         XCTAssertTrue(stdout.contains("stdout:stdio-survives\n"), stdout)
         XCTAssertEqual(stderr, "stderr:ok\n")
-        XCTAssertGreaterThanOrEqual(fcntl(sentinelFD, F_GETFD), 0, "Parent sentinel should remain open")
     }
 
     func testEstablishedSessionObservesEOFWhileSpawnedChildRemainsAlive() throws {

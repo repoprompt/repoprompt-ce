@@ -468,8 +468,19 @@ class PromptViewModel: ObservableObject {
         availableAgentKinds = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext)
     }
 
-    private func normalizedPersistedAgentSelection(agentRaw: String?, modelRaw: String?) -> AgentModelCatalog.NormalizedAgentSelection {
-        AgentModelCatalog.normalizePersistedSelection(agentRaw: agentRaw, modelRaw: modelRaw, availability: agentAvailabilityContext)
+    private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+        guard let apiSettingsViewModel,
+              apiSettingsViewModel.isContextBuilderProviderValidationComplete
+        else {
+            return nil
+        }
+        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        return AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: persisted.agentRaw,
+            persistedModelRaw: persisted.modelRaw,
+            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
+        )
     }
 
     func selectContextBuilderAgentModel(rawModel: String) {
@@ -486,10 +497,7 @@ class PromptViewModel: ObservableObject {
 
     private func handleAgentProviderAvailabilityChanged(reason: String) {
         refreshAvailableAgentKinds()
-        let normalizedContextBuilder = normalizedPersistedAgentSelection(
-            agentRaw: contextBuilderAgent.rawValue,
-            modelRaw: contextBuilderAgentModelRaw
-        )
+        guard let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() else { return }
         if normalizedContextBuilder.agent != contextBuilderAgent ||
             normalizedContextBuilder.modelRaw.caseInsensitiveCompare(contextBuilderAgentModelRaw) != .orderedSame
         {
@@ -873,12 +881,12 @@ class PromptViewModel: ObservableObject {
 
         // Sync Context Builder agent/model from global Context Builder settings (single source of truth)
         refreshAvailableAgentKinds()
-        let (globalAgentRaw, globalModelRaw) = settingsManager.globalContextBuilderAgentSelection()
-        let normalizedContextBuilder = normalizedPersistedAgentSelection(agentRaw: globalAgentRaw, modelRaw: globalModelRaw)
-        if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
-        contextBuilderAgent = normalizedContextBuilder.agent
-        contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-        if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
+        }
 
         // Sync model selection from the global settings store (may have been set by recommendation engine).
         syncModelSelectionFromSettingsManager()
@@ -2305,6 +2313,16 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
+        guard let index = currentComposeTabs.firstIndex(where: { $0.id == tabID }),
+              currentComposeTabs[index].selection != selection
+        else { return }
+        var updatedTabs = currentComposeTabs
+        updatedTabs[index].selection = selection
+        currentComposeTabs = updatedTabs
+    }
+
+    @MainActor
     func loadComposeTabsFromWorkspace(_ workspace: WorkspaceModel, syncPromptText: Bool = false) {
         currentComposeTabs = workspace.composeTabs
         activeComposeTabID = workspace.activeComposeTabID ?? workspace.composeTabs.first?.id
@@ -3598,10 +3616,14 @@ class PromptViewModel: ObservableObject {
             }
 
         Publishers.MergeMany([
-            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
+            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableOpenCodeModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableCursorModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher()
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in

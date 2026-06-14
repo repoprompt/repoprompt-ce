@@ -270,14 +270,13 @@ final class ClaudeAgentModeCoordinator {
         }
 
         if session.claudeController == nil {
-            let bashOverride: Bool? = session.mcpControlContext?.taskLabelKind == .explore ? false : nil
             session.claudeController = claudeControllerFactory(
                 runID,
                 session.tabID,
                 windowID,
                 runtimeWorkspacePath,
                 runtimeVariant,
-                bashOverride,
+                nil,
                 effectivePermissionMode
             )
             session.claudeControllerRuntimeVariant = runtimeVariant
@@ -346,7 +345,6 @@ final class ClaudeAgentModeCoordinator {
 
             let freshRunID = UUID()
             session.runID = freshRunID
-            let retryBashOverride: Bool? = session.mcpControlContext?.taskLabelKind == .explore ? false : nil
             let retryWorkspacePath = try workspacePathProvider(session)
             let freshController = claudeControllerFactory(
                 freshRunID,
@@ -354,7 +352,7 @@ final class ClaudeAgentModeCoordinator {
                 windowID,
                 retryWorkspacePath,
                 runtimeVariant,
-                retryBashOverride,
+                nil,
                 effectivePermissionMode
             )
             session.claudeController = freshController

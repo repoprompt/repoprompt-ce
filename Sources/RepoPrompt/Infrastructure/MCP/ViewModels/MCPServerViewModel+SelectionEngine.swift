@@ -1,6 +1,41 @@
 import Foundation
 import MCP
 
+struct WorkspaceGitDiffArtifactSelectionService {
+    let store: WorkspaceFileContextStore
+
+    func addPrimaryArtifacts(
+        existing: StoredSelection,
+        paths: [String],
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspacePlusGitData
+    ) async -> (selection: StoredSelection, autoSelectedPaths: [String]) {
+        let orderedPaths = paths
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .reduce(into: [String]()) { result, item in
+                if !result.contains(item) { result.append(item) }
+            }
+        guard !orderedPaths.isEmpty else { return (existing, []) }
+
+        let previouslySelected = Set(existing.selectedPaths)
+        let mutation = await WorkspaceSelectionMutationService(store: store).addPaths(
+            existing: existing,
+            paths: orderedPaths,
+            rawPaths: orderedPaths,
+            mode: "full",
+            rootScope: rootScope
+        )
+        let resolvedFiles = await store.lookupFiles(atPaths: orderedPaths, rootScope: rootScope)
+        let autoSelectedPaths = orderedPaths.filter { rawPath in
+            guard let file = resolvedFiles[rawPath] else { return false }
+            let fullPath = file.standardizedFullPath
+            return !previouslySelected.contains(fullPath)
+                && mutation.selection.selectedPaths.contains(fullPath)
+        }
+        return (mutation.selection, autoSelectedPaths)
+    }
+}
+
 extension MCPServerViewModel {
     /// Result of building a stored selection
     struct BuildStoredSelectionResult {
@@ -195,36 +230,15 @@ extension MCPServerViewModel {
     func addPrimaryGitDiffArtifactsToSelection(
         existing: StoredSelection,
         paths: [String],
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspacePlusGitData
     ) async -> (selection: StoredSelection, autoSelectedPaths: [String]) {
-        let orderedPaths = paths
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .reduce(into: [String]()) { result, item in
-                if !result.contains(item) { result.append(item) }
-            }
-        guard !orderedPaths.isEmpty else {
-            return (existing, [])
-        }
-        let previouslySelected = Set(existing.selectedPaths)
-        let result = await addStoredSelectionPaths(
+        await WorkspaceGitDiffArtifactSelectionService(
+            store: promptVM.workspaceFileContextStore
+        ).addPrimaryArtifacts(
             existing: existing,
-            paths: orderedPaths,
-            rawPaths: orderedPaths,
-            mode: "full",
-            lookupRootScope: lookupRootScope
+            paths: paths,
+            rootScope: lookupRootScope
         )
-        let resolvedFiles = await selectionFindFiles(
-            atPaths: orderedPaths,
-            lookupRootScope: lookupRootScope
-        )
-        let autoSelectedPaths = orderedPaths.filter { rawPath in
-            guard let file = resolvedFiles[rawPath] else { return false }
-            let fullPath = file.standardizedFullPath
-            return !previouslySelected.contains(fullPath)
-                && result.selection.selectedPaths.contains(fullPath)
-        }
-        return (result.selection, autoSelectedPaths)
     }
 
     @MainActor

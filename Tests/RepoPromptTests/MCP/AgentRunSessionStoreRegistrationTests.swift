@@ -30,6 +30,18 @@ final class AgentRunSessionStoreRegistrationTests: XCTestCase {
         await AgentRunSessionStore.cleanup(registration: replacement)
     }
 
+    func testRegisterIfMissingDoesNotReplaceExistingRegistration() async {
+        let sessionID = UUID()
+        let registration = await AgentRunSessionStore.register(sessionID: sessionID)
+
+        let recovered = await AgentRunSessionStore.registerIfMissing(sessionID: sessionID)
+        let current = await AgentRunSessionStore.currentRegistration(for: sessionID)
+
+        XCTAssertNil(recovered)
+        XCTAssertEqual(current, registration)
+        await AgentRunSessionStore.cleanup(registration: registration)
+    }
+
     func testPreEpochWaiterAdvancesWithoutRotatingActivationRegistration() async throws {
         let sessionID = UUID()
         let registration = await AgentRunSessionStore.register(sessionID: sessionID)

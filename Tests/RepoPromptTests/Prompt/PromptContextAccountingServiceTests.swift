@@ -39,6 +39,85 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testPhysicalizedSelectionRefreshesSessionBoundBatchLookupAfterWorktreeLoad() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "AccountingLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "AccountingWorktree")
+        let logicalFile = logicalRoot.appendingPathComponent("Sources/App.swift")
+        let worktreeFile = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try write("canonical", to: logicalFile)
+        try write("worktree", to: worktreeFile)
+
+        let store = WorkspaceFileContextStore()
+        let logicalRootRecord = try await store.loadRoot(path: logicalRoot.path)
+        let logicalRootRef = WorkspaceRootRef(
+            id: logicalRootRecord.id,
+            name: logicalRootRecord.name,
+            fullPath: logicalRootRecord.standardizedFullPath
+        )
+        let physicalRootRef = WorkspaceRootRef(
+            id: UUID(),
+            name: logicalRootRecord.name,
+            fullPath: worktreeRoot.path
+        )
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRootRef,
+                    physicalRoot: physicalRootRef,
+                    binding: AgentSessionWorktreeBinding(
+                        id: "accounting-binding",
+                        repositoryID: "accounting-repository",
+                        repoKey: "accounting-repo",
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: logicalRootRecord.name,
+                        worktreeID: "accounting-worktree",
+                        worktreeRootPath: worktreeRoot.path,
+                        source: "test"
+                    )
+                )
+            ],
+            visibleLogicalRoots: [logicalRootRef]
+        )
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        )
+        let logicalSelection = StoredSelection(
+            selectedPaths: [logicalFile.path],
+            codemapAutoEnabled: false
+        )
+        let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+        XCTAssertEqual(physicalSelection.selectedPaths, [worktreeFile.path])
+
+        let request = WorkspacePathLookupRequest(
+            userPath: worktreeFile.path,
+            profile: .uiAssisted,
+            rootScope: lookupContext.rootScope
+        )
+        let generationBeforeWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        let lookupBeforeWorktreeLoad = await store.lookupPaths([request])
+        XCTAssertTrue(lookupBeforeWorktreeLoad.isEmpty)
+
+        let worktreeRootRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+        let generationAfterWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        XCTAssertNotEqual(generationAfterWorktreeLoad, generationBeforeWorktreeLoad)
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: physicalSelection,
+            store: store,
+            rootScope: lookupContext.rootScope,
+            codeMapUsage: .none
+        )
+
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(resolution.entries.count, 1)
+        XCTAssertEqual(entry.file.rootID, worktreeRootRecord.id)
+        XCTAssertEqual(entry.file.standardizedRelativePath, "Sources/App.swift")
+        XCTAssertEqual(entry.loadedContent, "worktree")
+        XCTAssertEqual(resolution.missingPaths, [])
+        XCTAssertEqual(resolution.invalidPaths, [])
+    }
+
     func testDuplicateSelectedPathsPreserveExistingEntryDedupOrder() async throws {
         let root = try makeTemporaryRoot(name: "AccountingDuplicates")
         let fileA = root.appendingPathComponent("A.swift")
@@ -152,6 +231,61 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.entries.map(\.loadedContent), ["b", "a", "notes"])
         XCTAssertEqual(resolution.missingPaths, [])
         XCTAssertEqual(resolution.invalidPaths, [])
+    }
+
+    func testCompleteCodemapResolutionBuildsSingleStaticPathSnapshot() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AccountingCompleteCodemapBatch")
+            let fileCount = 24
+            var observed: [WorkspaceObservedCodemapResult] = []
+            observed.reserveCapacity(fileCount)
+            for index in 0 ..< fileCount {
+                let fileURL = root.appendingPathComponent("File\(index).swift")
+                try write("struct File\(index) {}", to: fileURL)
+                observed.append(
+                    WorkspaceObservedCodemapResult(
+                        fullPath: fileURL.path,
+                        modificationDate: Date(),
+                        fileAPI: makeFileAPI(path: fileURL.path)
+                    )
+                )
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.applyObservedCodemapResults(observed)
+            let service = PromptContextAccountingService()
+            let selection = StoredSelection(
+                selectedPaths: [],
+                autoCodemapPaths: [],
+                slices: [:],
+                codemapAutoEnabled: false
+            )
+
+            EditFlowPerf.resetDebugCaptureForTesting()
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+            switch EditFlowPerf.beginDebugCapture(label: "complete-codemap-batch", maxSamples: 200) {
+            case .started:
+                break
+            case .busy:
+                XCTFail("Performance capture should start")
+            }
+
+            let resolution = await service.resolveEntries(
+                selection: selection,
+                store: store,
+                codeMapUsage: .complete
+            )
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let snapshotBuildCount = capture.stages
+                .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
+                .reduce(0) { $0 + $1.sampleCount }
+
+            XCTAssertEqual(resolution.entries.count, fileCount)
+            XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
+            XCTAssertEqual(snapshotBuildCount, 1)
+            XCTAssertEqual(capture.droppedSampleCount, 0)
+        #endif
     }
 
     private func makeTemporaryRoot(name: String) throws -> URL {
