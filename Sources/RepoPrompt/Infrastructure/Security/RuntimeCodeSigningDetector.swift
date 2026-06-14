@@ -96,6 +96,12 @@ enum RuntimeCodeSigningDetector {
         if SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), debugRequirement) == errSecSuccess {
             validatedDomains.insert(.appleDevelopmentDebug)
         }
+        if let localDeveloperIDRequirement = localDeveloperIDRequirement(
+            codeIdentifier: codeIdentifier,
+            teamIdentifier: teamIdentifier
+        ), SecCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), localDeveloperIDRequirement) == errSecSuccess {
+            validatedDomains.insert(.localDeveloperID)
+        }
         if let expectedFingerprint = localSigningExpectation?.validatedIdentity?.fingerprint,
            !isAdHoc,
            codeIdentifier == RuntimeCodeSigningPolicy.developerIDBundleIdentifier,
@@ -120,6 +126,28 @@ enum RuntimeCodeSigningDetector {
         let status = SecRequirementCreateWithString(source as CFString, [], &requirement)
         guard status == errSecSuccess else { return nil }
         return requirement
+    }
+
+    private static func localDeveloperIDRequirement(
+        codeIdentifier: String?,
+        teamIdentifier: String?
+    ) -> SecRequirement? {
+        guard let codeIdentifier = normalizedString(codeIdentifier),
+              let teamIdentifier = normalizedString(teamIdentifier)
+        else {
+            return nil
+        }
+        return requirement(
+            from: "anchor apple generic and identifier \"\(requirementStringLiteral(codeIdentifier))\" "
+                + "and certificate leaf[subject.OU] = \"\(requirementStringLiteral(teamIdentifier))\" "
+                + "and certificate leaf[field.1.2.840.113635.100.6.1.13] exists"
+        )
+    }
+
+    private static func requirementStringLiteral(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
     }
 
     private static func leafCertificateFingerprint(from dictionary: [String: Any]) -> String? {

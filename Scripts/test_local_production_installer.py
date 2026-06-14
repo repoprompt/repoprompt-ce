@@ -271,6 +271,138 @@ class LocalProductionInstallerTests(unittest.TestCase):
         self.assertIn("--extract-certificates=\"$certificate_prefix\"", package_script)
         self.assertIn("Extracted designated requirement", package_script)
 
+    def test_developer_id_mode_installs_personal_bundle_without_self_signed_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            temp_dir = Path(tmp)
+            root = temp_dir / "repo"
+            scripts = root / "Scripts"
+            scripts.mkdir(parents=True)
+            shutil.copy2(SCRIPT_DIR / "install_local_production.sh", scripts / "install_local_production.sh")
+            (root / "version.env").write_text(
+                'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nBUNDLE_ID=com.pvncher.repoprompt.ce\nSIGNING_TEAM_ID=648A27MST5\n',
+                encoding="utf-8",
+            )
+            package_capture = temp_dir / "package-capture.txt"
+            (scripts / "package_app.sh").write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env bash
+                    set -euo pipefail
+                    app="$FAKE_BUILD_DIR/RepoPrompt.app"
+                    mkdir -p "$app/Contents/MacOS"
+                    printf '%s|%s|%s|%s|%s\n' "$LOCAL_DEVELOPER_ID_RELEASE" "$DISPLAY_NAME" "$BUNDLE_ID" "$SIGNING_TEAM_ID" "$SIGN_IDENTITY" > "$PACKAGE_CAPTURE"
+                    cat > "$app/Contents/Info.plist" <<EOF
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <plist version="1.0"><dict>
+                      <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
+                      <key>CFBundleDisplayName</key><string>$DISPLAY_NAME</string>
+                      <key>RepoPromptSigningMode</key><string>local-developer-id</string>
+                    </dict></plist>
+                    EOF
+                    """
+                ),
+                encoding="utf-8",
+            )
+            (scripts / "package_app.sh").chmod(0o755)
+
+            bin_dir = temp_dir / "bin"
+            bin_dir.mkdir()
+            install_dir = temp_dir / "Applications"
+            build_dir = temp_dir / "build"
+            keychain = temp_dir / "login.keychain-db"
+            keychain.touch()
+            codesign_log = temp_dir / "codesign.log"
+            registry_path = temp_dir / "Application Support" / "RepoPrompt CE" / "local-signing-identity-v1.json"
+
+            self.write_stub(bin_dir, "security", 'printf "    \\\"%s\\\"\\n" "$FAKE_KEYCHAIN"\n')
+            self.write_stub(bin_dir, "swift", 'printf "%s\\n" "$FAKE_BUILD_DIR"\n')
+            self.write_stub(bin_dir, "codesign", 'printf "%s\\n" "$*" >> "$CODESIGN_LOG"\n')
+            self.write_stub(bin_dir, "ditto", 'cp -R "$1" "$2"\n')
+            self.write_stub(bin_dir, "pgrep", "exit 1\n")
+            self.write_stub(bin_dir, "ps", '[[ -z "${FAKE_RUNNING_COMMAND:-}" ]] || printf "%s\\n" "$FAKE_RUNNING_COMMAND"\n')
+            self.write_stub(bin_dir, "openssl", "exit 0\n")
+
+            env = os.environ.copy()
+            env.pop("BASH_ENV", None)
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env.get('PATH', '')}",
+                    "CONFIRM_LOCAL_PRODUCTION_INSTALL": "1",
+                    "LOCAL_PRODUCTION_SIGNING_MODE": "developer-id",
+                    "LOCAL_PRODUCTION_INSTALL_DIR": str(install_dir),
+                    "LOCAL_SIGNING_IDENTITY_REGISTRY_PATH": str(registry_path),
+                    "DISPLAY_NAME": "My RepoPrompt CE (Local)",
+                    "BUNDLE_ID": "com.example.repoprompt.ce",
+                    "SIGNING_TEAM_ID": "TEAM123456",
+                    "SIGN_IDENTITY": "Developer ID Application: Person (TEAM123456)",
+                    "FAKE_BUILD_DIR": str(build_dir),
+                    "FAKE_KEYCHAIN": str(keychain),
+                    "PACKAGE_CAPTURE": str(package_capture),
+                    "CODESIGN_LOG": str(codesign_log),
+                }
+            )
+
+            default_identity_env = env.copy()
+            default_identity_env.pop("DISPLAY_NAME")
+            default_identity_env.pop("BUNDLE_ID")
+            default_identity_result = subprocess.run(
+                ["bash", str(scripts / "install_local_production.sh")],
+                env=default_identity_env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertNotEqual(default_identity_result.returncode, 0)
+            self.assertIn("require a personal BUNDLE_ID", default_identity_result.stderr)
+            self.assertFalse(package_capture.exists())
+
+            display_collision_env = env.copy()
+            display_collision_env["DISPLAY_NAME"] = "repoprompt ce"
+            display_collision_result = subprocess.run(
+                ["bash", str(scripts / "install_local_production.sh")],
+                env=display_collision_env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertNotEqual(display_collision_result.returncode, 0)
+            self.assertIn("require a personal DISPLAY_NAME", display_collision_result.stderr)
+            self.assertFalse(package_capture.exists())
+
+            running_env = env.copy()
+            running_env["FAKE_RUNNING_COMMAND"] = str(install_dir / "My RepoPrompt CE (Local).app" / "Contents" / "MacOS" / "RepoPrompt")
+            running_result = subprocess.run(
+                ["bash", str(scripts / "install_local_production.sh")],
+                env=running_env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+            self.assertNotEqual(running_result.returncode, 0)
+            self.assertIn("Quit My RepoPrompt CE (Local)", running_result.stderr)
+            self.assertFalse((install_dir / "My RepoPrompt CE (Local).app").exists())
+            package_capture.unlink()
+
+            result = subprocess.run(
+                ["bash", str(scripts / "install_local_production.sh")],
+                env=env,
+                text=True,
+                capture_output=True,
+                timeout=15,
+            )
+
+            installed_app = install_dir / "My RepoPrompt CE (Local).app"
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(installed_app.exists())
+            self.assertEqual(
+                package_capture.read_text(encoding="utf-8").strip(),
+                "1|My RepoPrompt CE (Local)|com.example.repoprompt.ce|TEAM123456|Developer ID Application: Person (TEAM123456)",
+            )
+            self.assertFalse(registry_path.exists())
+            self.assertIn("Installed local Developer ID production app", result.stdout)
+            self.assertIn('identifier "com.example.repoprompt.ce"', codesign_log.read_text(encoding="utf-8"))
+            self.assertIn('certificate leaf[subject.OU] = "TEAM123456"', codesign_log.read_text(encoding="utf-8"))
+
     def test_first_use_adopts_sole_identity_and_writes_registry(self) -> None:
         result, context = self.run_installer([certificate(SHA1_A, SHA256_A)], expected_sha1=SHA1_A)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -544,7 +676,7 @@ class LocalProductionInstallerTests(unittest.TestCase):
                 encoding="utf-8",
             )
         (root / "version.env").write_text(
-            'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nBUNDLE_ID=com.pvncher.repoprompt.ce\n',
+            'APP_NAME=RepoPrompt\nDISPLAY_NAME="RepoPrompt CE"\nBUNDLE_ID=com.pvncher.repoprompt.ce\nSIGNING_TEAM_ID=648A27MST5\n',
             encoding="utf-8",
         )
 

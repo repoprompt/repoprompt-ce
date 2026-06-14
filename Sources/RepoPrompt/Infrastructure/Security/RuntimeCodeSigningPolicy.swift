@@ -3,6 +3,7 @@ import Foundation
 enum RuntimeCodeSigningDomain: Hashable {
     case developerID
     case appleDevelopmentDebug
+    case localDeveloperID
     case localSelfSigned
 }
 
@@ -55,6 +56,7 @@ enum RuntimeSecureStorageDomain: Equatable {
     case officialDeveloperID
     case localSelfSigned
     case appleDevelopmentDebug
+    case localDeveloperID
     case ephemeral
 }
 
@@ -88,17 +90,23 @@ struct RuntimeSecureStorageDecision: Equatable {
     let rejectionReason: RuntimeSecureStorageRejectionReason?
     let localCertificateFingerprint: String?
     let localServiceGeneration: Int?
+    let localBundleIdentifier: String?
+    let localTeamIdentifier: String?
 
     init(
         domain: RuntimeSecureStorageDomain,
         rejectionReason: RuntimeSecureStorageRejectionReason?,
         localCertificateFingerprint: String? = nil,
-        localServiceGeneration: Int? = nil
+        localServiceGeneration: Int? = nil,
+        localBundleIdentifier: String? = nil,
+        localTeamIdentifier: String? = nil
     ) {
         self.domain = domain
         self.rejectionReason = rejectionReason
         self.localCertificateFingerprint = localCertificateFingerprint
         self.localServiceGeneration = localServiceGeneration
+        self.localBundleIdentifier = localBundleIdentifier
+        self.localTeamIdentifier = localTeamIdentifier
     }
 }
 
@@ -222,6 +230,19 @@ enum RuntimeCodeSigningPolicy {
                 localCertificateFingerprint: validatedIdentity.fingerprint,
                 localServiceGeneration: validatedIdentity.serviceGeneration
             )
+        case "local-developer-id":
+            guard let codeIdentifier = signingInfo.codeIdentifier,
+                  let teamIdentifier = signingInfo.teamIdentifier,
+                  matchesLocalDeveloperID(signingInfo)
+            else {
+                return ephemeral(.markerSignatureMismatch)
+            }
+            return RuntimeSecureStorageDecision(
+                domain: .localDeveloperID,
+                rejectionReason: nil,
+                localBundleIdentifier: codeIdentifier,
+                localTeamIdentifier: teamIdentifier
+            )
         case "release-candidate-adhoc":
             return ephemeral(.releaseCandidate)
         case "debug-adhoc":
@@ -267,6 +288,17 @@ enum RuntimeCodeSigningPolicy {
               signingInfo.codeIdentifier == identifier,
               signingInfo.teamIdentifier == teamIdentifier,
               signingInfo.validationResult.validates(domain)
+        else {
+            return false
+        }
+        return true
+    }
+
+    private static func matchesLocalDeveloperID(_ signingInfo: RuntimeCodeSigningInfo) -> Bool {
+        guard !signingInfo.isAdHoc,
+              normalized(signingInfo.codeIdentifier) != nil,
+              normalized(signingInfo.teamIdentifier) != nil,
+              signingInfo.validationResult.validates(.localDeveloperID)
         else {
             return false
         }

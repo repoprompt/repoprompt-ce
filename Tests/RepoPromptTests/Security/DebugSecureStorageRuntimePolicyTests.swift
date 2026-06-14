@@ -25,6 +25,11 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
             validatedDomains: [.appleDevelopmentDebug]
         )
+        let localDeveloperID = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: "com.example.repoprompt.ce",
+            teamIdentifier: "TEAM123456",
+            validatedDomains: [.localDeveloperID]
+        )
 
         assertDecision(
             marker: "developer-id",
@@ -46,6 +51,14 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             debugMarker: "keychain",
             signingInfo: debug,
             expectedDomain: .appleDevelopmentDebug
+        )
+        assertDecision(
+            marker: "local-developer-id",
+            debugMarker: "keychain",
+            signingInfo: localDeveloperID,
+            expectedDomain: .localDeveloperID,
+            expectedLocalBundleIdentifier: "com.example.repoprompt.ce",
+            expectedLocalTeamIdentifier: "TEAM123456"
         )
 
         XCTAssertTrue(
@@ -70,6 +83,20 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 for: RuntimeSecureStorageDecision(domain: .appleDevelopmentDebug, rejectionReason: nil)
             ).backend === KeychainService.debugShared
         )
+        XCTAssertEqual(
+            (SecureKeyValueStorageFactory.selection(
+                for: RuntimeSecureStorageDecision(
+                    domain: .localDeveloperID,
+                    rejectionReason: nil,
+                    localBundleIdentifier: "com.example.repoprompt.ce",
+                    localTeamIdentifier: "TEAM123456"
+                )
+            ).backend as? KeychainService)?.serviceName,
+            KeychainService.localDeveloperIDServiceName(
+                bundleIdentifier: "com.example.repoprompt.ce",
+                teamIdentifier: "TEAM123456"
+            )
+        )
     }
 
     func testRejectedModesExhaustivelyFailClosedToEphemeralStorage() {
@@ -83,12 +110,28 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
             teamIdentifier: RuntimeCodeSigningPolicy.signingTeamIdentifier,
             validatedDomains: [.appleDevelopmentDebug]
         )
+        let localDeveloperIDWithoutValidatedDomain = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: "com.example.repoprompt.ce",
+            teamIdentifier: "TEAM123456"
+        )
+        let localDeveloperIDWithoutTeam = RuntimeCodeSigningInfo.synthetic(
+            codeIdentifier: "com.example.repoprompt.ce",
+            validatedDomains: [.localDeveloperID]
+        )
+        let localDeveloperIDWithoutBundleIdentifier = RuntimeCodeSigningInfo.synthetic(
+            teamIdentifier: "TEAM123456",
+            validatedDomains: [.localDeveloperID]
+        )
         let invalid = RuntimeCodeSigningInfo.synthetic(failure: .signatureInvalid)
 
         let cases: [(String?, String?, RuntimeCodeSigningInfo, RuntimeSecureStorageRejectionReason)] = [
             (nil, nil, official, .missingSigningModeMarker),
             ("", nil, official, .missingSigningModeMarker),
             ("unknown", nil, official, .unknownSigningModeMarker),
+            ("local-developer-id", "keychain", debug, .markerSignatureMismatch),
+            ("local-developer-id", "keychain", localDeveloperIDWithoutValidatedDomain, .markerSignatureMismatch),
+            ("local-developer-id", "keychain", localDeveloperIDWithoutTeam, .markerSignatureMismatch),
+            ("local-developer-id", "keychain", localDeveloperIDWithoutBundleIdentifier, .markerSignatureMismatch),
             ("release-candidate-adhoc", nil, official, .releaseCandidate),
             ("debug-adhoc", "alternate-in-memory", debug, .adHocDebug),
             ("debug-apple-development", "alternate-in-memory", debug, .debugEphemeralRequested),
@@ -210,7 +253,9 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
         expectedDomain: RuntimeSecureStorageDomain,
         expectedReason: RuntimeSecureStorageRejectionReason? = nil,
         expectedLocalCertificateFingerprint: String? = nil,
-        expectedLocalServiceGeneration: Int? = nil
+        expectedLocalServiceGeneration: Int? = nil,
+        expectedLocalBundleIdentifier: String? = nil,
+        expectedLocalTeamIdentifier: String? = nil
     ) {
         XCTAssertEqual(
             RuntimeCodeSigningPolicy.decision(
@@ -223,7 +268,9 @@ final class RuntimeCodeSigningPolicyTests: XCTestCase {
                 domain: expectedDomain,
                 rejectionReason: expectedReason,
                 localCertificateFingerprint: expectedLocalCertificateFingerprint,
-                localServiceGeneration: expectedLocalServiceGeneration
+                localServiceGeneration: expectedLocalServiceGeneration,
+                localBundleIdentifier: expectedLocalBundleIdentifier,
+                localTeamIdentifier: expectedLocalTeamIdentifier
             )
         )
     }
