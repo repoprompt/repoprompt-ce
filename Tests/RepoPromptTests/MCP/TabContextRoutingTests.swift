@@ -508,6 +508,31 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertTrue(message.contains("disabled"), message)
     }
 
+    func testAgentModeRoutingRecoveryDoesNotRecommendRejectedExplicitContextOverrides() {
+        for message in [
+            MCPServerViewModel.tabContextRoutingErrorMessage(
+                toolName: "context_builder",
+                runPurpose: .agentModeRun
+            ),
+            MCPServerViewModel.runScopedActiveTabCompatibilityMessage(
+                toolName: "context_builder",
+                runPurpose: .agentModeRun
+            )
+        ] {
+            XCTAssertTrue(message.contains("Retry"), message)
+            XCTAssertTrue(message.contains("restart this Agent Mode run"), message)
+            XCTAssertFalse(message.contains("bind_context"), message)
+            XCTAssertFalse(message.contains("context_id"), message)
+        }
+
+        let ordinary = MCPServerViewModel.tabContextRoutingErrorMessage(
+            toolName: "workspace_context",
+            runPurpose: .unknown
+        )
+        XCTAssertTrue(ordinary.contains("bind_context"), ordinary)
+        XCTAssertTrue(ordinary.contains("context_id"), ordinary)
+    }
+
     func testConnectionManagerRoutingPoliciesKeepRunScopedToolsOutOfLegacyGenericBinding() {
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "agent_run"))
         XCTAssertFalse(ServerNetworkManager.shouldUseGenericTabBindingCompatibility(for: "ask_oracle"))

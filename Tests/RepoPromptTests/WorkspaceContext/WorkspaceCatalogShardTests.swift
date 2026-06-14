@@ -38,7 +38,7 @@ import XCTest
             let supplemental = try await loadStoppedRoot(in: store, path: supplementalURL.path, kind: .supplementalSystem)
             let worktree = try await loadStoppedRoot(in: store, path: worktreeURL.path, kind: .sessionWorktree)
             let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [visibleAURL.path],
+                canonicalRootPaths: [visibleBURL.path],
                 physicalRootPaths: [worktreeURL.path]
             )
 

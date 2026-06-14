@@ -7,6 +7,11 @@ struct MCPOracleToolService {
     typealias ResolvedTabContextSnapshot = MCPServerViewModel.ResolvedTabContextSnapshot
     typealias TabScopedContext = MCPServerViewModel.TabScopedContext
     typealias ChatSendOperation = @Sendable () async throws -> [String: Value]
+    typealias SendChat = @MainActor @Sendable (
+        _ args: [String: Value],
+        _ promptVM: PromptViewModel,
+        _ tabContext: OracleViewModel.OracleSendTabContext?
+    ) async throws -> [String: Value]
     typealias ExportOracleResponse = @MainActor @Sendable (OracleExportRequest) async throws -> OracleExportFile
 
     let askOracleToolName: String
@@ -17,13 +22,13 @@ struct MCPOracleToolService {
     let captureRequestMetadata: () async -> RequestMetadata
     let resolveTabContextSnapshot: (RequestMetadata) throws -> ResolvedTabContextSnapshot
     let requireCurrentTabContext: (String) async throws -> TabScopedContext
-    let resolveLookupContext: (TabScopedContext) async -> WorkspaceLookupContext
     let rebindChatSessionIfNeeded: (_ metadata: RequestMetadata, _ chatIDString: String) throws -> Void
     let resolveTabIDForAgentMode: (_ args: [String: Value], _ connectionID: UUID?) async throws -> UUID
     let requireTargetWindow: () throws -> WindowState
     let rawExplicitTabID: (_ args: [String: Value]) -> String?
     let sendStageProgress: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String) async -> Void
     let withHeartbeat: (_ connectionID: UUID?, _ tool: String, _ stage: String, _ message: String, _ operation: @escaping ChatSendOperation) async throws -> [String: Value]
+    let sendChat: SendChat
     let exportOracleResponse: ExportOracleResponse
 
     func executeOracleUtils(args: [String: Value]) async throws -> Value {
@@ -86,7 +91,7 @@ struct MCPOracleToolService {
             tabContext = currentContext
         }
         let targetWindow = try requireTargetWindow()
-        let owner = resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: tabContext)
+        let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: tabContext)
 
         let result = try await oracleVM.tool_oracleChatLog(
             args: args,
@@ -127,7 +132,6 @@ struct MCPOracleToolService {
         let tabID = try await resolveTabIDForAgentMode(args, connectionID)
         let requestContext = try? await requireCurrentTabContext(askOracleToolName)
         let virtualContext = (requestContext?.tabID == tabID) ? requestContext : nil
-
         if let normalizedChatID {
             guard let session = oracleVM.resolveSession(id: normalizedChatID) else {
                 throw MCPError.invalidParams("Chat with ID '\(normalizedChatID)' not found")
@@ -144,21 +148,15 @@ struct MCPOracleToolService {
             }
         }
 
-        let owner = resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
+        let owner = await resolveAgentOracleOwner(tabID: tabID, targetWindow: targetWindow, tabContext: virtualContext)
         let tabContext: OracleViewModel.OracleSendTabContext
         if let virtualContext, virtualContext.tabID == tabID {
-            tabContext = await oracleSendTabContext(from: virtualContext, owner: owner)
+            tabContext = try await oracleSendTabContext(from: virtualContext, owner: owner)
         } else {
             guard let tabSnapshot = targetWindow.workspaceManager.composeTabSnapshot(for: tabID) else {
                 throw MCPError.internalError("Unable to resolve compose tab context for ask_oracle")
             }
-            let worktreeBindings = owner.agentSessionID.map {
-                targetWindow.agentModeViewModel.worktreeBindings(forAgentSessionID: $0, tabID: tabID)
-            } ?? []
-            let lookupContext = await oraclePackagingLookupContext(
-                agentSessionID: owner.agentSessionID,
-                worktreeBindings: worktreeBindings
-            )
+            let lookupContext = try await oraclePackagingLookupContext(owner: owner)
             tabContext = OracleViewModel.OracleSendTabContext(
                 tabID: tabID,
                 promptText: tabSnapshot.promptText,
@@ -198,11 +196,7 @@ struct MCPOracleToolService {
             "waiting",
             "Waiting for Oracle response..."
         ) {
-            try await oracleVM.tool_chatSend(
-                args: capturedChatArgs,
-                promptVM: promptVM,
-                tabContext: tabContext
-            )
+            try await sendChat(capturedChatArgs, promptVM, tabContext)
         }
 
         if exportResponse {
@@ -264,10 +258,10 @@ struct MCPOracleToolService {
 
             let context = try await requireCurrentTabContext(oracleSendToolName)
             if runPurpose == .agentModeRun, let targetWindow {
-                let owner = resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
-                tabContext = await oracleSendTabContext(from: context, owner: owner)
+                let owner = await resolveAgentOracleOwner(tabID: context.tabID, targetWindow: targetWindow, tabContext: context)
+                tabContext = try await oracleSendTabContext(from: context, owner: owner)
             } else {
-                tabContext = await oracleSendTabContext(from: context)
+                tabContext = try await oracleSendTabContext(from: context)
             }
         }
 
@@ -295,11 +289,7 @@ struct MCPOracleToolService {
             "waiting",
             "Waiting for Oracle response..."
         ) {
-            try await oracleVM.tool_chatSend(
-                args: capturedChatArgs,
-                promptVM: promptVM,
-                tabContext: capturedTabContext
-            )
+            try await sendChat(capturedChatArgs, promptVM, capturedTabContext)
         }
 
         if exportResponse {
@@ -475,43 +465,87 @@ struct MCPOracleToolService {
     private struct AgentOracleOwner {
         let agentSessionID: UUID?
         let runID: UUID?
+        let worktreeBindingState: AgentSessionWorktreeBindingState
     }
 
     private func resolveAgentOracleOwner(
         tabID: UUID,
         targetWindow: WindowState,
         tabContext: TabScopedContext?
-    ) -> AgentOracleOwner {
-        let session = targetWindow.agentModeViewModel.session(for: tabID, createIfNeeded: false)
+    ) async -> AgentOracleOwner {
+        let agentModeViewModel = targetWindow.agentModeViewModel
+        let storedSessionID = tabContext?.activeAgentSessionID
+            ?? targetWindow.workspaceManager.composeTab(with: tabID)?.activeAgentSessionID
+            ?? agentModeViewModel.session(for: tabID, createIfNeeded: false)?.activeAgentSessionID
+        guard let storedSessionID else {
+            return AgentOracleOwner(
+                agentSessionID: nil,
+                runID: tabContext?.runID,
+                worktreeBindingState: .notApplicable
+            )
+        }
+
+        let hydratedSession = await agentModeViewModel.ensureSessionReady(tabID: tabID)
+        guard hydratedSession.activeAgentSessionID == storedSessionID else {
+            return AgentOracleOwner(
+                agentSessionID: storedSessionID,
+                runID: tabContext?.runID ?? hydratedSession.runID,
+                worktreeBindingState: .unavailable
+            )
+        }
         return AgentOracleOwner(
-            agentSessionID: session?.activeAgentSessionID,
-            runID: tabContext?.runID ?? session?.runID
+            agentSessionID: storedSessionID,
+            runID: tabContext?.runID ?? hydratedSession.runID,
+            worktreeBindingState: agentModeViewModel.worktreeBindingState(
+                forAgentSessionID: storedSessionID,
+                tabID: tabID
+            )
         )
     }
 
-    private func oraclePackagingLookupContext(for context: TabScopedContext) async -> WorkspaceLookupContext? {
-        await resolveLookupContext(context)
-    }
-
-    private func oraclePackagingLookupContext(
-        agentSessionID: UUID?,
-        worktreeBindings: [AgentSessionWorktreeBinding]
-    ) async -> WorkspaceLookupContext? {
-        guard let agentSessionID else { return .visibleWorkspace }
-        return await AgentWorkspaceLookupContextResolver.lookupContext(
+    private func oraclePackagingLookupContext(for context: TabScopedContext) async throws -> WorkspaceLookupContext {
+        if let frozenLookupContext = context.frozenLookupContext {
+            return frozenLookupContext
+        }
+        return try await requiredOracleLookupContext(
             source: AgentWorkspaceLookupContextSource(
-                activeAgentSessionID: agentSessionID,
-                worktreeBindings: worktreeBindings
-            ),
-            store: promptVM.workspaceFileContextStore
+                activeAgentSessionID: context.activeAgentSessionID,
+                worktreeBindingState: context.worktreeBindingState
+            )
         )
+    }
+
+    private func oraclePackagingLookupContext(owner: AgentOracleOwner) async throws -> WorkspaceLookupContext {
+        try await requiredOracleLookupContext(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: owner.agentSessionID,
+                worktreeBindingState: owner.worktreeBindingState
+            )
+        )
+    }
+
+    private func requiredOracleLookupContext(
+        source: AgentWorkspaceLookupContextSource
+    ) async throws -> WorkspaceLookupContext {
+        do {
+            return try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                source: source,
+                store: promptVM.workspaceFileContextStore
+            )
+        } catch {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 
     private func oracleSendTabContext(
         from context: TabScopedContext,
-        owner: AgentOracleOwner = AgentOracleOwner(agentSessionID: nil, runID: nil)
-    ) async -> OracleViewModel.OracleSendTabContext {
-        let lookupContext = await oraclePackagingLookupContext(for: context)
+        owner: AgentOracleOwner = AgentOracleOwner(
+            agentSessionID: nil,
+            runID: nil,
+            worktreeBindingState: .notApplicable
+        )
+    ) async throws -> OracleViewModel.OracleSendTabContext {
+        let lookupContext = try await oraclePackagingLookupContext(for: context)
         return OracleViewModel.OracleSendTabContext(
             tabID: context.tabID,
             promptText: context.promptText,

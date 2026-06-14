@@ -112,7 +112,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         let visibleWorktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleWorktreeHit)
         let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-            logicalRootPaths: [logicalRoot.path],
+            canonicalRootPaths: [],
             physicalRootPaths: [worktreeRoot.path]
         )
         let worktreeHit = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(worktreeFile.path, rootScope: sessionScope)
@@ -936,7 +936,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                 await permitSignal.mark()
             }
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [missingPhysicalRoot.standardizedFileURL.path]
             )
 
@@ -979,7 +979,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             let held = Task { try await self.searchContent(pattern: "baseNeedle", store: store) }
             await assertAsyncTrue(gate.waitUntilStartedCount(1))
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.standardizedFileURL.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [physicalRoot.standardizedFileURL.path]
             )
             let queued = Task {

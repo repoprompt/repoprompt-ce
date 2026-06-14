@@ -300,6 +300,13 @@ public class APISettingsViewModel: ObservableObject {
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
 
+    /// CLI connection flags are persisted configuration hints, not proof that the provider is
+    /// usable in the current process. Context Builder restoration waits for this validation pass
+    /// before accepting or replacing a saved provider/model selection.
+    @Published private(set) var isContextBuilderProviderValidationComplete = false
+    @Published private(set) var contextBuilderVerifiedCLIProviders: Set<AgentProviderKind> = []
+    private var contextBuilderProviderValidationTask: Task<Void, Never>?
+
     @Published var openRouterApiKey: String = ""
     @Published var isOpenRouterKeyValid: Bool = false
     @Published var customOpenRouterModels: [String] = []
@@ -410,6 +417,86 @@ public class APISettingsViewModel: ObservableObject {
         }
     }
 
+    /// Availability safe for restoring persisted Context Builder selections. A persisted
+    /// "connected" bit is treated as configured-but-unverified until a current-process health
+    /// check succeeds. Compatible backends are loaded from their actual config/secret state
+    /// before the validation pass completes.
+    var contextBuilderRestorationAvailabilityContext: AgentModelCatalog.AvailabilityContext {
+        AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: isVerifiedContextBuilderProvider(.claudeCode) && isClaudeCodeConnected,
+            codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
+            openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
+            cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            zaiConfigured: compatibleBackendIsActive(.glmZAI),
+            kimiConfigured: compatibleBackendIsActive(.kimi),
+            customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
+        )
+    }
+
+    var recommendationProviderStatusSnapshot: ProviderStatusSnapshot {
+        ProviderStatusSnapshot(
+            claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
+            codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
+            cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
+        )
+    }
+
+    private func recommendationAvailability(
+        isConnected: Bool,
+        provider: AgentProviderKind
+    ) -> ProviderStatusSnapshot.Availability {
+        guard isConnected else { return .notConfigured }
+        if isVerifiedContextBuilderProvider(provider) { return .ready }
+        return isContextBuilderProviderValidationComplete ? .notConfigured : .configured
+    }
+
+    private func isVerifiedContextBuilderProvider(_ provider: AgentProviderKind) -> Bool {
+        contextBuilderVerifiedCLIProviders.contains(provider)
+    }
+
+    private func setContextBuilderProviderVerified(
+        _ provider: AgentProviderKind,
+        verified: Bool
+    ) {
+        var updated = contextBuilderVerifiedCLIProviders
+        if verified {
+            updated.insert(provider)
+        } else {
+            updated.remove(provider)
+        }
+        guard updated != contextBuilderVerifiedCLIProviders else { return }
+        contextBuilderVerifiedCLIProviders = updated
+    }
+
+    private func contextBuilderProviderIsConnected(_ provider: AgentProviderKind) -> Bool {
+        switch provider {
+        case .claudeCode:
+            isClaudeCodeConnected
+        case .codexExec:
+            isCodexConnected
+        case .openCode:
+            isOpenCodeConnected
+        case .cursor:
+            isCursorConnected
+        case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+            false
+        }
+    }
+
+    private func applyContextBuilderProviderValidationResult(
+        _ verified: Bool,
+        provider: AgentProviderKind
+    ) {
+        let isConnected = contextBuilderProviderIsConnected(provider)
+        if verified, isConnected {
+            setContextBuilderProviderVerified(provider, verified: true)
+        } else if !isConnected || !isVerifiedContextBuilderProvider(provider) {
+            // Preserve a newer successful manual/live verification that raced this startup check.
+            setContextBuilderProviderVerified(provider, verified: false)
+        }
+    }
+
     var isCodexExecutableUnavailable: Bool {
         if case .executableUnavailable = codexConnectionPhase {
             return true
@@ -435,14 +522,19 @@ public class APISettingsViewModel: ObservableObject {
 
     private func installCLIConnectionObservers() {
         Publishers.MergeMany([
-            NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in () },
-            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in () }
+            NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
+            NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
+            NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
+            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor }
         ])
         .receive(on: DispatchQueue.main)
-        .sink { [weak self] _ in
-            self?.reloadCLIConnectionFlagsFromDefaults()
+        .sink { [weak self] provider in
+            guard let self else { return }
+            reloadCLIConnectionFlagsFromDefaults()
+            setContextBuilderProviderVerified(
+                provider,
+                verified: contextBuilderProviderIsConnected(provider)
+            )
         }
         .store(in: &cliConnectionCancellables)
     }
@@ -509,7 +601,10 @@ public class APISettingsViewModel: ObservableObject {
     }
 
     @discardableResult
-    func refreshClaudeCodeBinaryStatus(timeout: TimeInterval = 10) async -> Bool {
+    func refreshClaudeCodeBinaryStatus(
+        timeout: TimeInterval = 10,
+        forceProbe: Bool = false
+    ) async -> Bool {
         let previousAvailability = isClaudeFamilyModelProviderAvailable
         let previousStatus = claudeCodeCLIStatus
         if case .probing = claudeCodeCLIStatus {
@@ -517,7 +612,7 @@ public class APISettingsViewModel: ObservableObject {
             // concrete launch/test attempt will still surface command-not-found if needed.
             return true
         }
-        if isClaudeCodeConnected {
+        if isClaudeCodeConnected, !forceProbe {
             claudeCodeCLIStatus = .binaryPresent
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
             return true
@@ -869,6 +964,7 @@ public class APISettingsViewModel: ObservableObject {
         if loadStoredDataOnInit {
             Task {
                 await self.loadStoredDataIfNeeded()
+                await self.validateCachedContextBuilderProvidersIfNeeded()
             }
         }
     }
@@ -883,6 +979,7 @@ public class APISettingsViewModel: ObservableObject {
         openCodeModelsTask?.cancel()
         cursorModelsTask?.cancel()
         openRouterModelsTask?.cancel()
+        contextBuilderProviderValidationTask?.cancel()
     }
 
     @MainActor
@@ -959,6 +1056,136 @@ public class APISettingsViewModel: ObservableObject {
         guard !hasLoadedStoredData, !isLoadingStoredData else { return }
         isLoadingStoredData = true
         await loadStoredData(accessMode: accessMode)
+    }
+
+    /// Revalidates persisted CLI connection hints once per view-model lifetime. Startup uses
+    /// bounded, non-generation checks and the shared single-flight ACP pollers, so restoration
+    /// cannot reject a saved dynamic model before discovery has had a chance to run.
+    @MainActor
+    func validateCachedContextBuilderProvidersIfNeeded() async {
+        if isContextBuilderProviderValidationComplete { return }
+        if let contextBuilderProviderValidationTask {
+            await contextBuilderProviderValidationTask.value
+            return
+        }
+
+        // Load persisted ACP catalogs before any provider result can trigger restoration.
+        // A live refresh may legitimately omit dynamic metadata, especially for Cursor.
+        await AgentACPModelRegistry.shared.warmStandardStoreIfNeeded()
+        if isContextBuilderProviderValidationComplete { return }
+        if let contextBuilderProviderValidationTask {
+            await contextBuilderProviderValidationTask.value
+            return
+        }
+
+        let shouldValidateClaude = isClaudeCodeConnected
+        let shouldValidateClaudeBinary = hasActiveClaudeCompatibleBackend
+        let shouldValidateCodex = isCodexConnected
+        let shouldValidateOpenCode = isOpenCodeConnected
+        let shouldValidateCursor = isCursorConnected
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+
+            async let claudeReady = probeCachedClaudeCodeConnection(
+                ifNeeded: shouldValidateClaude,
+                verifyBinaryForCompatibleBackends: shouldValidateClaudeBinary
+            )
+            async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
+            async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
+            async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+
+            applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
+            applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
+            applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
+            applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
+                startCodexModelsSubscriptionIfNeeded()
+            }
+            isContextBuilderProviderValidationComplete = true
+            contextBuilderProviderValidationTask = nil
+        }
+        contextBuilderProviderValidationTask = task
+        await task.value
+    }
+
+    private func probeCachedClaudeCodeConnection(
+        ifNeeded: Bool,
+        verifyBinaryForCompatibleBackends: Bool
+    ) async -> Bool {
+        guard ifNeeded || verifyBinaryForCompatibleBackends else { return false }
+        guard ifNeeded else {
+            _ = await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            return false
+        }
+
+        var config = CLIProcessConfiguration(
+            captureStdoutTailBytes: 8 * 1024,
+            captureStderrTailBytes: 8 * 1024
+        )
+        config.ensureAdditionalPaths(CLIPathHints.claudeCode)
+        let runner = CLIProcessRunner(config: config)
+        do {
+            let result = try await runner.run(
+                args: ["auth", "status", "--json"],
+                stdin: nil,
+                outputMode: .none,
+                timeout: 10
+            )
+            await runner.cancelAll()
+
+            if !result.timedOut,
+               let object = try? JSONSerialization.jsonObject(with: result.stdout),
+               let payload = object as? [String: Any],
+               let loggedIn = payload["loggedIn"] as? Bool
+            {
+                let previousStatus = claudeCodeCLIStatus
+                claudeCodeCLIStatus = .binaryPresent
+                notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+                return loggedIn
+            }
+
+            let diagnostic = String(data: result.stderr + result.stdout, encoding: .utf8)?.lowercased() ?? ""
+            if diagnostic.contains("unknown command") || diagnostic.contains("unknown option") {
+                return await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            }
+            return false
+        } catch {
+            await runner.cancelAll()
+            _ = await refreshClaudeCodeBinaryStatus(timeout: 10, forceProbe: true)
+            return false
+        }
+    }
+
+    private func probeCachedCodexConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        switch await CodexManagedAuthRecoveryService.shared.refreshManagedAccount() {
+        case .recovered:
+            return true
+        case .requiresUserLogin, .executableUnavailable:
+            return false
+        }
+    }
+
+    private func probeCachedOpenCodeConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await OpenCodeACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await OpenCodeACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedCursorConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        if let latest = await CursorACPModelPollingService.shared.latestSnapshot(),
+           latest.isLiveDiscovery
+        {
+            return true
+        }
+        return await CursorACPModelPollingService.shared.refreshNow(workspacePath: nil)
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -1172,7 +1399,11 @@ public class APISettingsViewModel: ObservableObject {
         if isFireworksKeyValid { fireworksModelsTask = Task { await self.updateFireworksModels() } }
         if isGrokKeyValid { grokModelsTask = Task { await self.updateGrokModels() } }
         if isGroqKeyValid { groqModelsTask = Task { await self.updateGroqModels() } }
-        if isCodexConnected { startCodexModelsSubscriptionIfNeeded() } else { stopCodexModelsSubscription() }
+        if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
+            startCodexModelsSubscriptionIfNeeded()
+        } else {
+            stopCodexModelsSubscription()
+        }
         if isOpenCodeConnected { startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopOpenCodeModelsSubscription(clearModels: true) }
         if isCursorConnected { startCursorModelsSubscriptionIfNeeded(workspacePath: nil) } else { stopCursorModelsSubscription(clearModels: true) }
         if isOpenRouterKeyValid { openRouterModelsTask = Task { await self.fetchOpenRouterModels() } }
@@ -1700,6 +1931,13 @@ public class APISettingsViewModel: ObservableObject {
             let previousStatus = claudeCodeCLIStatus
             claudeCodeCLIStatus = status
             notifyClaudeCompatibleBackendRuntimeAvailabilityIfNeeded(previousStatus: previousStatus)
+        }
+
+        func test_completeContextBuilderProviderValidation(
+            verifiedProviders: Set<AgentProviderKind>
+        ) {
+            contextBuilderVerifiedCLIProviders = verifiedProviders
+            isContextBuilderProviderValidationComplete = true
         }
     #endif
 
@@ -2457,6 +2695,7 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             collector.append("Claude Code provider disposed")
             isClaudeCodeConnected = ok
+            setContextBuilderProviderVerified(.claudeCode, verified: ok)
             if ok {
                 claudeCodeCLIStatus = .binaryPresent
             }
@@ -2480,6 +2719,7 @@ public class APISettingsViewModel: ObservableObject {
             await provider.dispose()
             collector.append("Claude Code provider disposed")
             isClaudeCodeConnected = false
+            setContextBuilderProviderVerified(.claudeCode, verified: false)
             claudeCodeCLIStatus = Self.errorLooksLikeClaudeCodeBinaryMissing(error)
                 ? .binaryMissing(message: "Claude Code CLI isn't installed or isn't on PATH.")
                 : .binaryPresent
@@ -2533,6 +2773,7 @@ public class APISettingsViewModel: ObservableObject {
         windowID: Int = 0
     ) async {
         isCodexConnected = connected
+        setContextBuilderProviderVerified(.codexExec, verified: connected)
         codexError = error
         codexConnectionPhase = phase
         UserDefaults.standard.set(connected, forKey: "CodexCLIConnected")
@@ -2844,6 +3085,7 @@ public class APISettingsViewModel: ObservableObject {
             collector.append("Discovered \(snapshot.models.options.count) OpenCode model option(s)")
             availableOpenCodeModelOptions = snapshot.models.options
             isOpenCodeConnected = true
+            setContextBuilderProviderVerified(.openCode, verified: true)
             openCodeError = nil
             UserDefaults.standard.set(true, forKey: "OpenCodeCLIConnected")
             startOpenCodeModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -2859,6 +3101,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             isOpenCodeConnected = false
+            setContextBuilderProviderVerified(.openCode, verified: false)
             openCodeError = friendlyOpenCodeMessage(for: error)
             UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
             stopOpenCodeModelsSubscription(clearModels: true)
@@ -2876,6 +3119,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func disconnectOpenCode() {
         isOpenCodeConnected = false
+        setContextBuilderProviderVerified(.openCode, verified: false)
         openCodeError = nil
         UserDefaults.standard.set(false, forKey: "OpenCodeCLIConnected")
         stopOpenCodeModelsSubscription(clearModels: true)
@@ -2941,7 +3185,11 @@ public class APISettingsViewModel: ObservableObject {
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.availableOpenCodeModelOptions = snapshot.models.options
+                    guard let self else { return }
+                    availableOpenCodeModelOptions = snapshot.models.options
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.openCode, verified: true)
+                    }
                 }
                 await self?.updateAvailableModels()
             }
@@ -2982,6 +3230,7 @@ public class APISettingsViewModel: ObservableObject {
                 availableCursorModelOptions = cursorOptions
             }
             isCursorConnected = true
+            setContextBuilderProviderVerified(.cursor, verified: true)
             cursorError = nil
             UserDefaults.standard.set(true, forKey: "CursorCLIConnected")
             startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -2997,6 +3246,7 @@ public class APISettingsViewModel: ObservableObject {
         } catch {
             collector.append("Connection test threw error: \(error.localizedDescription)")
             isCursorConnected = false
+            setContextBuilderProviderVerified(.cursor, verified: false)
             cursorError = friendlyCursorMessage(for: error)
             UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
             stopCursorModelsSubscription(clearModels: true)
@@ -3014,6 +3264,7 @@ public class APISettingsViewModel: ObservableObject {
 
     func disconnectCursor() {
         isCursorConnected = false
+        setContextBuilderProviderVerified(.cursor, verified: false)
         cursorError = nil
         UserDefaults.standard.set(false, forKey: "CursorCLIConnected")
         stopCursorModelsSubscription(clearModels: true)
@@ -3079,13 +3330,17 @@ public class APISettingsViewModel: ObservableObject {
         guard cursorModelsTask == nil else { return }
         cursorModelsTask = Task { [weak self, workspacePath] in
             let stream = await CursorACPModelPollingService.shared.subscribe(workspacePath: workspacePath)
-            for await _ in stream {
+            for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
-                    self?.availableCursorModelOptions = AgentModelCatalog.options(
+                    guard let self else { return }
+                    availableCursorModelOptions = AgentModelCatalog.options(
                         for: .cursor,
                         availability: AgentModelCatalog.AvailabilityContext(cursorAvailable: true, zaiConfigured: false)
                     )
+                    if snapshot.isLiveDiscovery {
+                        setContextBuilderProviderVerified(.cursor, verified: true)
+                    }
                 }
                 await self?.updateAvailableModels()
             }

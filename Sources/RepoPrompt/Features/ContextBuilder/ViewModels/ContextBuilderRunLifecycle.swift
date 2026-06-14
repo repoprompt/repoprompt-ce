@@ -84,6 +84,7 @@ final class ContextBuilderRunRecord {
     let agentKind: AgentProviderKind
     let modelRaw: String
     let progressReporter: ContextBuilderMCPProgressReporter?
+    let workspaceContext: ContextBuilderWorkspaceContext?
 
     var output = ContextBuilderAssistantOutputAccumulator()
     var executionTask: Task<Void, Never>?
@@ -107,6 +108,7 @@ final class ContextBuilderRunRecord {
         origin: ContextBuilderRunOrigin,
         agentKind: AgentProviderKind,
         modelRaw: String,
+        workspaceContext: ContextBuilderWorkspaceContext? = nil,
         continuation: CheckedContinuation<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error>? = nil,
         restoreConfiguration: (() -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil
@@ -118,6 +120,7 @@ final class ContextBuilderRunRecord {
         self.origin = origin
         self.agentKind = agentKind
         self.modelRaw = modelRaw
+        self.workspaceContext = workspaceContext
         self.continuation = continuation
         self.restoreConfiguration = restoreConfiguration
         self.progressReporter = progressReporter

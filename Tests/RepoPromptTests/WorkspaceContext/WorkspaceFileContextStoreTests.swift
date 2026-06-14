@@ -2840,8 +2840,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         _ = try await store.loadRoot(path: logicalRoot.path)
         let recordA = try await store.loadRoot(path: worktreeA.path, kind: .sessionWorktree)
         let recordB = try await store.loadRoot(path: worktreeB.path, kind: .sessionWorktree)
-        let scopeA = WorkspaceLookupRootScope.sessionBoundWorkspace(logicalRootPaths: [logicalRoot.path], physicalRootPaths: [worktreeA.path])
-        let scopeB = WorkspaceLookupRootScope.sessionBoundWorkspace(logicalRootPaths: [logicalRoot.path], physicalRootPaths: [worktreeB.path])
+        let scopeA = WorkspaceLookupRootScope.sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: [worktreeA.path])
+        let scopeB = WorkspaceLookupRootScope.sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: [worktreeB.path])
 
         let initialA = await store.searchCatalogSnapshot(rootScope: scopeA)
         let initialB = await store.searchCatalogSnapshot(rootScope: scopeB)
@@ -2881,11 +2881,11 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let recordA = try await store.loadRoot(path: worktreeA.path, kind: .sessionWorktree)
             _ = try await store.loadRoot(path: worktreeB.path, kind: .sessionWorktree)
             let scopeA = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [visibleRoot.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [worktreeA.path]
             )
             let scopeB = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [visibleRoot.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [worktreeB.path]
             )
             _ = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
@@ -2980,7 +2980,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             _ = try await store.loadRoot(path: logicalRoot.path)
             let initialRecord = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
             let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-                logicalRootPaths: [logicalRoot.path],
+                canonicalRootPaths: [],
                 physicalRootPaths: [worktree.path]
             )
             let initial = await store.searchCatalogSnapshot(rootScope: scope)
@@ -3002,7 +3002,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             let store = WorkspaceFileContextStore()
             let scopes = (0 ... 16).map { index in
                 WorkspaceLookupRootScope.sessionBoundWorkspace(
-                    logicalRootPaths: ["/logical/\(index)"],
+                    canonicalRootPaths: ["/canonical/\(index)"],
                     physicalRootPaths: ["/physical/\(index)"]
                 )
             }

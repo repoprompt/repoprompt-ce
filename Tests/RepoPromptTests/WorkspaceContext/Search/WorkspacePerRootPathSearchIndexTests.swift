@@ -44,7 +44,7 @@ import XCTest
                 .visibleWorkspacePlusGitData,
                 .allLoaded,
                 .sessionBoundWorkspace(
-                    logicalRootPaths: [primaryAURL.path],
+                    canonicalRootPaths: [primaryAURL.path],
                     physicalRootPaths: [worktreeURL.path]
                 )
             ]

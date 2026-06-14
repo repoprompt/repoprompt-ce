@@ -83,14 +83,16 @@ extension MCPServerViewModel {
 
     @MainActor
     func lookupContext(for context: TabContextSnapshot) async -> WorkspaceLookupContext {
-        guard let sessionID = context.activeAgentSessionID,
-              !context.worktreeBindings.isEmpty,
-              let projection = await materializeWorkspaceBindingProjection(sessionID: sessionID, bindings: context.worktreeBindings),
-              !projection.isEmpty
-        else {
-            return .visibleWorkspace
+        if let frozenLookupContext = context.frozenLookupContext {
+            return frozenLookupContext
         }
-        return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        return await AgentWorkspaceLookupContextResolver.authoritativeLookupContextOrFailClosed(
+            source: AgentWorkspaceLookupContextSource(
+                activeAgentSessionID: context.activeAgentSessionID,
+                worktreeBindingState: context.worktreeBindingState
+            ),
+            store: promptVM.workspaceFileContextStore
+        )
     }
 
     @MainActor
@@ -235,8 +237,17 @@ extension MCPServerViewModel {
             )
         }
 
-        private static func pathMetadata(for file: WorkspaceFileRecord, entry: ResolvedPromptFileEntry? = nil) -> (rootPath: String, pathWithinRoot: String) {
-            (entry?.rootFolderPath.map { StandardizedPath.absolute($0) } ?? (file.standardizedFullPath as NSString).deletingLastPathComponent, file.standardizedRelativePath)
+        private static func pathMetadata(
+            for file: WorkspaceFileRecord,
+            entry: ResolvedPromptFileEntry? = nil,
+            projection: WorkspaceRootBindingProjection? = nil
+        ) -> (rootPath: String, pathWithinRoot: String) {
+            if let projected = projection?.projectedLogicalRootMetadata(forPhysicalPath: file.standardizedFullPath) {
+                return projected
+            }
+            let rootPath = entry?.rootFolderPath.map { StandardizedPath.absolute($0) }
+                ?? (file.standardizedFullPath as NSString).deletingLastPathComponent
+            return (rootPath, file.standardizedRelativePath)
         }
 
         /// Computes how a file would render under a given codemap usage mode
@@ -337,7 +348,7 @@ extension MCPServerViewModel {
             for entry in collections.selected {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry)
+                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
                 let ranges = entry.ranges ?? []
                 let hasSlices = !ranges.isEmpty
                 let entryResult = entryResultsByFileID?[file.id]
@@ -423,7 +434,7 @@ extension MCPServerViewModel {
             for entry in collections.codemap {
                 let file = entry.file
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry)
+                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
                 let entryResult = entryResultsByFileID?[file.id]
                 let tokenCount: Int
                 if let entryResult {
@@ -675,7 +686,7 @@ extension MCPServerViewModel {
                 guard !ranges.isEmpty else { continue }
 
                 let displayPath = await formatter.displayPath(for: file)
-                let metadata = pathMetadata(for: file, entry: entry.entry)
+                let metadata = pathMetadata(for: file, entry: entry.entry, projection: formatter.projection)
                 let dtoRanges = ranges.map { ToolResultDTOs.LineRangeDTO(range: $0) }
                 slices.append(.init(
                     path: displayPath,
@@ -733,7 +744,7 @@ extension MCPServerViewModel {
 
     struct CodeStructureBuilder {
         unowned let owner: MCPServerViewModel
-        let projection: WorkspaceRootBindingProjection?
+        let lookupContext: WorkspaceLookupContext
 
         func build(for files: [WorkspaceFileRecord]) async throws -> ToolResultDTOs.SelectedCodeStructureDTO? {
             guard !files.isEmpty else { return nil }
@@ -744,7 +755,7 @@ extension MCPServerViewModel {
                 fromRecords: files,
                 maxResults: 25,
                 includeUnmappedPaths: true,
-                projection: projection
+                lookupContext: lookupContext
             )
         }
     }

@@ -422,9 +422,9 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             XCTAssertNotNil(exportObject["plan"]?.objectValue, String(describing: exportObject))
             let exportPath = try XCTUnwrap(exportObject["oracle_export_path"]?.stringValue)
             let exportInstruction = try XCTUnwrap(exportObject["oracle_export_instruction"]?.stringValue)
-            let standardizedWorktreePath = StandardizedPath.absolute(worktreePath)
+            let standardizedLogicalPath = fixture.repo.standardizedFileURL.path
             XCTAssertTrue(
-                exportPath.hasPrefix(standardizedWorktreePath + "/prompt-exports/"),
+                exportPath.hasPrefix(standardizedLogicalPath + "/prompt-exports/"),
                 exportPath
             )
             let exportPathLiteral = try XCTUnwrap(
@@ -434,12 +434,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 exportInstruction.contains("{\"path\": \(exportPathLiteral)}"),
                 exportInstruction
             )
-            XCTAssertTrue(FileManager.default.fileExists(atPath: exportPath), exportPath)
+            XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), exportPath)
 
-            let relativeExportPath = String(exportPath.dropFirst(standardizedWorktreePath.count))
+            let relativeExportPath = String(exportPath.dropFirst(standardizedLogicalPath.count))
                 .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            let logicalExportPath = fixture.repo.appendingPathComponent(relativeExportPath).path
-            XCTAssertFalse(FileManager.default.fileExists(atPath: logicalExportPath), logicalExportPath)
+            let physicalExportPath = URL(fileURLWithPath: worktreePath)
+                .appendingPathComponent(relativeExportPath)
+                .path
+            XCTAssertTrue(FileManager.default.fileExists(atPath: physicalExportPath), physicalExportPath)
 
             let readConnectionID = UUID()
             let contextHint = MCPServerViewModel.TabContextHint(
@@ -570,7 +572,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedTree = try Self.onlyText(ToolOutputFormatter.formatFileTree(value: treeValue))
         XCTAssertTrue(formattedTree.contains(logicalRootPath), formattedTree)
-        XCTAssertTrue(formattedTree.contains(effectiveRootPath), formattedTree)
+        XCTAssertFalse(formattedTree.contains(effectiveRootPath), formattedTree)
         XCTAssertTrue(formattedTree.contains("session-bound worktree"), formattedTree)
 
         let readValue = try await readFile(["path": .string("Tracked.txt")])
@@ -582,7 +584,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedRead = try Self.onlyText(ToolOutputFormatter.formatReadFile(args: ["path": .string("Tracked.txt")], value: readValue))
         XCTAssertTrue(formattedRead.contains(logicalRootPath), formattedRead)
-        XCTAssertTrue(formattedRead.contains(effectiveRootPath), formattedRead)
+        XCTAssertFalse(formattedRead.contains(effectiveRootPath), formattedRead)
         XCTAssertTrue(formattedRead.contains("session-bound worktree"), formattedRead)
 
         let searchValue = try await fileSearch(["pattern": .string("original"), "mode": .string("content"), "max_results": .int(5)])
@@ -594,7 +596,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedSearch = try Self.onlyText(ToolOutputFormatter.formatSearch(value: searchValue))
         XCTAssertTrue(formattedSearch.contains(logicalRootPath), formattedSearch)
-        XCTAssertTrue(formattedSearch.contains(effectiveRootPath), formattedSearch)
+        XCTAssertFalse(formattedSearch.contains(effectiveRootPath), formattedSearch)
         XCTAssertTrue(formattedSearch.contains("session-bound worktree"), formattedSearch)
     }
 

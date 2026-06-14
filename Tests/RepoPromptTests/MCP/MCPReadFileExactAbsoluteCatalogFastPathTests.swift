@@ -228,7 +228,7 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         let visibleWorktreeHit = await service.resolveExactWorkspaceCatalogHit(worktreeFile.path, rootScope: .visibleWorkspace)
         XCTAssertNil(visibleWorktreeHit)
         let sessionScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
-            logicalRootPaths: [logicalRoot.path],
+            canonicalRootPaths: [],
             physicalRootPaths: [worktreeRoot.path]
         )
         let worktreeHit = await service.resolveExactWorkspaceCatalogHit(worktreeFile.path, rootScope: sessionScope)

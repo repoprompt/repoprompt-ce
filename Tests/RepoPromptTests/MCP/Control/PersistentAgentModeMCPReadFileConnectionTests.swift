@@ -1571,6 +1571,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
+            if agentOwned {
+                window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
+                    guard sessionID == agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+                    return .hydrated([])
+                }
+            }
             WindowStatesManager.shared.registerWindowState(window)
             // Keep dispatch in ordinary multi-window routing mode so catalog services retained by
             // earlier tests are filtered by window ID instead of relying on singleton cleanliness.
@@ -1843,8 +1849,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 source: "test"
             )
             window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
-                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return [] }
-                return [binding]
+                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .hydrated([]) }
+                return .hydrated([binding])
             }
         }
 

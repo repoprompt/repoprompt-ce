@@ -11,21 +11,23 @@ struct OracleExportDestination: Equatable {
     let workspaceID: UUID
     let windowID: Int
     let tabID: UUID?
+    /// Logical/canonical primary root returned to the bound child.
     let primaryRootPath: String
-    let rootScope: WorkspaceLookupRootScope
+    /// Frozen logical-to-physical scope used for disk I/O and read-back verification.
+    let lookupContext: WorkspaceLookupContext
 
     init(
         workspaceID: UUID,
         windowID: Int,
         tabID: UUID?,
         primaryRootPath: String,
-        rootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) {
         self.workspaceID = workspaceID
         self.windowID = windowID
         self.tabID = tabID
         self.primaryRootPath = primaryRootPath
-        self.rootScope = rootScope
+        self.lookupContext = lookupContext
     }
 }
 

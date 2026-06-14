@@ -12,7 +12,9 @@ protocol SettingsManaging {
     func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?)
     func updateChatSettings(_ settings: ChatGlobalSettings, commit: Bool?)
     func globalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
+    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?)
     func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool)
+    func globalRecommendationProviderFilter() -> Set<RecommendationProviderKind>
     func promptSectionsOrderRaw() -> String
     func setPromptSectionsOrderRaw(_ raw: String, commit: Bool)
     func duplicateUserInstructionsAtTop() -> Bool
@@ -111,12 +113,20 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
         store.globalContextBuilderAgentSelection()
     }
 
+    func persistedGlobalContextBuilderAgentSelection() -> (agentRaw: String?, modelRaw: String?) {
+        store.persistedGlobalContextBuilderAgentSelection()
+    }
+
     func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool = true) {
         store.setGlobalContextBuilderAgentSelection(
             agentRaw: agentRaw,
             modelRaw: modelRaw,
             markUserDefined: markUserDefined
         )
+    }
+
+    func globalRecommendationProviderFilter() -> Set<RecommendationProviderKind> {
+        store.globalRecommendationProviderFilter()
     }
 
     // MARK: - Scalar global settings

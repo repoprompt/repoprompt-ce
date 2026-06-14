@@ -151,6 +151,7 @@ final class MCPServerViewModel: ObservableObject {
 
     // -----------------------------------------------------------------
     private nonisolated static let defaultCodeStructureMaxResults = 10
+    private nonisolated static let maxCodeStructureSelfHealingFiles = 50
     private nonisolated static let codeStructureTokenBudget = 6000
     private nonisolated static let codeStructureSeparatorTokenCost = TokenCalculationService.estimateTokens(for: "\n\n")
 
@@ -177,10 +178,10 @@ final class MCPServerViewModel: ObservableObject {
     private let oracleVM: OracleViewModel
     let workspaceManager: WorkspaceManagerViewModel?
     let selectionCoordinator: WorkspaceSelectionCoordinator?
-    var agentWorktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
+    var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
 
-    func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding]) {
-        agentWorktreeBindingsProvider = provider
+    func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState) {
+        agentWorktreeBindingStateProvider = provider
     }
 
     private let workspaceSearch: WorkspaceSearchHandler
@@ -193,6 +194,32 @@ final class MCPServerViewModel: ObservableObject {
     let windowID: Int
     private(set) var service: MCPService
     private let logger = Logger(label: "com.repoprompt.mcp")
+
+    #if DEBUG
+        private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
+        private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+        private var contextBuilderSelectionReplyObserverForTesting: ((
+            StoredSelection,
+            WorkspaceLookupContext?,
+            ToolResultDTOs.SelectionReply
+        ) -> Void)?
+
+        func setOracleChatSendOverrideForTesting(_ override: MCPOracleToolService.SendChat?) {
+            oracleChatSendOverrideForTesting = override
+        }
+
+        func setContextBuilderFollowUpOverrideForTesting(
+            _ override: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+        ) {
+            contextBuilderFollowUpOverrideForTesting = override
+        }
+
+        func setContextBuilderSelectionReplyObserverForTesting(
+            _ observer: ((StoredSelection, WorkspaceLookupContext?, ToolResultDTOs.SelectionReply) -> Void)?
+        ) {
+            contextBuilderSelectionReplyObserverForTesting = observer
+        }
+    #endif
 
     private var oracleToolService: MCPOracleToolService {
         MCPOracleToolService(
@@ -210,7 +237,6 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(toolName: toolName) },
-            resolveLookupContext: { [self] context in await lookupContext(for: context) },
             rebindChatSessionIfNeeded: { [self] metadata, chatIDString in
                 try rebindOracleChatSessionIfNeeded(metadata: metadata, chatIDString: chatIDString)
             },
@@ -229,6 +255,18 @@ final class MCPServerViewModel: ObservableObject {
                     stage: stage,
                     message: message,
                     operation: operation
+                )
+            },
+            sendChat: { [self] args, promptVM, tabContext in
+                #if DEBUG
+                    if let override = oracleChatSendOverrideForTesting {
+                        return try await override(args, promptVM, tabContext)
+                    }
+                #endif
+                return try await oracleVM.tool_chatSend(
+                    args: args,
+                    promptVM: promptVM,
+                    tabContext: tabContext
                 )
             },
             exportOracleResponse: { [self] request in
@@ -609,7 +647,8 @@ final class MCPServerViewModel: ObservableObject {
                 tabID: resolution.tabID,
                 workspaceID: resolution.workspaceID,
                 bindCaller: resolution.bindCaller,
-                lookupContext: resolution.lookupContext
+                lookupContext: resolution.lookupContext,
+                workspaceContext: resolution.workspaceContext
             )
         },
         bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
@@ -622,14 +661,19 @@ final class MCPServerViewModel: ObservableObject {
                 windowID: windowID
             )
         },
-        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride in
+        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride, lookupContextOverride in
             guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
-            return await buildTabSelectionReply(
+            let reply = await buildTabSelectionReply(
                 from: selection,
                 includeBlocks: includeBlocks,
                 display: display,
-                codeMapUsageOverride: codeMapUsageOverride
+                codeMapUsageOverride: codeMapUsageOverride,
+                lookupContextOverride: lookupContextOverride
             )
+            #if DEBUG
+                contextBuilderSelectionReplyObserverForTesting?(selection, lookupContextOverride, reply)
+            #endif
+            return reply
         },
         sendStageProgress: { [weak self] connectionID, tool, stage, message in
             guard let self else { return }
@@ -651,14 +695,29 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, mode, prompt, selection, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, mode, prompt, selection, lookupContext, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
+            #if DEBUG
+                if let override = contextBuilderFollowUpOverrideForTesting {
+                    return try await override(
+                        contextBuilderVM,
+                        tabID,
+                        mode,
+                        prompt,
+                        selection,
+                        lookupContext,
+                        progressReporter,
+                        activityReporter
+                    )
+                }
+            #endif
             return try await contextBuilderVM.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: oracleVM,
                 mode: mode,
                 prompt: prompt,
                 selection: selection,
+                lookupContext: lookupContext,
                 progressReporter: progressReporter,
                 activityReporter: activityReporter
             )
@@ -786,17 +845,22 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return nil }
             return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
         },
-        makeSelectionHintError: { [weak self] paths, operation, lookupRootScope in
+        makeSelectionHintError: { [weak self] paths, operation, lookupContext in
             guard let self else { return "Window deallocated while resolving selection inputs." }
-            return await makeSelectionHintError(paths: paths, operation: operation, lookupRootScope: lookupRootScope)
+            return await makeSelectionHintError(paths: paths, operation: operation, lookupContext: lookupContext)
         },
         performFileAction: { [weak self] action, path, content, newPath, ifExists in
             guard let self else { throw MCPError.internalError("Window deallocated while performing file action") }
             return try await performFileAction(action: action, path: path, content: content, newPath: newPath, ifExists: ifExists)
         },
-        buildCodeStructureDTO: { [weak self] files, maxResults, includeUnmappedPaths, projection in
+        buildCodeStructureDTO: { [weak self] files, maxResults, includeUnmappedPaths, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building code structure") }
-            return try await buildCodeStructureDTO(fromRecords: files, maxResults: maxResults, includeUnmappedPaths: includeUnmappedPaths, projection: projection)
+            return try await buildCodeStructureDTO(
+                fromRecords: files,
+                maxResults: maxResults,
+                includeUnmappedPaths: includeUnmappedPaths,
+                lookupContext: lookupContext
+            )
         },
         resolveFilesForCodeStructure: { [weak self] paths, lookupRootScope in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving code structure files") }
@@ -924,7 +988,7 @@ final class MCPServerViewModel: ObservableObject {
             forTabID: key.tabID,
             inWorkspaceID: key.workspaceID
         ),
-            agentWorktreeBindingsProvider?(sessionID, key.tabID).isEmpty == false
+            agentWorktreeBindingStateProvider?(sessionID, key.tabID).bindings?.isEmpty == false
         {
             // Worktree-only paths cannot be represented by the logical base file tree. Their
             // canonical selection and badge presentation are already updated by persistence.
@@ -2694,7 +2758,13 @@ final class MCPServerViewModel: ObservableObject {
         args: [String: Value],
         targetWindow: WindowState,
         connectionID: UUID?
-    ) async throws -> (tabID: UUID, workspaceID: UUID?, bindCaller: Bool, lookupContext: WorkspaceLookupContext) {
+    ) async throws -> (
+        tabID: UUID,
+        workspaceID: UUID?,
+        bindCaller: Bool,
+        lookupContext: WorkspaceLookupContext,
+        workspaceContext: ContextBuilderWorkspaceContext?
+    ) {
         let purpose: MCPRunPurpose = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
         } else {
@@ -2713,6 +2783,9 @@ final class MCPServerViewModel: ObservableObject {
            existingBinding.tabID != explicitHint.tabID
         {
             throw MCPError.invalidParams("Explicit tab context hint for context_builder targets tab \(explicitHint.tabID), but this connection is already bound to tab \(existingBinding.tabID?.uuidString ?? "unknown"). Clear or intentionally rebind the connection before targeting a different tab context.")
+        }
+        if purpose == .agentModeRun, explicitHint != nil {
+            throw MCPError.invalidParams("Agent Mode context_builder cannot replace the invoking run-scoped tab context with an explicit context_id. Retry without an explicit context override.")
         }
 
         let clientName: String? = if let connectionID {
@@ -2738,19 +2811,38 @@ final class MCPServerViewModel: ObservableObject {
                 throw MCPError.invalidParams("Tab context '\(context.tabID.uuidString)' is not available in window \(targetWindow.windowID).")
             }
             let shouldBindCaller = source == .explicitHint && purpose != .agentModeRun && connectionID != nil
-            let lookupContext = try await targetWindow.mcpServer.resolveFileToolLookupContext(
-                tabID: context.tabID,
-                workspaceID: context.workspaceID
-            )
-            return (context.tabID, context.workspaceID, shouldBindCaller, lookupContext)
-        } catch {
-            if explicitHint != nil || existingBinding != nil {
-                throw error
-            }
+            let workspaceContext: ContextBuilderWorkspaceContext?
             if purpose == .agentModeRun {
-                throw MCPError.invalidParams(
-                    "context_builder could not resolve the invoking agent-mode tab context. Retry after routing settles, or pass context_id explicitly."
+                guard let workspaceID = context.workspaceID,
+                      let workspace = targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
+                else {
+                    throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
+                }
+                do {
+                    workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
+                        from: context,
+                        workspaceRepoPaths: workspace.repoPaths,
+                        store: targetWindow.promptManager.workspaceFileContextStore
+                    )
+                } catch {
+                    throw MCPError.invalidParams(error.localizedDescription)
+                }
+            } else {
+                workspaceContext = nil
+            }
+
+            let lookupContext: WorkspaceLookupContext = if let workspaceContext {
+                workspaceContext.lookupContext
+            } else {
+                try await targetWindow.mcpServer.resolveFileToolLookupContext(
+                    tabID: context.tabID,
+                    workspaceID: context.workspaceID
                 )
+            }
+            return (context.tabID, context.workspaceID, shouldBindCaller, lookupContext, workspaceContext)
+        } catch {
+            if explicitHint != nil || existingBinding != nil || purpose == .agentModeRun {
+                throw error
             }
         }
 
@@ -2762,7 +2854,13 @@ final class MCPServerViewModel: ObservableObject {
         ) else {
             throw MCPError.internalError("Failed to create compose tab.")
         }
-        return (createdTab.id, targetWindow.workspaceManager.activeWorkspace?.id, true, .visibleWorkspace)
+        return (
+            createdTab.id,
+            targetWindow.workspaceManager.activeWorkspace?.id,
+            true,
+            .visibleWorkspace,
+            nil
+        )
     }
 
     /// Runs an async operation with periodic heartbeat emissions to prevent agent timeouts.
@@ -3507,21 +3605,25 @@ final class MCPServerViewModel: ObservableObject {
     private func makeSelectionHintError(
         paths: [String],
         operation: String,
-        lookupRootScope: WorkspaceLookupRootScope = .visibleWorkspace
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace
     ) async -> String {
         let trimmed = paths.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
-        let roots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupRootScope)
+        let roots = await promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         if roots.isEmpty {
             return "No workspace is currently loaded in this window. Use the 'manage_workspaces' tool with action: 'list' to see available workspaces, then action: 'switch' to load one."
         }
 
-        let rootSummaries = roots.map { "\($0.name) → \($0.fullPath)" }.joined(separator: "; ")
+        let displayRoots = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? roots
+        let rootSummaries = displayRoots.map { "\($0.name) → \($0.fullPath)" }.joined(separator: "; ")
 
         var outside: [String] = []
-        for p in trimmed where p.hasPrefix("/") {
-            let standardized = StandardizedPath.absolute(p)
-            let under = roots.contains { StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) || standardized == $0.standardizedFullPath }
-            if !under { outside.append(p) }
+        for path in trimmed where path.hasPrefix("/") {
+            let standardized = StandardizedPath.absolute(lookupContext.translateInputPath(path))
+            let under = roots.contains {
+                standardized == $0.standardizedFullPath
+                    || StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath)
+            }
+            if !under { outside.append(path) }
         }
 
         var lines: [String] = []
@@ -3576,8 +3678,15 @@ final class MCPServerViewModel: ObservableObject {
         fromRecords files: [WorkspaceFileRecord],
         maxResults: Int,
         includeUnmappedPaths: Bool,
-        projection: WorkspaceRootBindingProjection? = nil
+        lookupContext: WorkspaceLookupContext = .visibleWorkspace,
+        selfHealTimeout: Duration = .seconds(5)
     ) async throws -> ToolResultDTOs.SelectedCodeStructureDTO {
+        struct CodeStructureFile {
+            let file: WorkspaceFileRecord
+            let key: String
+            let displayPath: String
+        }
+
         struct RenderableCodeStructure {
             let key: String
             let displayPath: String
@@ -3587,45 +3696,92 @@ final class MCPServerViewModel: ObservableObject {
 
         try Task.checkCancellation()
         let store = promptVM.workspaceFileContextStore
-        let snapshots = await store.codemapSnapshotDictionary()
-        try Task.checkCancellation()
-        let roots = await store.rootRefs(scope: .allLoaded)
-        try Task.checkCancellation()
-        var renderable: [RenderableCodeStructure] = []
-        var unmappedPaths: [String] = []
-        var seenPaths = Set<String>()
+        switch await store.rootScopeAvailability(lookupContext.rootScope) {
+        case .available:
+            break
+        case .sessionWorktreeUnavailable:
+            throw MCPError.invalidParams(
+                "The session-bound worktree root is unavailable. get_code_structure stopped rather than reading the canonical checkout."
+            )
+        }
 
+        let roots = await store.rootRefs(scope: lookupContext.rootScope)
+        try Task.checkCancellation()
+        let scopedRootIDs = Set(roots.map(\.id))
+        let requiresScopedRootMembership = if case .sessionBoundWorkspace = lookupContext.rootScope {
+            true
+        } else {
+            false
+        }
+        var codeStructureFiles: [CodeStructureFile] = []
+        var seenPaths = Set<String>()
         for file in files {
             try Task.checkCancellation()
+            guard !requiresScopedRootMembership || scopedRootIDs.contains(file.rootID) else { continue }
             let fullPath = file.standardizedFullPath
             guard seenPaths.insert(fullPath).inserted else { continue }
-            let displayPath: String = if let projection,
-                                         let projected = projection.projectedLogicalDisplayPath(forPhysicalPath: fullPath, display: .relative)
-            {
+            let displayPath: String = if let projected = lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: fullPath,
+                display: .relative
+            ) {
                 projected
             } else if let root = roots.first(where: { $0.id == file.rootID }) {
                 ClientPathFormatter.displayPath(root: root, relativePath: file.standardizedRelativePath, visibleRoots: roots)
             } else {
                 file.relativePath
             }
-            if let api = snapshots[file.id]?.fileAPI {
-                renderable.append(
-                    RenderableCodeStructure(
-                        key: fullPath,
-                        displayPath: displayPath,
-                        api: api,
-                        estimatedTokens: api.estimatedFullAPIDescriptionTokens(displayPath: displayPath)
-                    )
-                )
-            } else if includeUnmappedPaths {
-                unmappedPaths.append(displayPath)
-            }
+            codeStructureFiles.append(CodeStructureFile(file: file, key: fullPath, displayPath: displayPath))
         }
-
-        try Task.checkCancellation()
-        renderable.sort { lhs, rhs in
+        codeStructureFiles.sort { lhs, rhs in
             if lhs.displayPath == rhs.displayPath { return lhs.key < rhs.key }
             return lhs.displayPath < rhs.displayPath
+        }
+
+        var snapshots = await store.codemapSnapshotDictionary()
+        try Task.checkCancellation()
+        let repairLimit = min(max(0, maxResults), Self.maxCodeStructureSelfHealingFiles)
+        let repairFiles = Array(codeStructureFiles.lazy.filter { item in
+            guard snapshots[item.file.id] == nil else { return false }
+            let ext = (item.file.name as NSString).pathExtension
+            return SyntaxManager.isSupportedFileExtension(ext)
+        }.prefix(repairLimit).map(\.file))
+        let repairResult: WorkspaceCodemapRepairResult
+        if repairFiles.isEmpty {
+            repairResult = WorkspaceCodemapRepairResult(
+                snapshotsByFileID: snapshots,
+                pendingFileIDs: []
+            )
+        } else {
+            repairResult = try await store.repairMissingCodemapSnapshots(
+                for: repairFiles,
+                timeout: selfHealTimeout
+            )
+            snapshots = repairResult.snapshotsByFileID
+        }
+        try Task.checkCancellation()
+
+        var renderable: [RenderableCodeStructure] = []
+        var unmappedPaths: [String] = []
+        var pendingPaths: [String] = []
+        for item in codeStructureFiles {
+            try Task.checkCancellation()
+            if let api = snapshots[item.file.id]?.fileAPI {
+                renderable.append(
+                    RenderableCodeStructure(
+                        key: item.key,
+                        displayPath: item.displayPath,
+                        api: api,
+                        estimatedTokens: api.estimatedFullAPIDescriptionTokens(displayPath: item.displayPath)
+                    )
+                )
+            } else if repairResult.pendingFileIDs.contains(item.file.id) {
+                pendingPaths.append(item.displayPath)
+            } else {
+                let ext = (item.file.name as NSString).pathExtension
+                if includeUnmappedPaths || SyntaxManager.isSupportedFileExtension(ext) {
+                    unmappedPaths.append(item.displayPath)
+                }
+            }
         }
 
         let budgetSelection = Self.applyCodeStructureOutputBudget(
@@ -3644,15 +3800,18 @@ final class MCPServerViewModel: ObservableObject {
         }
         try Task.checkCancellation()
         let content = contentParts.joined(separator: "\n\n")
-        let sortedUnmapped = includeUnmappedPaths && !unmappedPaths.isEmpty ? unmappedPaths.sorted() : nil
+        let sortedUnmapped = unmappedPaths.isEmpty ? nil : unmappedPaths.sorted()
+        let sortedPending = pendingPaths.isEmpty ? nil : pendingPaths.sorted()
         return ToolResultDTOs.SelectedCodeStructureDTO(
             fileCount: budgetSelection.includedKeys.count,
             content: content,
             unmappedPaths: sortedUnmapped,
+            pendingPaths: sortedPending,
             omittedCount: budgetSelection.omittedByMaxResults > 0 ? budgetSelection.omittedByMaxResults : nil,
             omittedTotal: budgetSelection.omittedTotal > 0 ? budgetSelection.omittedTotal : nil,
             tokenBudgetOmittedCount: budgetSelection.omittedByTokenBudget > 0 ? budgetSelection.omittedByTokenBudget : nil,
-            tokenBudgetHit: budgetSelection.omittedByTokenBudget > 0 ? true : nil
+            tokenBudgetHit: budgetSelection.omittedByTokenBudget > 0 ? true : nil,
+            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
         )
     }
 
@@ -4061,17 +4220,12 @@ final class MCPServerViewModel: ObservableObject {
         }
         let standardizedRoot = (expandedRoot as NSString).standardizingPath
         try validateOracleExportPrimaryRoot(standardizedRoot)
-        // Generated handoff files must live in the same effective root that read_file uses
-        // for this context; otherwise the returned logical path is remapped to a missing file.
-        let effectiveRoot = StandardizedPath.absolute(lookupContext.translateInputPath(standardizedRoot))
-        try validateOracleExportPrimaryRoot(effectiveRoot)
-
         return OracleExportDestination(
             workspaceID: workspace.id,
             windowID: windowID,
             tabID: tabID,
-            primaryRootPath: effectiveRoot,
-            rootScope: lookupContext.rootScope
+            primaryRootPath: standardizedRoot,
+            lookupContext: lookupContext
         )
     }
 
