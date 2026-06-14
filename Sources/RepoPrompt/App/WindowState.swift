@@ -293,6 +293,10 @@ class WindowState: ObservableObject {
         pendingFocusSideEffectsTask = nil
         detachTitlebarAccessoryControllers(from: nsWindow)
         clearTitlebarAccessoryRequestsForClose()
+        apiSettingsViewModel.prepareForWindowClose()
+        contextBuilderAgentViewModel.prepareForWindowClose()
+        workspaceManager.prepareForWindowClose()
+        promptManager.gitViewModel.prepareForWindowClose()
     }
 
     private var pendingRestoreEntry: WindowSessionEntry?
@@ -302,16 +306,39 @@ class WindowState: ObservableObject {
     // MARK: - Initialization
 
     convenience init() {
-        self.init(contextBuilderProviderFactory: nil)
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared
+        )
     }
 
     #if DEBUG
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
-            self.init(contextBuilderProviderFactory: Optional(contextBuilderProviderFactory))
+            self.init(
+                contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared
+            )
+        }
+
+        convenience init(
+            codexModelPollingService: CodexModelPollingService,
+            loadStoredAPISettingsDataOnInit: Bool
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+                codexModelPollingService: codexModelPollingService
+            )
         }
     #endif
 
-    private init(contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?) {
+    private init(
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
+        loadStoredAPISettingsDataOnInit: Bool,
+        codexModelPollingService: CodexModelPollingService
+    ) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
         windowID = WindowState.windowCounter
@@ -329,7 +356,9 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
-            contextBuilderProviderFactory: contextBuilderProviderFactory
+            contextBuilderProviderFactory: contextBuilderProviderFactory,
+            loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+            codexModelPollingService: codexModelPollingService
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore

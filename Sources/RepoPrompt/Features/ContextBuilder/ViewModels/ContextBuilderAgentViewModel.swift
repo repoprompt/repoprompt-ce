@@ -844,6 +844,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private var openCodeModelsSubscriptionTask: Task<Void, Never>?
     private var cursorModelsSubscriptionTask: Task<Void, Never>?
+    private let codexModelPollingService: CodexModelPollingService
+    private var hasPreparedForWindowClose = false
 
     // MARK: - Init / Deinit
 
@@ -852,12 +854,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         workspaceManager: WorkspaceManagerViewModel,
         mcpServer: MCPServerViewModel,
         oracleViewModel: OracleViewModel,
-        providerFactory: ProviderFactory? = nil
+        providerFactory: ProviderFactory? = nil,
+        codexModelPollingService: CodexModelPollingService = .shared
     ) {
         self.promptManager = promptManager
         self.workspaceManager = workspaceManager
         self.mcpServer = mcpServer
         self.oracleViewModel = oracleViewModel
+        self.codexModelPollingService = codexModelPollingService
         self.providerFactory = providerFactory ?? { agent, modelString, workspacePath in
             AgentRuntimeProviderService.shared.makeProvider(
                 for: agent,
@@ -896,19 +900,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
-
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
+            // Level-triggered: `agentAvailability` replays the current provider
+            // availability on subscription, while the Context Builder validation publishers
+            // cover startup verification state that is intentionally not part of that value.
             Publishers.MergeMany([
-                apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
-                apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+                apiSettingsViewModel.$agentAvailability.map { _ in () }.eraseToAnyPublisher(),
                 apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
                 apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher()
             ])
@@ -933,6 +930,22 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             await handleComposeTabsWillClose(tabIDs)
         }
         updateDynamicModelPolling(startCursorPolling: false)
+    }
+
+    func prepareForWindowClose() {
+        guard !hasPreparedForWindowClose else { return }
+        hasPreparedForWindowClose = true
+        backgroundPlanUIRefreshTask?.cancel()
+        backgroundPlanUIRefreshTask = nil
+        pendingBackgroundPlanRefreshTabIDs.removeAll()
+        stopCodexModelsSubscription()
+        stopOpenCodeModelsSubscription()
+        stopCursorModelsSubscription()
+        if let tabCloseListenerToken {
+            promptManager.removeComposeTabsWillCloseListener(tabCloseListenerToken)
+            self.tabCloseListenerToken = nil
+        }
+        cancellables.removeAll()
     }
 
     private var agentAvailabilityContext: AgentModelCatalog.AvailabilityContext {
@@ -980,10 +993,6 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged()
-    }
-
     private func handleAgentProviderAvailabilityChanged() {
         refreshAvailableAgents()
         guard let normalized = resolvedPersistedContextBuilderSelection() else { return }
@@ -1013,10 +1022,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func startCodexModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
         guard codexModelsSubscriptionTask == nil else { return }
-        codexModelsSubscriptionTask = Task { [weak self] in
+        let codexModelPollingService = codexModelPollingService
+        codexModelsSubscriptionTask = Task { [weak self, codexModelPollingService] in
             guard let self else { return }
-            let stream = await CodexModelPollingService.shared.subscribe()
+            let stream = await codexModelPollingService.subscribe()
             for await snapshot in stream {
                 guard !Task.isCancelled else { return }
                 await MainActor.run { [weak self] in
@@ -1031,6 +1042,20 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         codexModelsSubscriptionTask = nil
     }
 
+    #if DEBUG
+        func test_startCodexModelsSubscriptionIfNeeded() {
+            startCodexModelsSubscriptionIfNeeded()
+        }
+
+        var test_hasCodexModelsSubscriptionTask: Bool {
+            codexModelsSubscriptionTask != nil
+        }
+
+        func test_stopCodexModelsSubscription() {
+            stopCodexModelsSubscription()
+        }
+    #endif
+
     private func updateOpenCodeModelPolling() {
         if selectedAgent == .openCode {
             startOpenCodeModelsSubscriptionIfNeeded()
@@ -1040,6 +1065,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func startOpenCodeModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
         guard openCodeModelsSubscriptionTask == nil else { return }
         let workspacePath = currentWorkspacePath
         openCodeModelsSubscriptionTask = Task { [weak self, workspacePath] in
@@ -1075,6 +1101,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     }
 
     private func startCursorModelsSubscriptionIfNeeded() {
+        guard !hasPreparedForWindowClose else { return }
         guard cursorModelsSubscriptionTask == nil else { return }
         let workspacePath = currentWorkspacePath
         cursorModelsSubscriptionTask = Task { [weak self, workspacePath] in

@@ -6381,37 +6381,45 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 WorkspaceObservedCodemapResult(fullPath: retainedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: retainedFile.path, symbolName: "retainedSymbol")),
                 WorkspaceObservedCodemapResult(fullPath: detachedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: detachedFile.path, symbolName: "detachedSymbol"))
             ])
-            var aggregate = await store.codemapFileAPIAggregate()
-            var APIPaths = aggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(Set(APIPaths), [retainedFile.path, detachedFile.path])
-            XCTAssertEqual(Set(aggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
+            let initialAggregate = await store.codemapFileAPIAggregate()
+            let initialAPIPaths = initialAggregate.orderedFileAPIs.map(\.filePath)
+            XCTAssertEqual(Set(initialAPIPaths), [retainedFile.path, detachedFile.path])
+            XCTAssertEqual(Set(initialAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
 
-            let unloadGate = AsyncGate()
+            let unloadDidDetachSignal = AsyncSignal()
+            let retainedReplacementResult = WorkspaceObservedCodemapResult(
+                fullPath: retainedFile.path,
+                modificationDate: Date(),
+                fileAPI: makeFileAPI(path: retainedFile.path, symbolName: "retainedReplacement")
+            )
             await store.setRootUnloadDidDetachHandler { _ in
-                await unloadGate.markStartedAndWaitForRelease()
+                await unloadDidDetachSignal.mark()
+                let detachedAggregate = await store.codemapFileAPIAggregate()
+                let detachedAPIPaths = detachedAggregate.orderedFileAPIs.map(\.filePath)
+                XCTAssertEqual(Set(detachedAPIPaths), [retainedFile.path, detachedFile.path])
+                XCTAssertEqual(Set(detachedAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
+
+                await store.applyObservedCodemapResults([
+                    retainedReplacementResult
+                ])
+                let replacementAggregate = await store.codemapFileAPIAggregate()
+                let replacementAPIPaths = replacementAggregate.orderedFileAPIs.map(\.filePath)
+                XCTAssertEqual(Set(replacementAPIPaths), [retainedFile.path, detachedFile.path])
+                XCTAssertEqual(Set(replacementAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
             }
-            let unloadTask = Task { await store.unloadRoot(id: detachedRecord.id) }
-            await unloadGate.waitUntilStarted()
-            aggregate = await store.codemapFileAPIAggregate()
-            APIPaths = aggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(Set(APIPaths), [retainedFile.path, detachedFile.path])
-            XCTAssertEqual(Set(aggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
-
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(fullPath: retainedFile.path, modificationDate: Date(), fileAPI: makeFileAPI(path: retainedFile.path, symbolName: "retainedReplacement"))
-            ])
-            aggregate = await store.codemapFileAPIAggregate()
-            APIPaths = aggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(Set(APIPaths), [retainedFile.path, detachedFile.path])
-            XCTAssertEqual(Set(aggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path, detachedFile.path])
-
-            await unloadGate.release()
-            await unloadTask.value
+            addTeardownBlock {
+                await store.setRootUnloadDidDetachHandler(nil)
+                await store.unloadRoot(id: detachedRecord.id)
+                await store.unloadRoot(id: retainedRecord.id)
+            }
+            await store.unloadRoot(id: detachedRecord.id)
             await store.setRootUnloadDidDetachHandler(nil)
-            aggregate = await store.codemapFileAPIAggregate()
-            APIPaths = aggregate.orderedFileAPIs.map(\.filePath)
-            XCTAssertEqual(APIPaths, [retainedFile.path])
-            XCTAssertEqual(Set(aggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path])
+            let unloadDidDetach = await unloadDidDetachSignal.isMarked()
+            XCTAssertTrue(unloadDidDetach)
+            let finalAggregate = await store.codemapFileAPIAggregate()
+            let finalAPIPaths = finalAggregate.orderedFileAPIs.map(\.filePath)
+            XCTAssertEqual(finalAPIPaths, [retainedFile.path])
+            XCTAssertEqual(Set(finalAggregate.firstFileAPIByStandardizedNestedPath.keys), [retainedFile.path])
         }
     #endif
 

@@ -107,6 +107,8 @@ final class GitViewModel: ObservableObject {
     private var lastVisibleRootPaths: [String] = []
     private var lastVisibleRootRawPaths: [String] = []
     private var gitContextRefreshTask: Task<Void, Never>?
+    private let gitContextRefreshIntervalNanoseconds: UInt64
+    private let refreshGitContexts: @Sendable ([String]) async -> [GitStatusActor.RepoDetection]
     private var isRefreshingGitContexts = false
 
     private var resolvedStateTask: Task<Void, Never>?
@@ -124,10 +126,16 @@ final class GitViewModel: ObservableObject {
 
     init(
         fileManager: WorkspaceFilesViewModel? = nil,
-        statusActor: GitStatusActor = GitStatusActor()
+        statusActor: GitStatusActor = GitStatusActor(),
+        gitContextRefreshIntervalNanoseconds: UInt64 = 2_500_000_000,
+        refreshGitContexts: (@Sendable ([String]) async -> [GitStatusActor.RepoDetection])? = nil
     ) {
         self.fileManager = fileManager
         self.statusActor = statusActor
+        self.gitContextRefreshIntervalNanoseconds = gitContextRefreshIntervalNanoseconds
+        self.refreshGitContexts = refreshGitContexts ?? { roots in
+            await statusActor.updateRoots(roots)
+        }
 
         // Initialize @Published from @AppStorage
         gitDiffInclusionMode = GitDiffInclusionMode(rawValue: gitDiffInclusionModeStorage) ?? .none
@@ -425,28 +433,80 @@ final class GitViewModel: ObservableObject {
             return
         }
         guard gitContextRefreshTask == nil else { return }
-        gitContextRefreshTask = Task { [weak self] in
+        let intervalNanoseconds = gitContextRefreshIntervalNanoseconds
+        let refreshGitContexts = refreshGitContexts
+        gitContextRefreshTask = Task { [weak self, refreshGitContexts] in
             while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 2_500_000_000)
+                if intervalNanoseconds > 0 {
+                    try? await Task.sleep(nanoseconds: intervalNanoseconds)
+                }
                 guard !Task.isCancelled else { break }
-                await self?.refreshVisibleGitContextsFromWorkspaceRoots()
+                guard let request = self?.beginPeriodicGitContextRefresh() else {
+                    if self == nil { break }
+                    continue
+                }
+                let detections = await refreshGitContexts(request.rootPaths)
+                let shouldApply = !Task.isCancelled
+                self?.finishPeriodicGitContextRefresh(
+                    request,
+                    detections: detections,
+                    shouldApply: shouldApply
+                )
             }
         }
     }
 
-    private func refreshVisibleGitContextsFromWorkspaceRoots() async {
-        guard !isRefreshingGitContexts else { return }
+    func prepareForWindowClose() {
+        statusStreamTask?.cancel()
+        searchDebounceTask?.cancel()
+        rootUpdateTask?.cancel()
+        gitContextRefreshTask?.cancel()
+        gitContextRefreshTask = nil
+        resolvedStateTask?.cancel()
+    }
+
+    #if DEBUG
+        var test_hasGitContextRefreshTask: Bool {
+            gitContextRefreshTask != nil
+        }
+
+        var test_gitContextRefreshTask: Task<Void, Never>? {
+            gitContextRefreshTask
+        }
+    #endif
+
+    private struct PeriodicGitContextRefreshRequest {
+        let rootPaths: [String]
+        let standardizedRootPaths: [String]
+        let standardizedPathByRootPath: [String: String]
+    }
+
+    private func beginPeriodicGitContextRefresh() -> PeriodicGitContextRefreshRequest? {
+        guard !isRefreshingGitContexts else { return nil }
         let rootPaths = lastVisibleRootRawPaths
-        guard !rootPaths.isEmpty else { return }
-        let standardizedRootPaths = lastVisibleRootPaths
-        let standardizedPathByRootPath = Self.standardizedPathByRootPath(for: availableRootFolders)
+        guard !rootPaths.isEmpty else { return nil }
         isRefreshingGitContexts = true
-        defer { isRefreshingGitContexts = false }
-        let detections = await statusActor.updateRoots(rootPaths)
-        guard rootPaths == lastVisibleRootRawPaths,
-              standardizedRootPaths == lastVisibleRootPaths
+        return PeriodicGitContextRefreshRequest(
+            rootPaths: rootPaths,
+            standardizedRootPaths: lastVisibleRootPaths,
+            standardizedPathByRootPath: Self.standardizedPathByRootPath(for: availableRootFolders)
+        )
+    }
+
+    private func finishPeriodicGitContextRefresh(
+        _ request: PeriodicGitContextRefreshRequest,
+        detections: [GitStatusActor.RepoDetection],
+        shouldApply: Bool
+    ) {
+        isRefreshingGitContexts = false
+        guard shouldApply,
+              request.rootPaths == lastVisibleRootRawPaths,
+              request.standardizedRootPaths == lastVisibleRootPaths
         else { return }
-        applyRootDetections(detections, standardizedPathByRootPath: standardizedPathByRootPath)
+        applyRootDetections(
+            detections,
+            standardizedPathByRootPath: request.standardizedPathByRootPath
+        )
     }
 
     // MARK: - Fetch API (delegates to actor)
