@@ -2929,8 +2929,9 @@
             assertSourceOrder(
                 in: search,
                 hooks: [
-                    "let freshnessRootRefs = await store.searchFreshnessRootRefs(",
-                    "let appliedIngressSamples = await store.awaitAppliedIngress(rootRefs: freshnessRootRefs)",
+                    "let parsedSearchScope: SearchScopeParseResult? = if",
+                    "await parseSearchScopePaths(",
+                    "appliedIngressSamples = try await awaitAppliedIngress(",
                     "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
                     "switch await store.searchCatalogAccess(rootScope: rootScope)"
                 ]

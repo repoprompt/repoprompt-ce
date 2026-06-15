@@ -33,16 +33,13 @@ import XCTest
                 Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
             )
             XCTAssertEqual(
-                MCPToolDurationInventory.fileSearchExecutionDeadlineSeconds,
-                Double(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds)
-            )
-            XCTAssertEqual(
                 MCPToolDurationInventory.workspaceSwitchExecutionDeadlineSeconds,
                 Double(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds)
             )
             XCTAssertEqual(
                 MCPToolDurationInventory.preservedLongSynchronousToolNames,
                 [
+                    MCPWindowToolName.search,
                     MCPWindowToolName.oracleUtils,
                     MCPWindowToolName.askOracle,
                     MCPWindowToolName.oracleSend,
@@ -74,15 +71,7 @@ import XCTest
                     MCPWindowToolName.manageWorktree
                 ]
             )
-            XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12)
-            let fileSearch = try? XCTUnwrap(MCPToolDurationInventory.entries.first {
-                $0.toolName == MCPWindowToolName.search
-            })
-            XCTAssertEqual(fileSearch?.contractKind, .bounded)
-            XCTAssertEqual(
-                fileSearch?.executionDeadlineSeconds,
-                Double(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds)
-            )
+            XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 11)
             XCTAssertTrue(
                 MCPToolDurationInventory.entries.allSatisfy {
                     !$0.expectedActiveDuration.isEmpty
@@ -172,10 +161,6 @@ import XCTest
             XCTAssertEqual(
                 (payload["bounded_cleanup_grace_seconds"] as? NSNumber)?.intValue,
                 MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds
-            )
-            XCTAssertEqual(
-                (payload["file_search_execution_deadline_seconds"] as? NSNumber)?.intValue,
-                MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds
             )
             XCTAssertEqual(
                 (payload["workspace_switch_execution_deadline_seconds"] as? NSNumber)?.intValue,

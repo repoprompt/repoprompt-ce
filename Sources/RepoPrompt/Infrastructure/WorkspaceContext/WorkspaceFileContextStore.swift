@@ -2665,48 +2665,6 @@ actor WorkspaceFileContextStore {
         return .cachedMetadata
     }
 
-    /// Resolves the conservative union of roots whose freshness can affect an explicitly
-    /// path-filtered search. Exact absolute paths narrow to their deepest containing roots.
-    /// Relative, alias-shaped, wildcard, or malformed paths fall back to the complete caller
-    /// scope. Exact absolute paths outside loaded roots need no workspace barrier.
-    func searchFreshnessRootRefs(
-        explicitPaths: [String]?,
-        fallbackScope: WorkspaceLookupRootScope
-    ) -> [WorkspaceRootRef] {
-        let fallbackRootRefs = rootRefs(scope: fallbackScope)
-        guard let explicitPaths else { return fallbackRootRefs }
-
-        var selectedRootIDs = Set<UUID>()
-        var hasExplicitPath = false
-        for userPath in explicitPaths {
-            let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { continue }
-            hasExplicitPath = true
-            guard !StandardizedPath.containsNUL(trimmed) else {
-                return fallbackRootRefs
-            }
-
-            let expanded = (trimmed as NSString).expandingTildeInPath
-            let standardized = (expanded as NSString).standardizingPath
-            let hasWildcard = standardized.contains("*")
-                || standardized.contains("?")
-                || standardized.contains("[")
-            guard standardized.hasPrefix("/"), !hasWildcard else {
-                return fallbackRootRefs
-            }
-            if let containingRootID = fallbackRootRefs
-                .filter({ StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) })
-                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })?
-                .id
-            {
-                selectedRootIDs.insert(containingRootID)
-            }
-        }
-
-        guard hasExplicitPath else { return fallbackRootRefs }
-        return fallbackRootRefs.filter { selectedRootIDs.contains($0.id) }
-    }
-
     /// Resolves the narrowest safe workspace freshness scope for an explicit request.
     /// Absolute paths await only their containing loaded root. Absolute paths outside all
     /// loaded roots (including always-readable support files) do not pay a workspace barrier.
