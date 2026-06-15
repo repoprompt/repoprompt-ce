@@ -71,6 +71,11 @@ private struct ContentReadResult {
     }
 }
 
+struct FileContentPrefix {
+    let content: String
+    let truncated: Bool
+}
+
 private struct ValidatedContentFile {
     let url: URL
     let fileSize: Int64
@@ -557,6 +562,25 @@ extension FileSystemService {
         )
     }
 
+    func loadContentPrefix(
+        ofRelativePath relativePath: String,
+        maximumBytes: Int,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> FileContentPrefix? {
+        guard maximumBytes > 0 else { return FileContentPrefix(content: "", truncated: true) }
+        if Self.hasAlwaysBinaryExtension(relativePath) { return nil }
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: min(maximumBytes + 1, 1_048_576),
+            fileSizeLimit: 10_000_000,
+            mode: .automatic,
+            workloadClass: workloadClass
+        )
+        let prefix = try await Self.performContentPrefixReadOffActor(request, maximumBytes: maximumBytes)
+        try Task.checkCancellation()
+        return prefix
+    }
+
     func loadContent(
         ofRelativePath relativePath: String,
         workloadClass: ContentReadWorkloadClass = .unspecified
@@ -920,6 +944,28 @@ extension FileSystemService {
         encodingMap[cacheKey] = detectedEncoding
     }
 
+    private nonisolated static func performContentPrefixReadOffActor(
+        _ request: ContentReadRequest,
+        maximumBytes: Int
+    ) async throws -> FileContentPrefix? {
+        let workerPriority = Task.currentPriority
+        return try await contentReadWorkerLimiter.withPermit(
+            workloadClass: request.workloadClass,
+            ownerID: request.schedulerOwnerID
+        ) {
+            try await withThrowingTaskGroup(of: FileContentPrefix?.self) { group in
+                group.addTask(priority: workerPriority) {
+                    try await readContentPrefixFromDisk(request, maximumBytes: maximumBytes)
+                }
+                guard let result = try await group.next() else {
+                    throw CancellationError()
+                }
+                group.cancelAll()
+                return result
+            }
+        }
+    }
+
     private nonisolated static func performContentReadOffActor(
         _ request: ContentReadRequest,
         expectedFingerprint: FileContentFingerprint? = nil,
@@ -945,6 +991,56 @@ extension FileSystemService {
                 return result
             }
         }
+    }
+
+    private nonisolated static func readContentPrefixFromDisk(
+        _ request: ContentReadRequest,
+        maximumBytes: Int
+    ) async throws -> FileContentPrefix? {
+        if hasAlwaysBinaryExtension(request.relativePath) {
+            return nil
+        }
+        try Task.checkCancellation()
+        let requestedByteCount = max(0, maximumBytes)
+        let validated = try validateContentFileForReading(request)
+        if validated.fileSize <= Int64(requestedByteCount) {
+            let result = try await readAutomaticContent(
+                request,
+                validated: validated,
+                requireStableIdentity: false
+            )
+            return result.content.map { FileContentPrefix(content: $0, truncated: false) }
+        }
+
+        let handle = try openValidatedContentHandle(
+            request,
+            validated: validated,
+            requireStableIdentity: false
+        )
+        defer { try? handle.close() }
+
+        try await runContentReadChunkHook(request)
+        let data = try handle.read(upToCount: requestedByteCount + 1) ?? Data()
+        try Task.checkCancellation()
+        guard !data.isEmpty else {
+            return FileContentPrefix(content: "", truncated: false)
+        }
+
+        let probe = data.prefix(min(data.count, 8192))
+        if isProbablyBinary(probe) {
+            return nil
+        }
+
+        let wasTruncated = data.count > requestedByteCount || validated.fileSize > Int64(requestedByteCount)
+        var prefixData = Data(data.prefix(requestedByteCount))
+        let encoding: String.Encoding = detectBOMEncoding(in: prefixData) ?? detectEncodingFull(prefixData)
+        while !prefixData.isEmpty {
+            if let decoded = String(data: prefixData, encoding: encoding) {
+                return FileContentPrefix(content: decoded, truncated: wasTruncated)
+            }
+            prefixData.removeLast()
+        }
+        return FileContentPrefix(content: "", truncated: wasTruncated)
     }
 
     private nonisolated static func readContentFromDisk(

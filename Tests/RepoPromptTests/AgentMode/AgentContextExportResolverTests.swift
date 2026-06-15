@@ -560,6 +560,88 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("base checkout complete diff must not appear"), clipboard)
     }
 
+    func testPreviewContentIsPrefixBoundedWhileCopyRemainsFullContent() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewBound")
+        let content = String(repeating: "x", count: AgentContextPreviewContentPolicy.maximumBytes + 2000)
+        try write(content, to: root.appendingPathComponent("Sources/Large.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Large.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .copy
+        )
+        let preview = try XCTUnwrap(previewResult)
+        let copy = try XCTUnwrap(copyResult)
+
+        XCTAssertLessThan(preview.count, copy.count)
+        XCTAssertTrue(preview.contains("Preview truncated"))
+        XCTAssertEqual(copy, content)
+    }
+
+    func testPreviewContentBelowPrefixLimitUsesCompleteContentWithoutTruncationMarker() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewSmall")
+        let content = String(repeating: "small\n", count: 1000)
+        try write(content, to: root.appendingPathComponent("Sources/Small.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Small.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .copy
+        )
+
+        XCTAssertEqual(previewResult, content)
+        XCTAssertEqual(copyResult, content)
+        XCTAssertFalse(previewResult?.contains("Preview truncated") ?? true)
+    }
+
     private func makeBoundFixture() async throws -> (logicalRoot: URL, worktreeRoot: URL, store: WorkspaceFileContextStore) {
         let logicalRoot = try makeTemporaryRoot(name: "AgentExportLogical")
         let worktreeRoot = try makeTemporaryRoot(name: "AgentExportWorktree")

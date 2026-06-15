@@ -346,6 +346,9 @@ struct TextKitView: NSViewRepresentable {
         textView.isContinuousSpellCheckingEnabled = false
         textView.isAutomaticSpellingCorrectionEnabled = false
         coordinator.textViewUndoManager.removeAllActions()
+        textView.string = ""
+        coordinator.internalText = ""
+        coordinator.wasEmpty = true
         coordinator.pendingLayoutTask?.cancel()
         coordinator.pendingLayoutTask = nil
         // NEW: mark inactive
