@@ -172,6 +172,7 @@ enum ContentReadWorkloadClass: String {
     case contentSearch
     case codemap
     case encodingDetection
+    case promptAccounting
     case unspecified
 }
 

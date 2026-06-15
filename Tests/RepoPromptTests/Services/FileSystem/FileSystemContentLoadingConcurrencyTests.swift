@@ -282,7 +282,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         }
         let tasks = (0 ..< readCount).map { index in
             Task {
-                try await service.loadContent(ofRelativePath: "File-\(index).txt")
+                try await service.loadContent(ofRelativePath: "File-\(index).txt", workloadClass: .contentSearch)
             }
         }
         let reachedLimit = await enteredCount.waitUntilValue(atLeast: limit)
@@ -521,11 +521,143 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(idle.bulkGrantCount, 1)
         }
 
+        func testContentReadSchedulerReservesPermitForLatencySensitiveReadsAcrossSupportedCapacities() async throws {
+            let backgroundWorkloads: [ContentReadWorkloadClass] = [
+                .codemap,
+                .promptAccounting,
+                .encodingDetection,
+                .unspecified
+            ]
+
+            for capacity in 2 ... 4 {
+                let limiter = ContentReadAsyncLimiter(capacity: capacity, maxQueuedWaiterCount: 12)
+                let backgroundGate = AsyncGate()
+                let backgroundStarted = AsyncCounter()
+                let searchGate = AsyncGate()
+                let interactiveGate = AsyncGate()
+                let backgroundTasks = (0 ..< capacity).map { index in
+                    Task {
+                        try await limiter.withPermit(
+                            workloadClass: backgroundWorkloads[index],
+                            ownerID: UUID()
+                        ) {
+                            _ = await backgroundStarted.incrementAndValue()
+                            await backgroundGate.markStartedAndWaitForRelease()
+                        }
+                    }
+                }
+
+                let capped = await waitForLimiterSnapshot(limiter) {
+                    $0.activeBackgroundPermitCount == capacity - 1 && $0.queuedWaiterCount == 1
+                }
+                XCTAssertEqual(capped.backgroundPermitLimit, capacity - 1)
+                XCTAssertEqual(capped.activePermitCount, capacity - 1)
+                let initialBackgroundStartCount = await backgroundStarted.value()
+                XCTAssertEqual(initialBackgroundStartCount, capacity - 1)
+
+                let search = Task {
+                    try await limiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                        await searchGate.markStartedAndWaitForRelease()
+                    }
+                }
+                await searchGate.waitUntilStarted()
+                let searchAdmitted = await limiter.snapshotForTesting()
+                XCTAssertEqual(searchAdmitted.activePermitCount, capacity)
+                XCTAssertEqual(searchAdmitted.activeBackgroundPermitCount, capacity - 1)
+
+                let interactive = Task {
+                    try await limiter.withPermit(workloadClass: .interactiveRead, ownerID: UUID()) {
+                        await interactiveGate.markStartedAndWaitForRelease()
+                    }
+                }
+                _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 2 }
+
+                await searchGate.release()
+                _ = try await search.value
+                await interactiveGate.waitUntilStarted()
+                let interactiveAdmitted = await limiter.snapshotForTesting()
+                XCTAssertEqual(interactiveAdmitted.activePermitCount, capacity)
+                XCTAssertEqual(interactiveAdmitted.activeBackgroundPermitCount, capacity - 1)
+                XCTAssertEqual(interactiveAdmitted.queuedWaiterCount, 1)
+
+                await interactiveGate.release()
+                _ = try await interactive.value
+                let backgroundStillCapped = await waitForLimiterSnapshot(limiter) {
+                    $0.activePermitCount == capacity - 1 && $0.queuedWaiterCount == 1
+                }
+                XCTAssertEqual(backgroundStillCapped.activeBackgroundPermitCount, capacity - 1)
+
+                await backgroundGate.release()
+                let allBackgroundStarted = await backgroundStarted.waitUntilValue(atLeast: capacity)
+                XCTAssertTrue(allBackgroundStarted)
+                for task in backgroundTasks {
+                    _ = try await task.value
+                }
+                let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+                XCTAssertTrue(idle.isIdle)
+                XCTAssertEqual(idle.activeBackgroundPermitCount, 0)
+            }
+        }
+
+        func testCancelledActiveBackgroundReadRetainsPermitUntilBodyReturns() async throws {
+            let limiter = ContentReadAsyncLimiter(capacity: 2, maxQueuedWaiterCount: 4)
+            let firstGate = AsyncGate()
+            let secondGate = AsyncGate()
+            let sensitiveGate = AsyncGate()
+
+            let first = Task {
+                try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                    await firstGate.markStartedAndWaitForRelease()
+                }
+            }
+            await firstGate.waitUntilStarted()
+            first.cancel()
+
+            let second = Task {
+                try await limiter.withPermit(workloadClass: .encodingDetection, ownerID: UUID()) {
+                    await secondGate.markStartedAndWaitForRelease()
+                }
+            }
+            let backgroundQueued = await waitForLimiterSnapshot(limiter) {
+                $0.activeBackgroundPermitCount == 1 && $0.queuedWaiterCount == 1
+            }
+            XCTAssertEqual(backgroundQueued.activePermitCount, 1)
+
+            let sensitive = Task {
+                try await limiter.withPermit(workloadClass: .interactiveRead, ownerID: UUID()) {
+                    await sensitiveGate.markStartedAndWaitForRelease()
+                }
+            }
+            await sensitiveGate.waitUntilStarted()
+            let sensitiveAdmitted = await limiter.snapshotForTesting()
+            XCTAssertEqual(sensitiveAdmitted.activeBackgroundPermitCount, 1)
+
+            await sensitiveGate.release()
+            _ = try await sensitive.value
+            let cancelledBodyStillActive = await limiter.snapshotForTesting()
+            XCTAssertEqual(cancelledBodyStillActive.queuedWaiterCount, 1)
+
+            await firstGate.release()
+            _ = try? await first.value
+            await secondGate.waitUntilStarted()
+            let secondAdmitted = await limiter.snapshotForTesting()
+            XCTAssertEqual(secondAdmitted.activeBackgroundPermitCount, 1)
+            XCTAssertEqual(secondAdmitted.activePermitCount, 1)
+
+            await secondGate.release()
+            _ = try await second.value
+            let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+            XCTAssertTrue(idle.isIdle)
+            XCTAssertEqual(idle.activeBackgroundPermitCount, 0)
+        }
+
         func testContentReadSchedulerPromotesAgedWaitersAheadOfNewInteractiveWork() async throws {
+            let clock = ContentReadTestClock()
             let limiter = ContentReadAsyncLimiter(
                 capacity: 1,
                 maxQueuedWaiterCount: 4,
-                agePromotionNanoseconds: 10_000_000
+                agePromotionNanoseconds: 10_000_000,
+                nowUptimeNanoseconds: { clock.now() }
             )
             let gate = AsyncGate()
             let recorder = AsyncValueRecorder()
@@ -542,7 +674,7 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
                 }
             }
             _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 1 }
-            try await Task.sleep(nanoseconds: 20_000_000)
+            clock.advance(by: 20_000_000)
             let interactive = Task {
                 try await limiter.withPermit(workloadClass: .interactiveRead, ownerID: UUID()) {
                     await recorder.append(2)
@@ -750,6 +882,23 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         } catch {
             XCTFail("Expected invalidRelativePath, got \(error)")
         }
+    }
+}
+
+private final class ContentReadTestClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: UInt64 = 0
+
+    func now() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    func advance(by nanoseconds: UInt64) {
+        lock.lock()
+        value &+= nanoseconds
+        lock.unlock()
     }
 }
 
