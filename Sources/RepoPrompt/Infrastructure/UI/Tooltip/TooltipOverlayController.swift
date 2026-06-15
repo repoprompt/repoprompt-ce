@@ -19,6 +19,11 @@ final class TooltipOverlayController {
         placement: TooltipPlacement,
         preset: FontScalePreset
     ) {
+        guard Self.isValidAnchorRect(anchorRect) else {
+            hide()
+            return
+        }
+
         prepareWindowIfNeeded(owner: owner, preset: preset)
         let bubbleSize = bubbleSize(for: text, preset: preset)
         guard let win else { return }
@@ -43,6 +48,11 @@ final class TooltipOverlayController {
     }
 
     func reposition(to anchorRect: NSRect) {
+        guard Self.isValidAnchorRect(anchorRect) else {
+            hide()
+            return
+        }
+
         guard
             let win,
             let owner,
@@ -137,11 +147,7 @@ final class TooltipOverlayController {
             owner.removeChildWindow(w)
         }
 
-        // Remove notification observer
-        if let token = ownerWillCloseObserver {
-            NotificationCenter.default.removeObserver(token)
-            ownerWillCloseObserver = nil
-        }
+        removeObservers()
 
         win = nil
         owner = nil
@@ -159,6 +165,7 @@ final class TooltipOverlayController {
     private var cachedPreset: FontScalePreset?
 
     private var ownerWillCloseObserver: NSObjectProtocol?
+    private var hoverDismissObserver: NSObjectProtocol?
 
     /// Distance (in points) between the tooltip bubble and its anchor view.
     /// Kept small to avoid a large visual gap; still multiplied by
@@ -178,16 +185,57 @@ final class TooltipOverlayController {
         // This avoids hierarchy issues with menus
         win = tooltipWindow
 
-        ownerWillCloseObserver = NotificationCenter.default.addObserver(
+        installObservers(for: owner)
+    }
+
+    private func installObservers(for owner: NSWindow) {
+        removeObservers()
+
+        let center = NotificationCenter.default
+        ownerWillCloseObserver = center.addObserver(
             forName: NSWindow.willCloseNotification,
             object: owner,
             queue: .main
-        ) // ensure main thread
-            { [weak self] _ in
-                Task { @MainActor [weak self] in
-                    self?.hide()
-                }
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.hide()
+            }
         }
+
+        hoverDismissObserver = center.addObserver(
+            forName: .hoverTooltipsShouldDismiss,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.hide()
+            }
+        }
+    }
+
+    private func removeObservers() {
+        if let ownerWillCloseObserver {
+            NotificationCenter.default.removeObserver(ownerWillCloseObserver)
+            self.ownerWillCloseObserver = nil
+        }
+        if let hoverDismissObserver {
+            NotificationCenter.default.removeObserver(hoverDismissObserver)
+            self.hoverDismissObserver = nil
+        }
+    }
+
+    #if DEBUG
+        var isVisibleForTesting: Bool {
+            win?.isVisible == true
+        }
+    #endif
+
+    private static func isValidAnchorRect(_ rect: NSRect) -> Bool {
+        !rect.isEmpty
+            && rect.origin.x.isFinite
+            && rect.origin.y.isFinite
+            && rect.size.width.isFinite
+            && rect.size.height.isFinite
     }
 
     private func bubbleSize(for text: String, preset: FontScalePreset) -> CGSize {

@@ -46,6 +46,16 @@ struct TooltipBubble: View {
 /// ──────────────────────────────────
 enum TooltipPlacement { case top, bottom, left, right, topLeft, topRight, bottomLeft, bottomRight }
 
+enum HoverTooltipCoordinator {
+    static func dismissAll() {
+        NotificationCenter.default.post(name: .hoverTooltipsShouldDismiss, object: nil)
+    }
+}
+
+extension Notification.Name {
+    static let hoverTooltipsShouldDismiss = Notification.Name("RepoPromptHoverTooltipsShouldDismiss")
+}
+
 // ──────────────────────────────────
 // MARK: - Modifier
 
@@ -152,6 +162,9 @@ private struct HoverTooltipModifier: ViewModifier {
                 if !enabled {
                     cleanup(resetContext: false)
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .hoverTooltipsShouldDismiss)) { _ in
+                cleanup(resetContext: false)
             }
     }
 

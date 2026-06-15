@@ -29,6 +29,7 @@ struct MCPConnectionsCounter: View {
 
     var body: some View {
         Button {
+            HoverTooltipCoordinator.dismissAll()
             NotificationCenter.default.post(
                 name: .showMCPStatusWindow,
                 object: nil,

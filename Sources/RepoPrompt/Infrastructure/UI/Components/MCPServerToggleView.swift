@@ -95,7 +95,10 @@ struct MCPServerToggleView: View {
     }
 
     var body: some View {
-        Button(action: { showPopover.toggle() }) {
+        Button(action: {
+            HoverTooltipCoordinator.dismissAll()
+            showPopover.toggle()
+        }) {
             HStack(spacing: 6) {
                 Image(systemName: "server.rack")
                     .imageScale(.medium)
