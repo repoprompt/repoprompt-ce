@@ -559,6 +559,61 @@ private struct AgentSelectedFilesPopover: View {
     }
 }
 
+@MainActor
+final class AgentSelectedFilePreviewLoadCoordinator: ObservableObject {
+    @Published private(set) var showPreview = false
+    @Published private(set) var contentRevision = 0
+    @Published private(set) var previewText: String? {
+        didSet { contentRevision &+= 1 }
+    }
+
+    @Published private(set) var isLoadingPreview = false {
+        didSet { contentRevision &+= 1 }
+    }
+
+    private var previewLoadTask: Task<Void, Never>?
+
+    var hasPreviewLoadTask: Bool {
+        previewLoadTask != nil
+    }
+
+    func openPreview(
+        row: AgentContextExportRow,
+        loadContent: @escaping (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
+    ) {
+        cancelPreviewLoad()
+        showPreview = true
+        previewText = nil
+        isLoadingPreview = true
+        previewLoadTask = Task { [weak self] in
+            let text = await loadContent(row, .preview)
+            guard !Task.isCancelled else { return }
+            await MainActor.run { [weak self] in
+                self?.previewText = text
+                self?.isLoadingPreview = false
+                self?.previewLoadTask = nil
+            }
+        }
+    }
+
+    func handlePreviewPresentationChanged(isPresented: Bool) {
+        showPreview = isPresented
+        if !isPresented {
+            cancelPreviewLoad()
+        }
+    }
+
+    func handleRowDisappear() {
+        cancelPreviewLoad()
+    }
+
+    private func cancelPreviewLoad() {
+        previewLoadTask?.cancel()
+        previewLoadTask = nil
+        isLoadingPreview = false
+    }
+}
+
 private struct AgentSelectedFileRow: View {
     let row: AgentContextExportRow
     let rowIndex: Int
@@ -566,10 +621,7 @@ private struct AgentSelectedFileRow: View {
     let onLoadContent: (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
     let onRemove: (AgentContextExportRow) -> Void
 
-    @State private var showPreview = false
-    @State private var previewText: String?
-    @State private var isLoadingPreview = false
-    @State private var previewLoadTask: Task<Void, Never>?
+    @StateObject private var previewCoordinator = AgentSelectedFilePreviewLoadCoordinator()
     @State private var copyTask: Task<Void, Never>?
     @State private var isCopying = false
     @ObservedObject private var fontScale = FontScaleManager.shared
@@ -636,7 +688,7 @@ private struct AgentSelectedFileRow: View {
 
             HStack(spacing: 6) {
                 Button(action: openPreview) {
-                    Image(systemName: isLoadingPreview ? "hourglass" : "magnifyingglass")
+                    Image(systemName: previewCoordinator.isLoadingPreview ? "hourglass" : "magnifyingglass")
                         .font(.system(size: 13, weight: .medium))
                         .padding(6)
                 }
@@ -685,40 +737,26 @@ private struct AgentSelectedFileRow: View {
         )
         .cornerRadius(8)
         .contentShape(Rectangle())
-        .popover(isPresented: $showPreview, arrowEdge: .bottom) {
+        .popover(
+            isPresented: Binding(
+                get: { previewCoordinator.showPreview },
+                set: { previewCoordinator.handlePreviewPresentationChanged(isPresented: $0) }
+            ),
+            arrowEdge: .bottom
+        ) {
             AgentResolvedFilePreviewPopover(
                 row: row,
-                text: previewText,
-                isLoading: isLoadingPreview
+                previewCoordinator: previewCoordinator
             )
         }
-        .onChange(of: showPreview) { _, isPresented in
-            if !isPresented {
-                previewLoadTask?.cancel()
-                previewLoadTask = nil
-                isLoadingPreview = false
-            }
-        }
         .onDisappear {
-            previewLoadTask?.cancel()
+            previewCoordinator.handleRowDisappear()
             copyTask?.cancel()
         }
     }
 
     private func openPreview() {
-        showPreview = true
-        previewText = nil
-        isLoadingPreview = true
-        previewLoadTask?.cancel()
-        previewLoadTask = Task {
-            let text = await onLoadContent(row, .preview)
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                previewText = text
-                isLoadingPreview = false
-                previewLoadTask = nil
-            }
-        }
+        previewCoordinator.openPreview(row: row, loadContent: onLoadContent)
     }
 
     private func copyToClipboard() {
@@ -739,12 +777,11 @@ private struct AgentSelectedFileRow: View {
 
 private struct AgentResolvedFilePreviewPopover: View {
     let row: AgentContextExportRow
-    let text: String?
-    let isLoading: Bool
+    @ObservedObject var previewCoordinator: AgentSelectedFilePreviewLoadCoordinator
 
     private var displayText: String {
-        if isLoading { return "Loading preview…" }
-        return text ?? "No preview content available"
+        if previewCoordinator.isLoadingPreview { return "Loading preview…" }
+        return previewCoordinator.previewText ?? "No preview content available"
     }
 
     var body: some View {
@@ -761,7 +798,8 @@ private struct AgentResolvedFilePreviewPopover: View {
                 text: .constant(displayText),
                 isEditable: false,
                 isSpellCheckEnabled: false,
-                useMonospacedFont: true
+                useMonospacedFont: true,
+                externalUpdateTick: previewCoordinator.contentRevision
             )
         }
         .frame(width: 900, height: 650)
