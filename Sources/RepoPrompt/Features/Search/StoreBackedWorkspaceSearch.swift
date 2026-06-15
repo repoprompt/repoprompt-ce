@@ -74,7 +74,7 @@ enum StoreBackedWorkspaceSearch {
                 try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
             }
 
-            let initialParsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
+            var parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
                 await parseSearchScopePaths(
                     rawPaths,
                     caseInsensitive: caseInsensitive,
@@ -84,8 +84,8 @@ enum StoreBackedWorkspaceSearch {
             } else {
                 nil
             }
-            let freshnessRootRefs: [WorkspaceRootRef] = if let initialParsedSearchScope {
-                initialParsedSearchScope.freshnessRootRefs
+            let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
+                parsedSearchScope.freshnessRootRefs
             } else {
                 await store.rootRefs(scope: rootScope)
             }
@@ -114,18 +114,14 @@ enum StoreBackedWorkspaceSearch {
                 appliedIngressSamples: appliedIngressSamples
             )
             try Task.checkCancellation()
-            // Exact paths can change kind while the freshness barrier applies pending ingress.
-            // Re-resolve after the barrier so file-to-folder and folder-to-file transitions
-            // filter the fresh catalog using the current path type.
-            let parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
-                await parseSearchScopePaths(
-                    rawPaths,
-                    caseInsensitive: caseInsensitive,
-                    rootScope: rootScope,
+            if let parsed = parsedSearchScope {
+                // Exact paths can change kind or disappear while the freshness barrier applies
+                // pending ingress. Refresh only their root-local catalog records; wildcard,
+                // unresolved, and ambiguous clauses retain their initial conservative semantics.
+                parsedSearchScope = await refreshExactSearchScopeClauses(
+                    parsed,
                     store: store
                 )
-            } else {
-                nil
             }
             try Task.checkCancellation()
 
@@ -431,6 +427,21 @@ enum StoreBackedWorkspaceSearch {
         let spec: SearchPathFilterSpec
         let issues: [PathResolutionIssue]
         let freshnessRootRefs: [WorkspaceRootRef]
+        let exactClauses: [ExactSearchScopeClause]
+    }
+
+    private struct ExactSearchScopeClause {
+        let clauseIndex: Int
+        let rootID: UUID
+        let relativePath: String
+        var missingClauses: [SearchPathClause]
+    }
+
+    private enum PendingSearchScopeEntry {
+        case wildcard(normalizedPath: String)
+        case issue(PathResolutionIssue)
+        case resolved(normalizedPath: String, lookup: WorkspacePathLookupResult)
+        case lookup(normalizedPath: String)
     }
 
     private static func parseSearchScopePaths(
@@ -441,14 +452,21 @@ enum StoreBackedWorkspaceSearch {
     ) async -> SearchScopeParseResult {
         var clauses: [SearchPathClause] = []
         var issues: [PathResolutionIssue] = []
-        var seenClauses = Set<String>()
+        var exactClauses: [ExactSearchScopeClause] = []
+        var clauseIndicesByKey: [String: Int] = [:]
+        var exactClauseIndicesByClauseIndex: [Int: Int] = [:]
         let scopedRoots = await store.rootRefs(scope: rootScope)
         var freshnessRootPaths = Set<String>()
         var requiresFullFreshnessScope = false
 
-        func appendClause(_ clause: SearchPathClause) {
+        @discardableResult
+        func appendClause(_ clause: SearchPathClause) -> Int {
             let key = String(describing: clause)
-            guard seenClauses.insert(key).inserted else { return }
+            if let existingIndex = clauseIndicesByKey[key] {
+                return existingIndex
+            }
+            let clauseIndex = clauses.count
+            clauseIndicesByKey[key] = clauseIndex
             clauses.append(clause)
 
             switch clause {
@@ -472,6 +490,7 @@ enum StoreBackedWorkspaceSearch {
                     requiresFullFreshnessScope = true
                 }
             }
+            return clauseIndex
         }
 
         func appendIssue(_ issue: PathResolutionIssue) {
@@ -510,40 +529,86 @@ enum StoreBackedWorkspaceSearch {
             appendClause(.glob(pattern: normalized, restrictedRootPath: nil))
         }
 
+        func appendLookup(_ lookup: WorkspacePathLookupResult, normalizedPath: String) {
+            let root = scopedRoots.first { $0.id == lookup.location.rootID }
+            let clause: SearchPathClause
+            if let file = lookup.file {
+                clause = .exactFile(
+                    absPath: file.standardizedFullPath,
+                    relPath: file.standardizedRelativePath,
+                    restrictedRootPath: root?.standardizedFullPath
+                )
+            } else if let folder = lookup.folder {
+                clause = .exactFolder(
+                    absLower: folder.standardizedFullPath.lowercased(),
+                    relLower: folder.standardizedRelativePath.lowercased(),
+                    restrictedRootPath: root?.standardizedFullPath
+                )
+            } else {
+                return
+            }
+            let clauseIndex = appendClause(clause)
+            let missingClause = SearchPathClause.legacyPrefix(candidateLower: normalizedPath.lowercased())
+            if let exactClauseIndex = exactClauseIndicesByClauseIndex[clauseIndex] {
+                guard !exactClauses[exactClauseIndex].missingClauses.contains(missingClause) else { return }
+                exactClauses[exactClauseIndex].missingClauses.append(missingClause)
+            } else {
+                exactClauseIndicesByClauseIndex[clauseIndex] = exactClauses.count
+                exactClauses.append(ExactSearchScopeClause(
+                    clauseIndex: clauseIndex,
+                    rootID: lookup.location.rootID,
+                    relativePath: lookup.location.correctedPath,
+                    missingClauses: [missingClause]
+                ))
+            }
+        }
+
+        var pendingEntries: [PendingSearchScopeEntry] = []
+        var lookupRequests: [WorkspacePathLookupRequest] = []
         for raw in rawPaths {
             let normalized = normalizeUserInputPath(raw)
             guard !normalized.isEmpty else { continue }
             let hasWildcard = normalized.contains("*") || normalized.contains("?") || normalized.contains("[")
             if hasWildcard {
-                appendWildcardClause(for: normalized)
+                pendingEntries.append(.wildcard(normalizedPath: normalized))
                 continue
             }
 
             if let issue = await store.exactPathResolutionIssue(for: normalized, kind: .either, rootScope: rootScope) {
-                appendIssue(issue)
+                pendingEntries.append(.issue(issue))
                 continue
             }
-            var lookup = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(normalized, rootScope: rootScope)
-            if lookup == nil {
-                lookup = await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope))
+            if let lookup = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
+                normalized,
+                rootScope: rootScope
+            ) {
+                pendingEntries.append(.resolved(normalizedPath: normalized, lookup: lookup))
+                continue
             }
-            if let lookup {
-                if let file = lookup.file {
-                    let root = scopedRoots.first { $0.id == file.rootID }
-                    appendClause(.exactFile(absPath: file.standardizedFullPath, relPath: file.standardizedRelativePath, restrictedRootPath: root?.standardizedFullPath))
-                    continue
-                }
-                if let folder = lookup.folder {
-                    let root = scopedRoots.first { $0.id == folder.rootID }
-                    appendClause(.exactFolder(
-                        absLower: folder.standardizedFullPath.lowercased(),
-                        relLower: folder.standardizedRelativePath.lowercased(),
-                        restrictedRootPath: root?.standardizedFullPath
-                    ))
-                    continue
+            pendingEntries.append(.lookup(normalizedPath: normalized))
+            lookupRequests.append(WorkspacePathLookupRequest(
+                userPath: normalized,
+                profile: .mcpSearchScope,
+                rootScope: rootScope
+            ))
+        }
+
+        let lookupResults = await store.lookupPaths(lookupRequests)
+        for entry in pendingEntries {
+            switch entry {
+            case let .wildcard(normalizedPath):
+                appendWildcardClause(for: normalizedPath)
+            case let .issue(issue):
+                appendIssue(issue)
+            case let .resolved(normalizedPath, lookup):
+                appendLookup(lookup, normalizedPath: normalizedPath)
+            case let .lookup(normalizedPath):
+                if let lookup = lookupResults[normalizedPath] {
+                    appendLookup(lookup, normalizedPath: normalizedPath)
+                } else {
+                    appendClause(.legacyPrefix(candidateLower: normalizedPath.lowercased()))
                 }
             }
-            appendClause(.legacyPrefix(candidateLower: normalized.lowercased()))
         }
 
         let freshnessRootRefs = if requiresFullFreshnessScope || clauses.isEmpty {
@@ -554,7 +619,70 @@ enum StoreBackedWorkspaceSearch {
         return SearchScopeParseResult(
             spec: SearchPathFilterSpec(caseInsensitive: caseInsensitive, clauses: clauses),
             issues: issues,
-            freshnessRootRefs: freshnessRootRefs
+            freshnessRootRefs: freshnessRootRefs,
+            exactClauses: exactClauses
+        )
+    }
+
+    private static func refreshExactSearchScopeClauses(
+        _ parsed: SearchScopeParseResult,
+        store: WorkspaceFileContextStore
+    ) async -> SearchScopeParseResult {
+        guard !parsed.exactClauses.isEmpty else { return parsed }
+        var clauses = parsed.spec.clauses
+        var disappearedExactClauses: [ExactSearchScopeClause] = []
+
+        for exactClause in parsed.exactClauses {
+            guard let lookup = await store.lookupDiscoverablePath(
+                rootID: exactClause.rootID,
+                relativePath: exactClause.relativePath
+            ) else {
+                disappearedExactClauses.append(exactClause)
+                continue
+            }
+            let restrictedRootPath = lookup.location.rootPath
+            if let file = lookup.file {
+                clauses[exactClause.clauseIndex] = .exactFile(
+                    absPath: file.standardizedFullPath,
+                    relPath: file.standardizedRelativePath,
+                    restrictedRootPath: restrictedRootPath
+                )
+            } else if let folder = lookup.folder {
+                clauses[exactClause.clauseIndex] = .exactFolder(
+                    absLower: folder.standardizedFullPath.lowercased(),
+                    relLower: folder.standardizedRelativePath.lowercased(),
+                    restrictedRootPath: restrictedRootPath
+                )
+            } else {
+                disappearedExactClauses.append(exactClause)
+            }
+        }
+
+        if !disappearedExactClauses.isEmpty {
+            let fallbacksByClauseIndex = Dictionary(
+                uniqueKeysWithValues: disappearedExactClauses.map { ($0.clauseIndex, $0.missingClauses) }
+            )
+            var refreshedClauses: [SearchPathClause] = []
+            refreshedClauses.reserveCapacity(
+                clauses.count + disappearedExactClauses.reduce(0) { $0 + max(0, $1.missingClauses.count - 1) }
+            )
+            var seenClauseKeys = Set<String>()
+            for (clauseIndex, clause) in clauses.enumerated() {
+                let candidates = fallbacksByClauseIndex[clauseIndex] ?? [clause]
+                for candidate in candidates
+                    where seenClauseKeys.insert(String(describing: candidate)).inserted
+                {
+                    refreshedClauses.append(candidate)
+                }
+            }
+            clauses = refreshedClauses
+        }
+
+        return SearchScopeParseResult(
+            spec: SearchPathFilterSpec(caseInsensitive: parsed.spec.caseInsensitive, clauses: clauses),
+            issues: parsed.issues,
+            freshnessRootRefs: parsed.freshnessRootRefs,
+            exactClauses: []
         )
     }
 

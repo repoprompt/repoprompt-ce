@@ -1142,6 +1142,211 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             await store.stopWatchingRoot(id: record.id)
         }
 
+        func testExactFolderBecomingFileIsResolvedAfterFreshnessApplies() async throws {
+            let root = try makeTemporaryRoot(name: "ExactFolderToFileTransition")
+            let targetURL = root.appendingPathComponent("Target")
+            try write("let oldNestedValue = true\n", to: targetURL.appendingPathComponent("Old.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try write("let refreshedFileKindNeedle = true\n", to: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [
+                    .folderRemoved("Target"),
+                    .fileAdded("Target")
+                ]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "refreshedFileKindNeedle",
+                    paths: [targetURL.path],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [targetURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testExactPathDisappearanceRetainsMissingPathFallbackSemantics() async throws {
+            let root = try makeTemporaryRoot(name: "ExactPathDisappearance")
+            let targetURL = root.appendingPathComponent("Target.swift")
+            try write("let disappearingNeedle = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileRemoved("Target.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "disappearingNeedle",
+                    paths: [targetURL.path, "/tmp/invalid\0.swift"],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertTrue(result.matches?.isEmpty ?? true)
+            XCTAssertEqual(result.scopedFileCount, 0)
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testDeduplicatedExactPathRetainsEveryDisappearanceFallback() async throws {
+            let targetRoot = try makeTemporaryRoot(name: "DeduplicatedExactTarget")
+            let fallbackRoot = try makeTemporaryRoot(name: "DeduplicatedExactFallback")
+            let targetURL = targetRoot.appendingPathComponent("Foo.swift")
+            let fallbackURL = fallbackRoot.appendingPathComponent("Foo.swift")
+            try write("let oldTargetValue = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let targetRecord = try await store.loadRoot(path: targetRoot.path)
+            let fallbackRecord = try await store.loadRoot(path: fallbackRoot.path)
+            try await store.startWatchingRoot(id: targetRecord.id)
+            try await store.startWatchingRoot(id: fallbackRecord.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == targetRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: targetRecord.id)
+                await store.stopWatchingRoot(id: fallbackRecord.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: targetRecord.id,
+                deltas: [.fileRemoved("Foo.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "deduplicatedFallbackNeedle",
+                    paths: [
+                        targetURL.path,
+                        "\(targetRecord.name)/Foo.swift",
+                        "Foo.swift"
+                    ],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+
+            try write("let deduplicatedFallbackNeedle = true\n", to: fallbackURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: fallbackRecord.id,
+                deltas: [.fileAdded("Foo.swift")]
+            )
+            _ = await store.awaitAppliedIngress(rootRefs: [
+                WorkspaceRootRef(
+                    id: fallbackRecord.id,
+                    name: fallbackRecord.name,
+                    fullPath: fallbackRecord.standardizedFullPath
+                )
+            ])
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [fallbackURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: targetRecord.id)
+            await store.stopWatchingRoot(id: fallbackRecord.id)
+        }
+
+        func testMultipleRelativeAndAliasExactSearchPathsBuildOneStaticLookupSnapshot() async throws {
+            let root = try makeTemporaryRoot(name: "BatchedExactSearchScopes")
+            let firstURL = root.appendingPathComponent("First.swift")
+            let secondURL = root.appendingPathComponent("Second.swift")
+            try write("let batchedExactNeedle = 1\n", to: firstURL)
+            try write("let batchedExactNeedle = 2\n", to: secondURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            _ = startedCapture(label: "batched-exact-search-scopes", maxSamples: 200)
+
+            let result = try await searchContent(
+                pattern: "batchedExactNeedle",
+                paths: [
+                    "\(record.name)/First.swift",
+                    "Second.swift"
+                ],
+                store: store
+            )
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let snapshotBuildCount = capture.stages
+                .filter {
+                    $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
+                }
+                .reduce(0) { $0 + $1.sampleCount }
+
+            XCTAssertEqual(Set(result.matches?.map(\.filePath) ?? []), Set([firstURL.path, secondURL.path]))
+            XCTAssertEqual(snapshotBuildCount, 1)
+        }
+
         func testRootRestrictedSearchPathsDoNotWaitForUnrelatedRepresentedRoot() async throws {
             let targetRoot = try makeTemporaryRoot(name: "ScopedFreshnessTarget")
             let blockedRoot = try makeTemporaryRoot(name: "ScopedFreshnessBlocked")
@@ -1692,10 +1897,16 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "let hasWildcard = normalized.contains(\"*\")",
             "if hasWildcard {",
             "await store.exactPathResolutionIssue(for: normalized, kind: .either, rootScope: rootScope)",
-            "await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(normalized, rootScope: rootScope)",
-            "await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope))",
-            "appendClause(.legacyPrefix(candidateLower: normalized.lowercased()))"
+            "await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(",
+            "let lookupResults = await store.lookupPaths(lookupRequests)",
+            "appendClause(.legacyPrefix(candidateLower: normalizedPath.lowercased()))",
+            "await store.lookupDiscoverablePath("
         ], in: source)
+        XCTAssertEqual(
+            source.components(separatedBy: "parseSearchScopePaths(").count - 1,
+            2,
+            "Explicit search paths must be parsed once, then exact clauses refreshed by root-local lookup"
+        )
     }
 
     private func searchSwiftFiles(paths: [String], store: WorkspaceFileContextStore) async throws -> SearchResults {

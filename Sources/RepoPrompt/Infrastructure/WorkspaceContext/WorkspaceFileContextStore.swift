@@ -5862,6 +5862,13 @@ actor WorkspaceFileContextStore {
         return nil
     }
 
+    func lookupDiscoverablePath(rootID: UUID, relativePath: String) -> WorkspacePathLookupResult? {
+        guard let result = lookupPath(rootID: rootID, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
+    }
+
     func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope
