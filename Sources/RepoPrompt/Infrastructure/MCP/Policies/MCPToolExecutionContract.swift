@@ -67,11 +67,15 @@ enum MCPToolExecutionContractCatalog {
             MCPWindowToolName.askOracle,
             MCPWindowToolName.oracleSend,
             MCPWindowToolName.oracleChatLog,
-            MCPWindowToolName.contextBuilder,
-            MCPWindowToolName.search
+            MCPWindowToolName.contextBuilder
         ] {
             result[toolName] = .longSynchronousCancellable
         }
+
+        result[MCPWindowToolName.search] = .bounded(
+            deadline: MCPTimeoutPolicy.fileSearchToolExecutionDeadline,
+            cancellationGrace: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+        )
 
         for toolName in [
             MCPWindowToolName.agentExplore,

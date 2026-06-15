@@ -2626,18 +2626,31 @@ actor WorkspaceFileContextStore {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
     }
 
+    func awaitAppliedIngress(rootRefs: [WorkspaceRootRef]) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootRefs.map(\.id))
+    }
+
     func contentSearchFreshnessPolicy(
         rootScope: WorkspaceLookupRootScope,
         appliedIngressSamples: [WorkspaceIngressBarrierSample]
     ) async -> FileContentFreshnessPolicy {
-        let scopedRoots = rootsForPathLookup(scope: rootScope)
-        guard !scopedRoots.isEmpty,
-              appliedIngressSamples.count == scopedRoots.count
+        await contentSearchFreshnessPolicy(
+            rootRefs: rootRefs(scope: rootScope),
+            appliedIngressSamples: appliedIngressSamples
+        )
+    }
+
+    func contentSearchFreshnessPolicy(
+        rootRefs: [WorkspaceRootRef],
+        appliedIngressSamples: [WorkspaceIngressBarrierSample]
+    ) async -> FileContentFreshnessPolicy {
+        guard !rootRefs.isEmpty,
+              appliedIngressSamples.count == rootRefs.count
         else {
             return .validateDiskMetadata
         }
         let samplesByRootID = Dictionary(uniqueKeysWithValues: appliedIngressSamples.map { ($0.rootID, $0) })
-        for root in scopedRoots {
+        for root in rootRefs {
             guard let state = rootStatesByID[root.id],
                   let sample = samplesByRootID[root.id],
                   await state.service.canUseCachedSearchContent(
@@ -2650,6 +2663,48 @@ actor WorkspaceFileContextStore {
             }
         }
         return .cachedMetadata
+    }
+
+    /// Resolves the conservative union of roots whose freshness can affect an explicitly
+    /// path-filtered search. Exact absolute paths narrow to their deepest containing roots.
+    /// Relative, alias-shaped, wildcard, or malformed paths fall back to the complete caller
+    /// scope. Exact absolute paths outside loaded roots need no workspace barrier.
+    func searchFreshnessRootRefs(
+        explicitPaths: [String]?,
+        fallbackScope: WorkspaceLookupRootScope
+    ) -> [WorkspaceRootRef] {
+        let fallbackRootRefs = rootRefs(scope: fallbackScope)
+        guard let explicitPaths else { return fallbackRootRefs }
+
+        var selectedRootIDs = Set<UUID>()
+        var hasExplicitPath = false
+        for userPath in explicitPaths {
+            let trimmed = userPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { continue }
+            hasExplicitPath = true
+            guard !StandardizedPath.containsNUL(trimmed) else {
+                return fallbackRootRefs
+            }
+
+            let expanded = (trimmed as NSString).expandingTildeInPath
+            let standardized = (expanded as NSString).standardizingPath
+            let hasWildcard = standardized.contains("*")
+                || standardized.contains("?")
+                || standardized.contains("[")
+            guard standardized.hasPrefix("/"), !hasWildcard else {
+                return fallbackRootRefs
+            }
+            if let containingRootID = fallbackRootRefs
+                .filter({ StandardizedPath.isDescendant(standardized, of: $0.standardizedFullPath) })
+                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })?
+                .id
+            {
+                selectedRootIDs.insert(containingRootID)
+            }
+        }
+
+        guard hasExplicitPath else { return fallbackRootRefs }
+        return fallbackRootRefs.filter { selectedRootIDs.contains($0.id) }
     }
 
     /// Resolves the narrowest safe workspace freshness scope for an explicit request.

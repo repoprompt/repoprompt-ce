@@ -144,6 +144,64 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         XCTAssertEqual(fileResult.paths, [nestedA.path])
     }
 
+    func testSearchFreshnessRootsKeepPhysicalWorktreesIndependent() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "FreshnessLogical")
+        let worktreeA = try makeTemporaryRoot(name: "FreshnessWorktreeA")
+        let worktreeB = try makeTemporaryRoot(name: "FreshnessWorktreeB")
+        let logicalFile = logicalRoot.appendingPathComponent("Logical.swift")
+        let worktreeAFile = worktreeA.appendingPathComponent("Sources/A.swift")
+        let worktreeBFile = worktreeB.appendingPathComponent("Sources/B.swift")
+        try write("logical", to: logicalFile)
+        try write("worktree a", to: worktreeAFile)
+        try write("worktree b", to: worktreeBFile)
+
+        let store = WorkspaceFileContextStore()
+        let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
+        let worktreeARecord = try await store.loadRoot(path: worktreeA.path, kind: .sessionWorktree)
+        let worktreeBRecord = try await store.loadRoot(path: worktreeB.path, kind: .sessionWorktree)
+        let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+            canonicalRootPaths: [logicalRoot.path],
+            physicalRootPaths: [worktreeA.path, worktreeB.path]
+        )
+
+        let worktreeAOnly = await store.searchFreshnessRootRefs(
+            explicitPaths: [worktreeAFile.path],
+            fallbackScope: scope
+        )
+        XCTAssertEqual(worktreeAOnly.map(\.id), [worktreeARecord.id])
+
+        let physicalUnion = await store.searchFreshnessRootRefs(
+            explicitPaths: [worktreeAFile.path, worktreeBFile.path],
+            fallbackScope: scope
+        )
+        XCTAssertEqual(Set(physicalUnion.map(\.id)), Set([worktreeARecord.id, worktreeBRecord.id]))
+        XCTAssertFalse(physicalUnion.contains { $0.id == logicalRecord.id })
+
+        let logicalOnly = await store.searchFreshnessRootRefs(
+            explicitPaths: [logicalFile.path],
+            fallbackScope: scope
+        )
+        XCTAssertEqual(logicalOnly.map(\.id), [logicalRecord.id])
+
+        for fallbackPaths in [
+            ["Sources/A.swift"],
+            ["\(logicalRecord.name)/Logical.swift"],
+            [worktreeA.appendingPathComponent("Sources/*.swift").path],
+            [worktreeAFile.path, "Sources/B.swift"],
+            ["/tmp/invalid\0.swift"]
+        ] {
+            let fallbackRoots = await store.searchFreshnessRootRefs(
+                explicitPaths: fallbackPaths,
+                fallbackScope: scope
+            )
+            XCTAssertEqual(
+                Set(fallbackRoots.map(\.id)),
+                Set([logicalRecord.id, worktreeARecord.id, worktreeBRecord.id]),
+                "Expected full-scope freshness for \(fallbackPaths)"
+            )
+        }
+    }
+
     func testStoreBackedSearchPreservesRelativeAliasAbsoluteMissAndWildcardFallbacks() async throws {
         let rootA = try makeTemporaryRoot(name: "FallbackAlpha")
         let rootB = try makeTemporaryRoot(name: "FallbackBeta")
@@ -247,6 +305,55 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                     .reduce(0) { $0 + $1.sampleCount },
                 0
             )
+        }
+
+        func testAbsoluteScopedWarmSearchIgnoresUnrelatedUnqualifiedRoot() async throws {
+            let qualifiedRoot = try makeTemporaryRoot(name: "ScopedWarmQualified")
+            let unqualifiedRoot = try makeTemporaryRoot(name: "ScopedWarmUnqualified")
+            let qualifiedFile = qualifiedRoot.appendingPathComponent("Qualified.swift")
+            try write("let scopedWarmNeedle = true\n", to: qualifiedFile)
+            try write("let unrelatedNeedle = true\n", to: unqualifiedRoot.appendingPathComponent("Unqualified.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let qualifiedRecord = try await store.loadRoot(path: qualifiedRoot.path)
+            let unqualifiedRecord = try await store.loadRoot(path: unqualifiedRoot.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: qualifiedRecord.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(
+                rootID: qualifiedRecord.id,
+                true
+            )
+            addTeardownBlock {
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(
+                    rootID: qualifiedRecord.id,
+                    nil
+                )
+                await store.stopWatchingRoot(id: qualifiedRecord.id)
+            }
+
+            let cold = try await searchContent(
+                pattern: "scopedWarmNeedle",
+                paths: [qualifiedFile.path],
+                store: store
+            )
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: qualifiedRecord.id)
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: unqualifiedRecord.id)
+
+            let warm = try await searchContent(
+                pattern: "scopedWarmNeedle",
+                paths: [qualifiedFile.path],
+                store: store
+            )
+            let qualifiedFingerprintRequests = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: qualifiedRecord.id)
+            let unqualifiedFingerprintRequests = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: unqualifiedRecord.id)
+
+            XCTAssertEqual(cold.matches?.map(\.filePath), [qualifiedFile.path])
+            XCTAssertEqual(warm.matches, cold.matches)
+            XCTAssertEqual(qualifiedFingerprintRequests, 0)
+            XCTAssertEqual(unqualifiedFingerprintRequests, 0)
         }
 
         func testWatcherQualifiedWarmSearchReloadsAppliedModificationBeforeMatching() async throws {
@@ -1038,6 +1145,73 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertEqual(cache.latestRevision, 1)
         }
 
+        func testExplicitAbsolutePathSearchDoesNotWaitForUnrelatedRepresentedRoot() async throws {
+            let targetRoot = try makeTemporaryRoot(name: "ScopedFreshnessTarget")
+            let blockedRoot = try makeTemporaryRoot(name: "ScopedFreshnessBlocked")
+            let targetFile = targetRoot.appendingPathComponent("Target.swift")
+            let blockedFile = blockedRoot.appendingPathComponent("Blocked.swift")
+            try write("let scopedFreshnessNeedle = true\n", to: targetFile)
+
+            let store = WorkspaceFileContextStore()
+            let targetRecord = try await store.loadRoot(path: targetRoot.path)
+            let blockedRecord = try await store.loadRoot(path: blockedRoot.path)
+            try await store.startWatchingRoot(id: blockedRecord.id)
+            let sinkGate = AsyncGate()
+            let completionSignal = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == blockedRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: blockedRecord.id)
+            }
+
+            try write("let unrelatedBlockedNeedle = true\n", to: blockedFile)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: blockedRecord.id,
+                deltas: [.fileAdded("Blocked.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task { () -> Result<SearchResults, Error> in
+                do {
+                    let result = try await self.searchContent(
+                        pattern: "scopedFreshnessNeedle",
+                        paths: [targetFile.path],
+                        store: store
+                    )
+                    await completionSignal.mark()
+                    return .success(result)
+                } catch {
+                    await completionSignal.mark()
+                    return .failure(error)
+                }
+            }
+
+            let completedWhileUnrelatedRootBlocked = await completionSignal.waitUntilMarked()
+            XCTAssertTrue(
+                completedWhileUnrelatedRootBlocked,
+                "An absolute path-filtered search must not wait for another represented root"
+            )
+            switch await searchTask.value {
+            case let .success(result):
+                XCTAssertEqual(result.matches?.map(\.filePath), [targetFile.path])
+            case let .failure(error):
+                XCTFail("Expected targeted search success, got \(error)")
+            }
+
+            let targetStats = await store.scopedIngressBarrierStatsForTesting(rootID: targetRecord.id)
+            let blockedStats = await store.scopedIngressBarrierStatsForTesting(rootID: blockedRecord.id)
+            XCTAssertEqual(targetStats.launchCount, 1)
+            XCTAssertEqual(blockedStats.launchCount, 0)
+
+            await sinkGate.release()
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.stopWatchingRoot(id: blockedRecord.id)
+        }
+
         func testStoreBackedSearchAcquiresBroadPermitBeforeAwaitingScopedFreshnessAndCatalogSnapshot() async throws {
             let root = try makeTemporaryRoot(name: "ScopedSearchFreshness")
             let addedURL = root.appendingPathComponent("Added.swift")
@@ -1248,7 +1422,8 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "return try await store.withStoreBackedSearchAccess(",
             "try await ensureRootScopeAvailable(rootScope, store: store)",
             "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
-            "let appliedIngressSamples = await store.awaitAppliedIngress(rootScope: rootScope)",
+            "let freshnessRootRefs = await store.searchFreshnessRootRefs(",
+            "let appliedIngressSamples = await store.awaitAppliedIngress(rootRefs: freshnessRootRefs)",
             "try Task.checkCancellation()",
             "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
             "try Task.checkCancellation()",

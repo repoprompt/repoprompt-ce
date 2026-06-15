@@ -7,6 +7,7 @@ import XCTest
 final class MCPToolExecutionContractTests: XCTestCase {
     func testCentralTimeoutPolicyMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
+        XCTAssertEqual(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
         XCTAssertEqual(MCPTimeoutPolicy.responseSendDeadlineSeconds, 30)
@@ -46,6 +47,7 @@ final class MCPToolExecutionContractTests: XCTestCase {
             MCPWindowToolName.getCodeStructure,
             MCPWindowToolName.getFileTree,
             MCPWindowToolName.readFile,
+            MCPWindowToolName.search,
             MCPWindowToolName.workspaceContext,
             MCPWindowToolName.prompt,
             MCPWindowToolName.agentManage,
@@ -57,14 +59,16 @@ final class MCPToolExecutionContractTests: XCTestCase {
             guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
                 return XCTFail("Expected bounded contract for \(toolName)")
             }
-            XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline, toolName)
+            let expectedDeadline = toolName == MCPWindowToolName.search
+                ? MCPTimeoutPolicy.fileSearchToolExecutionDeadline
+                : MCPTimeoutPolicy.boundedToolExecutionDeadline
+            XCTAssertEqual(deadline, expectedDeadline, toolName)
             XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, toolName)
         }
     }
 
-    func testSearchOracleAndContextBuilderUseLongSynchronousExemption() {
+    func testOracleAndContextBuilderUseLongSynchronousExemption() {
         XCTAssertEqual(names(for: .longSynchronousCancellable), [
-            MCPWindowToolName.search,
             MCPWindowToolName.oracleUtils,
             MCPWindowToolName.askOracle,
             MCPWindowToolName.oracleSend,

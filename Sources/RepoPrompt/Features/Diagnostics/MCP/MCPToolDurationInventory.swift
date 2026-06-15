@@ -30,10 +30,11 @@ import RepoPromptShared
         static let perToolTimeoutOverridesSupported = false
         static let intentionalPhaseB3Deviation = true
         static let deviationReason = "Codex applies tool_timeout_sec to every tool on the RepoPromptCE server, while Oracle and Context Builder remain synchronous and can legitimately run for an hour or more."
-        static let activeTimeoutSemantics = "RepoPromptCE intentionally preserves a \(MCPTimeoutPolicy.codexServerActiveTimeoutSeconds.formatted())-active-second per-server timeout. The separate dispatch-boundary execution contract bounds computational/local tools expected to finish within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds and switch-producing manage_workspaces calls within \(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds) seconds; other workspace/VCS lifecycle actions retain explicit cancellable exemptions."
+        static let activeTimeoutSemantics = "RepoPromptCE intentionally preserves a \(MCPTimeoutPolicy.codexServerActiveTimeoutSeconds.formatted())-active-second per-server timeout. The separate dispatch-boundary execution contract bounds ordinary computational/local tools within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds, file_search within \(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds) seconds, and switch-producing manage_workspaces calls within \(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds) seconds; other workspace/VCS lifecycle actions retain explicit cancellable exemptions."
         static let wallClockMayBeLongerDuringElicitation = true
         static let customUIWaitsAreElicitation = false
         static let boundedExecutionDeadlineSeconds = MCPTimeoutPolicy.boundedToolExecutionDeadline.mcpSeconds
+        static let fileSearchExecutionDeadlineSeconds = MCPTimeoutPolicy.fileSearchToolExecutionDeadline.mcpSeconds
         static let workspaceSwitchExecutionDeadlineSeconds = MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadline.mcpSeconds
         static let boundedCleanupGraceSeconds = MCPTimeoutPolicy.boundedToolCancellationCleanupGrace.mcpSeconds
 
@@ -86,6 +87,7 @@ import RepoPromptShared
                 "wall_clock_may_be_longer_during_elicitation": wallClockMayBeLongerDuringElicitation,
                 "custom_ui_waits_are_mcp_elicitation": customUIWaitsAreElicitation,
                 "bounded_execution_deadline_seconds": boundedExecutionDeadlineSeconds,
+                "file_search_execution_deadline_seconds": fileSearchExecutionDeadlineSeconds,
                 "workspace_switch_execution_deadline_seconds": workspaceSwitchExecutionDeadlineSeconds,
                 "bounded_cleanup_grace_seconds": boundedCleanupGraceSeconds,
                 "preserved_long_synchronous_tools": preservedLongSynchronousToolNames,
@@ -170,7 +172,9 @@ import RepoPromptShared
                     contractKind: contract.kind,
                     executionDeadlineSeconds: deadline.mcpSeconds,
                     cleanupGraceSeconds: cancellationGrace.mcpSeconds,
-                    expectedActiveDuration: "Ordinary dispatch must complete within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
+                    expectedActiveDuration: toolName == MCPWindowToolName.search
+                        ? "File search must complete within \(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds) seconds."
+                        : "Ordinary dispatch must complete within \(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds) seconds.",
                     evidence: "ServerNetworkManager applies MCPToolExecutionWatchdog at the resolved provider boundary.",
                     qualification: "Cancellation must release provider, limiter, ownership, and run-registration state; an uncooperative handler force-disconnects its connection after grace.",
                     semanticWaitMaximumSeconds: semanticWaitMaximumSeconds,

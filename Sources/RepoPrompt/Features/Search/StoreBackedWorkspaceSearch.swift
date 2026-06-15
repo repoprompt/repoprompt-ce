@@ -60,12 +60,16 @@ enum StoreBackedWorkspaceSearch {
                 try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
             }
 
+            let freshnessRootRefs = await store.searchFreshnessRootRefs(
+                explicitPaths: paths,
+                fallbackScope: rootScope
+            )
             let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
-            let appliedIngressSamples = await store.awaitAppliedIngress(rootScope: rootScope)
+            let appliedIngressSamples = await store.awaitAppliedIngress(rootRefs: freshnessRootRefs)
             EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
             try Task.checkCancellation()
             let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(
-                rootScope: rootScope,
+                rootRefs: freshnessRootRefs,
                 appliedIngressSamples: appliedIngressSamples
             )
             try Task.checkCancellation()
