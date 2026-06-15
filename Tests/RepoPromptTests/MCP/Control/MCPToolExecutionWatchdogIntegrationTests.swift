@@ -208,25 +208,27 @@ import XCTest
             }
         }
 
-        func testFileSearchUsesBoundedWatchdogAndKeepsConnectionUsable() async throws {
+        func testLongRunningFileSearchSurvivesFormerWatchdogAndHonorsCallerCancellation() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
                 let clock = ExecutionWatchdogManualClock()
-                let operationGate = MCPExecutionCooperativeCancellationGate()
+                let survivalGate = MCPExecutionIgnoringCancellationGate()
+                let cancellationGate = MCPExecutionCooperativeCancellationGate()
                 let recorder = MCPExecutionTraceRecorder()
                 let manager = fixture.networkManager
                 let endpoint = try fixture.endpointA()
-                var responseTask: Task<PersistentMCPTestRPCResponse, Error>?
 
                 MCPToolExecutionTracer.setTestSink { recorder.append($0) }
                 await manager.debugSetToolExecutionWatchdogEnvironment(clock.environment)
                 await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.search) {
-                    try await operationGate.enterAndWait()
-                    return .null
+                    await survivalGate.enterAndWait()
+                    return .object(["phase": .string("survived-former-watchdog")])
                 }
 
+                var survivalTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var cancellationTask: Task<PersistentMCPTestRPCResponse, Error>?
                 do {
-                    let activeResponseTask = Task {
+                    let activeSurvivalTask = Task {
                         try await endpoint.callTool(
                             name: MCPWindowToolName.search,
                             arguments: [
@@ -236,35 +238,81 @@ import XCTest
                             ]
                         )
                     }
-                    responseTask = activeResponseTask
-                    try await clock.waitForSleeperCount(1)
-                    try await operationGate.waitUntilEntered()
-                    try await clock.advanceNext(expected: MCPTimeoutPolicy.fileSearchToolExecutionDeadline)
+                    survivalTask = activeSurvivalTask
+                    try await survivalGate.waitUntilEntered(count: 1)
+                    let survivalSleeperCount = await clock.sleeperCount()
+                    XCTAssertEqual(survivalSleeperCount, 0)
+                    let formerWatchdogWindow = MCPTimeoutPolicy.boundedToolExecutionDeadline
+                        + MCPTimeoutPolicy.boundedToolCancellationCleanupGrace
+                        + .seconds(1)
+                    try await clock.advanceWithoutSleepers(by: formerWatchdogWindow)
+                    for _ in 0 ..< 20 {
+                        await Task.yield()
+                    }
+                    let survivalInFlight = await manager.hasInFlightCalls(for: endpoint.connectionID)
+                    let survivalTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
+                    XCTAssertTrue(survivalInFlight)
+                    XCTAssertFalse(survivalTerminal)
+                    let survivalViable = await endpoint.connectionManager.isViableForRetention()
+                    XCTAssertTrue(survivalViable)
+                    let survivalEvents = recorder.snapshot().filter {
+                        $0.connectionID == endpoint.connectionID && $0.toolName == MCPWindowToolName.search
+                    }
+                    let selected = try XCTUnwrap(survivalEvents.first { $0.phase == .contractSelected })
+                    XCTAssertEqual(selected.contractKind, .longSynchronousCancellable)
+                    XCTAssertNil(selected.executionDeadlineSeconds)
+                    XCTAssertNil(selected.cleanupGraceSeconds)
+                    XCTAssertFalse(survivalEvents.contains { $0.phase == .deadlineExpired })
+                    XCTAssertFalse(survivalEvents.contains { $0.phase == .connectionForceDisconnectRequested })
 
-                    let response = try await activeResponseTask.value
-                    responseTask = nil
-                    let cancellationCount = await operationGate.observedCancellationCount()
-                    XCTAssertEqual(cancellationCount, 1)
-                    let text = try Self.toolResultText(response)
-                    XCTAssertEqual(text.components(separatedBy: "tool_execution_timeout").count - 1, 1, text)
-                    XCTAssertTrue(text.contains("120-second execution contract"), text)
+                    await survivalGate.release()
+                    _ = try await activeSurvivalTask.value
+
+                    await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.search) {
+                        try await cancellationGate.enterAndWait()
+                        return .object(["phase": .string("unexpected-completion")])
+                    }
+                    let cancellationRequestID = endpoint.client.nextRequestIDForTesting()
+                    let activeCancellationTask = Task {
+                        try await endpoint.callTool(
+                            name: MCPWindowToolName.search,
+                            arguments: [
+                                "pattern": PersistentMCPTestFixture.sharedSearchToken,
+                                "mode": "content",
+                                "context_id": fixture.contextA.tabID.uuidString
+                            ]
+                        )
+                    }
+                    cancellationTask = activeCancellationTask
+                    try await cancellationGate.waitUntilEntered()
+                    let cancellationSleeperCount = await clock.sleeperCount()
+                    XCTAssertEqual(cancellationSleeperCount, 0)
+                    try endpoint.client.sendNotification(
+                        method: "notifications/cancelled",
+                        params: ["requestId": cancellationRequestID]
+                    )
+                    try await cancellationGate.waitUntilCancellationObserved()
+                    let observedCancellationCount = await cancellationGate.observedCancellationCount()
+                    XCTAssertEqual(observedCancellationCount, 1)
+                    let cancellationResponse = try await activeCancellationTask.value
+                    let cancellationText = try Self.toolResultText(cancellationResponse)
+                    XCTAssertFalse(cancellationText.contains("tool_execution_timeout"), cancellationText)
+                    XCTAssertFalse(cancellationText.contains("tool_execution_cleanup_unresponsive"), cancellationText)
 
                     let events = recorder.snapshot().filter {
                         $0.connectionID == endpoint.connectionID && $0.toolName == MCPWindowToolName.search
                     }
-                    let selected = try XCTUnwrap(events.first { $0.phase == .contractSelected })
-                    XCTAssertEqual(selected.contractKind, .bounded)
-                    XCTAssertEqual(
-                        selected.executionDeadlineSeconds,
-                        Double(MCPTimeoutPolicy.fileSearchToolExecutionDeadlineSeconds)
-                    )
-                    XCTAssertEqual(
-                        selected.cleanupGraceSeconds,
-                        Double(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds)
-                    )
-                    XCTAssertEqual(events.count(where: { $0.phase == .deadlineExpired }), 1)
-                    let isTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
-                    XCTAssertFalse(isTerminal)
+                    XCTAssertEqual(events.count(where: { $0.phase == .contractSelected }), 2)
+                    XCTAssertTrue(events.filter { $0.phase == .contractSelected }.allSatisfy {
+                        $0.contractKind == .longSynchronousCancellable
+                            && $0.executionDeadlineSeconds == nil
+                            && $0.cleanupGraceSeconds == nil
+                    })
+                    XCTAssertFalse(events.contains { $0.phase == .deadlineExpired })
+                    XCTAssertFalse(events.contains { $0.phase == .cleanupGraceExpired })
+                    XCTAssertFalse(events.contains { $0.phase == .connectionForceDisconnectRequested })
+                    let cancellationTerminal = await manager.debugIsExecutionWatchdogTerminal(connectionID: endpoint.connectionID)
+                    XCTAssertFalse(cancellationTerminal)
 
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.search, operation: nil)
                     await manager.debugResetToolExecutionWatchdogEnvironment()
@@ -286,6 +334,8 @@ import XCTest
                         ]
                     )
                     _ = try await endpoint.client.request(method: "tools/list", params: [:])
+                    let finalInFlight = await manager.hasInFlightCalls(for: endpoint.connectionID)
+                    XCTAssertFalse(finalInFlight)
                     let limiter = await manager.connectionLimiterSnapshotForTesting(connectionID: endpoint.connectionID)
                     XCTAssertEqual(limiter?.permits, 1)
                     XCTAssertEqual(limiter?.waiterCount, 0)
@@ -294,10 +344,15 @@ import XCTest
                     await fixture.cleanup()
                     try await fixture.assertCleanedUp()
                 } catch {
-                    await operationGate.cancelForCleanup()
-                    responseTask?.cancel()
-                    if let responseTask {
-                        _ = try? await responseTask.value
+                    await survivalGate.release()
+                    await cancellationGate.cancelForCleanup()
+                    survivalTask?.cancel()
+                    cancellationTask?.cancel()
+                    if let survivalTask {
+                        _ = try? await survivalTask.value
+                    }
+                    if let cancellationTask {
+                        _ = try? await cancellationTask.value
                     }
                     MCPToolExecutionTracer.setTestSink(nil)
                     await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.search, operation: nil)

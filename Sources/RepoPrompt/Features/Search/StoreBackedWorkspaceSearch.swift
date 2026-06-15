@@ -1,14 +1,21 @@
 import Foundation
+import RepoPromptShared
 
 enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
     case worktreeScopeUnavailable(missingPhysicalRootPaths: [String])
+    case workspaceFreshnessTimedOut
 
     var retryAfterMilliseconds: Int {
         1000
     }
 
     var suggestion: String {
-        "Retry after the suggested delay. If the worktree remains unavailable, restore it or rebind the Agent session to an available worktree."
+        switch self {
+        case .worktreeScopeUnavailable:
+            "Retry after the suggested delay. If the worktree remains unavailable, restore it or rebind the Agent session to an available worktree."
+        case .workspaceFreshnessTimedOut:
+            "Retry after workspace file updates finish applying."
+        }
     }
 
     var errorDescription: String? {
@@ -17,6 +24,8 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
             let count = missingPhysicalRootPaths.count
             let noun = count == 1 ? "worktree root is" : "worktree roots are"
             return "The bound physical \(noun) unavailable. The visible base workspace was intentionally not searched."
+        case .workspaceFreshnessTimedOut:
+            return "Workspace freshness timed out before file_search could begin. Retry the search after workspace updates finish applying."
         }
     }
 }
@@ -26,6 +35,11 @@ enum StoreBackedWorkspaceSearchError: LocalizedError, Equatable {
 /// This intentionally works from `WorkspaceFileContextStore` catalog snapshots rather than
 /// `WorkspaceFilesViewModel` tree projections.
 enum StoreBackedWorkspaceSearch {
+    #if DEBUG
+        @TaskLocal static var freshnessWaitTimeoutOverrideForTesting: Duration?
+        @TaskLocal static var freshnessWaitOperationOverrideForTesting: (@Sendable ([WorkspaceRootRef], WorkspaceFileContextStore) async -> [WorkspaceIngressBarrierSample])?
+    #endif
+
     static func search(
         pattern: String,
         mode: SearchMode = .auto,
@@ -60,12 +74,39 @@ enum StoreBackedWorkspaceSearch {
                 try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
             }
 
-            let freshnessRootRefs = await store.searchFreshnessRootRefs(
-                explicitPaths: paths,
-                fallbackScope: rootScope
-            )
+            let parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
+                await parseSearchScopePaths(
+                    rawPaths,
+                    caseInsensitive: caseInsensitive,
+                    rootScope: rootScope,
+                    store: store
+                )
+            } else {
+                nil
+            }
+            let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
+                parsedSearchScope.freshnessRootRefs
+            } else {
+                await store.rootRefs(scope: rootScope)
+            }
+            #if DEBUG
+                let freshnessWaitTimeout = freshnessWaitTimeoutOverrideForTesting
+                    ?? MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+            #else
+                let freshnessWaitTimeout = MCPTimeoutPolicy.workspaceFreshnessWaitTimeout
+            #endif
             let ingressFreshnessState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.ingressFreshnessWait)
-            let appliedIngressSamples = await store.awaitAppliedIngress(rootRefs: freshnessRootRefs)
+            let appliedIngressSamples: [WorkspaceIngressBarrierSample]
+            do {
+                appliedIngressSamples = try await awaitAppliedIngress(
+                    rootRefs: freshnessRootRefs,
+                    store: store,
+                    timeout: freshnessWaitTimeout
+                )
+            } catch {
+                EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
+                throw error
+            }
             EditFlowPerf.end(EditFlowPerf.Stage.Search.ingressFreshnessWait, ingressFreshnessState)
             try Task.checkCancellation()
             let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(
@@ -91,6 +132,8 @@ enum StoreBackedWorkspaceSearch {
                 fuzzySpaceMatching: fuzzySpaceMatching,
                 allowLiteralUnescapeFallback: allowLiteralUnescapeFallback,
                 contentFreshnessPolicy: contentFreshnessPolicy,
+                freshnessQualifiedRootIDs: Set(freshnessRootRefs.map(\.id)),
+                parsedSearchScope: parsedSearchScope,
                 rootScope: rootScope,
                 store: store,
                 fileSearchActor: fileSearchActor
@@ -143,6 +186,8 @@ enum StoreBackedWorkspaceSearch {
         fuzzySpaceMatching: Bool,
         allowLiteralUnescapeFallback: Bool,
         contentFreshnessPolicy: FileContentFreshnessPolicy,
+        freshnessQualifiedRootIDs: Set<UUID>,
+        parsedSearchScope: SearchScopeParseResult?,
         rootScope: WorkspaceLookupRootScope,
         store: WorkspaceFileContextStore,
         fileSearchActor: FileSearchActor
@@ -198,7 +243,9 @@ enum StoreBackedWorkspaceSearch {
 
         let filesToSearch: [WorkspaceFileRecord]
         if let rawPaths = paths, !rawPaths.isEmpty {
-            let parsed = await parseSearchScopePaths(rawPaths, caseInsensitive: caseInsensitive, rootScope: rootScope, store: store)
+            guard let parsed = parsedSearchScope else {
+                preconditionFailure("Explicit search paths must be parsed before freshness")
+            }
             if parsed.spec.clauses.isEmpty, let issue = parsed.issues.first {
                 entryPerfStatus = "error"
                 EditFlowPerf.end(
@@ -245,10 +292,23 @@ enum StoreBackedWorkspaceSearch {
             EditFlowPerf.Dimensions(status: (paths?.isEmpty == false) ? "explicit" : "all", fileCount: filesToSearch.count)
         )
 
-        let effectiveContentFreshnessPolicy: FileContentFreshnessPolicy =
-            (effectiveMode == .content || effectiveMode == .both)
-                ? contentFreshnessPolicy
-                : .cachedMetadata
+        let allSearchedFilesAreFreshnessQualified = filesToSearch.allSatisfy {
+            freshnessQualifiedRootIDs.contains($0.rootID)
+        }
+        let freshnessAllowsCachedMetadata = if case .cachedMetadata = contentFreshnessPolicy {
+            true
+        } else {
+            false
+        }
+        let effectiveContentFreshnessPolicy: FileContentFreshnessPolicy = if effectiveMode == .content
+            || effectiveMode == .both
+        {
+            freshnessAllowsCachedMetadata && allSearchedFilesAreFreshnessQualified
+                ? .cachedMetadata
+                : .validateDiskMetadata
+        } else {
+            .cachedMetadata
+        }
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
@@ -331,6 +391,8 @@ enum StoreBackedWorkspaceSearch {
             throw FileManagerError.fileSystemServiceNotFoundWithContext(msg)
         }
         guard let workspaceManager else { return }
+        // This state covers the activated workspace catalog. Session-bound worktrees can be
+        // loaded afterward, so their applied-ingress barrier below remains authoritative.
         let state = await MainActor.run { workspaceManager.workspaceSearchReadinessState }
         switch state {
         case .ready, .degraded:
@@ -354,6 +416,7 @@ enum StoreBackedWorkspaceSearch {
     private struct SearchScopeParseResult {
         let spec: SearchPathFilterSpec
         let issues: [PathResolutionIssue]
+        let freshnessRootRefs: [WorkspaceRootRef]
     }
 
     private static func parseSearchScopePaths(
@@ -366,12 +429,40 @@ enum StoreBackedWorkspaceSearch {
         var issues: [PathResolutionIssue] = []
         var seenClauses = Set<String>()
         let scopedRoots = await store.rootRefs(scope: rootScope)
+        var freshnessRootPaths = Set<String>()
+        var requiresFullFreshnessScope = false
 
         func appendClause(_ clause: SearchPathClause) {
             let key = String(describing: clause)
-            if seenClauses.insert(key).inserted {
-                clauses.append(clause)
+            guard seenClauses.insert(key).inserted else { return }
+            clauses.append(clause)
+
+            switch clause {
+            case let .exactFile(_, _, restrictedRootPath),
+                 let .exactFolder(_, _, restrictedRootPath),
+                 let .glob(_, restrictedRootPath):
+                if let restrictedRootPath {
+                    freshnessRootPaths.insert(restrictedRootPath)
+                } else {
+                    requiresFullFreshnessScope = true
+                }
+            case let .legacyPrefix(candidateLower):
+                if candidateLower.hasPrefix("/") {
+                    if let root = scopedRoots
+                        .filter({ StandardizedPath.isDescendant(candidateLower, of: $0.standardizedFullPath.lowercased()) })
+                        .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count })
+                    {
+                        freshnessRootPaths.insert(root.standardizedFullPath)
+                    }
+                } else {
+                    requiresFullFreshnessScope = true
+                }
             }
+        }
+
+        func appendIssue(_ issue: PathResolutionIssue) {
+            issues.append(issue)
+            requiresFullFreshnessScope = true
         }
 
         func appendWildcardClause(for normalized: String) {
@@ -397,7 +488,7 @@ enum StoreBackedWorkspaceSearch {
                     return
                 }
                 if matches.count > 1 {
-                    issues.append(.ambiguousAlias(alias: alias, matchingRoots: matches))
+                    appendIssue(.ambiguousAlias(alias: alias, matchingRoots: matches))
                     return
                 }
             }
@@ -415,7 +506,7 @@ enum StoreBackedWorkspaceSearch {
             }
 
             if let issue = await store.exactPathResolutionIssue(for: normalized, kind: .either, rootScope: rootScope) {
-                issues.append(issue)
+                appendIssue(issue)
                 continue
             }
             var lookup = await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(normalized, rootScope: rootScope)
@@ -441,10 +532,113 @@ enum StoreBackedWorkspaceSearch {
             appendClause(.legacyPrefix(candidateLower: normalized.lowercased()))
         }
 
+        let freshnessRootRefs = if requiresFullFreshnessScope || clauses.isEmpty {
+            scopedRoots
+        } else {
+            scopedRoots.filter { freshnessRootPaths.contains($0.standardizedFullPath) }
+        }
         return SearchScopeParseResult(
             spec: SearchPathFilterSpec(caseInsensitive: caseInsensitive, clauses: clauses),
-            issues: issues
+            issues: issues,
+            freshnessRootRefs: freshnessRootRefs
         )
+    }
+
+    private static func awaitAppliedIngress(
+        rootRefs: [WorkspaceRootRef],
+        store: WorkspaceFileContextStore,
+        timeout: Duration
+    ) async throws -> [WorkspaceIngressBarrierSample] {
+        let race = AppliedIngressWaitRace()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                race.install(continuation: continuation)
+                let freshnessTask = Task {
+                    let samples: [WorkspaceIngressBarrierSample]
+                    #if DEBUG
+                        if let override = freshnessWaitOperationOverrideForTesting {
+                            samples = await override(rootRefs, store)
+                        } else {
+                            samples = await store.awaitAppliedIngress(rootRefs: rootRefs)
+                        }
+                    #else
+                        samples = await store.awaitAppliedIngress(rootRefs: rootRefs)
+                    #endif
+                    race.resolve(.success(samples))
+                }
+                let timeoutTask = Task {
+                    do {
+                        try await Task.sleep(for: timeout)
+                    } catch {
+                        return
+                    }
+                    race.resolve(.failure(StoreBackedWorkspaceSearchError.workspaceFreshnessTimedOut))
+                }
+                race.install(freshnessTask: freshnessTask, timeoutTask: timeoutTask)
+            }
+        } onCancel: {
+            race.resolve(.failure(CancellationError()))
+        }
+    }
+
+    private final class AppliedIngressWaitRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>?
+        private var pendingResult: Result<[WorkspaceIngressBarrierSample], Error>?
+        private var freshnessTask: Task<Void, Never>?
+        private var timeoutTask: Task<Void, Never>?
+        private var isResolved = false
+
+        func install(continuation: CheckedContinuation<[WorkspaceIngressBarrierSample], Error>) {
+            lock.lock()
+            if let pendingResult {
+                self.pendingResult = nil
+                lock.unlock()
+                continuation.resume(with: pendingResult)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+        }
+
+        func install(
+            freshnessTask: Task<Void, Never>,
+            timeoutTask: Task<Void, Never>
+        ) {
+            lock.lock()
+            if isResolved {
+                lock.unlock()
+                freshnessTask.cancel()
+                timeoutTask.cancel()
+                return
+            }
+            self.freshnessTask = freshnessTask
+            self.timeoutTask = timeoutTask
+            lock.unlock()
+        }
+
+        func resolve(_ result: Result<[WorkspaceIngressBarrierSample], Error>) {
+            lock.lock()
+            guard !isResolved else {
+                lock.unlock()
+                return
+            }
+            isResolved = true
+            let continuation = continuation
+            self.continuation = nil
+            if continuation == nil {
+                pendingResult = result
+            }
+            let freshnessTask = freshnessTask
+            let timeoutTask = timeoutTask
+            self.freshnessTask = nil
+            self.timeoutTask = nil
+            lock.unlock()
+
+            freshnessTask?.cancel()
+            timeoutTask?.cancel()
+            continuation?.resume(with: result)
+        }
     }
 
     private static func normalizeUserInputPath(_ path: String) -> String {
