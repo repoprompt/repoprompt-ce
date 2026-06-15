@@ -45,18 +45,23 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
             }
 
             let snapshot = await transport.ingressSnapshot()
+            let closeValue = await transport.closeSnapshot()
+            let closeSnapshot = try XCTUnwrap(closeValue)
             XCTAssertEqual(snapshot.receiveBufferCapacity, 2)
             XCTAssertEqual(snapshot.acceptedFrameCount, 2)
             XCTAssertEqual(snapshot.droppedFrameCount, 1)
             XCTAssertEqual(snapshot.receiveBufferHighWaterMark, 2)
             XCTAssertTrue(snapshot.isTerminal)
             XCTAssertEqual(snapshot.terminalCause, .receiveBufferOverflow)
+            XCTAssertEqual(closeSnapshot.cause, .receiveBufferOverflow)
+            XCTAssertEqual(closeSnapshot.initiator, .transport)
 
             await manager.recordTransportIngressTerminal(
                 connectionID: connectionID,
                 clientName: "overflow-test-client",
                 sessionToken: "overflow-test-session",
-                snapshot: snapshot
+                snapshot: snapshot,
+                closeSnapshot: closeSnapshot
             )
             let payload = await manager.debugTransportIngressSnapshotPayload(
                 currentConnectionID: connectionID,
@@ -141,6 +146,10 @@ final class UnixSocketMCPReceiveOverflowTests: XCTestCase {
             } catch {
                 XCTFail("Unexpected terminal error: \(error)")
             }
+            let closeValue = await transport.closeSnapshot()
+            let closeSnapshot = try XCTUnwrap(closeValue)
+            XCTAssertEqual(closeSnapshot.cause, .receiveBufferOverflow)
+            XCTAssertEqual(closeSnapshot.initiator, .transport)
 
             let peerSawEOF = await Self.waitUntil { Self.peerObservedEOF(on: descriptors[1]) }
             XCTAssertTrue(peerSawEOF)

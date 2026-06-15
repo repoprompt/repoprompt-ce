@@ -4,6 +4,84 @@ import Foundation
 import XCTest
 
 final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
+    func testCleanPeerEOFPreservesFirstCloseCause() async throws {
+        let descriptors = try Self.makeSocketPair()
+        defer { Self.closeIfOpen(descriptors[1]) }
+
+        let transport = try UnixSocketMCPTransport(connectedFD: descriptors[0])
+        try await transport.connect()
+        let closeStream = await transport.closed()
+
+        XCTAssertEqual(Darwin.shutdown(descriptors[1], SHUT_WR), 0)
+
+        var iterator = closeStream.makeAsyncIterator()
+        let closeValue = await iterator.next()
+        let close = try XCTUnwrap(closeValue)
+        XCTAssertEqual(close.cause, .peerEOF)
+        XCTAssertEqual(close.initiator, .peer)
+        XCTAssertNil(close.errno)
+        XCTAssertNil(close.errorDescription)
+        let storedClose = await transport.closeSnapshot()
+        XCTAssertEqual(storedClose, close)
+    }
+
+    func testIncompletePeerEOFPreservesProtocolCause() async throws {
+        let descriptors = try Self.makeSocketPair()
+        defer { Self.closeIfOpen(descriptors[1]) }
+
+        let transport = try UnixSocketMCPTransport(connectedFD: descriptors[0])
+        try await transport.connect()
+        let closeStream = await transport.closed()
+
+        try Self.writeAll(Data(#"{"jsonrpc":"2.0""#.utf8), to: descriptors[1])
+        XCTAssertEqual(Darwin.shutdown(descriptors[1], SHUT_WR), 0)
+
+        var iterator = closeStream.makeAsyncIterator()
+        let closeValue = await iterator.next()
+        let close = try XCTUnwrap(closeValue)
+        XCTAssertEqual(close.cause, .incompleteEOF)
+        XCTAssertEqual(close.initiator, .peer)
+        XCTAssertTrue(close.errorDescription?.contains("incomplete frame data") == true)
+        let storedClose = await transport.closeSnapshot()
+        XCTAssertEqual(storedClose, close)
+    }
+
+    func testPeerCloseDuringWritePublishesPeerWriteHangup() async throws {
+        #if DEBUG
+            let descriptors = try Self.makeSocketPair()
+            var peerFD = descriptors[1]
+            defer { Self.closeIfOpen(peerFD) }
+
+            let transport = try UnixSocketMCPTransport(connectedFD: descriptors[0])
+            await transport.debugHoldReaderTerminalCallback()
+            try await transport.connect()
+            let closeStream = await transport.closed()
+
+            Self.closeIfOpen(peerFD)
+            peerFD = -1
+
+            do {
+                try await transport.send(Data("peer-close-write".utf8))
+                XCTFail("Expected write to fail after the peer closed")
+            } catch {
+                // Expected: the close snapshot is the behavior under test.
+            }
+
+            var iterator = closeStream.makeAsyncIterator()
+            let closeValue = await iterator.next()
+            let close = try XCTUnwrap(closeValue)
+            XCTAssertEqual(close.cause, .writeHangup)
+            XCTAssertEqual(close.initiator, .peer)
+            XCTAssertTrue(close.errno == EPIPE || close.errno == ECONNRESET)
+            let storedClose = await transport.closeSnapshot()
+            XCTAssertEqual(storedClose, close)
+
+            await transport.debugReleaseReaderTerminalCallbacks()
+        #else
+            throw XCTSkip("Deterministic transport callback gates require a DEBUG build")
+        #endif
+    }
+
     func testCancellationCallbackBeforeTerminalTaskFinalizesExactlyOnce() async throws {
         #if DEBUG
             let descriptors = try Self.makeSocketPair()

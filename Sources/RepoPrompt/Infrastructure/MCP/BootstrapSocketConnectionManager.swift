@@ -121,7 +121,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         // Start close-watch task to clean up when socket closes
         closeWatchTask = Task { [weak self] in
             guard let self else { return }
-            for await _ in await transport.closed() {
+            for await closeSnapshot in await transport.closed() {
                 let id = connectionID
                 let ingressSnapshot = await transport.ingressSnapshot()
                 mcpConnectionLog("BootstrapSocketConnectionManager: transport closed for \(id)")
@@ -129,9 +129,13 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
                     connectionID: id,
                     clientName: _clientName,
                     sessionToken: sessionToken,
-                    snapshot: ingressSnapshot
+                    snapshot: ingressSnapshot,
+                    closeSnapshot: closeSnapshot
                 )
-                await parentManager.removeConnection(id)
+                await parentManager.removeConnection(
+                    id,
+                    context: MCPConnectionCloseContext(transport: closeSnapshot)
+                )
                 break
             }
         }
@@ -161,6 +165,8 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         } catch {
             bootstrapLog.error("BootstrapSocketConnectionManager: start failed: \(error)")
             updateState(.failed(error))
+            closeWatchTask?.cancel()
+            closeWatchTask = nil
             await transport.disconnect()
             throw error
         }
@@ -220,7 +226,14 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
         } catch {
             if isClosing { return }
             bootstrapLog.error("Failed to notify bootstrap client of tool list change: \(error)")
-            await parentManager.removeConnection(connectionID)
+            await parentManager.removeConnection(
+                connectionID,
+                context: MCPConnectionCloseContext(
+                    reason: "tool_list_notification_failure",
+                    initiator: .app,
+                    errorDescription: String(describing: error)
+                )
+            )
         }
     }
 

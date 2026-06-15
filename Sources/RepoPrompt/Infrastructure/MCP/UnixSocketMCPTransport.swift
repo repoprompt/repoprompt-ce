@@ -309,12 +309,12 @@ public actor UnixSocketMCPTransport: Transport {
     }
 
     private struct CloseChannel {
-        let stream: AsyncStream<Void>
-        let continuation: AsyncStream<Void>.Continuation
+        let stream: AsyncStream<MCPTransportCloseSnapshot>
+        let continuation: AsyncStream<MCPTransportCloseSnapshot>.Continuation
 
         init() {
-            var continuation: AsyncStream<Void>.Continuation!
-            stream = AsyncStream(Void.self) { continuation = $0 }
+            var continuation: AsyncStream<MCPTransportCloseSnapshot>.Continuation!
+            stream = AsyncStream(MCPTransportCloseSnapshot.self) { continuation = $0 }
             self.continuation = continuation
         }
     }
@@ -325,6 +325,7 @@ public actor UnixSocketMCPTransport: Transport {
     private var inboundChannel: InboundChannel
     private var closeChannel: CloseChannel
     private var closeSignaled = false
+    private var firstCloseSnapshot: MCPTransportCloseSnapshot?
 
     /// Event-driven read source (replaces poll loop)
     private let readQueue = DispatchQueue(label: "com.repoprompt.mcp.unix.read", qos: .userInitiated)
@@ -497,6 +498,11 @@ public actor UnixSocketMCPTransport: Transport {
 
         while Date().timeIntervalSince(startTime) < connectionTimeout {
             if Task.isCancelled {
+                tearDownSocket(
+                    error: CancellationError(),
+                    cause: .connectFailure,
+                    initiator: .app
+                )
                 throw MCPError.connectionClosed
             }
 
@@ -517,7 +523,12 @@ public actor UnixSocketMCPTransport: Transport {
                     lastError = error
                 } catch {
                     // Other error - fail this connection attempt cleanly.
-                    tearDownSocket(error: error)
+                    tearDownSocket(
+                        error: error,
+                        cause: .connectFailure,
+                        initiator: .transport,
+                        errno: Self.errnoValue(from: error)
+                    )
                     throw error
                 }
             }
@@ -528,7 +539,14 @@ public actor UnixSocketMCPTransport: Transport {
 
         // Timeout reached
         logger.error("UnixSocketMCPTransport connection timeout after \(connectionTimeout)s")
-        throw lastError ?? MCPError.internalError("Timeout connecting to UNIX socket at \(socketURL.path)")
+        let error = lastError ?? MCPError.internalError("Timeout connecting to UNIX socket at \(socketURL.path)")
+        tearDownSocket(
+            error: error,
+            cause: .connectFailure,
+            initiator: .transport,
+            errno: Self.errnoValue(from: error)
+        )
+        throw error
     }
 
     /// Disconnects from the UNIX socket.
@@ -537,7 +555,11 @@ public actor UnixSocketMCPTransport: Transport {
         guard isConnected || !isStopping else { return }
 
         mcpConnectionLog("UnixSocketMCPTransport disconnecting")
-        tearDownSocket(error: MCPError.connectionClosed)
+        tearDownSocket(
+            error: MCPError.connectionClosed,
+            cause: .localDisconnect,
+            initiator: .app
+        )
         mcpConnectionLog("UnixSocketMCPTransport disconnect requested")
     }
 
@@ -689,8 +711,12 @@ public actor UnixSocketMCPTransport: Transport {
 
     /// Returns the close notification stream.
     /// Use this to detect when the socket closes so connections can be cleaned up promptly.
-    public func closed() -> AsyncStream<Void> {
+    public func closed() -> AsyncStream<MCPTransportCloseSnapshot> {
         closeChannel.stream
+    }
+
+    public func closeSnapshot() -> MCPTransportCloseSnapshot? {
+        firstCloseSnapshot
     }
 
     func ingressSnapshot() -> MCPTransportIngressSnapshot {
@@ -718,6 +744,7 @@ public actor UnixSocketMCPTransport: Transport {
         }
         streamFinished = false
         closeSignaled = false
+        firstCloseSnapshot = nil
     }
 
     /// Connects to the UNIX socket at socketURL.
@@ -803,7 +830,12 @@ public actor UnixSocketMCPTransport: Transport {
     /// Wakes blocked I/O and deterministically transfers final-close responsibility.
     /// If a reader exists, its cancel handler remains the sole final-close owner to
     /// avoid a stale callback closing a reused descriptor number.
-    private func tearDownSocket(error proposedError: Swift.Error?) {
+    private func tearDownSocket(
+        error proposedError: Swift.Error?,
+        cause proposedCause: MCPTransportTerminalCause,
+        initiator proposedInitiator: MCPTerminalInitiator,
+        errno proposedErrno: Int32? = nil
+    ) {
         guard !streamFinished else { return }
         responseDeliveryGate.close()
         #if DEBUG
@@ -815,13 +847,28 @@ public actor UnixSocketMCPTransport: Transport {
             }
         #endif
         let ingressSnapshot = inboundChannel.gate.closeAndSnapshot()
+        let overflowError = MCPReceiveBufferOverflowError(
+            capacity: ingressSnapshot.receiveBufferCapacity,
+            highWaterMark: ingressSnapshot.receiveBufferHighWaterMark
+        )
         let resolvedError: Swift.Error? = if ingressSnapshot.terminalCause == .receiveBufferOverflow {
-            MCPReceiveBufferOverflowError(
-                capacity: ingressSnapshot.receiveBufferCapacity,
-                highWaterMark: ingressSnapshot.receiveBufferHighWaterMark
-            )
+            overflowError
         } else {
             proposedError
+        }
+        if firstCloseSnapshot == nil {
+            firstCloseSnapshot = MCPTransportCloseSnapshot(
+                cause: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? .receiveBufferOverflow
+                    : proposedCause,
+                initiator: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? .transport
+                    : proposedInitiator,
+                errno: ingressSnapshot.terminalCause == .receiveBufferOverflow
+                    ? nil
+                    : proposedErrno,
+                errorDescription: resolvedError.map { String(describing: $0) }
+            )
         }
         if ingressSnapshot.terminalCause == .receiveBufferOverflow {
             logger.error("UnixSocketMCPTransport ingress terminated: \(String(describing: resolvedError))")
@@ -843,7 +890,11 @@ public actor UnixSocketMCPTransport: Transport {
         if isConnected {
             guard activeReaderOwnership != nil else {
                 let error = MCPError.connectionClosed
-                tearDownSocket(error: error)
+                tearDownSocket(
+                    error: error,
+                    cause: .connectFailure,
+                    initiator: .transport
+                )
                 throw error
             }
             return
@@ -851,7 +902,11 @@ public actor UnixSocketMCPTransport: Transport {
 
         guard !streamFinished, !closeSignaled, socketFD >= 0 else {
             let error = MCPError.connectionClosed
-            tearDownSocket(error: error)
+            tearDownSocket(
+                error: error,
+                cause: .connectFailure,
+                initiator: .transport
+            )
             throw error
         }
 
@@ -876,9 +931,21 @@ public actor UnixSocketMCPTransport: Transport {
             lastActivityTime = Date()
             unixSocketMCPTransportDebugLog("started with existing FD \(socketFD)")
         } catch {
-            tearDownSocket(error: error)
+            tearDownSocket(
+                error: error,
+                cause: .connectFailure,
+                initiator: .transport,
+                errno: Self.errnoValue(from: error)
+            )
             throw error
         }
+    }
+
+    private nonisolated static func errnoValue(from error: Swift.Error) -> Int32? {
+        if let posixError = error as? POSIXError {
+            return posixError.code.rawValue
+        }
+        return nil
     }
 
     #if DEBUG
@@ -982,7 +1049,7 @@ public actor UnixSocketMCPTransport: Transport {
         do {
             try Self.ensureNonBlocking(fd: fd)
         } catch {
-            closeAfterSendFailure(error)
+            closeAfterSendFailure(error, cause: .writeFailure, errno: Self.errnoValue(from: error))
             throw error
         }
         var remaining = data
@@ -999,7 +1066,7 @@ public actor UnixSocketMCPTransport: Transport {
                     bytesRemaining: remaining.count,
                     totalBytes: data.count
                 ))
-                closeAfterSendFailure(error)
+                closeAfterSendFailure(error, cause: .writeStall)
                 throw error
             }
 
@@ -1021,16 +1088,16 @@ public actor UnixSocketMCPTransport: Transport {
                     )
                     continue
                 } else if err == EPIPE || err == ECONNRESET {
-                    closeAfterSendFailure(MCPError.connectionClosed)
+                    closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer, errno: err)
                     throw MCPError.connectionClosed
                 } else {
                     let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
-                    closeAfterSendFailure(error)
+                    closeAfterSendFailure(error, cause: .writeFailure, errno: err)
                     throw error
                 }
             } else if written == 0 {
                 // On sockets, a 0-length write generally means closed / unusable
-                closeAfterSendFailure(MCPError.connectionClosed)
+                closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer)
                 throw MCPError.connectionClosed
             }
 
@@ -1058,7 +1125,7 @@ public actor UnixSocketMCPTransport: Transport {
                     bytesRemaining: bytesRemaining,
                     totalBytes: totalBytes
                 ))
-                closeAfterSendFailure(error)
+                closeAfterSendFailure(error, cause: .writeStall)
                 throw error
             }
 
@@ -1069,8 +1136,9 @@ public actor UnixSocketMCPTransport: Transport {
 
             if result < 0 {
                 if errno == EINTR { continue }
-                let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO))
-                closeAfterSendFailure(error)
+                let err = errno
+                let error = MCPError.transportError(POSIXError(POSIXErrorCode(rawValue: err) ?? .EIO))
+                closeAfterSendFailure(error, cause: .writeFailure, errno: err)
                 throw error
             }
 
@@ -1079,7 +1147,7 @@ public actor UnixSocketMCPTransport: Transport {
             }
 
             if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
-                closeAfterSendFailure(MCPError.connectionClosed)
+                closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer)
                 throw MCPError.connectionClosed
             }
 
@@ -1089,9 +1157,19 @@ public actor UnixSocketMCPTransport: Transport {
         }
     }
 
-    private func closeAfterSendFailure(_ error: Swift.Error) {
+    private func closeAfterSendFailure(
+        _ error: Swift.Error,
+        cause: MCPTransportTerminalCause,
+        initiator: MCPTerminalInitiator = .transport,
+        errno: Int32? = nil
+    ) {
         logger.error("UnixSocketMCPTransport send failed; closing transport: \(String(describing: error))")
-        tearDownSocket(error: error)
+        tearDownSocket(
+            error: error,
+            cause: cause,
+            initiator: initiator,
+            errno: errno
+        )
     }
 
     private struct UnixSocketWriteStalledError: Swift.Error, CustomStringConvertible {
@@ -1292,7 +1370,11 @@ public actor UnixSocketMCPTransport: Transport {
                 return
             }
         #endif
-        tearDownSocket(error: error)
+        tearDownSocket(
+            error: error,
+            cause: .receiveBufferOverflow,
+            initiator: .transport
+        )
     }
 
     private func handleReaderTerminal(
@@ -1312,16 +1394,29 @@ public actor UnixSocketMCPTransport: Transport {
 
         switch terminal {
         case let .error(error):
-            tearDownSocket(error: error)
+            tearDownSocket(
+                error: error,
+                cause: .readError,
+                initiator: .transport,
+                errno: Self.errnoValue(from: error)
+            )
         case let .eof(hasResidualData):
             mcpConnectionLog("UnixSocketMCPTransport received EOF")
             guard hasResidualData else {
-                tearDownSocket(error: nil)
+                tearDownSocket(
+                    error: nil,
+                    cause: .peerEOF,
+                    initiator: .peer
+                )
                 return
             }
             // Treat residual incomplete frame as a protocol error
             let truncationError = MCPError.internalError("Connection closed with incomplete frame data")
-            tearDownSocket(error: truncationError)
+            tearDownSocket(
+                error: truncationError,
+                cause: .incompleteEOF,
+                initiator: .peer
+            )
         }
     }
 
@@ -1360,7 +1455,9 @@ public actor UnixSocketMCPTransport: Transport {
     private func signalClosedOnce() {
         guard !closeSignaled else { return }
         closeSignaled = true
-        closeChannel.continuation.yield()
+        if let firstCloseSnapshot {
+            closeChannel.continuation.yield(firstCloseSnapshot)
+        }
         closeChannel.continuation.finish()
     }
 }
