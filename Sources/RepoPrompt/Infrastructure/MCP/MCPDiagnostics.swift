@@ -1,7 +1,91 @@
 import Foundation
+import RepoPromptShared
 
-enum MCPTransportTerminalCause: String, Equatable {
+public enum MCPTransportTerminalCause: String, Codable, Equatable, Sendable {
+    case peerEOF = "peer_eof"
+    case incompleteEOF = "incomplete_eof"
+    case readError = "read_error"
+    case writeFailure = "write_failure"
+    case writeStall = "write_stall"
+    case writeHangup = "write_hangup"
     case receiveBufferOverflow = "receive_buffer_overflow"
+    case localDisconnect = "local_disconnect"
+    case connectFailure = "connect_failure"
+    case connectCancelled = "connect_cancelled"
+}
+
+public struct MCPTransportCloseSnapshot: Equatable, Sendable {
+    public let cause: MCPTransportTerminalCause
+    public let initiator: MCPTerminalInitiator
+    public let errno: Int32?
+    public let errorDescription: String?
+}
+
+struct MCPFirstTerminalRecordClaim: Equatable {
+    private(set) var record: MCPTerminalRecord?
+    private(set) var didPersist = false
+
+    mutating func claim(_ candidate: MCPTerminalRecord) -> MCPTerminalRecord? {
+        guard !didPersist else { return nil }
+        if record == nil {
+            record = candidate
+        }
+        return record
+    }
+
+    mutating func markPersisted() {
+        guard record != nil else { return }
+        didPersist = true
+    }
+}
+
+struct MCPConnectionCloseContext: Equatable {
+    let reason: String
+    let initiator: MCPTerminalInitiator
+    let errno: Int32?
+    let errorDescription: String?
+
+    init(
+        reason: String,
+        initiator: MCPTerminalInitiator,
+        errno: Int32? = nil,
+        errorDescription: String? = nil
+    ) {
+        self.reason = reason
+        self.initiator = initiator
+        self.errno = errno
+        self.errorDescription = errorDescription
+    }
+
+    init(transport snapshot: MCPTransportCloseSnapshot) {
+        self.init(
+            reason: snapshot.cause.rawValue,
+            initiator: snapshot.initiator,
+            errno: snapshot.errno,
+            errorDescription: snapshot.errorDescription
+        )
+    }
+
+    static func startupFailure(
+        error: Swift.Error,
+        transportSnapshot: MCPTransportCloseSnapshot?
+    ) -> MCPConnectionCloseContext {
+        if let transportSnapshot {
+            return MCPConnectionCloseContext(transport: transportSnapshot)
+        }
+        return MCPConnectionCloseContext(
+            reason: error is CancellationError
+                ? "connection_start_cancelled"
+                : "connection_start_failure",
+            initiator: .app,
+            errorDescription: String(describing: error)
+        )
+    }
+
+    static let cleanupUnspecified = MCPConnectionCloseContext(
+        reason: "connection_cleanup_unspecified",
+        initiator: .unknown
+    )
 }
 
 struct MCPTransportIngressSnapshot: Equatable {

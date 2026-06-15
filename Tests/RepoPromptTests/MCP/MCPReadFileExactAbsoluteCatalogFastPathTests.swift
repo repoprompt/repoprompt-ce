@@ -237,6 +237,35 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         XCTAssertNil(sessionLogicalHit)
     }
 
+    func testReadFreshnessTargetsOnlyRequestedPhysicalWorktree() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "ReadFreshnessLogical")
+        let worktreeA = try makeTemporaryRoot(name: "ReadFreshnessWorktreeA")
+        let worktreeB = try makeTemporaryRoot(name: "ReadFreshnessWorktreeB")
+        let worktreeAFile = worktreeA.appendingPathComponent("Sources/A.swift")
+        try write("worktree a", to: worktreeAFile)
+        try write("worktree b", to: worktreeB.appendingPathComponent("Sources/B.swift"))
+
+        let store = WorkspaceFileContextStore()
+        let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
+        let worktreeARecord = try await store.loadRoot(path: worktreeA.path, kind: .sessionWorktree)
+        let worktreeBRecord = try await store.loadRoot(path: worktreeB.path, kind: .sessionWorktree)
+        let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+            canonicalRootPaths: [logicalRoot.path],
+            physicalRootPaths: [worktreeA.path, worktreeB.path]
+        )
+        let roots = await store.rootRefs(scope: scope)
+        let service = WorkspaceReadableFileService(store: store)
+
+        try await service.awaitFreshnessForExplicitRequest(worktreeAFile.path, rootRefs: roots)
+
+        let logicalStats = await store.scopedIngressBarrierStatsForTesting(rootID: logicalRecord.id)
+        let worktreeAStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeARecord.id)
+        let worktreeBStats = await store.scopedIngressBarrierStatsForTesting(rootID: worktreeBRecord.id)
+        XCTAssertEqual(logicalStats.launchCount, 0)
+        XCTAssertEqual(worktreeAStats.launchCount, 1)
+        XCTAssertEqual(worktreeBStats.launchCount, 0)
+    }
+
     func testProviderTranslationPrecedesScopedReadDependencyCall() throws {
         let source = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
         let translation = try XCTUnwrap(source.range(of: "let resolvedPath = lookupContext.translateInputPath(path)"))

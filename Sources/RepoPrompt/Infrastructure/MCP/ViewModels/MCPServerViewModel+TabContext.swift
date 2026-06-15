@@ -1704,6 +1704,11 @@ extension MCPServerViewModel {
         guard let resolved else {
             return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
         }
+        if resolved.usesActiveTabCompatibility,
+           resolved.snapshot.activeAgentSessionID == nil
+        {
+            return WorkspaceLookupContext(rootScope: baseScope, bindingProjection: nil)
+        }
         if let frozenLookupContext = resolved.snapshot.frozenLookupContext {
             return frozenLookupContext
         }

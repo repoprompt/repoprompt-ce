@@ -113,7 +113,8 @@ struct MCPWindowToolDependencies {
         _ display: FilePathDisplay,
         _ extraInvalid: [String],
         _ viewMode: String?,
-        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot
+        _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
+        _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildSelectionPreviewReply = @MainActor @Sendable (
         _ selection: StoredSelection,
@@ -131,7 +132,8 @@ struct MCPWindowToolDependencies {
         _ extraInvalid: [String],
         _ viewMode: String?,
         _ codeMapUsageOverride: CodeMapUsage?,
-        _ virtualContext: MCPServerViewModel.TabScopedContext?
+        _ virtualContext: MCPServerViewModel.TabScopedContext?,
+        _ lookupContext: WorkspaceLookupContext
     ) async throws -> ToolResultDTOs.SelectionReply
     typealias BuildManageSelectionSetSelection = @MainActor @Sendable (
         _ inputs: MCPServerViewModel.ManageSelectionInputs,

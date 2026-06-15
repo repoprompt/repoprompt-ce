@@ -7,6 +7,7 @@ import XCTest
 final class MCPToolExecutionContractTests: XCTestCase {
     func testCentralTimeoutPolicyMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
+        XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
         XCTAssertEqual(MCPTimeoutPolicy.responseSendDeadlineSeconds, 30)

@@ -12,10 +12,6 @@ import RepoPromptShared
 import SwiftUI
 
 #if DEBUG
-    import CryptoKit
-#endif
-
-#if DEBUG
     private var mcpConnectionManagerDebugLoggingEnabled = ProcessInfo.processInfo.environment["REPOPROMPT_MCP_DEBUG"] == "1"
     private var mcpRoutingDebugLoggingEnabled = false
     private var mcpPolicyDebugLoggingEnabled = false
@@ -877,6 +873,8 @@ actor ServerNetworkManager {
     private var executionWatchdogTerminalConnections: Set<UUID> = []
     private var toolExecutionWatchdogEnvironment = MCPToolExecutionWatchdogEnvironment.continuous()
     private var connectionLifecycleGenerationByID: [UUID: UInt64] = [:]
+    private var bootstrapPeerPIDByConnectionID: [UUID: Int] = [:]
+    private var terminalRecordClaimsByConnectionID: [UUID: MCPFirstTerminalRecordClaim] = [:]
     private var connectionTasks: [UUID: Task<Void, Never>] = [:]
     private var pendingConnections: [UUID: String] = [:]
 
@@ -3766,7 +3764,7 @@ actor ServerNetworkManager {
         guard !connections.isEmpty else { return }
         let now = Date()
         let connectingTimeout = TimeInterval(connectingTimeoutSeconds)
-        var toRemove: [UUID] = []
+        var toRemove: [(UUID, MCPConnectionCloseContext)] = []
 
         for (id, mgr) in connections {
             if let expectedLifecycleGeneration {
@@ -3777,11 +3775,17 @@ actor ServerNetworkManager {
                 guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             }
             if case .failed = state {
-                toRemove.append(id)
+                toRemove.append((
+                    id,
+                    MCPConnectionCloseContext(reason: "maintenance_prune_failed", initiator: .app)
+                ))
                 continue
             }
             if case .cancelled = state {
-                toRemove.append(id)
+                toRemove.append((
+                    id,
+                    MCPConnectionCloseContext(reason: "maintenance_prune_cancelled", initiator: .app)
+                ))
                 continue
             }
             let viable = await mgr.isViableForRetention()
@@ -3789,7 +3793,10 @@ actor ServerNetworkManager {
                 guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             }
             if !viable {
-                toRemove.append(id)
+                toRemove.append((
+                    id,
+                    MCPConnectionCloseContext(reason: "maintenance_prune_nonviable", initiator: .app)
+                ))
                 continue
             }
             if connectingTimeout > 0, state == .connecting {
@@ -3797,16 +3804,19 @@ actor ServerNetworkManager {
                    now.timeIntervalSince(createdAt) > connectingTimeout
                 {
                     log.warning("Pruning connection \(id) stuck in connecting for \(Int(now.timeIntervalSince(createdAt)))s")
-                    toRemove.append(id)
+                    toRemove.append((
+                        id,
+                        MCPConnectionCloseContext(reason: "maintenance_prune_connect_timeout", initiator: .app)
+                    ))
                 }
             }
         }
 
-        for id in toRemove {
+        for (id, context) in toRemove {
             if let expectedLifecycleGeneration {
                 guard isCurrentLifecycle(expectedLifecycleGeneration) else { return }
             }
-            await removeConnection(id)
+            await removeConnection(id, context: context)
         }
     }
 
@@ -3865,7 +3875,11 @@ actor ServerNetworkManager {
         _ = await removeConnection(
             victim.id,
             committedRemoval: committedRemoval,
-            connectionAlreadyStopped: false
+            connectionAlreadyStopped: false,
+            context: MCPConnectionCloseContext(
+                reason: "pressure_eviction",
+                initiator: .app
+            )
         )
     }
 
@@ -4561,6 +4575,14 @@ actor ServerNetworkManager {
         #endif
         Task { [weak self] in
             guard let self else { return }
+            let closeContext = MCPConnectionCloseContext(
+                reason: TerminationReason.connectionReplaced.rawValue,
+                initiator: .app
+            )
+            await persistAcceptedSocketTerminalRecord(
+                connectionID: committedRemoval.connectionID,
+                context: closeContext
+            )
             let race = MCPConnectionStopRace()
             Task {
                 await committedRemoval.connection.stop()
@@ -4584,7 +4606,8 @@ actor ServerNetworkManager {
             _ = await removeConnection(
                 committedRemoval.connectionID,
                 committedRemoval: committedRemoval,
-                connectionAlreadyStopped: true
+                connectionAlreadyStopped: true,
+                context: closeContext
             )
         }
     }
@@ -4711,6 +4734,7 @@ actor ServerNetworkManager {
         mcpACPLog("[MCP-ACP] registered bootstrap connection connection=\(connectionID) pendingClientName=\(clientName ?? "unknown")")
 
         connections[connectionID] = manager
+        bootstrapPeerPIDByConnectionID[connectionID] = clientPid
         callLimiters[connectionID] = MCPConnectionCallLimiters(
             limit: limiterLimit(for: connectionID),
             controlLimit: controlLimiterLimit(for: connectionID),
@@ -4858,7 +4882,13 @@ actor ServerNetworkManager {
             do {
                 guard let approvalHandler = self.connectionApprovalHandler else {
                     log.error("No connection approval handler set, rejecting bootstrap connection")
-                    await removeConnection(connectionID)
+                    await removeConnection(
+                        connectionID,
+                        context: MCPConnectionCloseContext(
+                            reason: "connection_approval_handler_unavailable",
+                            initiator: .app
+                        )
+                    )
                     return
                 }
 
@@ -5005,8 +5035,15 @@ actor ServerNetworkManager {
             } catch {
                 startupOutcome = error is CancellationError ? "cancelled" : "error"
                 log.error("Bootstrap connection \(connectionID) start failed: \(error)")
+                let transportSnapshot = await manager.startupFailureTransportCloseSnapshot()
                 guard self.isCurrentConnection(connectionID, lifecycleGeneration: expectedLifecycleGeneration) else { return }
-                await removeConnection(connectionID)
+                await removeConnection(
+                    connectionID,
+                    context: MCPConnectionCloseContext.startupFailure(
+                        error: error,
+                        transportSnapshot: transportSnapshot
+                    )
+                )
             }
         }
     }
@@ -5057,6 +5094,16 @@ actor ServerNetworkManager {
         let connectionsToStop = connections.compactMap { connectionID, connectionManager -> (UUID, any MCPServerConnection)? in
             guard connectionLifecycleGenerationByID[connectionID] == stoppedLifecycleGeneration else { return nil }
             return (connectionID, connectionManager)
+        }
+        let shutdownContext = MCPConnectionCloseContext(
+            reason: "server_shutdown",
+            initiator: .app
+        )
+        for (connectionID, _) in connectionsToStop {
+            persistAcceptedSocketTerminalRecord(
+                connectionID: connectionID,
+                context: shutdownContext
+            )
         }
         let limitersToStop = Array(callLimiters)
         let committingBootstrapConnectionsToStop = bootstrapReservations.values.compactMap { reservation in
@@ -5109,6 +5156,7 @@ actor ServerNetworkManager {
             connectionTasks[id]?.cancel()
             connections.removeValue(forKey: id)
             connectionLifecycleGenerationByID.removeValue(forKey: id)
+            bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
             connectionTasks.removeValue(forKey: id)
             pendingConnections.removeValue(forKey: id)
             identityContextByConnection.removeValue(forKey: id)
@@ -5126,6 +5174,9 @@ actor ServerNetworkManager {
         connectionIDBySessionToken.removeAll()
         sessionTokenBindingGeneration.removeAll()
         resetInMemoryRoutingCachesForRestart()
+        for (connectionID, _) in connectionsToStop {
+            terminalRecordClaimsByConnectionID.removeValue(forKey: connectionID)
+        }
 
         for (_, limiters) in limitersToStop {
             await limiters.cancelAll()
@@ -5133,7 +5184,7 @@ actor ServerNetworkManager {
         for (connectionID, _) in limitersToStop {
             let cancelledToolCount = await cancelActiveToolsOwnedByConnection(
                 connectionID,
-                reason: "serverShutdown"
+                reason: shutdownContext.reason
             )
             if cancelledToolCount > 0 {
                 connectionLog(
@@ -5152,7 +5203,7 @@ actor ServerNetworkManager {
         for (id, connectionManager) in connectionsToStop {
             connectionLog("Stopping connection: \(id)")
             #if DEBUG
-                debugRecordConnectionEvent("removed", connectionID: id, reason: "serverShutdown")
+                debugRecordConnectionEvent("removed", connectionID: id, reason: shutdownContext.reason)
             #endif
             await connectionManager.stop()
         }
@@ -5371,6 +5422,12 @@ actor ServerNetworkManager {
         #if DEBUG
             debugRecordConnectionEvent("terminated", connectionID: id, reason: reason.rawValue, sessionToken: sessionToken)
         #endif
+        let closeContext = MCPConnectionCloseContext(
+            reason: reason.rawValue,
+            initiator: .app,
+            errorDescription: message
+        )
+        persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
 
         // 1. Write kill signal file (works for both transport types)
         if sem.writeKillSignal, let token = sessionToken {
@@ -5401,7 +5458,7 @@ actor ServerNetworkManager {
         await connection.terminate(reason: reason, message: message)
 
         // 4. Clean up connection state
-        await removeConnection(id)
+        await removeConnection(id, context: closeContext)
 
         connectionLog("Successfully terminated and removed connection \(id)")
 
@@ -5422,8 +5479,14 @@ actor ServerNetworkManager {
         #if DEBUG
             debugRecordConnectionEvent("soft_disconnected", connectionID: id, reason: reason.rawValue)
         #endif
+        let closeContext = MCPConnectionCloseContext(
+            reason: reason.rawValue,
+            initiator: .app,
+            errorDescription: message
+        )
+        persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
         await connection.stop()
-        await removeConnection(id)
+        await removeConnection(id, context: closeContext)
     }
 
     private func currentBootstrapReplacementConnectionID(forSessionToken token: String) -> UUID? {
@@ -5504,6 +5567,37 @@ actor ServerNetworkManager {
         capabilityTokenByConnection[connectionID] ?? connections[connectionID]?.capabilityToken
     }
 
+    private func persistAcceptedSocketTerminalRecord(
+        connectionID: UUID,
+        context: MCPConnectionCloseContext
+    ) {
+        guard let peerPID = bootstrapPeerPIDByConnectionID[connectionID] else { return }
+
+        let candidate = MCPTerminalRecord(
+            layer: .appAcceptedSocket,
+            initiator: context.initiator,
+            reason: context.reason,
+            sessionToken: sessionToken(for: connectionID),
+            localPID: Int(getpid()),
+            peerPID: peerPID,
+            appConnectionID: connectionID,
+            connectionGeneration: connectionLifecycleGenerationByID[connectionID],
+            errno: context.errno,
+            errorDescription: context.errorDescription
+        )
+        var claim = terminalRecordClaimsByConnectionID[connectionID] ?? MCPFirstTerminalRecordClaim()
+        guard let record = claim.claim(candidate) else { return }
+        terminalRecordClaimsByConnectionID[connectionID] = claim
+
+        if MCPTerminalRecordStore.writeBestEffort(
+            record,
+            to: MCPFilesystemConstants.eventsDirectoryURL()
+        ) != nil {
+            claim.markPersisted()
+            terminalRecordClaimsByConnectionID[connectionID] = claim
+        }
+    }
+
     /// Handles connection replacement when a new connection registers with the same runID.
     /// Uses soft-disconnect for same-session replacements to avoid blocking legitimate reconnects.
     func handleConnectionReplaced(
@@ -5579,12 +5673,22 @@ actor ServerNetworkManager {
         connectionID: UUID,
         clientName: String?,
         sessionToken: String?,
-        snapshot: MCPTransportIngressSnapshot
+        snapshot: MCPTransportIngressSnapshot,
+        closeSnapshot: MCPTransportCloseSnapshot
     ) {
-        guard snapshot.terminalCause == .receiveBufferOverflow else { return }
-        log.error(
-            "MCP connection \(connectionID) ingress terminated: cause=\(MCPTransportTerminalCause.receiveBufferOverflow.rawValue) capacity=\(snapshot.receiveBufferCapacity) highWaterMark=\(snapshot.receiveBufferHighWaterMark)"
+        persistAcceptedSocketTerminalRecord(
+            connectionID: connectionID,
+            context: MCPConnectionCloseContext(transport: closeSnapshot)
         )
+        if snapshot.terminalCause == .receiveBufferOverflow {
+            log.error(
+                "MCP connection \(connectionID) ingress terminated: cause=\(closeSnapshot.cause.rawValue) capacity=\(snapshot.receiveBufferCapacity) highWaterMark=\(snapshot.receiveBufferHighWaterMark)"
+            )
+        } else {
+            connectionLog(
+                "MCP connection \(connectionID) transport terminated: cause=\(closeSnapshot.cause.rawValue)"
+            )
+        }
         #if DEBUG
             let retained = DebugRetainedTransportIngress(
                 snapshot: snapshot,
@@ -5603,7 +5707,7 @@ actor ServerNetworkManager {
                 debugRecordConnectionEvent(
                     "transport_terminal",
                     connectionID: connectionID,
-                    reason: MCPTransportTerminalCause.receiveBufferOverflow.rawValue,
+                    reason: closeSnapshot.cause.rawValue,
                     clientName: clientName,
                     sessionToken: sessionToken,
                     transportIngress: snapshot
@@ -5637,6 +5741,12 @@ actor ServerNetworkManager {
                 reason: "tool_execution_watchdog"
             )
         #endif
+        let closeContext = MCPConnectionCloseContext(
+            reason: "tool_execution_watchdog",
+            initiator: .app,
+            errorDescription: "Unresponsive tool execution exceeded the watchdog deadline"
+        )
+        persistAcceptedSocketTerminalRecord(connectionID: id, context: closeContext)
 
         let connection: (any MCPServerConnection)? = if let registeredConnection = connections[id] {
             registeredConnection
@@ -5650,7 +5760,7 @@ actor ServerNetworkManager {
         guard let connection else { return }
         await connection.abortForExecutionWatchdog()
         Task { [weak self] in
-            await self?.removeConnection(id)
+            await self?.removeConnection(id, context: closeContext)
         }
     }
 
@@ -5715,15 +5825,24 @@ actor ServerNetworkManager {
         }
     }
 
-    func removeConnection(_ id: UUID) async {
-        _ = await removeConnection(id, committedRemoval: nil, connectionAlreadyStopped: false)
+    func removeConnection(
+        _ id: UUID,
+        context: MCPConnectionCloseContext = .cleanupUnspecified
+    ) async {
+        _ = await removeConnection(
+            id,
+            committedRemoval: nil,
+            connectionAlreadyStopped: false,
+            context: context
+        )
     }
 
     @discardableResult
     private func removeConnection(
         _ id: UUID,
         committedRemoval: CommittedConnectionRemoval?,
-        connectionAlreadyStopped: Bool
+        connectionAlreadyStopped: Bool,
+        context: MCPConnectionCloseContext
     ) async -> Bool {
         if let committedRemoval {
             guard committedRemoval.connectionID == id,
@@ -5739,21 +5858,6 @@ actor ServerNetworkManager {
                 connectionLog("removeConnection: \(id) cleanup already in progress; ignoring duplicate call")
                 return false
             }
-        }
-
-        // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
-        // but this is a leak safety-net for edge cases)
-        if let reservation = bootstrapReservations.removeValue(forKey: id) {
-            releaseBootstrapAdmissionClaim(
-                sessionToken: reservation.sessionToken,
-                connectionID: id,
-                lifecycleGeneration: reservation.lifecycleGeneration
-            )
-            closeTransferredBootstrapSocket(
-                connectionID: id,
-                lifecycleGeneration: reservation.lifecycleGeneration
-            )
-            await reservation.committingConnection?.stop()
         }
 
         // Idempotent guard – if already gone, do nothing (and do not log)
@@ -5773,6 +5877,26 @@ actor ServerNetworkManager {
         }
         defer { connectionsBeingRemoved.remove(id) }
 
+        // Claim and persist the first terminal cause before any suspension.
+        // Later termination/watchdog cleanup must not overwrite the event that
+        // actually initiated removal.
+        persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
+
+        // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
+        // but this is a leak safety-net for edge cases)
+        if let reservation = bootstrapReservations.removeValue(forKey: id) {
+            releaseBootstrapAdmissionClaim(
+                sessionToken: reservation.sessionToken,
+                connectionID: id,
+                lifecycleGeneration: reservation.lifecycleGeneration
+            )
+            closeTransferredBootstrapSocket(
+                connectionID: id,
+                lifecycleGeneration: reservation.lifecycleGeneration
+            )
+            await reservation.committingConnection?.stop()
+        }
+
         connectionLog("Removing connection: \(id)")
 
         let limiters = callLimiters.removeValue(forKey: id)
@@ -5786,7 +5910,7 @@ actor ServerNetworkManager {
             debugRecordConnectionEvent(
                 "removed",
                 connectionID: id,
-                reason: "connectionRemoved",
+                reason: context.reason,
                 clientName: cleanupClientName,
                 sessionToken: sessionToken,
                 windowID: assignedWindowID
@@ -5805,7 +5929,7 @@ actor ServerNetworkManager {
 
         let cancelledToolCount = await cancelActiveToolsOwnedByConnection(
             id,
-            reason: "connectionRemoved"
+            reason: context.reason
         )
         if cancelledToolCount > 0 {
             connectionLog("Cancelled \(cancelledToolCount) active tool execution(s) owned by disconnected connection \(id)")
@@ -5832,6 +5956,7 @@ actor ServerNetworkManager {
         // Remove from all collections
         connections.removeValue(forKey: id)
         connectionLifecycleGenerationByID.removeValue(forKey: id)
+        bootstrapPeerPIDByConnectionID.removeValue(forKey: id)
         connectionTasks.removeValue(forKey: id)
         pendingConnections.removeValue(forKey: id)
         connectionStats.removeValue(forKey: id)
@@ -5850,6 +5975,7 @@ actor ServerNetworkManager {
         // Clean up routing metadata before any bounded drain wait so the disconnected
         // connection cannot remain discoverable while an active owner ignores cancellation.
         unbindSessionToken(sessionToken, forConnectionID: id)
+        terminalRecordClaimsByConnectionID.removeValue(forKey: id)
 
         if let limiters {
             let results = await limiters.waitUntilIdle(
@@ -6904,11 +7030,7 @@ actor ServerNetworkManager {
             }
 
             func debugSessionFingerprint(forToken token: String?) -> String? {
-                guard let token, !token.isEmpty else { return nil }
-                let salted = "RepoPrompt.DEBUG.MCP.session:\(token)"
-                let digest = SHA256.hash(data: Data(salted.utf8))
-                let hex = digest.prefix(8).map { String(format: "%02x", $0) }.joined()
-                return "sha256:\(hex)"
+                MCPTerminalFingerprint.session(token)?.description
             }
 
             func debugSessionFingerprint(forConnection connectionID: UUID) -> String? {
@@ -8114,7 +8236,13 @@ actor ServerNetworkManager {
             #if DEBUG
                 debugExecutionWatchdogAbortTargets.removeValue(forKey: id)
             #endif
-            await removeConnection(id)
+            await removeConnection(
+                id,
+                context: MCPConnectionCloseContext(
+                    reason: "debug_remove_connection",
+                    initiator: .app
+                )
+            )
         }
 
         #if DEBUG
@@ -12877,7 +13005,11 @@ actor ServerNetworkManager {
             _ = await removeConnection(
                 victim.id,
                 committedRemoval: committedRemoval,
-                connectionAlreadyStopped: false
+                connectionAlreadyStopped: false,
+                context: MCPConnectionCloseContext(
+                    reason: "per_client_admission_eviction",
+                    initiator: .app
+                )
             )
             return .evicted
         }
@@ -13032,7 +13164,11 @@ actor ServerNetworkManager {
                 _ = await removeConnection(
                     victim.id,
                     committedRemoval: committedRemoval,
-                    connectionAlreadyStopped: false
+                    connectionAlreadyStopped: false,
+                    context: MCPConnectionCloseContext(
+                        reason: "global_admission_eviction_lifecycle_invalidated",
+                        initiator: .app
+                    )
                 )
                 return .admissionContextInvalidated
             }
@@ -13093,7 +13229,11 @@ actor ServerNetworkManager {
                 _ = await removeConnection(
                     victim.id,
                     committedRemoval: committedRemoval,
-                    connectionAlreadyStopped: false
+                    connectionAlreadyStopped: false,
+                    context: MCPConnectionCloseContext(
+                        reason: "global_admission_eviction_restore_failed",
+                        initiator: .app
+                    )
                 )
                 guard isCurrentBootstrapAdmissionContext(
                     sourceListener: sourceListener,
@@ -13119,7 +13259,11 @@ actor ServerNetworkManager {
             _ = await removeConnection(
                 victim.id,
                 committedRemoval: committedRemoval,
-                connectionAlreadyStopped: false
+                connectionAlreadyStopped: false,
+                context: MCPConnectionCloseContext(
+                    reason: "global_admission_eviction",
+                    initiator: .app
+                )
             )
             guard isCurrentBootstrapAdmissionContext(
                 sourceListener: sourceListener,

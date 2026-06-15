@@ -1855,6 +1855,10 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
         }
 
         func installPeerWindowLookupSnapshot() async throws {
+            routingGuardWindow.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, tabID in
+                guard sessionID == Self.agentSessionID, tabID == Self.tabID else { return .unavailable }
+                return .hydrated([])
+            }
             var peerWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
             peerWorkspace.activeComposeTabID = Self.tabID
             let unrelatedSelection = StoredSelection(selectedPaths: ["/tmp/unrelated-workspace.swift"])

@@ -157,7 +157,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionConstruction, transition: .completed)
             try Task.checkCancellation()
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction)
-            let reply = try await dependencies.buildCurrentSelectionReply(includeBlocks, display, extraInvalid, view, resolvedContext)
+            let reply = try await dependencies.buildCurrentSelectionReply(includeBlocks, display, extraInvalid, view, resolvedContext, lookupContext)
             await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction, transition: .completed)
             try Task.checkCancellation()
             return reply
@@ -226,6 +226,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             return try await persistAndReply(
                 resolvedContext: &resolvedContext,
                 metadata: metadata,
+                lookupContext: lookupContext,
                 baseContext: context,
                 selection: currentSelection,
                 includeBlocks: includeBlocks,
@@ -296,7 +297,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             for msg in codemapUnavailableMsgs where !combinedInvalid.contains(msg) {
                 combinedInvalid.append(msg)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: currentSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: currentSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
         case "remove":
             if physicalSelectionPaths.isEmpty, physicalSliceInputs.isEmpty { throw MCPError.invalidParams("paths or slices required for remove") }
             if mode == "codemap_only", !physicalSliceInputs.isEmpty { throw MCPError.invalidParams("mode 'codemap_only' cannot be used with slices") }
@@ -345,7 +346,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             for error in sliceParseErrors where !combinedInvalid.contains(error) {
                 combinedInvalid.append(error)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: currentSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: currentSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
         case "promote":
             let context = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=promote paths=\(selectionPaths.count) tab=\(context.tabID)")
@@ -361,7 +362,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 let hint = await dependencies.makeSelectionHintError(rawPaths, "promote", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: newSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: newSelection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
         case "demote":
             let context = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=demote paths=\(selectionPaths.count) tab=\(context.tabID)")
@@ -380,7 +381,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
                 let hint = await dependencies.makeSelectionHintError(rawPaths, "demote", lookupContext)
                 throw MCPError.invalidParams(hint)
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: context, selection: demoteResult.selection, includeBlocks: includeBlocks, display: display, extraInvalid: combinedInvalid, view: view)
         case "clear":
             let baseContext = resolvedContext.snapshot
             selectionLog("[Virtual] manage_selection op=clear mode=\(mode) tab=\(baseContext.tabID)")
@@ -389,7 +390,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             } else {
                 StoredSelection()
             }
-            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, baseContext: baseContext, selection: clearedSelection, includeBlocks: includeBlocks, display: display, extraInvalid: extraInvalid, view: view)
+            return try await persistAndReply(resolvedContext: &resolvedContext, metadata: metadata, lookupContext: lookupContext, baseContext: baseContext, selection: clearedSelection, includeBlocks: includeBlocks, display: display, extraInvalid: extraInvalid, view: view)
         default:
             throw MCPError.invalidParams("Unsupported op '\(op)' for manage_selection when tab context is active")
         }
@@ -398,6 +399,7 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     private func persistAndReply(
         resolvedContext: inout MCPServerViewModel.ResolvedTabContextSnapshot,
         metadata: MCPServerViewModel.RequestMetadata,
+        lookupContext: WorkspaceLookupContext,
         baseContext: MCPServerViewModel.TabScopedContext,
         selection: StoredSelection,
         includeBlocks: Bool,
@@ -430,7 +432,8 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
             extraInvalid,
             view,
             codeMapOverride,
-            resolvedContext.usesActiveTabCompatibility ? nil : replyContext
+            resolvedContext.usesActiveTabCompatibility ? nil : replyContext,
+            lookupContext
         )
         await MCPToolExecutionHandlerPhaseContext.report(.manageSelectionReplyConstruction, transition: .completed)
         try Task.checkCancellation()

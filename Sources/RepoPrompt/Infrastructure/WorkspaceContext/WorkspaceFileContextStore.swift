@@ -2626,18 +2626,31 @@ actor WorkspaceFileContextStore {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
     }
 
+    func awaitAppliedIngress(rootRefs: [WorkspaceRootRef]) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootRefs.map(\.id))
+    }
+
     func contentSearchFreshnessPolicy(
         rootScope: WorkspaceLookupRootScope,
         appliedIngressSamples: [WorkspaceIngressBarrierSample]
     ) async -> FileContentFreshnessPolicy {
-        let scopedRoots = rootsForPathLookup(scope: rootScope)
-        guard !scopedRoots.isEmpty,
-              appliedIngressSamples.count == scopedRoots.count
+        await contentSearchFreshnessPolicy(
+            rootRefs: rootRefs(scope: rootScope),
+            appliedIngressSamples: appliedIngressSamples
+        )
+    }
+
+    func contentSearchFreshnessPolicy(
+        rootRefs: [WorkspaceRootRef],
+        appliedIngressSamples: [WorkspaceIngressBarrierSample]
+    ) async -> FileContentFreshnessPolicy {
+        guard !rootRefs.isEmpty,
+              appliedIngressSamples.count == rootRefs.count
         else {
             return .validateDiskMetadata
         }
         let samplesByRootID = Dictionary(uniqueKeysWithValues: appliedIngressSamples.map { ($0.rootID, $0) })
-        for root in scopedRoots {
+        for root in rootRefs {
             guard let state = rootStatesByID[root.id],
                   let sample = samplesByRootID[root.id],
                   await state.service.canUseCachedSearchContent(
@@ -5847,6 +5860,13 @@ actor WorkspaceFileContextStore {
             return lookupResult(input: relativePath, root: state.root, correctedPath: folder.standardizedRelativePath)
         }
         return nil
+    }
+
+    func lookupDiscoverablePath(rootID: UUID, relativePath: String) -> WorkspacePathLookupResult? {
+        guard let result = lookupPath(rootID: rootID, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
     }
 
     func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
