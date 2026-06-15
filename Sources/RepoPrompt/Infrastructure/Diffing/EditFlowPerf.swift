@@ -744,6 +744,7 @@ enum EditFlowPerf {
             static let formatResultReturned: StaticString = "MCP.ToolCall.FormatResultReturned"
             static let resolvedProviderBegan: StaticString = "MCP.ToolCall.ResolvedProviderBegan"
             static let resolvedProviderEnded: StaticString = "MCP.ToolCall.ResolvedProviderEnded"
+            static let resourceAdmissionReleased: StaticString = "MCP.ToolCall.ResourceAdmissionReleased"
             static let handlerResultReady: StaticString = "MCP.ToolCall.HandlerResultReady"
         }
 

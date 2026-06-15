@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import MCP
 @testable import RepoPrompt
 import XCTest
 
@@ -339,7 +340,398 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         #endif
     }
 
-    func testAuthoritativePIDOwnedAgentModeRouteReplacesLiveAffinityForEveryRole() async throws {
+    @MainActor
+    func testPolicyInstallFreezesBlankTabStateBeforeFirstSelectionGet() async throws {
+        #if DEBUG
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("PolicyBlankTab-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            defer { try? FileManager.default.removeItem(at: root) }
+            let selectedFile = root.appendingPathComponent("version.env")
+            try "VERSION=1\n".write(to: selectedFile, atomically: true, encoding: .utf8)
+
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let seedTabID = UUID()
+            let blankTabIDs = [UUID(), UUID()]
+            let seedSelection = StoredSelection(
+                selectedPaths: [selectedFile.path],
+                slices: [selectedFile.path: [LineRange(start: 1, end: 1)]],
+                codemapAutoEnabled: false
+            )
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Policy blank state \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let initialSwitchResult = await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "policyBlankStateInitial"
+            )
+            XCTAssertEqual(initialSwitchResult, .switched)
+            let workspaceIndex = try XCTUnwrap(
+                window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+            )
+            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+                ComposeTabState(
+                    id: seedTabID,
+                    name: "Seed",
+                    selection: seedSelection,
+                    promptText: "seed prompt"
+                ),
+                ComposeTabState(id: blankTabIDs[0], name: "Agent 1"),
+                ComposeTabState(id: blankTabIDs[1], name: "Agent 2")
+            ]
+            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = seedTabID
+            let reloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+                window.workspaceManager.workspaces[workspaceIndex],
+                reason: "policyBlankStateTabs"
+            )
+            XCTAssertEqual(reloadResult, .switched)
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            await window.workspaceFilesViewModel.applyStoredSelection(seedSelection)
+            window.promptManager.promptText = "seed prompt"
+            XCTAssertEqual(window.workspaceFilesViewModel.snapshotSelection(), seedSelection)
+
+            let tools = await window.mcpServer.windowMCPTools
+            let manageSelection = try XCTUnwrap(
+                tools.first { $0.name == MCPWindowToolName.manageSelection }
+            )
+
+            for (index, blankTabID) in blankTabIDs.enumerated() {
+                window.workspaceManager.beginApplyingTabContext(forTabID: blankTabID)
+                let currentWorkspaceIndex = try XCTUnwrap(
+                    window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+                )
+                window.workspaceManager.workspaces[currentWorkspaceIndex].activeComposeTabID = blankTabID
+                window.promptManager.loadComposeTabsFromWorkspace(
+                    window.workspaceManager.workspaces[currentWorkspaceIndex]
+                )
+                XCTAssertEqual(window.workspaceFilesViewModel.snapshotSelection(), seedSelection)
+
+                let runID = UUID()
+                let connectionID = UUID()
+                await installAuthoritativePolicy(
+                    runID: runID,
+                    tabID: blankTabID,
+                    windowID: window.windowID
+                )
+                await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+                let result = await manager.debugApplyPendingPolicy(
+                    clientName: clientName,
+                    connectionID: connectionID,
+                    clientPid: Int(getpid()),
+                    bootstrapClientName: "repoprompt_ce_cli_debug",
+                    sessionKey: "blank-policy-\(index)-\(UUID().uuidString)",
+                    pidGateTimeout: 0.25,
+                    requireRunRouting: true
+                )
+                XCTAssertEqual(result.outcome, "applied")
+                XCTAssertEqual(result.runID, runID)
+
+                let bound = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+                XCTAssertEqual(bound.tabID, blankTabID)
+                XCTAssertEqual(bound.selection, StoredSelection())
+
+                let firstGet = try await ServerNetworkManager.withConnectionID(connectionID) {
+                    try await manageSelection([
+                        "op": .string("get"),
+                        "view": .string("files"),
+                        "path_display": .string("full")
+                    ])
+                }
+                let object = try XCTUnwrap(firstGet.objectValue)
+                XCTAssertTrue((object["files"]?.arrayValue ?? []).isEmpty)
+                XCTAssertTrue((object["file_slices"]?.arrayValue ?? []).isEmpty)
+                XCTAssertEqual(window.workspaceManager.composeTab(with: blankTabID)?.selection, StoredSelection())
+
+                await cleanup(
+                    runID: runID,
+                    connectionID: connectionID,
+                    windowID: window.windowID,
+                    expectedPID: getpid()
+                )
+                window.workspaceManager.endApplyingTabContext(forTabID: blankTabID)
+            }
+        #else
+            throw XCTSkip("Policy-bound tab routing diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    @MainActor
+    func testRetainedConnectionCannotConsumeDifferentRunPolicy() async throws {
+        #if DEBUG
+            let window = makeWindow()
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let firstRunID = UUID()
+            let secondRunID = UUID()
+            let retainedConnectionID = UUID()
+            let rejectedHandoverConnectionID = UUID()
+            let freshConnectionID = UUID()
+            let firstTabID = UUID()
+            let secondTabID = UUID()
+            let firstSelection = StoredSelection(selectedPaths: ["/tmp/first-agent.swift"])
+            let secondSelection = StoredSelection(selectedPaths: ["/tmp/second-agent.swift"])
+            let windowID = window.windowID
+            let sessionKey = "retained-connection-pinning-\(UUID().uuidString)"
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Retained connection selection isolation \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let initialSwitchResult = await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "retainedConnectionSelectionIsolation"
+            )
+            XCTAssertEqual(initialSwitchResult, .switched)
+            let workspaceIndex = try XCTUnwrap(
+                window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+            )
+            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+                ComposeTabState(id: firstTabID, name: "First", selection: firstSelection),
+                ComposeTabState(id: secondTabID, name: "Second", selection: secondSelection)
+            ]
+            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = firstTabID
+            let tabReloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
+                window.workspaceManager.workspaces[workspaceIndex],
+                reason: "retainedConnectionSelectionIsolationTabs"
+            )
+            XCTAssertEqual(tabReloadResult, .switched)
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+
+            await installAuthoritativePolicy(
+                runID: firstRunID,
+                tabID: firstTabID,
+                windowID: windowID
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: firstRunID)
+            let firstResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: retainedConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+            XCTAssertEqual(firstResult.outcome, "applied")
+            XCTAssertEqual(firstResult.runID, firstRunID)
+            let firstBoundContext = try XCTUnwrap(
+                window.mcpServer.tabContextByConnectionID[retainedConnectionID]
+            )
+            XCTAssertEqual(firstBoundContext.tabID, firstTabID)
+
+            await installAuthoritativePolicy(
+                runID: secondRunID,
+                tabID: secondTabID,
+                windowID: windowID
+            )
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: secondRunID)
+            let retainedStateBeforeRejection = await manager.debugConnectionPolicyState(
+                for: retainedConnectionID
+            )
+
+            let rejectedResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: retainedConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+
+            let retainedRunID = await manager.runIDForConnection(retainedConnectionID)
+            let retainedStateAfterRejection = await manager.debugConnectionPolicyState(
+                for: retainedConnectionID
+            )
+            let pendingAfterRejection = await manager.debugPendingPolicySnapshot(for: clientName)
+            XCTAssertEqual(rejectedResult.outcome, "rejected:connection_bound_to_other_run")
+            XCTAssertEqual(rejectedResult.runID, secondRunID)
+            XCTAssertEqual(retainedRunID, firstRunID)
+            XCTAssertEqual(retainedStateAfterRejection.restrictedTools, retainedStateBeforeRejection.restrictedTools)
+            XCTAssertEqual(retainedStateAfterRejection.additionalTools, retainedStateBeforeRejection.additionalTools)
+            XCTAssertEqual(retainedStateAfterRejection.purpose, retainedStateBeforeRejection.purpose)
+            XCTAssertEqual(retainedStateAfterRejection.windowID, retainedStateBeforeRejection.windowID)
+            let retainedContextAfterRejection = try XCTUnwrap(
+                window.mcpServer.tabContextByConnectionID[retainedConnectionID]
+            )
+            XCTAssertEqual(retainedContextAfterRejection.tabID, firstBoundContext.tabID)
+            XCTAssertEqual(retainedContextAfterRejection.runID, firstBoundContext.runID)
+            XCTAssertEqual(retainedContextAfterRejection.workspaceID, firstBoundContext.workspaceID)
+            XCTAssertEqual(retainedContextAfterRejection.selection, firstBoundContext.selection)
+            XCTAssertNil(window.mcpServer.connectionID(forRunID: secondRunID))
+            XCTAssertTrue(pendingAfterRejection.contains { $0.runID == secondRunID })
+
+            let rejectedHandoverResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: rejectedHandoverConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+            XCTAssertEqual(rejectedHandoverResult.outcome, "rejected:session_token_bound_to_other_run")
+            XCTAssertEqual(rejectedHandoverResult.runID, secondRunID)
+            let rejectedHandoverRunID = await manager.runIDForConnection(rejectedHandoverConnectionID)
+            XCTAssertNil(rejectedHandoverRunID)
+
+            let freshSessionKey = "fresh-run-token-\(UUID().uuidString)"
+            XCTAssertNotEqual(freshSessionKey, sessionKey)
+            let freshResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: freshConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: freshSessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: true
+            )
+            XCTAssertEqual(freshResult.outcome, "applied")
+            XCTAssertEqual(freshResult.runID, secondRunID)
+            let freshRunID = await manager.runIDForConnection(freshConnectionID)
+            XCTAssertEqual(freshRunID, secondRunID)
+            XCTAssertEqual(window.mcpServer.tabContextByConnectionID[freshConnectionID]?.tabID, secondTabID)
+
+            await cleanup(
+                runID: secondRunID,
+                connectionID: freshConnectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+            await manager.removeConnection(rejectedHandoverConnectionID)
+            await cleanup(
+                runID: firstRunID,
+                connectionID: retainedConnectionID,
+                windowID: windowID,
+                expectedPID: getpid()
+            )
+        #else
+            throw XCTSkip("Connection/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testRetainedConnectionCanConsumeSameRunPolicy() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let connectionID = UUID()
+            let firstWindowID = 61012
+            let secondWindowID = 61013
+            let sessionKey = "same-run-connection-reuse-\(UUID().uuidString)"
+            await installPolicy(runID: runID, windowID: firstWindowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: runID)
+
+            let firstResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+            XCTAssertEqual(firstResult.outcome, "applied")
+
+            await installPolicy(runID: runID, windowID: secondWindowID)
+            let reconnectResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: connectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: sessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+
+            XCTAssertEqual(reconnectResult.outcome, "applied")
+            XCTAssertEqual(reconnectResult.runID, runID)
+            XCTAssertEqual(reconnectResult.windowID, secondWindowID)
+            let reconnectedRunID = await manager.runIDForConnection(connectionID)
+            XCTAssertEqual(reconnectedRunID, runID)
+
+            await cleanup(
+                runID: runID,
+                connectionID: connectionID,
+                windowID: secondWindowID,
+                expectedPID: getpid()
+            )
+        #else
+            throw XCTSkip("Connection/run isolation diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testTerminalRunCleanupReleasesAffinityBeforeFreshRunBinding() async throws {
+        #if DEBUG
+            let completedRunID = UUID()
+            let resumedRunID = UUID()
+            let completedConnectionID = UUID()
+            let resumedConnectionID = UUID()
+            let completedWindowID = 61014
+            let resumedWindowID = 61015
+            let completedSessionKey = "terminal-release-\(UUID().uuidString)"
+            let resumedSessionKey = "fresh-resume-\(UUID().uuidString)"
+            XCTAssertNotEqual(completedRunID, resumedRunID)
+            XCTAssertNotEqual(completedConnectionID, resumedConnectionID)
+            XCTAssertNotEqual(completedSessionKey, resumedSessionKey)
+
+            await installPolicy(runID: completedRunID, windowID: completedWindowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: completedRunID)
+            let completedResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: completedConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: completedSessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+            XCTAssertEqual(completedResult.outcome, "applied")
+            XCTAssertEqual(completedResult.runID, completedRunID)
+
+            await manager.clearExpectedAgentPID(getpid(), for: clientName, runID: completedRunID)
+            await manager.cleanupRunRoutingState(for: completedRunID, windowID: completedWindowID)
+            let releasedRunID = await manager.runIDForConnection(completedConnectionID)
+            let releasedRunPolicy = await manager.debugRunPolicyState(for: completedRunID)
+            XCTAssertNil(releasedRunID)
+            XCTAssertNil(releasedRunPolicy)
+            await manager.removeConnection(completedConnectionID)
+
+            await installPolicy(runID: resumedRunID, windowID: resumedWindowID)
+            await manager.registerExpectedAgentPID(getpid(), for: clientName, runID: resumedRunID)
+            let resumedResult = await manager.debugApplyPendingPolicy(
+                clientName: clientName,
+                connectionID: resumedConnectionID,
+                clientPid: Int(getpid()),
+                bootstrapClientName: "repoprompt_ce_cli_debug",
+                sessionKey: resumedSessionKey,
+                pidGateTimeout: 0.25,
+                requireRunRouting: false
+            )
+            let boundResumedRunID = await manager.runIDForConnection(resumedConnectionID)
+
+            XCTAssertEqual(resumedResult.outcome, "applied")
+            XCTAssertEqual(resumedResult.runID, resumedRunID)
+            XCTAssertEqual(boundResumedRunID, resumedRunID)
+
+            await cleanup(
+                runID: resumedRunID,
+                connectionID: resumedConnectionID,
+                windowID: resumedWindowID,
+                expectedPID: getpid()
+            )
+        #else
+            throw XCTSkip("Connection/run lifecycle diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testAuthoritativePIDOwnedAgentModeRouteCannotReplaceLiveAffinityForAnyRole() async throws {
         #if DEBUG
             let roles: [AgentModelCatalog.TaskLabelKind?] = [nil] + AgentModelCatalog.TaskLabelKind.allCases
                 .map(Optional.some)
@@ -367,8 +759,16 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                     requireRunRouting: false
                 )
 
-                XCTAssertEqual(result.outcome, "applied", "role=\(role?.rawValue ?? "nil")")
+                XCTAssertEqual(
+                    result.outcome,
+                    "rejected:session_token_bound_to_other_run",
+                    "role=\(role?.rawValue ?? "nil")"
+                )
                 XCTAssertEqual(result.runID, runID)
+                let mappedRunID = await manager.runIDForConnection(connectionID)
+                XCTAssertNil(mappedRunID)
+                let pending = await manager.debugPendingPolicySnapshot(for: clientName)
+                XCTAssertTrue(pending.contains { $0.runID == runID })
                 await cleanup(
                     runID: runID,
                     connectionID: connectionID,
@@ -550,7 +950,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
         #endif
     }
 
-    func testAuthoritativeRouteFailurePreservesPriorLiveAffinityForReconnect() async throws {
+    func testRejectedAuthoritativeRoutePreservesPriorLiveAffinityForReconnect() async throws {
         #if DEBUG
             let sessionKey = "authoritative-route-rollback-\(UUID().uuidString)"
             let affinity = await seedLiveAffinity(sessionKey: sessionKey, windowID: 61127)
@@ -574,7 +974,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 requireRunRouting: true
             )
 
-            XCTAssertEqual(failedChild.outcome, "rejected:route_mapping_failed")
+            XCTAssertEqual(failedChild.outcome, "rejected:session_token_bound_to_other_run")
             let pendingAfterFailure = await manager.debugPendingPolicySnapshot(for: clientName)
             XCTAssertTrue(pendingAfterFailure.contains { $0.runID == childRunID })
 

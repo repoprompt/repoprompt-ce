@@ -983,11 +983,9 @@ actor ServerNetworkManager {
     }
 
     /// Same-process live reconnect affinity keyed by MCP client name + capability token.
-    /// The capability token identifies the `repoprompt-mcp` helper process, not a logical
-    /// Agent session. External MCP/ACP runtimes own helper lifetime and may retain one helper
-    /// while opening a child session, so an exact reserved PID-owned route can supersede this
-    /// reconnect fallback. This is never persisted and is only usable while the matching run
-    /// policy still exists in memory for the current app process.
+    /// The capability token identifies one `repoprompt-mcp` helper process lease. While the
+    /// matching run policy remains live, that token is pinned to the run and may only reconnect
+    /// to the same run. A different run must use a fresh helper/token.
     private struct LiveRunAffinity {
         let windowID: Int
         let runID: UUID
@@ -1422,6 +1420,8 @@ actor ServerNetworkManager {
         private var debugAfterConnectionCallLimiterResolutionForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallPermitAcquiredForTesting: (@Sendable (UUID) async -> Void)?
         private var debugAfterConnectionCallLimiterRejectionForTesting: (@Sendable (UUID) async -> Void)?
+        private var debugBeforeToolResultFormattingForTesting: (@Sendable (UUID, String) async -> Void)?
+        private var debugBeforeToolCompletionObserversForTesting: (@Sendable (UUID, String) async -> Void)?
         private var debugBeforeAdmissionEvictionCloseForTesting: (@Sendable (UUID) async -> Void)?
         private var debugBeforeActiveToolCancellationScanForTesting: (@Sendable (UUID, [UUID]) async -> Void)?
         private var debugAllocatedActiveToolScopeIDsForTesting: Set<UUID> = []
@@ -8640,6 +8640,18 @@ actor ServerNetworkManager {
                 }
             }
 
+            func debugSetBeforeToolResultFormattingForTesting(
+                _ handler: (@Sendable (UUID, String) async -> Void)?
+            ) {
+                debugBeforeToolResultFormattingForTesting = handler
+            }
+
+            func debugSetBeforeToolCompletionObserversForTesting(
+                _ handler: (@Sendable (UUID, String) async -> Void)?
+            ) {
+                debugBeforeToolCompletionObserversForTesting = handler
+            }
+
             func debugIsExecutionWatchdogTerminal(connectionID: UUID) -> Bool {
                 executionWatchdogTerminalConnections.contains(connectionID)
             }
@@ -9069,39 +9081,6 @@ actor ServerNetworkManager {
         return isExpectedAgentDescendant(clientName: clientName, clientPid: clientPid, runID: policy.runID) == true
     }
 
-    /// Returns whether a pending route has enough current ownership evidence to override
-    /// process-token reconnect affinity. Role/tool profile is intentionally irrelevant here.
-    /// The policy must already be reserved by this connection and still be the current queued
-    /// policy, while the peer PID and connection lifecycle independently prove ownership.
-    private func isAuthoritativePIDOwnedAgentModeRoute(
-        _ policy: ClientConnectionPolicy,
-        key: String,
-        clientName: String,
-        clientPid: Int?,
-        connectionID: UUID,
-        expectedLifecycleGeneration: UInt64?
-    ) -> Bool {
-        guard policy.oneShot,
-              policy.purpose == .agentModeRun,
-              policy.runID != nil,
-              policy.tabID != nil,
-              policy.requiresExpectedAgentPID,
-              policy.reservationConnectionID == connectionID,
-              canConsumePendingPolicy(policy, clientName: clientName, clientPid: clientPid),
-              isPendingPolicyApplicationCurrent(
-                  connectionID: connectionID,
-                  clientName: clientName,
-                  expectedLifecycleGeneration: expectedLifecycleGeneration
-              ),
-              pendingPoliciesByClient[key]?.contains(where: {
-                  $0.id == policy.id && $0.reservationConnectionID == connectionID
-              }) == true
-        else {
-            return false
-        }
-        return true
-    }
-
     private func oldestReservedPendingPolicyEntry(
         for clientName: String
     ) -> (key: String, index: Int, policy: ClientConnectionPolicy)? {
@@ -9363,16 +9342,34 @@ actor ServerNetworkManager {
         }
 
         if let policyRunID = policy.runID,
+           let boundRunID = await runIDForConnection(connectionID),
+           boundRunID != policyRunID
+        {
+            if policy.oneShot {
+                _ = rollbackOneShotPendingPolicyReservation(
+                    id: policy.id,
+                    key: matchedQueueEntry.key,
+                    connectionID: connectionID
+                )
+            }
+            #if DEBUG
+                debugRecordRunRoutingEvent(
+                    runID: policyRunID,
+                    event: "policy_rejected",
+                    connectionID: connectionID,
+                    fields: [
+                        "client_name": clientName,
+                        "reason": "connection_bound_to_other_run",
+                        "bound_run_id": boundRunID.uuidString
+                    ]
+                )
+            #endif
+            return .rejected(runID: policyRunID, reason: "connection_bound_to_other_run")
+        }
+
+        if let policyRunID = policy.runID,
            let liveAffinity,
-           liveAffinity.runID != policyRunID,
-           !isAuthoritativePIDOwnedAgentModeRoute(
-               policy,
-               key: matchedQueueEntry.key,
-               clientName: clientName,
-               clientPid: clientPid,
-               connectionID: connectionID,
-               expectedLifecycleGeneration: expectedLifecycleGeneration
-           )
+           liveAffinity.runID != policyRunID
         {
             if policy.oneShot {
                 _ = rollbackOneShotPendingPolicyReservation(
@@ -9838,7 +9835,10 @@ actor ServerNetworkManager {
             guard let windowState = WindowStatesManager.shared.window(withID: windowID) else {
                 return nil
             }
-            guard let resolved = windowState.workspaceManager.resolveComposeTabRoutingSnapshot(for: tabID) else {
+            guard let resolved = windowState.workspaceManager.resolveComposeTabRoutingSnapshot(
+                for: tabID,
+                captureActiveUIState: false
+            ) else {
                 return nil
             }
             let replacementToken = windowState.mcpServer.installTabContext(
@@ -10792,6 +10792,36 @@ actor ServerNetworkManager {
                                 }
                                 defer { smallReadAdmissionLease?.release() }
 
+                                let resourceAdmissionWindowID = chosenID
+                                let resourceAdmissionOwner = MCPGlobalToolName.orderedToolNames.contains(toolName)
+                                    ? "app_wide"
+                                    : resourceAdmissionWindowID.map { "window:\($0)" }
+                                @Sendable func releaseResourceAdmissionLeases(outcome: String) {
+                                    let releasedMutation = mutationAdmissionLease?.release() ?? false
+                                    let releasedSmallRead = smallReadAdmissionLease?.release() ?? false
+                                    guard releasedMutation || releasedSmallRead else { return }
+                                    EditFlowPerf.lifecycleEvent(
+                                        EditFlowPerf.Lifecycle.MCPToolCall.resourceAdmissionReleased,
+                                        correlation: lifecycleCorrelation,
+                                        EditFlowPerf.Dimensions(
+                                            toolName: toolName,
+                                            outcome: outcome,
+                                            windowID: resourceAdmissionWindowID,
+                                            ownerResource: resourceAdmissionOwner,
+                                            permitActive: true,
+                                            publicationPending: true,
+                                            terminalBarrier: false
+                                        )
+                                    )
+                                }
+
+                                @Sendable func releaseResourceAdmissionLeasesAfterProviderError(_ error: Error) {
+                                    if case MCPToolExecutionWatchdogError.cleanupUnresponsive = error {
+                                        return
+                                    }
+                                    releaseResourceAdmissionLeases(outcome: "provider_error")
+                                }
+
                                 let toolCardOwnershipLease: MCPToolCardOwnershipLedger.Lease?
                                 if let runID = observerRunIDForCallbacksFinal, let chosenID {
                                     guard let lease = self.toolCardOwnershipLedger.begin(
@@ -11419,12 +11449,16 @@ actor ServerNetworkManager {
                                                     ) {
                                                         try await dispatchResolvedProvider(resolvedOperation)
                                                     }
+                                                    releaseResourceAdmissionLeases(outcome: "provider_success")
                                                     let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                         EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
                                                         EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
                                                     )
                                                     defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
 
+                                                    #if DEBUG
+                                                        await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
+                                                    #endif
                                                     // Build well‑structured, human‑readable content blocks for the result
                                                     let contentBlocks = EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.formatResult,
@@ -11442,6 +11476,9 @@ actor ServerNetworkManager {
                                                     )
 
                                                     // Fire completion observer with result for detailed UI rendering
+                                                    #if DEBUG
+                                                        await self.debugBeforeToolCompletionObserversForTesting?(connectionID, toolName)
+                                                    #endif
                                                     await EditFlowPerf.measure(
                                                         EditFlowPerf.Stage.MCPToolCall.completionObservers,
                                                         EditFlowPerf.Dimensions(toolName: toolName)
@@ -11483,6 +11520,7 @@ actor ServerNetworkManager {
                                                 }
                                             }
                                         } catch {
+                                            releaseResourceAdmissionLeasesAfterProviderError(error)
                                             if let failure = await executionContractFailureResult(
                                                 for: error,
                                                 context: "window-scoped"
@@ -11537,12 +11575,16 @@ actor ServerNetworkManager {
                                             ) {
                                                 try await dispatchResolvedProvider(resolvedOperation)
                                             }
+                                            releaseResourceAdmissionLeases(outcome: "provider_success")
                                             let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                                 EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
                                                 EditFlowPerf.Dimensions(toolName: toolName, outcome: "success")
                                             )
                                             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope, permitPostDispatchEnvelopeState) }
 
+                                            #if DEBUG
+                                                await self.debugBeforeToolResultFormattingForTesting?(connectionID, toolName)
+                                            #endif
                                             // Build well‑structured, human‑readable content blocks for the result
                                             let contentBlocks = EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.formatResult,
@@ -11560,6 +11602,9 @@ actor ServerNetworkManager {
                                             )
 
                                             // Fire completion observer with result for detailed UI rendering
+                                            #if DEBUG
+                                                await self.debugBeforeToolCompletionObserversForTesting?(connectionID, toolName)
+                                            #endif
                                             await EditFlowPerf.measure(
                                                 EditFlowPerf.Stage.MCPToolCall.completionObservers,
                                                 EditFlowPerf.Dimensions(toolName: toolName)
@@ -11597,6 +11642,7 @@ actor ServerNetworkManager {
                                                 outcome: "success"
                                             )
                                         } catch {
+                                            releaseResourceAdmissionLeasesAfterProviderError(error)
                                             if let failure = await executionContractFailureResult(
                                                 for: error,
                                                 context: "global"
@@ -11647,6 +11693,7 @@ actor ServerNetworkManager {
 
                                 EditFlowPerf.end(EditFlowPerf.Stage.MCPToolCall.serviceToolLookup, serviceToolLookupState)
                                 endPermitPreDispatchEnvelopeIfNeeded()
+                                releaseResourceAdmissionLeases(outcome: "tool_not_found")
                                 let permitPostDispatchEnvelopeState = EditFlowPerf.begin(
                                     EditFlowPerf.Stage.MCPToolCall.permitPostDispatchEnvelope,
                                     EditFlowPerf.Dimensions(toolName: toolName, outcome: "toolNotFound")

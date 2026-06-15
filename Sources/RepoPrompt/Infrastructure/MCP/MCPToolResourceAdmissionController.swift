@@ -16,12 +16,14 @@ final class MCPToolResourceAdmissionController: @unchecked Sendable {
             self.releaseAction = releaseAction
         }
 
-        func release() {
+        @discardableResult
+        func release() -> Bool {
             let action: (() -> Void)? = lock.withLock {
                 defer { releaseAction = nil }
                 return releaseAction
             }
             action?()
+            return action != nil
         }
 
         deinit {
