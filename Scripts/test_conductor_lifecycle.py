@@ -200,6 +200,34 @@ class LifecycleQueueTests(LifecycleTestCase):
         self.assertEqual(guarded_env["REPOPROMPT_GUARD_DELAYED_LAUNCH"], "1")
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "relaunch"}), "app relaunch")
 
+    def test_test_operations_default_to_bounded_timeout_and_xctest_stall_watchdog(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+
+        with mock.patch.object(state, "_schedule_locked"):
+            root_payload = state.enqueue({"operation": "test", "args": {}})
+            provider_payload = state.enqueue({"operation": "provider-test", "args": {}})
+
+        root_job = state.jobs[root_payload["ticket"]]
+        provider_job = state.jobs[provider_payload["ticket"]]
+        self.assertEqual(root_job.timeout, conductor.TEST_TIMEOUT_SECONDS)
+        self.assertEqual(provider_job.timeout, conductor.TEST_TIMEOUT_SECONDS)
+        self.assertEqual(root_job.args["xctestStallSeconds"], conductor.DEFAULT_XCTEST_STALL_SECONDS)
+        self.assertEqual(provider_job.args["xctestStallSeconds"], conductor.DEFAULT_XCTEST_STALL_SECONDS)
+        self.assertTrue(state._xctest_watchdog_enabled(root_job))
+        self.assertTrue(state._xctest_watchdog_enabled(provider_job))
+
+    def test_explicit_xctest_stall_timeout_overrides_default(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+
+        with mock.patch.object(state, "_schedule_locked"):
+            payload = state.enqueue({"operation": "test", "args": {"xctestStallSeconds": 45.0}})
+
+        job = state.jobs[payload["ticket"]]
+        self.assertEqual(job.args["xctestStallSeconds"], 45.0)
+        self.assertEqual(job.timeout, conductor.TEST_TIMEOUT_SECONDS)
+
     def test_release_artifact_delegates_release_script_with_release_lanes_and_timeout(self) -> None:
         tmp, state = self.make_state()
         self.addCleanup(tmp.cleanup)
@@ -637,6 +665,30 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertIsNone(claim)
         self.assertFalse(job.measurement_invalid)
         kill.assert_not_called()
+
+    def test_watchdog_arms_after_build_complete_before_first_progress_marker(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_watchdog_job(state)
+
+        armed = state._record_xctest_startup_locked(job, "Build complete! (2.35s)\n", observed_at=40.0)
+
+        self.assertTrue(armed)
+        self.assertEqual(job.xctest_progress_deadline, 45.0)
+        claim = state._claim_xctest_stall_locked(job, observed_at=45.0)
+        self.assertIsNotNone(claim)
+        self.assertIsNone(claim.current_test)
+        self.assertTrue(job.measurement_invalid)
+
+    def test_watchdog_waits_for_build_complete_before_startup_deadline(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        job = self.make_watchdog_job(state)
+
+        armed = state._record_xctest_startup_locked(job, "[12/34] Compiling Thing.swift\n", observed_at=40.0)
+
+        self.assertFalse(armed)
+        self.assertIsNone(job.xctest_progress_deadline)
 
     def test_only_xctest_progress_markers_reset_after_first_started_marker(self) -> None:
         tmp, state = self.make_state()

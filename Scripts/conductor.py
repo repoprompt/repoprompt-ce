@@ -68,8 +68,10 @@ APP_STOP_CONFIRM_TIMEOUT_SECONDS = 8.0
 APP_STOP_DELAYED_LAUNCH_CONFIRM_TIMEOUT_SECONDS = 25.0
 
 SHORT_TIMEOUT_SECONDS = 5 * 60
+TEST_TIMEOUT_SECONDS = 15 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
+DEFAULT_XCTEST_STALL_SECONDS = 120.0
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
 IMPLEMENTED_OPERATIONS = {
@@ -176,6 +178,7 @@ class ConductorError(Exception):
 XCTEST_PROGRESS_RE = re.compile(
     r"^Test Case '(.+)' (started|passed|failed|skipped)(?: \([^)]*\))?\.\s*$"
 )
+XCTEST_BUILD_COMPLETE_RE = re.compile(r"^Build complete! \([^)]+\)\s*$")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -944,9 +947,16 @@ class OperationRegistry:
             snapshot[key] = value
         return snapshot
 
+    @staticmethod
+    def normalize_operation_args(operation: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(args)
+        if operation in {"test", "provider-test"} and "xctestStallSeconds" not in normalized:
+            normalized["xctestStallSeconds"] = DEFAULT_XCTEST_STALL_SECONDS
+        return normalized
+
     def prepare(self, request: Dict[str, Any]) -> Tuple[List[str], List[str], Path, Dict[str, str], Optional[float]]:
         operation = request.get("operation")
-        args = request.get("args") or {}
+        args = self.normalize_operation_args(operation, request.get("args") or {})
         timeout = request.get("timeout")
         verbose = bool(request.get("verbose"))
         if timeout is not None and float(timeout) < 0:
@@ -1107,6 +1117,8 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
+        if operation in {"test", "provider-test"}:
+            return TEST_TIMEOUT_SECONDS
         if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
@@ -1225,6 +1237,7 @@ class DaemonState:
         if operation == "app" and args.get("subcommand") in {"stop", "relaunch"}:
             # Derived exclusively by supersession below, never accepted from a client.
             args.pop("guardDelayedLaunch", None)
+        args = self.registry.normalize_operation_args(operation, args)
         normalized_request = dict(request)
         normalized_request["args"] = args
         fingerprint = self.registry.fingerprint(normalized_request)
@@ -1692,6 +1705,7 @@ class DaemonState:
                 job = self.jobs.get(ticket)
                 if job:
                     self._append_tail_locked(job, text)
+                    self._record_xctest_startup_locked(job, text)
                     self._record_xctest_progress_locked(job, text)
                     self.condition.notify_all()
 
@@ -1752,6 +1766,20 @@ class DaemonState:
                 if job.xctest_current_test == test_name:
                     job.xctest_current_test = None
         return matched
+
+    def _record_xctest_startup_locked(
+        self,
+        job: Job,
+        text: str,
+        observed_at: Optional[float] = None,
+    ) -> bool:
+        if not self._xctest_watchdog_enabled(job) or job.xctest_progress_deadline is not None:
+            return False
+        if not any(XCTEST_BUILD_COMPLETE_RE.match(raw_line.strip()) for raw_line in text.splitlines()):
+            return False
+        timestamp = time.monotonic() if observed_at is None else observed_at
+        job.xctest_progress_deadline = timestamp + float(job.args["xctestStallSeconds"])
+        return True
 
     def _claim_xctest_stall_locked(
         self,
