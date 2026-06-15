@@ -1087,6 +1087,61 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertEqual(cache.latestRevision, 1)
         }
 
+        func testExactPathKindIsResolvedAgainAfterFreshnessApplies() async throws {
+            let root = try makeTemporaryRoot(name: "ExactPathKindTransition")
+            let targetURL = root.appendingPathComponent("Target")
+            try write("let oldFileValue = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            let nestedURL = targetURL.appendingPathComponent("Nested.swift")
+            try write("let refreshedKindNeedle = true\n", to: nestedURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [
+                    .fileRemoved("Target"),
+                    .folderAdded("Target"),
+                    .fileAdded("Target/Nested.swift")
+                ]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "refreshedKindNeedle",
+                    paths: [targetURL.path],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [nestedURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
         func testRootRestrictedSearchPathsDoNotWaitForUnrelatedRepresentedRoot() async throws {
             let targetRoot = try makeTemporaryRoot(name: "ScopedFreshnessTarget")
             let blockedRoot = try makeTemporaryRoot(name: "ScopedFreshnessBlocked")
@@ -1621,10 +1676,6 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "return try await store.withStoreBackedSearchAccess(",
             "try await ensureRootScopeAvailable(rootScope, store: store)",
             "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
-            "let parsedSearchScope: SearchScopeParseResult? = if",
-            "await parseSearchScopePaths(",
-            "let freshnessRootRefs: [WorkspaceRootRef]",
-            "appliedIngressSamples = try await awaitAppliedIngress(",
             "try Task.checkCancellation()",
             "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
             "try Task.checkCancellation()",
@@ -1645,18 +1696,6 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope))",
             "appendClause(.legacyPrefix(candidateLower: normalized.lowercased()))"
         ], in: source)
-        XCTAssertEqual(
-            source.components(separatedBy: "parseSearchScopePaths(").count - 1,
-            2,
-            "The explicit path scope must be parsed once and then reused by filtering"
-        )
-        let performSearch = try XCTUnwrap(source.range(of: "private static func performSearch("))
-        let parser = try XCTUnwrap(source.range(of: "private static func parseSearchScopePaths("))
-        let performSearchBody = source[performSearch.lowerBound ..< parser.lowerBound]
-        XCTAssertFalse(performSearchBody.contains("parseSearchScopePaths("))
-        XCTAssertTrue(performSearchBody.contains("let parsed = parsedSearchScope"))
-        XCTAssertTrue(performSearchBody.contains("allSearchedFilesAreFreshnessQualified"))
-        XCTAssertTrue(performSearchBody.contains(": .validateDiskMetadata"))
     }
 
     private func searchSwiftFiles(paths: [String], store: WorkspaceFileContextStore) async throws -> SearchResults {

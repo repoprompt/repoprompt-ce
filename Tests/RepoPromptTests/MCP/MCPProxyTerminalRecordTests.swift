@@ -80,6 +80,51 @@ final class MCPProxyTerminalRecordTests: XCTestCase {
         XCTAssertEqual(record.errno, ECONNRESET)
     }
 
+    func testLocalSocketReadFailureIsAttributedToTransport() async throws {
+        let ledger = JSONRPCBridgeLedger(connectionID: "local-read-test")
+        _ = try await ledger.beginConnection()
+        let runtimeError = CLIRuntimeError.connectionFailed(
+            underlying: SocketProxyError.readFailed(errno: EIO)
+        )
+
+        let record = await CLIProxyRuntimePolicy.makeTerminalRecord(
+            sessionToken: "local-read-session",
+            localPID: 303,
+            initialParentPID: 404,
+            ledgerSnapshot: ledger.snapshot(),
+            runtimeError: runtimeError,
+            fallbackReason: "unexpected_fallback"
+        )
+        XCTAssertEqual(record.initiator, .transport)
+        XCTAssertEqual(record.reason, "socket_read_failed")
+        XCTAssertEqual(record.errno, EIO)
+    }
+
+    func testCancellationNormalizesToStableHostTaskProvenance() async throws {
+        let runtimeError = try XCTUnwrap(
+            CLIProxyRuntimePolicy.normalizedTerminalRuntimeError(for: CancellationError())
+        )
+        guard case let .hostDisconnected(provenance) = runtimeError else {
+            return XCTFail("Expected host-disconnected cancellation provenance")
+        }
+        XCTAssertEqual(provenance.reason, .taskCancelled)
+        XCTAssertFalse(CLIProxyRuntimePolicy.shouldRetry(after: runtimeError))
+
+        let ledger = JSONRPCBridgeLedger(connectionID: "cancelled-proxy-test")
+        _ = try await ledger.beginConnection()
+        let record = await CLIProxyRuntimePolicy.makeTerminalRecord(
+            sessionToken: "cancelled-proxy-session",
+            localPID: 505,
+            initialParentPID: 606,
+            ledgerSnapshot: ledger.snapshot(),
+            runtimeError: runtimeError,
+            fallbackReason: "proxy_unexpected_error"
+        )
+        XCTAssertEqual(record.initiator, .host)
+        XCTAssertEqual(record.reason, CLIHostDisconnectProvenance.Reason.taskCancelled.rawValue)
+        XCTAssertNotEqual(record.reason, "proxy_unexpected_error")
+    }
+
     func testTerminalRecordCopiesLiveLedgerSnapshotAndServerReason() async throws {
         let ledger = JSONRPCBridgeLedger(connectionID: "terminal-record-test")
         _ = try await ledger.beginConnection()

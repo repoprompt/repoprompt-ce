@@ -498,12 +498,13 @@ public actor UnixSocketMCPTransport: Transport {
 
         while Date().timeIntervalSince(startTime) < connectionTimeout {
             if Task.isCancelled {
+                let error = CancellationError()
                 tearDownSocket(
-                    error: CancellationError(),
-                    cause: .connectFailure,
+                    error: error,
+                    cause: .connectCancelled,
                     initiator: .app
                 )
-                throw MCPError.connectionClosed
+                throw error
             }
 
             // Check if socket file exists
@@ -948,6 +949,10 @@ public actor UnixSocketMCPTransport: Transport {
         return nil
     }
 
+    private nonisolated static func readErrorInitiator(errno: Int32?) -> MCPTerminalInitiator {
+        errno == ECONNRESET ? .peer : .transport
+    }
+
     #if DEBUG
         private struct DebugExistingFDConnectFailure: Swift.Error {}
 
@@ -982,9 +987,9 @@ public actor UnixSocketMCPTransport: Transport {
             callbackGate.release(.cancellation)
         }
 
-        func debugTriggerReadErrorForCleanupTest() {
+        func debugTriggerReadErrorForCleanupTest(_ code: POSIXErrorCode = .EIO) {
             guard let identity = activeReaderOwnership?.identity else { return }
-            handleReaderTerminal(.error(POSIXError(.EIO)), from: identity)
+            handleReaderTerminal(.error(POSIXError(code)), from: identity)
         }
 
         func debugCleanupSnapshot() -> UnixSocketMCPTransportCleanupSnapshot {
@@ -1146,7 +1151,13 @@ public actor UnixSocketMCPTransport: Transport {
                 continue
             }
 
-            if pfd.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
+            if pfd.revents & Int16(POLLNVAL) != 0 {
+                let error = MCPError.transportError(POSIXError(.EBADF))
+                closeAfterSendFailure(error, cause: .writeFailure, errno: EBADF)
+                throw error
+            }
+
+            if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
                 closeAfterSendFailure(MCPError.connectionClosed, cause: .writeHangup, initiator: .peer)
                 throw MCPError.connectionClosed
             }
@@ -1394,11 +1405,12 @@ public actor UnixSocketMCPTransport: Transport {
 
         switch terminal {
         case let .error(error):
+            let errorNumber = Self.errnoValue(from: error)
             tearDownSocket(
                 error: error,
                 cause: .readError,
-                initiator: .transport,
-                errno: Self.errnoValue(from: error)
+                initiator: Self.readErrorInitiator(errno: errorNumber),
+                errno: errorNumber
             )
         case let .eof(hasResidualData):
             mcpConnectionLog("UnixSocketMCPTransport received EOF")

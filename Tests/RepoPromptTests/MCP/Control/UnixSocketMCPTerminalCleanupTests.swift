@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+import RepoPromptShared
 import XCTest
 
 final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
@@ -73,6 +74,64 @@ final class UnixSocketMCPTerminalCleanupTests: XCTestCase {
         #else
             throw XCTSkip("Deterministic transport callback gates require a DEBUG build")
         #endif
+    }
+
+    func testReadErrorAttributionDistinguishesPeerResetFromLocalFailure() async throws {
+        #if DEBUG
+            let cases: [(POSIXErrorCode, MCPTerminalInitiator)] = [
+                (.ECONNRESET, .peer),
+                (.EIO, .transport)
+            ]
+            for (code, expectedInitiator) in cases {
+                let descriptors = try Self.makeSocketPair()
+                defer { Self.closeIfOpen(descriptors[1]) }
+
+                let transport = try UnixSocketMCPTransport(connectedFD: descriptors[0])
+                try await transport.connect()
+                let closeStream = await transport.closed()
+
+                await transport.debugTriggerReadErrorForCleanupTest(code)
+
+                let close = try await Self.firstCloseSnapshot(closeStream)
+                XCTAssertEqual(close.cause, .readError)
+                XCTAssertEqual(close.initiator, expectedInitiator)
+                XCTAssertEqual(close.errno, code.rawValue)
+            }
+        #else
+            throw XCTSkip("Deterministic read-error injection requires a DEBUG build")
+        #endif
+    }
+
+    func testConnectCancellationPreservesCancellationProvenance() async throws {
+        let missingSocket = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RepoPromptMissingSocket-\(UUID().uuidString)")
+        let transport = UnixSocketMCPTransport(socketURL: missingSocket)
+        let closeStream = await transport.closed()
+        let connectTask = Task {
+            try await transport.connect()
+        }
+        connectTask.cancel()
+
+        do {
+            try await Self.boundedTaskValue(
+                connectTask,
+                description: "cancelled transport connect"
+            )
+            XCTFail("Expected connect cancellation")
+        } catch is CancellationError {
+            // Expected.
+        }
+
+        let close = try await Self.firstCloseSnapshot(closeStream)
+        XCTAssertEqual(close.cause, .connectCancelled)
+        XCTAssertEqual(close.initiator, .app)
+        XCTAssertNil(close.errno)
+        let context = MCPConnectionCloseContext.startupFailure(
+            error: CancellationError(),
+            transportSnapshot: close
+        )
+        XCTAssertEqual(context.reason, MCPTransportTerminalCause.connectCancelled.rawValue)
+        XCTAssertEqual(context.initiator, .app)
     }
 
     func testBootstrapStartupFailurePrefersCapturedTransportSnapshot() async throws {

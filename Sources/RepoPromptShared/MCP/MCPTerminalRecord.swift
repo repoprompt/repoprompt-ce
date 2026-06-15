@@ -222,6 +222,7 @@ public enum MCPTerminalRecordStore {
         try? pruneTerminalRecords(
             in: directory,
             keeping: retainedRecordLimit,
+            preserving: fileURL,
             fileManager: fileManager
         )
         return fileURL
@@ -230,6 +231,7 @@ public enum MCPTerminalRecordStore {
     private static func pruneTerminalRecords(
         in directory: URL,
         keeping limit: Int,
+        preserving preservedRecord: URL,
         fileManager: FileManager
     ) throws {
         let terminalRecords = try fileManager.contentsOfDirectory(
@@ -244,7 +246,12 @@ public enum MCPTerminalRecordStore {
         }
 
         guard terminalRecords.count > limit else { return }
-        for staleRecord in terminalRecords.dropFirst(limit) {
+        let preservedPath = preservedRecord.standardizedFileURL.path
+        var retainedPaths: Set<String> = [preservedPath]
+        for record in terminalRecords where retainedPaths.count < limit {
+            retainedPaths.insert(record.standardizedFileURL.path)
+        }
+        for staleRecord in terminalRecords where !retainedPaths.contains(staleRecord.standardizedFileURL.path) {
             do {
                 try fileManager.removeItem(at: staleRecord)
             } catch let error as CocoaError where error.code == .fileNoSuchFile {

@@ -104,6 +104,32 @@ final class MCPTerminalRecordTests: XCTestCase {
         for retainedURL in writtenURLs.dropFirst(4) {
             XCTAssertTrue(FileManager.default.fileExists(atPath: retainedURL.path))
         }
+
+        let backdatedRecord = try MCPTerminalRecord(
+            id: XCTUnwrap(UUID(uuidString: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF")),
+            timestamp: Date(timeIntervalSince1970: 1),
+            monotonicUptime: 9999,
+            layer: .proxy,
+            initiator: .transport,
+            reason: "clock_rollback_retention_test",
+            sessionToken: nil,
+            localPID: 1,
+            peerPID: nil,
+            appConnectionID: nil,
+            connectionGeneration: 9999,
+            errno: nil,
+            errorDescription: nil
+        )
+        let backdatedURL = try MCPTerminalRecordStore.write(backdatedRecord, to: directory)
+        let retainedAfterBackdatedWrite = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ).filter {
+            $0.pathExtension == "json" && $0.lastPathComponent.hasPrefix("terminal-")
+        }
+        XCTAssertEqual(retainedAfterBackdatedWrite.count, 256)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: backdatedURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: writtenURLs[4].path))
     }
 
     func testFirstTerminalRecordClaimRetriesOriginalRecordWithoutSubstitutingNewCause() {

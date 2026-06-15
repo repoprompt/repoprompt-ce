@@ -4,22 +4,6 @@ import XCTest
 
 @MainActor
 final class MCPFileSearchBackpressureFormattingTests: XCTestCase {
-    func testProviderCatchesAdmissionBackpressureBeforePatternErrors() throws {
-        let source = try String(
-            contentsOf: RepoRoot.url().appendingPathComponent("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift"),
-            encoding: .utf8
-        )
-        let worktreeCatch = try XCTUnwrap(source.range(of: "} catch let error as StoreBackedWorkspaceSearchError {"))
-        let worktreeMapping = try XCTUnwrap(source.range(of: "let reply = Self.searchWorktreeUnavailableDTO(for: error, worktreeScope: worktreeScope)"))
-        let admissionCatch = try XCTUnwrap(source.range(of: "} catch let error as StoreBackedWorkspaceSearchAdmissionError {"))
-        let admissionMapping = try XCTUnwrap(source.range(of: "let reply = Self.searchBackpressureDTO(for: error, worktreeScope: worktreeScope)"))
-        let patternCatch = try XCTUnwrap(source.range(of: "} catch let error as SearchPatternError {"))
-        XCTAssertLessThan(worktreeCatch.lowerBound, worktreeMapping.lowerBound)
-        XCTAssertLessThan(worktreeMapping.lowerBound, admissionCatch.lowerBound)
-        XCTAssertLessThan(admissionCatch.lowerBound, admissionMapping.lowerBound)
-        XCTAssertLessThan(admissionMapping.lowerBound, patternCatch.lowerBound)
-    }
-
     func testQueueFullMapsToMachineReadableRetryableDTO() throws {
         let dto = MCPFileToolProvider.searchBackpressureDTO(
             for: .queueFull(scope: .perStore, retryAfterMilliseconds: 1250)
@@ -94,7 +78,7 @@ final class MCPFileSearchBackpressureFormattingTests: XCTestCase {
                 )
             ]
         )
-        let dto = MCPFileToolProvider.searchWorktreeUnavailableDTO(
+        let dto = MCPFileToolProvider.searchRetryableFailureDTO(
             for: .worktreeScopeUnavailable(missingPhysicalRootPaths: ["/tmp/worktrees/project-agent"]),
             worktreeScope: scope
         )
@@ -110,6 +94,28 @@ final class MCPFileSearchBackpressureFormattingTests: XCTestCase {
         XCTAssertTrue(text.contains("**Status**: Worktree unavailable"), text)
         XCTAssertTrue(text.contains("**Retryable**: yes"), text)
         XCTAssertTrue(text.contains("project-agent"), text)
+        XCTAssertFalse(text.contains("Total matches"), text)
+    }
+
+    func testFreshnessTimeoutMapsToDistinctRetryableDTOAndWarningFormatting() throws {
+        let dto = MCPFileToolProvider.searchRetryableFailureDTO(
+            for: .workspaceFreshnessTimedOut
+        )
+
+        XCTAssertEqual(dto.errorCode, "workspace_freshness_timeout")
+        XCTAssertEqual(dto.retryable, true)
+        XCTAssertEqual(dto.retryAfterMilliseconds, 1000)
+        XCTAssertTrue(dto.errorMessage?.contains("Workspace freshness timed out") == true)
+
+        let object = try XCTUnwrap(Self.value(dto).objectValue)
+        XCTAssertEqual(object["error_code"]?.stringValue, "workspace_freshness_timeout")
+        XCTAssertEqual(object["retryable"]?.boolValue, true)
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatSearch(value: Self.value(dto)))
+        XCTAssertTrue(text.contains("## Search Results ⚠️"), text)
+        XCTAssertTrue(text.contains("**Status**: Workspace freshness timed out"), text)
+        XCTAssertTrue(text.contains("**Code**: workspace_freshness_timeout"), text)
+        XCTAssertFalse(text.contains("Worktree unavailable"), text)
         XCTAssertFalse(text.contains("Total matches"), text)
     }
 

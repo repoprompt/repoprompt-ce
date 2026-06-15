@@ -548,6 +548,16 @@ enum CLIProxyRuntimePolicy {
         }
     }
 
+    static func normalizedTerminalRuntimeError(for error: Swift.Error) -> CLIRuntimeError? {
+        if let runtimeError = error as? CLIRuntimeError {
+            return runtimeError
+        }
+        if error is CancellationError {
+            return .hostDisconnected(.taskCancelled)
+        }
+        return nil
+    }
+
     static func failureReason(for error: CLIRuntimeError) -> String {
         switch error {
         case .approvalDenied:
@@ -702,8 +712,10 @@ enum CLIProxyRuntimePolicy {
             return .host
         case .approvalDenied, .terminatedByServer:
             return .app
-        case .serverClosed, .connectionReset, .readFailed:
+        case .serverClosed, .connectionReset:
             return .peer
+        case let .readFailed(errno):
+            return errno == ECONNRESET ? .peer : .transport
         default:
             return .transport
         }
@@ -1791,7 +1803,7 @@ actor MCPService: Service {
             )
         } catch {
             await persistProxyTerminalRecord(
-                runtimeError: error as? CLIRuntimeError,
+                runtimeError: CLIProxyRuntimePolicy.normalizedTerminalRuntimeError(for: error),
                 fallbackReason: "proxy_unexpected_error",
                 initialPPID: initialPPID,
                 unexpectedError: error

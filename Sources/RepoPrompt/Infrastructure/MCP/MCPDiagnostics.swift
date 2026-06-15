@@ -11,6 +11,7 @@ public enum MCPTransportTerminalCause: String, Codable, Equatable, Sendable {
     case receiveBufferOverflow = "receive_buffer_overflow"
     case localDisconnect = "local_disconnect"
     case connectFailure = "connect_failure"
+    case connectCancelled = "connect_cancelled"
 }
 
 public struct MCPTransportCloseSnapshot: Equatable, Sendable {

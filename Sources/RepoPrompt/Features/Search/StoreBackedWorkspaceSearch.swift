@@ -74,7 +74,7 @@ enum StoreBackedWorkspaceSearch {
                 try await ensureSearchReady(store: store, workspaceManager: workspaceManager)
             }
 
-            let parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
+            let initialParsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
                 await parseSearchScopePaths(
                     rawPaths,
                     caseInsensitive: caseInsensitive,
@@ -84,8 +84,8 @@ enum StoreBackedWorkspaceSearch {
             } else {
                 nil
             }
-            let freshnessRootRefs: [WorkspaceRootRef] = if let parsedSearchScope {
-                parsedSearchScope.freshnessRootRefs
+            let freshnessRootRefs: [WorkspaceRootRef] = if let initialParsedSearchScope {
+                initialParsedSearchScope.freshnessRootRefs
             } else {
                 await store.rootRefs(scope: rootScope)
             }
@@ -113,6 +113,20 @@ enum StoreBackedWorkspaceSearch {
                 rootRefs: freshnessRootRefs,
                 appliedIngressSamples: appliedIngressSamples
             )
+            try Task.checkCancellation()
+            // Exact paths can change kind while the freshness barrier applies pending ingress.
+            // Re-resolve after the barrier so file-to-folder and folder-to-file transitions
+            // filter the fresh catalog using the current path type.
+            let parsedSearchScope: SearchScopeParseResult? = if let rawPaths = paths, !rawPaths.isEmpty {
+                await parseSearchScopePaths(
+                    rawPaths,
+                    caseInsensitive: caseInsensitive,
+                    rootScope: rootScope,
+                    store: store
+                )
+            } else {
+                nil
+            }
             try Task.checkCancellation()
 
             return try await performSearch(
