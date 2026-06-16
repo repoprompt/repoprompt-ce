@@ -43,7 +43,144 @@ jobs:
         run: swift build --product repoprompt-mcp
 
       - name: Run app tests
-        run: swift test
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A single long-lived XCTest process accumulates suspended app-lifecycle tasks
+          # and can wedge Swift's cooperative executor late in the suite on hosted runners.
+          # Preserve serial test semantics while bounding each process to one test class.
+          # Retry only silent startup timeouts; assertion failures remain immediate failures.
+          python3 <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+          import threading
+          import time
+
+          suite_timeout_seconds = 180
+          listed = subprocess.run(
+              ["swift", "test", "list"],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          suites = sorted({
+              line.split("/", 1)[0]
+              for line in listed.stdout.splitlines()
+              if "/" in line
+          })
+
+          def descendant_process_groups(root_pid):
+              process_list = subprocess.run(
+                  ["ps", "-axo", "pid=,ppid="],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              children = {}
+              for line in process_list.stdout.splitlines():
+                  pid_text, parent_text = line.split()
+                  children.setdefault(int(parent_text), []).append(int(pid_text))
+
+              pending = [root_pid]
+              process_ids = set()
+              while pending:
+                  process_id = pending.pop()
+                  if process_id in process_ids:
+                      continue
+                  process_ids.add(process_id)
+                  pending.extend(children.get(process_id, []))
+
+              groups = set()
+              for process_id in process_ids:
+                  try:
+                      groups.add(os.getpgid(process_id))
+                  except ProcessLookupError:
+                      pass
+              groups.discard(os.getpgrp())
+              return groups
+
+          def signal_process_groups(groups, sent_signal):
+              for group in groups:
+                  try:
+                      os.killpg(group, sent_signal)
+                  except ProcessLookupError:
+                      pass
+
+          def live_process_groups(groups):
+              live = set()
+              for group in groups:
+                  try:
+                      os.killpg(group, 0)
+                  except ProcessLookupError:
+                      continue
+                  live.add(group)
+              return live
+
+          def stop_process_tree(process):
+              groups = descendant_process_groups(process.pid)
+              signal_process_groups(groups, signal.SIGTERM)
+
+              deadline = time.monotonic() + 10
+              while time.monotonic() < deadline:
+                  process.poll()
+                  groups = live_process_groups(groups)
+                  if not groups:
+                      break
+                  time.sleep(0.1)
+
+              signal_process_groups(groups, signal.SIGKILL)
+              process.wait()
+
+          def relay_output(process, output_seen):
+              for line in process.stdout:
+                  output_seen.set()
+                  sys.stdout.write(line)
+                  sys.stdout.flush()
+
+          for suite in suites:
+              print(f"::group::{suite}", flush=True)
+              for attempt in range(1, 3):
+                  output_seen = threading.Event()
+                  process = subprocess.Popen(
+                      ["swift", "test", "--skip-build", "--filter", suite],
+                      start_new_session=True,
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                  )
+                  relay = threading.Thread(
+                      target=relay_output,
+                      args=(process, output_seen),
+                      daemon=True,
+                  )
+                  relay.start()
+                  try:
+                      return_code = process.wait(timeout=suite_timeout_seconds)
+                  except subprocess.TimeoutExpired:
+                      stop_process_tree(process)
+                      relay.join(timeout=10)
+                      if attempt == 1 and not output_seen.is_set():
+                          print(
+                              f"::warning::{suite} produced no output for "
+                              f"{suite_timeout_seconds}s; retrying once",
+                              flush=True,
+                          )
+                          continue
+                      print(
+                          f"::error::{suite} timed out after "
+                          f"{suite_timeout_seconds}s",
+                          flush=True,
+                      )
+                      sys.exit(124)
+
+                  relay.join(timeout=10)
+                  if return_code != 0:
+                      sys.exit(return_code)
+                  break
+              print("::endgroup::", flush=True)
+          PY
 
       - name: Run provider package tests
         working-directory: Packages/RepoPromptAgentProviders

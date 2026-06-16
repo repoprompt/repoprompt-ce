@@ -44,6 +44,7 @@ struct MCPBootstrapLeaseSpec {
 ///
 /// ## Additional operations (agent-mode specific)
 /// - `releaseWithoutRoutingWait()` — releases gate immediately (when no fresh connection is expected)
+/// - `releaseGateForDeferredRouting()` — releases the gate while retaining pending routing/policy state
 actor MCPBootstrapLease {
     private let log = Logger(subsystem: "com.repoprompt.mcp", category: "BootstrapLease")
 
@@ -263,6 +264,43 @@ actor MCPBootstrapLease {
         didCleanupRouting = true
     }
 
+    /// Releases only the serialized bootstrap gate while retaining the pending run policy.
+    /// Use this for ACP runtimes that do not open their MCP transport until the first prompt.
+    func releaseGateForDeferredRouting() async {
+        if hasReleased {
+            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) releaseGateForDeferredRouting() ignored because lease already released")
+            return
+        }
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) deferring route wait until provider prompt")
+        #if DEBUG
+            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "route_wait_deferred",
+                fields: [
+                    "client_name": spec.clientName ?? "nil",
+                    "gate_id": spec.gateID.uuidString
+                ]
+            )
+        #endif
+        if ownsGate {
+            _ = await HeadlessAgentConnectionGate.completeIfActive(spec.gateID)
+            ownsGate = false
+        }
+    }
+
+    /// Cleans up deferred routing state after a prompt-deferred provider reaches a terminal state
+    /// without needing to report a bootstrap failure.
+    func cleanupDeferredRouting() async {
+        if hasReleased {
+            acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cleanupDeferredRouting() ignored because lease already released")
+            return
+        }
+        cleanupRequested = true
+        hasReleased = true
+        acpLeaseLog("[ACP-Runner] lease run=\(spec.runID) gate=\(spec.gateID) cleaning up deferred routing state")
+        await performDeferredRoutingCleanup(reason: "deferred_terminal")
+    }
+
     // MARK: - Failure & Cancellation
 
     /// Hard failure path: signal routing failure and release gate immediately.
@@ -314,6 +352,44 @@ actor MCPBootstrapLease {
             didSignalRoutingFailure = true
             await MCPRoutingWaiter.notifyFailed(runID: spec.runID)
         }
+        if ownsGate {
+            _ = await HeadlessAgentConnectionGate.completeIfActive(spec.gateID)
+            ownsGate = false
+        }
+        if routingRegistered, !didCleanupRouting {
+            didCleanupRouting = true
+            await AgentRunCoordinator.shared.cleanupRouting(runID: spec.runID)
+        }
+        if policyInstalled, !didClearPolicy {
+            didClearPolicy = true
+            await policyClearer(spec)
+        }
+        #if DEBUG
+            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "lease_cleanup_completed",
+                fields: [
+                    "client_name": spec.clientName ?? "nil",
+                    "reason": reason,
+                    "owns_gate": String(ownsGate),
+                    "policy_installed": String(policyInstalled)
+                ]
+            )
+        #endif
+    }
+
+    private func performDeferredRoutingCleanup(reason: String) async {
+        #if DEBUG
+            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                runID: spec.runID,
+                event: "lease_deferred_cleanup",
+                fields: [
+                    "client_name": spec.clientName ?? "nil",
+                    "gate_id": spec.gateID.uuidString,
+                    "reason": reason
+                ]
+            )
+        #endif
         if ownsGate {
             _ = await HeadlessAgentConnectionGate.completeIfActive(spec.gateID)
             ownsGate = false

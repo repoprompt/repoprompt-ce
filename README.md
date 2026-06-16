@@ -41,8 +41,11 @@ and local development.
 For development and quick evaluation, double-click
 [`Launch RepoPrompt CE.command`](Launch%20RepoPrompt%20CE.command) in Finder.
 
-The launcher builds RepoPrompt CE from source, opens the debug app, and keeps a
-small terminal window available for rebuild, status, and stop controls.
+The launcher requires Python 3, builds RepoPrompt CE through the coordinated
+developer daemon, opens the debug app, and keeps a small terminal window
+available for rebuild, status, and stop controls. It does not provide an
+uncoordinated no-Python fallback because lifecycle actions validate the exact
+debug executable path.
 
 The debug launcher uses an available `Apple Development:` signing identity. If
 your Mac does not have one, run the same debug app from Terminal with explicit

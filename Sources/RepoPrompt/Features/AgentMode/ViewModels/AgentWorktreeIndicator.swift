@@ -139,6 +139,19 @@ extension AgentWorktreeIndicator {
         "WT \(label)"
     }
 
+    /// Available worktrees may collapse to a compact `WT` fallback at narrow widths.
+    /// Unavailable worktrees keep their identifying label visible for recovery.
+    var allowsCompactCapsule: Bool {
+        isAvailable
+    }
+
+    /// Missing physical worktree path exposed for recovery actions.
+    var missingWorktreePath: String? {
+        guard !isAvailable else { return nil }
+        let trimmed = worktreeRootPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// Tooltip / help text describing the bound worktree.
     var tooltipText: String {
         var parts = ["Agent execution worktree: \(label)"]

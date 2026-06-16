@@ -263,7 +263,7 @@ struct AgentModeDetailWithSidebarView: View {
 
     private func syncRuntimeMetricsSelectionCount(selection: StoredSelection) {
         agentModeVM.syncRuntimeMetricsUIState(
-            liveSelectedFileCount: AgentContextExportResolver.selectionFileCount(selection)
+            liveSelectedFileCount: AgentContextExportResolver.explicitSelectionFileCount(selection)
         )
     }
 }

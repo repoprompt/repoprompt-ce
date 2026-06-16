@@ -92,40 +92,4 @@ final class AIModelPreferenceRegressionTests: XCTestCase {
         )
         XCTAssertEqual(resolved, .configured(configuredModel))
     }
-
-    func testOracleModelsReportingUsesStrictPlanningResolutionInsteadOfPreferredFallback() throws {
-        let repoRoot = try RepoRoot.url(filePath: #filePath)
-        let sourcePath = "Sources/RepoPrompt/Infrastructure/MCP/MCPOracleToolService.swift"
-        let contents = try String(contentsOf: repoRoot.appendingPathComponent(sourcePath), encoding: .utf8)
-
-        XCTAssertTrue(contents.contains("promptVM.mcpOraclePlanningModelResolution()"))
-        XCTAssertFalse(contents.contains("let effectiveModel = planningAvailable ? planningModel : await promptVM.preferredAIModel"))
-    }
-
-    func testMCPOraclePlanningResolutionUsesProviderConfiguredAvailabilityWithoutAutoHeal() throws {
-        let repoRoot = try RepoRoot.url(filePath: #filePath)
-        let sourcePath = "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel.swift"
-        let contents = try String(contentsOf: repoRoot.appendingPathComponent(sourcePath), encoding: .utf8)
-
-        XCTAssertTrue(contents.contains("func mcpOraclePlanningModelResolution() -> MCPOraclePlanningModelResolution"))
-        XCTAssertTrue(contents.contains("self?.isProviderConfigured(for: model) ?? false"))
-        XCTAssertFalse(contents.contains("self?.isModelAvailable(model) ?? false"))
-        XCTAssertFalse(contents.contains("pickPlanningModelFallback"))
-        XCTAssertFalse(contents.contains("prompt.validate_planning_model.fallback"))
-    }
-
-    func testLegacyMCPPlanningModelMigrationSymbolAndStartupCallAreRemoved() throws {
-        let repoRoot = try RepoRoot.url(filePath: #filePath)
-        let sourcePaths = [
-            "Sources/RepoPrompt/App/AppDelegate.swift",
-            "Sources/RepoPrompt/Features/Settings/ViewModels/APISettingsViewModel.swift"
-        ]
-
-        for sourcePath in sourcePaths {
-            let contents = try String(contentsOf: repoRoot.appendingPathComponent(sourcePath), encoding: .utf8)
-            XCTAssertFalse(contents.contains("migrateLegacyMCPPlanningModel"), sourcePath)
-            XCTAssertFalse(contents.contains("mcpPlanningModel"), sourcePath)
-            XCTAssertFalse(contents.contains("didMigrateMCPPlanningModelToPlanningModel"), sourcePath)
-        }
-    }
 }

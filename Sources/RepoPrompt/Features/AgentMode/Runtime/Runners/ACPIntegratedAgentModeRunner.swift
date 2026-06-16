@@ -121,8 +121,24 @@ final class ACPIntegratedAgentModeRunner {
                let runID = AgentModeProcessRunIdentity.existingProcessRunID(for: session)
             {
                 guard isStartupStillCurrent(session: session, runID: runID, runAttemptID: runAttemptID) else { return }
-                session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] _ in
-                    self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+                let deferredLease = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
+                    ? nil
+                    : makeLease(runID)
+                session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
+                    let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
+                    return {
+                        await trackerTeardown?()
+                        switch terminalState {
+                        case .failed:
+                            await deferredLease?.failAndCleanup()
+                        case .cancelled:
+                            await deferredLease?.cancelAndCleanup()
+                        case .completed:
+                            await deferredLease?.cleanupDeferredRouting()
+                        default:
+                            break
+                        }
+                    }
                 }
                 session.agentTask = Task { [weak self, weak session] in
                     guard let self, let session else { return }
@@ -139,6 +155,7 @@ final class ACPIntegratedAgentModeRunner {
                             attachments: attachments,
                             controller: existingController,
                             runRequest: runRequest,
+                            deferredLease: deferredLease,
                             attachmentReservationID: attachmentReservationID
                         )
                     } onCancel: {}
@@ -217,15 +234,24 @@ final class ACPIntegratedAgentModeRunner {
 
         await controller.setExpectedMCPRunID(runID)
         session.acpController = controller
+        let requiresPrePromptMCPRouting = runRequest.agentKind.requiresPrePromptAgentModeMCPRouting
         session.installRunAttemptTerminalResources(ownership: ownership) { [weak self] terminalState in
             let trackerTeardown = self?.prepareToolTrackingTeardown(for: session, matchingRunID: runID)
             return {
                 await trackerTeardown?()
                 switch terminalState {
                 case .failed:
-                    await lease.failAndRelease()
+                    if requiresPrePromptMCPRouting {
+                        await lease.failAndRelease()
+                    } else {
+                        await lease.failAndCleanup()
+                    }
                 case .cancelled:
                     await lease.cancelAndCleanup()
+                case .completed:
+                    if !requiresPrePromptMCPRouting {
+                        await lease.cleanupDeferredRouting()
+                    }
                 default:
                     break
                 }
@@ -483,21 +509,26 @@ final class ACPIntegratedAgentModeRunner {
             try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
             setRunningStatus(waitingForConnectionStatusText(for: runRequest.agentKind), source: .transport, session: session, urgent: true)
 
-            let routed = await lease.releaseWhenRouted()
-            log("releaseWhenRouted routed=\(routed)", runID: runID)
-            guard routed else {
-                await finalize(
-                    session: session,
-                    runID: runID,
-                    runAttemptID: runAttemptID,
-                    controller: controller,
-                    attachmentReservationID: attachmentReservationID,
-                    terminalState: .failed,
-                    errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
-                    notifyTurnComplete: false,
-                    shouldShutdownController: true
-                )
-                return
+            if runRequest.agentKind.requiresPrePromptAgentModeMCPRouting {
+                let routed = await lease.releaseWhenRouted()
+                log("releaseWhenRouted routed=\(routed)", runID: runID)
+                guard routed else {
+                    await finalize(
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        controller: controller,
+                        attachmentReservationID: attachmentReservationID,
+                        terminalState: .failed,
+                        errorText: "RepoPrompt MCP routing did not complete before \(runRequest.agentKind.displayName) ACP prompt submission.",
+                        notifyTurnComplete: false,
+                        shouldShutdownController: true
+                    )
+                    return
+                }
+            } else {
+                await lease.releaseGateForDeferredRouting()
+                log("deferred MCP routing until ACP prompt", runID: runID)
             }
 
             await runPromptTurn(
@@ -551,6 +582,7 @@ final class ACPIntegratedAgentModeRunner {
         attachments: [AgentImageAttachment],
         controller: ACPAgentSessionController,
         runRequest: ACPRunRequest,
+        deferredLease: MCPBootstrapLease?,
         attachmentReservationID: UUID?
     ) async {
         do {
@@ -572,6 +604,26 @@ final class ACPIntegratedAgentModeRunner {
             try await applyExplicitSelectedModelIfNeeded(runRequest, controller: controller, runID: runID)
             await controller.setAutoApproveAllToolPermissions(runRequest.autoApproveAllToolPermissions)
             try await applyRequestedSessionModeIfNeeded(runRequest.sessionModeID, controller: controller, runID: runID)
+
+            if let deferredLease {
+                let acquired = await deferredLease.acquire()
+                guard acquired else {
+                    await finalize(
+                        session: session,
+                        runID: runID,
+                        runAttemptID: runAttemptID,
+                        controller: controller,
+                        attachmentReservationID: attachmentReservationID,
+                        terminalState: .failed,
+                        errorText: "RepoPrompt MCP routing policy could not be prepared before \(runRequest.agentKind.displayName) ACP prompt submission.",
+                        notifyTurnComplete: false,
+                        shouldShutdownController: true
+                    )
+                    return
+                }
+                await deferredLease.releaseGateForDeferredRouting()
+                log("deferred MCP routing until ACP follow-up prompt", runID: runID)
+            }
 
             await runPromptTurn(
                 session: session,
@@ -1149,6 +1201,23 @@ final class ACPIntegratedAgentModeRunner {
         toolTrackingHooks.scheduleSave(session.tabID)
     }
 
+    private func indexedThenActiveTurnToolCandidates(
+        indexedIndices: [Int],
+        session: AgentModeViewModel.TabSession,
+        where predicate: (AgentChatItem) -> Bool
+    ) -> (indices: [Int], inspectedItemCount: Int, usedFallbackScan: Bool) {
+        let indexedMatches = indexedIndices.filter { predicate(session.items[$0]) }
+        if !indexedMatches.isEmpty || !indexedIndices.isEmpty {
+            return (indexedMatches, indexedIndices.count, false)
+        }
+        let fallback = session.activeTurnToolItemIndices(where: predicate)
+        return (
+            fallback.indices,
+            indexedIndices.count + fallback.scannedItemCount,
+            !fallback.indices.isEmpty
+        )
+    }
+
     private func correlatedToolCallItemIndex(
         in session: AgentModeViewModel.TabSession,
         storedToolName: String,
@@ -1156,46 +1225,89 @@ final class ACPIntegratedAgentModeRunner {
         argsJSON: String?,
         allowNameOnlyFallback: Bool
     ) -> Int? {
-        if let invocationID,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolCall
-                   && $0.toolInvocationID == invocationID
-                   && shouldUpdateExistingToolCall($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
-           })
-        {
-            return index
+        var inspectedItemCount = 0
+        if let invocationID {
+            let candidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: session.indexedToolItemIndices(invocationID: invocationID),
+                session: session,
+                where: {
+                    $0.kind == .toolCall
+                        && $0.toolInvocationID == invocationID
+                        && self.shouldUpdateExistingToolCall(
+                            $0,
+                            storedToolName: storedToolName,
+                            argsJSON: argsJSON,
+                            tabID: session.tabID
+                        )
+                }
+            )
+            inspectedItemCount += candidates.inspectedItemCount
+            if let index = candidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: candidates.usedFallbackScan ? "invocation_id_active_turn_scan" : "invocation_id",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
         }
-        if let argsJSON,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolCall
-                   && toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON)
-                   == toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
-           })
-        {
-            return index
+        if let argsJSON {
+            let signature = toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
+            let candidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: session.indexedToolItemIndices(
+                    signature: signature,
+                    pendingCallsOnly: true
+                ),
+                session: session,
+                where: {
+                    $0.kind == .toolCall
+                        && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
+                }
+            )
+            inspectedItemCount += candidates.inspectedItemCount
+            if let index = candidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: candidates.usedFallbackScan ? "signature_active_turn_scan" : "signature",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
         }
         if let argsJSON,
            hasAccountableToolPayload(argsJSON)
         {
-            let placeholderCandidates = currentTurnItemIndices(in: session).filter { index in
-                let item = session.items[index]
-                return item.kind == .toolCall
-                    && isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
-                    && isPlaceholderToolArgs(item.toolArgsJSON)
-                    && MCPIntegrationHelper.normalizedRepoPromptToolName(item.toolName ?? "")
-                    == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
-            }
-            if placeholderCandidates.count == 1 {
-                return placeholderCandidates[0]
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let placeholderCandidates = session.activeTurnToolItemIndices(where: { item in
+                item.kind == .toolCall
+                    && self.isProviderPlaceholderInvocation(item.toolInvocationID, tabID: session.tabID)
+                    && self.isPlaceholderToolArgs(item.toolArgsJSON)
+                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName(item.toolName) == normalizedToolName
+            })
+            inspectedItemCount += placeholderCandidates.scannedItemCount
+            if placeholderCandidates.indices.count == 1 {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: "placeholder_active_turn_scan",
+                    scannedItemCount: inspectedItemCount
+                )
+                return placeholderCandidates.indices[0]
             }
         }
         if allowNameOnlyFallback {
-            return lastCurrentTurnItemIndex(in: session, where: {
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && MCPIntegrationHelper.normalizedRepoPromptToolName($0.toolName ?? "")
-                    == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
+                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
+            inspectedItemCount += fallback.scannedItemCount
+            MCPToolObserverAttributionContext.record(
+                correlationPath: fallback.lastIndex == nil ? "none" : "name_active_turn_scan",
+                scannedItemCount: inspectedItemCount
+            )
+            return fallback.lastIndex
         }
+        MCPToolObserverAttributionContext.record(
+            correlationPath: "none",
+            scannedItemCount: inspectedItemCount
+        )
         return nil
     }
 
@@ -1206,48 +1318,114 @@ final class ACPIntegratedAgentModeRunner {
         argsJSON: String?,
         allowNameOnlyFallback: Bool
     ) -> Int? {
-        if let invocationID,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolCall
-                   && $0.toolInvocationID == invocationID
-                   && shouldUpdateExistingToolCall($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
-           })
-        {
-            return index
-        }
-        if let invocationID,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolResult
-                   && $0.toolInvocationID == invocationID
-                   && shouldUpdateExistingToolResult($0, storedToolName: storedToolName, argsJSON: argsJSON, tabID: session.tabID)
-           })
-        {
-            return index
+        var inspectedItemCount = 0
+        if let invocationID {
+            let callCandidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: session.indexedToolItemIndices(invocationID: invocationID),
+                session: session,
+                where: {
+                    $0.kind == .toolCall
+                        && $0.toolInvocationID == invocationID
+                        && self.shouldUpdateExistingToolCall(
+                            $0,
+                            storedToolName: storedToolName,
+                            argsJSON: argsJSON,
+                            tabID: session.tabID
+                        )
+                }
+            )
+            inspectedItemCount += callCandidates.inspectedItemCount
+            if let index = callCandidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: callCandidates.usedFallbackScan
+                        ? "invocation_id_call_active_turn_scan"
+                        : "invocation_id_call",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
+            let resultCandidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: session.indexedToolItemIndices(invocationID: invocationID),
+                session: session,
+                where: {
+                    $0.kind == .toolResult
+                        && $0.toolInvocationID == invocationID
+                        && self.shouldUpdateExistingToolResult(
+                            $0,
+                            storedToolName: storedToolName,
+                            argsJSON: argsJSON,
+                            tabID: session.tabID
+                        )
+                }
+            )
+            inspectedItemCount += resultCandidates.inspectedItemCount
+            if let index = resultCandidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: resultCandidates.usedFallbackScan
+                        ? "invocation_id_result_active_turn_scan"
+                        : "invocation_id_result",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
         }
         let signature = toolInvocationSignature(toolName: storedToolName, argsJSON: argsJSON)
-        if argsJSON != nil,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolCall
-                   && toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
-           })
-        {
-            return index
-        }
-        if argsJSON != nil,
-           let index = lastCurrentTurnItemIndex(in: session, where: {
-               $0.kind == .toolResult
-                   && toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
-           })
-        {
-            return index
+        if argsJSON != nil {
+            let signatureIndices = session.indexedToolItemIndices(signature: signature)
+            let callCandidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: signatureIndices,
+                session: session,
+                where: {
+                    $0.kind == .toolCall
+                        && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
+                }
+            )
+            inspectedItemCount += callCandidates.inspectedItemCount
+            if let index = callCandidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: callCandidates.usedFallbackScan
+                        ? "signature_call_active_turn_scan"
+                        : "signature_call",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
+            let resultCandidates = indexedThenActiveTurnToolCandidates(
+                indexedIndices: signatureIndices,
+                session: session,
+                where: {
+                    $0.kind == .toolResult
+                        && self.toolInvocationSignature(toolName: $0.toolName, argsJSON: $0.toolArgsJSON) == signature
+                }
+            )
+            inspectedItemCount += resultCandidates.inspectedItemCount
+            if let index = resultCandidates.indices.last {
+                MCPToolObserverAttributionContext.record(
+                    correlationPath: resultCandidates.usedFallbackScan
+                        ? "signature_result_active_turn_scan"
+                        : "signature_result",
+                    scannedItemCount: inspectedItemCount
+                )
+                return index
+            }
         }
         if allowNameOnlyFallback {
-            return lastCurrentTurnItemIndex(in: session, where: {
+            let normalizedToolName = AgentModeViewModel.TabSession.normalizedToolCorrelationName(storedToolName)
+            let fallback = session.activeTurnToolItemIndices(where: {
                 $0.kind == .toolCall
-                    && MCPIntegrationHelper.normalizedRepoPromptToolName($0.toolName ?? "")
-                    == MCPIntegrationHelper.normalizedRepoPromptToolName(storedToolName)
+                    && AgentModeViewModel.TabSession.normalizedToolCorrelationName($0.toolName) == normalizedToolName
             })
+            inspectedItemCount += fallback.scannedItemCount
+            MCPToolObserverAttributionContext.record(
+                correlationPath: fallback.lastIndex == nil ? "none" : "name_active_turn_scan",
+                scannedItemCount: inspectedItemCount
+            )
+            return fallback.lastIndex
         }
+        MCPToolObserverAttributionContext.record(
+            correlationPath: "none",
+            scannedItemCount: inspectedItemCount
+        )
         return nil
     }
 
@@ -1302,29 +1480,6 @@ final class ACPIntegratedAgentModeRunner {
             && isPlaceholderToolArgs(item.toolArgsJSON)
     }
 
-    private func currentTurnItemIndices(in session: AgentModeViewModel.TabSession) -> Range<Int> {
-        let start = currentTurnStartIndex(in: session)
-        return start ..< session.items.endIndex
-    }
-
-    private func lastCurrentTurnItemIndex(
-        in session: AgentModeViewModel.TabSession,
-        where predicate: (AgentChatItem) -> Bool
-    ) -> Int? {
-        let start = currentTurnStartIndex(in: session)
-        guard start < session.items.endIndex else { return nil }
-        for index in stride(from: session.items.index(before: session.items.endIndex), through: start, by: -1) {
-            if predicate(session.items[index]) {
-                return index
-            }
-        }
-        return nil
-    }
-
-    private func currentTurnStartIndex(in session: AgentModeViewModel.TabSession) -> Int {
-        session.items.lastIndex(where: { $0.kind == .user }).map { $0 + 1 } ?? session.items.startIndex
-    }
-
     private func recordProviderInvocation(_ providerInvocationID: UUID, forTrackerInvocationID trackerInvocationID: UUID, tabID: UUID) {
         var mappings = acpProviderInvocationByTrackerInvocationIDByTabID[tabID, default: [:]]
         mappings[trackerInvocationID] = providerInvocationID
@@ -1363,9 +1518,10 @@ final class ACPIntegratedAgentModeRunner {
     }
 
     private func toolInvocationSignature(toolName: String?, argsJSON: String?) -> String {
-        let normalizedToolName = MCPIntegrationHelper.normalizedRepoPromptToolName(toolName ?? "")
-        let normalizedArgs = canonicalizedJSON(argsJSON) ?? ""
-        return "\(normalizedToolName)|\(normalizedArgs)"
+        AgentModeViewModel.TabSession.canonicalToolInvocationSignature(
+            toolName: toolName,
+            argsJSON: argsJSON
+        )
     }
 
     private func hasNonEmptyPayload(_ payload: String?) -> Bool {

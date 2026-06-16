@@ -79,13 +79,14 @@ actor CursorACPModelPollingService {
     struct Snapshot: Equatable {
         let models: ACPDiscoveredSessionModels
         let fetchedAt: Date
+        let isLiveDiscovery: Bool
     }
 
     private let client: any CursorACPModelDiscoveryClient
     private let intervalNanos: UInt64
 
     private var pollingTask: Task<Void, Never>?
-    private var inFlightRefresh: Task<Void, Never>?
+    private var inFlightRefresh: Task<Bool, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
     private var latest: Snapshot?
     private var preferredWorkspacePath: String?
@@ -147,14 +148,14 @@ actor CursorACPModelPollingService {
         return stream
     }
 
-    func refreshNow(workspacePath: String?) async {
-        guard !isShutdown else { return }
+    @discardableResult
+    func refreshNow(workspacePath: String?) async -> Bool {
+        guard !isShutdown else { return false }
         preferredWorkspacePath = normalizedWorkspacePath(workspacePath)
         if let existing = inFlightRefresh {
-            await existing.value
-            return
+            return await existing.value
         }
-        await performRefresh()
+        return await performRefresh()
     }
 
     func shutdown(finishSubscribers: Bool = true) async {
@@ -178,7 +179,7 @@ actor CursorACPModelPollingService {
         pollingTask = Task { [weak self] in
             guard let self else { return }
             while !Task.isCancelled {
-                await performRefresh()
+                _ = await performRefresh()
                 do {
                     try await Task.sleep(nanoseconds: intervalNanos)
                 } catch {
@@ -199,35 +200,53 @@ actor CursorACPModelPollingService {
         stopPollingIfIdle()
     }
 
-    private func performRefresh() async {
-        guard !isShutdown else { return }
+    private func performRefresh() async -> Bool {
+        guard !isShutdown else { return false }
         if let existing = inFlightRefresh {
-            await existing.value
-            return
+            return await existing.value
         }
 
         let workspacePath = preferredWorkspacePath
-        let task = Task { [weak self, workspacePath] in
-            guard let self else { return }
+        let task = Task<Bool, Never> { [weak self, workspacePath] in
+            guard let self else { return false }
             do {
-                guard let discovered = try await client.discoverModels(workspacePath: workspacePath) else { return }
-                guard !Task.isCancelled else { return }
-                await applyRefreshResult(discovered)
+                let discovered = try await client.discoverModels(workspacePath: workspacePath)
+                guard !Task.isCancelled else { return false }
+                if let discovered {
+                    await applyRefreshResult(discovered)
+                } else {
+                    await publishLiveReadinessWithoutModels()
+                }
+                return true
             } catch {
                 // Keep the last registry/cache snapshot when preflight or ACP discovery fails.
+                return false
             }
         }
         inFlightRefresh = task
         defer { inFlightRefresh = nil }
-        await task.value
+        return await task.value
+    }
+
+    private func publishLiveReadinessWithoutModels() {
+        guard !isShutdown else { return }
+        let models = latest?.models
+            ?? AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)
+            ?? ACPDiscoveredSessionModels(options: [], currentModelRaw: nil)
+        let snapshot = Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: true)
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
+        latest = snapshot
+        for continuation in continuations.values {
+            continuation.yield(snapshot)
+        }
     }
 
     private func applyRefreshResult(_ discovered: ACPDiscoveredSessionModels) {
         guard !isShutdown else { return }
         _ = AgentACPModelRegistry.shared.updateDiscoveredModels(discovered, for: .cursor)
         guard let normalized = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor) else { return }
-        let snapshot = Snapshot(models: normalized, fetchedAt: Date())
-        guard latest?.models != snapshot.models else { return }
+        let snapshot = Snapshot(models: normalized, fetchedAt: Date(), isLiveDiscovery: true)
+        guard latest?.models != snapshot.models || latest?.isLiveDiscovery == false else { return }
         latest = snapshot
         for continuation in continuations.values {
             continuation.yield(snapshot)
@@ -238,7 +257,7 @@ actor CursorACPModelPollingService {
         guard let models = await AgentACPModelRegistry.shared.resolvedSnapshotAfterWarmingStandardStore(for: .cursor) else {
             return nil
         }
-        return Snapshot(models: models, fetchedAt: Date())
+        return Snapshot(models: models, fetchedAt: Date(), isLiveDiscovery: false)
     }
 
     private func normalizedWorkspacePath(_ path: String?) -> String? {

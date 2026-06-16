@@ -39,6 +39,85 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testPhysicalizedSelectionRefreshesSessionBoundBatchLookupAfterWorktreeLoad() async throws {
+        let logicalRoot = try makeTemporaryRoot(name: "AccountingLogical")
+        let worktreeRoot = try makeTemporaryRoot(name: "AccountingWorktree")
+        let logicalFile = logicalRoot.appendingPathComponent("Sources/App.swift")
+        let worktreeFile = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try write("canonical", to: logicalFile)
+        try write("worktree", to: worktreeFile)
+
+        let store = WorkspaceFileContextStore()
+        let logicalRootRecord = try await store.loadRoot(path: logicalRoot.path)
+        let logicalRootRef = WorkspaceRootRef(
+            id: logicalRootRecord.id,
+            name: logicalRootRecord.name,
+            fullPath: logicalRootRecord.standardizedFullPath
+        )
+        let physicalRootRef = WorkspaceRootRef(
+            id: UUID(),
+            name: logicalRootRecord.name,
+            fullPath: worktreeRoot.path
+        )
+        let projection = WorkspaceRootBindingProjection(
+            sessionID: UUID(),
+            boundRoots: [
+                .init(
+                    logicalRoot: logicalRootRef,
+                    physicalRoot: physicalRootRef,
+                    binding: AgentSessionWorktreeBinding(
+                        id: "accounting-binding",
+                        repositoryID: "accounting-repository",
+                        repoKey: "accounting-repo",
+                        logicalRootPath: logicalRoot.path,
+                        logicalRootName: logicalRootRecord.name,
+                        worktreeID: "accounting-worktree",
+                        worktreeRootPath: worktreeRoot.path,
+                        source: "test"
+                    )
+                )
+            ],
+            visibleLogicalRoots: [logicalRootRef]
+        )
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: projection.lookupRootScope,
+            bindingProjection: projection
+        )
+        let logicalSelection = StoredSelection(
+            selectedPaths: [logicalFile.path],
+            codemapAutoEnabled: false
+        )
+        let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+        XCTAssertEqual(physicalSelection.selectedPaths, [worktreeFile.path])
+
+        let request = WorkspacePathLookupRequest(
+            userPath: worktreeFile.path,
+            profile: .uiAssisted,
+            rootScope: lookupContext.rootScope
+        )
+        let generationBeforeWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        let lookupBeforeWorktreeLoad = await store.lookupPaths([request])
+        XCTAssertTrue(lookupBeforeWorktreeLoad.isEmpty)
+
+        let worktreeRootRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+        let generationAfterWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        XCTAssertNotEqual(generationAfterWorktreeLoad, generationBeforeWorktreeLoad)
+        let resolution = await PromptContextAccountingService().resolveEntries(
+            selection: physicalSelection,
+            store: store,
+            rootScope: lookupContext.rootScope,
+            codeMapUsage: .none
+        )
+
+        let entry = try XCTUnwrap(resolution.entries.first)
+        XCTAssertEqual(resolution.entries.count, 1)
+        XCTAssertEqual(entry.file.rootID, worktreeRootRecord.id)
+        XCTAssertEqual(entry.file.standardizedRelativePath, "Sources/App.swift")
+        XCTAssertEqual(entry.loadedContent, "worktree")
+        XCTAssertEqual(resolution.missingPaths, [])
+        XCTAssertEqual(resolution.invalidPaths, [])
+    }
+
     func testDuplicateSelectedPathsPreserveExistingEntryDedupOrder() async throws {
         let root = try makeTemporaryRoot(name: "AccountingDuplicates")
         let fileA = root.appendingPathComponent("A.swift")
@@ -154,6 +233,107 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testCancelledAccountingReadBatchStopsSchedulingRemainingFiles() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AccountingCancellation")
+            let fileCount = 24
+            var selectedPaths: [String] = []
+            for index in 0 ..< fileCount {
+                let fileURL = root.appendingPathComponent("File\(index).swift")
+                try write("struct File\(index) {}", to: fileURL)
+                selectedPaths.append(fileURL.path)
+            }
+
+            let store = WorkspaceFileContextStore()
+            let rootRecord = try await store.loadRoot(path: root.path)
+            let loadedService = await store.fileSystemServiceForTesting(rootID: rootRecord.id)
+            let service = try XCTUnwrap(loadedService)
+            let gate = AccountingReadCancellationGate()
+            await service.setContentReadChunkHandlerForTesting { _ in
+                await gate.markStartedAndWaitForRelease()
+            }
+
+            let accountingTask = Task {
+                await PromptContextAccountingService().resolveEntries(
+                    selection: StoredSelection(
+                        selectedPaths: selectedPaths,
+                        codemapAutoEnabled: false
+                    ),
+                    store: store,
+                    codeMapUsage: .none
+                )
+            }
+            await gate.waitUntilStarted()
+            accountingTask.cancel()
+            await gate.release()
+            _ = await accountingTask.value
+            try? await Task.sleep(for: .milliseconds(50))
+
+            let startedReadCount = await gate.startedCount()
+            await service.setContentReadChunkHandlerForTesting(nil)
+            XCTAssertLessThanOrEqual(
+                startedReadCount,
+                4,
+                "A cancelled accounting batch should not continue draining all selected files"
+            )
+        #endif
+    }
+
+    func testCompleteCodemapResolutionBuildsSingleStaticPathSnapshot() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AccountingCompleteCodemapBatch")
+            let fileCount = 24
+            var observed: [WorkspaceObservedCodemapResult] = []
+            observed.reserveCapacity(fileCount)
+            for index in 0 ..< fileCount {
+                let fileURL = root.appendingPathComponent("File\(index).swift")
+                try write("struct File\(index) {}", to: fileURL)
+                observed.append(
+                    WorkspaceObservedCodemapResult(
+                        fullPath: fileURL.path,
+                        modificationDate: Date(),
+                        fileAPI: makeFileAPI(path: fileURL.path)
+                    )
+                )
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.applyObservedCodemapResults(observed)
+            let service = PromptContextAccountingService()
+            let selection = StoredSelection(
+                selectedPaths: [],
+                autoCodemapPaths: [],
+                slices: [:],
+                codemapAutoEnabled: false
+            )
+
+            EditFlowPerf.resetDebugCaptureForTesting()
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+            switch EditFlowPerf.beginDebugCapture(label: "complete-codemap-batch", maxSamples: 200) {
+            case .started:
+                break
+            case .busy:
+                XCTFail("Performance capture should start")
+            }
+
+            let resolution = await service.resolveEntries(
+                selection: selection,
+                store: store,
+                codeMapUsage: .complete
+            )
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let snapshotBuildCount = capture.stages
+                .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
+                .reduce(0) { $0 + $1.sampleCount }
+
+            XCTAssertEqual(resolution.entries.count, fileCount)
+            XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
+            XCTAssertEqual(snapshotBuildCount, 1)
+            XCTAssertEqual(capture.droppedSampleCount, 0)
+        #endif
+    }
+
     private func makeTemporaryRoot(name: String) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("RepoPromptTests", isDirectory: true)
@@ -189,3 +369,43 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         )
     }
 }
+
+#if DEBUG
+    private actor AccountingReadCancellationGate {
+        private var count = 0
+        private var released = false
+        private var startWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func markStartedAndWaitForRelease() async {
+            count += 1
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilStarted() async {
+            guard count > 0 else {
+                await withCheckedContinuation { continuation in
+                    startWaiters.append(continuation)
+                }
+                return
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+
+        func startedCount() -> Int {
+            count
+        }
+    }
+#endif

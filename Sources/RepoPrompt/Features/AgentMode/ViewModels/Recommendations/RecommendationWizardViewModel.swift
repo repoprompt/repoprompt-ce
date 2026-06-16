@@ -263,6 +263,18 @@ final class RecommendationWizardViewModel: ObservableObject {
                 self?.refresh(navigation: .preserveCurrentStep)
             }
             .store(in: &cancellables)
+
+            // Startup verification changes effective readiness, but must never auto-apply a
+            // transient fallback into persisted recommendation settings.
+            Publishers.Merge(
+                api.$isContextBuilderProviderValidationComplete.map { _ in () },
+                api.$contextBuilderVerifiedCLIProviders.map { _ in () }
+            )
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+            .sink { [weak self] _ in
+                self?.refresh(navigation: .preserveCurrentStep)
+            }
+            .store(in: &cancellables)
         }
 
         // Subscribe to recommendation-related setting changes

@@ -327,7 +327,7 @@ size_t path_search_upper_bound(const char** array, size_t count, const char* pre
 
 // Main search function
 search_result_t* path_search_find(
-    path_search_index_t* index,
+    const path_search_index_t* index,
     const char* pattern,
     size_t limit
 ) {
@@ -401,8 +401,23 @@ search_result_t* path_search_find(
     
     // Apply regex filter or special space handling
     search_result_t* result = calloc(1, sizeof(search_result_t));
+    if (!result) {
+        free(candidates);
+        pattern_parts_destroy(parts);
+        return NULL;
+    }
     result->capacity = limit < candidate_count ? limit : candidate_count;
-    result->indices = calloc(result->capacity, sizeof(size_t));
+    if (result->capacity > 0) {
+        result->indices = calloc(result->capacity, sizeof(size_t));
+        result->scores = calloc(result->capacity, sizeof(int32_t));
+        result->tie_break_keys = calloc(result->capacity, sizeof(const char*));
+        if (!result->indices || !result->scores || !result->tie_break_keys) {
+            search_result_destroy(result);
+            free(candidates);
+            pattern_parts_destroy(parts);
+            return NULL;
+        }
+    }
     result->count = 0;
     
     // Check if this is a space-separated AND pattern
@@ -444,7 +459,10 @@ search_result_t* path_search_find(
                 }
                 
                 if (all_match) {
-                    result->indices[result->count++] = orig_idx;
+                    size_t result_index = result->count++;
+                    result->indices[result_index] = orig_idx;
+                    result->scores[result_index] = 1;
+                    result->tie_break_keys[result_index] = path;
                     if (result->count <= 5) {
                         SEARCH_LOG("  matched: %s\n", path);
                     }
@@ -469,7 +487,10 @@ search_result_t* path_search_find(
                 const char* path = index->original_paths[orig_idx];
                 
                 if (path && regexec(&regex, path, 0, NULL, 0) == 0) {
-                    result->indices[result->count++] = orig_idx;
+                    size_t result_index = result->count++;
+                    result->indices[result_index] = orig_idx;
+                    result->scores[result_index] = 1;
+                    result->tie_break_keys[result_index] = path;
                     if (result->count <= 5) {  // Log first few matches
                         SEARCH_LOG("  matched: %s\n", path);
                     }
@@ -492,6 +513,8 @@ search_result_t* path_search_find(
 void search_result_destroy(search_result_t* result) {
     if (!result) return;
     free(result->indices);
+    free(result->scores);
+    free(result->tie_break_keys);
     free(result);
 }
 
@@ -521,5 +544,9 @@ int path_compare(const void* a, const void* b) {
     const path_with_index_t* pa = (const path_with_index_t*)a;
     const path_with_index_t* pb = (const path_with_index_t*)b;
     
-    return strcmp(pa->path, pb->path);
+    int comparison = strcmp(pa->path, pb->path);
+    if (comparison != 0) return comparison;
+    if (pa->original_index < pb->original_index) return -1;
+    if (pa->original_index > pb->original_index) return 1;
+    return 0;
 }

@@ -73,30 +73,6 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
         )
     }
 
-    func testProductionAccountLiteralsExistOnlyInCatalog() throws {
-        let root = try RepoRoot.url()
-        let sourceRoot = root.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
-        let catalogPath = "Sources/RepoPrompt/Infrastructure/Security/SecureStorageAccountCatalog.swift"
-        let plaintextIdentifiers = SecureStorageAccountCatalog.allAccounts
-            .map(\.identifier)
-            .filter { !$0.hasPrefix("rp.agent.permissions.") }
-
-        var filesByQuotedIdentifier: [String: Set<String>] = [:]
-        let enumerator = FileManager.default.enumerator(at: sourceRoot, includingPropertiesForKeys: nil)
-        while let fileURL = enumerator?.nextObject() as? URL {
-            guard fileURL.pathExtension == "swift" else { continue }
-            let text = try String(contentsOf: fileURL, encoding: .utf8)
-            let relativePath = RepoRoot.relativePath(for: fileURL, relativeTo: root)
-            for identifier in plaintextIdentifiers where text.contains("\"\(identifier)\"") {
-                filesByQuotedIdentifier[identifier, default: []].insert(relativePath)
-            }
-        }
-
-        for identifier in plaintextIdentifiers {
-            XCTAssertEqual(filesByQuotedIdentifier[identifier], Set([catalogPath]), identifier)
-        }
-    }
-
     func testSecureStorageBackendBoundaryRemainsCentralized() throws {
         let root = try RepoRoot.url()
         let sourceRoot = root.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)

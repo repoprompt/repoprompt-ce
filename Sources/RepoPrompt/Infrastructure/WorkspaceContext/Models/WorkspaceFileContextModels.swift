@@ -5,7 +5,7 @@ enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
-    case sessionBoundWorkspace(logicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
+    case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
 }
 
 enum WorkspaceLookupRootScopeAvailability: Equatable {
@@ -126,13 +126,53 @@ struct WorkspaceSearchCatalogEntry: Identifiable, Equatable, Hashable {
     }
 }
 
+/// Opaque ARC lease keeping immutable catalog generations alive for snapshot readers.
+final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
+    private let retainedObjects: [AnyObject]
+
+    init(retaining retainedObjects: [AnyObject]) {
+        self.retainedObjects = retainedObjects
+    }
+}
+
 struct WorkspaceSearchCatalogSnapshot: Equatable {
     let generation: UInt64
     let rootScope: WorkspaceLookupRootScope
     let roots: [WorkspaceRootRecord]
     let files: [WorkspaceFileRecord]
     let entries: [WorkspaceSearchCatalogEntry]
+    let rootPathIndexes: [WorkspaceSearchRootPathIndex]
     let diagnostics: WorkspaceCatalogDiagnostics
+    private let generationLease: WorkspaceSearchCatalogGenerationLease?
+
+    init(
+        generation: UInt64,
+        rootScope: WorkspaceLookupRootScope,
+        roots: [WorkspaceRootRecord],
+        files: [WorkspaceFileRecord],
+        entries: [WorkspaceSearchCatalogEntry],
+        rootPathIndexes: [WorkspaceSearchRootPathIndex] = [],
+        diagnostics: WorkspaceCatalogDiagnostics,
+        generationLease: WorkspaceSearchCatalogGenerationLease? = nil
+    ) {
+        self.generation = generation
+        self.rootScope = rootScope
+        self.roots = roots
+        self.files = files
+        self.entries = entries
+        self.rootPathIndexes = rootPathIndexes
+        self.diagnostics = diagnostics
+        self.generationLease = generationLease
+    }
+
+    static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {
+        lhs.generation == rhs.generation
+            && lhs.rootScope == rhs.rootScope
+            && lhs.roots == rhs.roots
+            && lhs.files == rhs.files
+            && lhs.entries == rhs.entries
+            && lhs.diagnostics == rhs.diagnostics
+    }
 }
 
 struct WorkspaceDirectFolderChildrenSnapshot: Equatable {
@@ -432,6 +472,11 @@ struct WorkspaceCodemapSnapshot {
     let fullPath: String
     let modificationDate: Date
     let fileAPI: FileAPI?
+}
+
+struct WorkspaceCodemapRepairResult {
+    let snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]
+    let pendingFileIDs: Set<UUID>
 }
 
 struct WorkspaceCodemapUpdateEvent {

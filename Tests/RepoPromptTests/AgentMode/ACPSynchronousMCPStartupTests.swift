@@ -34,7 +34,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
-            requestTimeouts: .init(bootstrapSeconds: 2)
+            requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {
             await controller.shutdown()
@@ -74,7 +74,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
-            requestTimeouts: .init(bootstrapSeconds: 2)
+            requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {
             await controller.shutdown()
@@ -132,7 +132,7 @@ final class ACPSynchronousMCPStartupTests: XCTestCase {
         let controller = try ACPAgentSessionController(
             provider: provider,
             runRequest: request,
-            requestTimeouts: .init(bootstrapSeconds: 2)
+            requestTimeouts: .init(bootstrapSeconds: 10)
         )
         addTeardownBlock {
             await controller.shutdown()

@@ -89,6 +89,13 @@ actor AgentRunSessionStore {
         return registration
     }
 
+    func registerIfMissing(sessionID: UUID) -> Registration? {
+        guard records[sessionID] == nil else { return nil }
+        let registration = makeRegistration(sessionID: sessionID)
+        records[sessionID] = Record(registration: registration)
+        return registration
+    }
+
     func beginEpoch(
         registration: Registration,
         activationID: UUID,
@@ -677,6 +684,10 @@ actor AgentRunSessionStore {
 extension AgentRunSessionStore {
     static func register(sessionID: UUID) async -> Registration {
         await shared.register(sessionID: sessionID)
+    }
+
+    static func registerIfMissing(sessionID: UUID) async -> Registration? {
+        await shared.registerIfMissing(sessionID: sessionID)
     }
 
     static func beginEpoch(

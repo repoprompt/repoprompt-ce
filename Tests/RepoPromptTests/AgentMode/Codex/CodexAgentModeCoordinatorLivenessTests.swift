@@ -168,6 +168,29 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.items, baselineItems)
     }
 
+    func testScopedErrorWithoutAuthoritativeIdentityFailsClosed() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexAuthoritativeActiveTurn = nil
+        let baselineItems = session.items
+        let baselineOwnership = session.activeRunOwnership
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .errorNotification(.init(
+                message: "stale fatal error",
+                willRetry: false,
+                threadID: "fake",
+                turnID: "untrusted-routing-turn"
+            )),
+            session: session
+        )
+
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.activeRunOwnership, baselineOwnership)
+        XCTAssertEqual(session.items, baselineItems)
+    }
+
     func testWatchdogPauseRemainsRunningAndDoesNotAppendTranscriptFailure() async throws {
         let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
         let viewModel = makeViewModel(controller: controller)
@@ -241,9 +264,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
         let ownership = session.activeRunOwnership
-        session.codexCurrentTurnID = nil
-        session.codexCurrentTurnKind = nil
-        session.codexTurnKindsByID.removeAll()
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexAnonymousActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
         session.codexPendingTurnKind = .user
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -254,8 +277,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(session.activeRunOwnership, ownership)
         XCTAssertEqual(session.codexPendingTurnKind, .user)
-        XCTAssertNil(session.codexCurrentTurnID)
-        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNil(session.lastTerminalCommitRevision)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -264,8 +287,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         )
 
         XCTAssertNil(session.codexPendingTurnKind)
-        XCTAssertEqual(session.codexCurrentTurnID, "current-turn")
-        XCTAssertEqual(session.codexCurrentTurnKind, .user)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "current-turn")
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnKind, .user)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
             .turnCompleted(turnID: "current-turn", status: .completed),
@@ -290,10 +313,31 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(session.activeRunOwnership, ownership)
-        XCTAssertEqual(session.codexCurrentTurnID, "turn")
-        XCTAssertEqual(session.codexCurrentTurnKind, .user)
-        XCTAssertEqual(session.codexTurnKindsByID["turn"], .user)
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnKind, .user)
         XCTAssertNil(session.lastTerminalCommitRevision)
+    }
+
+    func testMismatchedStartCannotReplaceAuthoritativeIdentityAndDuplicateIsIdempotent() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let originalIdentity = session.codexAuthoritativeActiveTurn
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "different-turn"),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn, originalIdentity)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnStarted(turnID: "turn"),
+            session: session
+        )
+
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn, originalIdentity)
+        XCTAssertEqual(session.runState, .running)
     }
 
     func testNilCompletionAfterIdentifiedStartCompletesCurrentTurn() async {
@@ -308,8 +352,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertEqual(session.runState, .completed)
         XCTAssertNil(session.activeRunOwnership)
-        XCTAssertNil(session.codexCurrentTurnID)
-        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
     }
 
@@ -317,9 +361,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
-        session.codexCurrentTurnID = nil
-        session.codexCurrentTurnKind = nil
-        session.codexTurnKindsByID.removeAll()
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexAnonymousActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
         session.codexPendingTurnKind = .user
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -327,8 +371,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             session: session
         )
 
-        XCTAssertNil(session.codexCurrentTurnID)
-        XCTAssertEqual(session.codexCurrentTurnKind, .user)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertEqual(session.codexAnonymousActiveTurn?.turnKind, .user)
         XCTAssertNil(session.codexPendingTurnKind)
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -338,6 +382,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
 
         XCTAssertEqual(session.runState, .completed)
         XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNotNil(session.lastTerminalCommitRevision)
     }
 
@@ -346,9 +391,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         let viewModel = makeViewModel(controller: controller)
         let session = preparedCodexSession(in: viewModel, controller: controller)
         let ownership = session.activeRunOwnership
-        session.codexCurrentTurnID = nil
-        session.codexCurrentTurnKind = nil
-        session.codexTurnKindsByID.removeAll()
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexAnonymousActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
         session.codexPendingTurnKind = .user
 
         await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
@@ -359,8 +404,8 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.runState, .running)
         XCTAssertEqual(session.activeRunOwnership, ownership)
         XCTAssertEqual(session.codexPendingTurnKind, .user)
-        XCTAssertNil(session.codexCurrentTurnID)
-        XCTAssertNil(session.codexCurrentTurnKind)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertNil(session.codexAnonymousActiveTurn)
         XCTAssertNil(session.lastTerminalCommitRevision)
     }
 
@@ -389,6 +434,7 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
                 controller: controller,
                 runID: harness.parentRunID
             )
+            session.codexRoutingObservedTurnID = "routing-hint-only"
 
             let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
                 session: session,
@@ -408,7 +454,9 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
                 interruptedObject["wait"]?.objectValue?["result"]?.stringValue,
                 "interrupted_by_steering"
             )
-            XCTAssertEqual(controller.sendUserTurnCountSync(), 1)
+            XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+            XCTAssertEqual(controller.steerUserTurnIDsSync(), ["turn"])
+            XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
             XCTAssertTrue(orderingSnapshot.drainSucceeded)
             XCTAssertEqual(orderingSnapshot.activeScopeCountAtDrainCompletion, 0)
             XCTAssertTrue(orderingSnapshot.sendObservedAfterDrain)
@@ -434,8 +482,135 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
             return XCTFail("Expected failed outcome, got \(outcome)")
         }
         XCTAssertTrue(message.contains("agent_run.wait"))
-        XCTAssertEqual(controller.sendUserTurnCountSync(), 0)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
         XCTAssertEqual(session.runState, .running)
+    }
+
+    func testInactiveCodexNativeSendStartsTurnWithoutInstallingLifecycleIdentity() async {
+        let controller = LivenessFakeCodexController(snapshot: .idle, activeTurnIDs: [])
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.runState = .idle
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = nil
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(controller.startUserTurnCountSync(), 1)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertNil(session.codexAuthoritativeActiveTurn)
+        XCTAssertEqual(session.codexPendingTurnKind, .user)
+    }
+
+    func testActiveCodexNativeSendWithoutExactIdentityQueuesWithoutStarting() async {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        session.codexAuthoritativeActiveTurn = nil
+        session.codexRoutingObservedTurnID = "routing-only-turn"
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case .queuedFallback(_, .activeWithoutAuthoritativeIdentity) = outcome else {
+            return XCTFail("Expected missing-identity fallback queue, got \(outcome)")
+        }
+        XCTAssertEqual(controller.startUserTurnCountSync(), 0)
+        XCTAssertTrue(controller.steerUserTurnIDsSync().isEmpty)
+        XCTAssertEqual(session.codexFallbackQueue.count, 1)
+    }
+
+    func testTypedSteerRejectionReturnsFallbackWithoutReplacingAuthoritativeIdentity() async {
+        let failure = CodexAppServerClient.RequestFailure(
+            method: "turn/steer",
+            code: -32602,
+            message: "no active turn to steer",
+            data: nil
+        )
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            steerError: CodexTurnSteerError.noActiveTurn(failure)
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let identity = session.codexAuthoritativeActiveTurn
+
+        let outcome = await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+            session: session,
+            text: "hello",
+            attachments: []
+        )
+
+        guard case .queuedFallback(_, .noActiveTurn(failure: failure)) = outcome else {
+            return XCTFail("Expected no-active fallback queue, got \(outcome)")
+        }
+        XCTAssertEqual(controller.steerUserTurnIDsSync(), ["turn"])
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn, identity)
+        XCTAssertEqual(session.codexFallbackQueue.count, 1)
+    }
+
+    func testManualTypedFallbackKeepsOptimisticBubbleAndDraft() async throws {
+        let failure = CodexAppServerClient.RequestFailure(
+            method: "turn/steer",
+            code: -32602,
+            message: "no active turn to steer",
+            data: nil
+        )
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            steerError: CodexTurnSteerError.noActiveTurn(failure)
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        viewModel.storeDraftText(for: session.tabID, "restore me")
+
+        let result = viewModel.submitUserTurn(text: "restore me", tabID: session.tabID)
+
+        XCTAssertEqual(result, .submitted)
+        try await waitUntil {
+            controller.steerUserTurnIDsSync() == ["turn"]
+                && session.codexFallbackQueue.count == 1
+        }
+        XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["restore me"])
+        XCTAssertEqual(viewModel.retrieveDraftText(for: session.tabID), "restore me")
+        XCTAssertEqual(session.codexAuthoritativeActiveTurn?.turnID, "turn")
+    }
+
+    func testAcceptedSteerRemainsSentWhenMatchingTurnCompletesBeforeReceiptResumes() async throws {
+        let controller = LivenessFakeCodexController(
+            snapshot: .active(activeFlags: []),
+            steerDelayNanos: 50_000_000
+        )
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let sendTask = Task {
+            await viewModel.test_codexCoordinator.sendCodexNativeMessage(
+                session: session,
+                text: "hello",
+                attachments: []
+            )
+        }
+        try await waitUntil {
+            controller.steerUserTurnIDsSync() == ["turn"]
+        }
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let outcome = await sendTask.value
+        XCTAssertEqual(outcome, .sent)
+        XCTAssertEqual(session.runState, .completed)
     }
 
     private func makeViewModel(
@@ -465,9 +640,16 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         session.beginRunAttempt(source: "test.codexLiveness")
         session.codexController = controller
         session.codexConversationID = "fake"
-        session.codexCurrentTurnID = "turn"
-        session.codexCurrentTurnKind = .user
-        session.codexTurnKindsByID["turn"] = .user
+        session.codexAuthoritativeActiveTurn = .init(
+            threadID: "fake",
+            turnID: "turn",
+            turnKind: .user,
+            controllerInstanceID: ObjectIdentifier(controller),
+            controllerGeneration: session.codexControllerGeneration,
+            runID: runID,
+            runAttemptID: session.activeRunAttemptID!
+        )
+        session.codexRoutingObservedTurnID = "turn"
         session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
         return session
     }
@@ -546,19 +728,26 @@ private final class CodexDrainSendOrderingRecorder: @unchecked Sendable {
 
 private final class LivenessFakeCodexController: CodexSessionControlling {
     private var readSnapshotCount = 0
-    private var sendUserTurnCount = 0
+    private var startUserTurnCount = 0
+    private var steerUserTurnIDs: [String] = []
     private let snapshotStatus: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus
     private let snapshotActiveTurnIDs: [String]
     private let onSendUserTurn: (() -> Void)?
+    private let steerError: Error?
+    private let steerDelayNanos: UInt64
 
     init(
         snapshot: CodexNativeSessionController.ThreadSnapshot.RuntimeStatus,
         activeTurnIDs: [String] = ["turn"],
-        onSendUserTurn: (() -> Void)? = nil
+        onSendUserTurn: (() -> Void)? = nil,
+        steerError: Error? = nil,
+        steerDelayNanos: UInt64 = 0
     ) {
         snapshotStatus = snapshot
         snapshotActiveTurnIDs = activeTurnIDs
         self.onSendUserTurn = onSendUserTurn
+        self.steerError = steerError
+        self.steerDelayNanos = steerDelayNanos
     }
 
     var hasActiveThread: Bool {
@@ -566,7 +755,7 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
     }
 
     var events: AsyncStream<CodexNativeSessionController.Event> {
-        AsyncStream { continuation in continuation.finish() }
+        AsyncStream { _ in }
     }
 
     func ensureEventsStreamReady() {}
@@ -575,8 +764,12 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         readSnapshotCount
     }
 
-    func sendUserTurnCountSync() -> Int {
-        sendUserTurnCount
+    func startUserTurnCountSync() -> Int {
+        startUserTurnCount
+    }
+
+    func steerUserTurnIDsSync() -> [String] {
+        steerUserTurnIDs
     }
 
     func startOrResume(existing: CodexNativeSessionController.SessionRef?, baseInstructions: String) async throws -> CodexNativeSessionController.SessionRef {
@@ -622,9 +815,40 @@ private final class LivenessFakeCodexController: CodexSessionControlling {
         recordSendUserTurn()
     }
 
+    func startUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        model _: String?,
+        reasoningEffort _: String?,
+        serviceTier _: String?
+    ) async throws -> CodexTurnStartReceipt {
+        recordSendUserTurn()
+        startUserTurnCount += 1
+        return CodexTurnStartReceipt(provisionalSubmissionID: "liveness-submission-\(startUserTurnCount)")
+    }
+
+    func steerUserTurn(
+        text _: String,
+        images _: [AgentImageAttachment],
+        expectedTurnID: String
+    ) async throws -> CodexTurnSteerReceipt {
+        recordSendUserTurn()
+        steerUserTurnIDs.append(expectedTurnID)
+        if let steerError {
+            throw steerError
+        }
+        if steerDelayNanos > 0 {
+            try await Task.sleep(nanoseconds: steerDelayNanos)
+        }
+        return CodexTurnSteerReceipt(acceptedTurnID: expectedTurnID)
+    }
+
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+    }
+
     private func recordSendUserTurn() {
         onSendUserTurn?()
-        sendUserTurnCount += 1
     }
 
     func compactThread() async throws {}

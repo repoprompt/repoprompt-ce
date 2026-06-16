@@ -90,7 +90,7 @@ final class AgentProviderPreferenceSnapshotStore {
                 approvalPolicy = CodexAgentToolPreferences.approvalPolicy(defaults: defaults, secureStore: securePermissions)
                 approvalReviewer = CodexAgentToolPreferences.approvalReviewer(defaults: defaults, secureStore: securePermissions)
             case .mcpSafeDefaults:
-                let level = CodexAgentToolPreferences.PermissionLevel.defaultPermission
+                let level = CodexAgentToolPreferences.PermissionLevel.autoReview
                 sandboxMode = level.sandboxMode
                 approvalPolicy = level.approvalPolicy
                 approvalReviewer = level.approvalReviewer
@@ -346,15 +346,14 @@ final class AgentProviderPreferenceSnapshotStore {
                 mcpServerStatesByNormalizedName: states
             )
         case .mcpSafeDefaults:
-            // Safe Managed: force Bash off and suppress every user-toggled MCP server.
-            // Search stays available — it is read-only and helps sub-agents without granting
-            // shell/tool execution.
+            // Codex Safe Managed keeps its product-default Bash capability while suppressing
+            // every user-toggled third-party MCP server. Search remains user-configurable.
             var states: [String: Bool] = [:]
             for entry in entries {
                 states[normalizedServerToggleKey(entry.normalizedName)] = false
             }
             return CodexToolSettingsBinding(
-                bashToolEnabled: false,
+                bashToolEnabled: true,
                 searchToolEnabled: CodexAgentToolPreferences.searchToolEnabled(defaults: defaults),
                 goalSupportEnabled: codexGoalSupportEnabled(),
                 mcpServerEntries: entries,
@@ -424,7 +423,7 @@ final class AgentProviderPreferenceSnapshotStore {
         case .userConfigured:
             CodexAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
         case .mcpSafeDefaults:
-            .defaultPermission
+            .autoReview
         case let .providerOverride(.codex(level)):
             level
         case .providerOverride:

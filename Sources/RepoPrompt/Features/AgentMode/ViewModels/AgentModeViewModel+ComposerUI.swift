@@ -84,7 +84,10 @@ extension AgentModeViewModel {
         return AgentComposerSubmitTarget(
             tabID: tabID,
             route: route,
+            expectedSourceTabSessionIdentity: ObjectIdentifier(resolvedSession),
             expectedSourceAgentSessionID: expectedSourceAgentSessionID,
+            expectedPersistentBindingIdentity: resolvedSession.persistentSessionBindingIdentity,
+            expectedBindingTransitionGeneration: resolvedSession.bindingTransitionGeneration,
             expectedRunState: expectedRunState,
             expectedRunID: expectedRunID,
             expectedRunAttemptID: expectedRunAttemptID,

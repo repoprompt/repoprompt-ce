@@ -140,27 +140,30 @@ class OutputSummarizerTests(unittest.TestCase):
 
     def test_app_lifecycle_summary_and_progress_prioritize_confirmed_transition(self) -> None:
         lines = [
-            "==> Stopping existing RepoPrompt instance\n",
-            "==> Waiting for existing RepoPrompt process to exit\n",
-            "RepoPrompt stop confirmed.\n",
+            "==> Stopping existing RepoPrompt CE debug app instance\n",
+            "==> Waiting for existing RepoPrompt CE debug app process to exit\n",
+            "RepoPrompt CE debug app stop confirmed.\n",
             "==> Launching /tmp/RepoPrompt.app\n",
-            "==> Confirming launched RepoPrompt process\n",
-            "Observed launched RepoPrompt PID(s): 123\n",
+            "==> Confirming launched RepoPrompt CE debug app process\n",
+            "Observed launched RepoPrompt CE debug PID(s): 123\n",
         ]
 
         summary = summarize("run", "completed", 0, lines)
         lifecycle = section(summary, "App lifecycle")
         titles = [item["title"] for item in summary["sections"]]
-        progress = conductor.select_progress_lines("run", ["RepoPrompt stop confirmed.\n", "Observed launched RepoPrompt PID(s): 123\n"])
+        progress = conductor.select_progress_lines(
+            "run",
+            ["RepoPrompt CE debug app stop confirmed.\n", "Observed launched RepoPrompt CE debug PID(s): 123\n"],
+        )
 
-        self.assertIn("RepoPrompt stop confirmed.", lifecycle)
-        self.assertIn("Observed launched RepoPrompt PID(s): 123", lifecycle)
+        self.assertIn("RepoPrompt CE debug app stop confirmed.", lifecycle)
+        self.assertIn("Observed launched RepoPrompt CE debug PID(s): 123", lifecycle)
         self.assertTrue(summary["launchLifecycle"]["transitionStarted"])
         self.assertTrue(summary["launchLifecycle"]["launchRequested"])
         self.assertTrue(summary["launchLifecycle"]["launchConfirmed"])
         self.assertLess(titles.index("App lifecycle"), titles.index("Phases"))
-        self.assertIn("RepoPrompt stop confirmed.", progress)
-        self.assertIn("Observed launched RepoPrompt PID(s): 123", progress)
+        self.assertIn("RepoPrompt CE debug app stop confirmed.", progress)
+        self.assertIn("Observed launched RepoPrompt CE debug PID(s): 123", progress)
 
     def test_app_operation_display_name_is_precise(self) -> None:
         self.assertEqual(conductor.operation_display_name("app", {"subcommand": "stop"}), "app stop")
@@ -195,7 +198,7 @@ class OutputSummarizerTests(unittest.TestCase):
             1,
             [
                 "==> Packaging debug app\n",
-                "==> Stopping existing RepoPrompt instance\n",
+                "==> Stopping existing RepoPrompt CE debug app instance\n",
                 "ERROR: open failed\n",
             ],
         )

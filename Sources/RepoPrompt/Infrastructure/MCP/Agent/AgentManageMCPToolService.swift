@@ -510,13 +510,17 @@ struct AgentManageMCPToolService {
         )
         let hadMatchingMCPControl = agentModeVM.session(for: target.tabID, createIfNeeded: false)?.mcpControlContext?.sessionID == sessionID
         do {
-            try await agentModeVM.mcpActivateControlContext(
-                forTabID: target.tabID,
-                sessionID: sessionID,
-                originatingConnectionID: metadata.connectionID,
-                taskLabelKind: selection.taskLabelKind,
-                startPending: false
-            )
+            // Resume adopts the live session's existing control registration. Re-registering the
+            // same persistent session expires in-flight waiters and splits poll state from the UI.
+            if !hadMatchingMCPControl {
+                try await agentModeVM.mcpActivateControlContext(
+                    forTabID: target.tabID,
+                    sessionID: sessionID,
+                    originatingConnectionID: metadata.connectionID,
+                    taskLabelKind: selection.taskLabelKind,
+                    startPending: false
+                )
+            }
             try await agentModeVM.mcpConfigureSession(
                 tabID: target.tabID,
                 agentRaw: resolved.agent,

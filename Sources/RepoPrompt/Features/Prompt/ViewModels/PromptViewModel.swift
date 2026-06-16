@@ -468,8 +468,19 @@ class PromptViewModel: ObservableObject {
         availableAgentKinds = AgentModelCatalog.selectableAgents(availability: agentAvailabilityContext)
     }
 
-    private func normalizedPersistedAgentSelection(agentRaw: String?, modelRaw: String?) -> AgentModelCatalog.NormalizedAgentSelection {
-        AgentModelCatalog.normalizePersistedSelection(agentRaw: agentRaw, modelRaw: modelRaw, availability: agentAvailabilityContext)
+    private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+        guard let apiSettingsViewModel,
+              apiSettingsViewModel.isContextBuilderProviderValidationComplete
+        else {
+            return nil
+        }
+        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        return AutoRecommendationEngine.resolveContextBuilderSelection(
+            persistedAgentRaw: persisted.agentRaw,
+            persistedModelRaw: persisted.modelRaw,
+            availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
+            enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
+        )
     }
 
     func selectContextBuilderAgentModel(rawModel: String) {
@@ -480,16 +491,9 @@ class PromptViewModel: ObservableObject {
         AgentModelCatalog.isValid(rawModel: rawModel, for: agent, availability: agentAvailabilityContext)
     }
 
-    private func handleClaudeCodeGLMAvailabilityChanged() {
-        handleAgentProviderAvailabilityChanged(reason: "claudeCodeGLMAvailabilityChanged")
-    }
-
     private func handleAgentProviderAvailabilityChanged(reason: String) {
         refreshAvailableAgentKinds()
-        let normalizedContextBuilder = normalizedPersistedAgentSelection(
-            agentRaw: contextBuilderAgent.rawValue,
-            modelRaw: contextBuilderAgentModelRaw
-        )
+        guard let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() else { return }
         if normalizedContextBuilder.agent != contextBuilderAgent ||
             normalizedContextBuilder.modelRaw.caseInsensitiveCompare(contextBuilderAgentModelRaw) != .orderedSame
         {
@@ -873,12 +877,12 @@ class PromptViewModel: ObservableObject {
 
         // Sync Context Builder agent/model from global Context Builder settings (single source of truth)
         refreshAvailableAgentKinds()
-        let (globalAgentRaw, globalModelRaw) = settingsManager.globalContextBuilderAgentSelection()
-        let normalizedContextBuilder = normalizedPersistedAgentSelection(agentRaw: globalAgentRaw, modelRaw: globalModelRaw)
-        if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
-        contextBuilderAgent = normalizedContextBuilder.agent
-        contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-        if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
+        }
 
         // Sync model selection from the global settings store (may have been set by recommendation engine).
         syncModelSelectionFromSettingsManager()
@@ -2197,13 +2201,6 @@ class PromptViewModel: ObservableObject {
                 syncSettingsFromSettingsManager()
             }
             .store(in: &cancellables)
-
-        NotificationCenter.default.publisher(for: .claudeCodeGLMAvailabilityChanged)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                self?.handleClaudeCodeGLMAvailabilityChanged()
-            }
-            .store(in: &cancellables)
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
@@ -2302,6 +2299,16 @@ class PromptViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    @MainActor
+    func updateComposeTabSelectionPresentation(_ selection: StoredSelection, forTabID tabID: UUID) {
+        guard let index = currentComposeTabs.firstIndex(where: { $0.id == tabID }),
+              currentComposeTabs[index].selection != selection
+        else { return }
+        var updatedTabs = currentComposeTabs
+        updatedTabs[index].selection = selection
+        currentComposeTabs = updatedTabs
     }
 
     @MainActor
@@ -2448,6 +2455,17 @@ class PromptViewModel: ObservableObject {
         return try await operation()
     }
 
+    @MainActor
+    private func withComposeTabActivationSnapshotSuspended<T>(
+        targetTabID: UUID,
+        manager: WorkspaceManagerViewModel,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        manager.beginApplyingTabContext(forTabID: targetTabID)
+        defer { manager.endApplyingTabContext(forTabID: targetTabID) }
+        return try await operation()
+    }
+
     @discardableResult
     @MainActor
     private func flushAndSnapshotSourceTabIfNeeded(
@@ -2523,16 +2541,17 @@ class PromptViewModel: ObservableObject {
         }
 
         manager.workspaces[index].composeTabs.append(newTab)
-        manager.workspaces[index].activeComposeTabID = newTab.id
-        activeComposeTabID = newTab.id
-        dirtyTabIDs.remove(newTab.id)
+        await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
+            manager.workspaces[index].activeComposeTabID = newTab.id
+            activeComposeTabID = newTab.id
+            dirtyTabIDs.remove(newTab.id)
+            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            await withComposeTabSwitching(targetTabID: newTab.id) {
+                await manager.applyComposeTabState(newTab)
+            }
+        }
 
         manager.markWorkspaceDirty()
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        await withComposeTabSwitching(targetTabID: newTab.id) {
-            await manager.applyComposeTabState(newTab)
-        }
         manager.pollAndSaveState()
     }
 
@@ -2639,23 +2658,25 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
-        manager.workspaces[index].activeComposeTabID = id
-        activeComposeTabID = id
+        await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
+            manager.workspaces[index].activeComposeTabID = id
+            activeComposeTabID = id
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
 
-        activeTabApplyTask?.cancel()
+            activeTabApplyTask?.cancel()
 
-        let task = Task { [weak self, weak manager] in
-            guard let self, let manager else { return }
-            await withComposeTabSwitching(targetTabID: id) {
-                await manager.applyComposeTabStateAsync(tab: target, windowID: self.windowID)
+            let task = Task { [weak self, weak manager] in
+                guard let self, let manager else { return }
+                await withComposeTabSwitching(targetTabID: id) {
+                    await manager.applyComposeTabStateAsync(tab: target, windowID: self.windowID)
+                }
             }
-        }
 
-        activeTabApplyTask = task
-        await task.value
+            activeTabApplyTask = task
+            await task.value
+        }
     }
 
     @MainActor
@@ -2671,6 +2692,15 @@ class PromptViewModel: ObservableObject {
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         loadComposeTabsFromWorkspace(manager.workspaces[index])
+        NotificationCenter.default.post(
+            name: .composeTabNameChanged,
+            object: nil,
+            userInfo: [
+                "tabID": id,
+                "windowID": windowID,
+                "name": trimmed
+            ]
+        )
     }
 
     @MainActor
@@ -2795,7 +2825,6 @@ class PromptViewModel: ObservableObject {
         manager.workspaces[index].composeTabs = tabs
 
         if tabs.isEmpty {
-            manager.workspaces[index].activeComposeTabID = nil
             await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             #if DEBUG
@@ -2828,16 +2857,20 @@ class PromptViewModel: ObservableObject {
             newActiveID = tabs.first?.id
         }
 
-        manager.workspaces[index].activeComposeTabID = newActiveID
-        activeComposeTabID = newActiveID
-
         if newActiveID != previousActiveID,
            let newActiveID,
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
-            await withComposeTabSwitching(targetTabID: newActiveID) {
-                await manager.applyComposeTabState(tab)
+            await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
+                manager.workspaces[index].activeComposeTabID = newActiveID
+                activeComposeTabID = newActiveID
+                await withComposeTabSwitching(targetTabID: newActiveID) {
+                    await manager.applyComposeTabState(tab)
+                }
             }
+        } else {
+            manager.workspaces[index].activeComposeTabID = newActiveID
+            activeComposeTabID = newActiveID
         }
 
         loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2898,11 +2931,13 @@ class PromptViewModel: ObservableObject {
             manager: manager
         ) else { return }
         manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
-        activeComposeTabID = blankTab.id
-        dirtyTabIDs.remove(blankTab.id)
-        await withComposeTabSwitching(targetTabID: blankTab.id) {
-            await manager.applyComposeTabState(blankTab)
+        await withComposeTabActivationSnapshotSuspended(targetTabID: blankTab.id, manager: manager) {
+            manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
+            activeComposeTabID = blankTab.id
+            dirtyTabIDs.remove(blankTab.id)
+            await withComposeTabSwitching(targetTabID: blankTab.id) {
+                await manager.applyComposeTabState(blankTab)
+            }
         }
     }
 
@@ -3127,11 +3162,7 @@ class PromptViewModel: ObservableObject {
 
         // Add to compose tabs
         manager.workspaces[index].composeTabs.append(restoredTab)
-        manager.workspaces[index].activeComposeTabID = restoredTab.id
         manager.workspaces[index].dateModified = Date()
-
-        // Reload state
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
         currentStashedTabs = manager.workspaces[index].stashedTabs
 
         // Switch to the restored tab
@@ -3192,7 +3223,6 @@ class PromptViewModel: ObservableObject {
                 dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
                 manager.workspaces[index].composeTabs = remainingComposeTabs
                 if remainingComposeTabs.isEmpty {
-                    manager.workspaces[index].activeComposeTabID = nil
                     await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
                 } else {
                     var newActiveID = previousActiveID
@@ -3209,15 +3239,20 @@ class PromptViewModel: ObservableObject {
                     } else if newActiveID == nil {
                         newActiveID = remainingComposeTabs.first?.id
                     }
-                    manager.workspaces[index].activeComposeTabID = newActiveID
-                    activeComposeTabID = newActiveID
                     if newActiveID != previousActiveID,
                        let newActiveID,
                        let tab = remainingComposeTabs.first(where: { $0.id == newActiveID })
                     {
-                        await withComposeTabSwitching(targetTabID: newActiveID) {
-                            await manager.applyComposeTabState(tab)
+                        await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
+                            manager.workspaces[index].activeComposeTabID = newActiveID
+                            activeComposeTabID = newActiveID
+                            await withComposeTabSwitching(targetTabID: newActiveID) {
+                                await manager.applyComposeTabState(tab)
+                            }
                         }
+                    } else {
+                        manager.workspaces[index].activeComposeTabID = newActiveID
+                        activeComposeTabID = newActiveID
                     }
                 }
             }
@@ -3588,15 +3623,21 @@ class PromptViewModel: ObservableObject {
                 self?.availableModels = models
             }
 
+        // Level-triggered: `agentAvailability` replays the current provider
+        // availability on subscription, so a PromptViewModel wired after startup key
+        // load still initializes correctly. The remaining publishers cover Context
+        // Builder verification/model-option state that is intentionally outside that
+        // availability value.
         Publishers.MergeMany([
-            apiSettingsViewModel.$isClaudeCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCodexConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isOpenCodeConnected.dropFirst().map { _ in () },
-            apiSettingsViewModel.$isCursorConnected.dropFirst().map { _ in () }
+            apiSettingsViewModel.$agentAvailability.map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$isContextBuilderProviderValidationComplete.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$contextBuilderVerifiedCLIProviders.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableOpenCodeModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher(),
+            apiSettingsViewModel.$availableCursorModelOptions.dropFirst().map { _ in () }.eraseToAnyPublisher()
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] _ in
-            self?.handleAgentProviderAvailabilityChanged(reason: "agentProviderConnectionChanged")
+            self?.handleAgentProviderAvailabilityChanged(reason: "agentAvailabilityChanged")
         }
         .store(in: &apiSettingsCancellables)
     }

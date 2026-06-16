@@ -1,7 +1,7 @@
 import Foundation
 
 enum AgentModelCatalog {
-    struct AvailabilityContext {
+    struct AvailabilityContext: Equatable {
         let claudeCodeAvailable: Bool
         let codexAvailable: Bool
         let openCodeAvailable: Bool
@@ -1008,17 +1008,6 @@ enum AgentModelCatalog {
             agentKind: agentKind
         )
     }
-
-    /// Base model raw values (lowercased) that support the XHigh effort tier.
-    /// Opus Latest, Opus 1M, and pinned Opus full IDs support XHigh.
-    /// Sonnet, Haiku, and GLM deliberately do not support XHigh.
-    private static let claudeXHighEligibleBaseRaws: Set<String> = [
-        AgentModel.claudeOpus.rawValue.lowercased(),
-        AgentModel.claudeOpus1m.rawValue.lowercased(),
-        AgentModel.claudeOpus47.rawValue.lowercased(),
-        AgentModel.claudeOpus46.rawValue.lowercased(),
-        AgentModel.claudeOpus45.rawValue.lowercased()
-    ]
 
     private static func strippedClaudeEffortSuffix(from label: String) -> String {
         let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -73,6 +73,9 @@ extension Notification.Name {
     /// object: WorkspaceManagerViewModel instance (window-scoped)
     /// userInfo: ["isVisible": Bool]
     static let workspaceSwitchOverlayDidChange = Notification.Name("workspaceSwitchOverlayDidChange")
+    /// Posted when a compose tab's persisted display name changes.
+    /// userInfo: ["tabID": UUID, "windowID": Int, "name": String]
+    static let composeTabNameChanged = Notification.Name("composeTabNameChanged")
 
     /// Toggle the Agent session sidebar for the focused window.
     /// `userInfo["windowID"]` should be the target window ID.

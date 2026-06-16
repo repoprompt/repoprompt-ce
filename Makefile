@@ -52,6 +52,7 @@ guardrails:
 	./Scripts/swiftpm_notice_guardrails.sh
 
 conductor-selftest:
+	python3 Scripts/test_debug_app_process.py
 	python3 Scripts/test_conductor_output.py
 	python3 Scripts/test_conductor_lifecycle.py
 	python3 Scripts/test_local_production_installer.py

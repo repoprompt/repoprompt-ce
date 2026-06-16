@@ -271,6 +271,8 @@ enum ToolResultDTOs {
         let content: String
         /// Paths (display-form) that are selected but have **no codemap** available
         let unmappedPaths: [String]?
+        /// Paths still awaiting a codemap after repair scheduling
+        let pendingPaths: [String]?
         /// Number of additional files with codemaps omitted due to `max_results` cap
         let omittedCount: Int?
         /// Total number of codemaps omitted due to all limits
@@ -279,33 +281,40 @@ enum ToolResultDTOs {
         let tokenBudgetOmittedCount: Int?
         /// Indicates the response token budget prevented more codemaps from being emitted
         let tokenBudgetHit: Bool?
+        let worktreeScope: WorktreeScopeDTO?
 
         init(
             fileCount: Int,
             content: String,
             unmappedPaths: [String]? = nil,
+            pendingPaths: [String]? = nil,
             omittedCount: Int? = nil,
             omittedTotal: Int? = nil,
             tokenBudgetOmittedCount: Int? = nil,
-            tokenBudgetHit: Bool? = nil
+            tokenBudgetHit: Bool? = nil,
+            worktreeScope: WorktreeScopeDTO? = nil
         ) {
             self.fileCount = fileCount
             self.content = content
             self.unmappedPaths = unmappedPaths
+            self.pendingPaths = pendingPaths
             self.omittedCount = omittedCount
             self.omittedTotal = omittedTotal
             self.tokenBudgetOmittedCount = tokenBudgetOmittedCount
             self.tokenBudgetHit = tokenBudgetHit
+            self.worktreeScope = worktreeScope
         }
 
         private enum CodingKeys: String, CodingKey {
             case fileCount = "file_count"
             case content
             case unmappedPaths = "unmapped_paths"
+            case pendingPaths = "pending_paths"
             case omittedCount = "codemaps_omitted"
             case omittedTotal = "omitted_total"
             case tokenBudgetOmittedCount = "token_budget_omitted"
             case tokenBudgetHit = "token_budget_hit"
+            case worktreeScope = "worktree_scope"
         }
     }
 
@@ -538,6 +547,8 @@ enum ToolResultDTOs {
         let normalizedCodeMapUsage: String?
         /// Workspace token breakdown (total includes prompt, file tree, meta, git, etc.)
         let tokenStats: TokenStats?
+        /// Cache freshness and pending refresh state for token fields.
+        let tokenAccounting: TokenAccountingDTO?
         /// Summary of how selection would render under the effective copy preset (when it differs from auto)
         let copyPresetProjection: CopyPresetProjectionSummaryDTO?
 
@@ -559,6 +570,7 @@ enum ToolResultDTOs {
             userChatTokens: Int? = nil,
             normalizedCodeMapUsage: String? = nil,
             tokenStats: TokenStats? = nil,
+            tokenAccounting: TokenAccountingDTO? = nil,
             copyPresetProjection: CopyPresetProjectionSummaryDTO? = nil
         ) {
             self.files = files
@@ -577,6 +589,7 @@ enum ToolResultDTOs {
             self.userChatTokens = userChatTokens
             self.normalizedCodeMapUsage = normalizedCodeMapUsage
             self.tokenStats = tokenStats
+            self.tokenAccounting = tokenAccounting
             self.copyPresetProjection = copyPresetProjection
         }
 
@@ -597,6 +610,7 @@ enum ToolResultDTOs {
             case userChatTokens = "user_chat_tokens"
             case normalizedCodeMapUsage = "normalized_codemap_usage"
             case tokenStats = "token_stats"
+            case tokenAccounting = "token_accounting"
             case copyPresetProjection = "copy_preset_projection"
         }
     }
@@ -1031,6 +1045,32 @@ enum ToolResultDTOs {
     }
 
     // MARK: - Unified prompt + selection + context (codemaps-first)
+
+    struct TokenAccountingDTO: Codable, Equatable {
+        let status: String
+        let source: String
+        let refreshPending: Bool
+        let incompleteComponents: [String]?
+
+        init(
+            status: String,
+            source: String,
+            refreshPending: Bool,
+            incompleteComponents: [String]? = nil
+        ) {
+            self.status = status
+            self.source = source
+            self.refreshPending = refreshPending
+            self.incompleteComponents = incompleteComponents
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case status
+            case source
+            case refreshPending = "refresh_pending"
+            case incompleteComponents = "incomplete_components"
+        }
+    }
 
     struct TokenStats: Codable, Equatable {
         let total: Int
@@ -2206,6 +2246,8 @@ enum ToolResultDTOs {
         let userTokenStats: TokenStats?
         /// Explains why tokenStats and userTokenStats differ (e.g., codemap settings)
         let tokenStatsNote: String?
+        /// Cache freshness and pending refresh state for token fields.
+        let tokenAccounting: TokenAccountingDTO?
         /// Active and effective copy preset information (when override is used)
         let copyPreset: CopyPresetContextDTO?
         /// Available copy presets (when include contains "presets")
@@ -2222,6 +2264,7 @@ enum ToolResultDTOs {
             tokenStats: TokenStats?,
             userTokenStats: TokenStats?,
             tokenStatsNote: String?,
+            tokenAccounting: TokenAccountingDTO? = nil,
             copyPreset: CopyPresetContextDTO?,
             copyPresets: [CopyPresetListItemDTO]?,
             worktreeScope: WorktreeScopeDTO? = nil
@@ -2234,6 +2277,7 @@ enum ToolResultDTOs {
             self.tokenStats = tokenStats
             self.userTokenStats = userTokenStats
             self.tokenStatsNote = tokenStatsNote
+            self.tokenAccounting = tokenAccounting
             self.copyPreset = copyPreset
             self.copyPresets = copyPresets
             self.worktreeScope = worktreeScope
@@ -2248,6 +2292,7 @@ enum ToolResultDTOs {
             case tokenStats = "token_stats"
             case userTokenStats = "user_token_stats"
             case tokenStatsNote = "token_stats_note"
+            case tokenAccounting = "token_accounting"
             case copyPreset = "copy_preset"
             case copyPresets = "copy_presets"
             case worktreeScope = "worktree_scope"

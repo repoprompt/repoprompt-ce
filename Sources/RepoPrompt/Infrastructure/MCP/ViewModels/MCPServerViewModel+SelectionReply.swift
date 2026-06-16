@@ -1,17 +1,21 @@
 import Foundation
 
 extension MCPServerViewModel {
+    enum SelectionReplyIngressPolicy: Equatable {
+        case awaitPending
+        case alreadyAwaited
+    }
+
     @MainActor
     func stabilizedVirtualSelection(for context: TabScopedContext) async -> StoredSelection {
         // For any tab-bound virtual context (including runs), prefer latest stored tab selection.
         // This prevents resurrecting stale slices from the run snapshot after the user clears them.
-        if let manager = workspaceManager,
-           let liveTab = manager.composeTab(with: context.tabID)
-        {
-            return liveTab.selection
+        guard let manager = workspaceManager else { return context.selection }
+        if let workspaceID = context.workspaceID {
+            let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+            return manager.composeTab(for: identity)?.selection ?? context.selection
         }
-
-        return context.selection
+        return manager.composeTab(with: context.tabID)?.selection ?? context.selection
     }
 
     struct TabSelectionData {
@@ -68,7 +72,8 @@ extension MCPServerViewModel {
     @MainActor
     func evaluateVirtualPromptEntries(
         for selection: StoredSelection,
-        codeMapUsage: CodeMapUsage
+        codeMapUsage: CodeMapUsage,
+        rootScope: WorkspaceLookupRootScope = .allLoaded
     ) async -> PromptEntriesEvaluation {
         let store = promptVM.workspaceFileContextStore
         let accountingService = PromptContextAccountingService()
@@ -76,7 +81,7 @@ extension MCPServerViewModel {
             selection: selection,
             codeMapUsage: codeMapUsage,
             filePathDisplay: promptVM.filePathDisplayOption,
-            rootScope: .allLoaded,
+            rootScope: rootScope,
             pathLocateProfile: .uiAssisted
         )
         let accounting = await accountingService.calculatePromptStats(request: request, store: store)
@@ -87,22 +92,24 @@ extension MCPServerViewModel {
     @MainActor
     private func virtualSelectionFileTreeText(
         selection: StoredSelection,
-        resolvedContext: PromptContextResolved
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext
     ) async -> String {
         guard resolvedContext.rendersFileTree else { return "" }
         let store = promptVM.workspaceFileContextStore
-        let snapshot = await store.makeFileTreeSelectionSnapshot(
-            selection: selection,
+        let rawSnapshot = await store.makeFileTreeSelectionSnapshot(
+            selection: lookupContext.physicalizeSelection(selection),
             request: WorkspaceFileTreeSnapshotRequest(
                 mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: resolvedContext.effectiveFileTreeMode),
                 filePathDisplay: promptVM.filePathDisplayOption,
                 onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
                 includeLegend: true,
                 showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                rootScope: .allLoaded
+                rootScope: lookupContext.rootScope
             ),
             profile: .uiAssisted
         )
+        let snapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawSnapshot) ?? rawSnapshot
         return await Task.detached(priority: .userInitiated) {
             CodeMapExtractor.generateFileTree(using: snapshot)
         }.value
@@ -111,22 +118,26 @@ extension MCPServerViewModel {
     @MainActor
     private func virtualSelectionGitDiffText(
         for selection: StoredSelection,
-        resolvedContext: PromptContextResolved
+        resolvedContext: PromptContextResolved,
+        lookupContext: WorkspaceLookupContext
     ) async -> String? {
         switch resolvedContext.gitInclusion {
         case .none:
             return nil
         case .selected:
             let selectedPaths = await WorkspaceGitDiffSelectionResolver.selectedGitDiffPaths(
-                for: selection,
+                for: lookupContext.physicalizeSelection(selection),
                 store: promptVM.workspaceFileContextStore,
-                rootScope: .allLoaded,
+                rootScope: lookupContext.rootScope,
                 folderPolicy: .filesOnly,
                 profile: .mcpSelection,
-                allowFilesystemFallback: WorkspaceLookupRootScope.allLoaded.allowsSelectedGitDiffFilesystemFallback
+                allowFilesystemFallback: lookupContext.rootScope.allowsSelectedGitDiffFilesystemFallback
             )
             return await promptVM.gitViewModel.getDiffForAbsolutePaths(selectedPaths, forceRefreshStatus: true)
         case .complete:
+            guard lookupContext.bindingProjection == nil else {
+                return PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage
+            }
             return await promptVM.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)
         }
     }
@@ -136,7 +147,8 @@ extension MCPServerViewModel {
         for context: TabScopedContext,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
-        codemapFiles: [WorkspaceFileRecord]
+        codemapFiles: [WorkspaceFileRecord],
+        lookupContext: WorkspaceLookupContext
     ) async -> TokenComponentBreakdown {
         let selectedInstructionsText = promptVM.metaInstructions(
             for: resolvedContext,
@@ -146,10 +158,18 @@ extension MCPServerViewModel {
         .joined(separator: "\n\n")
         let isActiveWorkspaceBound = context.workspaceID == nil || context.workspaceID == workspaceManager?.activeWorkspace?.id
         let fileTreeText = isActiveWorkspaceBound
-            ? await virtualSelectionFileTreeText(selection: context.selection, resolvedContext: resolvedContext)
+            ? await virtualSelectionFileTreeText(
+                selection: context.selection,
+                resolvedContext: resolvedContext,
+                lookupContext: lookupContext
+            )
             : ""
         let gitDiffText = isActiveWorkspaceBound
-            ? await virtualSelectionGitDiffText(for: context.selection, resolvedContext: resolvedContext)
+            ? await virtualSelectionGitDiffText(
+                for: context.selection,
+                resolvedContext: resolvedContext,
+                lookupContext: lookupContext
+            )
             : nil
         let promptText = resolvedContext.includeUserPrompt ? context.promptText : ""
         let duplicateUserPrompt = resolvedContext.includeUserPrompt ? promptVM.duplicateUserInstructionsAtTop : false
@@ -169,7 +189,8 @@ extension MCPServerViewModel {
         filesReply: ToolResultDTOs.SelectedFilesReply,
         resolvedContext: PromptContextResolved,
         selectedFiles: [WorkspaceFileRecord],
-        codemapFiles: [WorkspaceFileRecord]
+        codemapFiles: [WorkspaceFileRecord],
+        lookupContext: WorkspaceLookupContext
     ) async -> ToolResultDTOs.TokenStats {
         let filesContentTokens = (filesReply.summary?.fullTokens ?? 0) + (filesReply.summary?.sliceTokens ?? 0)
         let codemapsTokens = filesReply.summary?.codemapTokens ?? 0
@@ -177,7 +198,8 @@ extension MCPServerViewModel {
             for: context,
             resolvedContext: resolvedContext,
             selectedFiles: selectedFiles,
-            codemapFiles: codemapFiles
+            codemapFiles: codemapFiles,
+            lookupContext: lookupContext
         )
         return Self.makeTokenStats(
             filesTokens: filesReply.totalTokens,
@@ -227,7 +249,12 @@ extension MCPServerViewModel {
             stored: lookupContext.physicalizeSelection(selection),
             codeMapUsage: effectiveMCPCodeMapUsage(codeMapUsageOverride ?? promptVM.codeMapUsage)
         )
-        let collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
+        let collections = await SelectionReplyAssembler.collect(
+            from: source,
+            owner: self,
+            rootScope: lookupContext.rootScope,
+            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+        )
         let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
         let tokens = TokenServices(owner: self)
         var reply = await SelectionReplyAssembler.buildSelectionReply(
@@ -254,23 +281,48 @@ extension MCPServerViewModel {
         viewMode: String? = nil,
         codeMapUsageOverride: CodeMapUsage? = nil,
         virtualContext: TabScopedContext? = nil,
-        lookupContextOverride: WorkspaceLookupContext? = nil
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        ingressPolicy: SelectionReplyIngressPolicy = .awaitPending
     ) async -> ToolResultDTOs.SelectionReply {
         // Always use .auto mode for manage_selection (normalized view)
         let effectiveOverride = effectiveMCPCodeMapUsage(codeMapUsageOverride ?? .auto)
-        let lookupContext = if let virtualContext {
-            await lookupContext(for: virtualContext)
-        } else if let lookupContextOverride {
+        let lookupContext = if let lookupContextOverride {
             lookupContextOverride
+        } else if let virtualContext {
+            await lookupContext(for: virtualContext)
         } else {
             WorkspaceLookupContext.visibleWorkspace
         }
+        if ingressPolicy == .awaitPending {
+            _ = await promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+        }
         let effectiveSelection = lookupContext.physicalizeSelection(selection)
         let source = StoredSelectionSource(stored: effectiveSelection, codeMapUsage: effectiveOverride)
-        let collections = await SelectionReplyAssembler.collect(from: source, owner: self, rootScope: lookupContext.rootScope)
-        let evaluation = await evaluateVirtualPromptEntries(
-            for: effectiveSelection,
-            codeMapUsage: collections.codeMapUsage
+        let collections = await SelectionReplyAssembler.collect(
+            from: source,
+            owner: self,
+            rootScope: lookupContext.rootScope,
+            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+        )
+        let resolvedPromptContext = promptVM.resolvePromptContext()
+        let accountingContext = virtualContext ?? TabContextSnapshot(
+            tabID: promptVM.activeComposeTabID ?? UUID(),
+            windowID: windowID,
+            workspaceID: workspaceManager?.activeWorkspace?.id,
+            promptText: promptVM.promptText,
+            selection: effectiveSelection,
+            selectedMetaPromptIDs: [],
+            tabName: "Active",
+            runID: nil,
+            explicitlyBound: false
+        )
+        let preparedAccounting = await prepareMCPTokenAccounting(
+            context: accountingContext,
+            effectiveSelection: effectiveSelection,
+            collections: collections,
+            resolvedContext: resolvedPromptContext,
+            lookupContext: lookupContext,
+            activeTabCompatibility: virtualContext == nil
         )
         let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
         let tokens = TokenServices(owner: self)
@@ -287,22 +339,18 @@ extension MCPServerViewModel {
             tokens: tokens,
             userPresetState: userPresetState,
             copyUsage: copyUsage != .auto ? copyUsage : nil,
-            entryResultsByFileID: evaluation.entryResultsByFileID
+            entryResultsByFileID: preparedAccounting.entryResultsByFileID
         )
 
-        let tokenStatsOverride: ToolResultDTOs.TokenStats?
-        if let virtualContext {
-            let selectedFiles = collections.selected.map(\.file)
-            let codemapFiles = collections.codemap.map(\.file)
-            tokenStatsOverride = await buildVirtualSelectionTokenStats(
-                for: virtualContext,
-                filesReply: filesReply,
-                resolvedContext: promptVM.resolvePromptContext(),
-                selectedFiles: selectedFiles,
-                codemapFiles: codemapFiles
-            )
+        let tokenStatsOverride: ToolResultDTOs.TokenStats = if let published = preparedAccounting.activePublishedSnapshot {
+            Self.publishedTokenStats(published)
         } else {
-            tokenStatsOverride = nil
+            Self.makeTokenStats(
+                filesTokens: filesReply.totalTokens,
+                filesContentTokens: (filesReply.summary?.fullTokens ?? 0) + (filesReply.summary?.sliceTokens ?? 0),
+                codemapsTokens: filesReply.summary?.codemapTokens,
+                breakdown: preparedAccounting.breakdown
+            )
         }
 
         var reply = await SelectionReplyAssembler.makeSelectionReply(
@@ -314,7 +362,8 @@ extension MCPServerViewModel {
             extraInvalid: extraInvalid,
             userPresetState: userPresetState,
             tokens: tokens,
-            tokenStatsOverride: tokenStatsOverride
+            tokenStatsOverride: tokenStatsOverride,
+            tokenAccountingOverride: preparedAccounting.tokenAccounting
         )
 
         // Inject minimal codeStructure.unmappedPaths to report pending codemaps
@@ -337,7 +386,8 @@ extension MCPServerViewModel {
                     userCopyTokens: reply.userCopyTokens,
                     userChatTokens: reply.userChatTokens,
                     normalizedCodeMapUsage: reply.normalizedCodeMapUsage,
-                    tokenStats: reply.tokenStats
+                    tokenStats: reply.tokenStats,
+                    tokenAccounting: reply.tokenAccounting
                 )
             }
         }
@@ -357,7 +407,8 @@ extension MCPServerViewModel {
         display: FilePathDisplay,
         extraInvalid: [String] = [],
         viewMode: String? = nil,
-        resolvedContext: ResolvedTabContextSnapshot
+        resolvedContext: ResolvedTabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
     ) async -> ToolResultDTOs.SelectionReply {
         var context = resolvedContext.snapshot
         if !resolvedContext.usesActiveTabCompatibility {
@@ -370,7 +421,40 @@ extension MCPServerViewModel {
             extraInvalid: extraInvalid,
             viewMode: viewMode,
             codeMapUsageOverride: .auto,
-            virtualContext: resolvedContext.usesActiveTabCompatibility ? nil : context
+            virtualContext: resolvedContext.usesActiveTabCompatibility ? nil : context,
+            lookupContextOverride: lookupContext,
+            ingressPolicy: .alreadyAwaited
+        )
+    }
+
+    @MainActor
+    func buildSelectionMutationReply(
+        from selection: StoredSelection,
+        includeBlocks: Bool,
+        display: FilePathDisplay,
+        extraInvalid: [String] = [],
+        viewMode: String? = nil,
+        codeMapUsageOverride: CodeMapUsage? = nil,
+        virtualContext: TabScopedContext?,
+        lookupContext: WorkspaceLookupContext
+    ) async -> ToolResultDTOs.SelectionReply {
+        var effectiveSelection = selection
+        var effectiveVirtualContext = virtualContext
+        if var context = virtualContext {
+            effectiveSelection = await stabilizedVirtualSelection(for: context)
+            context.selection = effectiveSelection
+            effectiveVirtualContext = context
+        }
+        return await buildTabSelectionReply(
+            from: effectiveSelection,
+            includeBlocks: includeBlocks,
+            display: display,
+            extraInvalid: extraInvalid,
+            viewMode: viewMode,
+            codeMapUsageOverride: codeMapUsageOverride,
+            virtualContext: effectiveVirtualContext,
+            lookupContextOverride: lookupContext,
+            ingressPolicy: .alreadyAwaited
         )
     }
 
@@ -435,7 +519,8 @@ extension MCPServerViewModel {
             fileCount: 0,
             content: "",
             unmappedPaths: unmapped,
-            omittedCount: nil
+            omittedCount: nil,
+            worktreeScope: ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: projection)
         )
     }
 }

@@ -230,16 +230,26 @@ actor TaskManager {
 }
 
 public class AIQueriesService {
+    typealias SendPromptOverride = @Sendable (
+        _ message: AIMessage,
+        _ model: AIModel
+    ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>)
+
     private let taskManager = TaskManager()
     private let chunkSizeThreshold = 8000 // e.g. 8KB
     private let timeThreshold: TimeInterval = 0.7 // 0.4 seconds
     private let providerPool: DisposableProviderPool
     private let keyManager: KeyManager
+    private let sendPromptOverride: SendPromptOverride?
     private var currentModel: AIModel
 
-    init(keyManager: KeyManager) {
+    init(
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil
+    ) {
         currentModel = .claude4Sonnet
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -247,10 +257,12 @@ public class AIQueriesService {
         model: AIModel,
         ollamaURL: URL? = nil,
         azureConfiguration: AzureOpenAIConfiguration? = nil,
-        keyManager: KeyManager
+        keyManager: KeyManager,
+        sendPromptOverride: SendPromptOverride? = nil
     ) {
         currentModel = model
         self.keyManager = keyManager
+        self.sendPromptOverride = sendPromptOverride
         providerPool = DisposableProviderPool(keyManager: keyManager)
     }
 
@@ -290,6 +302,10 @@ public class AIQueriesService {
         _ aiMessage: AIMessage,
         model: AIModel
     ) async throws -> (id: ChatStreamID, stream: AsyncThrowingStream<ChatStreamOutput, Error>) {
+        if let sendPromptOverride {
+            return try await sendPromptOverride(aiMessage, model)
+        }
+
         let taskId = UUID()
         await taskManager.createPartialBuffer(for: taskId)
 
@@ -599,6 +615,29 @@ public class AIQueriesService {
             try await AIProviderFactory.createProvider(for: .zAI, keyManager: keyManager) as! ZAIProvider
         }
         return try await withTimeout(seconds: 30) { try await provider.testAPIKey() }
+    }
+
+    func testZAICodingPlanAPI(with apiKey: String? = nil) async throws -> Bool {
+        let key: String = if let apiKey {
+            apiKey
+        } else {
+            try await keyManager.getAPIKey(for: .zAI) ?? ""
+        }
+        let provider = ZAIProvider(apiKey: key, endpoint: .codingPlan)
+        let hasCodingPlanAccess = try await withTimeout(seconds: 30) { try await provider.testAPIKey(model: .zaiGLM47) }
+        if hasCodingPlanAccess {
+            return true
+        }
+
+        let generalProvider = ZAIProvider(apiKey: key, endpoint: .generalAPI)
+        let hasGeneralAccess = try await withTimeout(seconds: 30) { try await generalProvider.testAPIKey() }
+        if hasGeneralAccess {
+            throw AIProviderError.invalidConfiguration(
+                detail: "This Z.ai API key is valid, but it does not have an active GLM Coding Plan. CC Zai in Agent Mode requires a Z.ai GLM Coding Plan subscription."
+            )
+        }
+
+        return false
     }
 
     private func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async throws -> T) async throws -> T {

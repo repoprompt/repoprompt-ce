@@ -31,6 +31,17 @@ enum WindowKind: String, Codable {
 }
 
 enum WindowTitleFormatter {
+    /// Default window title when no user workspace is active.
+    /// Mirrors the app's display name so window and tab titles match the running distribution.
+    static let defaultTitle: String = {
+        let info = Bundle.main.infoDictionary
+        let candidates = [info?["CFBundleDisplayName"] as? String, info?["CFBundleName"] as? String]
+        let resolved = candidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+        return resolved ?? "RepoPrompt CE"
+    }()
+
     static func compose(
         workspaceTitle: String,
         agentSessionTitle: String?,
@@ -168,14 +179,14 @@ class WindowState: ObservableObject {
     @Published var workspaceInstanceNumber: Int? = nil
 
     /// Convenience: the workspace name with an instance suffix " (N)" when N ≥ 2,
-    /// except for the default/system workspace which always shows "Repo Prompt".
+    /// except for the default/system workspace which always shows the app name.
     var workspaceDisplayName: String {
         guard let ws = workspaceManager.activeWorkspace else {
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         if ws.isSystemWorkspace {
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         let base = ws.name
@@ -185,8 +196,13 @@ class WindowState: ObservableObject {
         return base
     }
 
+    /// Source of truth for the SwiftUI scene title (window title and native tab name).
+    /// Published so the scene keeps re-applying it; otherwise SwiftUI falls back to the
+    /// app display name whenever it refreshes the window chrome.
+    @Published private(set) var displayedWindowTitle: String = WindowTitleFormatter.defaultTitle
+
     // Cache to survive transient activeWorkspace == nil. This may include Agent session context.
-    private var lastKnownResolvedTitle: String = "Repo Prompt"
+    private var lastKnownResolvedTitle: String = WindowTitleFormatter.defaultTitle
     private var lastAppliedWindowTitle: String?
 
     private func resolvedWindowTitle() -> String {
@@ -196,14 +212,14 @@ class WindowState: ObservableObject {
                 return lastKnownResolvedTitle
             }
 
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         let workspaceTitle = resolvedWorkspaceWindowTitle(for: ws)
         let resolvedTitle = WindowTitleFormatter.compose(
             workspaceTitle: workspaceTitle,
             agentSessionTitle: resolvedAgentSessionTitleForWindowTitle(activeWorkspace: ws),
-            duplicateWorkspaceTitle: ws.isSystemWorkspace ? "Repo Prompt" : ws.name
+            duplicateWorkspaceTitle: ws.isSystemWorkspace ? WindowTitleFormatter.defaultTitle : ws.name
         )
         lastKnownResolvedTitle = resolvedTitle
         return resolvedTitle
@@ -211,7 +227,7 @@ class WindowState: ObservableObject {
 
     private func resolvedWorkspaceWindowTitle(for workspace: WorkspaceModel) -> String {
         if workspace.isSystemWorkspace {
-            return "Repo Prompt"
+            return WindowTitleFormatter.defaultTitle
         }
 
         let base = workspace.name
@@ -277,6 +293,10 @@ class WindowState: ObservableObject {
         pendingFocusSideEffectsTask = nil
         detachTitlebarAccessoryControllers(from: nsWindow)
         clearTitlebarAccessoryRequestsForClose()
+        apiSettingsViewModel.prepareForWindowClose()
+        contextBuilderAgentViewModel.prepareForWindowClose()
+        workspaceManager.prepareForWindowClose()
+        promptManager.gitViewModel.prepareForWindowClose()
     }
 
     private var pendingRestoreEntry: WindowSessionEntry?
@@ -286,16 +306,40 @@ class WindowState: ObservableObject {
     // MARK: - Initialization
 
     convenience init() {
-        self.init(contextBuilderProviderFactory: nil)
+        self.init(
+            contextBuilderProviderFactory: nil,
+            loadStoredAPISettingsDataOnInit: true,
+            codexModelPollingService: .shared
+        )
     }
 
     #if DEBUG
         convenience init(contextBuilderProviderFactory: @escaping ContextBuilderAgentViewModel.ProviderFactory) {
-            self.init(contextBuilderProviderFactory: Optional(contextBuilderProviderFactory))
+            self.init(
+                contextBuilderProviderFactory: Optional(contextBuilderProviderFactory),
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared
+            )
         }
+
+        convenience init(
+            codexModelPollingService: CodexModelPollingService,
+            loadStoredAPISettingsDataOnInit: Bool
+        ) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+                codexModelPollingService: codexModelPollingService
+            )
+        }
+
     #endif
 
-    private init(contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?) {
+    private init(
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
+        loadStoredAPISettingsDataOnInit: Bool,
+        codexModelPollingService: CodexModelPollingService
+    ) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
         windowID = WindowState.windowCounter
@@ -313,7 +357,9 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
-            contextBuilderProviderFactory: contextBuilderProviderFactory
+            contextBuilderProviderFactory: contextBuilderProviderFactory,
+            loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
+            codexModelPollingService: codexModelPollingService
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore
@@ -359,6 +405,32 @@ class WindowState: ObservableObject {
                 await self.processCommands()
             }
         }
+
+        // Keep the window title in sync when this window's active compose tab changes,
+        // so the Agent session portion of the title does not go stale.
+        NotificationCenter.default.publisher(for: .activeComposeTabChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID
+                else { return }
+                requestWindowTitleUpdate(reason: .activeComposeTabChanged)
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .composeTabNameChanged)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] notification in
+                guard let self,
+                      let notifiedWindowID = notification.userInfo?["windowID"] as? Int,
+                      notifiedWindowID == windowID,
+                      let tabID = notification.userInfo?["tabID"] as? UUID,
+                      tabID == promptManager.activeComposeTabID
+                else { return }
+                requestWindowTitleUpdate(reason: .agentSessionNameChanged)
+            }
+            .store(in: &cancellables)
     }
 
     private func setupMCPAutoStart() {
@@ -536,6 +608,9 @@ class WindowState: ObservableObject {
 
     @MainActor
     private func applyWindowTitleIfNeeded(_ title: String) {
+        if displayedWindowTitle != title {
+            displayedWindowTitle = title
+        }
         guard let window = nsWindow else { return }
         if window.title == title, lastAppliedWindowTitle == title {
             return
@@ -856,7 +931,7 @@ class WindowState: ObservableObject {
 
         if workspaceManager.activeWorkspaceID != route.workspaceID {
             let switchResult = await workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
-            if !switchResult.didSwitch, workspaceManager.activeWorkspaceID != route.workspaceID {
+            if !switchResult.didSwitch {
                 return .workspaceSwitchBlocked(switchResult.message)
             }
         }
@@ -1220,6 +1295,9 @@ class WindowState: ObservableObject {
     // MARK: - Teardown
 
     func tearDown() async {
+        beginClose()
+        await promptManager.gitViewModel.shutdownForWindowClose()
+
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG
             agentChatStressHarness?.pause()
@@ -1245,6 +1323,9 @@ class WindowState: ObservableObject {
 
         // Stop the local MCP server
         await mcpServer.stopServer()
+
+        // Release per-window codemap work before the closed window can contend with later windows.
+        await workspaceFilesViewModel.cancelAllScans()
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

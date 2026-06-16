@@ -35,8 +35,12 @@ struct WorkspaceRootBindingProjection: Equatable {
         Set(replacementsByLogicalRootPath.values.map(\.physicalRoot.standardizedFullPath))
     }
 
+    var canonicalRootPaths: Set<String> {
+        Set(visibleLogicalRoots.map(\.standardizedFullPath)).subtracting(logicalRootPaths)
+    }
+
     var lookupRootScope: WorkspaceLookupRootScope {
-        .sessionBoundWorkspace(logicalRootPaths: logicalRootPaths, physicalRootPaths: physicalRootPaths)
+        .sessionBoundWorkspace(canonicalRootPaths: canonicalRootPaths, physicalRootPaths: physicalRootPaths)
     }
 
     var logicalRootRefs: [WorkspaceRootRef] {
@@ -113,6 +117,16 @@ struct WorkspaceRootBindingProjection: Equatable {
                 ranges: input.ranges
             )
         }
+    }
+
+    func projectedLogicalRootMetadata(forPhysicalPath rawPath: String) -> (rootPath: String, pathWithinRoot: String)? {
+        let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
+        guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
+            return nil
+        }
+        let relative = String(standardized.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return (boundRoot.logicalRoot.standardizedFullPath, StandardizedPath.relative(relative))
     }
 
     func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {
@@ -275,6 +289,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
     ) async -> WorkspaceRootBindingProjection? {
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         var boundRoots: [WorkspaceRootBindingProjection.BoundRoot] = []
+        var loadedSessionWorktreeRootIDs: [UUID] = []
         for binding in bindings {
             let logicalPath = StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath)
             let logicalRoot = visibleRoots.first { $0.standardizedFullPath == logicalPath }
@@ -297,6 +312,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
                     name: logicalRoot.name,
                     fullPath: physicalRecord.standardizedFullPath
                 )
+                loadedSessionWorktreeRootIDs.append(physicalRecord.id)
             } catch {
                 // Fail closed for bound sessions: keep the logical -> physical projection so
                 // display paths and complete-diff policy still know this session is worktree-bound,
@@ -313,6 +329,7 @@ struct WorkspaceRootBindingProjectionMaterializer {
             boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
         }
         guard !boundRoots.isEmpty else { return nil }
+        _ = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: loadedSessionWorktreeRootIDs)
         return WorkspaceRootBindingProjection(sessionID: sessionID, boundRoots: boundRoots, visibleLogicalRoots: visibleRoots)
     }
 }

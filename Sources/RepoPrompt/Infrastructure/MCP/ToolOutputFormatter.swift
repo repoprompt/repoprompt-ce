@@ -32,6 +32,7 @@ enum ToolOutputFormatter {
     }
 
     private enum WorktreeScopeOperation {
+        case codeStructure
         case fileTree
         case search
         case readFile
@@ -43,19 +44,21 @@ enum ToolOutputFormatter {
         operation: WorktreeScopeOperation
     ) -> [String] {
         guard let scope, !scope.rootMappings.isEmpty else { return [] }
-        let action = switch operation {
+        let scopeDescription = switch operation {
+        case .codeStructure:
+            "codemap scans use that bound checkout"
         case .fileTree:
-            "filesystem reads use"
+            "filesystem reads use that bound checkout"
         case .search:
-            "filesystem searches use"
+            "filesystem searches use that bound checkout"
         case .readFile:
-            "filesystem reads use"
+            "filesystem reads use that bound checkout"
         case .workspaceContext:
-            "filesystem-derived sections use"
+            "filesystem-derived sections use that bound checkout"
         }
 
         var lines: [String] = []
-        lines.append("- **Scope**: session-bound worktree. Displayed paths use logical/canonical roots; \(action) the effective worktree roots below.")
+        lines.append("- **Scope**: session-bound worktree. Displayed paths use logical/canonical roots; \(scopeDescription).")
         lines.append("- **Root remapping**:")
         for mapping in scope.rootMappings {
             var details = ["worktree `\(mapping.worktreeID)`"]
@@ -68,7 +71,7 @@ enum ToolOutputFormatter {
             if let label = nonEmpty(mapping.label) {
                 details.append("label `\(label)`")
             }
-            lines.append("  - `\(mapping.logicalRootName)` `\(mapping.logicalRootPath)` → `\(mapping.effectiveRootName)` `\(mapping.effectiveRootPath)` (\(details.joined(separator: ", ")))")
+            lines.append("  - `\(mapping.logicalRootName)` `\(mapping.logicalRootPath)` → session-bound worktree (\(details.joined(separator: ", ")))")
         }
         return lines
     }
@@ -172,11 +175,14 @@ enum ToolOutputFormatter {
         var lines: [String] = []
         let isBackpressure = dto.errorCode == "search_backpressure" && dto.retryable == true
         let isWorktreeUnavailable = dto.errorCode == "worktree_scope_unavailable" && dto.retryable == true
-        lines.append((isBackpressure || isWorktreeUnavailable) ? "## Search Results ⚠️" : "## Search Results ❌")
+        let isFreshnessTimeout = dto.errorCode == "workspace_freshness_timeout" && dto.retryable == true
+        lines.append((isBackpressure || isWorktreeUnavailable || isFreshnessTimeout) ? "## Search Results ⚠️" : "## Search Results ❌")
         if isBackpressure {
             lines.append("- **Status**: Temporarily busy")
         } else if isWorktreeUnavailable {
             lines.append("- **Status**: Worktree unavailable")
+        } else if isFreshnessTimeout {
+            lines.append("- **Status**: Workspace freshness timed out")
         }
         lines.append("- **Error**: \(error)")
         if let errorCode = dto.errorCode, !errorCode.isEmpty {
@@ -2267,6 +2273,9 @@ extension ToolOutputFormatter {
                     out.append("- Git: \(formatTokenCount(git))")
                 }
             }
+            if let accounting = ctx.tokenAccounting {
+                out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+            }
             if let sel = ctx.selection {
                 if let summary = sel.summary {
                     let totalCount = summary.fullCount + summary.sliceCount + summary.codemapCount
@@ -2573,8 +2582,9 @@ extension ToolOutputFormatter {
             let tokenBudgetOmitted = dto.tokenBudgetOmittedCount ?? 0
             let totalOmitted = dto.omittedTotal ?? (maxResultsOmitted + tokenBudgetOmitted)
             let hasRenderableResult = dto.fileCount > 0 || totalOmitted > 0
+            let hasPendingRepair = dto.pendingPaths?.isEmpty == false
             var out: [String] = []
-            out.append("## Code Structure \(statusIcon(success: hasRenderableResult))")
+            out.append("## Code Structure \(statusIcon(success: hasRenderableResult, warning: hasPendingRepair))")
             out.append("- **Files with codemap**: \(dto.fileCount)")
             switch (maxResultsOmitted, tokenBudgetOmitted) {
             case let (maxOmitted, 0) where maxOmitted > 0:
@@ -2586,6 +2596,19 @@ extension ToolOutputFormatter {
                 out.append("- **Guidance**: Increase `max_results` to consider more files, or narrow `paths` to change which files fit inside the response cap.")
             default:
                 break
+            }
+            out.append(contentsOf: worktreeScopeLines(dto.worktreeScope, operation: .codeStructure))
+            if let pending = dto.pendingPaths, !pending.isEmpty {
+                out.append("- **Codemap generation pending**: \(pending.count) (retry with narrower `paths` if needed)")
+                out.append("")
+                out.append("### Files still awaiting codemap")
+                let grouped = groupPathsByRoot(pending)
+                for (root, paths) in grouped {
+                    out.append("- **\(root)**")
+                    for p in paths {
+                        out.append("  - `\(p)`")
+                    }
+                }
             }
             if let unmapped = dto.unmappedPaths, !unmapped.isEmpty {
                 out.append("- **Without codemap**: \(unmapped.count)")
@@ -2696,6 +2719,10 @@ extension ToolOutputFormatter {
             if let total = dto.totalTokens {
                 out.append("- Total tokens: \(total) (Auto view)")
             }
+        }
+
+        if let accounting = dto.tokenAccounting {
+            out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
         }
 
         // Copy preset effect (only if it differs from auto)

@@ -2,7 +2,7 @@ import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
 
-enum CodexJSONValue {
+enum CodexJSONValue: Equatable {
     case string(String)
     case number(Double)
     case bool(Bool)
@@ -91,6 +91,13 @@ enum CodexAppServerRequestID: Hashable {
 }
 
 actor CodexAppServerClient {
+    struct RequestFailure: Equatable {
+        let method: String
+        let code: Int?
+        let message: String
+        let data: CodexJSONValue?
+    }
+
     struct RemoteReasoningEffort: Hashable {
         let reasoningEffort: String
         let description: String
@@ -148,7 +155,7 @@ actor CodexAppServerClient {
         case processNotRunning
         case invalidResponse
         case jsonDecodeFailed
-        case requestFailed(String)
+        case requestFailed(RequestFailure)
         case executableUnavailable(String)
         case transportWriteFailed(message: String, errno: Int32?)
         case transportReadSetupFailed(message: String, errno: Int32?)
@@ -161,8 +168,8 @@ actor CodexAppServerClient {
                 "Codex app-server returned an invalid response."
             case .jsonDecodeFailed:
                 "Failed to decode Codex app-server JSON response."
-            case let .requestFailed(message):
-                message
+            case let .requestFailed(failure):
+                failure.message
             case let .executableUnavailable(message):
                 message
             case let .transportWriteFailed(message, _):
@@ -220,9 +227,9 @@ actor CodexAppServerClient {
 
     static func isTimeoutError(_ error: Error) -> Bool {
         if let clientError = error as? ClientError,
-           case let .requestFailed(message) = clientError
+           case let .requestFailed(failure) = clientError
         {
-            return isTimeoutErrorMessage(message)
+            return isTimeoutErrorMessage(failure.message)
         }
 
         let nsError = error as NSError
@@ -241,6 +248,26 @@ actor CodexAppServerClient {
         guard !normalized.isEmpty else { return false }
         return normalized.contains("request timed out after")
             || normalized.contains("timed out after")
+    }
+
+    static func requestFailure(
+        method: String,
+        errorObject: [String: Any]
+    ) -> RequestFailure? {
+        guard let message = errorObject["message"] as? String else { return nil }
+        let code: Int? = if let value = errorObject["code"] as? Int {
+            value
+        } else if let value = errorObject["code"] as? NSNumber {
+            value.intValue
+        } else {
+            nil
+        }
+        return RequestFailure(
+            method: method,
+            code: code,
+            message: message,
+            data: errorObject["data"].flatMap(CodexJSONValue.from)
+        )
     }
 
     private static func shouldPoisonTransportOnTimeout(method: String) -> Bool {
@@ -1034,16 +1061,21 @@ actor CodexAppServerClient {
                 return
             }
             if let error = json["error"] as? [String: Any],
-               let message = error["message"] as? String
+               let continuation = pendingRequests.removeValue(forKey: idString)
             {
-                if let continuation = pendingRequests.removeValue(forKey: idString) {
-                    pendingRequestMetadata.removeValue(forKey: idString)
-                    cancelTimeout(for: idString)
-                    if config.enableDebugLogging {
-                        print("[CodexAppServer] Error for request \(idString): \(message)")
-                    }
-                    continuation.resume(throwing: ClientError.requestFailed(message))
+                let metadata = pendingRequestMetadata.removeValue(forKey: idString)
+                cancelTimeout(for: idString)
+                guard let failure = Self.requestFailure(
+                    method: metadata?.method ?? "<unknown>",
+                    errorObject: error
+                ) else {
+                    continuation.resume(throwing: ClientError.invalidResponse)
+                    return
                 }
+                if config.enableDebugLogging {
+                    print("[CodexAppServer] Error for request \(idString): \(failure.message)")
+                }
+                continuation.resume(throwing: ClientError.requestFailed(failure))
                 return
             }
             if let method = json["method"] as? String,
@@ -1403,7 +1435,12 @@ actor CodexAppServerClient {
             )
             scheduleTransportCleanup(terminatingTransport)
         }
-        continuation.resume(throwing: ClientError.requestFailed("Request timed out after \(timeout)s"))
+        continuation.resume(throwing: ClientError.requestFailed(.init(
+            method: metadata?.method ?? "<unknown>",
+            code: nil,
+            message: "Request timed out after \(timeout)s",
+            data: nil
+        )))
     }
 
     private func cancelTimeout(for requestID: String) {

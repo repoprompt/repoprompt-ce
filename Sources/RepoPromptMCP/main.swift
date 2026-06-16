@@ -9,7 +9,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.0.13"
+let CLI_VERSION = "1.0.18"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -66,11 +66,95 @@ enum MCPCLIExitCode: Int32 {
     case unknownError = 1
 }
 
+struct CLIHostDisconnectProvenance: Equatable, CustomStringConvertible {
+    enum Reason: String {
+        case stdinClosed = "stdin_closed"
+        case stdinPollFailed = "stdin_poll_failed"
+        case stdinReadFailed = "stdin_read_failed"
+        case parentProcessChanged = "parent_process_changed"
+        case stdoutBrokenPipe = "stdout_broken_pipe"
+        case taskCancelled = "host_task_cancelled"
+    }
+
+    let reason: Reason
+    let errno: Int32?
+    let bytesWritten: Int?
+    let totalBytes: Int?
+    let initialParentPID: Int?
+    let currentParentPID: Int?
+
+    static let stdinClosed = CLIHostDisconnectProvenance(reason: .stdinClosed)
+    static let taskCancelled = CLIHostDisconnectProvenance(reason: .taskCancelled)
+
+    static func stdinPollFailed(errno: Int32) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(reason: .stdinPollFailed, errno: errno)
+    }
+
+    static func stdinReadFailed(errno: Int32) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(reason: .stdinReadFailed, errno: errno)
+    }
+
+    static func stdoutBrokenPipe(bytesWritten: Int, totalBytes: Int) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(
+            reason: .stdoutBrokenPipe,
+            bytesWritten: bytesWritten,
+            totalBytes: totalBytes
+        )
+    }
+
+    static func parentProcessChanged(initialPPID: pid_t, currentPPID: pid_t) -> CLIHostDisconnectProvenance {
+        CLIHostDisconnectProvenance(
+            reason: .parentProcessChanged,
+            initialParentPID: Int(initialPPID),
+            currentParentPID: Int(currentPPID)
+        )
+    }
+
+    init(
+        reason: Reason,
+        errno: Int32? = nil,
+        bytesWritten: Int? = nil,
+        totalBytes: Int? = nil,
+        initialParentPID: Int? = nil,
+        currentParentPID: Int? = nil
+    ) {
+        self.reason = reason
+        self.errno = errno
+        self.bytesWritten = bytesWritten
+        self.totalBytes = totalBytes
+        self.initialParentPID = initialParentPID
+        self.currentParentPID = currentParentPID
+    }
+
+    var description: String {
+        var fields = ["reason=\(reason.rawValue)"]
+        if let errno { fields.append("errno=\(errno)") }
+        if let bytesWritten { fields.append("bytes_written=\(bytesWritten)") }
+        if let totalBytes { fields.append("total_bytes=\(totalBytes)") }
+        if let initialParentPID { fields.append("initial_parent_pid=\(initialParentPID)") }
+        if let currentParentPID { fields.append("current_parent_pid=\(currentParentPID)") }
+        return fields.joined(separator: " ")
+    }
+}
+
+struct CLIServerTerminationProvenance: Equatable {
+    let reason: TerminationReason?
+    let message: String?
+
+    var stableReason: String {
+        reason?.rawValue ?? "terminated_by_server"
+    }
+
+    var humanMessage: String {
+        message ?? "Connection terminated by server"
+    }
+}
+
 enum CLIRuntimeError: Swift.Error {
     case connectionFailed(underlying: Swift.Error)
     case approvalDenied
-    case terminatedByServer(reason: String?)
-    case hostDisconnected // Stdin closed or stdout broken pipe
+    case terminatedByServer(CLIServerTerminationProvenance)
+    case hostDisconnected(CLIHostDisconnectProvenance)
 }
 
 // ────────────────────────────────────────────────────────────
@@ -184,11 +268,11 @@ enum CLIEventLogger {
             return (.connectionFailed, "Connection failed", details)
         case .approvalDenied:
             return (.approvalDenied, "Connection approval denied", nil)
-        case let .terminatedByServer(reason):
+        case let .terminatedByServer(provenance):
             // Server explicitly terminated - this is expected behavior, not an error to surface
-            return (.approvalDenied, reason ?? "Connection terminated by server", nil)
-        case .hostDisconnected:
-            return (.connectionFailed, "Host disconnected (stdin closed or stdout broken)", nil)
+            return (.approvalDenied, provenance.humanMessage, nil)
+        case let .hostDisconnected(provenance):
+            return (.connectionFailed, "Host disconnected (\(provenance.description))", nil)
         }
     }
 
@@ -396,6 +480,278 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Protocol version mismatch. Update the CLI or RepoPrompt app."
         case .hostDisconnected:
             return "Host disconnected"
+        }
+    }
+}
+
+func validateCLIHostInputPollResult(
+    _ result: Int32,
+    errno: Int32
+) throws {
+    guard result < 0, errno != EINTR else { return }
+    throw CLIRuntimeError.hostDisconnected(.stdinPollFailed(errno: errno))
+}
+
+func validateCLIHostInputReadResult(
+    _ result: Int,
+    errno: Int32
+) throws {
+    guard result < 0, errno != EAGAIN, errno != EINTR else { return }
+    throw CLIRuntimeError.hostDisconnected(.stdinReadFailed(errno: errno))
+}
+
+enum CLIProxyRuntimePolicy {
+    static func shouldRetry(after error: CLIRuntimeError) -> Bool {
+        switch error {
+        case .approvalDenied,
+             .hostDisconnected,
+             .terminatedByServer:
+            return false
+
+        case let .connectionFailed(underlying):
+            guard let socketError = underlying as? SocketProxyError else {
+                return true
+            }
+            switch socketError {
+            case .approvalDenied,
+                 .handshakeFailed,
+                 .protocolVersionMismatch,
+                 .socketCreationFailed,
+                 .descriptorConfigurationFailed,
+                 .pathTooLong,
+                 .bindFailed,
+                 .listenFailed,
+                 .acceptFailed,
+                 .stdoutWriteTimeout,
+                 .stdoutBrokenPipe,
+                 .hostDisconnected:
+                return false
+
+            case let .handshakeRejected(errorCode, _):
+                return isTransientBootstrapRejection(errorCode)
+
+            case .connectionRefused,
+                 .connectionTimeout,
+                 .bootstrapResponseTimeout,
+                 .connectionReset,
+                 .serverClosed,
+                 .readFailed,
+                 .writeFailed,
+                 .pollFailed,
+                 .notConnected,
+                 .notListening,
+                 .cancelled,
+                 .connectFailed,
+                 .terminatedByServer:
+                return true
+            }
+        }
+    }
+
+    static func normalizedTerminalRuntimeError(for error: Swift.Error) -> CLIRuntimeError? {
+        if let runtimeError = error as? CLIRuntimeError {
+            return runtimeError
+        }
+        if error is CancellationError {
+            return .hostDisconnected(.taskCancelled)
+        }
+        return nil
+    }
+
+    static func failureReason(for error: CLIRuntimeError) -> String {
+        switch error {
+        case .approvalDenied:
+            return "approval_denied"
+        case let .hostDisconnected(provenance):
+            return provenance.reason.rawValue
+        case let .terminatedByServer(provenance):
+            return provenance.stableReason
+        case let .connectionFailed(underlying):
+            if underlying is JSONRPCBridgeLedgerError {
+                return "jsonrpc_bridge_terminal"
+            }
+            if let socketError = underlying as? SocketProxyError {
+                switch socketError {
+                case .socketCreationFailed: return "socket_creation_failed"
+                case .descriptorConfigurationFailed: return "descriptor_configuration_failed"
+                case .pathTooLong: return "socket_path_too_long"
+                case .bindFailed: return "socket_bind_failed"
+                case .listenFailed: return "socket_listen_failed"
+                case .acceptFailed: return "socket_accept_failed"
+                case .connectFailed: return "app_socket_connect_failed"
+                case .notListening: return "socket_not_listening"
+                case .notConnected: return "socket_not_connected"
+                case .connectionTimeout: return "app_socket_write_timeout"
+                case .bootstrapResponseTimeout: return "bootstrap_response_timeout"
+                case .connectionReset: return "app_socket_reset"
+                case .connectionRefused: return "app_socket_connection_refused"
+                case .writeFailed: return "socket_write_failed"
+                case .readFailed: return "socket_read_failed"
+                case .pollFailed: return "socket_poll_failed"
+                case .stdoutWriteTimeout: return "stdout_write_timeout"
+                case .stdoutBrokenPipe: return "stdout_broken_pipe"
+                case .cancelled: return "transport_cancelled"
+                case .serverClosed: return "app_socket_closed"
+                case .approvalDenied: return "approval_denied"
+                case .terminatedByServer: return "terminated_by_server"
+                case .handshakeFailed: return "handshake_failed"
+                case .handshakeRejected: return "handshake_rejected"
+                case .protocolVersionMismatch: return "protocol_version_mismatch"
+                case .hostDisconnected: return "host_disconnected"
+                }
+            }
+            return "transport_failure"
+        }
+    }
+
+    static func makeTerminalRecord(
+        sessionToken: String,
+        localPID: Int,
+        initialParentPID: Int,
+        ledgerSnapshot: JSONRPCBridgeLedgerSnapshot,
+        runtimeError: CLIRuntimeError?,
+        fallbackReason: String,
+        unexpectedError: Swift.Error? = nil
+    ) -> MCPTerminalRecord {
+        let reason = terminalReason(
+            runtimeError: runtimeError,
+            ledgerTerminalReason: ledgerSnapshot.terminalReason,
+            fallbackReason: fallbackReason
+        )
+        let details = terminalDetails(
+            runtimeError: runtimeError,
+            unexpectedError: unexpectedError
+        )
+        return MCPTerminalRecord(
+            layer: .proxy,
+            initiator: details.initiator,
+            reason: reason,
+            sessionToken: sessionToken,
+            localPID: localPID,
+            peerPID: initialParentPID,
+            appConnectionID: nil,
+            connectionGeneration: ledgerSnapshot.connectionGeneration,
+            errno: details.errno,
+            errorDescription: details.errorDescription,
+            bridgeActiveRequestCount: ledgerSnapshot.activeRequestCount,
+            bridgeResponseInDeliveryCount: ledgerSnapshot.responseInDeliveryCount,
+            bridgeCancellationTombstoneCount: ledgerSnapshot.cancellationTombstoneCount,
+            bridgeRecentCompletionCount: ledgerSnapshot.recentCompletionCount,
+            bridgePendingTransactionCount: ledgerSnapshot.pendingTransactionCount,
+            bridgeHasForwardedProtocolFrame: ledgerSnapshot.hasForwardedProtocolFrame
+        )
+    }
+
+    private static func terminalReason(
+        runtimeError: CLIRuntimeError?,
+        ledgerTerminalReason: String?,
+        fallbackReason: String
+    ) -> String {
+        guard let runtimeError else {
+            return ledgerTerminalReason ?? fallbackReason
+        }
+        switch runtimeError {
+        case .approvalDenied:
+            return "approval_denied"
+        case let .terminatedByServer(provenance):
+            return provenance.stableReason
+        case let .hostDisconnected(provenance):
+            return provenance.reason.rawValue
+        case .connectionFailed:
+            return ledgerTerminalReason ?? failureReason(for: runtimeError)
+        }
+    }
+
+    private static func terminalDetails(
+        runtimeError: CLIRuntimeError?,
+        unexpectedError: Swift.Error?
+    ) -> (initiator: MCPTerminalInitiator, errno: Int32?, errorDescription: String?) {
+        guard let runtimeError else {
+            return (
+                .proxy,
+                nil,
+                unexpectedError.map { String(describing: $0) }
+            )
+        }
+        switch runtimeError {
+        case .approvalDenied:
+            return (.app, nil, "Connection approval denied")
+        case let .terminatedByServer(provenance):
+            return (.app, nil, provenance.humanMessage)
+        case let .hostDisconnected(provenance):
+            return (.host, provenance.errno, provenance.description)
+        case let .connectionFailed(underlying):
+            let socketError = underlying as? SocketProxyError
+            return (
+                terminalInitiator(for: socketError, underlying: underlying),
+                terminalErrno(for: socketError),
+                (underlying as? LocalizedError)?.errorDescription
+                    ?? String(describing: underlying)
+            )
+        }
+    }
+
+    private static func terminalInitiator(
+        for error: SocketProxyError?,
+        underlying: Swift.Error
+    ) -> MCPTerminalInitiator {
+        if let ledgerError = underlying as? JSONRPCBridgeLedgerError,
+           case let .terminal(reason) = ledgerError
+        {
+            if reason.hasPrefix("socket_") {
+                return .peer
+            }
+            if reason.hasPrefix("stdin_") {
+                return .host
+            }
+            return .proxy
+        }
+        guard let error else { return .proxy }
+        switch error {
+        case .stdoutBrokenPipe, .stdoutWriteTimeout, .hostDisconnected:
+            return .host
+        case .approvalDenied, .terminatedByServer:
+            return .app
+        case .serverClosed, .connectionReset:
+            return .peer
+        case let .readFailed(errno):
+            return errno == ECONNRESET ? .peer : .transport
+        default:
+            return .transport
+        }
+    }
+
+    private static func terminalErrno(for error: SocketProxyError?) -> Int32? {
+        guard let error else { return nil }
+        switch error {
+        case let .socketCreationFailed(errno),
+             let .descriptorConfigurationFailed(errno),
+             let .bindFailed(errno),
+             let .listenFailed(errno),
+             let .acceptFailed(errno),
+             let .connectFailed(errno),
+             let .writeFailed(errno),
+             let .readFailed(errno),
+             let .pollFailed(errno):
+            return errno
+        case .connectionRefused:
+            return ECONNREFUSED
+        default:
+            return nil
+        }
+    }
+
+    private static func isTransientBootstrapRejection(_ code: String?) -> Bool {
+        guard let code else { return false }
+        switch code {
+        case MCPBootstrapErrorCode.serverNotReady.rawValue,
+             MCPBootstrapErrorCode.serverUnavailable.rawValue,
+             MCPBootstrapErrorCode.connectionLimitReached.rawValue,
+             MCPBootstrapErrorCode.capacityExceeded.rawValue,
+             MCPBootstrapErrorCode.clientCooldown.rawValue:
+            return true
+        default:
+            return false
         }
     }
 }
@@ -669,6 +1025,7 @@ private actor BridgeDrainState {
 
     private let clock: Clock
     private var stdinClosedAt: TimeInterval?
+    private var lastVisibilityLogAt: TimeInterval?
 
     init(clock: @escaping Clock) {
         self.clock = clock
@@ -680,8 +1037,21 @@ private actor BridgeDrainState {
         }
     }
 
-    func isStdinClosed() -> Bool {
-        stdinClosedAt != nil
+    func elapsedSinceStdinClosed() -> TimeInterval? {
+        guard let stdinClosedAt else { return nil }
+        return max(0, clock() - stdinClosedAt)
+    }
+
+    func claimVisibilityLog(interval: TimeInterval) -> TimeInterval? {
+        guard let stdinClosedAt else { return nil }
+        let now = clock()
+        if let lastVisibilityLogAt,
+           now - lastVisibilityLogAt < max(0.001, interval)
+        {
+            return nil
+        }
+        lastVisibilityLogAt = now
+        return max(0, now - stdinClosedAt)
     }
 }
 
@@ -695,6 +1065,9 @@ extension BootstrapSocketProxy {
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
         drainClock: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        drainDeadline: TimeInterval = TimeInterval(MCPTimeoutPolicy.postStdinHalfCloseBridgeDrainDeadlineSeconds),
+        drainVisibilityInterval: TimeInterval = 30,
+        drainLogDescriptor: Int32 = STDERR_FILENO,
         onStdinClosed: @escaping @Sendable () async -> Void = {}
     ) async throws {
         let drainState = BridgeDrainState(clock: drainClock)
@@ -718,7 +1091,10 @@ extension BootstrapSocketProxy {
                     drainState: drainState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule,
-                    socketPoller: socketPoller
+                    socketPoller: socketPoller,
+                    drainDeadline: drainDeadline,
+                    drainVisibilityInterval: drainVisibilityInterval,
+                    drainLogDescriptor: drainLogDescriptor
                 )
                 return .socketClosed
             }
@@ -738,7 +1114,12 @@ extension BootstrapSocketProxy {
                     }
                 }
             } catch {
-                log.error("BootstrapSocketProxy: Bridge task failed: \(error)")
+                let message = "[MCPBridge] task_failed error=\(error)\n"
+                BestEffortStderrWriter.writeNonBlocking(
+                    Data(message.utf8),
+                    to: drainLogDescriptor
+                )
+                debugLog("BootstrapSocketProxy: Bridge task failed: \(error)")
                 group.cancelAll()
                 throw error
             }
@@ -769,8 +1150,8 @@ extension BootstrapSocketProxy {
             let pollResult = poll(&pfd, 1, 1000)
 
             if pollResult < 0 {
-                if errno == EINTR { continue }
-                throw SocketProxyError.pollFailed(errno: errno)
+                try validateCLIHostInputPollResult(pollResult, errno: errno)
+                continue
             }
             if pollResult == 0 { continue }
 
@@ -799,8 +1180,8 @@ extension BootstrapSocketProxy {
             }
 
             if bytesRead < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
-                throw SocketProxyError.readFailed(errno: errno)
+                try validateCLIHostInputReadResult(bytesRead, errno: errno)
+                continue
             }
             if bytesRead == 0 {
                 debugLog("BootstrapSocketProxy: stdin EOF after draining input")
@@ -837,13 +1218,11 @@ extension BootstrapSocketProxy {
                 ) { framed in
                     try writeToSocket(framed, socketFD: socketFD)
                 }
-                if let delivered = prepared.deliveryFrame {
-                    MCPResponseDeliveryTracer.emitFrame(
+                if prepared.deliveryFrame != nil {
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_app_uds",
                         phase: "socket_write_completed",
-                        frame: delivered,
-                        direction: .clientToServer,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared
                     )
                 }
             }
@@ -945,7 +1324,10 @@ extension BootstrapSocketProxy {
         drainState: BridgeDrainState,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
-        socketPoller: BridgeSocketPoller? = nil
+        socketPoller: BridgeSocketPoller? = nil,
+        drainDeadline: TimeInterval,
+        drainVisibilityInterval: TimeInterval,
+        drainLogDescriptor: Int32
     ) async throws {
         var buffer = [UInt8](repeating: 0, count: 8192)
         var pending = Data()
@@ -980,10 +1362,13 @@ extension BootstrapSocketProxy {
             }
 
             guard case let .events(rawEvents) = readiness else {
-                if await shouldFinishSocketDrain(
+                if try await shouldFinishSocketDrain(
                     drainState: drainState,
                     ledger: bridgeLedger,
-                    pendingByteCount: pending.count
+                    pendingByteCount: pending.count,
+                    deadline: drainDeadline,
+                    visibilityInterval: drainVisibilityInterval,
+                    logDescriptor: drainLogDescriptor
                 ) {
                     debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                     return
@@ -1042,8 +1427,16 @@ extension BootstrapSocketProxy {
                     faultRule: faultRule
                 ) { framed in
                     // Progress notifications are an intentional stderr-only control surface.
+                    // Delivery is best-effort: if the host closed stderr, drop the progress
+                    // line and keep the stdout transport alive rather than raising an ObjC
+                    // exception that would abort the helper mid-ledger-transaction.
                     if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        FileHandle.standardError.write("[progress] \(progressMessage)\n".data(using: .utf8)!)
+                        let delivered = BestEffortStderrWriter.writeNonBlocking(
+                            Data("[progress] \(progressMessage)\n".utf8)
+                        )
+                        if !delivered {
+                            debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
+                        }
                         return
                     }
                     do {
@@ -1062,12 +1455,12 @@ extension BootstrapSocketProxy {
                 if let delivered = prepared.deliveryFrame,
                    Self.extractProgressMessage(from: delivered) == nil
                 {
-                    MCPResponseDeliveryTracer.emitFrame(
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_stdout",
                         phase: "stdout_write_completed",
-                        frame: delivered,
-                        direction: .serverToClient,
-                        connectionGeneration: prepared.connectionGeneration
+                        prepared: prepared,
+                        publicationPending: false,
+                        terminalBarrier: false
                     )
                 }
             }
@@ -1081,10 +1474,13 @@ extension BootstrapSocketProxy {
                 )
                 return
             }
-            if await shouldFinishSocketDrain(
+            if try await shouldFinishSocketDrain(
                 drainState: drainState,
                 ledger: bridgeLedger,
-                pendingByteCount: pending.count
+                pendingByteCount: pending.count,
+                deadline: drainDeadline,
+                visibilityInterval: drainVisibilityInterval,
+                logDescriptor: drainLogDescriptor
             ) {
                 debugLog("BootstrapSocketProxy: socket→stdout drained after stdin close")
                 return
@@ -1095,13 +1491,34 @@ extension BootstrapSocketProxy {
     private static func shouldFinishSocketDrain(
         drainState: BridgeDrainState,
         ledger: JSONRPCBridgeLedger,
-        pendingByteCount: Int
-    ) async -> Bool {
-        guard pendingByteCount == 0, await drainState.isStdinClosed() else { return false }
+        pendingByteCount: Int,
+        deadline: TimeInterval,
+        visibilityInterval: TimeInterval,
+        logDescriptor: Int32
+    ) async throws -> Bool {
+        guard let elapsed = await drainState.elapsedSinceStdinClosed() else { return false }
         let snapshot = await ledger.snapshot()
-        return snapshot.terminalReason == nil
-            && snapshot.activeRequestCount == 0
-            && snapshot.pendingTransactionCount == 0
+        if snapshot.canFinishSocketDrain(partialByteCount: pendingByteCount) {
+            return true
+        }
+
+        let effectiveDeadline = max(0.001, deadline)
+        if elapsed >= effectiveDeadline {
+            let terminalReason = await ledger.terminalizePostStdinHalfCloseDrainDeadline()
+            let elapsedText = String(format: "%.3fs", elapsed)
+            let deadlineText = String(format: "%.3fs", effectiveDeadline)
+            let blockers = snapshot.socketDrainBlockerDescription(partialByteCount: pendingByteCount)
+            let message = "[MCPBridgeDrain] deadline_exceeded elapsed=\(elapsedText) deadline=\(deadlineText) \(blockers) terminalized_reason=\(terminalReason)\n"
+            BestEffortStderrWriter.writeNonBlocking(Data(message.utf8), to: logDescriptor)
+            throw JSONRPCBridgeLedgerError.terminal(terminalReason)
+        }
+
+        if let visibleElapsed = await drainState.claimVisibilityLog(interval: visibilityInterval) {
+            let elapsedText = String(format: "%.3fs", visibleElapsed)
+            let message = "[MCPBridgeDrain] waiting elapsed=\(elapsedText) \(snapshot.socketDrainBlockerDescription(partialByteCount: pendingByteCount))\n"
+            BestEffortStderrWriter.writeNonBlocking(Data(message.utf8), to: logDescriptor)
+        }
+        return false
     }
 
     private static func requireCleanBridgeStop(
@@ -1227,8 +1644,9 @@ actor MCPService: Service {
     private var killSignalContinuation: CheckedContinuation<CLIKillSignal.SignalContent?, Never>?
 
     init() {
-        sessionToken = UUID().uuidString
-        bridgeLedger = JSONRPCBridgeLedger(traceSink: { event in
+        let sessionToken = UUID().uuidString
+        self.sessionToken = sessionToken
+        bridgeLedger = JSONRPCBridgeLedger(connectionID: sessionToken, traceSink: { event in
             MCPResponseDeliveryTracer.emit(event)
         })
         // No TCP/Bonjour transport – bootstrap socket only
@@ -1345,37 +1763,75 @@ actor MCPService: Service {
         // Capture initial parent PID for orphan detection
         let initialPPID = getppid()
 
-        // Race between transport loop, kill signal, and PPID watchdog
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            // Kill signal monitor task
-            group.addTask {
-                guard let signal = await self.waitForKillSignal() else {
-                    // Task was cancelled - just return without throwing
-                    return
+        do {
+            // Race between transport loop, kill signal, and PPID watchdog
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                // Kill signal monitor task
+                group.addTask {
+                    guard let signal = await self.waitForKillSignal() else {
+                        // Task was cancelled - just return without throwing
+                        return
+                    }
+                    throw CLIRuntimeError.terminatedByServer(CLIServerTerminationProvenance(
+                        reason: signal.reason,
+                        message: signal.message ?? CLIKillSignal.messageForReason(signal.reason)
+                    ))
                 }
-                throw CLIRuntimeError.terminatedByServer(
-                    reason: CLIKillSignal.messageForReason(signal.reason)
-                )
-            }
 
-            // PPID watchdog - detect orphaned CLI when parent dies
-            group.addTask {
-                try await self.runPPIDWatchdog(initialPPID: initialPPID)
-            }
+                // PPID watchdog - detect orphaned CLI when parent dies
+                group.addTask {
+                    try await self.runPPIDWatchdog(initialPPID: initialPPID)
+                }
 
-            // Main transport task
-            group.addTask {
-                try await self.runTransport()
-            }
+                // Main transport task
+                group.addTask {
+                    try await self.runTransport()
+                }
 
-            // Wait for first to complete (either kill signal, orphan detection, or transport exit)
-            do {
-                while let _ = try await group.next() {}
-            } catch {
-                group.cancelAll()
-                throw error
+                // Wait for first to complete (either kill signal, orphan detection, or transport exit)
+                do {
+                    while let _ = try await group.next() {}
+                } catch {
+                    group.cancelAll()
+                    throw error
+                }
             }
+            await persistProxyTerminalRecord(
+                runtimeError: nil,
+                fallbackReason: "proxy_task_group_completed",
+                initialPPID: initialPPID
+            )
+        } catch {
+            await persistProxyTerminalRecord(
+                runtimeError: CLIProxyRuntimePolicy.normalizedTerminalRuntimeError(for: error),
+                fallbackReason: "proxy_unexpected_error",
+                initialPPID: initialPPID,
+                unexpectedError: error
+            )
+            throw error
         }
+    }
+
+    private func persistProxyTerminalRecord(
+        runtimeError: CLIRuntimeError?,
+        fallbackReason: String,
+        initialPPID: pid_t,
+        unexpectedError: Swift.Error? = nil
+    ) async {
+        let snapshot = await bridgeLedger.snapshot()
+        let record = CLIProxyRuntimePolicy.makeTerminalRecord(
+            sessionToken: sessionToken,
+            localPID: Int(getpid()),
+            initialParentPID: Int(initialPPID),
+            ledgerSnapshot: snapshot,
+            runtimeError: runtimeError,
+            fallbackReason: fallbackReason,
+            unexpectedError: unexpectedError
+        )
+        _ = MCPTerminalRecordStore.writeBestEffort(
+            record,
+            to: MCPFilesystemConstants.eventsDirectoryURL()
+        )
     }
 
     /// Monitors the parent process ID. If it changes (reparented to init/launchd),
@@ -1389,7 +1845,7 @@ actor MCPService: Service {
             if currentPPID != initialPPID {
                 // Parent changed - we've been orphaned (typically reparented to PID 1)
                 log.notice("CLI: Parent process died (PPID changed from \(initialPPID) to \(currentPPID)), exiting")
-                throw CLIRuntimeError.hostDisconnected
+                throw CLIRuntimeError.hostDisconnected(.parentProcessChanged(initialPPID: initialPPID, currentPPID: currentPPID))
             }
         }
     }
@@ -1399,79 +1855,11 @@ actor MCPService: Service {
     /// Determines whether a runtime error is transient and should trigger a retry.
     /// Terminal errors (approval denied, explicit termination, host disconnect) return false.
     private func shouldRetry(after error: CLIRuntimeError) -> Bool {
-        switch error {
-        case .approvalDenied,
-             .hostDisconnected,
-             .terminatedByServer:
-            return false
-
-        case let .connectionFailed(underlying):
-            guard let socketError = underlying as? SocketProxyError else {
-                // Unknown underlying error - be conservative, allow a few retries
-                return true
-            }
-            switch socketError {
-            // Terminal socket errors - don't retry
-            case .approvalDenied,
-                 .handshakeFailed,
-                 .protocolVersionMismatch,
-                 .socketCreationFailed,
-                 .descriptorConfigurationFailed,
-                 .pathTooLong,
-                 .bindFailed,
-                 .listenFailed,
-                 .acceptFailed,
-                 .stdoutWriteTimeout,
-                 .stdoutBrokenPipe,
-                 .hostDisconnected:
-                return false
-
-            case let .handshakeRejected(errorCode, _):
-                return isTransientBootstrapRejection(errorCode)
-
-            // Transient socket errors - retry with backoff
-            case .connectionRefused,
-                 .connectionTimeout,
-                 .bootstrapResponseTimeout,
-                 .connectionReset,
-                 .serverClosed,
-                 .readFailed,
-                 .writeFailed,
-                 .pollFailed,
-                 .notConnected,
-                 .notListening,
-                 .cancelled,
-                 .connectFailed,
-                 .terminatedByServer:
-                return true
-            }
-        }
+        CLIProxyRuntimePolicy.shouldRetry(after: error)
     }
 
     private func transportFailureReason(for error: CLIRuntimeError) -> String {
-        switch error {
-        case .approvalDenied:
-            return "approval_denied"
-        case .hostDisconnected:
-            return "host_disconnected"
-        case .terminatedByServer:
-            return "terminated_by_server"
-        case let .connectionFailed(underlying):
-            if underlying is JSONRPCBridgeLedgerError {
-                return "jsonrpc_bridge_terminal"
-            }
-            if let socketError = underlying as? SocketProxyError {
-                switch socketError {
-                case .stdoutWriteTimeout: return "stdout_write_timeout"
-                case .stdoutBrokenPipe: return "stdout_broken_pipe"
-                case .serverClosed: return "app_socket_closed"
-                case .connectionReset: return "app_socket_reset"
-                case .connectionTimeout: return "app_socket_write_timeout"
-                default: return "bootstrap_transport_failure"
-                }
-            }
-            return "transport_failure"
-        }
+        CLIProxyRuntimePolicy.failureReason(for: error)
     }
 
     private static func responseDeliveryFaultRuleFromEnvironment() -> JSONRPCBridgeFaultRule? {
@@ -1506,20 +1894,6 @@ actor MCPService: Service {
         #else
             return nil
         #endif
-    }
-
-    private func isTransientBootstrapRejection(_ code: String?) -> Bool {
-        guard let code else { return false }
-        switch code {
-        case MCPBootstrapErrorCode.serverNotReady.rawValue,
-             MCPBootstrapErrorCode.serverUnavailable.rawValue,
-             MCPBootstrapErrorCode.connectionLimitReached.rawValue,
-             MCPBootstrapErrorCode.capacityExceeded.rawValue,
-             MCPBootstrapErrorCode.clientCooldown.rawValue:
-            return true
-        default:
-            return false
-        }
     }
 
     /// Runs the MCP transport with reconnection on transient failures.
@@ -1583,7 +1957,7 @@ actor MCPService: Service {
                     try await Task.sleep(for: .seconds(delay))
                 } catch is CancellationError {
                     // Cancelled by kill signal or PPID watchdog
-                    throw CLIRuntimeError.hostDisconnected
+                    throw CLIRuntimeError.hostDisconnected(.taskCancelled)
                 }
             } catch {
                 // Unknown error type - treat as fatal connection failure
@@ -1592,7 +1966,7 @@ actor MCPService: Service {
         }
 
         // If loop exits due to Task cancellation
-        throw CLIRuntimeError.hostDisconnected
+        throw CLIRuntimeError.hostDisconnected(.taskCancelled)
     }
 
     /// Single connection attempt to the bootstrap socket.
@@ -1620,7 +1994,7 @@ actor MCPService: Service {
         do {
             try await proxy.start()
             log.debug("Bootstrap socket proxy stopped cleanly")
-            throw CLIRuntimeError.hostDisconnected
+            throw CLIRuntimeError.hostDisconnected(.stdinClosed)
         } catch let err as SocketProxyError {
             await proxy.stop()
             switch err {
@@ -1628,10 +2002,13 @@ actor MCPService: Service {
                 throw CLIRuntimeError.approvalDenied
             case .hostDisconnected:
                 // Host process closed stdin - clean exit
-                throw CLIRuntimeError.hostDisconnected
+                throw CLIRuntimeError.hostDisconnected(.stdinClosed)
             case let .stdoutBrokenPipe(bytesWritten, totalBytes):
                 debugLog("BootstrapSocketProxy: stdout bridge broken_pipe bytes_written=\(bytesWritten) total_bytes=\(totalBytes)")
-                throw CLIRuntimeError.hostDisconnected
+                throw CLIRuntimeError.hostDisconnected(.stdoutBrokenPipe(
+                    bytesWritten: bytesWritten,
+                    totalBytes: totalBytes
+                ))
             case .stdoutWriteTimeout:
                 throw CLIRuntimeError.connectionFailed(underlying: err)
             case .serverClosed, .connectionReset, .connectionTimeout:
@@ -1641,7 +2018,10 @@ actor MCPService: Service {
                 throw CLIRuntimeError.connectionFailed(underlying: err)
             case let .terminatedByServer(reason):
                 // Server explicitly killed this connection - exit without retry
-                throw CLIRuntimeError.terminatedByServer(reason: reason)
+                throw CLIRuntimeError.terminatedByServer(CLIServerTerminationProvenance(
+                    reason: nil,
+                    message: reason
+                ))
             case let .handshakeFailed(reason):
                 log.error("Bootstrap handshake failed: \(reason)")
                 throw CLIRuntimeError.connectionFailed(underlying: err)
@@ -1664,7 +2044,21 @@ actor MCPService: Service {
 
 // MARK: - Error Handlers
 
+func mcpCLIExitCode(for error: CLIRuntimeError) -> MCPCLIExitCode {
+    switch error {
+    case .connectionFailed:
+        .connectionFailed
+    case .approvalDenied:
+        .approvalDenied
+    case .terminatedByServer:
+        .terminatedByServer
+    case .hostDisconnected:
+        .ok
+    }
+}
+
 func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
+    let exitCode = mcpCLIExitCode(for: err)
     // Log error event to disk for app to surface (respects shouldPersistEvent policy)
     CLIEventLogger.logRuntimeError(err)
 
@@ -1672,20 +2066,19 @@ func handleRuntimeError(_ err: CLIRuntimeError) -> Never {
     case let .connectionFailed(underlying):
         log.error("Connection failed: \(underlying)")
         fputs("RepoPrompt MCP: connection failed – \(underlying)\n", stderr)
-        exit(MCPCLIExitCode.connectionFailed.rawValue)
+        exit(exitCode.rawValue)
     case .approvalDenied:
         fputs("RepoPrompt MCP: connection closed immediately. Approval was likely denied or the server is disabled. Check the RepoPrompt approval dialog or MCP settings.\n", stderr)
-        exit(MCPCLIExitCode.approvalDenied.rawValue)
-    case let .terminatedByServer(reason):
+        exit(exitCode.rawValue)
+    case let .terminatedByServer(provenance):
         // Clean exit - server explicitly terminated this connection
-        let message = reason ?? "Connection terminated by server"
-        log.notice("CLI exiting: \(message)")
-        fputs("RepoPrompt MCP: \(message)\n", stderr)
-        exit(MCPCLIExitCode.terminatedByServer.rawValue)
-    case .hostDisconnected:
+        log.notice("CLI exiting: \(provenance.humanMessage)")
+        fputs("RepoPrompt MCP: \(provenance.humanMessage)\n", stderr)
+        exit(exitCode.rawValue)
+    case let .hostDisconnected(provenance):
         // Host process died - exit cleanly without retry
-        log.notice("CLI exiting: host disconnected")
-        exit(MCPCLIExitCode.ok.rawValue)
+        log.notice("CLI exiting: host disconnected \(provenance.description)")
+        exit(exitCode.rawValue)
     }
 }
 

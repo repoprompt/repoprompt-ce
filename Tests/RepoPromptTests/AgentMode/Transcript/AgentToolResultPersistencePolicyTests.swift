@@ -270,6 +270,161 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertNil(promptObject["summary_only"])
     }
 
+    func testTrustedIncrementalFinalTurnSanitizationMatchesFullSanitization() {
+        let turnID = UUID()
+        let spanID = UUID()
+        let startedAt = Date()
+        let activities = (0 ..< 100).map { sequenceIndex in
+            makeReadFileActivity(
+                id: UUID(),
+                sequenceIndex: sequenceIndex,
+                marker: "before-\(sequenceIndex)"
+            )
+        }
+        let previousRaw = AgentTranscript(
+            turns: [
+                AgentTranscriptTurn(
+                    id: turnID,
+                    responseSpans: [
+                        AgentTranscriptProviderResponseSpan(
+                            id: spanID,
+                            lifecycle: .open,
+                            startedAt: startedAt,
+                            activities: activities
+                        )
+                    ],
+                    startedAt: startedAt
+                )
+            ],
+            nextSequenceIndex: 100
+        )
+        let previousSanitized = AgentToolResultPersistencePolicy
+            .sanitizeTranscriptWithMetrics(previousRaw)
+            .transcript
+
+        var updatedActivities = activities
+        updatedActivities[99] = makeReadFileActivity(
+            id: activities[99].id,
+            sequenceIndex: 99,
+            marker: "after"
+        )
+        let updatedRaw = AgentTranscript(
+            turns: [
+                AgentTranscriptTurn(
+                    id: turnID,
+                    responseSpans: [
+                        AgentTranscriptProviderResponseSpan(
+                            id: spanID,
+                            lifecycle: .open,
+                            startedAt: startedAt,
+                            activities: updatedActivities
+                        )
+                    ],
+                    startedAt: startedAt
+                )
+            ],
+            nextSequenceIndex: 100
+        )
+
+        let incremental = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+            updatedRaw,
+            previousSanitizedTranscript: previousSanitized,
+            trustedReusablePrefixTurnCount: 0,
+            trustedIncrementalFinalTurnStartSequenceIndex: 99
+        )
+        let fullySanitized = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(updatedRaw)
+
+        XCTAssertEqual(incremental.transcript, fullySanitized.transcript)
+        XCTAssertLessThanOrEqual(incremental.sanitizedActivityCount, 1)
+        XCTAssertGreaterThan(fullySanitized.sanitizedActivityCount, incremental.sanitizedActivityCount)
+    }
+
+    func testIncrementalSanitizerFallbackDoesNotReuseChangedCompactionPrefix() {
+        let startedAt = Date(timeIntervalSinceReferenceDate: 1)
+        let prefixActivity = makeReadFileActivity(
+            id: UUID(),
+            sequenceIndex: 0,
+            marker: "prefix"
+        )
+        let previousFinalActivity = makeReadFileActivity(
+            id: UUID(),
+            sequenceIndex: 100,
+            marker: "previous-final"
+        )
+        let previousRaw = AgentTranscript(
+            turns: [
+                AgentTranscriptTurn(
+                    id: UUID(),
+                    responseSpans: [
+                        AgentTranscriptProviderResponseSpan(
+                            lifecycle: .completed,
+                            startedAt: startedAt,
+                            activities: [prefixActivity]
+                        )
+                    ],
+                    retentionTier: .archived,
+                    startedAt: startedAt,
+                    completedAt: startedAt
+                ),
+                AgentTranscriptTurn(
+                    id: UUID(),
+                    responseSpans: [
+                        AgentTranscriptProviderResponseSpan(
+                            lifecycle: .open,
+                            startedAt: startedAt,
+                            activities: [previousFinalActivity]
+                        )
+                    ],
+                    startedAt: startedAt
+                )
+            ],
+            nextSequenceIndex: 101
+        )
+        let previousSanitized = AgentToolResultPersistencePolicy
+            .sanitizeTranscriptWithMetrics(previousRaw)
+            .transcript
+
+        var changedPrefix = previousSanitized.turns[0]
+        changedPrefix.retentionTier = .summary
+        let changedFinalActivity = makeReadFileActivity(
+            id: previousFinalActivity.id,
+            sequenceIndex: 100,
+            marker: "changed-final"
+        )
+        let appendedFinalActivity = makeReadFileActivity(
+            id: UUID(),
+            sequenceIndex: 101,
+            marker: "appended-final"
+        )
+        var updatedRaw = previousRaw
+        updatedRaw.turns[0] = changedPrefix
+        updatedRaw.turns[1].responseSpans = [
+            AgentTranscriptProviderResponseSpan(
+                lifecycle: .completed,
+                startedAt: startedAt,
+                activities: [changedFinalActivity]
+            ),
+            AgentTranscriptProviderResponseSpan(
+                lifecycle: .open,
+                startedAt: startedAt,
+                activities: [appendedFinalActivity]
+            )
+        ]
+        updatedRaw.nextSequenceIndex = 102
+
+        let incrementalFallback = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(
+            updatedRaw,
+            previousSanitizedTranscript: previousSanitized,
+            trustedReusablePrefixTurnCount: 1,
+            trustedIncrementalFinalTurnStartSequenceIndex: 100
+        )
+        let fullySanitized = AgentToolResultPersistencePolicy.sanitizeTranscriptWithMetrics(updatedRaw)
+
+        XCTAssertEqual(incrementalFallback.transcript, fullySanitized.transcript)
+        XCTAssertEqual(incrementalFallback.transcript.turns[0].retentionTier, .summary)
+        XCTAssertEqual(incrementalFallback.reusedTurnCount, 0)
+    }
+
     private func persistedSummary(toolName: String, rawResultJSON: String, argsJSON: String? = nil) -> AgentPersistedToolResultSummary? {
         let invocationID = UUID()
         let item = AgentChatItem(
@@ -293,6 +448,37 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             for: item,
             toolExecution: execution,
             rawResultTextFallback: rawResultJSON
+        )
+    }
+
+    private func makeReadFileActivity(
+        id: UUID,
+        sequenceIndex: Int,
+        marker: String
+    ) -> AgentTranscriptActivity {
+        let invocationID = UUID()
+        let argsJSON = jsonString(["path": "/tmp/\(marker).txt"])
+        let resultJSON = jsonString([
+            "path": "/tmp/\(marker).txt",
+            "content": String(repeating: "\(marker) payload ", count: 80)
+        ])
+        let execution = AgentTranscriptToolExecution(
+            stableExecutionID: invocationID.uuidString,
+            toolName: "read_file",
+            invocationID: invocationID,
+            argsJSON: argsJSON,
+            resultJSON: resultJSON,
+            toolIsError: false,
+            status: .success
+        )
+        return AgentTranscriptActivity(
+            id: id,
+            timestamp: Date(timeIntervalSinceReferenceDate: TimeInterval(sequenceIndex)),
+            sequenceIndex: sequenceIndex,
+            role: .toolExecution,
+            itemKind: .toolResult,
+            text: resultJSON,
+            toolExecution: execution
         )
     }
 

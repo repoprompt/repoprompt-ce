@@ -88,9 +88,13 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
             let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
             let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
             let metadata = await dependencies.captureRequestMetadata()
-            await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
+            guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
+                throw CancellationError()
+            }
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            if includeArr.contains("files") {
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            }
             let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
             let dto = try await dependencies.buildTabWorkspaceContext(
                 resolvedTabContext.snapshot,
@@ -154,7 +158,9 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
         }
         let metadata = await dependencies.captureRequestMetadata()
         if op == "export" {
-            await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
+            guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
+                throw CancellationError()
+            }
         }
         let resolvedContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.prompt, .allowLegacyImplicitRouting)
         if !resolvedContext.usesActiveTabCompatibility {

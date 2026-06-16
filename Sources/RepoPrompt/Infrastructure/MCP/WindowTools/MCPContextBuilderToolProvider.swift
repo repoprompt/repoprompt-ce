@@ -170,7 +170,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     ) async throws -> ContextBuilderToolResult {
         let instructions = args["instructions"]?.stringValue ?? ""
         let metadata = await dependencies.captureRequestMetadata()
-        await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics)
+        guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
+            throw CancellationError()
+        }
         let responseType = try ContextBuilderResponseType.parse(from: args["response_type"])
         let exportResponse: Bool
         if let value = args["export_response"] {
@@ -186,7 +188,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
 
         let targetWindow = try dependencies.requireTargetWindow()
-        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace else {
             throw MCPError.invalidParams("No active workspace in this window. Use manage_workspaces action='list' to see available workspaces, then action='switch' to load one.")
         }
         let preferredAgent = targetWindow.promptManager.contextBuilderAgent
@@ -198,15 +200,11 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
             connectionID
         )
         let finalTabID = tabResolution.tabID
-        let capturedOracleExportDestination: OracleExportDestination? = if exportResponse {
-            try dependencies.makeOracleExportDestination(
-                workspace,
-                targetWindow.windowID,
-                finalTabID
-            )
-        } else {
-            nil
-        }
+        let workspace = tabResolution.workspaceID.flatMap { workspaceID in
+            targetWindow.workspaceManager.workspaces.first(where: { $0.id == workspaceID })
+        } ?? activeWorkspace
+        let workspaceContext = tabResolution.workspaceContext
+        let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -218,6 +216,22 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 targetWindow.windowID
             )
         }
+
+        // swiftformat:disable conditionalAssignment
+        let capturedOracleExportDestination: OracleExportDestination?
+        if exportResponse {
+            // Export into the exact root scope selected by Context Builder's final tab resolution.
+            // Ambient request metadata may still describe a different active tab.
+            capturedOracleExportDestination = try dependencies.makeOracleExportDestination(
+                workspace,
+                targetWindow.windowID,
+                finalTabID,
+                lookupContext
+            )
+        } else {
+            capturedOracleExportDestination = nil
+        }
+        // swiftformat:enable conditionalAssignment
 
         let contextBuilderVM = targetWindow.contextBuilderAgentViewModel
         let tabIDForCleanup = finalTabID
@@ -271,6 +285,22 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 return promptManager.planningModel.displayName
             } : nil
 
+            let sendStageProgress = dependencies.sendStageProgress
+            let progressTimeline = ContextBuilderMCPProgressTimeline { event in
+                await sendStageProgress(
+                    connectionID,
+                    MCPWindowToolName.contextBuilder,
+                    event.stage,
+                    event.message
+                )
+            }
+            let progressReporter: ContextBuilderMCPProgressReporter = { phase in
+                await progressTimeline.transition(to: phase)
+            }
+            let activityReporter: ContextBuilderMCPActivityReporter = { phase, message in
+                await progressTimeline.reportActivity(phase: phase, message: message)
+            }
+
             func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
                 await dependencies.sendStageProgress(
                     connectionID,
@@ -285,24 +315,29 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "discovering",
                     "Running Context Builder agent..."
                 )
-                let snapshot = try await withHeartbeat(
-                    connectionID: connectionID,
-                    tool: MCPWindowToolName.contextBuilder,
-                    stage: "discovering",
-                    message: "Still building context..."
-                ) {
-                    try await contextBuilderVM.runContextBuilderForMCP(
-                        tabID: finalTabID,
-                        instructionsOverride: instructions.isEmpty ? nil : instructions,
-                        tokenBudgetOverride: tokenBudgetOverride,
-                        persistTokenBudget: false,
-                        enhancementModeOverride: .fullRewrite,
-                        agentOverride: preferredAgent,
-                        modelOverrideRaw: preferredModelRaw,
-                        responseType: responseType?.rawValue,
-                        planModelName: planModelName,
-                        mcpControlToken: mcpControlToken
-                    )
+                let snapshot = try await withTimelinePhaseCompletion(progressTimeline) {
+                    try await withHeartbeat(
+                        connectionID: connectionID,
+                        tool: MCPWindowToolName.contextBuilder,
+                        stage: "discovering",
+                        message: "Still building context...",
+                        timeline: progressTimeline
+                    ) {
+                        try await contextBuilderVM.runContextBuilderForMCP(
+                            tabID: finalTabID,
+                            instructionsOverride: instructions.isEmpty ? nil : instructions,
+                            tokenBudgetOverride: tokenBudgetOverride,
+                            persistTokenBudget: false,
+                            enhancementModeOverride: .fullRewrite,
+                            agentOverride: preferredAgent,
+                            modelOverrideRaw: preferredModelRaw,
+                            responseType: responseType?.rawValue,
+                            planModelName: planModelName,
+                            workspaceContext: workspaceContext,
+                            mcpControlToken: mcpControlToken,
+                            progressReporter: progressReporter
+                        )
+                    }
                 }
 
                 await dependencies.sendStageProgress(
@@ -329,6 +364,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 default: "completed"
                 }
 
+                try workspaceContext?.validateAvailability()
                 let sel = resultTab.selection
                 let fileCount = sel.selectedPaths.count + sel.autoCodemapPaths.count
 
@@ -336,7 +372,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     sel,
                     false,
                     .relative,
-                    .auto
+                    .auto,
+                    lookupContext
                 )
                 let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
 
@@ -362,19 +399,25 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         "Generating \(modeLabel)..."
                     )
 
-                    let reply = try await withHeartbeat(
-                        connectionID: connectionID,
-                        tool: MCPWindowToolName.contextBuilder,
-                        stage: "generating",
-                        message: "Still generating \(modeLabel)..."
-                    ) {
-                        try await dependencies.runMCPPlanOrQuestion(
-                            contextBuilderVM,
-                            resultTab.id,
-                            mode,
-                            effectivePrompt,
-                            sel
-                        )
+                    let reply = try await withTimelinePhaseCompletion(progressTimeline) {
+                        try await withHeartbeat(
+                            connectionID: connectionID,
+                            tool: MCPWindowToolName.contextBuilder,
+                            stage: "generating",
+                            message: "Still generating \(modeLabel)...",
+                            timeline: progressTimeline
+                        ) {
+                            try await dependencies.runMCPPlanOrQuestion(
+                                contextBuilderVM,
+                                resultTab.id,
+                                mode,
+                                effectivePrompt,
+                                sel,
+                                lookupContext,
+                                progressReporter,
+                                activityReporter
+                            )
+                        }
                     }
 
                     if mode == .review {
@@ -476,6 +519,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         tool: String,
         stage: String,
         message: String,
+        timeline: ContextBuilderMCPProgressTimeline? = nil,
         interval: Duration = .seconds(30),
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -492,12 +536,20 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 while !Task.isCancelled {
                     try await Task.sleep(for: interval)
                     try Task.checkCancellation()
+                    let heartbeat: (stage: String, message: String) = if let timeline {
+                        await timeline.heartbeat(
+                            fallbackStage: stage,
+                            fallbackMessage: message
+                        )
+                    } else {
+                        (stage, message)
+                    }
                     await ServerNetworkManager.shared.sendProgress(
                         for: connectionID,
                         tool: tool,
                         kind: .heartbeat,
-                        stage: stage,
-                        message: message
+                        stage: heartbeat.stage,
+                        message: heartbeat.message
                     )
                 }
             } catch {
@@ -506,5 +558,21 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         }
         defer { heartbeatTask.cancel() }
         return try await operation()
+    }
+
+    private static func withTimelinePhaseCompletion<T: Sendable>(
+        _ timeline: ContextBuilderMCPProgressTimeline,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        do {
+            let result = try await operation()
+            await timeline.finishCurrentPhase()
+            await timeline.flush()
+            return result
+        } catch {
+            await timeline.finishCurrentPhase()
+            await timeline.flush()
+            throw error
+        }
     }
 }

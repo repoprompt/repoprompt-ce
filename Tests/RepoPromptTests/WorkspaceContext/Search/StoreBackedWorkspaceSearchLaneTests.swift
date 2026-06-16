@@ -3,14 +3,62 @@ import XCTest
 
 #if DEBUG
     final class StoreBackedWorkspaceSearchLaneTests: XCTestCase {
-        func testProductionPolicyIsOneActiveOneQueuedWithBoundedWait() {
+        func testProductionPolicyAdmitsBoundedBurstWithBoundedWait() {
             let configuration = StoreBackedWorkspaceSearchLane.Configuration.production
+            XCTAssertEqual(configuration.maxActiveLeases, 4)
+            XCTAssertEqual(configuration.maxQueuedWaiters, 4)
             XCTAssertEqual(configuration.maxQueueWaitMilliseconds, 1500)
             XCTAssertEqual(configuration.retryAfterMilliseconds, 1000)
         }
 
-        func testOneActiveOneQueuedAndThirdRejectedThenLaneReturnsIdle() async throws {
+        func testProductionBurstAdmitsActiveBatchQueuesOverflowAndRejectsBeyondQueue() async throws {
             let lane = StoreBackedWorkspaceSearchLane()
+            let configuration = StoreBackedWorkspaceSearchLane.Configuration.production
+            let gate = AsyncGate()
+            await lane.setPermitAcquiredHandlerForTesting {
+                await gate.markStartedAndWaitForRelease()
+            }
+
+            var activeBatch: [Task<Int, Error>] = []
+            for value in 1 ... configuration.maxActiveLeases {
+                activeBatch.append(permitTask(lane: lane, value: value))
+            }
+            await assertTrue(gate.waitUntilStartedCount(configuration.maxActiveLeases))
+
+            var queuedBatch: [Task<Int, Error>] = []
+            for value in 1 ... configuration.maxQueuedWaiters {
+                queuedBatch.append(permitTask(lane: lane, value: 100 + value))
+            }
+            await assertTrue(waitForSnapshot(lane) { $0.waiterCount == configuration.maxQueuedWaiters })
+
+            let overflow = permitTask(lane: lane, value: 999)
+            await assertQueueFull(overflow)
+
+            let held = await lane.snapshotForTesting()
+            XCTAssertEqual(held.activePermitCount, configuration.maxActiveLeases)
+            XCTAssertEqual(held.waiterCount, configuration.maxQueuedWaiters)
+            XCTAssertEqual(held.overloadCount, 1)
+            XCTAssertEqual(held.maximumActivePermitCount, configuration.maxActiveLeases)
+            XCTAssertEqual(held.maximumWaiterCount, configuration.maxQueuedWaiters)
+
+            await gate.release()
+            for (index, task) in activeBatch.enumerated() {
+                let value = try await task.value
+                XCTAssertEqual(value, index + 1)
+            }
+            for (index, task) in queuedBatch.enumerated() {
+                let value = try await task.value
+                XCTAssertEqual(value, 101 + index)
+            }
+            let settled = await lane.snapshotForTesting()
+            XCTAssertTrue(settled.isIdle)
+            XCTAssertEqual(settled.grantCount, configuration.maxActiveLeases + configuration.maxQueuedWaiters)
+        }
+
+        func testOneActiveOneQueuedAndThirdRejectedThenLaneReturnsIdle() async throws {
+            let lane = StoreBackedWorkspaceSearchLane(
+                configuration: .init(maxQueueWait: .milliseconds(1500))
+            )
             let gate = AsyncGate()
             await lane.setPermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()
@@ -41,7 +89,9 @@ import XCTest
         }
 
         func testQueuedCancellationRemovesWaiterWithoutLeakingLane() async throws {
-            let lane = StoreBackedWorkspaceSearchLane()
+            let lane = StoreBackedWorkspaceSearchLane(
+                configuration: .init(maxQueueWait: .milliseconds(1500))
+            )
             let gate = AsyncGate()
             await lane.setPermitAcquiredHandlerForTesting {
                 await gate.markStartedAndWaitForRelease()

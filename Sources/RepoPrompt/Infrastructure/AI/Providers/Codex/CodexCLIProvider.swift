@@ -396,7 +396,7 @@ final class CodexCLIProvider: AIProvider {
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
-                try await controller.sendUserTurn(
+                _ = try await controller.startUserTurn(
                     text: prompt,
                     images: [],
                     model: selection.model,
@@ -540,7 +540,7 @@ final class CodexCLIProvider: AIProvider {
                     reasoningEffort: selection.reasoningEffort,
                     serviceTier: selection.serviceTier
                 )
-                try await controller.sendUserTurn(
+                _ = try await controller.startUserTurn(
                     text: prompt,
                     images: [],
                     model: selection.model,
@@ -934,8 +934,8 @@ final class CodexCLIProvider: AIProvider {
         }
         if let clientError = error as? CodexAppServerClient.ClientError {
             switch clientError {
-            case let .requestFailed(message):
-                return message
+            case let .requestFailed(failure):
+                return failure.message
             case let .executableUnavailable(message):
                 return message
             case let .transportWriteFailed(message, _):

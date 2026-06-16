@@ -12,18 +12,106 @@ final class AgentContextExportResolverTests: XCTestCase {
         try super.tearDownWithError()
     }
 
-    func testDisplayFileCountUsesSourceSelectionBeforeModelLoads() {
+    func testDisplayFileCountUsesExplicitSelectionAndExcludesAutoCodemaps() {
         let selection = StoredSelection(
             selectedPaths: ["A.swift", "B.swift", "C.swift", "D.swift", "E.swift"],
-            autoCodemapPaths: ["G.swift"],
-            slices: ["F.swift": [LineRange(start: 1, end: 2)]],
-            codemapAutoEnabled: false
+            autoCodemapPaths: ["G.swift", "H.swift"],
+            slices: [
+                "E.swift": [LineRange(start: 1, end: 2)],
+                "F.swift": [LineRange(start: 3, end: 4)]
+            ],
+            codemapAutoEnabled: true
         )
 
+        XCTAssertEqual(AgentContextExportResolver.explicitSelectionFileCount(selection), 6)
         XCTAssertEqual(
             AgentContextExportResolver.displayFileCount(resolvedModel: nil, sourceSelection: selection),
-            7
+            6
         )
+    }
+
+    func testAutoCodemapExportResolutionBatchesPopoverPathLookups() async throws {
+        #if DEBUG
+            let root = try makeTemporaryRoot(name: "AgentExportAutoCodemapBatch")
+            let explicitFileCount = 7
+            var selectedPaths: [String] = []
+            var slices: [String: [LineRange]] = [:]
+            for index in 0 ..< explicitFileCount {
+                let fileURL = root.appendingPathComponent("Selected\(index).swift")
+                try write("struct Selected\(index) {}", to: fileURL)
+                selectedPaths.append(fileURL.path)
+                if index >= 3 {
+                    slices[fileURL.path] = [LineRange(start: 1, end: 1)]
+                }
+            }
+
+            let codemapCount = 44
+            var codemapPaths: [String] = []
+            var observed: [WorkspaceObservedCodemapResult] = []
+            for index in 0 ..< codemapCount {
+                let fileURL = root.appendingPathComponent("Dependency\(index).swift")
+                try write("struct Dependency\(index) {}", to: fileURL)
+                codemapPaths.append(fileURL.path)
+                observed.append(
+                    WorkspaceObservedCodemapResult(
+                        fullPath: fileURL.path,
+                        modificationDate: Date(),
+                        fileAPI: makeFileAPI(path: fileURL.path, symbol: "dependency\(index)")
+                    )
+                )
+            }
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            await store.applyObservedCodemapResults(observed)
+            let source = AgentContextExportSource(
+                tabID: UUID(),
+                promptText: "Review",
+                selection: StoredSelection(
+                    selectedPaths: selectedPaths,
+                    autoCodemapPaths: codemapPaths,
+                    slices: slices,
+                    codemapAutoEnabled: true
+                ),
+                selectedMetaPromptIDs: [],
+                tabName: "Agent Tab",
+                activeAgentSessionID: nil,
+                worktreeBindings: []
+            )
+
+            EditFlowPerf.resetDebugCaptureForTesting()
+            defer { EditFlowPerf.resetDebugCaptureForTesting() }
+            switch EditFlowPerf.beginDebugCapture(label: "agent-export-auto-codemap-batch", maxSamples: 200) {
+            case .started:
+                break
+            case .busy:
+                XCTFail("Performance capture should start")
+            }
+
+            let model = await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: store,
+                filePathDisplay: .relative,
+                codeMapUsage: .auto
+            )
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let snapshotBuildCount = capture.stages
+                .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
+                .reduce(0) { $0 + $1.sampleCount }
+
+            XCTAssertEqual(model.rows.count(where: { $0.kind != .codemap }), explicitFileCount)
+            XCTAssertEqual(model.rows.count(where: { $0.kind == .slices }), 4)
+            XCTAssertEqual(model.rows.count(where: { $0.kind == .codemap }), codemapCount)
+            XCTAssertEqual(
+                AgentContextExportResolver.displayFileCount(
+                    resolvedModel: model,
+                    sourceSelection: source.selection
+                ),
+                explicitFileCount
+            )
+            XCTAssertEqual(snapshotBuildCount, 1)
+            XCTAssertEqual(capture.droppedSampleCount, 0)
+        #endif
     }
 
     func testWorktreeExportUsesPhysicalContentWhileDisplayingLogicalPath() async throws {
@@ -194,6 +282,14 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         XCTAssertNotEqual(firstSource.exportContextIdentity, secondSource.exportContextIdentity)
         XCTAssertEqual(firstSource.exportContextIdentity, visualOnlySource.exportContextIdentity)
+
+        let changedSelectionSource = makeSource(
+            tabID: tabID,
+            sessionID: sessionID,
+            selection: StoredSelection(selectedPaths: ["Sources/Keep.swift"], codemapAutoEnabled: false),
+            bindings: [firstBinding]
+        )
+        XCTAssertNotEqual(firstSource.exportContextIdentity, changedSelectionSource.exportContextIdentity)
     }
 
     func testRemoveRowRebasedOntoLatestSelectionPreservesNewlyAddedFiles() async throws {
@@ -368,7 +464,7 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         XCTAssertEqual(source.tabID, requestedTabID)
         XCTAssertEqual(source.selection, coordinatorSelection)
-        XCTAssertEqual(AgentContextExportResolver.selectionFileCount(source.selection), 2)
+        XCTAssertEqual(AgentContextExportResolver.explicitSelectionFileCount(source.selection), 2)
         XCTAssertEqual(source.promptText, "requested prompt")
     }
 
@@ -464,6 +560,88 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("base checkout complete diff must not appear"), clipboard)
     }
 
+    func testPreviewContentIsPrefixBoundedWhileCopyRemainsFullContent() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewBound")
+        let content = String(repeating: "x", count: AgentContextPreviewContentPolicy.maximumBytes + 2000)
+        try write(content, to: root.appendingPathComponent("Sources/Large.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Large.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .copy
+        )
+        let preview = try XCTUnwrap(previewResult)
+        let copy = try XCTUnwrap(copyResult)
+
+        XCTAssertLessThan(preview.count, copy.count)
+        XCTAssertTrue(preview.contains("Preview truncated"))
+        XCTAssertEqual(copy, content)
+    }
+
+    func testPreviewContentBelowPrefixLimitUsesCompleteContentWithoutTruncationMarker() async throws {
+        let root = try makeTemporaryRoot(name: "AgentExportPreviewSmall")
+        let content = String(repeating: "small\n", count: 1000)
+        try write(content, to: root.appendingPathComponent("Sources/Small.swift"))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let source = AgentContextExportSource(
+            tabID: UUID(),
+            promptText: "Review",
+            selection: StoredSelection(selectedPaths: ["Sources/Small.swift"], codemapAutoEnabled: false),
+            selectedMetaPromptIDs: [],
+            tabName: "Agent Tab",
+            activeAgentSessionID: nil,
+            worktreeBindings: []
+        )
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+        let row = try XCTUnwrap(model.rows.first)
+
+        let previewResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .preview
+        )
+        let copyResult = await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: store,
+            purpose: .copy
+        )
+
+        XCTAssertEqual(previewResult, content)
+        XCTAssertEqual(copyResult, content)
+        XCTAssertFalse(previewResult?.contains("Preview truncated") ?? true)
+    }
+
     private func makeBoundFixture() async throws -> (logicalRoot: URL, worktreeRoot: URL, store: WorkspaceFileContextStore) {
         let logicalRoot = try makeTemporaryRoot(name: "AgentExportLogical")
         let worktreeRoot = try makeTemporaryRoot(name: "AgentExportWorktree")
@@ -523,6 +701,27 @@ final class AgentContextExportResolverTests: XCTestCase {
             visualColorHex: "#3366FF",
             boundAt: Date(timeIntervalSinceReferenceDate: 123),
             source: "test"
+        )
+    }
+
+    private func makeFileAPI(path: String, symbol: String) -> FileAPI {
+        FileAPI(
+            filePath: path,
+            imports: [],
+            classes: [],
+            functions: [
+                FunctionInfo(
+                    name: symbol,
+                    parameters: [],
+                    returnType: nil,
+                    definitionLine: "func \(symbol)()",
+                    lineNumber: 1
+                )
+            ],
+            enums: [],
+            globalVars: [],
+            macros: [],
+            referencedTypes: []
         )
     }
 

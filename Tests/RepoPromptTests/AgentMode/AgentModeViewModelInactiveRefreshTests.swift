@@ -52,6 +52,135 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertGreaterThan(viewModel.activeTranscriptPresentation.rawToolResultPayloadRenderRevision, 0)
     }
 
+    func testLiveToolResultRefreshUsesIncrementalRetentionCompaction() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.runState = .running
+        var items = makeTranscriptItems(prefix: "history", turnCount: 40)
+        items.append(.user("Run a live tool", sequenceIndex: items.count))
+        let invocationID = UUID()
+        let toolCall = AgentChatItem.toolCall(
+            name: "apply_edits",
+            invocationID: invocationID,
+            argsJSON: #"{"path":"File.swift"}"#,
+            sequenceIndex: items.count
+        )
+        items.append(toolCall)
+        session.setItemsSilently(items, reason: .testOverride)
+        viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertNotNil(session.transcript.compactionFrontier)
+        let marker = "INCREMENTAL_RAW_PAYLOAD_\(UUID().uuidString)"
+        let rawResult = jsonString([
+            "status": "success",
+            "edits_requested": 1,
+            "edits_applied": 1,
+            "raw_output": String(repeating: marker, count: 8)
+        ])
+        var toolResult = toolCall
+        toolResult.kind = .toolResult
+        toolResult.text = rawResult
+        toolResult.toolResultJSON = rawResult
+        toolResult.toolIsError = false
+
+        let previousIncrementalImportSuccessCount =
+            session.transcriptPerformanceSnapshot.incrementalImportSuccessCount
+        session.replaceItem(at: session.items.count - 1, with: toolResult)
+        await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
+        XCTAssertGreaterThan(
+            session.transcriptPerformanceSnapshot.incrementalImportSuccessCount,
+            previousIncrementalImportSuccessCount
+        )
+        XCTAssertEqual(session.test_incrementalRetentionCompactionCount, 1)
+        let compactedResult = try XCTUnwrap(session.items.last)
+        XCTAssertTrue(AgentTranscriptToolNormalizer.isSummaryOnly(raw: compactedResult.toolResultJSON ?? ""))
+        XCTAssertFalse(compactedResult.toolResultJSON?.contains(marker) ?? false)
+        XCTAssertTrue(session.ephemeralToolResultPayloadByItemID[toolCall.id]?.contains(marker) == true)
+        XCTAssertEqual(session.derivedTranscriptSyncState?.sourceItemsRevision, session.sourceItemsRevision)
+    }
+
+    func testIncrementalRefreshReconcilesOlderTurnWhenCompactionChangesFullEnvelope() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.runState = .running
+        let initialItems = makeTranscriptItems(prefix: "boundary", turnCount: 32)
+        let oldestItemID = initialItems[0].id
+        session.setItemsSilently(initialItems, reason: .testOverride)
+        viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertFalse(session.transcript.turns.contains(where: { $0.retentionTier != .full }))
+        let previousFullTurnIDs = session.transcript.turns.map(\.id)
+
+        for _ in 0 ..< 4 {
+            let invocationID = UUID()
+            session.appendItem(.toolCall(
+                name: "read_file",
+                invocationID: invocationID,
+                argsJSON: #"{"path":"/tmp/file.swift"}"#,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+            session.appendItem(.toolResult(
+                name: "read_file",
+                invocationID: invocationID,
+                resultJSON: #"{"content":"ok"}"#,
+                sequenceIndex: session.nextSequenceIndex
+            ))
+        }
+        await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
+        let updatedFullTurnIDs = session.transcript.turns
+            .filter { $0.retentionTier == .full }
+            .map(\.id)
+        XCTAssertNotEqual(updatedFullTurnIDs, previousFullTurnIDs)
+        XCTAssertTrue(session.transcript.turns.contains(where: { $0.retentionTier != .full }))
+        XCTAssertFalse(session.items.contains(where: { $0.id == oldestItemID }))
+        XCTAssertGreaterThan(session.transcriptPerformanceSnapshot.incrementalImportSuccessCount, 0)
+    }
+
+    func testIncrementalRefreshStillRemovesImportPolicyExcludedItems() async {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        session.runState = .running
+        session.setItemsSilently(
+            makeTranscriptItems(prefix: "history", turnCount: 40),
+            reason: .testOverride
+        )
+        viewModel.refreshDerivedTranscriptState(for: session)
+        XCTAssertNotNil(session.transcript.compactionFrontier)
+
+        let excludedItem = AgentChatItem.toolCall(
+            name: "set_status",
+            invocationID: UUID(),
+            argsJSON: #"{"session_name":"hidden"}"#,
+            sequenceIndex: session.nextSequenceIndex
+        )
+        let previousIncrementalImportSuccessCount =
+            session.transcriptPerformanceSnapshot.incrementalImportSuccessCount
+        session.appendItem(excludedItem)
+        await viewModel.test_drainScheduledDerivedTranscriptRefresh(tabID: tabID)
+
+        XCTAssertGreaterThan(
+            session.transcriptPerformanceSnapshot.incrementalImportSuccessCount,
+            previousIncrementalImportSuccessCount
+        )
+        XCTAssertFalse(session.items.contains(where: { $0.id == excludedItem.id }))
+        XCTAssertFalse(
+            AgentTranscriptIO.flattenFullTranscript(session.transcript)
+                .contains(where: { $0.id == excludedItem.id })
+        )
+    }
+
     func testRefreshingInactiveSessionDoesNotClobberActivePresentation() async {
         let viewModel = makeViewModel()
         let activeTabID = UUID()
@@ -658,7 +787,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     }
 }
 
-private final class InactiveRefreshFakeCodexController: CodexSessionControlling {
+private final class InactiveRefreshFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     var hasActiveThread: Bool {
         false
     }
@@ -694,10 +823,6 @@ private final class InactiveRefreshFakeCodexController: CodexSessionControlling 
     }
 
     func setThreadName(_ name: String, threadID: String?) async throws {}
-    func sendUserMessage(_ text: String) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?) async throws {}
-    func sendUserTurn(text: String, images: [AgentImageAttachment], model: String?, reasoningEffort: String?, serviceTier: String?) async throws {}
     func compactThread() async throws {}
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal? {
         nil

@@ -113,6 +113,355 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
+        let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/selection-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let created = try Self.worktreeObject(createValue, key: "created_worktree")
+        let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+        let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+        let worktreeOnlyFile = URL(fileURLWithPath: worktreePath)
+            .appendingPathComponent("WorktreeOnly.swift")
+        try "struct WorktreeOnly {}\n".write(to: worktreeOnlyFile, atomically: true, encoding: .utf8)
+
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let sessionID = UUID()
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "worktree_id": .string(worktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+
+        let staleConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: staleConnectionID,
+            clientName: "stale-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+
+        let setterConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: setterConnectionID,
+            clientName: "setter-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        #if DEBUG
+            let staleSelectionRevision = try XCTUnwrap(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID)
+            )
+        #endif
+        let setValue = try await ServerNetworkManager.withConnectionID(setterConnectionID) {
+            try await manageSelection([
+                "op": .string("set"),
+                "paths": .array([.string("WorktreeOnly.swift")]),
+                "mode": .string("full"),
+                "view": .string("files"),
+                "path_display": .string("full"),
+                "strict": .bool(true)
+            ])
+        }
+
+        let logicalPath = fixture.repo.appendingPathComponent("WorktreeOnly.swift").path
+        XCTAssertEqual(try Self.selectionPaths(setValue), [logicalPath])
+        #if DEBUG
+            let canonicalSelectionRevision = window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            )
+            XCTAssertGreaterThan(canonicalSelectionRevision, staleSelectionRevision)
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(setterConnectionID),
+                canonicalSelectionRevision
+            )
+            XCTAssertEqual(
+                window.mcpServer.debugSelectionRevisionForBoundConnection(staleConnectionID),
+                staleSelectionRevision
+            )
+        #endif
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalPath))
+
+        // Reproduce the app-only race absent from direct provider tests: a debounced file-tree
+        // publisher captured the empty logical-base UI before MCP persistence and fires later.
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+
+        // Exec-mode CLI disconnect is asynchronous. Exercise the stale cleanup ordering where
+        // an older bound snapshot commits after the setter has persisted newer canonical state.
+        let staleCleanup = Task { @MainActor in
+            await window.mcpServer.commitAndClearTabContext(connectionID: staleConnectionID)
+        }
+        let staleCommitSucceeded = await staleCleanup.value
+        XCTAssertTrue(staleCommitSucceeded)
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: setterConnectionID,
+            clientName: "setter-one-shot-selection-client",
+            windowID: window.windowID
+        )
+
+        let getterConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: getterConnectionID,
+            clientName: "getter-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        let getValue = try await ServerNetworkManager.withConnectionID(getterConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(getValue), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: getterConnectionID,
+            clientName: "getter-one-shot-selection-client",
+            windowID: window.windowID
+        )
+
+        // A worktree-bound Agent Mode read auto-selects canonically without attempting to
+        // project a physical-only file into the logical base file tree.
+        let readConnectionID = UUID()
+        let readRunID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: readConnectionID,
+            clientName: "read-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID,
+            runID: readRunID,
+            explicitlyBound: false
+        )
+        await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: readConnectionID)
+        _ = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await manageSelection(["op": .string("clear")])
+        }
+        _ = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await readFile(["path": .string("WorktreeOnly.swift")])
+        }
+        let readSelection = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(readSelection), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+        XCTAssertTrue(window.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty)
+        window.mcpServer.removeTabContext(
+            forConnectionID: readConnectionID,
+            clientName: "read-one-shot-selection-client",
+            windowID: window.windowID,
+            runID: readRunID
+        )
+        await ServerNetworkManager.shared.setRunPurpose(.unknown, for: readConnectionID)
+
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+
+        let finalConnectionID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: finalConnectionID,
+            clientName: "final-one-shot-selection-client",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID
+        )
+        defer {
+            window.mcpServer.removeTabContext(
+                forConnectionID: finalConnectionID,
+                clientName: "final-one-shot-selection-client",
+                windowID: window.windowID
+            )
+        }
+        let finalSelection = try await ServerNetworkManager.withConnectionID(finalConnectionID) {
+            try await manageSelection([
+                "op": .string("get"),
+                "view": .string("files"),
+                "path_display": .string("full")
+            ])
+        }
+        XCTAssertEqual(try Self.selectionPaths(finalSelection), [logicalPath])
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths, [logicalPath])
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection.selectedPaths,
+            [logicalPath]
+        )
+
+        // A genuinely newer manual UI mutation advances the live-owner revision and supersedes
+        // the worktree fence rather than leaving canonical selection permanently pinned.
+        let manualUISelection = StoredSelection(
+            selectedPaths: [fixture.trackedFile.path],
+            codemapAutoEnabled: false
+        )
+        await window.workspaceFilesViewModel.applyStoredSelection(manualUISelection)
+        window.workspaceManager.publishActiveComposeTabSnapshot(commitToMemory: true, touchModified: false)
+        try await Task.sleep(for: .milliseconds(250))
+        XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.selection, manualUISelection)
+        XCTAssertEqual(
+            window.promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.selection,
+            manualUISelection
+        )
+    }
+
+    func testContextBuilderExportUsesResolvedWorktreeContextAndIsReadableFromFreshConnection() async throws {
+        #if DEBUG
+            let fixture = try Self.makeGitFixture()
+            defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+            let provider = WorktreeContextBuilderImmediateCompletionProvider()
+            let window = try await Self.makeWindow(
+                root: fixture.repo,
+                contextBuilderProviderFactory: { _, _, _ in provider }
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+            let contextBuilder = try await Self.windowTool(named: MCPWindowToolName.contextBuilder, in: window)
+            let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
+
+            var targetTab = try await Self.createBackgroundTab(in: window, name: "Bound Export Target")
+            let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+            XCTAssertNotEqual(window.workspaceManager.activeWorkspace?.activeComposeTabID, targetTab.id)
+            targetTab.promptText = "Generate the deterministic worktree export."
+            window.workspaceManager.updateComposeTab(targetTab, markDirty: false)
+            let sessionID = UUID()
+            let session = window.agentModeViewModel.session(for: targetTab.id)
+            _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: true
+            )
+
+            let createValue = try await manageWorktree([
+                "op": .string("create"),
+                "branch": .string("feature/export-\(fixture.suffix)"),
+                "base_ref": .string("HEAD")
+            ])
+            let created = try Self.worktreeObject(createValue, key: "created_worktree")
+            let worktreeID = try XCTUnwrap(created["worktree_id"]?.stringValue)
+            let worktreePath = try XCTUnwrap(created["path"]?.stringValue)
+            _ = try await manageWorktree([
+                "op": .string("bind"),
+                "worktree_id": .string(worktreeID),
+                "session_id": .string(sessionID.uuidString)
+            ])
+
+            window.contextBuilderAgentViewModel.installRunTestHooks(
+                ContextBuilderAgentViewModel.RunTestHooks(
+                    beforeProcessingProviderEvent: nil,
+                    providerEventDisposition: nil,
+                    teardownCompleted: nil,
+                    runMCPFollowUp: { mode, _, _ in
+                        let chatID = UUID()
+                        return ChatSendReply(
+                            chatId: chatID,
+                            shortId: String(chatID.uuidString.prefix(8)).lowercased(),
+                            mode: mode.mcpModeName,
+                            response: "deterministic worktree export response",
+                            errors: nil
+                        )
+                    }
+                )
+            )
+            defer { window.contextBuilderAgentViewModel.installRunTestHooks(nil) }
+
+            let exportConnectionID = UUID()
+            let exportValue = try await ServerNetworkManager.withConnectionID(exportConnectionID) {
+                // Exercise the provider's explicit context_id resolution without an ambient
+                // TaskLocal hint; the active tab intentionally points at the base checkout.
+                try await contextBuilder([
+                    "instructions": .string("Inspect the worktree-bound target."),
+                    "response_type": .string("plan"),
+                    "context_id": .string(targetTab.id.uuidString),
+                    "export_response": .bool(true)
+                ])
+            }
+            let exportObject = try XCTUnwrap(exportValue.objectValue)
+            XCTAssertNotNil(exportObject["plan"]?.objectValue, String(describing: exportObject))
+            let exportPath = try XCTUnwrap(exportObject["oracle_export_path"]?.stringValue)
+            let exportInstruction = try XCTUnwrap(exportObject["oracle_export_instruction"]?.stringValue)
+            let standardizedLogicalPath = fixture.repo.standardizedFileURL.path
+            XCTAssertTrue(
+                exportPath.hasPrefix(standardizedLogicalPath + "/prompt-exports/"),
+                exportPath
+            )
+            let exportPathLiteral = try XCTUnwrap(
+                String(data: JSONEncoder().encode(exportPath), encoding: .utf8)
+            )
+            XCTAssertTrue(
+                exportInstruction.contains("{\"path\": \(exportPathLiteral)}"),
+                exportInstruction
+            )
+            XCTAssertFalse(FileManager.default.fileExists(atPath: exportPath), exportPath)
+
+            let relativeExportPath = String(exportPath.dropFirst(standardizedLogicalPath.count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let physicalExportPath = URL(fileURLWithPath: worktreePath)
+                .appendingPathComponent(relativeExportPath)
+                .path
+            XCTAssertTrue(FileManager.default.fileExists(atPath: physicalExportPath), physicalExportPath)
+
+            let readConnectionID = UUID()
+            let contextHint = MCPServerViewModel.TabContextHint(
+                tabID: targetTab.id,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            let readValue = try await ServerNetworkManager.withConnectionID(readConnectionID) {
+                try await ServerNetworkManager.$currentTabContextHint.withValue(contextHint) {
+                    try await readFile(["path": .string(exportPath)])
+                }
+            }
+            let readReply = try XCTUnwrap(readValue.decode(ToolResultDTOs.ReadFileReply.self))
+            XCTAssertTrue(readReply.content.contains("deterministic worktree export response"), readReply.content)
+            XCTAssertNotNil(readReply.worktreeScope)
+        #else
+            throw XCTSkip("Context Builder provider injection is DEBUG-only.")
+        #endif
+    }
+
     func testManageWorktreeMergePreviewCleanApplyRawAndFormattedContract() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
@@ -223,7 +572,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedTree = try Self.onlyText(ToolOutputFormatter.formatFileTree(value: treeValue))
         XCTAssertTrue(formattedTree.contains(logicalRootPath), formattedTree)
-        XCTAssertTrue(formattedTree.contains(effectiveRootPath), formattedTree)
+        XCTAssertFalse(formattedTree.contains(effectiveRootPath), formattedTree)
         XCTAssertTrue(formattedTree.contains("session-bound worktree"), formattedTree)
 
         let readValue = try await readFile(["path": .string("Tracked.txt")])
@@ -235,7 +584,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedRead = try Self.onlyText(ToolOutputFormatter.formatReadFile(args: ["path": .string("Tracked.txt")], value: readValue))
         XCTAssertTrue(formattedRead.contains(logicalRootPath), formattedRead)
-        XCTAssertTrue(formattedRead.contains(effectiveRootPath), formattedRead)
+        XCTAssertFalse(formattedRead.contains(effectiveRootPath), formattedRead)
         XCTAssertTrue(formattedRead.contains("session-bound worktree"), formattedRead)
 
         let searchValue = try await fileSearch(["pattern": .string("original"), "mode": .string("content"), "max_results": .int(5)])
@@ -247,7 +596,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
         let formattedSearch = try Self.onlyText(ToolOutputFormatter.formatSearch(value: searchValue))
         XCTAssertTrue(formattedSearch.contains(logicalRootPath), formattedSearch)
-        XCTAssertTrue(formattedSearch.contains(effectiveRootPath), formattedSearch)
+        XCTAssertFalse(formattedSearch.contains(effectiveRootPath), formattedSearch)
         XCTAssertTrue(formattedSearch.contains("session-bound worktree"), formattedSearch)
     }
 
@@ -330,10 +679,23 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         )
     }
 
-    private static func makeWindow(root: URL) async throws -> WindowState {
+    private static func makeWindow(
+        root: URL,
+        contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil
+    ) async throws -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
-        let window = WindowState()
+        let window: WindowState
+        #if DEBUG
+            if let contextBuilderProviderFactory {
+                window = WindowState(contextBuilderProviderFactory: contextBuilderProviderFactory)
+            } else {
+                window = WindowState()
+            }
+        #else
+            _ = contextBuilderProviderFactory
+            window = WindowState()
+        #endif
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
@@ -345,7 +707,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         await window.workspaceManager.switchWorkspace(to: workspace, saveState: false, reason: "worktreeAPISmokeHarness")
         let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
         window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
-        _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(in: window, path: root.path)
         return window
     }
 
@@ -445,6 +807,14 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return try XCTUnwrap(first.objectValue)
     }
 
+    private static func selectionPaths(_ value: Value) throws -> [String] {
+        let object = try XCTUnwrap(value.objectValue)
+        let files = try XCTUnwrap(object["files"]?.arrayValue)
+        return try files.map { file in
+            try XCTUnwrap(file.objectValue?["path"]?.stringValue)
+        }
+    }
+
     private static func onlyText(_ blocks: [MCP.Tool.Content]) throws -> String {
         let first = try XCTUnwrap(blocks.first)
         guard case let .text(text, _, _) = first else {
@@ -454,3 +824,24 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         return text
     }
 }
+
+#if DEBUG
+    private final class WorktreeContextBuilderImmediateCompletionProvider: HeadlessAgentProvider {
+        func streamAgentMessage(
+            _ message: AgentMessage,
+            runID: UUID?
+        ) async throws -> AsyncThrowingStream<AIStreamResult, Error> {
+            _ = message
+            let stream = AsyncThrowingStream<AIStreamResult, Error> { continuation in
+                continuation.yield(AIStreamResult(type: "content", text: "Discovery complete"))
+                continuation.finish()
+            }
+            if let runID {
+                await MCPRoutingWaiter.notifyRouted(runID: runID)
+            }
+            return stream
+        }
+
+        func dispose() async {}
+    }
+#endif

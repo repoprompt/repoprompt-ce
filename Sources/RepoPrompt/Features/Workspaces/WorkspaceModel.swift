@@ -145,7 +145,7 @@ struct WorkspacePreset: Codable, Identifiable, Equatable {
     }
 }
 
-struct StoredSelection: Codable, Equatable {
+struct StoredSelection: Codable, Equatable, Hashable {
     let selectedPaths: [String]
     let autoCodemapPaths: [String]
     let slices: [String: [LineRange]]

@@ -48,7 +48,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
-    // Progressive disclosure state — disconnected providers start expanded
+    // Progressive disclosure state stays user-controlled. Async provider refreshes must not
+    // expand or collapse cards after the user starts interacting with this view.
     @State private var isClaudeCodeExpanded: Bool = false
     @State private var isClaudeCodeGLMExpanded: Bool = false
     @State private var isKimiCodeExpanded: Bool = false
@@ -56,7 +57,6 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
-    @State private var hasSetInitialExpansion = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -137,23 +137,9 @@ struct CLIProvidersSettingsView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear {
-            // Load backend state, then probe the Claude CLI binary before first expansion
-            // so a missing launcher opens the compatible-backend cards that need attention.
             Task {
                 await viewModel.loadCompatibleBackendState()
                 await viewModel.refreshClaudeCodeBinaryStatus()
-                await MainActor.run {
-                    if !hasSetInitialExpansion {
-                        isClaudeCodeExpanded = !viewModel.isClaudeCodeConnected
-                        isClaudeCodeGLMExpanded = shouldExpandCompatibleBackendInitially(.glmZAI)
-                        isKimiCodeExpanded = shouldExpandCompatibleBackendInitially(.kimi)
-                        isCustomCompatibleExpanded = shouldExpandCompatibleBackendInitially(.custom)
-                        isCodexExpanded = !viewModel.isCodexConnected
-                        isOpenCodeExpanded = !viewModel.isOpenCodeConnected
-                        isCursorExpanded = !viewModel.isCursorConnected
-                        hasSetInitialExpansion = true
-                    }
-                }
             }
         }
         .alert(isPresented: $showAlert) {
@@ -207,13 +193,6 @@ struct CLIProvidersSettingsView: View {
         if let url = URL(string: urlString) {
             NSWorkspace.shared.open(url)
         }
-    }
-
-    private func shouldExpandCompatibleBackendInitially(_ backendID: ClaudeCodeCompatibleBackendID) -> Bool {
-        let config = viewModel.compatibleBackendConfig(for: backendID)
-        if backendID == .custom, !config.isEnabled { return false }
-        if viewModel.claudeCodeCLIStatus.isKnownMissing { return true }
-        return !viewModel.compatibleBackendIsActive(backendID)
     }
 
     private var claudeCodeCLIUnavailableDetail: String {
@@ -1893,20 +1872,20 @@ struct CLIProvidersSettingsView: View {
         isLoadingZAI = true
         Task {
             do {
-                let isValid = try await viewModel.validateZAIKey()
+                let isValid = try await viewModel.validateZAICodingPlanKey()
                 await MainActor.run {
                     isLoadingZAI = false
                     if isValid {
                         onAPIKeyUpdated?()
                     } else {
-                        alertMessage = "Unable to validate Z.ai API Key. Please check that your key is correct and that you have funds available in your account."
+                        alertMessage = "Unable to validate Z.ai Coding Plan. Please check that your key is correct and that your GLM Coding Plan subscription is active."
                         showAlert = true
                     }
                 }
             } catch {
                 await MainActor.run {
                     isLoadingZAI = false
-                    alertMessage = "Error validating Z.ai API Key: \(error.asFriendlyString())"
+                    alertMessage = "Error validating Z.ai Coding Plan: \(error.asFriendlyString())"
                     showAlert = true
                 }
             }

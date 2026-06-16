@@ -36,6 +36,50 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
     }
 
+    func testSessionNewInjectsACPStdioMCPServerShape() async throws {
+        let fixtureServer = RepoPromptMCPServerConfiguration(
+            name: "RepoPromptFixture",
+            command: "/bin/echo",
+            args: ["--window", "4"],
+            env: [.init(name: "RPCE_TEST", value: "1")]
+        )
+        let fixture = try makeFixture(shape: "modern", mcpServers: [fixtureServer])
+        try await withBootstrappedController(fixture.controller) { _ in }
+
+        let sessionNew = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/new").first)
+        let mcpServers = try XCTUnwrap(sessionNew.params["mcpServers"] as? [[String: Any]])
+        let server = try XCTUnwrap(mcpServers.first)
+        XCTAssertEqual(mcpServers.count, 1)
+        XCTAssertEqual(server["type"] as? String, "stdio")
+        XCTAssertEqual(server["name"] as? String, "RepoPromptFixture")
+        XCTAssertEqual(server["command"] as? String, "/bin/echo")
+        XCTAssertEqual(server["args"] as? [String], ["--window", "4"])
+        let env = try XCTUnwrap(server["env"] as? [[String: String]])
+        XCTAssertEqual(env, [["name": "RPCE_TEST", "value": "1"]])
+    }
+
+    func testSessionLoadInjectsACPStdioMCPServerShape() async throws {
+        let fixtureServer = RepoPromptMCPServerConfiguration(
+            name: "RepoPromptFixture",
+            command: "/bin/echo",
+            args: ["--window", "4"],
+            env: [.init(name: "RPCE_TEST", value: "1")]
+        )
+        let fixture = try makeFixture(shape: "modern", resumeSessionID: "loaded-session", mcpServers: [fixtureServer])
+        try await withBootstrappedController(fixture.controller) { _ in }
+
+        let sessionLoad = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/load").first)
+        let mcpServers = try XCTUnwrap(sessionLoad.params["mcpServers"] as? [[String: Any]])
+        let server = try XCTUnwrap(mcpServers.first)
+        XCTAssertEqual(mcpServers.count, 1)
+        XCTAssertEqual(server["type"] as? String, "stdio")
+        XCTAssertEqual(server["name"] as? String, "RepoPromptFixture")
+        XCTAssertEqual(server["command"] as? String, "/bin/echo")
+        XCTAssertEqual(server["args"] as? [String], ["--window", "4"])
+        let env = try XCTUnwrap(server["env"] as? [[String: String]])
+        XCTAssertEqual(env, [["name": "RPCE_TEST", "value": "1"]])
+    }
+
     func testDualAdvertisementPrefersModernSnapshot() async throws {
         let fixture = try makeFixture(shape: "dual")
         try await withBootstrappedController(fixture.controller) { controller in

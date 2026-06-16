@@ -1,5 +1,55 @@
 import Foundation
 
+struct CodexTurnStartReceipt: Equatable {
+    let provisionalSubmissionID: String
+}
+
+struct CodexTurnSteerReceipt: Equatable {
+    let acceptedTurnID: String
+}
+
+struct CodexTurnInterruptReceipt: Equatable {
+    let interruptedTurnID: String
+}
+
+enum CodexTurnSteerError: Error, LocalizedError, Equatable {
+    case noActiveTurn(CodexAppServerClient.RequestFailure)
+    case expectedTurnMismatch(
+        expectedTurnID: String,
+        actualTurnID: String?,
+        failure: CodexAppServerClient.RequestFailure
+    )
+    case activeTurnNotSteerable(
+        turnKind: String?,
+        failure: CodexAppServerClient.RequestFailure
+    )
+
+    var errorDescription: String? {
+        switch self {
+        case let .noActiveTurn(failure):
+            failure.message
+        case let .expectedTurnMismatch(_, _, failure):
+            failure.message
+        case let .activeTurnNotSteerable(_, failure):
+            failure.message
+        }
+    }
+}
+
+enum CodexTurnInterruptError: Error, LocalizedError, Equatable {
+    case reconciliationFailed(expectedTurnID: String, authoritativeTurnID: String?)
+    case noUniqueActiveTurn(authoritativeTurnID: String?, observedTurnIDs: [String])
+
+    var errorDescription: String? {
+        switch self {
+        case let .reconciliationFailed(expectedTurnID, authoritativeTurnID):
+            "Codex interrupt identity reconciliation failed: expected \(expectedTurnID), authoritative \(authoritativeTurnID ?? "nil")."
+        case let .noUniqueActiveTurn(authoritativeTurnID, observedTurnIDs):
+            "Codex interrupt identity reconciliation failed: authoritative \(authoritativeTurnID ?? "nil"), observed active turns \(observedTurnIDs)."
+        }
+    }
+}
+
 protocol CodexSessionControlling: AnyObject {
     var hasActiveThread: Bool { get }
     var events: AsyncStream<CodexNativeSessionController.Event> { get }
@@ -27,21 +77,24 @@ protocol CodexSessionControlling: AnyObject {
         timeout: TimeInterval?
     ) async throws -> CodexNativeSessionController.ThreadSnapshot
     func setThreadName(_ name: String, threadID: String?) async throws
-    func sendUserMessage(_ text: String) async throws
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws
-    func sendUserTurn(
-        text: String,
-        images: [AgentImageAttachment],
-        model: String?,
-        reasoningEffort: String?
-    ) async throws
-    func sendUserTurn(
+    func startUserTurn(
         text: String,
         images: [AgentImageAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
-    ) async throws
+    ) async throws -> CodexTurnStartReceipt
+    func steerUserTurn(
+        text: String,
+        images: [AgentImageAttachment],
+        expectedTurnID: String
+    ) async throws -> CodexTurnSteerReceipt
+    func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
+        expectedCurrentTurnID: String,
+        acceptedDispatchTurnID: String
+    ) async -> Bool
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt
+    func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt
     func compactThread() async throws
     func getThreadGoal() async throws -> CodexNativeSessionController.ThreadGoal?
     func setThreadGoalObjective(_ objective: String) async throws -> CodexNativeSessionController.ThreadGoal
@@ -333,6 +386,7 @@ final class CodexNativeSessionController {
             sandboxModeProvider: @escaping () -> CodexAgentToolPreferences.SandboxMode = { CodexAgentToolPreferences.sandboxMode() },
             approvalReviewerProvider: @escaping () -> CodexAgentToolPreferences.ApprovalReviewer = { CodexAgentToolPreferences.approvalReviewer() },
             shellToolEnabled: Bool? = nil,
+            suppressThirdPartyMCPServers: Bool = false,
             goalSupportEnabledProvider: @escaping @MainActor () -> Bool = { CodexGoalSupport.isEnabled },
             computerUseEnabledProvider: @escaping @MainActor () -> Bool = { false }
         ) -> Options {
@@ -351,6 +405,7 @@ final class CodexNativeSessionController {
                         sandboxMode: sandboxModeProvider(),
                         approvalReviewer: approvalReviewerProvider(),
                         shellToolEnabled: shellToolEnabled,
+                        suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
                         goalSupportEnabled: featurePolicy.goalSupportEnabled,
                         computerUseEnabled: featurePolicy.computerUseEnabled
                     )
@@ -388,6 +443,21 @@ final class CodexNativeSessionController {
         case serverRequests
     }
 
+    private struct LifecycleAuthorityReconciliationLineage: Equatable {
+        let expectedCurrentTurnID: String
+        let acceptedDispatchTurnID: String
+    }
+
+    private enum LifecycleAuthorityObservationKind: Equatable {
+        case started
+        case completed
+    }
+
+    private struct LifecycleAuthorityObservation: Equatable {
+        let lineage: LifecycleAuthorityReconciliationLineage
+        let kind: LifecycleAuthorityObservationKind
+    }
+
     private let client: CodexAppServerClient
     private let runID: UUID
     private let tabID: UUID
@@ -396,6 +466,7 @@ final class CodexNativeSessionController {
     private let options: Options
     private let clientShutdownBehavior: ClientShutdownBehavior
     private let expectedMCPClientName: String?
+    private let requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])?
     private let rawEventFileLoggingEnabled: Bool
     private var rawEventLogFileURL: URL?
     private var rawEventLogFileThreadID: String?
@@ -403,10 +474,13 @@ final class CodexNativeSessionController {
 
     private var threadID: String?
     private var threadPath: String?
-    private var currentTurnID: String?
+    private var routingCurrentTurnID: String?
+    private var authoritativeLifecycleTurnID: String?
     private var activeTurnIDs: Set<String> = []
     private var activeTurnOrder: [String] = []
     private var activeTurnIDsWithObservedActivity: Set<String> = []
+    private var pendingLifecycleAuthorityReconciliation: LifecycleAuthorityReconciliationLineage?
+    private var lifecycleAuthorityObservations: [LifecycleAuthorityObservation] = []
     private var assistantDeltaSeenTurnIDs: Set<String> = []
     private var fileChangeStateByItemID: [String: FileChangeStreamState] = [:]
     /// Item IDs whose fileChange lifecycle has reached terminal (completed) state.
@@ -506,7 +580,7 @@ final class CodexNativeSessionController {
     ) async throws -> [String: Any] {
         let attemptedStyle = appServerRequestValueStyle
         do {
-            return try await client.request(
+            return try await performRequest(
                 method: method,
                 params: paramsBuilder(attemptedStyle),
                 timeout: timeout
@@ -519,7 +593,7 @@ final class CodexNativeSessionController {
             Self.logCodexDebug(
                 "[CodexNativeController] retrying \(method) with alternate request value style=\(String(describing: fallbackStyle)) after error=\(error.localizedDescription)"
             )
-            let result = try await client.request(
+            let result = try await performRequest(
                 method: method,
                 params: paramsBuilder(fallbackStyle),
                 timeout: timeout
@@ -527,6 +601,17 @@ final class CodexNativeSessionController {
             appServerRequestValueStyle = fallbackStyle
             return result
         }
+    }
+
+    private func performRequest(
+        method: String,
+        params: [String: Any]?,
+        timeout: TimeInterval?
+    ) async throws -> [String: Any] {
+        if let requestExecutor {
+            return try await requestExecutor(method, params, timeout)
+        }
+        return try await client.request(method: method, params: params, timeout: timeout)
     }
 
     init(
@@ -538,7 +623,8 @@ final class CodexNativeSessionController {
         forceExperimentalSteering: Bool = false,
         options: Options? = nil,
         clientShutdownBehavior: ClientShutdownBehavior = .none,
-        expectedMCPClientName: String? = nil
+        expectedMCPClientName: String? = nil,
+        requestExecutor: (@Sendable (String, [String: Any]?, TimeInterval?) async throws -> [String: Any])? = nil
     ) {
         self.client = client
         self.runID = runID
@@ -548,6 +634,7 @@ final class CodexNativeSessionController {
         self.options = options ?? Self.Options.agentModeDefault(forceExperimentalSteering: forceExperimentalSteering)
         self.clientShutdownBehavior = clientShutdownBehavior
         self.expectedMCPClientName = expectedMCPClientName
+        self.requestExecutor = requestExecutor
         rawEventFileLoggingEnabled = Self.isRawEventFileLoggingEnabled()
         rawEventLogFileURL = nil
         rawEventLogFileThreadID = nil
@@ -796,7 +883,7 @@ final class CodexNativeSessionController {
             "runID": runID.uuidString,
             "tabID": tabID.uuidString,
             "threadID": threadID ?? "",
-            "turnID": currentTurnID ?? ""
+            "turnID": routingCurrentTurnID ?? ""
         ]
         if let method {
             record["method"] = method
@@ -985,7 +1072,7 @@ final class CodexNativeSessionController {
         else {
             throw CodexAppServerClient.ClientError.invalidResponse
         }
-        let result = try await client.request(
+        let result = try await performRequest(
             method: "thread/read",
             params: [
                 "threadId": threadID,
@@ -1091,70 +1178,15 @@ final class CodexNativeSessionController {
         return resolvedThreadID
     }
 
-    func sendUserMessage(_ text: String) async throws {
-        try await sendUserTurn(text: text, images: [], model: nil, reasoningEffort: nil, serviceTier: nil)
-    }
-
-    func sendUserTurn(text: String, images: [AgentImageAttachment]) async throws {
-        try await sendUserTurn(text: text, images: images, model: nil, reasoningEffort: nil, serviceTier: nil)
-    }
-
-    func sendUserTurn(
-        text: String,
-        images: [AgentImageAttachment],
-        model: String?,
-        reasoningEffort: String?
-    ) async throws {
-        try await sendUserTurn(
-            text: text,
-            images: images,
-            model: model,
-            reasoningEffort: reasoningEffort,
-            serviceTier: nil
-        )
-    }
-
-    func sendUserTurn(
+    func startUserTurn(
         text: String,
         images: [AgentImageAttachment],
         model: String?,
         reasoningEffort: String?,
         serviceTier: String?
-    ) async throws {
+    ) async throws -> CodexTurnStartReceipt {
         guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
-        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        var input: [[String: Any]] = []
-
-        for image in images {
-            switch image.source {
-            case let .localFile(path):
-                let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmedPath.isEmpty else { continue }
-                input.append([
-                    "type": "localImage",
-                    "path": trimmedPath
-                ])
-            case let .url(rawURL):
-                let trimmedURL = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmedURL.isEmpty else { continue }
-                input.append([
-                    "type": "image",
-                    "url": trimmedURL
-                ])
-            }
-        }
-
-        if !trimmedText.isEmpty {
-            input.append([
-                "type": "text",
-                "text": trimmedText,
-                "textElements": []
-            ])
-        }
-
-        guard !input.isEmpty else {
-            throw CodexAppServerClient.ClientError.invalidResponse
-        }
+        let input = try Self.turnInput(text: text, images: images)
 
         var params: [String: Any] = [
             "threadId": threadID,
@@ -1190,11 +1222,137 @@ final class CodexNativeSessionController {
             // Thread-level config changes take effect on thread/start or thread/resume.
             return requestParams
         }
-        if let turn = result["turn"] as? [String: Any],
-           let turnID = turn["id"] as? String
-        {
-            registerActiveTurn(turnID)
+        guard let turn = result["turn"] as? [String: Any],
+              let submissionID = Self.nonEmptyString(turn["id"] as? String)
+        else {
+            throw CodexAppServerClient.ClientError.invalidResponse
         }
+        return CodexTurnStartReceipt(provisionalSubmissionID: submissionID)
+    }
+
+    func steerUserTurn(
+        text: String,
+        images: [AgentImageAttachment],
+        expectedTurnID: String
+    ) async throws -> CodexTurnSteerReceipt {
+        guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+        guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        let input = try Self.turnInput(text: text, images: images)
+        do {
+            let result = try await performRequest(
+                method: "turn/steer",
+                params: [
+                    "threadId": threadID,
+                    "input": input,
+                    "expectedTurnId": expectedTurnID
+                ],
+                timeout: options.requestTimeout
+            )
+            guard let acceptedTurnID = Self.nonEmptyString(
+                (result["turnId"] as? String)
+                    ?? ((result["turn"] as? [String: Any])?["id"] as? String)
+            ) else {
+                throw CodexAppServerClient.ClientError.invalidResponse
+            }
+            // An accepted steer with a different turn ID still delivered the input;
+            // callers reconcile identity from the receipt instead of retrying.
+            return CodexTurnSteerReceipt(acceptedTurnID: acceptedTurnID)
+        } catch let error as CodexAppServerClient.ClientError {
+            throw Self.mapSteerRequestError(error, expectedTurnID: expectedTurnID)
+        }
+    }
+
+    func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
+        expectedCurrentTurnID: String,
+        acceptedDispatchTurnID: String
+    ) async -> Bool {
+        guard let expectedCurrentTurnID = Self.nonEmptyString(expectedCurrentTurnID),
+              let acceptedDispatchTurnID = Self.nonEmptyString(acceptedDispatchTurnID),
+              expectedCurrentTurnID != acceptedDispatchTurnID
+        else {
+            return false
+        }
+        do {
+            return try await eventHandlingMutex.withLock {
+                if authoritativeLifecycleTurnID == acceptedDispatchTurnID {
+                    return true
+                }
+                guard authoritativeLifecycleTurnID == expectedCurrentTurnID else {
+                    return false
+                }
+                let lineage = LifecycleAuthorityReconciliationLineage(
+                    expectedCurrentTurnID: expectedCurrentTurnID,
+                    acceptedDispatchTurnID: acceptedDispatchTurnID
+                )
+                pendingLifecycleAuthorityReconciliation = lineage
+                if let observation = lifecycleAuthorityObservations.last(where: {
+                    $0.lineage == lineage
+                }) {
+                    applyLifecycleAuthorityReconciliation(observation)
+                }
+                return true
+            }
+        } catch {
+            return false
+        }
+    }
+
+    func interruptUserTurn(expectedTurnID: String) async throws -> CodexTurnInterruptReceipt {
+        guard let threadID else { throw CodexAppServerClient.ClientError.invalidResponse }
+        guard let expectedTurnID = Self.nonEmptyString(expectedTurnID) else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        guard authoritativeLifecycleTurnID == expectedTurnID else {
+            throw CodexTurnInterruptError.reconciliationFailed(
+                expectedTurnID: expectedTurnID,
+                authoritativeTurnID: authoritativeLifecycleTurnID
+            )
+        }
+        do {
+            _ = try await performRequest(
+                method: "turn/interrupt",
+                params: [
+                    "threadId": threadID,
+                    "turnId": expectedTurnID
+                ],
+                timeout: options.requestTimeout
+            )
+            return CodexTurnInterruptReceipt(interruptedTurnID: expectedTurnID)
+        } catch let error as CodexAppServerClient.ClientError {
+            throw Self.mapSteerRequestError(error, expectedTurnID: expectedTurnID)
+        }
+    }
+
+    func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+        if let authoritativeLifecycleTurnID {
+            return try await interruptUserTurn(expectedTurnID: authoritativeLifecycleTurnID)
+        }
+        let snapshot = try await readThreadSnapshot(
+            includeTurns: true,
+            timeout: min(options.requestTimeout ?? 5, 5)
+        )
+        let observedTurnIDs = Array(
+            Set(snapshot.activeTurnIDs + [snapshot.currentTurnID].compactMap(\.self))
+        ).sorted()
+        guard observedTurnIDs.count == 1,
+              let reconciledTurnID = observedTurnIDs.first
+        else {
+            throw CodexTurnInterruptError.noUniqueActiveTurn(
+                authoritativeTurnID: authoritativeLifecycleTurnID,
+                observedTurnIDs: observedTurnIDs
+            )
+        }
+        _ = try await performRequest(
+            method: "turn/interrupt",
+            params: [
+                "threadId": snapshot.conversationID,
+                "turnId": reconciledTurnID
+            ],
+            timeout: options.requestTimeout
+        )
+        return CodexTurnInterruptReceipt(interruptedTurnID: reconciledTurnID)
     }
 
     func compactThread() async throws {
@@ -1209,37 +1367,11 @@ final class CodexNativeSessionController {
     }
 
     func cancelCurrentTurn() async {
-        guard threadID != nil else { return }
-        let cachedTurnID = currentTurnID
-        let refreshResult = await refreshActiveTurnForInterruptIfPossible()
-        guard let threadID,
-              let turnID = Self.resolvedInterruptTurnID(cachedTurnID: cachedTurnID, refreshResult: refreshResult) else { return }
         do {
-            try await interruptTurn(threadID: threadID, turnID: turnID)
+            _ = try await reconcileAndInterruptCurrentTurn()
         } catch {
-            guard let actualTurnID = Self.activeTurnMismatchActualTurnID(from: error), actualTurnID != turnID else {
-                await emit(.error("Codex native interrupt failed: \(error.localizedDescription)"))
-                return
-            }
-            unregisterActiveTurn(turnID)
-            registerActiveTurn(actualTurnID)
-            do {
-                try await interruptTurn(threadID: threadID, turnID: actualTurnID)
-            } catch {
-                if let retryActualTurnID = Self.activeTurnMismatchActualTurnID(from: error) {
-                    unregisterActiveTurn(actualTurnID)
-                    registerActiveTurn(retryActualTurnID)
-                }
-                await emit(.error("Codex native interrupt failed: \(error.localizedDescription)"))
-            }
+            await emit(.error("Codex native interrupt failed: \(error.localizedDescription)"))
         }
-    }
-
-    private func interruptTurn(threadID: String, turnID: String) async throws {
-        _ = try await client.request(method: "turn/interrupt", params: [
-            "threadId": threadID,
-            "turnId": turnID
-        ])
     }
 
     enum InterruptActiveTurnRefreshResult: Equatable {
@@ -1281,7 +1413,7 @@ final class CodexNativeSessionController {
     private func reconcileActiveTurnRoutingState(from snapshot: ThreadSnapshot) {
         threadID = snapshot.conversationID
         threadPath = snapshot.rolloutPath
-        currentTurnID = snapshot.currentTurnID
+        routingCurrentTurnID = snapshot.currentTurnID
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
         activeTurnIDsWithObservedActivity = Set(snapshot.activeTurnIDs)
@@ -1299,9 +1431,150 @@ final class CodexNativeSessionController {
         return actual.isEmpty ? nil : actual
     }
 
-    private static func activeTurnMismatchActualTurnID(from error: Error) -> String? {
-        activeTurnMismatchActualTurnID(fromErrorDescription: error.localizedDescription)
-            ?? activeTurnMismatchActualTurnID(fromErrorDescription: String(describing: error))
+    private static func turnInput(
+        text: String,
+        images: [AgentImageAttachment]
+    ) throws -> [[String: Any]] {
+        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        var input: [[String: Any]] = []
+        for image in images {
+            switch image.source {
+            case let .localFile(path):
+                guard let path = nonEmptyString(path) else { continue }
+                input.append([
+                    "type": "localImage",
+                    "path": path
+                ])
+            case let .url(rawURL):
+                guard let rawURL = nonEmptyString(rawURL) else { continue }
+                input.append([
+                    "type": "image",
+                    "url": rawURL
+                ])
+            }
+        }
+        if !trimmedText.isEmpty {
+            input.append([
+                "type": "text",
+                "text": trimmedText,
+                "textElements": []
+            ])
+        }
+        guard !input.isEmpty else {
+            throw CodexAppServerClient.ClientError.invalidResponse
+        }
+        return input
+    }
+
+    private static func nonEmptyString(_ value: String?) -> String? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty
+        else { return nil }
+        return trimmed
+    }
+
+    private static func mapSteerRequestError(
+        _ error: CodexAppServerClient.ClientError,
+        expectedTurnID: String
+    ) -> Error {
+        guard case let .requestFailed(failure) = error else { return error }
+        if let turnKind = structuredNonSteerableTurnKind(from: failure.data) {
+            return CodexTurnSteerError.activeTurnNotSteerable(
+                turnKind: turnKind,
+                failure: failure
+            )
+        }
+        if structuredNoActiveTurn(from: failure.data) {
+            return CodexTurnSteerError.noActiveTurn(failure)
+        }
+        if let actualTurnID = structuredActualTurnID(from: failure.data) {
+            return CodexTurnSteerError.expectedTurnMismatch(
+                expectedTurnID: expectedTurnID,
+                actualTurnID: actualTurnID,
+                failure: failure
+            )
+        }
+
+        let normalizedMessage = failure.message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        if normalizedMessage == "no active turn to steer" {
+            return CodexTurnSteerError.noActiveTurn(failure)
+        }
+        if normalizedMessage == "cannot steer a review turn" {
+            return CodexTurnSteerError.activeTurnNotSteerable(
+                turnKind: "review",
+                failure: failure
+            )
+        }
+        if normalizedMessage == "cannot steer a compact turn" {
+            return CodexTurnSteerError.activeTurnNotSteerable(
+                turnKind: "compact",
+                failure: failure
+            )
+        }
+        if let actualTurnID = activeTurnMismatchActualTurnID(fromErrorDescription: failure.message) {
+            return CodexTurnSteerError.expectedTurnMismatch(
+                expectedTurnID: expectedTurnID,
+                actualTurnID: actualTurnID,
+                failure: failure
+            )
+        }
+        return error
+    }
+
+    private static func structuredNonSteerableTurnKind(from data: CodexJSONValue?) -> String? {
+        guard case let .object(root) = data else { return nil }
+        if case let .string(kind) = root["turnKind"] {
+            return nonEmptyString(kind)
+        }
+        if case let .object(info) = root["codexErrorInfo"],
+           case let .object(nonSteerable) = info["activeTurnNotSteerable"],
+           case let .string(kind) = nonSteerable["turnKind"]
+        {
+            return nonEmptyString(kind)
+        }
+        if case let .object(nonSteerable) = root["activeTurnNotSteerable"],
+           case let .string(kind) = nonSteerable["turnKind"]
+        {
+            return nonEmptyString(kind)
+        }
+        return nil
+    }
+
+    private static func structuredNoActiveTurn(from data: CodexJSONValue?) -> Bool {
+        guard case let .object(root) = data else { return false }
+        if root["noActiveTurn"] != nil {
+            return true
+        }
+        if case let .string(type) = root["type"] {
+            return type == "noActiveTurn"
+        }
+        if case let .string(code) = root["code"] {
+            return code == "noActiveTurn"
+        }
+        return false
+    }
+
+    private static func structuredActualTurnID(from data: CodexJSONValue?) -> String? {
+        guard case let .object(root) = data else { return nil }
+        for key in ["actualTurnId", "actualTurnID", "activeTurnId", "activeTurnID"] {
+            if case let .string(value) = root[key],
+               let value = nonEmptyString(value)
+            {
+                return value
+            }
+        }
+        if case let .object(mismatch) = root["expectedTurnMismatch"] {
+            for key in ["actualTurnId", "actualTurnID", "activeTurnId", "activeTurnID"] {
+                if case let .string(value) = mismatch[key],
+                   let value = nonEmptyString(value)
+                {
+                    return value
+                }
+            }
+        }
+        return nil
     }
 
     func shutdown() async {
@@ -1329,7 +1602,7 @@ final class CodexNativeSessionController {
     private func restoreThreadSnapshot(_ snapshot: ThreadSnapshot) {
         threadID = snapshot.conversationID
         threadPath = snapshot.rolloutPath
-        currentTurnID = snapshot.currentTurnID
+        routingCurrentTurnID = snapshot.currentTurnID
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
         activeTurnIDsWithObservedActivity = Set(snapshot.activeTurnIDs)
@@ -1691,12 +1964,12 @@ final class CodexNativeSessionController {
         activeTurnOrder.removeAll(where: { $0 == trimmed })
         activeTurnOrder.append(trimmed)
         if makeCurrent {
-            currentTurnID = trimmed
+            routingCurrentTurnID = trimmed
         }
     }
 
     /// Lightweight pre-registration: ensures the turn ID is known to the routing filter
-    /// without mutating `activeTurnOrder` or `currentTurnID`. This prevents cascade drops
+    /// without mutating `activeTurnOrder` or `routingCurrentTurnID`. This prevents cascade drops
     /// when a lifecycle event (`turn/started`) was missed upstream.
     ///
     /// Related:
@@ -1705,7 +1978,7 @@ final class CodexNativeSessionController {
     private func observeTurnIDForRouting(_ turnID: String) {
         let trimmed = turnID.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        // Only insert into activeTurnIDs — don't touch activeTurnOrder or currentTurnID
+        // Only insert into activeTurnIDs — don't touch activeTurnOrder or routingCurrentTurnID
         // to minimize side effects from pre-registration.
         activeTurnIDs.insert(trimmed)
     }
@@ -1717,14 +1990,65 @@ final class CodexNativeSessionController {
         activeTurnOrder.removeAll(where: { $0 == trimmed })
         activeTurnIDsWithObservedActivity.remove(trimmed)
         assistantDeltaSeenTurnIDs.remove(trimmed)
-        if currentTurnID == trimmed {
-            currentTurnID = activeTurnOrder.last(where: { activeTurnIDsWithObservedActivity.contains($0) })
+        if routingCurrentTurnID == trimmed {
+            routingCurrentTurnID = activeTurnOrder.last(where: { activeTurnIDsWithObservedActivity.contains($0) })
         }
     }
 
     private func markTurnActivity(_ turnID: String, makeCurrent: Bool) {
         registerActiveTurn(turnID, makeCurrent: makeCurrent)
         activeTurnIDsWithObservedActivity.insert(turnID)
+    }
+
+    private func recordLifecycleAuthorityObservation(
+        turnID: String,
+        kind: LifecycleAuthorityObservationKind
+    ) {
+        guard let authoritativeLifecycleTurnID,
+              authoritativeLifecycleTurnID != turnID
+        else {
+            return
+        }
+        let lineage = LifecycleAuthorityReconciliationLineage(
+            expectedCurrentTurnID: authoritativeLifecycleTurnID,
+            acceptedDispatchTurnID: turnID
+        )
+        let observation = LifecycleAuthorityObservation(lineage: lineage, kind: kind)
+        lifecycleAuthorityObservations.removeAll(where: { $0 == observation })
+        lifecycleAuthorityObservations.append(observation)
+        if lifecycleAuthorityObservations.count > 8 {
+            lifecycleAuthorityObservations.removeFirst(lifecycleAuthorityObservations.count - 8)
+        }
+        if pendingLifecycleAuthorityReconciliation == lineage {
+            applyLifecycleAuthorityReconciliation(observation)
+        }
+    }
+
+    private func applyLifecycleAuthorityReconciliation(
+        _ observation: LifecycleAuthorityObservation
+    ) {
+        let lineage = observation.lineage
+        guard pendingLifecycleAuthorityReconciliation == lineage,
+              authoritativeLifecycleTurnID == lineage.expectedCurrentTurnID
+        else {
+            return
+        }
+        switch observation.kind {
+        case .started:
+            let expectedWasRoutingCurrent = routingCurrentTurnID == lineage.expectedCurrentTurnID
+            unregisterActiveTurn(lineage.expectedCurrentTurnID)
+            registerActiveTurn(
+                lineage.acceptedDispatchTurnID,
+                makeCurrent: expectedWasRoutingCurrent
+            )
+            authoritativeLifecycleTurnID = lineage.acceptedDispatchTurnID
+        case .completed:
+            unregisterActiveTurn(lineage.expectedCurrentTurnID)
+            unregisterActiveTurn(lineage.acceptedDispatchTurnID)
+            authoritativeLifecycleTurnID = nil
+        }
+        pendingLifecycleAuthorityReconciliation = nil
+        lifecycleAuthorityObservations.removeAll(where: { $0.lineage == lineage })
     }
 
     private func handleNotification(_ notification: CodexAppServerClient.Notification) async {
@@ -1754,7 +2078,7 @@ final class CodexNativeSessionController {
             method: notification.method,
             params: params,
             activeThreadID: threadID,
-            currentTurnID: currentTurnID,
+            currentTurnID: routingCurrentTurnID,
             activeTurnIDs: activeTurnIDs
         ) {
             #if DEBUG
@@ -1767,7 +2091,7 @@ final class CodexNativeSessionController {
            Self.shouldPromoteCurrentTurn(
                method: notification.method,
                notifiedTurnID: notifiedTurnID,
-               currentTurnID: currentTurnID
+               currentTurnID: routingCurrentTurnID
            )
         {
             markTurnActivity(notifiedTurnID, makeCurrent: true)
@@ -1780,11 +2104,21 @@ final class CodexNativeSessionController {
                 turnID = (turn["id"] as? String) ?? (turn["turn_id"] as? String)
                 if let turnID {
                     registerActiveTurn(turnID, makeCurrent: false)
+                    if authoritativeLifecycleTurnID == nil || authoritativeLifecycleTurnID == turnID {
+                        authoritativeLifecycleTurnID = turnID
+                    } else {
+                        recordLifecycleAuthorityObservation(turnID: turnID, kind: .started)
+                    }
                 }
             } else {
                 turnID = notifiedTurnID
                 if let notifiedTurnID {
                     registerActiveTurn(notifiedTurnID, makeCurrent: false)
+                    if authoritativeLifecycleTurnID == nil || authoritativeLifecycleTurnID == notifiedTurnID {
+                        authoritativeLifecycleTurnID = notifiedTurnID
+                    } else {
+                        recordLifecycleAuthorityObservation(turnID: notifiedTurnID, kind: .started)
+                    }
                 }
             }
             await emit(.turnStarted(turnID: turnID))
@@ -1797,18 +2131,32 @@ final class CodexNativeSessionController {
                     ?? notifiedTurnID
             let turnID = parsedTurnID?.trimmingCharacters(in: .whitespacesAndNewlines)
             let wasActive = turnID.map { activeTurnIDs.contains($0) } ?? false
-            let trackingWasUncertain = activeTurnIDs.isEmpty || currentTurnID == nil
-            let matchesCurrentTurn = turnID != nil && turnID == currentTurnID
+            let trackingWasUncertain = activeTurnIDs.isEmpty || routingCurrentTurnID == nil
+            let matchesCurrentTurn = turnID != nil && turnID == routingCurrentTurnID
+            let nilCompletionHasSingleActiveTurn = turnID == nil
+                && activeTurnIDs.count <= 1
+                && authoritativeLifecycleTurnID != nil
             if let turnID {
+                recordLifecycleAuthorityObservation(turnID: turnID, kind: .completed)
                 unregisterActiveTurn(turnID)
-            } else if let currentTurnID {
-                unregisterActiveTurn(currentTurnID)
+                if authoritativeLifecycleTurnID == turnID {
+                    authoritativeLifecycleTurnID = nil
+                }
+            } else if nilCompletionHasSingleActiveTurn,
+                      let authoritativeLifecycleTurnID
+            {
+                unregisterActiveTurn(authoritativeLifecycleTurnID)
+                self.authoritativeLifecycleTurnID = nil
+            } else if authoritativeLifecycleTurnID == nil,
+                      let routingCurrentTurnID
+            {
+                unregisterActiveTurn(routingCurrentTurnID)
             }
-            if wasActive || matchesCurrentTurn || trackingWasUncertain || turnID == nil {
+            if wasActive || matchesCurrentTurn || trackingWasUncertain || nilCompletionHasSingleActiveTurn {
                 await emit(.turnCompleted(turnID: turnID, status: mapTurnStatus(statusRaw ?? "completed")))
             } else {
                 Self.logCodexDebug(
-                    "[CodexNativeController] ignoring turnCompleted for non-active turnID=\(turnID ?? "nil") currentTurnID=\(currentTurnID ?? "nil") activeTurnIDs=\(Array(activeTurnIDs).joined(separator: ","))"
+                    "[CodexNativeController] ignoring turnCompleted for non-active turnID=\(turnID ?? "nil") currentTurnID=\(routingCurrentTurnID ?? "nil") activeTurnIDs=\(Array(activeTurnIDs).joined(separator: ","))"
                 )
             }
         case "codex/event/task_complete":
@@ -2504,6 +2852,37 @@ final class CodexNativeSessionController {
     }
 
     #if DEBUG
+        func test_installThreadState(
+            threadID: String,
+            authoritativeTurnID: String? = nil,
+            routingTurnID: String? = nil
+        ) {
+            self.threadID = threadID
+            authoritativeLifecycleTurnID = authoritativeTurnID
+            routingCurrentTurnID = routingTurnID
+            activeTurnIDs = Set([authoritativeTurnID, routingTurnID].compactMap(\.self))
+            activeTurnOrder = [authoritativeTurnID, routingTurnID].compactMap(\.self)
+            pendingLifecycleAuthorityReconciliation = nil
+            lifecycleAuthorityObservations.removeAll()
+        }
+
+        func test_handleNotification(
+            method: String,
+            params: [String: CodexJSONValue]
+        ) async {
+            try? await eventHandlingMutex.withLock {
+                await handleNotification(.init(method: method, params: params))
+            }
+        }
+
+        var test_authoritativeLifecycleTurnID: String? {
+            authoritativeLifecycleTurnID
+        }
+
+        var test_routingCurrentTurnID: String? {
+            routingCurrentTurnID
+        }
+
         static func test_shouldDropNotificationForRouting(
             method: String,
             params: [String: Any],
@@ -2715,7 +3094,7 @@ final class CodexNativeSessionController {
                 method: method,
                 params: params,
                 activeThreadID: threadID,
-                currentTurnID: currentTurnID
+                currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
                     requestID: request.id,
@@ -2750,7 +3129,7 @@ final class CodexNativeSessionController {
                 method: method,
                 params: params,
                 activeThreadID: threadID,
-                currentTurnID: currentTurnID
+                currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
                     requestID: request.id,
@@ -2772,7 +3151,7 @@ final class CodexNativeSessionController {
                 method: method,
                 params: params,
                 activeThreadID: threadID,
-                currentTurnID: currentTurnID
+                currentTurnID: routingCurrentTurnID
             ) else {
                 await emitServerRequestIssue(
                     requestID: request.id,
@@ -2831,7 +3210,7 @@ final class CodexNativeSessionController {
             method: method,
             params: params,
             activeThreadID: threadID,
-            currentTurnID: currentTurnID
+            currentTurnID: routingCurrentTurnID
         )
     }
 
@@ -6945,6 +7324,7 @@ final class CodexNativeSessionController {
         sandboxMode: CodexAgentToolPreferences.SandboxMode? = nil,
         approvalReviewer: CodexAgentToolPreferences.ApprovalReviewer? = nil,
         shellToolEnabled: Bool? = nil,
+        suppressThirdPartyMCPServers: Bool = false,
         goalSupportEnabled: Bool = false,
         computerUseEnabled: Bool = false
     ) -> [String: Any] {
@@ -6965,19 +7345,11 @@ final class CodexNativeSessionController {
             toolPolicy: toolPolicy,
             featurePolicy: .resolved(goalsEnabled: goalSupportEnabled, computerUseEnabled: computerUseEnabled)
         )
-        var enabledMCPServerNames = preferences.enabledMCPServerNames
-        if computerUseEnabled,
-           serverEntries.contains(where: { $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame })
-        {
-            enabledMCPServerNames.insert(Self.computerUseMCPServerName)
-        }
-        let mcpOverrides = CodexOverrides.appServerMCPServerMap(
-            entries: serverEntries,
-            policy: .enableSelected(
-                enabledNormalizedNames: enabledMCPServerNames,
-                repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
-                exceptBroken: []
-            )
+        let mcpOverrides = appServerMCPServerOverrides(
+            serverEntries: serverEntries,
+            enabledMCPServerNames: preferences.enabledMCPServerNames,
+            suppressThirdPartyMCPServers: suppressThirdPartyMCPServers,
+            computerUseEnabled: computerUseEnabled
         )
         for (key, value) in mcpOverrides {
             overrides[key] = value
@@ -6989,6 +7361,32 @@ final class CodexNativeSessionController {
         overrides["sandbox_mode"] = effectiveSandboxMode.appServerConfigOverrideValue
         overrides["approvals_reviewer"] = effectiveApprovalReviewer.appServerConfigOverrideValue
         return overrides
+    }
+
+    static func appServerMCPServerOverrides(
+        serverEntries: [MCPIntegrationHelper.CodexServerEntry],
+        enabledMCPServerNames: Set<String>,
+        suppressThirdPartyMCPServers: Bool,
+        computerUseEnabled: Bool
+    ) -> [String: Any] {
+        var effectiveEnabledNames = suppressThirdPartyMCPServers
+            ? Set([MCPIntegrationHelper.repoPromptMCPServerName])
+            : enabledMCPServerNames
+        if computerUseEnabled,
+           serverEntries.contains(where: {
+               $0.normalizedName.caseInsensitiveCompare(Self.computerUseMCPServerName) == .orderedSame
+           })
+        {
+            effectiveEnabledNames.insert(Self.computerUseMCPServerName)
+        }
+        return CodexOverrides.appServerMCPServerMap(
+            entries: serverEntries,
+            policy: .enableSelected(
+                enabledNormalizedNames: effectiveEnabledNames,
+                repoPromptNormalizedName: MCPIntegrationHelper.repoPromptMCPServerName,
+                exceptBroken: []
+            )
+        )
     }
 }
 
@@ -7112,6 +7510,13 @@ enum CodexSessionControllerError: LocalizedError {
 }
 
 extension CodexSessionControlling {
+    func prepareLifecycleAuthorityReconciliationAfterAcceptedMismatch(
+        expectedCurrentTurnID _: String,
+        acceptedDispatchTurnID _: String
+    ) async -> Bool {
+        true
+    }
+
     func readThreadSnapshot(
         includeTurns _: Bool,
         timeout _: TimeInterval?
@@ -7121,6 +7526,11 @@ extension CodexSessionControlling {
     }
 
     func setThreadName(_: String, threadID _: String?) async throws {}
+
+    func reconcileAndInterruptCurrentTurn() async throws -> CodexTurnInterruptReceipt {
+        await cancelCurrentTurn()
+        return CodexTurnInterruptReceipt(interruptedTurnID: "<legacy-cancel>")
+    }
 
     func startOrResume(
         existing: CodexNativeSessionController.SessionRef?,
@@ -7141,37 +7551,6 @@ extension CodexSessionControlling {
         try await startOrResume(
             existing: existing,
             baseInstructions: baseInstructions,
-            model: model,
-            reasoningEffort: reasoningEffort
-        )
-    }
-
-    func sendUserTurn(
-        text: String,
-        images: [AgentImageAttachment],
-        model: String?,
-        reasoningEffort: String?
-    ) async throws {
-        guard images.isEmpty else {
-            throw CodexSessionControllerError.imageAttachmentsUnsupported
-        }
-        let trimmedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else {
-            throw CodexSessionControllerError.emptyUserTurn
-        }
-        try await sendUserMessage(trimmedText)
-    }
-
-    func sendUserTurn(
-        text: String,
-        images: [AgentImageAttachment],
-        model: String?,
-        reasoningEffort: String?,
-        serviceTier _: String?
-    ) async throws {
-        try await sendUserTurn(
-            text: text,
-            images: images,
             model: model,
             reasoningEffort: reasoningEffort
         )

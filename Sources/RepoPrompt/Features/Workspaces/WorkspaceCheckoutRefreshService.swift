@@ -98,9 +98,9 @@ struct WorkspaceCheckoutRefreshService {
     private func narrowRootScope(for targetRoots: [WorkspaceRootRecord]) async -> WorkspaceLookupRootScope {
         let allRoots = await store.roots()
         let targetRootIDs = Set(targetRoots.map(\.id))
-        let excludedPrimaryRootPaths = Set(
+        let targetPrimaryRootPaths = Set(
             allRoots.compactMap { root -> String? in
-                guard root.kind == .primaryWorkspace, !targetRootIDs.contains(root.id) else { return nil }
+                guard root.kind == .primaryWorkspace, targetRootIDs.contains(root.id) else { return nil }
                 return root.standardizedFullPath
             }
         )
@@ -111,7 +111,7 @@ struct WorkspaceCheckoutRefreshService {
             }
         )
         return .sessionBoundWorkspace(
-            logicalRootPaths: excludedPrimaryRootPaths,
+            canonicalRootPaths: targetPrimaryRootPaths,
             physicalRootPaths: targetSessionWorktreePaths
         )
     }

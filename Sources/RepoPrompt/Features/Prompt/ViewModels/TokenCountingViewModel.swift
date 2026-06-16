@@ -86,6 +86,11 @@ class TokenCountingViewModel: ObservableObject {
     private var lastObservedSelectionObservationRevision: UInt64 = 0
     private var lastPredominantLanguage: String = "Swift"
     private var automaticRecountSuspendDepth: Int = 0
+    private var lastPublishedSelection: StoredSelection?
+    #if DEBUG
+        private var debugBeforeTokenCalculationForTesting: (@MainActor @Sendable () async -> Void)?
+        private var debugTokenCalculationStartCount = 0
+    #endif
 
     // MARK: - Dependencies
 
@@ -361,7 +366,51 @@ class TokenCountingViewModel: ObservableObject {
         }
     }
 
+    struct PublishedTokenSnapshot {
+        let breakdown: TokenBreakdown
+        let filesContentTokens: Int
+        let codeMapTokens: Int
+        let isComplete: Bool
+        let isStale: Bool
+        let refreshPending: Bool
+    }
+
+    func latestPublishedTokenSnapshot(for expectedSelection: StoredSelection?) -> PublishedTokenSnapshot {
+        let selectionMatches = expectedSelection == nil || expectedSelection == lastPublishedSelection
+        let calculationPending = tokenUpdateDebounceTask != nil || updateTokenCountTask != nil || isImmediateRecountInProgress
+        let isComplete = didComputeBaseline
+        let isStale = !pendingDirty.isEmpty || calculationPending || !selectionMatches
+        if !isComplete {
+            markDirty()
+        } else if !selectionMatches {
+            markDirty(.selection)
+        }
+        return PublishedTokenSnapshot(
+            breakdown: latestTokenBreakdown(),
+            filesContentTokens: totalTokenCountFilesOnly,
+            codeMapTokens: codeMapTokenCount,
+            isComplete: isComplete,
+            isStale: isStale,
+            refreshPending: !isComplete || isStale || tokenUpdateDebounceTask != nil || updateTokenCountTask != nil
+        )
+    }
+
+    func latestPublishedTokenInfo(forFullPath fullPath: String) -> TokenInfo? {
+        guard let fileID = fileManager?.findFileByFullPath(fullPath)?.id else { return nil }
+        return fileTokenInfo[fileID]
+    }
+
     #if DEBUG
+        func setBeforeTokenCalculationForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            debugBeforeTokenCalculationForTesting = handler
+        }
+
+        func tokenCalculationStartCountForTesting() -> Int {
+            debugTokenCalculationStartCount
+        }
+
         func debugTokenRecountStateFields() -> [String: String] {
             [
                 "pendingDirtyRaw": "\(pendingDirty.rawValue)",
@@ -482,6 +531,8 @@ class TokenCountingViewModel: ObservableObject {
     /// Heavy path (rebuild baseline and everything else).
     private func performTokenCountOffMainThread() async {
         #if DEBUG
+            debugTokenCalculationStartCount += 1
+            await debugBeforeTokenCalculationForTesting?()
             let calculateStartMS = PromptTokenRecountDiagnostics.start()
             PromptTokenRecountDiagnostics.event("tokenRecount.calculate.begin", fields: debugTokenRecountStateFields())
         #endif
@@ -794,6 +845,7 @@ class TokenCountingViewModel: ObservableObject {
         lastDuplicatePromptTokens = duplicatePromptTokensLocal
         lastInstructionsTokens = instructionsTokensLocal
         lastGitDiffTokens = gitDiffTokens
+        lastPublishedSelection = selectionAtStart
         copyContextTotalTokens = copyTotal
         copyContextTokenCountString = copyTokenString
         didComputeBaseline = true

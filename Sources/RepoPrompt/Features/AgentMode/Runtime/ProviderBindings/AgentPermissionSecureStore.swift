@@ -119,7 +119,7 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
         updatedAt: Date = Date(),
         approvalPolicyRaw: String? = CodexAgentToolPreferences.ApprovalPolicy.onRequest.persistedValue,
         sandboxModeRaw: String? = CodexAgentToolPreferences.SandboxMode.workspaceWrite.persistedValue,
-        approvalReviewerRaw: String? = CodexAgentToolPreferences.ApprovalReviewer.user.persistedValue,
+        approvalReviewerRaw: String? = CodexAgentToolPreferences.ApprovalReviewer.autoReview.persistedValue,
         bashToolEnabled: Bool? = true,
         mcpServerTogglesByNormalizedName: [String: Bool]? = nil
     ) {
@@ -133,7 +133,11 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
     }
 
     static func failClosedDocument(now: Date = Date()) -> SecureCodexPermissionDocument {
-        SecureCodexPermissionDocument(updatedAt: now, bashToolEnabled: false)
+        SecureCodexPermissionDocument(
+            updatedAt: now,
+            approvalReviewerRaw: CodexAgentToolPreferences.ApprovalReviewer.user.persistedValue,
+            bashToolEnabled: false
+        )
     }
 
     func approvalPolicy() -> CodexAgentToolPreferences.ApprovalPolicy {
@@ -145,7 +149,8 @@ struct SecureCodexPermissionDocument: Codable, Equatable {
     }
 
     func approvalReviewer() -> CodexAgentToolPreferences.ApprovalReviewer {
-        CodexAgentToolPreferences.ApprovalReviewer(storedValue: approvalReviewerRaw ?? "") ?? .user
+        guard let approvalReviewerRaw else { return .autoReview }
+        return CodexAgentToolPreferences.ApprovalReviewer(storedValue: approvalReviewerRaw) ?? .user
     }
 
     func permissionLevel() -> CodexAgentToolPreferences.PermissionLevel {
@@ -359,7 +364,7 @@ final class AgentPermissionSecureStore {
             _ = normalizeSubagent(&subagent)
             record(.subagent, resetLocked(subagent, domain: .subagent, cache: &subagentCache, deferred: &effects))
 
-            var codex = SecureCodexPermissionDocument.failClosedDocument(now: resetDate)
+            var codex = SecureCodexPermissionDocument(updatedAt: resetDate)
             _ = normalizeCodex(&codex)
             record(.codex, resetLocked(codex, domain: .codex, cache: &codexCache, deferred: &effects))
 
@@ -525,6 +530,7 @@ final class AgentPermissionSecureStore {
         loadLocked(
             domain: .codex,
             cache: &codexCache,
+            missingDocument: SecureCodexPermissionDocument(updatedAt: now()),
             failClosedDocument: SecureCodexPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeCodex,
             deferred: &effects
@@ -574,6 +580,7 @@ final class AgentPermissionSecureStore {
     private func loadLocked<Document: Codable>(
         domain: AgentPermissionSecureDomain,
         cache: inout Document?,
+        missingDocument: Document? = nil,
         failClosedDocument: Document,
         normalize: (inout Document) -> Bool,
         deferred effects: inout DeferredSideEffects
@@ -600,7 +607,7 @@ final class AgentPermissionSecureStore {
         }
 
         guard let payload = plainPayload else {
-            var document = failClosedDocument
+            var document = missingDocument ?? failClosedDocument
             _ = normalize(&document)
             do {
                 try saveDocument(document, domain: domain, accessMode: permissionDecisionAccessMode)
@@ -734,7 +741,7 @@ final class AgentPermissionSecureStore {
             recordDiagnostic(domain: domain, kind: keychainFailureKind(for: error, fallback: .keychainWriteFailed), error: error)
             effects.requestDiagnosticsNotification(for: domain)
             try? secureStrings.deletePlainValue(for: domain.secureStorageAccount, accessMode: .interactive)
-            cache = document
+            cache = failClosedDocument(for: domain) as? Document
             effects.requestChangeNotification(domain: domain, writeSucceeded: false)
             return false
         }
@@ -800,13 +807,17 @@ final class AgentPermissionSecureStore {
             document.sandboxModeRaw = sandbox.persistedValue
             changed = true
         }
-        let reviewer = CodexAgentToolPreferences.ApprovalReviewer(storedValue: document.approvalReviewerRaw ?? "") ?? .user
+        let reviewer: CodexAgentToolPreferences.ApprovalReviewer = if let raw = document.approvalReviewerRaw {
+            CodexAgentToolPreferences.ApprovalReviewer(storedValue: raw) ?? .user
+        } else {
+            .autoReview
+        }
         if document.approvalReviewerRaw != reviewer.persistedValue {
             document.approvalReviewerRaw = reviewer.persistedValue
             changed = true
         }
         if document.bashToolEnabled == nil {
-            document.bashToolEnabled = false
+            document.bashToolEnabled = true
             changed = true
         }
         let originalToggles = document.mcpServerTogglesByNormalizedName ?? [:]

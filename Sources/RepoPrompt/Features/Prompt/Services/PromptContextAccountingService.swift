@@ -61,6 +61,11 @@ struct PromptContextAccountingResult {
     let codemapSnapshotsUsed: [UUID: WorkspaceCodemapSnapshot]
 }
 
+enum PromptContextAccountingContentPolicy {
+    case loadContent
+    case cachedOnly
+}
+
 private struct SelectedFileAccountingReadRequest {
     let selectedPathIndex: Int
     let selectedPath: String
@@ -130,7 +135,8 @@ actor PromptContextAccountingService {
             rootScope: request.rootScope,
             profile: request.pathLocateProfile,
             codeMapUsage: request.codeMapUsage,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: codemapSnapshots,
+            contentPolicy: .loadContent
         )
         #if DEBUG
             PromptTokenRecountDiagnostics.event(
@@ -207,7 +213,8 @@ actor PromptContextAccountingService {
         store: WorkspaceFileContextStore,
         rootScope: WorkspaceLookupRootScope = .allLoaded,
         profile: PathLocateProfile = .uiAssisted,
-        codeMapUsage: CodeMapUsage = .auto
+        codeMapUsage: CodeMapUsage = .auto,
+        contentPolicy: PromptContextAccountingContentPolicy = .loadContent
     ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
         let codemapSnapshots = await store.codemapSnapshotDictionary()
         return await resolveEntries(
@@ -216,7 +223,8 @@ actor PromptContextAccountingService {
             rootScope: rootScope,
             profile: profile,
             codeMapUsage: codeMapUsage,
-            codemapSnapshots: codemapSnapshots
+            codemapSnapshots: codemapSnapshots,
+            contentPolicy: contentPolicy
         )
     }
 
@@ -226,7 +234,8 @@ actor PromptContextAccountingService {
         rootScope: WorkspaceLookupRootScope,
         profile: PathLocateProfile,
         codeMapUsage: CodeMapUsage,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot]
+        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot],
+        contentPolicy: PromptContextAccountingContentPolicy
     ) async -> (entries: [ResolvedPromptFileEntry], missingPaths: [String], invalidPaths: [String]) {
         #if DEBUG
             let resolveStartMS = PromptTokenRecountDiagnostics.start()
@@ -277,6 +286,9 @@ actor PromptContextAccountingService {
             WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
         }
         let selectedPathLookupResults = await store.lookupPaths(selectedPathLookupRequests)
+        guard !Task.isCancelled else {
+            return (entries, missingPaths, invalidPaths)
+        }
         #if DEBUG
             selectedPathsDebugState.finishLookupBatch()
             let lookupResolvedFiles = selection.selectedPaths.reduce(into: 0) { count, path in
@@ -310,6 +322,9 @@ actor PromptContextAccountingService {
         var selectedPathResultsByIndex: [Int: WorkspacePathLookupResult] = [:]
         var selectedPathFallbackLookups = 0
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
+            guard !Task.isCancelled else {
+                return (entries, missingPaths, invalidPaths)
+            }
             if let result = selectedPathLookupResults[path] {
                 selectedPathResultsByIndex[selectedPathIndex] = result
             } else if let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) {
@@ -332,6 +347,9 @@ actor PromptContextAccountingService {
         var selectedFileReadRequests: [SelectedFileAccountingReadRequest] = []
         var selectedCodemapReadSkips = 0
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
+            guard !Task.isCancelled else {
+                return (entries, missingPaths, invalidPaths)
+            }
             #if DEBUG
                 selectedPathsDebugState.beginPath(index: selectedPathIndex, path: path)
                 PromptTokenRecountDiagnostics.event(
@@ -400,20 +418,42 @@ actor PromptContextAccountingService {
             var results: [Int: SelectedFileAccountingReadResult] = [:]
 
             func enqueueNextReadIfAvailable() {
-                guard activeReads < concurrencyLimit, let request = iterator.next() else { return }
+                guard !Task.isCancelled,
+                      activeReads < concurrencyLimit,
+                      let request = iterator.next()
+                else {
+                    return
+                }
                 activeReads += 1
                 group.addTask {
+                    guard !Task.isCancelled else {
+                        return SelectedFileAccountingReadResult(
+                            selectedPathIndex: request.selectedPathIndex,
+                            content: nil,
+                            errorDescription: "cancelled"
+                        )
+                    }
                     #if DEBUG
                         selectedPathsDebugState.beginBatchRead(index: request.selectedPathIndex, path: request.selectedPath, file: request.file)
                     #endif
                     let content: String?
                     let errorDescription: String?
-                    do {
-                        content = try await store.readContent(rootID: request.file.rootID, relativePath: request.file.standardizedRelativePath)
+                    switch contentPolicy {
+                    case .loadContent:
+                        do {
+                            content = try await store.readContent(
+                                rootID: request.file.rootID,
+                                relativePath: request.file.standardizedRelativePath,
+                                workloadClass: .promptAccounting
+                            )
+                            errorDescription = nil
+                        } catch {
+                            content = nil
+                            errorDescription = String(String(describing: error).prefix(120))
+                        }
+                    case .cachedOnly:
+                        content = await store.cachedSearchContentSnapshot(for: request.file).content
                         errorDescription = nil
-                    } catch {
-                        content = nil
-                        errorDescription = String(String(describing: error).prefix(120))
                     }
                     #if DEBUG
                         selectedPathsDebugState.finishBatchRead(errorDescription: errorDescription)
@@ -448,10 +488,17 @@ actor PromptContextAccountingService {
             while let result = await group.next() {
                 activeReads -= 1
                 results[result.selectedPathIndex] = result
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
                 enqueueNextReadIfAvailable()
             }
 
             return results
+        }
+        guard !Task.isCancelled else {
+            return (entries, missingPaths, invalidPaths)
         }
         #if DEBUG
             let readBatchErrors = selectedFileReadResults.values.reduce(into: 0) { count, result in
@@ -472,6 +519,9 @@ actor PromptContextAccountingService {
         #endif
 
         for (selectedPathIndex, path) in selection.selectedPaths.enumerated() {
+            guard !Task.isCancelled else {
+                return (entries, missingPaths, invalidPaths)
+            }
             guard let result = selectedPathResultsByIndex[selectedPathIndex] else {
                 #if DEBUG
                     selectedPathsDebugState.beginAssembly(index: selectedPathIndex, path: path, resolvedKind: "missing")
@@ -529,6 +579,9 @@ actor PromptContextAccountingService {
                     )
                 #endif
                 for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
+                    guard !Task.isCancelled else {
+                        return (entries, missingPaths, invalidPaths)
+                    }
                     selectedFileIDs.insert(file.id)
                     let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshots[file.id]?.fileAPI != nil
                     let content: String?
@@ -539,7 +592,16 @@ actor PromptContextAccountingService {
                             selectedPathsDebugState.beginRead(file: file)
                         #endif
                         do {
-                            content = try await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+                            content = switch contentPolicy {
+                            case .loadContent:
+                                try await store.readContent(
+                                    rootID: file.rootID,
+                                    relativePath: file.standardizedRelativePath,
+                                    workloadClass: .promptAccounting
+                                )
+                            case .cachedOnly:
+                                await store.cachedSearchContentSnapshot(for: file).content
+                            }
                         } catch {
                             content = nil
                             #if DEBUG
@@ -611,6 +673,9 @@ actor PromptContextAccountingService {
             )
         #endif
         for (path, ranges) in selection.slices {
+            guard !Task.isCancelled else {
+                return (entries, missingPaths, invalidPaths)
+            }
             guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
                 missingPaths.append(path)
                 continue
@@ -621,7 +686,16 @@ actor PromptContextAccountingService {
             }
             guard !selectedFileIDs.contains(file.id) else { continue }
             selectedFileIDs.insert(file.id)
-            let content = try? await store.readContent(rootID: file.rootID, relativePath: file.standardizedRelativePath)
+            let content: String? = switch contentPolicy {
+            case .loadContent:
+                try? await store.readContent(
+                    rootID: file.rootID,
+                    relativePath: file.standardizedRelativePath,
+                    workloadClass: .promptAccounting
+                )
+            case .cachedOnly:
+                await store.cachedSearchContentSnapshot(for: file).content
+            }
             let entry = ResolvedPromptFileEntry(file: file, lineRanges: ranges, mode: .sliced, loadedContent: content ?? nil, rootFolderPath: result.location.rootPath)
             append(entry, to: &entries, seenIDs: &seenIDs)
         }
@@ -657,8 +731,18 @@ actor PromptContextAccountingService {
                 fields: ["codemapPaths": "\(codemapPaths.count)"]
             )
         #endif
+        let codemapPathLookupRequests = codemapPaths.map {
+            WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
+        }
+        let codemapPathLookupResults = await store.lookupPaths(codemapPathLookupRequests)
+        guard !Task.isCancelled else {
+            return (entries, missingPaths, invalidPaths)
+        }
         for path in codemapPaths {
-            guard let result = await store.lookupPath(path, profile: profile, rootScope: rootScope) else {
+            guard !Task.isCancelled else {
+                return (entries, missingPaths, invalidPaths)
+            }
+            guard let result = codemapPathLookupResults[path] else {
                 missingPaths.append(path)
                 continue
             }

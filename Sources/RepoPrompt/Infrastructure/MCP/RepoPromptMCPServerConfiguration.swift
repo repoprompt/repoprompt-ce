@@ -61,6 +61,7 @@ struct RepoPromptMCPServerConfiguration: Equatable, Hashable {
 
     var acpJSONObject: [String: Any] {
         [
+            "type": "stdio",
             "name": name,
             "command": command,
             "args": args,

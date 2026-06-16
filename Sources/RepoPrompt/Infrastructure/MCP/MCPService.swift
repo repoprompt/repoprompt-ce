@@ -245,7 +245,20 @@ actor MCPService: Sendable {
         let totalToolCalls: Int
         let idleSeconds: TimeInterval?
         let hasInFlightCalls: Bool
-        let activeToolName: String?
+        let activeToolScope: ConnectionDashboardActiveToolScope?
+        let activeToolScopes: [ConnectionDashboardActiveToolScope]
+        var activeToolScopeCount: Int {
+            activeToolScopes.count
+        }
+
+        var activeToolName: String? {
+            activeToolScope?.toolName
+        }
+
+        var activeToolWindowID: Int? {
+            activeToolScope?.windowID
+        }
+
         /// Session key (capabilityToken) for disambiguating multiple client instances
         let sessionKey: String?
     }
@@ -284,7 +297,8 @@ actor MCPService: Sendable {
                 totalToolCalls: $0.totalToolCalls,
                 idleSeconds: $0.idleSeconds,
                 hasInFlightCalls: $0.hasInFlightCalls,
-                activeToolName: $0.activeToolName,
+                activeToolScope: $0.activeToolScope,
+                activeToolScopes: $0.activeToolScopes,
                 sessionKey: $0.sessionKey
             )
         }

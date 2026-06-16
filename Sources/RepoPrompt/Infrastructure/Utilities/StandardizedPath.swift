@@ -141,6 +141,27 @@ enum GitDiffPathNormalization {
         paths.map(normalizedAbsolutePath)
     }
 
+    static func gitPathspecs(from paths: [String], repoRootPath: String) -> [String] {
+        let standardizedRoot = normalizedAbsolutePath(repoRootPath)
+        return paths.map { rawPath in
+            let expanded = (rawPath as NSString).expandingTildeInPath
+            guard expanded.hasPrefix("/") else { return rawPath }
+
+            let standardizedPath = normalizedAbsolutePath(expanded)
+            guard StandardizedPath.isDescendant(standardizedPath, of: standardizedRoot) else {
+                return standardizedPath
+            }
+            guard standardizedPath != standardizedRoot else { return "." }
+
+            let suffix: Substring = if standardizedRoot == "/" {
+                standardizedPath.dropFirst()
+            } else {
+                standardizedPath.dropFirst(standardizedRoot.count)
+            }
+            return StandardizedPath.relative(String(suffix))
+        }
+    }
+
     static func gitRelativePaths(from absolutePaths: [String], repoRootPath: String) -> [String] {
         let standardizedRoot = normalizedAbsolutePath(repoRootPath)
         var results: [String] = []
