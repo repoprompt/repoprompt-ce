@@ -296,6 +296,8 @@ public class APISettingsViewModel: ObservableObject {
     private var openCodeLogCollector: CLIProcessLogCollector?
     // Cursor Agent CLI / ACP
     @Published var isCursorConnected: Bool = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
+    @Published var isGrokConnected: Bool = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
+    @Published var grokError: String?
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
@@ -378,6 +380,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            grokAvailable: isGrokConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -408,6 +411,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -428,6 +432,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            grokAvailable: isVerifiedContextBuilderProvider(.grok) && isGrokConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -439,6 +444,7 @@ public class APISettingsViewModel: ObservableObject {
             claudeCodeCLI: recommendationAvailability(isConnected: isClaudeCodeConnected, provider: .claudeCode),
             codexCLI: recommendationAvailability(isConnected: isCodexConnected, provider: .codexExec),
             cursorCLI: recommendationAvailability(isConnected: isCursorConnected, provider: .cursor),
+            grokCLI: recommendationAvailability(isConnected: isGrokConnected, provider: .grok),
             openAI: isOpenAIKeyValid ? .ready : (!openAIApiKey.isEmpty ? .configured : .notConfigured)
         )
     }
@@ -480,6 +486,8 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
+        case .grok:
+            isGrokConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -526,7 +534,8 @@ public class APISettingsViewModel: ObservableObject {
             NotificationCenter.default.publisher(for: .claudeCodeConnectionChanged).map { _ in AgentProviderKind.claudeCode },
             NotificationCenter.default.publisher(for: .codexConnectionChanged).map { _ in AgentProviderKind.codexExec },
             NotificationCenter.default.publisher(for: .openCodeConnectionChanged).map { _ in AgentProviderKind.openCode },
-            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor }
+            NotificationCenter.default.publisher(for: .cursorConnectionChanged).map { _ in AgentProviderKind.cursor },
+            NotificationCenter.default.publisher(for: .grokConnectionChanged).map { _ in AgentProviderKind.grok }
         ])
         .receive(on: DispatchQueue.main)
         .sink { [weak self] provider in
@@ -549,6 +558,7 @@ public class APISettingsViewModel: ObservableObject {
         isCodexConnected = UserDefaults.standard.bool(forKey: "CodexCLIConnected")
         isOpenCodeConnected = UserDefaults.standard.bool(forKey: "OpenCodeCLIConnected")
         isCursorConnected = UserDefaults.standard.bool(forKey: "CursorCLIConnected")
+        isGrokConnected = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
         guard wasCursorConnected != isCursorConnected else { return }
         if isCursorConnected {
             startCursorModelsSubscriptionIfNeeded(workspacePath: nil)
@@ -1146,6 +1156,7 @@ public class APISettingsViewModel: ObservableObject {
         let shouldValidateCodex = isCodexConnected
         let shouldValidateOpenCode = isOpenCodeConnected
         let shouldValidateCursor = isCursorConnected
+        let shouldValidateGrok = isGrokConnected
 
         let task = Task { @MainActor [weak self] in
             guard let self, !Task.isCancelled, !hasPreparedForWindowClose else { return }
@@ -1157,13 +1168,15 @@ public class APISettingsViewModel: ObservableObject {
             async let codexReady = probeCachedCodexConnection(ifNeeded: shouldValidateCodex)
             async let openCodeReady = probeCachedOpenCodeConnection(ifNeeded: shouldValidateOpenCode)
             async let cursorReady = probeCachedCursorConnection(ifNeeded: shouldValidateCursor)
-            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady)
+            async let grokReady = probeCachedGrokConnection(ifNeeded: shouldValidateGrok)
+            let readiness = await (claudeReady, codexReady, openCodeReady, cursorReady, grokReady)
             guard !Task.isCancelled, !hasPreparedForWindowClose else { return }
 
             applyContextBuilderProviderValidationResult(readiness.0, provider: .claudeCode)
             applyContextBuilderProviderValidationResult(readiness.1, provider: .codexExec)
             applyContextBuilderProviderValidationResult(readiness.2, provider: .openCode)
             applyContextBuilderProviderValidationResult(readiness.3, provider: .cursor)
+            applyContextBuilderProviderValidationResult(readiness.4, provider: .grok)
             if isCodexConnected, isVerifiedContextBuilderProvider(.codexExec) {
                 startCodexModelsSubscriptionIfNeeded()
             }
@@ -1250,6 +1263,13 @@ public class APISettingsViewModel: ObservableObject {
             return true
         }
         return await CursorACPModelPollingService.shared.refreshNow(workspacePath: nil)
+    }
+
+    private func probeCachedGrokConnection(ifNeeded: Bool) async -> Bool {
+        guard ifNeeded else { return false }
+        let config = GrokAgentConfig(enableDebugLogging: false)
+        let result = try? await GrokACPLaunchResolver().probeSupport(for: config)
+        return result == .supported
     }
 
     private func diagnosticReason(for error: Error) -> APIKeychainAccessDiagnostic.Reason {
@@ -3362,6 +3382,83 @@ public class APISettingsViewModel: ObservableObject {
         )
     }
 
+    // MARK: - Grok CLI / ACP
+
+    func testGrokConnection() async throws -> Bool {
+        let collector = CLIProcessLogCollector()
+        collector.append("Grok Build CLI connection test started")
+        collector.append("Preferred Grok model fallback: \(AgentModel.grokComposer25Fast.rawValue)")
+
+        collector.append("Refreshing login-shell environment cache")
+        await CLIEnvironmentCache.shared.invalidate()
+        collector.append("Starting Grok ACP support preflight")
+
+        do {
+            let config = GrokAgentConfig(enableDebugLogging: false)
+            let support = try await GrokACPLaunchResolver().probeSupport(for: config)
+            guard support == .supported else {
+                let reason = support.reason ?? "Grok ACP preflight failed."
+                throw AIProviderError.invalidConfiguration(detail: reason)
+            }
+
+            isGrokConnected = true
+            setContextBuilderProviderVerified(.grok, verified: true)
+            grokError = nil
+            UserDefaults.standard.set(true, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            collector.append("Grok Build CLI marked as connected")
+            NotificationCenter.default.post(
+                name: .grokConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            return true
+        } catch {
+            collector.append("Connection test threw error: \(error.localizedDescription)")
+            isGrokConnected = false
+            setContextBuilderProviderVerified(.grok, verified: false)
+            grokError = friendlyGrokMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            NotificationCenter.default.post(
+                name: .grokConnectionChanged,
+                object: nil,
+                userInfo: ["windowID": 0]
+            )
+            throw error
+        }
+    }
+
+    func disconnectGrok() {
+        isGrokConnected = false
+        setContextBuilderProviderVerified(.grok, verified: false)
+        grokError = nil
+        UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+        Task {
+            await updateAvailableModels()
+            resetPreferredModelIfNeeded(for: .grok)
+        }
+        NotificationCenter.default.post(
+            name: .grokConnectionChanged,
+            object: nil,
+            userInfo: ["windowID": 0]
+        )
+    }
+
+    private func friendlyGrokMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError {
+            switch providerError {
+            case let .invalidConfiguration(detail):
+                return detail
+            case let .apiError(source):
+                return source?.localizedDescription ?? "Unknown Grok Build CLI error"
+            default:
+                return providerError.localizedDescription
+            }
+        }
+        return error.localizedDescription
+    }
+
     private func friendlyCursorMessage(for error: Error) -> String {
         if let providerError = error as? AIProviderError {
             switch providerError {
@@ -3700,6 +3797,7 @@ extension APISettingsViewModel {
         let claudeCodeConnected: Bool
         let codexConnected: Bool
         let cursorConnected: Bool
+        let grokConnected: Bool
     }
 
     /// Get a snapshot of all provider flags for use by other services.
@@ -3709,7 +3807,8 @@ extension APISettingsViewModel {
             openAIValid: isOpenAIKeyValid,
             claudeCodeConnected: isClaudeCodeConnected,
             codexConnected: isCodexConnected,
-            cursorConnected: isCursorConnected
+            cursorConnected: isCursorConnected,
+            grokConnected: isGrokConnected
         )
     }
 }

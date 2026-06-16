@@ -88,7 +88,7 @@ struct AgentProviderPermissionLevelSection: View {
         switch providerID {
         case .codex, .claude: "Permission Level"
         case .openCode: "ACP Session Mode"
-        case .cursor: "ACP Auto-Approve"
+        case .cursor, .grok: "ACP Auto-Approve"
         }
     }
 }

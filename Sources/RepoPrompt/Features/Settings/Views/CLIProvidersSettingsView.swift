@@ -40,6 +40,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoggingIntoCodex = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
+    @State private var isLoadingGrok = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
@@ -57,6 +58,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isGrokExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -75,6 +77,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCodexConnected
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
+            || viewModel.isGrokConnected
     }
 
     private var codexStatusText: String? {
@@ -105,7 +108,7 @@ struct CLIProvidersSettingsView: View {
                         .font(.title2)
                         .fontWeight(.semibold)
 
-                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, or Cursor to leverage your existing subscriptions — OpenCode can also proxy any API key.")
+                    Text("Primary way to add Agent Mode model support. Connect Claude Code, Codex, OpenCode, Cursor, or Grok to leverage your existing subscriptions — OpenCode can also proxy any API key.")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -132,6 +135,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                grokCard
             }
             .padding(16)
         }
@@ -368,6 +372,11 @@ struct CLIProvidersSettingsView: View {
             return level.autoApprovesACPToolPermissions
                 ? "ACP auto-approve: on"
                 : "ACP auto-approve: off"
+        case .grok:
+            let level = GrokAgentToolPreferences.permissionLevel(defaults: defaults)
+            return level.autoApprovesACPToolPermissions
+                ? "ACP always-approve: on"
+                : "ACP always-approve: off"
         }
     }
 
@@ -434,7 +443,7 @@ struct CLIProvidersSettingsView: View {
             } else {
                 permissionControlsUnavailableRow()
             }
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grok:
             EmptyView()
         }
     }
@@ -1866,6 +1875,80 @@ struct CLIProvidersSettingsView: View {
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
     }
 
+    // MARK: - Grok Card
+
+    private var grokCard: some View {
+        providerCard(
+            title: "Grok CLI",
+            subtitle: "Uses Grok Build's ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. Launches with always-approve and injects RepoPrompt MCP tools.",
+            infoURL: "https://x.ai/cli",
+            isConnected: viewModel.isGrokConnected,
+            isExpanded: $isGrokExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrok() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(grokModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    permissionSummaryLinkRow(for: .grok)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Install with `curl -fsSL https://x.ai/cli/install.sh | bash`. Defaults to Composer 2.5 Fast with always-approve.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var grokModelSummary: String {
+        "Composer 2.5 Fast is the default Agent Mode model. Grok Build also exposes grok-build for deeper agentic work."
+    }
+
     // MARK: - Actions
 
     private func validateAndSaveZAIKey() {
@@ -2248,6 +2331,36 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testGrokConnection() {
+        isLoadingGrok = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokConnection()
+                await MainActor.run {
+                    isLoadingGrok = false
+                    if ok {
+                        alertMessage = "Grok CLI connected successfully."
+                        onAPIKeyUpdated?()
+                    }
+                    showAlert = true
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrok = false
+                    alertMessage = viewModel.grokError ?? error.localizedDescription
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func signOutFromGrok() {
+        viewModel.disconnectGrok()
+        alertMessage = "Signed out from Grok CLI"
         showAlert = true
         onAPIKeyUpdated?()
     }

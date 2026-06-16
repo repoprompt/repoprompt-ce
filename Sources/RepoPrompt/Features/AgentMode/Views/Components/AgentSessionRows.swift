@@ -858,6 +858,7 @@ extension AgentProviderKind {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible: "cpu"
         case .openCode: "curlybraces.square"
         case .cursor: "cursorarrow"
+        case .grok: "sparkles"
         }
     }
 }

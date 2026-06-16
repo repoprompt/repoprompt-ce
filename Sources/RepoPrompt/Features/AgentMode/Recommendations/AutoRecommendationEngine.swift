@@ -11,6 +11,7 @@ struct ProviderFlags {
     let claudeCodeConnected: Bool
     let codexConnected: Bool
     let cursorConnected: Bool
+    let grokConnected: Bool
 }
 
 // MARK: - Auto Recommendation Engine
@@ -51,6 +52,7 @@ final class AutoRecommendationEngine {
                 claudeCodeCLI: .notConfigured,
                 codexCLI: .notConfigured,
                 cursorCLI: .notConfigured,
+                grokCLI: .notConfigured,
                 openAI: .notConfigured
             )
         }
@@ -66,7 +68,8 @@ final class AutoRecommendationEngine {
             openAIValid: vm.isOpenAIKeyValid,
             claudeCodeConnected: vm.isClaudeCodeConnected,
             codexConnected: vm.isCodexConnected,
-            cursorConnected: vm.isCursorConnected
+            cursorConnected: vm.isCursorConnected,
+            grokConnected: vm.isGrokConnected
         )
     }
 
@@ -316,6 +319,13 @@ final class AutoRecommendationEngine {
                 rationale: "Claude Code with Sonnet provides strong context building with good balance of speed and quality.",
                 upgradeHint: "For best context building, connect Codex CLI with GPT-5.5 Low. Requires OpenAI Plus/Pro subscription."
             )
+        } else if status.grokCLI == .ready {
+            return ContextBuilderRecommendation(
+                recommendedAgent: .grok,
+                recommendedModel: .grokComposer25Fast,
+                rationale: "Grok CLI with Composer 2.5 Fast can handle context building when Codex or Claude Code are not configured.",
+                upgradeHint: "For best context building, connect Codex CLI with GPT-5.5 Low or Claude Code with Sonnet."
+            )
         } else if status.cursorCLI == .ready {
             return ContextBuilderRecommendation(
                 recommendedAgent: .cursor,
@@ -354,6 +364,7 @@ final class AutoRecommendationEngine {
             claudeCodeCLI: availability.claudeCodeAvailable ? .ready : .notConfigured,
             codexCLI: availability.codexAvailable ? .ready : .notConfigured,
             cursorCLI: availability.cursorAvailable ? .ready : .notConfigured,
+            grokCLI: availability.grokAvailable ? .ready : .notConfigured,
             openAI: .notConfigured
         ).filtered(to: enabledRecommendationProviders)
         if let recommendation = contextBuilderRecommendation(status: status) {
@@ -372,6 +383,8 @@ final class AutoRecommendationEngine {
                 enabledRecommendationProviders.contains(.codex)
             case .cursor:
                 enabledRecommendationProviders.contains(.cursor)
+            case .grok:
+                enabledRecommendationProviders.contains(.grok)
             case .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
                 true
             }
@@ -436,6 +449,7 @@ final class AutoRecommendationEngine {
             codexAvailable: status.codexCLI == .ready,
             openCodeAvailable: false,
             cursorAvailable: status.cursorCLI == .ready,
+            grokAvailable: status.grokCLI == .ready,
             zaiConfigured: backendStore.isConfigured(.glmZAI) && backendStore.config(for: .glmZAI).isEnabled && backendStore.config(for: .glmZAI).isValid,
             kimiConfigured: backendStore.isConfigured(.kimi) && backendStore.config(for: .kimi).isEnabled && backendStore.config(for: .kimi).isValid,
             customClaudeCompatibleConfigured: backendStore.isConfigured(.custom) && backendStore.config(for: .custom).isEnabled && backendStore.config(for: .custom).isValid

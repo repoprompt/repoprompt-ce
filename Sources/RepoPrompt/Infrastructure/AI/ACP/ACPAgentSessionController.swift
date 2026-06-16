@@ -649,7 +649,7 @@ actor ACPAgentSessionController {
         }
 
         switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grok:
             if let sessionModelFailureReason {
                 throw ControllerError.protocolViolation("malformed modern model config option: \(sessionModelFailureReason)")
             }
@@ -2677,7 +2677,7 @@ actor ACPAgentSessionController {
 
     private func preferredAllowOptionID(for options: [PermissionOption], sessionScoped: Bool) -> String {
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grok:
             genericAllowOptionPreferences(sessionScoped: sessionScoped)
         }
         return optionID(for: options, preferences: preferences) ?? options.first?.optionID ?? ""
@@ -2703,7 +2703,7 @@ actor ACPAgentSessionController {
     private func fullAccessAutoApprovalOptionID(for options: [PermissionOption]) -> String? {
         guard autoApproveAllToolPermissions else { return nil }
         switch provider.providerID {
-        case .cursor:
+        case .cursor, .grok:
             return optionID(for: options, preferences: genericAllowOptionPreferences(sessionScoped: true))
         case .openCode:
             return nil
@@ -2748,7 +2748,7 @@ actor ACPAgentSessionController {
         }
 
         let preferences: [PermissionOptionPreference] = switch provider.providerID {
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grok:
             [
                 .optionID("always"),
                 .optionID("allow_always"),
@@ -2940,6 +2940,8 @@ actor ACPAgentSessionController {
                 "RP_CURSOR_RAW_CAPTURE_PATH"
             case .openCode:
                 "RP_OPENCODE_ACP_RAW_CAPTURE_PATH"
+            case .grok:
+                "RP_GROK_ACP_RAW_CAPTURE_PATH"
             }
             let customPath = providerSpecificKey.flatMap { key in
                 env[key]?.trimmingCharacters(in: .whitespacesAndNewlines)
