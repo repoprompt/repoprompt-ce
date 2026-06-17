@@ -25,7 +25,16 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     func config(for id: ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig {
         lock.lock()
         defer { lock.unlock() }
-        return loadConfigsLocked()[id.rawValue] ?? id.defaultPreset
+        var configs = loadConfigsLocked()
+        guard let persisted = configs[id.rawValue] else { return id.defaultPreset }
+
+        if let migrated = migratedConfigIfNeededLocked(persisted, for: id) {
+            configs[id.rawValue] = migrated
+            saveConfigsLocked(configs)
+            return migrated
+        }
+
+        return persisted
     }
 
     func saveConfig(_ config: ClaudeCodeCompatibleBackendConfig) {
@@ -101,6 +110,27 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
 
     func configuredDefaultsKey(for id: ClaudeCodeCompatibleBackendID) -> String {
         Self.configuredDefaultsKeyPrefix + id.rawValue
+    }
+
+    private static let legacyGLMDefaultSlotMapping = ClaudeCodeCompatibleBackendConfig.ClaudeSlotMapping(
+        haiku: "glm-4.7",
+        sonnet: "glm-5-turbo",
+        opus: "glm-5.1"
+    )
+
+    /// Callers must hold `lock` for the entire read/migration sequence.
+    private func migratedConfigIfNeededLocked(
+        _ config: ClaudeCodeCompatibleBackendConfig,
+        for id: ClaudeCodeCompatibleBackendID
+    ) -> ClaudeCodeCompatibleBackendConfig? {
+        guard id == .glmZAI,
+              case let .claudeSlotMapping(mapping) = config.modelBehavior,
+              mapping == Self.legacyGLMDefaultSlotMapping
+        else { return nil }
+
+        var migrated = config
+        migrated.modelBehavior = ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset.modelBehavior
+        return migrated
     }
 
     /// Callers must hold `lock` for the entire read/legacy-migration sequence.
