@@ -9,6 +9,8 @@ struct MCPWindowToolDependencies {
     struct ContextBuilderTabResolution {
         let tabID: UUID
         let workspaceID: UUID?
+        let agentModeSessionID: UUID?
+        let agentModeRunID: UUID?
         let bindCaller: Bool
         let lookupContext: WorkspaceLookupContext
         let workspaceContext: ContextBuilderWorkspaceContext?
@@ -79,6 +81,8 @@ struct MCPWindowToolDependencies {
     typealias RunMCPPlanOrQuestion = @MainActor @Sendable (
         _ contextBuilderVM: ContextBuilderAgentViewModel,
         _ tabID: UUID,
+        _ agentModeSessionID: UUID?,
+        _ agentModeRunID: UUID?,
         _ mode: HeadlessMode,
         _ prompt: String,
         _ selection: StoredSelection,

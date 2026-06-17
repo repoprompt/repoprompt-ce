@@ -734,6 +734,8 @@ final class MCPServerViewModel: ObservableObject {
             return MCPWindowToolDependencies.ContextBuilderTabResolution(
                 tabID: resolution.tabID,
                 workspaceID: resolution.workspaceID,
+                agentModeSessionID: resolution.agentModeSessionID,
+                agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
                 lookupContext: resolution.lookupContext,
                 workspaceContext: resolution.workspaceContext
@@ -783,13 +785,15 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, mode, prompt, selection, lookupContext, progressReporter, activityReporter in
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
                     return try await override(
                         contextBuilderVM,
                         tabID,
+                        agentModeSessionID,
+                        agentModeRunID,
                         mode,
                         prompt,
                         selection,
@@ -802,6 +806,8 @@ final class MCPServerViewModel: ObservableObject {
             return try await contextBuilderVM.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: oracleVM,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
                 mode: mode,
                 prompt: prompt,
                 selection: selection,
@@ -2887,6 +2893,8 @@ final class MCPServerViewModel: ObservableObject {
     ) async throws -> (
         tabID: UUID,
         workspaceID: UUID?,
+        agentModeSessionID: UUID?,
+        agentModeRunID: UUID?,
         bindCaller: Bool,
         lookupContext: WorkspaceLookupContext,
         workspaceContext: ContextBuilderWorkspaceContext?
@@ -2965,7 +2973,17 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceID: context.workspaceID
                 )
             }
-            return (context.tabID, context.workspaceID, shouldBindCaller, lookupContext, workspaceContext)
+            let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
+            let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
+            return (
+                context.tabID,
+                context.workspaceID,
+                agentModeSessionID,
+                agentModeRunID,
+                shouldBindCaller,
+                lookupContext,
+                workspaceContext
+            )
         } catch {
             if explicitHint != nil || existingBinding != nil || purpose == .agentModeRun {
                 throw error
@@ -2983,6 +3001,8 @@ final class MCPServerViewModel: ObservableObject {
         return (
             createdTab.id,
             targetWindow.workspaceManager.activeWorkspace?.id,
+            nil,
+            nil,
             true,
             .visibleWorkspace,
             nil

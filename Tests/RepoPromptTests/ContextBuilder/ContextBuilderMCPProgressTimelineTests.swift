@@ -212,6 +212,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
 
+            let agentModeSessionID = UUID()
+            let agentModeRunID = UUID()
             let viewModel = composition.contextBuilderAgentViewModel
             viewModel.installRunTestHooks(
                 ContextBuilderAgentViewModel.RunTestHooks(
@@ -237,6 +239,8 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let reply = try await viewModel.runMCPPlanOrQuestion(
                 for: tabID,
                 oracleViewModel: composition.oracleViewModel,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID,
                 mode: .plan,
                 prompt: "Summarize the selected context.",
                 selection: StoredSelection(),
@@ -247,6 +251,11 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
 
             XCTAssertEqual(reply.mode, "plan")
             XCTAssertEqual(reply.response, "deterministic follow-up")
+            let createdSession = try XCTUnwrap(
+                composition.oracleViewModel.sessions.first(where: { $0.id == reply.chatId })
+            )
+            XCTAssertEqual(createdSession.agentModeSessionID, agentModeSessionID)
+            XCTAssertEqual(createdSession.agentModeRunID, agentModeRunID)
             let phases = await recorder.snapshot()
             XCTAssertEqual(phases, [
                 .modelResolution,

@@ -410,6 +410,8 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             try await dependencies.runMCPPlanOrQuestion(
                                 contextBuilderVM,
                                 resultTab.id,
+                                tabResolution.agentModeSessionID,
+                                tabResolution.agentModeRunID,
                                 mode,
                                 effectivePrompt,
                                 sel,

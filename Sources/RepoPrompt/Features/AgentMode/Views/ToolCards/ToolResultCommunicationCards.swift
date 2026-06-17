@@ -1,12 +1,32 @@
 import Foundation
 import SwiftUI
 
+func oracleToolResultPopoverUserInfo(
+    item: AgentChatItem,
+    openContext: AgentOracleOpenContext?
+) -> [AnyHashable: Any]? {
+    let chatID = AgentOracleToolRouting.stringValue(
+        from: item.toolResultJSON,
+        keys: ["chat_id", "chatID"]
+    )
+    let resultTabID = AgentOracleToolRouting.stringValue(
+        from: item.toolResultJSON,
+        keys: ["context_id", "tab_id", "tabID"]
+    ).flatMap(UUID.init(uuidString:))
+    return AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: chatID,
+        tabID: openContext?.tabID ?? resultTabID
+    )
+}
+
 struct ChatSendResultCard: View {
     let item: AgentChatItem
     let oracleOpenContext: AgentOracleOpenContext?
 
     private var isOracleTool: Bool {
-        (normalizedToolCardName(item.toolName) ?? "").lowercased() == "ask_oracle"
+        let toolName = (normalizedToolCardName(item.toolName) ?? "").lowercased()
+        return toolName == "ask_oracle" || toolName == "oracle_send"
     }
 
     private var dto: ToolResultDTOs.ChatSendDTO? {
@@ -43,17 +63,11 @@ struct ChatSendResultCard: View {
     }
 
     private var onTap: (() -> Void)? {
-        guard let oracleOpenContext else { return nil }
+        guard let userInfo = oracleToolResultPopoverUserInfo(
+            item: item,
+            openContext: oracleOpenContext
+        ) else { return nil }
         return {
-            var userInfo: [AnyHashable: Any] = ["windowID": oracleOpenContext.windowID]
-            if let tabID = oracleOpenContext.tabID
-                ?? AgentOracleToolRouting.stringValue(from: item.toolResultJSON, keys: ["context_id", "tab_id", "tabID"]).flatMap(UUID.init(uuidString:))
-            {
-                userInfo["tabID"] = tabID
-            }
-            if let chatID = dto?.chatID ?? oracleOpenContext.chatID {
-                userInfo["chatID"] = chatID
-            }
             NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
         }
     }

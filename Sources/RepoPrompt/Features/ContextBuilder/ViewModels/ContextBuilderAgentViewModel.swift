@@ -3580,6 +3580,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         prompt: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         chatName: String,
         model: AIModel,
         chatPresetID: UUID?,
@@ -3638,7 +3640,9 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 named: chatName,
                 tabID: tabID,
                 activateInUI: shouldActivate,
-                setActiveForTab: true
+                setActiveForTab: true,
+                agentModeSessionID: agentModeSessionID,
+                agentModeRunID: agentModeRunID
             )
             createdSessionID = createdSession.id
             session.followUpOracleSessionID = createdSession.id
@@ -3762,6 +3766,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func runMCPPlanOrQuestion(
         for tabID: UUID,
         oracleViewModel: OracleViewModel,
+        agentModeSessionID: UUID? = nil,
+        agentModeRunID: UUID? = nil,
         mode: HeadlessMode,
         prompt: String,
         selection: StoredSelection,
@@ -3810,6 +3816,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             prompt: prompt,
             selection: selection,
             lookupContext: lookupContext,
+            agentModeSessionID: agentModeSessionID,
+            agentModeRunID: agentModeRunID,
             chatName: chatNameForTab(tabID),
             model: modelSelection.model,
             chatPresetID: modelSelection.chatPresetID,

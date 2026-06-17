@@ -65,6 +65,12 @@ enum CursorACPEventNormalizer {
         }
         if let rawOutput = payload["rawOutput"] {
             result["rawOutput"] = rawOutput
+            if let rawOutputObject = rawOutput as? [String: Any],
+               let chatID = ACPRuntimeEventParsing.firstString(in: rawOutputObject, keys: ["chat_id", "chatID"])?
+               .trimmingCharacters(in: .whitespacesAndNewlines), !chatID.isEmpty
+            {
+                result["chat_id"] = chatID
+            }
         }
         if let content = payload["content"] {
             result["content"] = content

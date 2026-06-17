@@ -50,6 +50,24 @@ struct AgentOracleOpenContext {
 }
 
 enum AgentOracleToolRouting {
+    static func operationPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        chatID: String?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        guard let openContext,
+              let chatID = nonEmptyValue(chatID)
+        else { return nil }
+        var userInfo: [AnyHashable: Any] = [
+            "windowID": openContext.windowID,
+            "chatID": chatID
+        ]
+        if let tabID = tabID ?? openContext.tabID {
+            userInfo["tabID"] = tabID
+        }
+        return userInfo
+    }
+
     static func stringValue(from json: String?, keys: [String]) -> String? {
         guard let json else { return nil }
         let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -60,6 +78,13 @@ enum AgentOracleToolRouting {
             return nil
         }
         return stringValue(from: object, keys: keys)
+    }
+
+    private static func nonEmptyValue(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 
     private static func stringValue(from value: Any, keys: [String]) -> String? {
@@ -765,6 +790,23 @@ private enum ToolCardSubtitleBuilder {
     }
 }
 
+func oracleToolCallPopoverUserInfo(
+    item: AgentChatItem,
+    openContext: AgentOracleOpenContext?
+) -> [AnyHashable: Any]? {
+    guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
+          toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
+    else { return nil }
+    let chatID = AgentOracleToolRouting.stringValue(
+        from: item.toolArgsJSON,
+        keys: ["chat_id", "chatID"]
+    )
+    return AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: chatID
+    )
+}
+
 enum ToolCallCardStateResolver {
     static func status(for item: AgentChatItem) -> ToolCardStatus {
         if item.toolResultJSON != nil || item.toolIsError != nil {
@@ -816,19 +858,11 @@ struct ToolCallCard: View {
     }
 
     private var onTap: (() -> Void)? {
-        guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
-              toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send",
-              let oracleOpenContext else { return nil }
+        guard let userInfo = oracleToolCallPopoverUserInfo(
+            item: item,
+            openContext: oracleOpenContext
+        ) else { return nil }
         return {
-            var userInfo: [AnyHashable: Any] = ["windowID": oracleOpenContext.windowID]
-            if let tabID = oracleOpenContext.tabID {
-                userInfo["tabID"] = tabID
-            }
-            if let chatID = AgentOracleToolRouting.stringValue(from: item.toolArgsJSON, keys: ["chat_id", "chatID"])
-                ?? oracleOpenContext.chatID
-            {
-                userInfo["chatID"] = chatID
-            }
             NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
         }
     }

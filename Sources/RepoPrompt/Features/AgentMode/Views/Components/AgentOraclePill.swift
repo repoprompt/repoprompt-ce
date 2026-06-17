@@ -3,6 +3,34 @@ import SwiftUI
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    struct ExplicitOpenRequest: Equatable {
+        let generation: UInt64
+        let tabID: UUID
+        let chatID: String
+    }
+
+    static func explicitOpenRequest(
+        chatID rawChatID: String,
+        tabID: UUID,
+        generation: UInt64
+    ) -> ExplicitOpenRequest? {
+        let chatID = rawChatID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !chatID.isEmpty else { return nil }
+        return ExplicitOpenRequest(generation: generation, tabID: tabID, chatID: chatID)
+    }
+
+    static func shouldPresent(
+        session: ChatSession,
+        for request: ExplicitOpenRequest,
+        currentGeneration: UInt64,
+        currentTabID: UUID?
+    ) -> Bool {
+        guard request.generation == currentGeneration,
+              request.tabID == currentTabID,
+              session.composeTabID == request.tabID else { return false }
+        return Self.session(matchingChatID: request.chatID, in: [session]) != nil
+    }
+
     static func hasRenderableMessages(session: ChatSession, liveMessageCount: Int?) -> Bool {
         if let liveMessageCount {
             return liveMessageCount > 0
@@ -105,8 +133,9 @@ enum AgentOraclePillLogic {
     static func session(matchingChatID raw: String, in sessions: [ChatSession]) -> ChatSession? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
+        let targetUUID = UUID(uuidString: trimmed)
         return sessions.first { session in
-            session.id.uuidString == trimmed || session.shortID == trimmed
+            session.shortID == trimmed || targetUUID.map { session.id == $0 } == true
         }
     }
 }
@@ -129,6 +158,7 @@ struct AgentOraclePill: View {
     @State private var autoScrollEnabled = false
     @State private var presentedSessionID: UUID?
     @State private var presentedSessionSource: PresentedSessionSource = .latest
+    @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -244,6 +274,7 @@ struct AgentOraclePill: View {
             oraclePopoverContent
         }
         .onChange(of: currentTabID) { _, _ in
+            openRequestGeneration &+= 1
             reconcilePresentedSession()
         }
         .onChange(of: activeAgentSessionID) { _, _ in
@@ -315,23 +346,42 @@ struct AgentOraclePill: View {
 
     private func openPopover(chatID: String?) {
         guard let tabID = currentTabID else { return }
-        let target: ChatSession?
-        let source: PresentedSessionSource
-        if let chatID {
-            target = AgentOraclePillLogic.session(
-                matchingChatID: chatID,
-                in: oracleViewModel.sessions(forTabID: tabID)
-            )
-            source = .explicit
-            guard target != nil else { return }
-        } else {
-            target = latestTabSession
-            source = .latest
-        }
-        guard let target else { return }
+        openRequestGeneration &+= 1
+        let generation = openRequestGeneration
 
-        presentedSessionID = target.id
-        presentedSessionSource = source
-        showPopover = true
+        guard let chatID else {
+            guard let target = latestTabSession else { return }
+            presentedSessionID = target.id
+            presentedSessionSource = .latest
+            showPopover = true
+            return
+        }
+
+        presentedSessionID = nil
+        presentedSessionSource = .explicit
+        showPopover = false
+        guard let request = AgentOraclePillLogic.explicitOpenRequest(
+            chatID: chatID,
+            tabID: tabID,
+            generation: generation
+        ) else { return }
+
+        Task { @MainActor in
+            guard let target = await oracleViewModel.resolveExactSessionForPopover(
+                chatID: request.chatID,
+                tabID: request.tabID
+            ),
+                AgentOraclePillLogic.shouldPresent(
+                    session: target,
+                    for: request,
+                    currentGeneration: openRequestGeneration,
+                    currentTabID: currentTabID
+                )
+            else { return }
+
+            presentedSessionID = target.id
+            presentedSessionSource = .explicit
+            showPopover = true
+        }
     }
 }

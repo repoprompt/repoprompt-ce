@@ -53,6 +53,70 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         }
     }
 
+    func testContextBuilderPersistsOnlySelectedBoundedFollowUpRoutingMetadata() throws {
+        let rows: [(responseType: String, selectedKey: String, chatID: String, mode: String)] = [
+            ("plan", "plan", "plan-chat", "plan"),
+            ("review", "review", "review-chat", "review")
+        ]
+
+        for row in rows {
+            let bulkyResponse = String(repeating: "generated response ", count: 200)
+            let bulkyDiff = String(repeating: "diff --git a/File.swift b/File.swift\n", count: 100)
+            let raw = jsonString([
+                "status": "success",
+                "context_id": "11111111-2222-3333-4444-555555555555",
+                "response_type": row.responseType,
+                "plan": [
+                    "chat_id": "plan-chat",
+                    "mode": "plan",
+                    "response": bulkyResponse,
+                    "diffs": [["path": "File.swift", "patch": bulkyDiff]],
+                    "errors": ["plan error"]
+                ],
+                "review": [
+                    "chat_id": "review-chat",
+                    "mode": "review",
+                    "response": bulkyResponse,
+                    "diffs": [["path": "File.swift", "patch": bulkyDiff]],
+                    "errors": ["review error"]
+                ]
+            ])
+
+            let summary = try XCTUnwrap(persistedSummary(toolName: "context_builder", rawResultJSON: raw))
+            let object = try decodedObject(summary.resultJSON)
+            let selectedReply = try XCTUnwrap(object[row.selectedKey] as? [String: Any])
+            let unselectedKey = row.selectedKey == "plan" ? "review" : "plan"
+            let dto = try XCTUnwrap(ToolJSON.decode(
+                ToolResultDTOs.ContextBuilderDTO.self,
+                from: summary.resultJSON
+            ))
+            let selectedDTO = row.selectedKey == "plan" ? dto.plan : dto.review
+
+            XCTAssertTrue(summary.summaryOnly, row.responseType)
+            XCTAssertEqual(object["status"] as? String, "success", row.responseType)
+            XCTAssertEqual(object["summary_only"] as? Bool, true, row.responseType)
+            XCTAssertEqual(object["context_id"] as? String, "11111111-2222-3333-4444-555555555555", row.responseType)
+            XCTAssertEqual(object["response_type"] as? String, row.responseType, row.responseType)
+            XCTAssertEqual(selectedReply["chat_id"] as? String, row.chatID, row.responseType)
+            XCTAssertEqual(selectedReply["mode"] as? String, row.mode, row.responseType)
+            XCTAssertNil(selectedReply["response"], row.responseType)
+            XCTAssertNil(selectedReply["diffs"], row.responseType)
+            XCTAssertNil(selectedReply["errors"], row.responseType)
+            XCTAssertNil(object[unselectedKey], row.responseType)
+            XCTAssertEqual(dto.tabID, "11111111-2222-3333-4444-555555555555", row.responseType)
+            XCTAssertEqual(dto.responseType, row.responseType, row.responseType)
+            XCTAssertEqual(selectedDTO?.chatID, row.chatID, row.responseType)
+            XCTAssertEqual(selectedDTO?.mode, row.mode, row.responseType)
+            XCTAssertFalse(summary.resultJSON.contains(bulkyResponse), row.responseType)
+            XCTAssertFalse(summary.resultJSON.contains(bulkyDiff), row.responseType)
+            XCTAssertLessThanOrEqual(
+                summary.resultJSON.utf8.count,
+                AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes,
+                row.responseType
+            )
+        }
+    }
+
     func testOversizedStructuredSummaryFallsBackToMinimalResultJSON() throws {
         let oversizedReviewStatus = String(repeating: "approved-with-a-very-long-note-", count: 120)
         let raw = jsonString([
@@ -96,35 +160,48 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
     }
 
-    func testCursorACPStructuredSummaryKeepsPrecedenceForAllowedOracleTools() throws {
-        let raw = jsonString([
-            "status": "success",
-            "acp_status": "completed",
-            "kind": "message",
-            "title": "Tool result",
-            "chat_id": "chat-789",
-            "mode": "review",
-            "response": "raw oracle response",
-            "content": [[
-                "type": "text",
-                "text": "cursor acp text payload"
-            ]]
-        ])
+    func testCursorACPStructuredSummaryKeepsChatIDForAllowedOracleTools() throws {
+        for toolName in ["ask_oracle", "oracle_send"] {
+            let events = CursorACPEventNormalizer.normalize([
+                "sessionUpdate": "tool_call_update",
+                "status": "completed",
+                "toolCallId": "oracle-routing-\(toolName)",
+                "toolName": toolName,
+                "kind": "message",
+                "title": "Tool result",
+                "rawOutput": [
+                    "chat_id": "chat-789",
+                    "mode": "review",
+                    "response": "raw oracle response"
+                ],
+                "content": [[
+                    "type": "text",
+                    "text": "cursor acp text payload"
+                ]]
+            ])
+            guard case let .stream(result) = try XCTUnwrap(events.first) else {
+                return XCTFail("Expected normalized Cursor ACP stream event for \(toolName)")
+            }
+            let raw = try XCTUnwrap(result.toolResultJSON)
+            let summary = try XCTUnwrap(persistedSummary(toolName: toolName, rawResultJSON: raw))
+            let object = try decodedObject(summary.resultJSON)
+            let content = try XCTUnwrap(object["content"] as? [[String: Any]])
+            let firstContent = try XCTUnwrap(content.first)
 
-        let summary = try XCTUnwrap(persistedSummary(toolName: "ask_oracle", rawResultJSON: raw))
-        let object = try decodedObject(summary.resultJSON)
-        let content = try XCTUnwrap(object["content"] as? [[String: Any]])
-        let firstContent = try XCTUnwrap(content.first)
-
-        XCTAssertEqual(object["acp_status"] as? String, "completed")
-        XCTAssertEqual(object["kind"] as? String, "message")
-        XCTAssertEqual(firstContent["text_bytes"] as? Int, "cursor acp text payload".utf8.count)
-        XCTAssertNil(object["chat_id"])
-        XCTAssertNil(object["mode"])
-        XCTAssertNil(object["has_response"])
-        XCTAssertNil(object["response"])
-        XCTAssertFalse(summary.resultJSON.contains("raw oracle response"))
-        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+            XCTAssertEqual(object["acp_status"] as? String, "completed", toolName)
+            XCTAssertEqual(object["kind"] as? String, "message", toolName)
+            XCTAssertEqual(object["chat_id"] as? String, "chat-789", toolName)
+            XCTAssertEqual(firstContent["text_bytes"] as? Int, "cursor acp text payload".utf8.count, toolName)
+            XCTAssertNil(object["mode"], toolName)
+            XCTAssertNil(object["has_response"], toolName)
+            XCTAssertNil(object["response"], toolName)
+            XCTAssertFalse(summary.resultJSON.contains("raw oracle response"), toolName)
+            XCTAssertLessThanOrEqual(
+                summary.resultJSON.utf8.count,
+                AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes,
+                toolName
+            )
+        }
     }
 
     func testCompletionOnlyToolResultFactoryPreservesArgsForPersistenceClassification() throws {

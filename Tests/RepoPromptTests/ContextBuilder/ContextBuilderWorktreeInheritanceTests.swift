@@ -83,7 +83,9 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, mode, prompt, selection, lookupContext, _, _ in
+                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, _, _ in
+                        XCTAssertEqual(agentModeSessionID, sessionID)
+                        XCTAssertEqual(agentModeRunID, parentRunID)
                         let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
