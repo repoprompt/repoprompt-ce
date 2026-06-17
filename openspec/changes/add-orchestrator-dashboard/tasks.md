@@ -9,9 +9,9 @@
 
 - [ ] 2.1 Define `OrchestratorDashboardSnapshot` as the single render contract for counts, groups, rows, Coordinator rail, pending summaries, MCP footer, and deep-link payloads.
 - [ ] 2.2 Implement a lazy, window-scoped `@MainActor` dashboard view model.
-- [ ] 2.3 Compose the snapshot from active window Agent Mode session state/metadata and `MCPServerViewModel.dashboard`, assuming `add-mcp-dashboard-consumer` has provided the named dashboard consumer.
+- [ ] 2.3 Compose the snapshot from current-window Agent Mode live state, active-workspace session metadata, and `MCPServerViewModel.dashboard`, assuming `add-mcp-dashboard-consumer` has provided the named dashboard consumer.
 - [ ] 2.4 Add diff-before-publish/fingerprint behavior so streaming transcript or token deltas do not republish unchanged dashboard rows.
-- [ ] 2.5 Represent stale/persisted-only rows for sessions whose live state belongs to another window.
+- [ ] 2.5 Represent stale/persisted-only rows for active-workspace sessions without current-window live state.
 
 ## 3. Coordinator identity
 
@@ -27,18 +27,19 @@
 - [ ] 4.1 Project session identity, lineage, provider/model, run state, MCP origin, worktree bindings, and merge attention from structured metadata/live state.
 - [ ] 4.2 Omit workflow labels in v1; leave workflow index/transcript lookup as follow-up unless needed for Coordinator detection without churn.
 - [ ] 4.3 Omit objective labels in v1.
-- [ ] 4.4 Project workstream labels from worktree/logical-root metadata when available.
+- [ ] 4.4 Optionally project workstream labels/chips from worktree/logical-root metadata when available and useful for the UI.
 - [ ] 4.5 Ensure session titles or assistant prose are not parsed to infer labels.
 
 ## 5. Status grouping and sorting
 
 - [ ] 5.1 Implement dashboard status groups: Needs you, Blocked, Working, Done, Idle.
 - [ ] 5.2 Evaluate groups top-down: Needs you, Blocked, Working, Done, Idle.
-- [ ] 5.3 Map Needs you from `.waitingForUser`, `.waitingForQuestion`, and `.waitingForApproval`; use MCP pending interactions only as prompt/detail enrichment.
-- [ ] 5.4 Map Blocked from `.failed` run state or conflicted worktree/merge attention.
-- [ ] 5.5 Map Working from `.running`, Done from `.completed`/`.cancelled`, and Idle from `.idle` when no higher-priority group applies.
-- [ ] 5.6 Implement deterministic within-group sorting from cheap metadata such as attention age, activity date, last modified date, or completion date.
-- [ ] 5.7 Add snapshot adapter tests for grouping, counts, and sorting.
+- [ ] 5.3 Map Needs you from current-window live `.waitingForUser`, `.waitingForQuestion`, and `.waitingForApproval`; use MCP pending interactions only as prompt/detail enrichment.
+- [ ] 5.4 Ensure persisted-only rows never contribute to live `Needs you` or `Working` counts in v1.
+- [ ] 5.5 Map Blocked from `.failed` run state or conflicted worktree/merge attention.
+- [ ] 5.6 Map Working from current-window live `.running`, Done from `.completed`/`.cancelled`, and Idle from `.idle` when no higher-priority group applies.
+- [ ] 5.7 Implement deterministic within-group sorting from cheap metadata such as attention age, activity date, last modified date, or completion date.
+- [ ] 5.8 Add snapshot adapter tests for grouping, counts, stale-row count exclusion, and sorting.
 
 ## 6. Pending interaction summaries
 
@@ -53,7 +54,8 @@
 - [ ] 7.1 Build row and pending-summary route payloads from active workspace, resolvable tab, and optional session ID.
 - [ ] 7.2 Use direct `WindowState.routeToAgentSession` for same-window navigation when possible.
 - [ ] 7.3 Use existing `AgentSessionDeepLinkRoute` / router behavior for cross-window or URL-style navigation as needed.
-- [ ] 7.4 Add tests for resolvable and unresolvable route states.
+- [ ] 7.4 Ensure persisted-only rows without route data do not create or restore sessions during rendering.
+- [ ] 7.5 Add tests for resolvable, unresolvable, and persisted-only no-restore route states.
 
 ## 8. MCP compact projection
 
@@ -67,7 +69,7 @@
 - [ ] 9.1 Build the Orchestrator Dashboard shell with top counts, optional Coordinator rail, grouped inbox, inspection drawer, MCP footer, and filter affordance.
 - [ ] 9.2 Keep the main inbox calm by default: no full transcripts, full logs, diffs, file viewers, or streaming tool feeds.
 - [ ] 9.3 Add progressive disclosure from count to row to sourced drawer summaries to Agent Mode; keep full raw logs, transcripts, files, and diffs in Agent Mode for v1.
-- [ ] 9.4 Add UI previews or smoke states for empty workspace, active, needs-user, blocked, MCP-off, MCP-error, filtered, zero-Coordinator inbox-only, and multiple-Coordinator most-recent states.
+- [ ] 9.4 Add UI previews or smoke states for empty workspace, active, needs-user, blocked, MCP-off, MCP-empty, MCP-active, filtered, zero-Coordinator inbox-only, and multiple-Coordinator most-recent states.
 
 ## 10. Validation
 

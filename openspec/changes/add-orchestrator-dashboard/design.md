@@ -16,8 +16,8 @@ The dashboard should therefore be a read-only projection over existing state, no
 
 - Add an opt-in Orchestrator Dashboard surface inside `.main` while preserving Agent Mode as the default.
 - Render all dashboard regions from one `OrchestratorDashboardSnapshot` projection.
-- Compose that projection from two independent upstreams: the active window's Agent Mode state/session metadata and `MCPServerViewModel.dashboard`.
-- Scope v1 to the active workspace/current window.
+- Compose that projection from two independent upstreams: current-window Agent Mode live state, active-workspace session metadata, and `MCPServerViewModel.dashboard`.
+- Scope v1 to active-workspace rows with current-window live-state enrichment.
 - Show Coordinator context when selected or detected, keep the inbox useful without a Coordinator, group session rows by total run-state-aware rules, render read-only pending interaction prompts, compact MCP awareness, and deep links to Agent Mode.
 - Use coarse observation and diff-before-publish behavior so streaming transcript/token deltas do not churn the dashboard.
 
@@ -50,7 +50,7 @@ The default `.main` surface remains Agent Mode. `AppLaunchConfiguration.forcedRo
 
 This change depends on `add-mcp-dashboard-consumer` for the named MCP dashboard consumer identity. The dashboard SHALL render from `OrchestratorDashboardSnapshot`. That snapshot is one UI consistency boundary, but it is composed from independent upstreams:
 
-1. active window Agent Mode live state and active-workspace session metadata;
+1. current-window Agent Mode live state overlaid on active-workspace session metadata;
 2. `MCPServerViewModel.dashboard` with its existing dashboard consumer lifecycle.
 
 This avoids each UI component re-deriving counts, groups, pending decisions, and deep links from different sources while preserving the existing MCP data path.
@@ -70,13 +70,13 @@ Coordinator identity is not a flat set of OR predicates. Selection precedence is
 
 Plain lineage-root-with-children is never enough to auto-detect a Coordinator. User-selected Coordinator state lives in the window-scoped dashboard view model, keyed by active workspace ID, and does not persist across app launches in v1.
 
-### 6. Active workspace/current window scope
+### 6. Active workspace rows, current-window live enrichment
 
-V1 is active-workspace/current-window scoped. Persisted rows from the active workspace may appear even when live state belongs to another window; the v1 default is to render them as stale/persisted-only rows, never as live status. Rows without a resolvable route hide or disable Agent UI navigation.
+V1 projects active-workspace sessions. Live run-state enrichment is current-window scoped. Sessions without current-window live state render from persisted metadata only and are marked stale/persisted-only. Persisted-only rows never count toward live `Needs you` or `Working` groups in v1. Rows without a resolvable route hide or disable Agent UI navigation.
 
 ### 7. Labels are structured and conservative
 
-Workflow labels are omitted in v1. A future workflow label pass can choose between an index addition and shared request-anchor/transcript metadata lookup; that same lookup should be shared with workflow-based Coordinator detection if enabled. Objective labels are deferred. Workstream chips may render from worktree binding/logical-root metadata when present; otherwise omit them. Session-title parsing is out of scope.
+Workflow labels are omitted in v1. A future workflow label pass can choose between an index addition and shared request-anchor/transcript metadata lookup; that same lookup should be shared with workflow-based Coordinator detection if enabled. Objective labels are deferred. Workstream chips may optionally render from worktree binding/logical-root metadata when present and useful for the UI; otherwise omit them. Session-title parsing is out of scope.
 
 ### 8. Pending interactions are read-only and MCP-scoped in v1
 
@@ -107,13 +107,13 @@ Consume the `MCPServerViewModel.DashboardConsumer.orchestratorDashboard` case ad
 
 Status groups are evaluated top-down: `Needs you` > `Blocked` > `Working` > `Done` > `Idle`.
 
-- `Needs you`: run state is `.waitingForUser`, `.waitingForQuestion`, or `.waitingForApproval`; MCP pending interaction data enriches prompt/details when available.
+- `Needs you`: current-window live run state is `.waitingForUser`, `.waitingForQuestion`, or `.waitingForApproval`; MCP pending interaction data enriches prompt/details when available.
 - `Blocked`: run state is `.failed` or cheap metadata reports conflicted worktree/merge attention.
-- `Working`: run state is `.running`.
+- `Working`: current-window live run state is `.running`.
 - `Done`: run state is `.completed` or `.cancelled`.
 - `Idle`: run state is `.idle` or no higher-priority group applies.
 
-Blocked's conflicted-merge signal should come from cheap metadata such as active worktree merge summaries. Within-group sorting should also use cheap metadata, e.g. attention age or activity/last-modified dates, not transcript loads.
+Blocked's conflicted-merge signal should come from cheap metadata such as active worktree merge summaries. Within-group sorting should also use cheap metadata, e.g. attention age or activity/last-modified dates, not transcript loads. Persisted-only rows may still appear as `Blocked`, `Done`, or `Idle` from persisted metadata, but they must not contribute to live `Needs you` or `Working` counts.
 
 ### 12. Coordinator rail is optional; inbox stands alone
 
@@ -126,7 +126,7 @@ The v1 drawer shows sourced summaries only: status, pending interaction, blocker
 ## Risks / Trade-offs
 
 - **Coordinator ambiguity** → Use precedence rules, most-recent auto-candidate fallback, and per-window user override instead of guessing from plain lineage.
-- **Multi-window stale rows** → Render stale/persisted-only state explicitly; keep v1 active-window scoped.
+- **Multi-window stale rows** → Render stale/persisted-only state explicitly; keep live `Needs you` / `Working` counts current-window-only.
 - **Reactive firehose** → Observe coarse signals and diff snapshots before publishing.
 - **Workflow lookup cost** → Either add workflow to metadata/index or accept a shared transcript metadata read; do not repeatedly load transcripts per UI region.
 - **Pending decision asymmetry** → Run-state waiting values still enter `Needs you`; MCP-controlled live interactions only enrich the prompt/detail payload.

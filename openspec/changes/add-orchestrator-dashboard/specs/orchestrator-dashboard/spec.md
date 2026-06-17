@@ -32,8 +32,8 @@ The system SHALL render the Orchestrator Dashboard from a single dashboard-facin
 - **WHEN** assistant text, transcript tokens, or token counts stream without changing coarse dashboard state
 - **THEN** the dashboard snapshot SHALL NOT republish changed rows solely because of those streaming deltas.
 
-### Requirement: Active workspace and current window scope
-The system SHALL scope v1 dashboard content to the active workspace and current window.
+### Requirement: Active workspace rows and current-window live enrichment
+The system SHALL scope v1 dashboard rows to the active workspace and live run-state enrichment to the current window.
 
 #### Scenario: Dashboard opens in a workspace
 - **WHEN** the dashboard opens
@@ -44,7 +44,7 @@ The system SHALL scope v1 dashboard content to the active workspace and current 
 - **THEN** the dashboard SHALL show an empty state instead of empty groups or stale placeholder rows.
 
 #### Scenario: Session live state belongs to another window
-- **WHEN** a session is known from active-workspace persisted metadata but its live state belongs to another window
+- **WHEN** a session is known from active-workspace persisted metadata but has no current-window live state
 - **THEN** the dashboard SHALL render the row as stale/persisted-only in v1
 - **AND** it SHALL NOT present stale persisted data as live status.
 
@@ -57,11 +57,11 @@ The system SHALL identify the dashboard Coordinator using explicit precedence.
 
 #### Scenario: Orchestrate workflow candidate exists
 - **WHEN** no user-selected Coordinator exists and a parent session has launch or first-request workflow metadata of `Orchestrate`
-- **THEN** the dashboard MAY use that parent session as the auto-detected Coordinator.
+- **THEN** the dashboard SHALL treat that parent session as a Coordinator candidate.
 
 #### Scenario: MCP-originated lineage candidate exists
 - **WHEN** no user-selected Coordinator or Orchestrate workflow candidate exists and a parent session is both a lineage root with child sessions and MCP-originated
-- **THEN** the dashboard MAY use that parent session as the auto-detected Coordinator.
+- **THEN** the dashboard SHALL treat that parent session as a Coordinator candidate.
 
 #### Scenario: Plain lineage parent exists
 - **WHEN** a parent session has child sessions but is neither user-selected, Orchestrate-detected, nor MCP-originated
@@ -94,7 +94,7 @@ The system SHALL project dashboard session rows from structured session and live
 - **THEN** the row SHALL omit objective labels.
 
 #### Scenario: Workstream source exists
-- **WHEN** bound worktree or logical-root metadata exists for a session
+- **WHEN** bound worktree or logical-root metadata exists for a session and is useful for the UI
 - **THEN** the dashboard MAY project that structural metadata as a workstream grouping label.
 
 #### Scenario: Workstream source is absent
@@ -110,16 +110,21 @@ The system SHALL group dashboard rows by testable, structured status rules.
 - **THEN** the dashboard SHALL evaluate groups in this order: `Needs you`, `Blocked`, `Working`, `Done`, `Idle`.
 
 #### Scenario: Session needs user attention
-- **WHEN** a session run state is `.waitingForUser`, `.waitingForQuestion`, or `.waitingForApproval`
+- **WHEN** a session has current-window live run state `.waitingForUser`, `.waitingForQuestion`, or `.waitingForApproval`
 - **THEN** the dashboard SHALL group that row under `Needs you`
 - **AND** live MCP-controlled pending interaction data MAY enrich the row prompt/details when available.
+
+#### Scenario: Persisted-only row has active-looking stale run state
+- **WHEN** a row is known only from persisted metadata and has no current-window live state
+- **AND** its persisted run state is `.running`, `.waitingForUser`, `.waitingForQuestion`, or `.waitingForApproval`
+- **THEN** the dashboard SHALL NOT count that row as live `Working` or `Needs you` in v1.
 
 #### Scenario: Session is blocked
 - **WHEN** a session has `.failed` run state or conflicted worktree/merge attention
 - **THEN** the dashboard SHALL group that row under `Blocked`.
 
 #### Scenario: Session is working
-- **WHEN** a session run state is `.running`
+- **WHEN** a session has current-window live run state `.running`
 - **THEN** the dashboard SHALL group that row under `Working`.
 
 #### Scenario: Session is done
@@ -134,6 +139,14 @@ The system SHALL group dashboard rows by testable, structured status rules.
 - **WHEN** rows are displayed within a status group
 - **THEN** the dashboard SHALL sort them deterministically using cheap metadata such as attention age, activity date, last modified date, or completion date
 - **AND** it SHALL NOT require per-row transcript loads solely to sort rows.
+
+#### Scenario: High-priority groups are non-empty
+- **WHEN** `Needs you`, `Blocked`, or `Working` groups contain rows
+- **THEN** the dashboard SHALL expand those groups by default.
+
+#### Scenario: Low-priority groups are non-empty
+- **WHEN** `Done` or `Idle` groups contain rows
+- **THEN** the dashboard SHALL collapse those groups by default with a `Show` affordance.
 
 ### Requirement: Pending interaction display
 The system SHALL display pending interactions as read-only prompts that deep-link to Agent Mode.
@@ -166,6 +179,11 @@ The system SHALL deep-link dashboard rows to the existing Agent Mode session whe
 #### Scenario: Route is not resolvable
 - **WHEN** a dashboard row lacks required route data
 - **THEN** the dashboard SHALL hide or disable `Open agent chat` for that row.
+
+#### Scenario: Persisted-only row lacks a resolvable tab
+- **WHEN** a persisted-only row has no active workspace/tab/session route
+- **THEN** the dashboard SHALL show the row without `Open agent chat`
+- **AND** it SHALL NOT attempt to create or restore a session as part of dashboard rendering.
 
 ### Requirement: Compact MCP awareness
 The system SHALL provide compact MCP client/tool-call awareness without replacing existing MCP status surfaces.
