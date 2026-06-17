@@ -66,9 +66,9 @@
 
 ## 9. Dashboard UI shell
 
-- [ ] 9.1 Build the Orchestrator Dashboard shell with top counts, optional Coordinator rail, grouped inbox, inspection drawer, MCP footer, and filter affordance.
+- [ ] 9.1 Build the Orchestrator Dashboard shell with top counts, optional Coordinator rail, grouped inbox, optional inspection drawer, MCP footer, and filter affordance.
 - [ ] 9.2 Keep the main inbox calm by default: no full transcripts, full logs, diffs, file viewers, or streaming tool feeds.
-- [ ] 9.3 Add progressive disclosure from count to row to sourced drawer summaries to Agent Mode; keep full raw logs, transcripts, files, and diffs in Agent Mode for v1.
+- [ ] 9.3 Add progressive disclosure from count to row, optional sourced drawer summaries, and Agent Mode; keep full raw logs, transcripts, files, and diffs in Agent Mode for v1.
 - [ ] 9.4 Add UI previews or smoke states for empty workspace, active, needs-user, blocked, MCP-off, MCP-empty, MCP-active, filtered, zero-Coordinator inbox-only, and multiple-Coordinator most-recent states.
 
 ## 10. Validation

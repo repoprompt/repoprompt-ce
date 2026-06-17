@@ -16,7 +16,7 @@ The dashboard should therefore be a read-only projection over existing state, no
 
 - Add an opt-in Orchestrator Dashboard surface inside `.main` while preserving Agent Mode as the default.
 - Render all dashboard regions from one `OrchestratorDashboardSnapshot` projection.
-- Compose that projection from two independent upstreams: current-window Agent Mode live state, active-workspace session metadata, and `MCPServerViewModel.dashboard`.
+- Compose that projection from two independent upstream categories: Agent Mode state, including current-window live state plus active-workspace session metadata; and `MCPServerViewModel.dashboard`.
 - Scope v1 to active-workspace rows with current-window live-state enrichment.
 - Show Coordinator context when selected or detected, keep the inbox useful without a Coordinator, group session rows by total run-state-aware rules, render read-only pending interaction prompts, compact MCP awareness, and deep links to Agent Mode.
 - Use coarse observation and diff-before-publish behavior so streaming transcript/token deltas do not churn the dashboard.

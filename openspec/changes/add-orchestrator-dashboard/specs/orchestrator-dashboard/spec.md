@@ -152,8 +152,8 @@ The system SHALL group dashboard rows by testable, structured status rules.
 The system SHALL display pending interactions as read-only prompts that deep-link to Agent Mode.
 
 #### Scenario: Pending interaction is available
-- **WHEN** a live MCP-controlled session has an `AgentRunMCPSnapshot.Interaction`
-- **THEN** the dashboard MAY render a pending interaction summary with kind, title, prompt, details, and optional Agent UI route
+- **WHEN** a live MCP-controlled session has an `AgentRunMCPSnapshot.Interaction` that can be projected into the dashboard snapshot
+- **THEN** the dashboard SHALL render a read-only pending interaction summary with kind, title, prompt, details, and optional Agent UI route
 - **AND** non-MCP pending prompt/detail projection SHALL remain a follow-up Agent Mode contract change.
 
 #### Scenario: Pending interaction has no route
@@ -215,7 +215,7 @@ The system SHALL keep the dashboard calm by default and expose detail only throu
 
 #### Scenario: User selects a row
 - **WHEN** the user selects a dashboard row
-- **THEN** the dashboard MAY show an inspection drawer with sourced status, pending interaction, blocker, worktree/merge, route, MCP, and session metadata summaries
+- **THEN** the dashboard MAY show a read-only inspection drawer with sourced status, pending interaction, blocker, worktree/merge, route, MCP, and session metadata summaries
 - **AND** it SHALL NOT expose a dashboard-native full raw log, transcript, file viewer, or diff viewer in v1.
 
 #### Scenario: User needs deep detail
