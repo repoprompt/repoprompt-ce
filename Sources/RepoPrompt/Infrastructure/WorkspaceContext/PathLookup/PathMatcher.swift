@@ -1573,7 +1573,7 @@ enum PathMatcher {
             if isUnder(fullStd, root: rStd) || isUnder(fullRes, root: rStd) ||
                 isUnder(fullStd, root: rRes) || isUnder(fullRes, root: rRes)
             {
-                out.insert(rStd)
+                out.insert(root.rootPath)
             }
         }
         return Array(out)

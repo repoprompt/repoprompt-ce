@@ -18,6 +18,7 @@ struct PathMatchCacheIdentity: Hashable {
 
 struct PathMatchRootPathCache {
     struct Entry {
+        let rootPath: String
         let standardizedPath: String
         let resolvedPath: String
     }
@@ -28,6 +29,7 @@ struct PathMatchRootPathCache {
         entries = rootFolders.map { root in
             let standardizedPath = StandardizedPath.absolute(root.fullPath)
             return Entry(
+                rootPath: root.fullPath,
                 standardizedPath: standardizedPath,
                 resolvedPath: (standardizedPath as NSString).resolvingSymlinksInPath
             )
