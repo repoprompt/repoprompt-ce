@@ -1674,8 +1674,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 throw error
             }
 
+            let isolatedWorkspaceStorageURL = rootURL.appendingPathComponent("WorkspaceStorage", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: isolatedWorkspaceStorageURL,
+                withIntermediateDirectories: true
+            )
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            let previousGlobalStoragePath = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL")
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            UserDefaults.standard.set(isolatedWorkspaceStorageURL.path, forKey: "GlobalCustomStorageURL")
             let window = WindowState()
             let routingGuardWindow = WindowState()
             if agentOwned {
@@ -1688,7 +1695,16 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             // Keep dispatch in ordinary multi-window routing mode so catalog services retained by
             // earlier tests are filtered by window ID instead of relying on singleton cleanliness.
             WindowStatesManager.shared.registerWindowState(routingGuardWindow)
+
+            await window.workspaceManager.awaitInitialized()
+            await routingGuardWindow.workspaceManager.awaitInitialized()
+
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            if let previousGlobalStoragePath {
+                UserDefaults.standard.set(previousGlobalStoragePath, forKey: "GlobalCustomStorageURL")
+            } else {
+                UserDefaults.standard.removeObject(forKey: "GlobalCustomStorageURL")
+            }
 
             var rootID: UUID?
             var catalogService: MCPWindowToolCatalogService?
