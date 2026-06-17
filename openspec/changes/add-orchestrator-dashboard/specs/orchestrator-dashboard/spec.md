@@ -24,7 +24,7 @@ The system SHALL render the Orchestrator Dashboard from a single dashboard-facin
 - **THEN** those UI regions SHALL derive their displayed state from the same `OrchestratorDashboardSnapshot`.
 
 #### Scenario: Projection composes independent upstreams
-- **WHEN** the snapshot is produced
+- **WHEN** the snapshot is produced after `add-mcp-dashboard-consumer` is available
 - **THEN** it SHALL compose active window Agent Mode session state/metadata and MCP dashboard state
 - **AND** it SHALL NOT route MCP dashboard data through Agent Mode as a synthetic agent state.
 
@@ -140,7 +140,8 @@ The system SHALL display pending interactions as read-only prompts that deep-lin
 
 #### Scenario: Pending interaction is available
 - **WHEN** a live MCP-controlled session has an `AgentRunMCPSnapshot.Interaction`
-- **THEN** the dashboard MAY render a pending interaction summary with kind, title, prompt, details, and optional Agent UI route.
+- **THEN** the dashboard MAY render a pending interaction summary with kind, title, prompt, details, and optional Agent UI route
+- **AND** non-MCP pending prompt/detail projection SHALL remain a follow-up Agent Mode contract change.
 
 #### Scenario: Pending interaction has no route
 - **WHEN** a pending interaction summary cannot resolve an Agent UI route
@@ -171,7 +172,7 @@ The system SHALL provide compact MCP client/tool-call awareness without replacin
 
 #### Scenario: Dashboard is visible
 - **WHEN** the Orchestrator Dashboard is visible
-- **THEN** the system SHALL subscribe to MCP dashboard updates through a dashboard consumer such as `orchestratorDashboard`.
+- **THEN** the system SHALL subscribe to MCP dashboard updates through the Orchestrator Dashboard consumer provided by `add-mcp-dashboard-consumer`.
 
 #### Scenario: Dashboard is hidden
 - **WHEN** the Orchestrator Dashboard is not visible

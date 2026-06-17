@@ -5,7 +5,7 @@ RepoPrompt CE already has the raw data needed for a dashboard, but the data is s
 - `AgentSession` persists session identity, provider/model metadata, `parentSessionID`, MCP origin, run state, worktree bindings, and active merge summaries.
 - `AgentModeSidebarSessionBuilder` already demonstrates lineage-aware session grouping, status vocabulary, attention state, and calm row presentation.
 - `AgentRunMCPSnapshot.Interaction` provides the existing MCP-facing normalized pending interaction shape for live MCP-controlled sessions.
-- `MCPServerViewModel.dashboard` exposes MCP connection/tool-call state through an existing dashboard subscription lifecycle.
+- `MCPServerViewModel.dashboard` exposes MCP connection/tool-call state through an existing dashboard subscription lifecycle; the `add-mcp-dashboard-consumer` prerequisite adds the named Orchestrator Dashboard consumer for this lifecycle.
 - `AgentSessionDeepLinkRoute` and `WindowState.routeToAgentSession` already provide the basis for opening existing Agent Mode sessions.
 
 The dashboard should therefore be a read-only projection over existing state, not a new runtime, protocol, or Agent UI replacement.
@@ -48,7 +48,7 @@ The default `.main` surface remains Agent Mode. `AppLaunchConfiguration.forcedRo
 
 ### 3. One render projection, two upstreams
 
-The dashboard SHALL render from `OrchestratorDashboardSnapshot`. That snapshot is one UI consistency boundary, but it is composed from independent upstreams:
+This change depends on `add-mcp-dashboard-consumer` for the named MCP dashboard consumer identity. The dashboard SHALL render from `OrchestratorDashboardSnapshot`. That snapshot is one UI consistency boundary, but it is composed from independent upstreams:
 
 1. active window Agent Mode live state and active-workspace session metadata;
 2. `MCPServerViewModel.dashboard` with its existing dashboard consumer lifecycle.
@@ -80,7 +80,7 @@ Workflow labels are omitted in v1. A future workflow label pass can choose betwe
 
 ### 8. Pending interactions are read-only and MCP-scoped in v1
 
-V1 `Needs you` grouping is driven primarily by structured run state: `.waitingForUser`, `.waitingForQuestion`, and `.waitingForApproval`. Live MCP-controlled sessions may additionally provide normalized `AgentRunMCPSnapshot.Interaction` content as prompt/detail enrichment, but MCP interaction presence is not the only attention gate. Dashboard pending summaries carry render data plus an optional route, not executable actions:
+V1 `Needs you` grouping is driven primarily by structured run state: `.waitingForUser`, `.waitingForQuestion`, and `.waitingForApproval`. The pending-scope decision for v1 is MCP-only prompt/detail enrichment: live MCP-controlled sessions may additionally provide normalized `AgentRunMCPSnapshot.Interaction` content, but MCP interaction presence is not the only attention gate. A broader non-MCP pending projection is a follow-up Agent Mode contract change, not part of this dashboard core. Dashboard pending summaries carry render data plus an optional route, not executable actions:
 
 ```swift
 struct DashboardPendingInteractionSummary {
@@ -101,7 +101,7 @@ When route data is resolvable, dashboard rows and pending summaries use `AgentSe
 
 ### 10. MCP awareness is compact
 
-Add an `MCPServerViewModel.DashboardConsumer.orchestratorDashboard` case or equivalent consumer. The dashboard subscribes while visible and shows compact connected/idle/off client count, recent tool calls, and active/in-flight call count. Agent rows are active-workspace scoped, but the MCP footer is server/window scoped; it may include clients or calls not tied to the visible row list. External error triage, detailed attribution, and active-scope visualization are follow-ups.
+Consume the `MCPServerViewModel.DashboardConsumer.orchestratorDashboard` case added by `add-mcp-dashboard-consumer`. The dashboard subscribes while visible and shows compact connected/idle/off client count, recent tool calls, and active/in-flight call count. Agent rows are active-workspace scoped, but the MCP footer is server/window scoped; it may include clients or calls not tied to the visible row list. External error triage, detailed attribution, and active-scope visualization are follow-ups.
 
 ### 11. Status grouping is total and precedence-based
 
@@ -137,7 +137,7 @@ The v1 drawer shows sourced summaries only: status, pending interaction, blocker
 1. Add dashboard artifacts behind an opt-in in-`.main` surface while Agent Mode remains default.
 2. Build read-only snapshot projection and tests before UI action wiring.
 3. Add UI shell and deep links after snapshot behavior is stable.
-4. Add dashboard MCP consumer after compact projection tests are in place.
+4. Consume the MCP dashboard consumer added by `add-mcp-dashboard-consumer` after compact projection tests are in place.
 5. Defer dashboard-side actions, Coordinator directive transport, objective labels, and cross-window/cross-workspace aggregation.
 
 Rollback is simple for v1: remove or hide the dashboard entry point; Agent Mode remains the default and canonical surface.

@@ -5,10 +5,10 @@ Users can already run multiple isolated Agent Mode sessions, often across worktr
 ## What Changes
 
 - Add a new opt-in Orchestrator Dashboard surface inside the existing `.main` app experience.
-- Render the dashboard from a single `OrchestratorDashboardSnapshot` projection composed from the active window's Agent Mode state and `MCPServerViewModel.dashboard`.
+- Render the dashboard from a single `OrchestratorDashboardSnapshot` projection composed from the active window's Agent Mode state and `MCPServerViewModel.dashboard`, consuming the MCP dashboard consumer added by `add-mcp-dashboard-consumer`.
 - Scope v1 to the active workspace/current window and keep Agent Mode as the default surface.
 - Show a Coordinator rail when a Coordinator can be selected or detected, plus a grouped agent inbox, inspection drawer, compact MCP footer/popover, and deep links back to Agent Mode.
-- Surface pending decisions read-only for live MCP-controlled sessions and deep-link users to Agent Mode for response.
+- Group waiting sessions by run state and use live MCP-controlled pending interactions only as read-only prompt/detail enrichment, then deep-link users to Agent Mode for response.
 - Avoid heuristic labels and runtime rewrites: workflow is optional, objective is deferred, and workstream chips render only from structured data such as worktree binding metadata.
 
 ## Capabilities
@@ -24,5 +24,5 @@ None.
 
 - App shell: introduces in-`.main` surface selection while preserving existing `.main` / `.workspaceEntry` root gating and Agent Mode default behavior.
 - Agent Mode: reads existing session metadata, live window state, pending interaction projection, worktree binding summaries, and deep-link routing without replacing Agent UI.
-- MCP: adds a dashboard consumer/projection over existing MCP dashboard state rather than embedding the full MCP status surface.
+- MCP: depends on `add-mcp-dashboard-consumer` for the dashboard consumer identity, then projects existing MCP dashboard state rather than embedding the full MCP status surface.
 - Tests: requires snapshot, grouping, Coordinator selection, MCP projection, deep-link, and surface-selection coverage.

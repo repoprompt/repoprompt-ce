@@ -9,7 +9,7 @@
 
 - [ ] 2.1 Define `OrchestratorDashboardSnapshot` as the single render contract for counts, groups, rows, Coordinator rail, pending summaries, MCP footer, and deep-link payloads.
 - [ ] 2.2 Implement a lazy, window-scoped `@MainActor` dashboard view model.
-- [ ] 2.3 Compose the snapshot from active window Agent Mode session state/metadata and `MCPServerViewModel.dashboard`.
+- [ ] 2.3 Compose the snapshot from active window Agent Mode session state/metadata and `MCPServerViewModel.dashboard`, assuming `add-mcp-dashboard-consumer` has provided the named dashboard consumer.
 - [ ] 2.4 Add diff-before-publish/fingerprint behavior so streaming transcript or token deltas do not republish unchanged dashboard rows.
 - [ ] 2.5 Represent stale/persisted-only rows for sessions whose live state belongs to another window.
 
@@ -43,7 +43,7 @@
 ## 6. Pending interaction summaries
 
 - [ ] 6.1 Define dashboard pending summaries with `AgentRunMCPSnapshot.Interaction.Kind`, `AgentRunMCPSnapshot.Interaction.Detail`, and nullable `AgentSessionDeepLinkRoute`.
-- [ ] 6.2 Project summaries from live MCP-controlled `AgentRunMCPSnapshot.Interaction` values.
+- [ ] 6.2 Project prompt/detail summaries from live MCP-controlled `AgentRunMCPSnapshot.Interaction` values; leave broader non-MCP pending projection as a follow-up Agent Mode contract change.
 - [ ] 6.3 Hide or disable decision navigation when `openAgentChatRoute` cannot be resolved.
 - [ ] 6.4 Route users to Agent Mode for responses instead of executing dashboard-side actions.
 - [ ] 6.5 Add tests for pending interaction rendering, missing routes, and non-prose inference.
@@ -57,10 +57,10 @@
 
 ## 8. MCP compact projection
 
-- [ ] 8.1 Add an MCP dashboard consumer such as `MCPServerViewModel.DashboardConsumer.orchestratorDashboard`.
+- [ ] 8.1 Consume the Orchestrator Dashboard MCP consumer provided by `add-mcp-dashboard-consumer`.
 - [ ] 8.2 Subscribe to MCP dashboard updates while the dashboard is visible and unsubscribe when hidden.
 - [ ] 8.3 Project connected/idle/off client count, recent tool calls, and active/in-flight count as server/window-scoped MCP awareness that may not map one-to-one to visible rows.
-- [ ] 8.4 Add tests for MCP compact projection and MCP-off/empty states.
+- [ ] 8.4 Add tests for MCP compact projection and MCP-off/empty states without retesting the shared consumer lifecycle owned by `add-mcp-dashboard-consumer`.
 
 ## 9. Dashboard UI shell
 
