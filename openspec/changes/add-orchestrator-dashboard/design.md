@@ -76,7 +76,7 @@ V1 projects active-workspace sessions. Live run-state enrichment is current-wind
 
 ### 7. Labels are structured and conservative
 
-Workflow labels are omitted in v1. A future workflow label pass can choose between an index addition and shared request-anchor/transcript metadata lookup; that same lookup should be shared with workflow-based Coordinator detection if enabled. Objective labels are deferred. Workstream chips may optionally render from worktree binding/logical-root metadata when present and useful for the UI; otherwise omit them. Session-title parsing is out of scope.
+Workflow labels are omitted in v1. A future workflow label pass can choose between an index addition and shared request-anchor/transcript metadata lookup; that same lookup should be shared with workflow-based Coordinator detection if enabled. With no session-level workflow source in v1, the Orchestrate workflow auto-detection tier is inert; effective automatic Coordinator detection reduces to MCP-originated lineage-root candidates unless the deferred workflow lookup lands. Objective labels are deferred. Workstream chips may optionally render from worktree binding/logical-root metadata when present and useful for the UI; otherwise omit them. Session-title parsing is out of scope.
 
 ### 8. Pending interactions are read-only and MCP-scoped in v1
 
@@ -97,7 +97,7 @@ If `openAgentChatRoute` is nil, the dashboard hides or disables `Open agent chat
 
 ### 9. Deep links use existing Agent UI routing
 
-When route data is resolvable, dashboard rows and pending summaries use `AgentSessionDeepLinkRoute` or direct same-window `WindowState.routeToAgentSession`. A route requires active workspace context, a resolvable tab, and an optional session ID when available.
+When route data is resolvable, dashboard rows and pending summaries use `AgentSessionDeepLinkRoute` or direct same-window `WindowState.routeToAgentSession`. A route requires active workspace context, a resolvable tab, and an optional session ID when available. `AgentSessionMeta` is not a self-contained route payload because it does not carry `workspaceID`; v1 route construction uses the active workspace context for `workspaceID` and metadata for tab/session identifiers when present.
 
 ### 10. MCP awareness is compact
 
