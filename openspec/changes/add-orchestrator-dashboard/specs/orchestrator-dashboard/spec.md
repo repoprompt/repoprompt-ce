@@ -5,12 +5,23 @@ The system SHALL provide an opt-in Orchestrator Dashboard surface inside the exi
 
 #### Scenario: Agent Mode remains default
 - **WHEN** a user opens the app into the `.main` route
-- **THEN** the system SHALL show the existing Agent Mode surface by default
-- **AND** the dashboard SHALL be available only through an explicit dashboard entry point.
+- **THEN** the system SHALL show the existing Agent Mode surface by default in v1
+- **AND** this landing surface SHALL be represented as a configurable/default main-surface decision rather than a hard-coded permanent product constraint.
 
 #### Scenario: Workspace entry remains unchanged
 - **WHEN** the app is in workspace-entry routing
-- **THEN** the dashboard SHALL NOT bypass existing workspace-entry gating.
+- **THEN** the dashboard SHALL NOT bypass existing workspace-entry gating
+- **AND** the Agent Mode ↔ Orchestrator Dashboard surface switcher SHALL NOT appear until a real workspace is active.
+
+#### Scenario: Dashboard entry point is a peer surface switcher
+- **WHEN** a real workspace is active and the app is in `.main`
+- **THEN** the system SHALL provide a persistent top-level affordance for switching between Agent Mode and the Orchestrator Dashboard
+- **AND** the affordance SHALL model those views as peer `.main` surfaces rather than a one-way dashboard button or workspace-entry page.
+
+#### Scenario: Main surface selection is window-sticky
+- **WHEN** a user switches between Agent Mode and the Orchestrator Dashboard in a window
+- **THEN** that window SHALL retain the selected main surface while it remains alive
+- **AND** Coordinator selection state SHALL remain scoped separately by active workspace.
 
 #### Scenario: Forced main launch remains stable
 - **WHEN** UI tests or launch configuration force `.main`

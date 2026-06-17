@@ -35,7 +35,7 @@ The dashboard should therefore be a read-only projection over existing state, no
 
 ### 1. Dashboard surface lives inside `.main`
 
-`ContentViewModel.AppRootRoute` remains the binary workspace-entry gate (`.workspaceEntry` vs `.main`). The dashboard needs new window-scoped main-surface selection inside `.main`, and `ContentRootShellView.routedContent` should switch between existing Agent Mode and the dashboard within the `.main` branch.
+`ContentViewModel.AppRootRoute` remains the binary workspace-entry gate (`.workspaceEntry` vs `.main`). The dashboard needs new window-scoped main-surface selection inside `.main`, and `ContentRootShellView.routedContent` should switch between existing Agent Mode and the dashboard within the `.main` branch. Once a real workspace is active, the user reaches the dashboard through a persistent peer surface switcher for Agent Mode ↔ Orchestrator Dashboard; the switcher does not appear in or bypass workspace-entry/onboarding.
 
 Alternatives considered:
 
@@ -44,7 +44,7 @@ Alternatives considered:
 
 ### 2. Agent Mode remains default
 
-The default `.main` surface remains Agent Mode. `AppLaunchConfiguration.forcedRootRoute == .main` should continue to land on Agent Mode unless a future forced-surface test knob is added.
+The default `.main` surface remains Agent Mode in v1. Treat this as the configured landing surface, not a permanent hard-coded product truth, so a future control-plane release can choose the dashboard as the landing surface without replacing the routing seam. `AppLaunchConfiguration.forcedRootRoute == .main` should continue to land on Agent Mode unless a future forced-surface test knob is added. User surface selection is sticky per window while the window is alive; Coordinator selection remains keyed by active workspace.
 
 ### 3. One render projection, two upstreams
 

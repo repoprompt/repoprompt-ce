@@ -271,6 +271,25 @@ Recommended stance for now:
 - Plan Layer 2 against Option A first, while preserving row/window identity so Option B remains possible.
 - Do not pursue Option C without a separate architecture review.
 
+## Navigation Model
+
+The dashboard is not a workspace-entry page and not a subordinate Agent Mode panel. It is a peer surface inside `.main`.
+
+V1 navigation rules:
+
+- Workspace-entry/onboarding remains the gate before `.main`.
+- Opening/selecting a real workspace transitions into `.main`.
+- Agent Mode is the configured default landing surface in v1.
+- A persistent top-level surface switcher lets the user move between Agent Mode and Orchestrator Dashboard once a real workspace is active.
+- The switcher models Agent Mode and Orchestrator Dashboard as peer `.main` surfaces, not as a one-way dashboard button.
+- Surface selection is sticky per live window; switching workspaces in the same window keeps the selected surface unless workspace-entry gating takes over.
+- Coordinator selection has a different lifetime: it is keyed by active workspace, not by the window-level surface choice.
+- `AppLaunchConfiguration.forcedRootRoute == .main` continues to land on Agent Mode unless a future forced-surface knob is added.
+
+End-state implication:
+
+- “Which surface should a workspace open into?” is a configurable landing-surface decision, not a permanent route fact. V1 chooses Agent Mode for compatibility; a future control-plane release can choose the dashboard without replacing the `.main` surface-selection seam.
+
 ## V1 Forward-Compatibility Hooks
 
 These are cheap to preserve now and expensive to retrofit later.

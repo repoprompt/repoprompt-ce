@@ -1,9 +1,10 @@
 ## 1. Main surface and entry point
 
 - [ ] 1.1 Add window-scoped main-surface selection state inside `.main`.
-- [ ] 1.2 Preserve Agent Mode as the default `.main` surface.
-- [ ] 1.3 Add an opt-in entry point for the Orchestrator Dashboard.
-- [ ] 1.4 Preserve `AppLaunchConfiguration.forcedRootRoute == .main` behavior so deterministic UI tests still land on Agent Mode unless a forced-surface knob is added.
+- [ ] 1.2 Preserve Agent Mode as the configured default `.main` landing surface in v1.
+- [ ] 1.3 Add a persistent peer surface switcher for Agent Mode ↔ Orchestrator Dashboard that is available only after a real workspace is active.
+- [ ] 1.4 Preserve surface selection as sticky per live window while keeping Coordinator selection keyed by active workspace.
+- [ ] 1.5 Preserve `AppLaunchConfiguration.forcedRootRoute == .main` behavior so deterministic UI tests still land on Agent Mode unless a forced-surface knob is added.
 
 ## 2. Dashboard snapshot projection
 
