@@ -1179,7 +1179,10 @@ extension FileSystemService {
         defer { try? handle.close() }
 
         let skipProbe = shouldSkipBinaryProbe(url: validated.url)
-        if !skipProbe {
+        let probedTextPrefix: Data
+        if skipProbe {
+            probedTextPrefix = Data()
+        } else {
             try await runContentReadChunkHook(request)
             let probe = try handle.read(upToCount: 8192) ?? Data()
             try Task.checkCancellation()
@@ -1191,12 +1194,12 @@ extension FileSystemService {
                     required: requireStableIdentity
                 )
             }
-            try handle.seek(toOffset: 0)
+            probedTextPrefix = probe
         }
 
         if validated.fileSize < 2_000_000 {
             let data: Data
-            switch try await readBoundedData(request, handle: handle) {
+            switch try await readBoundedData(request, handle: handle, initialData: probedTextPrefix) {
             case let .data(readData):
                 data = readData
             case let .tooLarge(observedByteCount):
@@ -1386,9 +1389,13 @@ extension FileSystemService {
 
     private nonisolated static func readBoundedData(
         _ request: ContentReadRequest,
-        handle: FileHandle
+        handle: FileHandle,
+        initialData: Data = Data()
     ) async throws -> BoundedDataReadResult {
-        var data = Data()
+        var data = initialData
+        if Int64(data.count) > request.fileSizeLimit {
+            return .tooLarge(observedByteCount: Int64(data.count))
+        }
         while true {
             try await runContentReadChunkHook(request)
             let next = try handle.read(upToCount: request.chunkSize) ?? Data()

@@ -61,6 +61,27 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
         XCTAssertNil(standardizedNestedEncoding)
     }
 
+    func testSmallTextReadReusesBinaryProbePrefix() async throws {
+        let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingProbePrefix")
+        let service = try await makeService(root: root)
+        try FileSystemTestSupport.write("hello", to: root.appendingPathComponent("Small.txt"))
+        try Data([0x00, 0x01, 0x02, 0x03]).write(to: root.appendingPathComponent("Opaque.dat"))
+        let readCount = AsyncCounter()
+        await service.setContentReadChunkHandlerForTesting { _ in
+            _ = await readCount.incrementAndValue()
+        }
+
+        let text = try await service.loadContent(ofRelativePath: "Small.txt")
+        let countAfterText = await readCount.value()
+        let binary = try await service.loadContent(ofRelativePath: "Opaque.dat")
+        let countAfterBinary = await readCount.value()
+
+        XCTAssertEqual(text, "hello")
+        XCTAssertEqual(countAfterText, 2)
+        XCTAssertNil(binary)
+        XCTAssertEqual(countAfterBinary, 3)
+    }
+
     func testContentLoadingRejectsTraversalAndSymlinkTargets() async throws {
         let root = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingContainment")
         let outside = try temporaryRoots.makeRoot(suiteName: "FileSystemContentLoadingOutside")
