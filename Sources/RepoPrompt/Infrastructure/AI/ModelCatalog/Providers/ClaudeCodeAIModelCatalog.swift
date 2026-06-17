@@ -382,7 +382,10 @@ enum ClaudeCodeAIModelCatalog {
             guard let first = entries.first else { return nil }
             let options = entries
                 .sorted { lhs, rhs in
-                    compatibleBackendOptionRank(lhs.1.requestedModelRaw) < compatibleBackendOptionRank(rhs.1.requestedModelRaw)
+                    let lhsRank = compatibleBackendOptionRank(lhs.1.requestedModelRaw)
+                    let rhsRank = compatibleBackendOptionRank(rhs.1.requestedModelRaw)
+                    if lhsRank != rhsRank { return lhsRank < rhsRank }
+                    return lhs.1.optionDisplayName.localizedCaseInsensitiveCompare(rhs.1.optionDisplayName) == .orderedAscending
                 }
                 .map { model, descriptor in
                     AIModel.ClaudeCodePickerMenuOption(model: model, displayName: descriptor.optionDisplayName)
@@ -401,10 +404,16 @@ enum ClaudeCodeAIModelCatalog {
 
     private static func compatibleBackendOptionRank(_ rawModel: String?) -> Int {
         switch rawModel {
-        case .some(AgentModel.claudeHaiku.rawValue): 0
-        case .some(AgentModel.claudeSonnet.rawValue): 1
-        case .some(AgentModel.claudeOpus.rawValue): 2
-        default: 0
+        case .some(AgentModel.claudeHaiku.rawValue): return 0
+        case .some(AgentModel.claudeSonnet.rawValue): return 1
+        case .some(AgentModel.claudeOpus.rawValue): return 2
+        case let .some(raw):
+            if let index = ClaudeCompatibleProviderRuntimeBridge.directSelectableGLMModelRawValues.firstIndex(of: raw) {
+                return 10 + index
+            }
+            return 99
+        case nil:
+            return 99
         }
     }
 

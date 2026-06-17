@@ -341,6 +341,25 @@ final class ClaudeCompatiblePluginBridgeTests: XCTestCase {
         )
     }
 
+    func testGLMCompatibleBackendPickerLabelsSlotsAndLegacyChoicesDistinctly() throws {
+        let restore = installTemporaryOldGLMDefaultSlotMapping()
+        defer { restore() }
+
+        let models = ClaudeCodeAIModelCatalog.compatibleBackendModelsForPicker(.glmZAI)
+        let menu = AIModel.claudeCodeMenu(for: models)
+        let group = try XCTUnwrap(menu.groups.first { $0.baseModelRaw == "compatible:glmzai" })
+
+        XCTAssertEqual(group.displayName, "Saved CC Zai")
+        XCTAssertEqual(group.options.map(\.displayName), [
+            "GLM 4.5 Air — Haiku",
+            "GLM 5.2 (1M) — Sonnet",
+            "GLM 5.2 (1M) — Opus",
+            "GLM 4.7",
+            "GLM 5 Turbo",
+            "GLM 5.1"
+        ])
+    }
+
     func testCustomSlotMappingUsesBackendModelIDForXHighAndContextSupport() throws {
         let restore = installTemporaryCustomSlotMapping()
         defer { restore() }
