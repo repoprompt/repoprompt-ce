@@ -282,11 +282,18 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             profile: .uiAssisted,
             rootScope: failClosedProjection.lookupRootScope
         )
+        let scopeAvailability = await store.rootScopeAvailability(failClosedProjection.lookupRootScope)
+        let catalogAccess = await store.searchCatalogAccess(rootScope: failClosedProjection.lookupRootScope)
         XCTAssertEqual(failClosedProjection.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
         XCTAssertFalse(failClosedProjection.isFullyMaterialized)
         XCTAssertEqual(
             failClosedProjection.lookupRootScope,
             .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: [])
+        )
+        XCTAssertEqual(scopeAvailability, .sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
+        XCTAssertEqual(
+            catalogAccess,
+            .unavailable(.sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
         )
         XCTAssertNotNil(visibleLookup)
         XCTAssertNil(scopedLookup)

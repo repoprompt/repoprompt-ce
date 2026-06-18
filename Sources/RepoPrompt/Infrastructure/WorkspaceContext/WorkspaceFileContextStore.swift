@@ -565,6 +565,8 @@ actor WorkspaceFileContextStore {
             let publishedShardCount: Int
             let totalBuildCount: Int
             let totalBackstopCount: Int
+            let singleShardCompositionReuseCount: Int
+            let genericMergeElementVisitCount: Int
             let shadowComparisonCount: Int
             let shadowMismatchCount: Int
             let lastShadowByteCount: Int
@@ -673,6 +675,8 @@ actor WorkspaceFileContextStore {
         private var rootCatalogShardFallbackReasonCountsByRootID: [UUID: [String: Int]] = [:]
         private var rootCatalogShardBackstopCountsByRootID: [UUID: Int] = [:]
         private var rootCatalogShardMaxLiveGenerationCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardSingleShardCompositionReuseCount = 0
+        private var rootCatalogShardGenericMergeElementVisitCount = 0
         private var rootCatalogShardShadowComparisonCount = 0
         private var rootCatalogShardShadowMismatchCount = 0
         private var rootCatalogShardLastShadowByteCount = 0
@@ -926,6 +930,8 @@ actor WorkspaceFileContextStore {
                 publishedShardCount: publishedRootCatalogShardsByRootID.count,
                 totalBuildCount: rootCatalogShardBuildCountsByRootID.values.reduce(0, +),
                 totalBackstopCount: rootCatalogShardBackstopCountsByRootID.values.reduce(0, +),
+                singleShardCompositionReuseCount: rootCatalogShardSingleShardCompositionReuseCount,
+                genericMergeElementVisitCount: rootCatalogShardGenericMergeElementVisitCount,
                 shadowComparisonCount: rootCatalogShardShadowComparisonCount,
                 shadowMismatchCount: rootCatalogShardShadowMismatchCount,
                 lastShadowByteCount: rootCatalogShardLastShadowByteCount,
@@ -1388,17 +1394,20 @@ actor WorkspaceFileContextStore {
     private var codeScanResultTask: Task<Void, Never>?
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
+        private let isCatalogShardShadowValidationEnabled: Bool
     #endif
 
     #if DEBUG
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
-            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            enableCatalogShardShadowValidation: Bool = true
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -2511,8 +2520,11 @@ actor WorkspaceFileContextStore {
     }
 
     func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
-        guard case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths) = rootScope else {
+        guard case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths) = rootScope else {
             return .available
+        }
+        guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
+            return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
         }
         let requested = Set(requestedPhysicalRootPaths.map {
             StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
@@ -2563,7 +2575,7 @@ actor WorkspaceFileContextStore {
             let rebuildStart = DispatchTime.now().uptimeNanoseconds
         #endif
         let roots = rootsForPathLookup(scope: rootScope)
-        let generation = scopedSnapshotGeneration(scope: rootScope)
+        let generation = scopedSnapshotGeneration(scope: rootScope, validationToken: validationToken)
         var shouldCacheSnapshot = false
         let snapshot: WorkspaceSearchCatalogSnapshot
         if let shards = prepareAndPublishRootCatalogShardBatch(for: roots) {
@@ -2575,27 +2587,29 @@ actor WorkspaceFileContextStore {
             )
             shouldCacheSnapshot = true
             #if DEBUG
-                let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
-                    rootScope: rootScope,
-                    generation: generation,
-                    roots: roots,
-                    includePathIndexes: false
-                )
-                let composedBytes = catalogShadowBytes(composedSnapshot)
-                let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
-                let shadowMatches = composedBytes == authoritativeBytes
-                recordRootCatalogShardShadowComparison(
-                    matched: shadowMatches,
-                    byteCount: authoritativeBytes.count
-                )
-                if !shadowMatches {
-                    assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
-                    composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                if isCatalogShardShadowValidationEnabled {
+                    let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
                         rootScope: rootScope,
                         generation: generation,
-                        roots: roots
+                        roots: roots,
+                        includePathIndexes: false
                     )
-                    shouldCacheSnapshot = false
+                    let composedBytes = catalogShadowBytes(composedSnapshot)
+                    let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
+                    let shadowMatches = composedBytes == authoritativeBytes
+                    recordRootCatalogShardShadowComparison(
+                        matched: shadowMatches,
+                        byteCount: authoritativeBytes.count
+                    )
+                    if !shadowMatches {
+                        assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
+                        composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                            rootScope: rootScope,
+                            generation: generation,
+                            roots: roots
+                        )
+                        shouldCacheSnapshot = false
+                    }
                 }
             #endif
             snapshot = composedSnapshot
@@ -3226,7 +3240,18 @@ actor WorkspaceFileContextStore {
         roots: [WorkspaceRootRecord],
         shards: [RootCatalogShard]
     ) -> WorkspaceSearchCatalogSnapshot {
-        let merged = mergeRootCatalogShards(shards)
+        let merged: (files: [WorkspaceFileRecord], entries: [WorkspaceSearchCatalogEntry])
+        if let shard = shards.first, shards.count == 1 {
+            merged = (shard.files, shard.entries)
+            #if DEBUG
+                rootCatalogShardSingleShardCompositionReuseCount += 1
+            #endif
+        } else {
+            merged = mergeRootCatalogShards(shards)
+            #if DEBUG
+                rootCatalogShardGenericMergeElementVisitCount += merged.files.count
+            #endif
+        }
         let diagnostics = WorkspaceCatalogDiagnostics(
             generation: generation,
             rootScope: rootScope,
@@ -7591,7 +7616,16 @@ actor WorkspaceFileContextStore {
     #endif
 
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
-        let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
+        scopedSnapshotGeneration(
+            scope: scope,
+            validationToken: searchCatalogSnapshotValidationToken(scope: scope)
+        )
+    }
+
+    private func scopedSnapshotGeneration(
+        scope: WorkspaceLookupRootScope,
+        validationToken: SearchCatalogSnapshotValidationToken
+    ) -> UInt64 {
         switch validationToken {
         case let .staticScope(generation):
             return generation
