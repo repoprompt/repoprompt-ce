@@ -425,6 +425,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             let beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?
             let providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?
             let teardownCompleted: ((_ runID: UUID) -> Void)?
+            let allowSyntheticRoutingWithoutFinalContext: Bool
             let resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)?
             let runMCPFollowUp: MCPFollowUpRunner?
 
@@ -432,12 +433,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 beforeProcessingProviderEvent: ((_ result: AIStreamResult, _ runID: UUID) async -> Void)?,
                 providerEventDisposition: ((_ result: AIStreamResult, _ runID: UUID, _ accepted: Bool) -> Void)?,
                 teardownCompleted: ((_ runID: UUID) -> Void)?,
+                allowSyntheticRoutingWithoutFinalContext: Bool = false,
                 resolveMCPFollowUpModel: ((_ mode: String) async throws -> MCPFollowUpModelSelection)? = nil,
                 runMCPFollowUp: MCPFollowUpRunner? = nil
             ) {
                 self.beforeProcessingProviderEvent = beforeProcessingProviderEvent
                 self.providerEventDisposition = providerEventDisposition
                 self.teardownCompleted = teardownCompleted
+                self.allowSyntheticRoutingWithoutFinalContext = allowSyntheticRoutingWithoutFinalContext
                 self.resolveMCPFollowUpModel = resolveMCPFollowUpModel
                 self.runMCPFollowUp = runMCPFollowUp
             }
@@ -2625,6 +2628,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         let windowID = mcpServer.windowID
         let agentClientName = agent.mcpClientNameHint
         guard let finalContextConnectionID = mcpServer.contextBuilderFinalContextConnectionID(runID: runID) else {
+            #if DEBUG
+                if runTestHooks?.allowSyntheticRoutingWithoutFinalContext == true {
+                    guard activeAgentRuns.remove(runID) != nil, acceptsEvents(from: record) else {
+                        return .staleOrNoLongerCurrent
+                    }
+                    return .committed
+                }
+            #endif
             return .missingFinalContext(runID: runID, connectionID: nil)
         }
         record.finalContextConnectionIDForDiagnostics = finalContextConnectionID

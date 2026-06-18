@@ -321,6 +321,7 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                     beforeProcessingProviderEvent: nil,
                     providerEventDisposition: nil,
                     teardownCompleted: nil,
+                    allowSyntheticRoutingWithoutFinalContext: true,
                     runMCPFollowUp: { mode, prompt, selection in
                         await followUpRecorder.record(
                             mode: mode,
