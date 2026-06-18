@@ -31,7 +31,7 @@ enum AgentProviderContextBuilder {
         tokenCap: Int,
         store: WorkspaceFileContextStore,
         lookupContext: WorkspaceLookupContext,
-        overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext) async -> String?)? = nil
+        overTokenCapSummaryProvider: ((StoredSelection, WorkspaceLookupContext, WorkspaceCodemapSnapshotBundle) async -> String?)? = nil
     ) async -> String {
         let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
         let accountingService = PromptContextAccountingService()
@@ -42,36 +42,62 @@ enum AgentProviderContextBuilder {
             rootScope: lookupContext.rootScope,
             pathLocateProfile: .uiAssisted
         )
-        let accounting = await accountingService.calculatePromptStats(request: request, store: store)
+        let displayPathResolver: (ResolvedPromptFileEntry) -> String? = { entry in
+            lookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: entry.file.standardizedFullPath,
+                display: .relative
+            )
+        }
+        let accounting = await accountingService.calculatePromptStats(
+            request: request,
+            store: store,
+            codemapDisplayPathResolver: displayPathResolver
+        )
         let entries = accounting.resolvedEntries
         let selectionTokens = accounting.tokenResult.totalTokenCountFilesOnly
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
+            + accounting.tokenResult.codeMapTokenCount
+        let codemapSnapshotBundle = accounting.codemapSnapshotBundle
 
         if selectionTokens > tokenCap {
-            if let summary = await overTokenCapSummaryProvider?(logicalSelection, lookupContext),
-               !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if let summary = await overTokenCapSummaryProvider?(
+                logicalSelection,
+                lookupContext,
+                codemapSnapshotBundle
+            ),
+                !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             {
                 return summary
             }
             return "<selection_summary>\(entries.count) files, ~\(selectionTokens) tokens (contents omitted, exceeds \(tokenCap) token cap)</selection_summary>"
         }
 
-        let blocks = PromptPackagingService.generateFileContents(
-            entries,
+        let renderableEntries = entries.filter { entry in
+            !entry.isCodemap || codemapSnapshotBundle.hasRenderableCodemap(for: entry.file)
+        }
+        let (codemapBlocks, contentBlocks) = PromptPackagingService.generatePartitionedFileBlocks(
+            renderableEntries,
             filePathDisplay: .relative,
-            codemapSnapshots: codemapSnapshots,
-            displayPathResolver: { entry in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-                    forPhysicalPath: entry.file.standardizedFullPath,
-                    display: .relative
-                )
-            }
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            displayPathResolver: displayPathResolver
         )
-        guard !blocks.isEmpty else { return "" }
-        return """
-        <file_contents>
-        \(blocks.joined(separator: "\n\n"))
-        </file_contents>
-        """
+        var sections: [String] = []
+        if let fileMap = PromptPackagingService.combinedFileMapContent(
+            fileTreeContent: nil,
+            codemapBlocks: codemapBlocks
+        ) {
+            sections.append("""
+            <file_map>
+            \(fileMap)
+            </file_map>
+            """)
+        }
+        if !contentBlocks.isEmpty {
+            sections.append("""
+            <file_contents>
+            \(contentBlocks.joined(separator: "\n\n"))
+            </file_contents>
+            """)
+        }
+        return sections.joined(separator: "\n\n")
     }
 }

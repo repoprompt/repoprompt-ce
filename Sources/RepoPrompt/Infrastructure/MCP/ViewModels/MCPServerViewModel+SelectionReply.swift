@@ -282,6 +282,7 @@ extension MCPServerViewModel {
         codeMapUsageOverride: CodeMapUsage? = nil,
         virtualContext: TabScopedContext? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle? = nil,
         ingressPolicy: SelectionReplyIngressPolicy = .awaitPending
     ) async -> ToolResultDTOs.SelectionReply {
         // Always use .auto mode for manage_selection (normalized view)
@@ -302,6 +303,7 @@ extension MCPServerViewModel {
             from: source,
             owner: self,
             rootScope: lookupContext.rootScope,
+            codemapSnapshotBundle: codemapSnapshotBundle,
             contentPolicy: includeBlocks ? .loadContent : .cachedOnly
         )
         let resolvedPromptContext = promptVM.resolvePromptContext()
@@ -322,7 +324,7 @@ extension MCPServerViewModel {
             collections: collections,
             resolvedContext: resolvedPromptContext,
             lookupContext: lookupContext,
-            activeTabCompatibility: virtualContext == nil
+            activeTabCompatibility: virtualContext == nil && codemapSnapshotBundle == nil
         )
         let formatter = PathFormatter(format: display, owner: self, projection: lookupContext.bindingProjection)
         let tokens = TokenServices(owner: self)
@@ -494,7 +496,7 @@ extension MCPServerViewModel {
 
         var unmapped: [String] = []
         var seen = Set<String>()
-        for file in files where collections.codemapSnapshots[file.id]?.fileAPI == nil {
+        for file in files where !collections.codemapSnapshotBundle.hasRenderableCodemap(for: file) {
             let p: String = if let projection,
                                let projected = projection.projectedLogicalDisplayPath(forPhysicalPath: file.standardizedFullPath, display: display)
             {

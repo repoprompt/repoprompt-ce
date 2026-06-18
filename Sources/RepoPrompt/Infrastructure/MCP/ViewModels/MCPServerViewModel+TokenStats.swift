@@ -236,7 +236,7 @@ extension MCPServerViewModel {
         let entries = collections.selected.map(\.entry) + collections.codemap.map(\.entry)
         let snapshots = await PromptContextAccountingService().makePromptFileEntrySnapshots(
             from: entries,
-            codemapSnapshots: collections.codemapSnapshots,
+            codemapSnapshotBundle: collections.codemapSnapshotBundle,
             filePathDisplay: promptVM.filePathDisplayOption
         )
         return await TokenCalculationService().evaluatePromptEntries(snapshots)

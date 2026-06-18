@@ -11990,6 +11990,7 @@ final class AgentModeViewModel: ObservableObject {
         let workspaceBlocks = PromptPackagingService.generateFileBlocksDetailed(
             files: workspaceEntries,
             filePathDisplay: .relative,
+            codemapSnapshotBundle: .empty,
             displayPathResolver: { entry in
                 lookupContext.bindingProjection?.projectedLogicalDisplayPath(
                     forPhysicalPath: entry.file.standardizedFullPath,
@@ -15203,13 +15204,14 @@ final class AgentModeViewModel: ObservableObject {
             tokenCap: tokenCap,
             store: promptManager.workspaceFileContextStore,
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { [weak self] selection, lookupContext in
+            overTokenCapSummaryProvider: { [weak self] selection, lookupContext, codemapSnapshotBundle in
                 guard let self, let mcp = mcpServer else { return nil }
                 let reply = await mcp.buildTabSelectionReply(
                     from: selection,
                     includeBlocks: false,
                     display: .relative,
-                    lookupContextOverride: lookupContext
+                    lookupContextOverride: lookupContext,
+                    codemapSnapshotBundle: codemapSnapshotBundle
                 )
                 let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
                 return """

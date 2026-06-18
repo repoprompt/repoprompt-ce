@@ -189,12 +189,15 @@ struct WorkspaceSelectionMutationService {
 
         let isSliceScopedSet = mode == "slices" || (paths.isEmpty && !sliceInputs.isEmpty)
         guard isSliceScopedSet else {
+            let replacementSeed = StoredSelection(
+                codemapAutoEnabled: existing.codemapAutoEnabled
+            )
             return await buildSelection(
                 paths: paths,
                 slices: sliceInputs,
                 sliceErrors: sliceErrors,
                 mode: mode,
-                existing: StoredSelection(),
+                existing: replacementSeed,
                 rootScope: rootScope
             )
         }
@@ -397,6 +400,7 @@ struct WorkspaceSelectionMutationService {
                 EditFlowPerf.Dimensions(outcome: "skipped")
             )
         }
+        mutated = selection != existing
         return WorkspaceAddSelectionResult(selection: selection, invalidPaths: resolution.invalid, resolvedMap: resolution.resolvedMap, mutated: mutated, codemapUnavailable: resolution.unavailable)
     }
 
@@ -441,7 +445,12 @@ struct WorkspaceSelectionMutationService {
         if selection.codemapAutoEnabled, !disableAuto {
             selection = await recomputeAutoCodemaps(selection, rootScope: rootScope)
         }
-        return WorkspaceRemoveSelectionResult(selection: selection, invalidPaths: resolution.invalidPaths, resolvedMap: resolution.resolvedMap, mutated: mutated)
+        return WorkspaceRemoveSelectionResult(
+            selection: selection,
+            invalidPaths: resolution.invalidPaths,
+            resolvedMap: resolution.resolvedMap,
+            mutated: selection != existing
+        )
     }
 
     func promotePaths(
@@ -663,7 +672,7 @@ struct WorkspaceSelectionMutationService {
             return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)
         }
         let codemapAPILoad = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad)
-        let aggregate = await store.codemapFileAPIAggregate()
+        let aggregate = await store.codemapFileAPIAggregate(rootScope: rootScope)
         EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.codemapAPILoad, codemapAPILoad)
         guard !aggregate.orderedFileAPIs.isEmpty else {
             return StoredSelection(selectedPaths: base.selectedPaths, autoCodemapPaths: [], slices: base.slices, codemapAutoEnabled: base.codemapAutoEnabled)

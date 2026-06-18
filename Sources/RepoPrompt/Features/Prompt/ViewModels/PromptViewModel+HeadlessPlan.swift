@@ -85,15 +85,19 @@ extension PromptViewModel {
         } else {
             nil
         }
-        let fileBlocks = PromptPackagingService.generateFileContents(
+        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
             codeEntries,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             displayPathResolver: displayPathResolver
         )
+        let fileBlocks = partitionedBlocks.contentBlocks
 
-        // 3. Use the neutral pre-assembly file tree.
-        let fileTree = preAssembly.fileTreeContent ?? ""
+        // 3. Combine the frozen file tree with only the canonical codemap partition.
+        let fileTree = PromptPackagingService.combinedFileMapContent(
+            fileTreeContent: preAssembly.fileTreeContent,
+            codemapBlocks: partitionedBlocks.codemapBlocks
+        ) ?? ""
 
         // 4. System prompt based on mode
         let systemPrompt: String = {

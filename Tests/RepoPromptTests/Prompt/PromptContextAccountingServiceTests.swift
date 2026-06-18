@@ -173,6 +173,79 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         XCTAssertEqual(resolution.invalidPaths, [])
     }
 
+    func testAutoCodemapResolutionUsesCanonicalPathsAndPreservesSlices() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingCanonicalAutoCodemap")
+        let selectedURL = root.appendingPathComponent("Selected.swift")
+        let targetURL = root.appendingPathComponent("Target.swift")
+        try write("let excluded = 0\nlet selected = TargetType()\n", to: selectedURL)
+        try write("struct TargetType { func targetFullContent() {} }\n", to: targetURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        await store.applyObservedCodemapResults([
+            WorkspaceObservedCodemapResult(
+                fullPath: selectedURL.path,
+                modificationDate: Date(),
+                fileAPI: makeFileAPI(
+                    path: selectedURL.path,
+                    symbolName: "selectedSymbol",
+                    referencedTypes: ["TargetType"]
+                )
+            ),
+            WorkspaceObservedCodemapResult(
+                fullPath: targetURL.path,
+                modificationDate: Date(),
+                fileAPI: makeFileAPI(
+                    path: targetURL.path,
+                    symbolName: "targetCodemapSymbol",
+                    className: "TargetType"
+                )
+            )
+        ])
+        let service = PromptContextAccountingService()
+        let slice = LineRange(start: 2, end: 2)
+        let selectionWithoutCanonicalCodemap = StoredSelection(
+            selectedPaths: [selectedURL.path],
+            autoCodemapPaths: [],
+            slices: [selectedURL.path: [slice]],
+            codemapAutoEnabled: false
+        )
+
+        let withoutCanonicalCodemap = await service.resolveEntries(
+            selection: selectionWithoutCanonicalCodemap,
+            store: store,
+            codeMapUsage: .auto
+        )
+
+        let selectedOnlyEntry = try XCTUnwrap(withoutCanonicalCodemap.entries.first)
+        XCTAssertEqual(withoutCanonicalCodemap.entries.count, 1)
+        XCTAssertEqual(selectedOnlyEntry.file.standardizedFullPath, selectedURL.standardizedFileURL.path)
+        XCTAssertEqual(selectedOnlyEntry.mode, .sliced)
+        XCTAssertEqual(selectedOnlyEntry.lineRanges, [slice])
+        XCTAssertFalse(selectedOnlyEntry.isCodemap)
+
+        let canonicalSelection = StoredSelection(
+            selectedPaths: selectionWithoutCanonicalCodemap.selectedPaths,
+            autoCodemapPaths: [targetURL.path],
+            slices: selectionWithoutCanonicalCodemap.slices,
+            codemapAutoEnabled: false
+        )
+        let canonicalResolution = await service.resolveEntries(
+            selection: canonicalSelection,
+            store: store,
+            codeMapUsage: .auto
+        )
+
+        XCTAssertEqual(canonicalResolution.entries.count, 2)
+        let selectedEntry = try XCTUnwrap(canonicalResolution.entries.first { $0.file.standardizedFullPath == selectedURL.standardizedFileURL.path })
+        XCTAssertEqual(selectedEntry.mode, .sliced)
+        XCTAssertEqual(selectedEntry.lineRanges, [slice])
+        let codemapEntry = try XCTUnwrap(canonicalResolution.entries.first { $0.file.standardizedFullPath == targetURL.standardizedFileURL.path })
+        XCTAssertEqual(codemapEntry.mode, .codemap)
+        XCTAssertTrue(codemapEntry.isCodemap)
+        XCTAssertNil(codemapEntry.loadedContent)
+    }
+
     func testMissingSelectedPathsRemainMissingAndInvalidPathsRemainEmpty() async throws {
         let root = try makeTemporaryRoot(name: "AccountingMissing")
         try write("alpha", to: root.appendingPathComponent("A.swift"))
@@ -279,6 +352,48 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         #endif
     }
 
+    func testCodemapAccountingCountsExactRenderedHeaderAndImports() async throws {
+        let root = try makeTemporaryRoot(name: "AccountingRenderedCodemapTokens")
+        let fileURL = root.appendingPathComponent("Nested/Target.swift")
+        try write("struct Target {}", to: fileURL)
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let api = makeFileAPI(
+            path: fileURL.path,
+            symbolName: "renderedTokenSentinel",
+            imports: ["Foundation", "Combine"]
+        )
+        await store.applyObservedCodemapResults([
+            WorkspaceObservedCodemapResult(
+                fullPath: fileURL.path,
+                modificationDate: Date(),
+                fileAPI: api
+            )
+        ])
+
+        let result = await PromptContextAccountingService().calculatePromptStats(
+            request: PromptContextAccountingRequest(
+                selection: StoredSelection(
+                    autoCodemapPaths: [fileURL.path],
+                    codemapAutoEnabled: true
+                ),
+                codeMapUsage: .auto,
+                filePathDisplay: .relative
+            ),
+            store: store
+        )
+
+        let rendered = api.getFullAPIDescription(displayPath: "Nested/Target.swift")
+        let expectedTokens = TokenCalculationService.estimateTokens(for: rendered)
+        let snapshot = try XCTUnwrap(result.promptFileEntrySnapshots.first)
+        XCTAssertEqual(result.promptFileEntrySnapshots.count, 1)
+        XCTAssertEqual(snapshot.codeMapContent, rendered)
+        XCTAssertEqual(snapshot.availableCodeMapTokenCount, expectedTokens)
+        XCTAssertEqual(result.tokenResult.codeMapTokenCount, expectedTokens)
+        XCTAssertEqual(result.tokenResult.totalTokenCountFilesOnly, 0)
+    }
+
     func testCompleteCodemapResolutionBuildsSingleStaticPathSnapshot() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AccountingCompleteCodemapBatch")
@@ -348,24 +463,30 @@ final class PromptContextAccountingServiceTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
-    private func makeFileAPI(path: String) -> FileAPI {
+    private func makeFileAPI(
+        path: String,
+        symbolName: String = "codemapOnlySymbol",
+        className: String? = nil,
+        imports: [String] = [],
+        referencedTypes: [String] = []
+    ) -> FileAPI {
         FileAPI(
             filePath: path,
-            imports: [],
-            classes: [],
+            imports: imports,
+            classes: className.map { [ClassInfo(name: $0, methods: [], properties: [])] } ?? [],
             functions: [
                 FunctionInfo(
-                    name: "codemapOnlySymbol",
+                    name: symbolName,
                     parameters: [],
                     returnType: nil,
-                    definitionLine: "func codemapOnlySymbol()",
+                    definitionLine: "func \(symbolName)()",
                     lineNumber: 1
                 )
             ],
             enums: [],
             globalVars: [],
             macros: [],
-            referencedTypes: []
+            referencedTypes: referencedTypes
         )
     }
 }

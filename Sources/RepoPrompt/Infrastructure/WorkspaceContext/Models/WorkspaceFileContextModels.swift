@@ -497,6 +497,60 @@ struct WorkspaceCodemapSnapshot {
     let fileAPI: FileAPI?
 }
 
+/// Immutable codemap state captured once for a context-building operation.
+/// Consumers keep using this value even if the workspace store changes across awaits.
+struct WorkspaceCodemapSnapshotBundle {
+    struct RenderedCodemap {
+        let text: String
+        let tokenCount: Int
+    }
+
+    static let empty = WorkspaceCodemapSnapshotBundle(snapshots: [])
+
+    let snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]
+    let orderedSnapshots: [WorkspaceCodemapSnapshot]
+
+    init(snapshots: [WorkspaceCodemapSnapshot]) {
+        orderedSnapshots = snapshots.sorted {
+            let lhsPath = StandardizedPath.absolute($0.fullPath)
+            let rhsPath = StandardizedPath.absolute($1.fullPath)
+            if lhsPath != rhsPath { return lhsPath < rhsPath }
+            return $0.fileID.uuidString < $1.fileID.uuidString
+        }
+        snapshotsByFileID = Dictionary(uniqueKeysWithValues: orderedSnapshots.map { ($0.fileID, $0) })
+    }
+
+    init(snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]) {
+        self.init(snapshots: Array(snapshotsByFileID.values))
+    }
+
+    var count: Int {
+        snapshotsByFileID.count
+    }
+
+    func snapshot(for file: WorkspaceFileRecord) -> WorkspaceCodemapSnapshot? {
+        guard let snapshot = snapshotsByFileID[file.id],
+              snapshot.rootID == file.rootID,
+              StandardizedPath.absolute(snapshot.fullPath) == file.standardizedFullPath
+        else { return nil }
+        return snapshot
+    }
+
+    func hasRenderableCodemap(for file: WorkspaceFileRecord) -> Bool {
+        snapshot(for: file)?.fileAPI != nil
+    }
+
+    func renderedCodemap(for file: WorkspaceFileRecord, displayPath: String) -> RenderedCodemap? {
+        guard let api = snapshot(for: file)?.fileAPI else { return nil }
+        let text = api.getFullAPIDescription(displayPath: displayPath)
+        guard !text.isEmpty else { return nil }
+        return RenderedCodemap(
+            text: text,
+            tokenCount: TokenCalculationService.estimateTokens(for: text)
+        )
+    }
+}
+
 struct WorkspaceCodemapRepairResult {
     let snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]
     let pendingFileIDs: Set<UUID>

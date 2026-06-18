@@ -11448,10 +11448,10 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func clearAutoCodemapFiles(disableAuto: Bool = true) {
-        guard !autoCodemapFiles.isEmpty else { return }
-        if disableAuto, codemapAutoEnabled {
-            codemapAutoEnabled = false
+        if disableAuto {
+            enterManualCodemapMode()
         }
+        guard !autoCodemapFiles.isEmpty else { return }
         resetAutoCodemapFiles([])
     }
 
@@ -11463,8 +11463,10 @@ extension WorkspaceFilesViewModel {
         // Only sync when auto mode is enabled
         if codemapAutoEnabled {
             // Recompute the auto-codemap set immediately from the store codemap mirror.
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
+            let aggregate = await workspaceFileContextStore.codemapFileAPIAggregate(
+                rootScope: .visibleWorkspace
+            )
+            syncAutoCodemaps(aggregate: aggregate)
         }
     }
 
@@ -11543,14 +11545,16 @@ extension WorkspaceFilesViewModel {
             defer { self.autoCodemapSyncTask = nil }
             guard !Task.isCancelled else { return }
             guard codemapAutoEnabled else { return }
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
+            let aggregate = await workspaceFileContextStore.codemapFileAPIAggregate(
+                rootScope: .visibleWorkspace
+            )
             guard !Task.isCancelled else { return }
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
+            syncAutoCodemaps(aggregate: aggregate)
         }
     }
 
     @MainActor
-    private func syncAutoCodemaps(allFileAPIs: [FileAPI]) {
+    private func syncAutoCodemaps(aggregate: WorkspaceCodemapFileAPIAggregate) {
         guard codemapAutoEnabled else {
             resetAutoCodemapFiles([])
             return
@@ -11561,21 +11565,22 @@ extension WorkspaceFilesViewModel {
             return
         }
 
-        let selectedFilesSnapshot = selectedFiles
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        let selectedFilesSnapshot = selectedFiles.filter { visibleRootIDs.contains($0.rootIdentifier) }
         guard !selectedFilesSnapshot.isEmpty else {
             resetAutoCodemapFiles([])
             return
         }
 
         let selectedPaths = Set(selectedFilesSnapshot.map(\.standardizedFullPath))
-        guard !allFileAPIs.isEmpty else {
+        guard !aggregate.orderedFileAPIs.isEmpty else {
             resetAutoCodemapFiles([])
             return
         }
 
         let referencedPaths = CodeMapExtractor.resolveReferencedFilePaths(
             from: selectedFilesSnapshot,
-            among: allFileAPIs
+            among: aggregate.orderedFileAPIs
         )
 
         if referencedPaths.isEmpty {
@@ -11587,6 +11592,7 @@ extension WorkspaceFilesViewModel {
         let resolved = referencedPaths.compactMap { standardizedPath -> FileViewModel? in
             guard !selectedPaths.contains(standardizedPath),
                   let vm = fileHierarchyIndex.filesByFullPath[standardizedPath],
+                  visibleRootIDs.contains(vm.rootIdentifier),
                   unique.insert(vm.id).inserted
             else { return nil }
             return vm
@@ -11757,11 +11763,6 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func setFileAsFullContent(_ file: FileViewModel) {
-        // If switching from codemap to full content, disable auto mode
-        if isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
-
         performSelectionBatch {
             if !file.isChecked {
                 file.setIsChecked(true)
@@ -11769,7 +11770,7 @@ extension WorkspaceFilesViewModel {
         }
 
         selectionSlicesByFileID.removeValue(forKey: file.id)
-        removeAutoCodemapFile(file)
+        removeCodemapFile(file)
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
     }
 
@@ -11796,24 +11797,20 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func removeCodemapFile(_ file: FileViewModel) {
+        guard isAutoCodemapFile(file) else { return }
+        enterManualCodemapMode()
         removeAutoCodemapFile(file)
     }
 
     @MainActor
     func removeFileFromAllSelections(_ file: FileViewModel) {
-        // If auto-mode is on and the user is removing an auto-added file,
-        // interpret this as a switch to manual mode.
-        if codemapAutoEnabled, isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
+        removeCodemapFile(file)
 
         performSelectionBatch {
             // Remove from selected files if present
             if file.isChecked {
                 file.setIsChecked(false)
             }
-            // Remove from auto-codemap files
-            removeAutoCodemapFile(file)
             // Remove any slices for this file
             selectionSlicesByFileID.removeValue(forKey: file.id)
         }
