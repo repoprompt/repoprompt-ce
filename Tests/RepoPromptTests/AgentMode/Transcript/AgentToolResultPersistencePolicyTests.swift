@@ -54,10 +54,12 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
     }
 
     func testContextBuilderPersistsOnlySelectedBoundedFollowUpRoutingMetadata() throws {
-        let rows: [(responseType: String, selectedKey: String, chatID: String, mode: String)] = [
-            ("plan", "plan", "plan-chat", "plan"),
-            ("question", "plan", "plan-chat", "plan"),
-            ("review", "review", "review-chat", "review")
+        let rows: [(responseType: String, persistedResponseType: String, selectedKey: String, chatID: String, mode: String)] = [
+            ("plan", "plan", "plan", "plan-chat", "plan"),
+            ("question", "question", "plan", "plan-chat", "plan"),
+            ("review", "review", "review", "review-chat", "review"),
+            ("  PlAn\n", "PlAn", "plan", "plan-chat", "plan"),
+            ("\tReViEw ", "ReViEw", "review", "review-chat", "review")
         ]
 
         for row in rows {
@@ -97,7 +99,7 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             XCTAssertEqual(object["status"] as? String, "success", row.responseType)
             XCTAssertEqual(object["summary_only"] as? Bool, true, row.responseType)
             XCTAssertEqual(object["context_id"] as? String, "11111111-2222-3333-4444-555555555555", row.responseType)
-            XCTAssertEqual(object["response_type"] as? String, row.responseType, row.responseType)
+            XCTAssertEqual(object["response_type"] as? String, row.persistedResponseType, row.responseType)
             XCTAssertEqual(selectedReply["chat_id"] as? String, row.chatID, row.responseType)
             XCTAssertEqual(selectedReply["mode"] as? String, row.mode, row.responseType)
             XCTAssertNil(selectedReply["response"], row.responseType)
@@ -105,7 +107,7 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
             XCTAssertNil(selectedReply["errors"], row.responseType)
             XCTAssertNil(object[unselectedKey], row.responseType)
             XCTAssertEqual(dto.tabID, "11111111-2222-3333-4444-555555555555", row.responseType)
-            XCTAssertEqual(dto.responseType, row.responseType, row.responseType)
+            XCTAssertEqual(dto.responseType, row.persistedResponseType, row.responseType)
             XCTAssertEqual(selectedDTO?.chatID, row.chatID, row.responseType)
             XCTAssertEqual(selectedDTO?.mode, row.mode, row.responseType)
             XCTAssertFalse(summary.resultJSON.contains(bulkyResponse), row.responseType)
@@ -184,19 +186,40 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         }
     }
 
-    func testContextBuilderPersistenceRejectsMismatchedResponseBranch() throws {
-        let raw = jsonString([
-            "status": "success",
-            "response_type": "review",
-            "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"]
-        ])
+    func testContextBuilderPersistenceRejectsUnknownMissingAndMismatchedResponseBranch() throws {
+        let rows: [(payload: [String: Any], expectedResponseType: String?)] = [
+            ([
+                "status": "success",
+                "response_type": "review",
+                "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"]
+            ], "review"),
+            ([
+                "status": "success",
+                "response_type": "plan",
+                "review": ["chat_id": "wrong-review-chat", "mode": "review"]
+            ], "plan"),
+            ([
+                "status": "success",
+                "response_type": "clarify",
+                "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"],
+                "review": ["chat_id": "wrong-review-chat", "mode": "review"]
+            ], "clarify"),
+            ([
+                "status": "success",
+                "plan": ["chat_id": "wrong-plan-chat", "mode": "plan"],
+                "review": ["chat_id": "wrong-review-chat", "mode": "review"]
+            ], nil)
+        ]
 
-        let summary = try XCTUnwrap(persistedSummary(toolName: "context_builder", rawResultJSON: raw))
-        let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: summary.resultJSON))
+        for row in rows {
+            let raw = jsonString(row.payload)
+            let summary = try XCTUnwrap(persistedSummary(toolName: "context_builder", rawResultJSON: raw))
+            let dto = try XCTUnwrap(ToolJSON.decode(ToolResultDTOs.ContextBuilderDTO.self, from: summary.resultJSON))
 
-        XCTAssertEqual(dto.responseType, "review")
-        XCTAssertNil(dto.plan)
-        XCTAssertNil(dto.review)
+            XCTAssertEqual(dto.responseType, row.expectedResponseType)
+            XCTAssertNil(dto.plan)
+            XCTAssertNil(dto.review)
+        }
     }
 
     func testOversizedStructuredSummaryFallsBackToMinimalResultJSON() throws {
@@ -252,9 +275,10 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
                 "kind": "message",
                 "title": "Tool result",
                 "rawOutput": [
-                    "chat_id": "chat-789",
+                    "chat_id": "  chat-789  ",
                     "mode": "review",
-                    "response": "raw oracle response"
+                    "response": "raw oracle response",
+                    "diffs": [["path": 42]]
                 ],
                 "content": [[
                     "type": "text",
@@ -287,7 +311,11 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
 
         let invalidRawOutputs: [[String: Any]] = [
             ["result": ["chat_id": "nested-only"]],
-            ["chat_id": "authoritative", "result": ["chat_id": "conflict"]]
+            ["chatID": "camel-only"],
+            ["chat_id": 42],
+            ["chat_id": "  \n"],
+            ["chat_id": "authoritative", "result": ["chat_id": "conflict"]],
+            ["chat_id": "authoritative", "items": [["chatID": "conflict"]]]
         ]
         for rawOutput in invalidRawOutputs {
             let events = CursorACPEventNormalizer.normalize([

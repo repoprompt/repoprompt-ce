@@ -270,35 +270,12 @@ struct AgentOraclePill: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentOraclePopover)) { note in
-            guard let targetWindowID = note.userInfo?["windowID"] as? Int,
-                  targetWindowID == windowID else { return }
-
-            let requestedTabID: UUID? = {
-                if let tabID = note.userInfo?["tabID"] as? UUID { return tabID }
-                if let tabIDString = note.userInfo?["tabID"] as? String { return UUID(uuidString: tabIDString) }
-                return nil
-            }()
-            guard let requestedTabID, requestedTabID == currentTabID else { return }
-
-            let requestedWorkspaceID: UUID? = {
-                if let workspaceID = note.userInfo?["workspaceID"] as? UUID { return workspaceID }
-                if let workspaceIDString = note.userInfo?["workspaceID"] as? String {
-                    return UUID(uuidString: workspaceIDString)
-                }
-                return nil
-            }()
-            guard let requestedWorkspaceID,
-                  requestedWorkspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
+            guard let route = AgentOraclePopoverRoute(notificationUserInfo: note.userInfo),
+                  route.windowID == windowID,
+                  route.tabID == currentTabID,
+                  route.workspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
             else { return }
-
-            let requestedChatID: String? = {
-                if let chatID = note.userInfo?["chatID"] as? String { return chatID }
-                if let chatID = note.userInfo?["chatID"] as? UUID { return chatID.uuidString }
-                return nil
-            }()
-            guard let requestedChatID else { return }
-
-            openPopover(chatID: requestedChatID, workspaceID: requestedWorkspaceID)
+            openPopover(chatID: route.chatID, workspaceID: route.workspaceID)
         }
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             oraclePopoverContent
