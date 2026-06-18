@@ -11,6 +11,134 @@ import MCP
 #endif
 
 extension MCPServerViewModel {
+    struct DetachedContextBuilderTabContext {
+        let connectionID: UUID
+        let context: TabScopedContext
+    }
+
+    enum ContextBuilderTabContextCommitOutcome: Equatable {
+        case committed
+        case staleOrNoLongerCurrent
+        case missingFinalContext(runID: UUID, connectionID: UUID?)
+        case failed(String)
+    }
+
+    enum ContextBuilderTeardownPublicationOutcome: Equatable {
+        case peerEOFDetached
+        case resolvedWithoutPeerEOFDetachment(reason: String)
+        case timedOut
+        case cancelled
+
+        var diagnosticSource: String {
+            switch self {
+            case .peerEOFDetached:
+                "peer_eof_detached"
+            case let .resolvedWithoutPeerEOFDetachment(reason):
+                "resolved_without_detachment:\(reason)"
+            case .timedOut:
+                "timeout"
+            case .cancelled:
+                "cancelled"
+            }
+        }
+    }
+
+    @MainActor
+    final class ContextBuilderTeardownPublicationCoordinator {
+        struct Key: Hashable {
+            let runID: UUID
+            let connectionID: UUID
+        }
+
+        private struct Waiter {
+            let continuation: CheckedContinuation<ContextBuilderTeardownPublicationOutcome, Never>
+            let timeoutWorkItem: DispatchWorkItem
+        }
+
+        private var retainedOutcomes: [Key: ContextBuilderTeardownPublicationOutcome] = [:]
+        private var retainedOutcomeOrder: [Key] = []
+        private var waiters: [Key: [UUID: Waiter]] = [:]
+        private let retainedOutcomeLimit = 64
+
+        func publish(
+            _ outcome: ContextBuilderTeardownPublicationOutcome,
+            runID: UUID,
+            connectionID: UUID
+        ) {
+            let key = Key(runID: runID, connectionID: connectionID)
+            guard retainedOutcomes[key] == nil else { return }
+            retainedOutcomes[key] = outcome
+            retainedOutcomeOrder.removeAll { $0 == key }
+            retainedOutcomeOrder.append(key)
+            while retainedOutcomeOrder.count > retainedOutcomeLimit {
+                let expired = retainedOutcomeOrder.removeFirst()
+                retainedOutcomes.removeValue(forKey: expired)
+            }
+            let pending = waiters.removeValue(forKey: key)?.values ?? [:].values
+            for waiter in pending {
+                waiter.timeoutWorkItem.cancel()
+                waiter.continuation.resume(returning: outcome)
+            }
+        }
+
+        func wait(
+            runID: UUID,
+            connectionID: UUID,
+            timeoutSeconds: TimeInterval
+        ) async -> ContextBuilderTeardownPublicationOutcome {
+            let key = Key(runID: runID, connectionID: connectionID)
+            if let outcome = retainedOutcomes[key] { return outcome }
+
+            let waiterID = UUID()
+            return await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    if let outcome = retainedOutcomes[key] {
+                        continuation.resume(returning: outcome)
+                        return
+                    }
+                    let timeoutWorkItem = DispatchWorkItem { [weak self] in
+                        Task { @MainActor in
+                            self?.resolveWaiter(
+                                key: key,
+                                waiterID: waiterID,
+                                outcome: .timedOut
+                            )
+                        }
+                    }
+                    waiters[key, default: [:]][waiterID] = Waiter(
+                        continuation: continuation,
+                        timeoutWorkItem: timeoutWorkItem
+                    )
+                    DispatchQueue.main.asyncAfter(
+                        deadline: .now() + timeoutSeconds,
+                        execute: timeoutWorkItem
+                    )
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.resolveWaiter(
+                        key: key,
+                        waiterID: waiterID,
+                        outcome: .cancelled
+                    )
+                }
+            }
+        }
+
+        private func resolveWaiter(
+            key: Key,
+            waiterID: UUID,
+            outcome: ContextBuilderTeardownPublicationOutcome
+        ) {
+            guard let waiter = waiters[key]?.removeValue(forKey: waiterID) else { return }
+            if waiters[key]?.isEmpty == true {
+                waiters.removeValue(forKey: key)
+            }
+            waiter.timeoutWorkItem.cancel()
+            waiter.continuation.resume(returning: outcome)
+        }
+    }
+
     struct PendingPolicyRunIDMappingToken {
         let id: UUID
         let connectionID: UUID
@@ -2689,12 +2817,117 @@ extension MCPServerViewModel {
 
     @MainActor
     @discardableResult
+    func detachContextBuilderTabContextForPeerEOF(
+        connectionID: UUID,
+        runID: UUID
+    ) -> Bool {
+        guard connectionIDByRunID[runID] == connectionID,
+              connectionIDToRunID[connectionID] == runID,
+              let context = tabContextByConnectionID[connectionID],
+              context.runID == runID,
+              detachedContextBuilderTabContextByRunID[runID] == nil
+        else { return false }
+
+        detachedContextBuilderTabContextByRunID[runID] = DetachedContextBuilderTabContext(
+            connectionID: connectionID,
+            context: context
+        )
+        invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+        endMirroringForConnection(connectionID)
+        readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+        tabContextByConnectionID.removeValue(forKey: connectionID)
+        windowIDByConnection.removeValue(forKey: connectionID)
+        connectionIDByRunID.removeValue(forKey: runID)
+        pendingPolicyRunIDMappingTokenIDByRunID.removeValue(forKey: runID)
+        connectionIDToRunID.removeValue(forKey: connectionID)
+        tabContextLog("Detached Context Builder context after peer EOF connectionID=\(connectionID) runID=\(runID)")
+        return true
+    }
+
+    @MainActor
+    func contextBuilderFinalContextConnectionID(runID: UUID) -> UUID? {
+        if let connectionID = connectionIDByRunID[runID],
+           connectionIDToRunID[connectionID] == runID,
+           tabContextByConnectionID[connectionID]?.runID == runID
+        {
+            return connectionID
+        }
+        return detachedContextBuilderTabContextByRunID[runID]?.connectionID
+    }
+
+    @MainActor
+    func isDetachedContextBuilderConnection(connectionID: UUID, runID: UUID) -> Bool {
+        detachedContextBuilderTabContextByRunID[runID]?.connectionID == connectionID
+    }
+
+    @MainActor
+    func discardDetachedContextBuilderTabContext(runID: UUID) {
+        detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
+    }
+
+    @MainActor
+    func commitContextBuilderTabContext(
+        connectionID: UUID,
+        expectedRunID: UUID,
+        isStillCurrent: @MainActor () -> Bool,
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        deferRunMappingCleanupUntilCaller: Bool = false
+    ) async -> ContextBuilderTabContextCommitOutcome {
+        guard isStillCurrent(), !Task.isCancelled else {
+            discardDetachedContextBuilderTabContext(runID: expectedRunID)
+            return .staleOrNoLongerCurrent
+        }
+
+        let alreadyFinishedAutoSelection: Bool
+        if tabContextByConnectionID[connectionID]?.runID == expectedRunID {
+            alreadyFinishedAutoSelection = false
+        } else if let detached = detachedContextBuilderTabContextByRunID[expectedRunID],
+                  detached.connectionID == connectionID,
+                  detached.context.runID == expectedRunID
+        {
+            // Destructively claim the run-owned snapshot and move it into the existing
+            // commit implementation without suspending between removal and insertion.
+            detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
+            tabContextByConnectionID[connectionID] = detached.context
+            alreadyFinishedAutoSelection = true
+        } else {
+            return .missingFinalContext(runID: expectedRunID, connectionID: connectionID)
+        }
+
+        let committed = await commitAndClearTabContext(
+            connectionID: connectionID,
+            expectedRunID: expectedRunID,
+            isStillCurrent: isStillCurrent,
+            progressReporter: progressReporter,
+            deferRunMappingCleanupUntilCaller: deferRunMappingCleanupUntilCaller,
+            readFileAutoSelectionAlreadyFinished: alreadyFinishedAutoSelection
+        )
+
+        // Peer EOF may have transferred the live context while its auto-selection lane
+        // was finishing. The locally captured commit snapshot remains authoritative;
+        // consume any duplicate detached ownership exactly once.
+        if detachedContextBuilderTabContextByRunID[expectedRunID]?.connectionID == connectionID {
+            detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
+        }
+
+        if committed {
+            return .committed
+        }
+        if !isStillCurrent() || Task.isCancelled {
+            return .staleOrNoLongerCurrent
+        }
+        return .failed("Context Builder could not commit its final context for run \(expectedRunID.uuidString).")
+    }
+
+    @MainActor
+    @discardableResult
     func commitAndClearTabContext(
         connectionID: UUID,
         expectedRunID: UUID? = nil,
         isStillCurrent: @MainActor () -> Bool = { true },
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
-        deferRunMappingCleanupUntilCaller: Bool = false
+        deferRunMappingCleanupUntilCaller: Bool = false,
+        readFileAutoSelectionAlreadyFinished: Bool = false
     ) async -> Bool {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
@@ -2709,7 +2942,7 @@ extension MCPServerViewModel {
             shouldCommit = false
         }
 
-        if shouldCommit {
+        if shouldCommit, !readFileAutoSelectionAlreadyFinished {
             let key = readFileAutoSelectionContextKey(connectionID: connectionID, context: commitOwnedContext)
             await progressReporter?(.readFileAutoSelectionFinish)
             let finishResult = await readFileAutoSelectionCoordinator.finish(context: key)
@@ -2723,7 +2956,7 @@ extension MCPServerViewModel {
             if !isStillCurrent() || Task.isCancelled {
                 shouldCommit = false
             }
-        } else {
+        } else if !shouldCommit {
             invalidateReadFileAutoSelection(connectionID: connectionID, context: commitOwnedContext)
         }
 
@@ -2865,6 +3098,7 @@ extension MCPServerViewModel {
         }
 
         if let runID, connectionID == nil {
+            detachedContextBuilderTabContextByRunID.removeValue(forKey: runID)
             // This is an explicit cleanup by runID (called when discovery ends)
             for (boundConnectionID, context) in tabContextByConnectionID where context.runID == runID {
                 readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: boundConnectionID)

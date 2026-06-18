@@ -11,6 +11,7 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             let firstRunID = UUID()
             let secondRunID = UUID()
             let connectionID = UUID()
+            let secondConnectionID = UUID()
             await manager.debugClearRunRoutingHistoryForTesting()
 
             await manager.debugRecordRunRoutingEvent(
@@ -32,7 +33,11 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             await manager.debugRecordRunRoutingEvent(
                 runID: secondRunID,
                 event: "other_run_event",
-                fields: ["client_name": "opencode"]
+                connectionID: secondConnectionID,
+                fields: [
+                    "client_name": "opencode",
+                    "prompt_payload": "another private prompt"
+                ]
             )
             await manager.debugRecordRunRoutingEvent(
                 runID: firstRunID,
@@ -59,6 +64,28 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
             XCTAssertEqual(fields["bounded"]?.count, 512)
             XCTAssertFalse(String(describing: payload).contains("must-not-leak"))
             XCTAssertFalse(String(describing: payload).contains("private prompt"))
+
+            let recentPayload = await manager.debugRunRoutingHistoryPayload(runID: nil, limit: 2)
+            let recentEvents = try XCTUnwrap(recentPayload["events"] as? [[String: Any]])
+            XCTAssertTrue(recentPayload["run_id"] is NSNull)
+            XCTAssertEqual(recentPayload["history_capacity"] as? Int, 1000)
+            XCTAssertEqual(recentPayload["dropped_event_count"] as? Int, 0)
+            XCTAssertEqual(recentEvents.map { $0["event"] as? String }, ["other_run_event", "policy_applied"])
+            XCTAssertEqual(
+                recentEvents.map { $0["run_id"] as? String },
+                [secondRunID.uuidString, firstRunID.uuidString]
+            )
+            XCTAssertEqual(
+                recentEvents.map { $0["connection_id"] as? String },
+                [secondConnectionID.uuidString, connectionID.uuidString]
+            )
+            XCTAssertEqual(
+                (recentEvents.first?["fields"] as? [String: String])?["prompt_payload"],
+                "<redacted>"
+            )
+            let recentSequences = recentEvents.compactMap { $0["seq"] as? Int }
+            XCTAssertEqual(recentSequences, recentSequences.sorted())
+            XCTAssertFalse(String(describing: recentPayload).contains("another private prompt"))
         #else
             throw XCTSkip("Run routing history is DEBUG-only.")
         #endif
@@ -228,15 +255,33 @@ final class MCPRunRoutingDiagnosticsTests: XCTestCase {
         #endif
     }
 
-    func testRunRoutingHistoryToolRequiresRunIDAndBoundsLimit() async throws {
+    func testRunRoutingHistoryToolAllowsOmittedRunIDAndBoundsLimit() async throws {
         #if DEBUG
-            let missingRun = await manager.debugRunRoutingHistoryToolPayload(
+            let firstRunID = UUID()
+            let secondRunID = UUID()
+            await manager.debugClearRunRoutingHistoryForTesting()
+            await manager.debugRecordRunRoutingEvent(runID: firstRunID, event: "first")
+            await manager.debugRecordRunRoutingEvent(runID: secondRunID, event: "second")
+
+            let recentRun = await manager.debugRunRoutingHistoryToolPayload(
                 op: "run_routing_history",
-                arguments: [:]
+                arguments: ["limit": .int(1)]
             )
-            let missingPayload = try diagnosticsPayload(missingRun)
-            XCTAssertEqual(missingPayload["ok"] as? Bool, false)
-            XCTAssertEqual(missingPayload["code"] as? String, "invalid_params")
+            let recentPayload = try diagnosticsPayload(recentRun)
+            let recentEvents = try XCTUnwrap(recentPayload["events"] as? [[String: Any]])
+            XCTAssertEqual(recentPayload["ok"] as? Bool, true)
+            XCTAssertTrue(recentPayload["run_id"] is NSNull)
+            XCTAssertEqual(recentEvents.count, 1)
+            XCTAssertEqual(recentEvents.first?["run_id"] as? String, secondRunID.uuidString)
+
+            let filteredRun = await manager.debugRunRoutingHistoryToolPayload(
+                op: "run_routing_history",
+                arguments: ["run_id": .string(firstRunID.uuidString)]
+            )
+            let filteredPayload = try diagnosticsPayload(filteredRun)
+            let filteredEvents = try XCTUnwrap(filteredPayload["events"] as? [[String: Any]])
+            XCTAssertEqual(filteredPayload["run_id"] as? String, firstRunID.uuidString)
+            XCTAssertEqual(filteredEvents.map { $0["event"] as? String }, ["first"])
 
             let invalidLimit = await manager.debugRunRoutingHistoryToolPayload(
                 op: "run_routing_history",

@@ -30,6 +30,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
 
         await Task.yield()
         let record = try XCTUnwrap(capturedRecord)
+        XCTAssertTrue(record.canAcceptCancellation)
+        XCTAssertTrue(record.claimFinalContextCommit())
+        XCTAssertTrue(record.finalContextCommitClaimed)
+        XCTAssertFalse(record.canAcceptCancellation)
+        XCTAssertFalse(record.claimFinalContextCommit())
         XCTAssertTrue(record.claimTerminal(.completed))
         XCTAssertFalse(record.claimTerminal(.cancelled))
 
@@ -197,6 +202,20 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         XCTAssertFalse(didFinalize)
         XCTAssertFalse(didRequestTermination)
         XCTAssertFalse(didCleanupMapping)
+
+        var didAwaitNegativeTeardownResolution = false
+        let liveDrainFailure = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+            initiallyDetached: false,
+            awaitDrain: { false },
+            isAuthoritativePeerEOFDetached: { false },
+            awaitTeardownPublication: {
+                didAwaitNegativeTeardownResolution = true
+                return .resolvedWithoutPeerEOFDetachment(reason: "read_error")
+            }
+        )
+        XCTAssertTrue(didAwaitNegativeTeardownResolution)
+        XCTAssertEqual(liveDrainFailure, .failed)
+        XCTAssertFalse(liveDrainFailure.succeeded)
     }
 
     func testRealConnectionCleanupCannotEraseContextBeforeCommit() async throws {
@@ -228,10 +247,11 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             let tabID = try XCTUnwrap(
                 activeWorkspace.activeComposeTabID ?? activeWorkspace.composeTabs.first?.id
             )
+            let clientName = "context-builder-cleanup-commit-test"
+            let expectedPrompt = "context retained after peer EOF cleanup"
+
             let connectionID = UUID()
             let runID = UUID()
-            let clientName = "context-builder-cleanup-commit-test"
-            let expectedPrompt = "context captured before real connection cleanup"
             try window.mcpServer.bindTabForConnection(
                 connectionID: connectionID,
                 clientName: clientName,
@@ -251,80 +271,383 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 clientName: clientName,
                 sessionToken: UUID().uuidString
             )
-            await ServerNetworkManager.shared.debugSetConnectionWindowForTesting(
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
                 connectionID: connectionID,
+                runID: runID,
+                purpose: .discoverRun,
                 windowID: window.windowID
             )
-            defer {
-                Task { await ServerNetworkManager.shared.debugRemoveConnection(connectionID) }
-            }
 
-            let commitGate = LifecycleTestGate()
-            var commitCount = 0
-            var cleanupCount = 0
-            let finalization = Task { @MainActor in
+            // Reproduce the inverse production ordering: orderly peer EOF teardown
+            // completes fully before end-of-run commit begins.
+            await ServerNetworkManager.shared.removeConnection(
+                connectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                )
+            )
+            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: connectionID,
+                    runID: runID
+                )
+            )
+            let removedClient = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
+            XCTAssertNil(removedClient)
+
+            let commitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                connectionID: connectionID,
+                expectedRunID: runID,
+                isStillCurrent: { true }
+            )
+            XCTAssertEqual(commitOutcome, .committed)
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
+            XCTAssertFalse(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: connectionID,
+                    runID: runID
+                )
+            )
+
+            let secondCommitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                connectionID: connectionID,
+                expectedRunID: runID,
+                isStillCurrent: { true }
+            )
+            XCTAssertEqual(
+                secondCommitOutcome,
+                .missingFinalContext(runID: runID, connectionID: connectionID)
+            )
+
+            // Begin finalization while the connection is live, then complete peer-EOF
+            // teardown while response delivery is draining. The failed drain is accepted
+            // only after the same authoritative context has been detached.
+            let transitioningConnectionID = UUID()
+            let transitioningRunID = UUID()
+            let transitioningPrompt = "context detached during response drain"
+            try window.mcpServer.bindTabForConnection(
+                connectionID: transitioningConnectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: transitioningRunID
+            )
+            var transitioningContext = try XCTUnwrap(
+                window.mcpServer.tabContextByConnectionID[transitioningConnectionID]
+            )
+            transitioningContext.promptText = transitioningPrompt
+            window.mcpServer.tabContextByConnectionID[transitioningConnectionID] = transitioningContext
+
+            let transitioningConnection = ContextBuilderCleanupTestConnection()
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: transitioningConnectionID,
+                connection: transitioningConnection,
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: transitioningConnectionID,
+                runID: transitioningRunID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+
+            let handoffWaitStarted = LifecycleTestGate()
+            let commitAfterPublication = LifecycleTestGate()
+            var transitioningDrainOutcome: ContextBuilderResponseDeliveryDrainOutcome = .failed
+            var transitioningCommitCount = 0
+            var transitioningTerminationCount = 0
+            let transitioningFinalization = Task { @MainActor in
                 await ContextBuilderChildConnectionFinalizer.finalize(
-                    connectionIDs: [connectionID],
-                    awaitResponseDeliveryDrain: { _ in true },
-                    commitContext: { committedID in
-                        commitCount += 1
-                        return await window.mcpServer.commitAndClearTabContext(
-                            connectionID: committedID,
-                            expectedRunID: runID,
-                            progressReporter: { phase in
-                                if phase == .tabContextCommit {
-                                    await commitGate.arriveAndWait()
-                                }
+                    connectionIDs: [transitioningConnectionID],
+                    awaitResponseDeliveryDrain: { drainedID in
+                        transitioningDrainOutcome = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+                            initiallyDetached: false,
+                            awaitDrain: {
+                                XCTAssertEqual(drainedID, transitioningConnectionID)
+                                return false
                             },
+                            isAuthoritativePeerEOFDetached: {
+                                window.mcpServer.isDetachedContextBuilderConnection(
+                                    connectionID: drainedID,
+                                    runID: transitioningRunID
+                                )
+                            },
+                            awaitTeardownPublication: {
+                                await handoffWaitStarted.arrive()
+                                return await window.mcpServer.contextBuilderTeardownPublicationCoordinator.wait(
+                                    runID: transitioningRunID,
+                                    connectionID: drainedID,
+                                    timeoutSeconds: 1
+                                )
+                            }
+                        )
+                        return transitioningDrainOutcome.succeeded
+                    },
+                    commitContext: { committedID in
+                        await commitAfterPublication.arriveAndWait()
+                        transitioningCommitCount += 1
+                        let outcome = await window.mcpServer.commitContextBuilderTabContext(
+                            connectionID: committedID,
+                            expectedRunID: transitioningRunID,
+                            isStillCurrent: { true },
                             deferRunMappingCleanupUntilCaller: true
                         )
+                        return outcome == .committed
                     },
                     beforeTerminationRequest: {},
                     requestTermination: { requestedID in
-                        Task {
+                        guard !transitioningDrainOutcome.transportAlreadyClosed else {
+                            return Task {}
+                        }
+                        transitioningTerminationCount += 1
+                        return Task {
                             await ServerNetworkManager.shared.terminateConnection(
                                 requestedID,
                                 reason: .runCompleted,
-                                message: "test successful completion"
+                                message: "transitioning drain test completion"
                             )
                         }
                     },
                     beforeTerminationJoin: {},
                     cleanupMapping: { cleanedID in
-                        cleanupCount += 1
                         window.mcpServer.removeTabContext(
                             forConnectionID: cleanedID,
                             clientName: clientName,
                             windowID: window.windowID,
-                            runID: runID
+                            runID: transitioningRunID
                         )
                     }
                 )
             }
 
-            await commitGate.waitUntilArrived()
-            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
-            await ServerNetworkManager.shared.terminateConnection(
-                connectionID,
-                reason: .runCompleted,
-                message: "test cleanup while commit is paused"
+            await handoffWaitStarted.waitUntilArrived()
+            XCTAssertFalse(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: transitioningConnectionID,
+                    runID: transitioningRunID
+                )
             )
-            let removedClient = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
-            XCTAssertNil(removedClient)
+            await ServerNetworkManager.shared.removeConnection(
+                transitioningConnectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                )
+            )
+            await commitAfterPublication.waitUntilArrived()
+            XCTAssertTrue(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: transitioningConnectionID,
+                    runID: transitioningRunID
+                )
+            )
+            await commitAfterPublication.release()
 
-            await commitGate.release()
-            let didFinalize = await finalization.value
-            XCTAssertTrue(didFinalize)
-            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
-            XCTAssertEqual(commitCount, 1)
-            XCTAssertEqual(cleanupCount, 1)
-            XCTAssertNil(window.mcpServer.tabContextByConnectionID[connectionID])
-            XCTAssertFalse(window.mcpServer.hasRunID(runID))
-            XCTAssertTrue(window.mcpServer.connectionIDs(forRunID: runID).isEmpty)
+            let didFinalizeTransition = await transitioningFinalization.value
+            XCTAssertTrue(didFinalizeTransition)
+            XCTAssertEqual(transitioningDrainOutcome, .peerEOFDetached)
+            XCTAssertEqual(transitioningCommitCount, 1)
+            XCTAssertEqual(transitioningTerminationCount, 0)
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
+            XCTAssertFalse(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: transitioningConnectionID,
+                    runID: transitioningRunID
+                )
+            )
+            let transitioningSecondCommit = await window.mcpServer.commitContextBuilderTabContext(
+                connectionID: transitioningConnectionID,
+                expectedRunID: transitioningRunID,
+                isStillCurrent: { true }
+            )
+            XCTAssertEqual(
+                transitioningSecondCommit,
+                .missingFinalContext(
+                    runID: transitioningRunID,
+                    connectionID: transitioningConnectionID
+                )
+            )
+            let transitioningConnectionTerminationCount = await transitioningConnection.terminationCount()
+            XCTAssertEqual(transitioningConnectionTerminationCount, 0)
+
+            // The negative twin uses the same production peer-EOF teardown, then models
+            // explicit cancellation before commit. Detached ownership is discarded and
+            // the compose tab is not mutated.
+            let cancelledConnectionID = UUID()
+            let cancelledRunID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: cancelledConnectionID,
+                clientName: clientName,
+                tabID: tabID,
+                workspaceID: activeWorkspace.id,
+                windowID: window.windowID,
+                runID: cancelledRunID
+            )
+            var cancelledContext = try XCTUnwrap(
+                window.mcpServer.tabContextByConnectionID[cancelledConnectionID]
+            )
+            cancelledContext.promptText = "must not commit after cancellation"
+            window.mcpServer.tabContextByConnectionID[cancelledConnectionID] = cancelledContext
+
+            let cancelledConnection = ContextBuilderCleanupTestConnection()
+            await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                connectionID: cancelledConnectionID,
+                connection: cancelledConnection,
+                clientName: clientName,
+                sessionToken: UUID().uuidString
+            )
+            await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                connectionID: cancelledConnectionID,
+                runID: cancelledRunID,
+                purpose: .discoverRun,
+                windowID: window.windowID
+            )
+            await ServerNetworkManager.shared.removeConnection(
+                cancelledConnectionID,
+                context: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                )
+            )
+
+            let cancelledOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                connectionID: cancelledConnectionID,
+                expectedRunID: cancelledRunID,
+                isStillCurrent: { false }
+            )
+            XCTAssertEqual(cancelledOutcome, .staleOrNoLongerCurrent)
+            XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
+            XCTAssertFalse(
+                window.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: cancelledConnectionID,
+                    runID: cancelledRunID
+                )
+            )
+
+            func assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext,
+                purpose: MCPRunPurpose,
+                authoritative: Bool = true
+            ) async throws {
+                let excludedConnectionID = UUID()
+                let excludedRunID = UUID()
+                try window.mcpServer.bindTabForConnection(
+                    connectionID: excludedConnectionID,
+                    clientName: clientName,
+                    tabID: tabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID,
+                    runID: excludedRunID
+                )
+                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                    connectionID: excludedConnectionID,
+                    connection: ContextBuilderCleanupTestConnection(),
+                    clientName: clientName,
+                    sessionToken: UUID().uuidString
+                )
+                await ServerNetworkManager.shared.debugSeedConnectionRunRouting(
+                    connectionID: excludedConnectionID,
+                    runID: excludedRunID,
+                    purpose: purpose,
+                    windowID: window.windowID
+                )
+                if !authoritative {
+                    window.mcpServer.connectionIDByRunID[excludedRunID] = UUID()
+                }
+
+                await ServerNetworkManager.shared.removeConnection(
+                    excludedConnectionID,
+                    context: closeContext
+                )
+
+                XCTAssertNil(window.mcpServer.tabContextByConnectionID[excludedConnectionID])
+                XCTAssertFalse(
+                    window.mcpServer.isDetachedContextBuilderConnection(
+                        connectionID: excludedConnectionID,
+                        runID: excludedRunID
+                    )
+                )
+                XCTAssertNil(window.mcpServer.contextBuilderFinalContextConnectionID(runID: excludedRunID))
+                let excludedCommitOutcome = await window.mcpServer.commitContextBuilderTabContext(
+                    connectionID: excludedConnectionID,
+                    expectedRunID: excludedRunID,
+                    isStillCurrent: { true }
+                )
+                XCTAssertEqual(
+                    excludedCommitOutcome,
+                    .missingFinalContext(
+                        runID: excludedRunID,
+                        connectionID: excludedConnectionID
+                    )
+                )
+                window.mcpServer.removeTabContext(
+                    forConnectionID: nil,
+                    clientName: clientName,
+                    windowID: window.windowID,
+                    runID: excludedRunID
+                )
+            }
+
+            try await assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext(
+                    reason: "server_shutdown",
+                    initiator: .app
+                ),
+                purpose: .discoverRun
+            )
+            try await assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext(
+                    reason: TerminationReason.runCancelled.rawValue,
+                    initiator: .app
+                ),
+                purpose: .discoverRun
+            )
+            try await assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.readError.rawValue,
+                    initiator: .peer
+                ),
+                purpose: .discoverRun
+            )
+            try await assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                ),
+                purpose: .agentModeRun
+            )
+            try await assertDoesNotDetach(
+                closeContext: MCPConnectionCloseContext(
+                    reason: MCPTransportTerminalCause.peerEOF.rawValue,
+                    initiator: .peer
+                ),
+                purpose: .discoverRun,
+                authoritative: false
+            )
+
+            let missingOutcome = MCPServerViewModel.ContextBuilderTabContextCommitOutcome
+                .missingFinalContext(runID: cancelledRunID, connectionID: cancelledConnectionID)
+            guard case let .failed(message) = ContextBuilderAgentViewModel.terminalOutcome(
+                forContextCommitOutcome: missingOutcome
+            ) else {
+                return XCTFail("Missing final ownership must be classified as failed")
+            }
+            XCTAssertTrue(message.contains(cancelledRunID.uuidString))
+            XCTAssertTrue(message.contains(cancelledConnectionID.uuidString))
+            XCTAssertFalse(message.contains("Cancelled by user"))
+
             let terminationCount = await connection.terminationCount()
             let stopCount = await connection.stopCount()
-            XCTAssertEqual(terminationCount, 1)
+            let cancelledTerminationCount = await cancelledConnection.terminationCount()
+            let cancelledStopCount = await cancelledConnection.stopCount()
+            XCTAssertEqual(terminationCount, 0)
             XCTAssertGreaterThanOrEqual(stopCount, 1)
+            XCTAssertEqual(cancelledTerminationCount, 0)
+            XCTAssertGreaterThanOrEqual(cancelledStopCount, 1)
         #else
             throw XCTSkip("Real MCP connection cleanup fixture is DEBUG-only.")
         #endif
@@ -748,6 +1071,20 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 await retryProvider.waitUntilConnectionAttemptReady()
                 retryRunID = try XCTUnwrap(viewModel.activeRunIDForTesting(tabID: tabID))
                 let successorRunID = try XCTUnwrap(retryRunID)
+                await ServerNetworkManager.shared.debugRegisterConnectionForSocketFixture(
+                    connectionID: retryProvider.connectionID,
+                    connection: ContextBuilderCleanupTestConnection(),
+                    clientName: clientName,
+                    sessionToken: UUID().uuidString
+                )
+                try composition.mcpServer.bindTabForConnection(
+                    connectionID: retryProvider.connectionID,
+                    clientName: clientName,
+                    tabID: tabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: composition.mcpServer.windowID,
+                    runID: successorRunID
+                )
                 let lateOldProviderConnection = await ServerNetworkManager.shared.debugApplyPendingPolicy(
                     clientName: clientName,
                     connectionID: lateConnectionID,

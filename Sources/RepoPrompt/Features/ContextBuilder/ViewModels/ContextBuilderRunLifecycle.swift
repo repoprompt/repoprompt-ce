@@ -32,6 +32,40 @@ enum ContextBuilderRunWaiterResolution {
     case cancellationError
 }
 
+enum ContextBuilderResponseDeliveryDrainOutcome: Equatable {
+    case drained
+    case peerEOFDetached
+    case failed
+
+    var succeeded: Bool {
+        self != .failed
+    }
+
+    var transportAlreadyClosed: Bool {
+        self == .peerEOFDetached
+    }
+}
+
+@MainActor
+enum ContextBuilderResponseDeliveryDrainResolver {
+    static func resolve(
+        initiallyDetached: Bool,
+        awaitDrain: @MainActor () async -> Bool,
+        isAuthoritativePeerEOFDetached: @MainActor () -> Bool,
+        awaitTeardownPublication: @MainActor () async -> MCPServerViewModel.ContextBuilderTeardownPublicationOutcome
+    ) async -> ContextBuilderResponseDeliveryDrainOutcome {
+        if initiallyDetached { return .peerEOFDetached }
+        if await awaitDrain() { return .drained }
+        if isAuthoritativePeerEOFDetached() { return .peerEOFDetached }
+
+        let publication = await awaitTeardownPublication()
+        guard publication == .peerEOFDetached,
+              isAuthoritativePeerEOFDetached()
+        else { return .failed }
+        return .peerEOFDetached
+    }
+}
+
 /// Coordinates successful child-connection finalization. Each tab-context snapshot must be
 /// positively committed before transport termination can trigger connection-backed cleanup.
 /// Termination completion is joined before connection/run mappings are removed.
@@ -93,10 +127,12 @@ final class ContextBuilderRunRecord {
     var executionTask: Task<Void, Never>?
     var previewPublicationTask: Task<Void, Never>?
     var lastPublishedPreview: String?
+    var finalContextConnectionIDForDiagnostics: UUID?
     var restoreConfiguration: (() -> Void)?
 
     private var continuation: CheckedContinuation<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error>?
     private var provider: HeadlessAgentProvider?
+    private(set) var finalContextCommitClaimed = false
     private(set) var terminalOutcome: ContextBuilderRunTerminalOutcome?
     private(set) var teardownStartedAt: Date?
     private(set) var teardownFinishedAt: Date?
@@ -137,8 +173,19 @@ final class ContextBuilderRunRecord {
         terminalOutcome != nil
     }
 
+    var canAcceptCancellation: Bool {
+        terminalOutcome == nil && !finalContextCommitClaimed
+    }
+
     var isTeardownPending: Bool {
         teardownStartedAt != nil && teardownFinishedAt == nil
+    }
+
+    @discardableResult
+    func claimFinalContextCommit() -> Bool {
+        guard terminalOutcome == nil, !finalContextCommitClaimed else { return false }
+        finalContextCommitClaimed = true
+        return true
     }
 
     @discardableResult

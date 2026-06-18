@@ -2336,9 +2336,44 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             guard !Task.isCancelled, acceptsEvents(from: record) else { return .cancelled }
-            let committed = await commitTabContextForAgent(record: record)
-            guard committed, acceptsEvents(from: record) else { return .cancelled }
-            return .completed
+            let commitOutcome = await commitTabContextForAgent(record: record)
+            let terminalOutcome: ContextBuilderRunTerminalOutcome = if commitOutcome == .committed,
+                                                                       !acceptsEvents(from: record)
+            {
+                .cancelled
+            } else {
+                Self.terminalOutcome(forContextCommitOutcome: commitOutcome)
+            }
+            #if DEBUG
+                await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "context_builder.final_terminal_classification",
+                    connectionID: record.finalContextConnectionIDForDiagnostics,
+                    fields: [
+                        "commit_outcome": String(describing: commitOutcome),
+                        "terminal_outcome": String(describing: terminalOutcome)
+                    ]
+                )
+            #endif
+            return terminalOutcome
+        }
+    }
+
+    static func terminalOutcome(
+        forContextCommitOutcome outcome: MCPServerViewModel.ContextBuilderTabContextCommitOutcome
+    ) -> ContextBuilderRunTerminalOutcome {
+        switch outcome {
+        case .committed:
+            .completed
+        case .staleOrNoLongerCurrent:
+            .cancelled
+        case let .missingFinalContext(runID, connectionID):
+            .failed(
+                "Context Builder final context is missing for run \(runID.uuidString) " +
+                    "(connection \(connectionID?.uuidString ?? "none"))."
+            )
+        case let .failed(message):
+            .failed(message)
         }
     }
 
@@ -2476,6 +2511,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         saveHistory: Bool
     ) {
         guard acceptsEvents(from: record) else { return }
+        guard record.canAcceptCancellation else {
+            debugLog("Cancel ignored after final context commit claim for run \(record.runID)")
+            return
+        }
         _ = beginCancellation(forTabID: record.tabID)
         debugLog("Cancel requested for run \(record.runID) tab \(record.tabID)")
 
@@ -2572,35 +2611,148 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         return matches
     }
 
-    private func commitTabContextForAgent(record: ContextBuilderRunRecord) async -> Bool {
+    private func commitTabContextForAgent(
+        record: ContextBuilderRunRecord
+    ) async -> MCPServerViewModel.ContextBuilderTabContextCommitOutcome {
         let runID = record.runID
         let agent = record.agentKind
         guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else {
             debugLog("commitTabContextForAgent: runID=\(runID) not active, skipping")
-            return false
+            return .staleOrNoLongerCurrent
         }
         debugLog("commitTabContextForAgent: runID=\(runID)")
 
         let windowID = mcpServer.windowID
         let agentClientName = agent.mcpClientNameHint
-        let agentConnections = await agentConnectionIDs(for: runID, agent: agent)
-        guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else { return false }
+        guard let finalContextConnectionID = mcpServer.contextBuilderFinalContextConnectionID(runID: runID) else {
+            return .missingFinalContext(runID: runID, connectionID: nil)
+        }
+        record.finalContextConnectionIDForDiagnostics = finalContextConnectionID
+        let initiallyDetached = mcpServer.isDetachedContextBuilderConnection(
+            connectionID: finalContextConnectionID,
+            runID: runID
+        )
+        guard activeAgentRuns.contains(runID), acceptsEvents(from: record) else {
+            mcpServer.discardDetachedContextBuilderTabContext(runID: runID)
+            return .staleOrNoLongerCurrent
+        }
 
+        var contextCommitOutcome: MCPServerViewModel.ContextBuilderTabContextCommitOutcome?
+        var drainOutcome: ContextBuilderResponseDeliveryDrainOutcome = .failed
         let finalizedConnections = await ContextBuilderChildConnectionFinalizer.finalize(
-            connectionIDs: agentConnections,
+            connectionIDs: [finalContextConnectionID],
             awaitResponseDeliveryDrain: { cid in
-                await ServerNetworkManager.shared.waitUntilResponseDeliveryDrained(
-                    for: cid
+                #if DEBUG
+                    let drainStartedAt = ProcessInfo.processInfo.systemUptime
+                    await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "context_builder.response_drain_start",
+                        connectionID: cid,
+                        fields: ["initially_detached": String(initiallyDetached)]
+                    )
+                #endif
+                var rawDrainResult: Bool?
+                drainOutcome = await ContextBuilderResponseDeliveryDrainResolver.resolve(
+                    initiallyDetached: initiallyDetached,
+                    awaitDrain: {
+                        let result = await ServerNetworkManager.shared.waitUntilResponseDeliveryDrained(
+                            for: cid
+                        )
+                        rawDrainResult = result
+                        #if DEBUG
+                            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                                runID: runID,
+                                event: "context_builder.response_drain_raw_result",
+                                connectionID: cid,
+                                fields: [
+                                    "duration_ms": String(format: "%.3f", (
+                                        ProcessInfo.processInfo.systemUptime - drainStartedAt
+                                    ) * 1000),
+                                    "result": String(result)
+                                ]
+                            )
+                        #endif
+                        return result
+                    },
+                    isAuthoritativePeerEOFDetached: {
+                        mcpServer.isDetachedContextBuilderConnection(
+                            connectionID: cid,
+                            runID: runID
+                        )
+                    },
+                    awaitTeardownPublication: {
+                        #if DEBUG
+                            let handoffStartedAt = ProcessInfo.processInfo.systemUptime
+                            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                                runID: runID,
+                                event: "context_builder.handoff_wait_start",
+                                connectionID: cid,
+                                fields: [
+                                    "timeout_seconds": String(
+                                        ContextBuilderDefaults.peerEOFDetachmentHandoffTimeoutSeconds
+                                    )
+                                ]
+                            )
+                        #endif
+                        let publication = await mcpServer.contextBuilderTeardownPublicationCoordinator.wait(
+                            runID: runID,
+                            connectionID: cid,
+                            timeoutSeconds: ContextBuilderDefaults.peerEOFDetachmentHandoffTimeoutSeconds
+                        )
+                        #if DEBUG
+                            await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                                runID: runID,
+                                event: "context_builder.handoff_wait_resolved",
+                                connectionID: cid,
+                                fields: [
+                                    "duration_ms": String(format: "%.3f", (
+                                        ProcessInfo.processInfo.systemUptime - handoffStartedAt
+                                    ) * 1000),
+                                    "source": publication.diagnosticSource
+                                ]
+                            )
+                        #endif
+                        return publication
+                    }
                 )
+                #if DEBUG
+                    await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "context_builder.response_drain_result",
+                        connectionID: cid,
+                        fields: [
+                            "duration_ms": String(format: "%.3f", (
+                                ProcessInfo.processInfo.systemUptime - drainStartedAt
+                            ) * 1000),
+                            "final_outcome": String(describing: drainOutcome),
+                            "raw_result": rawDrainResult.map(String.init) ?? "not_attempted"
+                        ]
+                    )
+                #endif
+                return drainOutcome.succeeded
             },
             commitContext: { [weak self, weak record] cid in
                 guard let self, let record,
                       activeAgentRuns.contains(runID),
                       acceptsEvents(from: record)
                 else {
+                    contextCommitOutcome = .staleOrNoLongerCurrent
                     return false
                 }
-                let committed = await mcpServer.commitAndClearTabContext(
+                let didClaimCommit = record.claimFinalContextCommit()
+                #if DEBUG
+                    await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "context_builder.commit_claim",
+                        connectionID: cid,
+                        fields: ["claimed": String(didClaimCommit)]
+                    )
+                #endif
+                guard didClaimCommit else {
+                    contextCommitOutcome = .staleOrNoLongerCurrent
+                    return false
+                }
+                let outcome = await mcpServer.commitContextBuilderTabContext(
                     connectionID: cid,
                     expectedRunID: runID,
                     isStillCurrent: { [weak self, weak record] in
@@ -2610,13 +2762,24 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     progressReporter: record.progressReporter,
                     deferRunMappingCleanupUntilCaller: true
                 )
-                return committed && activeAgentRuns.contains(runID) && acceptsEvents(from: record)
+                contextCommitOutcome = outcome
+                #if DEBUG
+                    await ServerNetworkManager.shared.debugRecordRunRoutingEvent(
+                        runID: runID,
+                        event: "context_builder.commit_outcome",
+                        connectionID: cid,
+                        fields: ["outcome": String(describing: outcome)]
+                    )
+                #endif
+                return outcome == .committed &&
+                    activeAgentRuns.contains(runID) &&
+                    acceptsEvents(from: record)
             },
             beforeTerminationRequest: {
                 await record.reportProgress(.childConnectionTermination)
             },
             requestTermination: { [weak self] cid in
-                guard let self else { return Task {} }
+                guard let self, !drainOutcome.transportAlreadyClosed else { return Task {} }
                 debugLog("commitTabContextForAgent: requesting termination for agent connection \(cid) runID=\(runID)")
                 return Task {
                     await ServerNetworkManager.shared.terminateConnection(
@@ -2639,9 +2802,15 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 )
             }
         )
-        guard finalizedConnections else { return false }
+        guard finalizedConnections else {
+            if let contextCommitOutcome { return contextCommitOutcome }
+            if !acceptsEvents(from: record) { return .staleOrNoLongerCurrent }
+            return .failed("Context Builder response delivery did not finish for run \(runID.uuidString).")
+        }
 
-        guard activeAgentRuns.remove(runID) != nil, acceptsEvents(from: record) else { return false }
+        guard activeAgentRuns.remove(runID) != nil, acceptsEvents(from: record) else {
+            return .staleOrNoLongerCurrent
+        }
         if let clientName = agentClientName {
             mcpServer.removeTabContext(
                 forConnectionID: nil,
@@ -2650,10 +2819,11 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 runID: runID
             )
         }
-        return true
+        return .committed
     }
 
     private func clearTabContextForAgent(agent: AgentProviderKind, runID: UUID) async {
+        mcpServer.discardDetachedContextBuilderTabContext(runID: runID)
         guard activeAgentRuns.remove(runID) != nil else {
             debugLog("clearTabContextForAgent: runID=\(runID) not tracked, skipping")
             return

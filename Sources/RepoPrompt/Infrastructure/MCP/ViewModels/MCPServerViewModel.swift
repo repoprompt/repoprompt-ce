@@ -1130,6 +1130,10 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     var tabContextByConnectionID: [UUID: TabScopedContext] = [:]
     @MainActor
+    var detachedContextBuilderTabContextByRunID: [UUID: DetachedContextBuilderTabContext] = [:]
+    @MainActor
+    let contextBuilderTeardownPublicationCoordinator = ContextBuilderTeardownPublicationCoordinator()
+    @MainActor
     var readFileAutoSelectionHandoverLineageByConnectionID: [UUID: ReadFileAutoSelectionHandoverLineage] = [:]
     @MainActor
     var nextReadFileAutoSelectionBindingGeneration: UInt64 = 0
