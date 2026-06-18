@@ -4,6 +4,7 @@ set -uo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONDUCTOR="$ROOT_DIR/conductor"
 APP_ARGS=("$@")
+LAUNCHER_ADHOC_SIGNING=0
 
 if ! command -v python3 >/dev/null 2>&1; then
     echo "RepoPrompt CE's safe coordinated launcher requires Python 3."
@@ -21,10 +22,29 @@ elif [[ ! -x "$CONDUCTOR" ]]; then
     exit 1
 fi
 
+configure_debug_signing() {
+    if [[ -n "${SIGN_IDENTITY:-}" || "${ALLOW_ADHOC_SIGNING:-0}" == "1" || "${ALLOW_ADHOC_SIGNING:-0}" == "true" ]]; then
+        return 0
+    fi
+
+    local apple_development_identity
+    apple_development_identity="$(security find-identity -v -p codesigning 2>/dev/null | awk -F'"' '/"Apple Development: / { print $2; exit }' || true)"
+    if [[ -n "$apple_development_identity" ]]; then
+        return 0
+    fi
+
+    export ALLOW_ADHOC_SIGNING=1
+    LAUNCHER_ADHOC_SIGNING=1
+}
+
 launch_app() {
     echo
     echo "Building and relaunching RepoPrompt CE..."
     echo "This run becomes the active launch; any older build or launch jobs still in flight are canceled."
+    if (( LAUNCHER_ADHOC_SIGNING )); then
+        echo "No Apple Development signing identity was found, so this launcher is using explicit ad-hoc debug signing."
+        echo "Debug secure storage will be in-memory; saved API keys and secure permission changes will not persist across app launches."
+    fi
     echo
     if (( ${#APP_ARGS[@]} > 0 )); then
         if "$CONDUCTOR" app relaunch -- "${APP_ARGS[@]}"; then
@@ -112,6 +132,7 @@ echo "Project: $ROOT_DIR"
 echo "Mode:    coordinated (builds and launches run through the dev daemon)"
 
 cd "$ROOT_DIR" || exit 1
+configure_debug_signing
 launch_app
 
 while true; do
