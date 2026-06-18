@@ -309,13 +309,6 @@ extension AgentModeViewModel {
     /// Session-linked sidebar data source.
     /// Blank compose tabs stay hidden until they are explicitly linked to an agent session.
     func sidebarSessions(for tabs: [ComposeTabState]) -> [SidebarSession] {
-        sidebarSessions(for: tabs, activeTabID: currentTabID)
-    }
-
-    func sidebarSessions(
-        for tabs: [ComposeTabState],
-        activeTabID: UUID?
-    ) -> [SidebarSession] {
         let currentIndex = ownerValidatedSessionIndex
         let indexEntriesByTabID = Dictionary(grouping: currentIndex.values, by: \.tabID)
         let authoritativeSessionIDByTabID = Dictionary(
@@ -350,7 +343,6 @@ extension AgentModeViewModel {
             sessionListSortDates: ownerValidatedSessionListSortDates,
             sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
-            activeTabID: activeTabID,
             mcpControlledTabIDs: mcpControlledTabIDs
         ).build()
     }
@@ -383,7 +375,7 @@ extension AgentModeViewModel {
             let startMS = AgentModePerfDiagnostics.timestampMSIfEnabled()
         #endif
         let source = diagnosticSource ?? "unknown"
-        let sortedSessions = sidebarSessions(for: tabs, activeTabID: currentTabID)
+        let sortedSessions = sidebarSessions(for: tabs)
         let effectiveSearchText = searchText ?? sessionSidebarSearchText
         let searchTrimmed = effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let result: [SidebarSession]
@@ -439,13 +431,8 @@ extension AgentModeViewModel {
             }
 
             let filtered = sortedSessions.filter { matchedIDs.contains($0.id) }
-            let reordered = sidebarSearchRowsPromotingActiveThread(
-                filtered,
-                currentTabID: currentTabID,
-                sessionByID: sessionByID
-            )
             result = sidebarRowsApplyingThreadCollapse(
-                reordered,
+                filtered,
                 currentTabID: currentTabID,
                 searchText: effectiveSearchText,
                 diagnosticSource: source
@@ -466,46 +453,6 @@ extension AgentModeViewModel {
             )
         #endif
         return result
-    }
-
-    private func sidebarSearchRowsPromotingActiveThread(
-        _ rows: [SidebarSession],
-        currentTabID: UUID?,
-        sessionByID: [UUID: SidebarSession]
-    ) -> [SidebarSession] {
-        guard let activeTabID = currentTabID,
-              let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
-        else {
-            return rows
-        }
-        var rootID = rows[activeIndex].id
-        var cursor = rows[activeIndex].parentSessionID
-        var visitedSessionIDs: Set<UUID> = []
-        while let parentSessionID = cursor,
-              visitedSessionIDs.insert(parentSessionID).inserted,
-              let parent = sessionByID[parentSessionID]
-        {
-            rootID = parent.id
-            cursor = parent.parentSessionID
-        }
-        guard let groupStartIndex = rows.firstIndex(where: { $0.id == rootID }) else {
-            var reordered = rows
-            let active = reordered.remove(at: activeIndex)
-            reordered.insert(active, at: 0)
-            return reordered
-        }
-        let rootDepth = rows[groupStartIndex].depth
-        let groupEndIndex = rows[(groupStartIndex + 1)...]
-            .firstIndex(where: { $0.depth <= rootDepth }) ?? rows.endIndex
-        let groupRange = groupStartIndex ..< groupEndIndex
-        guard groupRange.contains(activeIndex), groupStartIndex != rows.startIndex else {
-            return rows
-        }
-        var reordered = rows
-        let group = Array(reordered[groupRange])
-        reordered.removeSubrange(groupRange)
-        reordered.insert(contentsOf: group, at: rows.startIndex)
-        return reordered
     }
 
     private func sidebarRowsApplyingThreadCollapse(

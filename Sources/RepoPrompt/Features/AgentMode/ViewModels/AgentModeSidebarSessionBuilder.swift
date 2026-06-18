@@ -13,7 +13,6 @@ struct AgentModeSidebarSessionBuilder {
     let sessionListSortDates: [UUID: Date]
     let sessionListCacheReady: Bool
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
-    let activeTabID: UUID?
     let mcpControlledTabIDs: Set<UUID>
 
     private struct BuildContext {
@@ -603,11 +602,6 @@ struct AgentModeSidebarSessionBuilder {
                     let rhsContainsPinned = subtreeContainsPinned(rhs)
                     if lhsContainsPinned != rhsContainsPinned {
                         return lhsContainsPinned && !rhsContainsPinned
-                    }
-                    let lhsIsActive = flat[lhs].tabID == activeTabID
-                    let rhsIsActive = flat[rhs].tabID == activeTabID
-                    if lhsIsActive != rhsIsActive {
-                        return lhsIsActive && !rhsIsActive
                     }
                     return sidebarRowPrecedes(flat[lhs], flat[rhs], tabOrder: tabOrder)
                 }
