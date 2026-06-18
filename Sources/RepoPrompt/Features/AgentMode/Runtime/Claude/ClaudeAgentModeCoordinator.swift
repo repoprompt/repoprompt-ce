@@ -401,6 +401,8 @@ final class ClaudeAgentModeCoordinator {
              .invalidControlResponse,
              .controlRequestTimedOut:
             return true
+        case .liveModelSwitchRequiresRestart:
+            return false
         }
     }
 
