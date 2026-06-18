@@ -197,7 +197,7 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         XCTAssertEqual(try row(for: staleTabID, in: rows).activityDate, date(100))
     }
 
-    func testActiveChildPromotesAmongSiblingsWithoutChangingActivityDates() throws {
+    func testSiblingOrderFollowsActivityDates() throws {
         let parentTabID = id(30)
         let newerChildTabID = id(31)
         let activeOlderChildTabID = id(32)
@@ -225,13 +225,9 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             )
         ])
 
-        let rows = build(
-            tabs: tabs,
-            sessionIndex: index,
-            activeTabID: activeOlderChildTabID
-        )
+        let rows = build(tabs: tabs, sessionIndex: index)
 
-        XCTAssertEqual(rows.map(\.tabID), [parentTabID, activeOlderChildTabID, newerChildTabID])
+        XCTAssertEqual(rows.map(\.tabID), [parentTabID, newerChildTabID, activeOlderChildTabID])
         XCTAssertEqual(
             try XCTUnwrap(rows.first(where: { $0.tabID == activeOlderChildTabID })).activityDate,
             date(100)
@@ -458,8 +454,7 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
-        sessionIndex: [UUID: AgentSessionIndexEntry],
-        activeTabID: UUID? = nil
+        sessionIndex: [UUID: AgentSessionIndexEntry]
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
@@ -474,7 +469,6 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             sessionListSortDates: [:],
             sessionListCacheReady: true,
             sidebarRestoreFrozenOrderByTabID: [:],
-            activeTabID: activeTabID,
             mcpControlledTabIDs: []
         ).build()
     }
