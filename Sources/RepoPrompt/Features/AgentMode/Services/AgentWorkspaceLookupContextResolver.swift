@@ -173,8 +173,8 @@ enum AgentWorkspaceLookupContextResolver {
             projection.lookupRootScope,
             expectedPhysicalRoots: projection.physicalRootRefs
         )
-        guard !Task.isCancelled else { return false }
-        return sessionRootSnapshot?.isCurrent() == true
+        guard !Task.isCancelled, let sessionRootSnapshot else { return false }
+        return sessionRootSnapshot.isGenerationCurrent()
     }
 
     static func authoritativeLookupContextOrFailClosed(

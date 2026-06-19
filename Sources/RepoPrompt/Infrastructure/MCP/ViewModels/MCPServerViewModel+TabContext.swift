@@ -2030,7 +2030,7 @@ extension MCPServerViewModel {
         )
         if let cached = fileToolLookupContextCacheByConnectionID[connectionID],
            cached.key == cacheKey,
-           cached.sessionRootLifetimeSnapshot.isCurrent()
+           cached.sessionRootLifetimeSnapshot.isGenerationCurrent()
         {
             let canReuse = await AgentWorkspaceLookupContextResolver.canReuseAuthoritativeLookupContext(
                 cached.context,
@@ -2055,9 +2055,11 @@ extension MCPServerViewModel {
                     return AgentWorkspaceLookupContextResolver.failClosedLookupContext
                 }
                 var currentCachedContext: WorkspaceLookupContext?
-                guard cached.sessionRootLifetimeSnapshot.performIfCurrent({
-                    currentCachedContext = cached.context
-                }), let currentCachedContext else {
+                guard await cached.sessionRootLifetimeSnapshot.isCurrent(),
+                      cached.sessionRootLifetimeSnapshot.performIfGenerationCurrent({
+                          currentCachedContext = cached.context
+                      }), let currentCachedContext
+                else {
                     fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                     #if DEBUG
                         fileToolLookupContextStaleCompletionCount += 1
@@ -2174,9 +2176,11 @@ extension MCPServerViewModel {
         }
         if let publishedEntry {
             var currentPublishedContext: WorkspaceLookupContext?
-            guard sessionRootLifetimeSnapshot.performIfCurrent({
-                currentPublishedContext = publishedEntry.context
-            }), let currentPublishedContext else {
+            guard await sessionRootLifetimeSnapshot.isCurrent(),
+                  sessionRootLifetimeSnapshot.performIfGenerationCurrent({
+                      currentPublishedContext = publishedEntry.context
+                  }), let currentPublishedContext
+            else {
                 fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
                 #if DEBUG
                     fileToolLookupContextStaleCompletionCount += 1
@@ -2191,9 +2195,11 @@ extension MCPServerViewModel {
             context: adjustedLookupContext,
             sessionRootLifetimeSnapshot: sessionRootLifetimeSnapshot
         )
-        guard sessionRootLifetimeSnapshot.performIfCurrent({
-            fileToolLookupContextCacheByConnectionID[connectionID] = cacheEntry
-        }) else {
+        guard await sessionRootLifetimeSnapshot.isCurrent(),
+              sessionRootLifetimeSnapshot.performIfGenerationCurrent({
+                  fileToolLookupContextCacheByConnectionID[connectionID] = cacheEntry
+              })
+        else {
             if stillOwnsResolution {
                 pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)
             }

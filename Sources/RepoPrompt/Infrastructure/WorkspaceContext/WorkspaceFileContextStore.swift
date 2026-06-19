@@ -129,20 +129,13 @@ private final class WorkspaceSessionRootLifetimeClock: @unchecked Sendable {
         )
     }
 
-    func performIfCurrent(
+    func performIfGenerationCurrent(
         generation expectedGeneration: UInt64,
-        physicalRootPaths: [String],
         operation: () -> Void
     ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
-        guard generation == expectedGeneration,
-              physicalRootPaths.allSatisfy({ path in
-                  var isDirectory: ObjCBool = false
-                  return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
-                      && isDirectory.boolValue
-              })
-        else { return false }
+        guard generation == expectedGeneration else { return false }
         operation()
         return true
     }
@@ -153,19 +146,30 @@ struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
     fileprivate let generation: UInt64
     fileprivate let physicalRootPaths: [String]
 
-    func isCurrent() -> Bool {
-        clock.performIfCurrent(
+    func isGenerationCurrent() -> Bool {
+        clock.performIfGenerationCurrent(
             generation: generation,
-            physicalRootPaths: physicalRootPaths,
             operation: {}
         )
     }
 
+    func isCurrent() async -> Bool {
+        let physicalRootPaths = physicalRootPaths
+        let rootsExist = await Task.detached(priority: .userInitiated) {
+            physicalRootPaths.allSatisfy { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        }.value
+        guard rootsExist else { return false }
+        return isGenerationCurrent()
+    }
+
     @discardableResult
-    func performIfCurrent(_ operation: () -> Void) -> Bool {
-        clock.performIfCurrent(
+    func performIfGenerationCurrent(_ operation: () -> Void) -> Bool {
+        clock.performIfGenerationCurrent(
             generation: generation,
-            physicalRootPaths: physicalRootPaths,
             operation: operation
         )
     }
