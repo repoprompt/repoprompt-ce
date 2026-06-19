@@ -66,7 +66,7 @@ enum CursorACPEventNormalizer {
         if let rawOutput = payload["rawOutput"] {
             result["rawOutput"] = rawOutput
             if let rawOutputObject = rawOutput as? [String: Any],
-               let chatID = authoritativeChatID(in: rawOutputObject)
+               let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromRootObject: rawOutputObject)
             {
                 result["chat_id"] = chatID
             }
@@ -78,35 +78,6 @@ enum CursorACPEventNormalizer {
             result["rawInput"] = rawInput
         }
         return result
-    }
-
-    private static func authoritativeChatID(in object: [String: Any]) -> String? {
-        guard object["chatID"] == nil,
-              !containsNestedChatID(in: object),
-              let chatID = object["chat_id"] as? String
-        else { return nil }
-        let trimmed = chatID.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static func containsNestedChatID(in object: [String: Any]) -> Bool {
-        for (key, value) in object where key != "chat_id" {
-            if key == "chatID" || key == "chat_id" { return true }
-            if containsChatID(in: value) { return true }
-        }
-        return false
-    }
-
-    private static func containsChatID(in value: Any) -> Bool {
-        if let object = value as? [String: Any] {
-            for (key, nested) in object {
-                if key == "chat_id" || key == "chatID" { return true }
-                if containsChatID(in: nested) { return true }
-            }
-        } else if let array = value as? [Any] {
-            return array.contains(where: containsChatID)
-        }
-        return false
     }
 
     private static func rawOutputIsMeaningful(_ value: Any) -> Bool {

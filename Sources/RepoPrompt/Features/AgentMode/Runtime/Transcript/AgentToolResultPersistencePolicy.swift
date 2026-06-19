@@ -2110,15 +2110,10 @@ enum AgentToolResultPersistencePolicy {
             object["response_type"] = responseType
         }
 
-        let selectedKey: String? = switch responseType?.lowercased() {
-        case "review": "review"
-        case "plan", "question": "plan"
-        default: nil
-        }
-        if let selectedKey,
-           let reply = boundedContextBuilderReply(rawObject[selectedKey] as? [String: Any])
+        if let branch = ContextBuilderFollowUpBranch.select(responseType: responseType),
+           let reply = boundedContextBuilderReply(rawObject[branch.rawValue] as? [String: Any])
         {
-            object[selectedKey] = reply
+            object[branch.rawValue] = reply
         }
 
         guard let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) else {

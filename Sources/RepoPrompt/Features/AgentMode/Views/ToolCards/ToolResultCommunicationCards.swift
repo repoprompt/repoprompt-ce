@@ -5,7 +5,7 @@ func oracleToolResultPopoverUserInfo(
     item: AgentChatItem,
     openContext: AgentOracleOpenContext?
 ) -> [AnyHashable: Any]? {
-    let chatID = AgentOracleToolRouting.authoritativeChatID(from: item.toolResultJSON)
+    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolResultJSON)
     return AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
         chatID: chatID

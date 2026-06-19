@@ -557,20 +557,14 @@ func contextBuilderOraclePopoverUserInfo(
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
-    guard let dto else { return nil }
-    let planChatID = nonEmptyContextBuilderValue(dto.plan?.chatID)
-    let reviewChatID = nonEmptyContextBuilderValue(dto.review?.chatID)
-    let responseType = dto.responseType?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-
-    switch responseType {
-    case "review":
-        return reviewChatID
-    case "plan", "question":
-        return planChatID
-    default:
-        return nil
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return nil }
+    switch branch {
+    case .review:
+        return nonEmptyContextBuilderValue(dto.review?.chatID)
+    case .plan:
+        return nonEmptyContextBuilderValue(dto.plan?.chatID)
     }
 }
 
