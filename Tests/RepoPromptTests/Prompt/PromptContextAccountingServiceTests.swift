@@ -80,7 +80,13 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             visibleLogicalRoots: [logicalRootRef]
         )
         let lookupContext = WorkspaceLookupContext(
-            rootScope: projection.lookupRootScope,
+            // This test intentionally exercises a dynamic path selector that begins before
+            // the worktree root is loaded. Authoritative file-tool projections use the
+            // identity-pinned `projection.lookupRootScope` instead.
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [worktreeRoot.path]
+            ),
             bindingProjection: projection
         )
         let logicalSelection = StoredSelection(
