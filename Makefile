@@ -1,4 +1,4 @@
-.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production dev-status dev-build dev-swift-build dev-run dev-test dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-test dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
 
@@ -75,6 +75,26 @@ release-artifact:
 
 install-local-production:
 	./Scripts/install_local_production.sh
+
+xcode: xcode-open
+
+xcode-open: xcode-generate
+	open "$$(python3 Scripts/generate_xcode_workspace.py print-path)"
+
+xcode-generate:
+	python3 Scripts/generate_xcode_workspace.py generate
+
+xcode-check:
+	python3 Scripts/generate_xcode_workspace.py check
+
+xcode-validate: xcode-generate
+	python3 Scripts/generate_xcode_workspace.py validate --xcodebuild-list
+
+xcode-generator-test:
+	python3 Scripts/test_xcode_workspace_generator.py
+
+xcode-clean:
+	rm -rf .build/xcode .build/xcode-custom
 
 dev-status:
 	./conductor status

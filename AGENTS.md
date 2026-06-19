@@ -57,6 +57,29 @@ SwiftPM’s architecture-specific build output is usually under:
 .build/arm64-apple-macosx/debug/
 ```
 
+## Generated Xcode workspace
+
+The repository-owned workspace is a disposable developer convenience under
+`.build/xcode`; `Package.swift`, conductor, and `Scripts/package_app.sh` remain
+authoritative.
+
+```bash
+make xcode                  # generate and open
+make xcode-generate         # generate without opening
+make xcode-validate         # regenerate and validate with xcodebuild -list
+make xcode-generator-test   # deterministic generator contract tests
+make xcode-clean            # remove generated workspace metadata
+```
+
+Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
+Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
+products. `RepoPrompt CE Tests` delegates to conductor because `RepoPromptMCP`
+is executable-only and cannot back a native Xcode unit-test dependency. Do not
+edit or commit `.build/xcode`, use these schemes for release/archive work, or
+assume canceling Xcode cancels a queued conductor job; inspect
+`./conductor job list` after cancellation. See
+[`docs/architecture/xcode-workspace.md`](docs/architecture/xcode-workspace.md).
+
 ## Debug CLI / MCP
 
 Use the CE-specific debug CLI when testing this app. The production `rp-cli` / `rp-cli-debug` connection is only an analogue and may talk to the non-CE app.

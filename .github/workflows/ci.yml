@@ -17,6 +17,9 @@ jobs:
       - name: Run repository guardrails
         run: make guardrails
 
+      - name: Test Xcode workspace generator
+        run: make xcode-generator-test
+
       - name: Install Swift style tools
         run: ./Scripts/install_format_tools.sh install
 
@@ -35,6 +38,9 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Validate generated Xcode workspace
+        run: make xcode-validate
 
       - name: Build app product
         run: swift build --product RepoPrompt
