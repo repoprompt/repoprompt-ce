@@ -1996,6 +1996,8 @@ extension MCPServerViewModel {
         )
         guard let connectionID = metadata.connectionID,
               !resolved.usesActiveTabCompatibility,
+              let boundSnapshot = tabContextByConnectionID[connectionID],
+              fileToolLookupSnapshotMatches(boundSnapshot, resolved.snapshot),
               source.activeAgentSessionID != nil,
               !source.worktreeBindings.isEmpty
         else {
