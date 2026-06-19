@@ -490,9 +490,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+            await dependencies.captureRequestMetadata()
+        }
         try Task.checkCancellation()
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let lookupContext = await EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.providerLookupContextResolution,
+            EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+        ) {
+            await dependencies.resolveFileToolLookupContext(metadata)
+        }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
@@ -651,7 +658,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 )
             }
             endDTOBuildIfNeeded()
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "completed", countOnly: true))
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerDTOReady,
+                EditFlowPerf.Dimensions(
+                    outcome: "completed",
+                    matchCount: reply.totalMatches,
+                    usesWorktreeProjection: usesWorktreeProjection,
+                    countOnly: true
+                )
+            )
             EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedCountOnly"))
             return reply
         }
@@ -781,7 +796,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.providerDTOReady,
-            EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
+            EditFlowPerf.Dimensions(
+                outcome: dtoBuildOutcome,
+                matchCount: reply.totalMatches,
+                usesWorktreeProjection: usesWorktreeProjection,
+                searchMode: mode.rawValue,
+                countOnly: false
+            )
         )
         try Task.checkCancellation()
         await EditFlowPerf.measure(

@@ -169,7 +169,6 @@ final class AgentModeProviderBindingService {
         sessions: [AgentModeViewModel.TabSession],
         currentTabID: UUID?,
         codexCoordinator: CodexAgentModeCoordinator,
-        claudeCoordinator: ClaudeAgentModeCoordinator,
         scheduleSave: @escaping (UUID) -> Void,
         updateActiveBindings: @escaping (AgentModeViewModel.TabSession) -> Void,
         refreshGuidance: @escaping () -> Void
@@ -188,13 +187,9 @@ final class AgentModeProviderBindingService {
             case .codex:
                 codexCoordinator.handleToolPreferencesChanged(for: session)
             case .claude:
-                guard !session.runState.isActive else { continue }
-                Task { @MainActor in
-                    await claudeCoordinator.shutdownClaudeSession(session)
-                    if session.tabID == currentTabID {
-                        updateActiveBindings(session)
-                    }
-                }
+                // Claude launch settings are revalidated immediately before dispatch.
+                // Avoid an eager untracked shutdown that could race a newly started run.
+                break
             case .openCode:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard let sessionModeID = runtime.acpSessionModeID,

@@ -5677,6 +5677,19 @@ actor ServerNetworkManager {
             )
         }
         #if DEBUG
+            if let runID = runIDByConnectionID[connectionID],
+               runPurposeByConnection[connectionID] == .discoverRun
+            {
+                debugRecordRunRoutingEvent(
+                    runID: runID,
+                    event: "context_builder.transport_close_accepted",
+                    connectionID: connectionID,
+                    fields: [
+                        "cause": closeSnapshot.cause.rawValue,
+                        "initiator": closeSnapshot.initiator.rawValue
+                    ]
+                )
+            }
             let retained = DebugRetainedTransportIngress(
                 snapshot: snapshot,
                 clientName: clientName,
@@ -5782,8 +5795,11 @@ actor ServerNetworkManager {
     private static func finishReadFileAutoSelectionAndRemoveTabContext(
         connectionID: UUID,
         clientName: String?,
-        assignedWindowID: Int?
-    ) async {
+        assignedWindowID: Int?,
+        contextBuilderRunID: UUID?,
+        detachContextBuilderRunID: UUID?,
+        closeContext: MCPConnectionCloseContext
+    ) async -> Bool {
         let windows = WindowStatesManager.shared.allWindows
         let targets: [WindowState]
         let cleanupWindowID: Int?
@@ -5802,6 +5818,15 @@ actor ServerNetworkManager {
                 connectionID: connectionID
             )
         }
+        var didDetachContextBuilderContext = false
+        if let detachContextBuilderRunID {
+            for state in targets {
+                didDetachContextBuilderContext = state.mcpServer.detachContextBuilderTabContextForPeerEOF(
+                    connectionID: connectionID,
+                    runID: detachContextBuilderRunID
+                ) || didDetachContextBuilderContext
+            }
+        }
         for state in targets {
             state.mcpServer.removeTabContext(
                 forConnectionID: connectionID,
@@ -5810,6 +5835,22 @@ actor ServerNetworkManager {
                 runID: nil
             )
         }
+        if let contextBuilderRunID {
+            for state in targets {
+                let wasDetached = state.mcpServer.isDetachedContextBuilderConnection(
+                    connectionID: connectionID,
+                    runID: contextBuilderRunID
+                )
+                state.mcpServer.contextBuilderTeardownPublicationCoordinator.publish(
+                    wasDetached
+                        ? .peerEOFDetached
+                        : .resolvedWithoutPeerEOFDetachment(reason: closeContext.reason),
+                    runID: contextBuilderRunID,
+                    connectionID: connectionID
+                )
+            }
+        }
+        return didDetachContextBuilderContext
     }
 
     func removeConnection(
@@ -5869,6 +5910,19 @@ actor ServerNetworkManager {
         // actually initiated removal.
         persistAcceptedSocketTerminalRecord(connectionID: id, context: context)
 
+        // Capture run ownership before any suspension or connection-dictionary cleanup.
+        // Only orderly peer EOF from a discover-run child may transfer final context ownership.
+        let cleanupRunPurpose = runPurposeByConnection[id] ?? .unknown
+        let cleanupRunID = runIDByConnectionID[id]
+        let detachContextBuilderRunID: UUID? = if context.reason == MCPTransportTerminalCause.peerEOF.rawValue,
+                                                  context.initiator == .peer,
+                                                  cleanupRunPurpose == .discoverRun
+        {
+            cleanupRunID
+        } else {
+            nil
+        }
+
         // Always drop any lingering bootstrap reservation (commit/rollback should handle it,
         // but this is a leak safety-net for edge cases)
         if let reservation = bootstrapReservations.removeValue(forKey: id) {
@@ -5922,11 +5976,30 @@ actor ServerNetworkManager {
             connectionLog("Cancelled \(cancelledToolCount) active tool execution(s) owned by disconnected connection \(id)")
         }
 
-        await Self.finishReadFileAutoSelectionAndRemoveTabContext(
+        let didDetachContextBuilderContext = await Self.finishReadFileAutoSelectionAndRemoveTabContext(
             connectionID: id,
             clientName: cleanupClientName,
-            assignedWindowID: assignedWindowID
+            assignedWindowID: assignedWindowID,
+            contextBuilderRunID: cleanupRunPurpose == .discoverRun ? cleanupRunID : nil,
+            detachContextBuilderRunID: detachContextBuilderRunID,
+            closeContext: context
         )
+        #if DEBUG
+            if cleanupRunPurpose == .discoverRun, let cleanupRunID {
+                debugRecordRunRoutingEvent(
+                    runID: cleanupRunID,
+                    event: didDetachContextBuilderContext
+                        ? "context_builder.tab_context_detach_published"
+                        : "context_builder.teardown_resolved_without_detach",
+                    connectionID: id,
+                    fields: [
+                        "cause": context.reason,
+                        "initiator": context.initiator.rawValue,
+                        "detached": String(didDetachContextBuilderContext)
+                    ]
+                )
+            }
+        #endif
         connectionWindowMap[id] = nil
 
         // Stop the connection manager unless the exact committed owner was already stopped
@@ -7117,12 +7190,18 @@ actor ServerNetworkManager {
             }
 
             func debugRunRoutingHistoryPayload(runID: UUID, limit: Int) -> [String: Any] {
-                let matching = debugRunRoutingHistory.filter { $0.runID == runID }
+                debugRunRoutingHistoryPayload(runID: Optional(runID), limit: limit)
+            }
+
+            func debugRunRoutingHistoryPayload(runID: UUID?, limit: Int) -> [String: Any] {
+                let matching = runID.map { requestedRunID in
+                    debugRunRoutingHistory.filter { $0.runID == requestedRunID }
+                } ?? debugRunRoutingHistory
                 let events = Array(matching.suffix(limit))
                 return [
                     "ok": true,
                     "op": "run_routing_history",
-                    "run_id": runID.uuidString,
+                    "run_id": runID?.uuidString ?? NSNull(),
                     "events": events.map(debugRunRoutingHistoryObject),
                     "oldest_available_seq": debugRunRoutingHistory.first.map { Int($0.seq) } ?? NSNull(),
                     "latest_seq": debugRunRoutingHistory.last.map { Int($0.seq) } ?? NSNull(),

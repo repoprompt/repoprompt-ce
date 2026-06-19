@@ -28,6 +28,7 @@ public enum MCPBootstrapProtocol {
 /// Keep proxy startup under common outer host timeouts so retries can engage.
 public enum MCPBootstrapTiming {
     public static let initialResponseTimeout: TimeInterval = 5
+    public static let initialRequestWriteTimeout: TimeInterval = 5
 }
 
 // MARK: - Handshake Request

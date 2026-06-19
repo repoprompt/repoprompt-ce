@@ -125,6 +125,29 @@ final class MCPProxyTerminalRecordTests: XCTestCase {
         XCTAssertNotEqual(record.reason, "proxy_unexpected_error")
     }
 
+    func testProxyTaskGroupOutcomesClassifyCleanCompletionAndCancellation() throws {
+        XCTAssertNil(MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
+            firstCompletedOutcome: .transportCompleted,
+            serviceTaskIsCancelled: false
+        ))
+
+        let cancelledOutcomes: [(MCPServiceProxyTaskOutcome, Bool)] = [
+            (.transportCompleted, true),
+            (.killSignalWaitCancelled, false),
+            (.ppidWatchdogCancelled, false)
+        ]
+        for (outcome, serviceTaskIsCancelled) in cancelledOutcomes {
+            let runtimeError = try XCTUnwrap(MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
+                firstCompletedOutcome: outcome,
+                serviceTaskIsCancelled: serviceTaskIsCancelled
+            ))
+            guard case let .hostDisconnected(provenance) = runtimeError else {
+                return XCTFail("Expected host-disconnected cancellation for \(outcome)")
+            }
+            XCTAssertEqual(provenance.reason, .taskCancelled)
+        }
+    }
+
     func testTerminalRecordCopiesLiveLedgerSnapshotAndServerReason() async throws {
         let ledger = JSONRPCBridgeLedger(connectionID: "terminal-record-test")
         _ = try await ledger.beginConnection()

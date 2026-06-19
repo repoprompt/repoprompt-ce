@@ -47,15 +47,6 @@ final class AgentModeViewModel: ObservableObject {
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?
     ) -> any CodexSessionControlling
     typealias CodexControllerFactoryWithComputerUse = CodexAgentModeCoordinator.CodexControllerFactory
-    typealias ClaudeControllerFactory = (
-        _ runID: UUID,
-        _ tabID: UUID,
-        _ windowID: Int,
-        _ workspacePath: String?,
-        _ runtimeVariant: ClaudeCodeRuntimeVariant,
-        _ allowNativeBashTool: Bool?,
-        _ permissionMode: String?
-    ) -> any NativeAgentRuntimeControlling
     typealias HeadlessProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> HeadlessAgentProvider
     typealias ACPProviderFactory = (_ agent: AgentProviderKind, _ modelString: String?) -> (any ACPAgentProvider)?
     typealias ACPControllerFactory = (_ provider: any ACPAgentProvider, _ runRequest: ACPRunRequest) throws -> ACPAgentSessionController
@@ -312,12 +303,11 @@ final class AgentModeViewModel: ObservableObject {
                 let previousAgent = session.selectedAgent
                 if previousAgent != selectedAgent {
                     codexCoordinator.handleProviderSwitch(from: previousAgent, to: selectedAgent, session: session)
-                    if previousAgent.usesClaudeNativeRuntime,
-                       !selectedAgent.usesClaudeNativeRuntime || previousAgent != selectedAgent
-                    {
-                        session.providerSessionID = nil
-                        Task { await claudeCoordinator.shutdownClaudeSession(session) }
-                    }
+                    claudeCoordinator.handleProviderIdentityTransitionSync(
+                        session: session,
+                        from: previousAgent,
+                        to: selectedAgent
+                    )
                 }
                 session.selectedAgent = selectedAgent
                 if !isModelRawValid(selectedModelRaw, for: selectedAgent) {
@@ -1338,32 +1328,6 @@ final class AgentModeViewModel: ObservableObject {
         return AgentRuntimeProviderService.shared.makeProvider(for: agent, modelString: modelString)
     }
 
-    private nonisolated static func makeClaudeCompatibleNativeController(
-        runID: UUID,
-        tabID: UUID,
-        windowID: Int,
-        workspacePath: String?,
-        runtimeVariant: ClaudeCodeRuntimeVariant,
-        allowNativeBashTool: Bool?,
-        permissionMode: String?
-    ) -> any NativeAgentRuntimeControlling {
-        let coreConfig = ClaudeCodeAgentConfig.agentMode(
-            runtimeVariant: runtimeVariant,
-            permissionMode: permissionMode,
-            allowNativeBashTool: allowNativeBashTool
-        )
-        let runtimeConfig = ClaudeCompatiblePluginBridge.runtimeConfig(from: coreConfig, mode: .agentMode)
-        return ClaudeCompatibleNativeSessionAdapter(runtimeConfig: runtimeConfig) {
-            ClaudeNativeProcessSessionController(
-                runID: runID,
-                tabID: tabID,
-                windowID: windowID,
-                workspacePath: workspacePath,
-                config: coreConfig
-            )
-        }
-    }
-
     private nonisolated static func defaultConnectionPolicyInstaller(
         clientName: String,
         windowID: Int,
@@ -1468,17 +1432,6 @@ final class AgentModeViewModel: ObservableObject {
                 expectedMCPClientName: AgentProviderKind.codexExec.mcpClientNameHint
             )
         }
-        let claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory = { runID, tabID, windowID, workspacePath, runtimeVariant, allowNativeBashTool, permissionMode in
-            Self.makeClaudeCompatibleNativeController(
-                runID: runID,
-                tabID: tabID,
-                windowID: windowID,
-                workspacePath: workspacePath,
-                runtimeVariant: runtimeVariant,
-                allowNativeBashTool: allowNativeBashTool,
-                permissionMode: permissionMode
-            )
-        }
         headlessProviderFactory = Self.defaultHeadlessProviderFactory
         acpProviderFactory = { agent, modelString in
             ACPAgentProviderFactory.makeProvider(for: agent, modelString: modelString)
@@ -1539,7 +1492,6 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
-            claudeControllerFactory: claudeControllerFactory,
             awaitNoActiveMCPTools: { [weak mcpServer] runID in
                 guard let mcpServer else { return }
                 try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
@@ -1601,17 +1553,7 @@ final class AgentModeViewModel: ObservableObject {
             skillCatalog: AgentSkillCatalog? = nil,
             codexControllerFactory: @escaping CodexControllerFactory,
             codexControllerFactoryWithComputerUse: CodexControllerFactoryWithComputerUse? = nil,
-            claudeControllerFactory: @escaping ClaudeControllerFactory = { runID, tabID, windowID, workspacePath, runtimeVariant, allowNativeBashTool, permissionMode in
-                AgentModeViewModel.makeClaudeCompatibleNativeController(
-                    runID: runID,
-                    tabID: tabID,
-                    windowID: windowID,
-                    workspacePath: workspacePath,
-                    runtimeVariant: runtimeVariant,
-                    allowNativeBashTool: allowNativeBashTool,
-                    permissionMode: permissionMode
-                )
-            },
+            claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory? = nil,
             headlessProviderFactory: @escaping HeadlessProviderFactory = { agent, modelString in
                 AgentModeViewModel.defaultHeadlessProviderFactory(agent: agent, modelString: modelString)
             },
@@ -1686,7 +1628,6 @@ final class AgentModeViewModel: ObservableObject {
                 ?? { runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind, _ in
                     codexControllerFactory(runID, tabID, windowID, workspacePath, permissionProfile, taskLabelKind)
                 }
-            let claudeControllerFactory: ClaudeAgentModeCoordinator.ClaudeControllerFactory = claudeControllerFactory
             self.headlessProviderFactory = headlessProviderFactory
             self.acpProviderFactory = acpProviderFactory
             self.acpControllerFactory = acpControllerFactory
@@ -5743,9 +5684,7 @@ final class AgentModeViewModel: ObservableObject {
             await codexCoordinator.shutdownCodexSession(session)
             codexCoordinator.clearCodexSessionState(session)
         }
-        if session.claudeController != nil || session.pendingClaudeResumeTransferTask != nil || session.selectedAgent.usesClaudeNativeRuntime {
-            await claudeCoordinator.shutdownClaudeSession(session)
-        }
+        await claudeCoordinator.shutdownClaudeSessionIfNeeded(session)
         session.providerSessionID = nil
         session.contextUsageSnapshot = nil
         session.activeNonCodexTurnTokenAccumulator = nil
@@ -5967,12 +5906,11 @@ final class AgentModeViewModel: ObservableObject {
         let previousAgent = session.selectedAgent
         if previousAgent != normalized.agent {
             codexCoordinator.handleProviderSwitch(from: previousAgent, to: normalized.agent, session: session)
-            if previousAgent.usesClaudeNativeRuntime,
-               !normalized.agent.usesClaudeNativeRuntime || previousAgent != normalized.agent
-            {
-                session.providerSessionID = nil
-                await claudeCoordinator.shutdownClaudeSession(session)
-            }
+            await claudeCoordinator.handleProviderIdentityTransition(
+                session: session,
+                from: previousAgent,
+                to: normalized.agent
+            )
         }
 
         session.selectedAgent = normalized.agent
@@ -15098,7 +15036,9 @@ final class AgentModeViewModel: ObservableObject {
         invalidateSidebarRestoreOrdering()
         sessionListSortDates.removeValue(forKey: tabID)
 
-        // Clear provider session ID so new conversation doesn't resume old CLI session
+        // Detach before clearing the provider session ID so async cleanup cannot
+        // restore the old conversation or affect a replacement controller.
+        claudeCoordinator.prepareForConversationResetSync(session)
         session.providerSessionID = nil
         session.providerTokenUsageByTurn.removeAll()
         session.pendingNonCodexUserInputTokenQueue.removeAll()
@@ -15115,9 +15055,6 @@ final class AgentModeViewModel: ObservableObject {
 
         // Clear Codex-native identifiers and usage
         codexCoordinator.clearCodexSessionState(session)
-        if session.claudeController != nil {
-            Task { await claudeCoordinator.shutdownClaudeSession(session) }
-        }
 
         applyTranscriptViewportBindingState(
             to: session,

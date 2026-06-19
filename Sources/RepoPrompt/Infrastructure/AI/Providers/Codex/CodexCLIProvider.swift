@@ -760,17 +760,20 @@ final class CodexCLIProvider: AIProvider {
         await appServerClient.stop()
     }
 
-    private func interactiveConfigOverrides(excludeServers: Set<String>) -> [String: Any] {
-        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
-        let toolPolicy = CodexOverrides.ToolPolicy(
+    static func interactiveToolPolicy() -> CodexOverrides.ToolPolicy {
+        CodexOverrides.ToolPolicy(
             toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
             shellToolEnabled: false,
             webSearchRequestEnabled: false,
             viewImageToolEnabled: false,
             includeApplyPatchTool: false,
-            parallelToolCallsEnabled: false,
             multiAgentEnabled: false
         )
+    }
+
+    private func interactiveConfigOverrides(excludeServers: Set<String>) -> [String: Any] {
+        let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
+        let toolPolicy = Self.interactiveToolPolicy()
         var overrides = CodexOverrides.appServerConfigMap(toolPolicy: toolPolicy)
         let mcpOverrides = CodexOverrides.appServerMCPServerMap(
             entries: serverEntries,

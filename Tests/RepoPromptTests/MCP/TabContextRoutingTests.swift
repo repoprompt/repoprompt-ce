@@ -1401,7 +1401,11 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(reboundContext.worktreeBindingState, .unavailable)
 
         await hydrationGate.release()
-        _ = await lookupTask.value
+        let supersededLookupContext = await lookupTask.value
+        XCTAssertEqual(
+            supersededLookupContext,
+            AgentWorkspaceLookupContextResolver.failClosedLookupContext
+        )
 
         let finalContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
         XCTAssertEqual(finalContext.activeAgentSessionID, replacementSessionID)
@@ -1411,6 +1415,81 @@ final class TabContextRoutingTests: XCTestCase {
             reboundContext.readFileAutoSelectionGeneration
         )
         XCTAssertEqual(finalContext.worktreeBindingState, .unavailable)
+    }
+
+    @MainActor
+    func testNonRunBindingHydrationRejectsLiveSessionSwitchBeforeMirrorDelivery() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        WindowStatesManager.shared.registerWindowState(window)
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+
+        let tabID = UUID()
+        let initialSessionID = UUID()
+        let replacementSessionID = UUID()
+        let connectionID = UUID()
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Hydration Session Switch \(UUID().uuidString.prefix(8))",
+            repoPaths: [],
+            ephemeral: true
+        )
+        let workspaceIndex = try XCTUnwrap(
+            window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
+        )
+        window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
+            ComposeTabState(
+                id: tabID,
+                name: "Agent",
+                activeAgentSessionID: initialSessionID
+            )
+        ]
+        window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
+
+        var initialBindingState = AgentSessionWorktreeBindingState.unhydrated
+        window.mcpServer.registerAgentWorktreeBindingsProvider { sessionID, requestedTabID in
+            guard sessionID == initialSessionID, requestedTabID == tabID else { return .unavailable }
+            return initialBindingState
+        }
+        window.mcpServer.registerAgentWorktreeBindingsResolver { sessionID, requestedTabID in
+            XCTAssertEqual(sessionID, initialSessionID)
+            XCTAssertEqual(requestedTabID, tabID)
+            guard var replacementTab = window.workspaceManager.composeTab(with: tabID) else {
+                XCTFail("Expected live Agent tab")
+                return .unavailable
+            }
+            replacementTab.activeAgentSessionID = replacementSessionID
+            XCTAssertTrue(
+                window.workspaceManager.updateComposeTabStoredOnly(
+                    replacementTab,
+                    inWorkspaceID: workspace.id
+                )
+            )
+            initialBindingState = .hydrated([])
+            return initialBindingState
+        }
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "hydration-session-switch-client",
+            tabID: tabID,
+            workspaceID: workspace.id,
+            windowID: window.windowID,
+            runID: nil
+        )
+
+        let lookupContext = await window.mcpServer.resolveFileToolLookupContext(from: .init(
+            connectionID: connectionID,
+            clientName: "hydration-session-switch-client",
+            windowID: window.windowID,
+            runPurpose: .agentModeRun
+        ))
+
+        XCTAssertEqual(lookupContext, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+        XCTAssertEqual(
+            try XCTUnwrap(window.workspaceManager.composeTab(with: tabID)).activeAgentSessionID,
+            replacementSessionID
+        )
     }
 
     @MainActor

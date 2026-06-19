@@ -423,6 +423,8 @@ enum StoreBackedWorkspaceSearch {
         readinessTicket: WorkspaceSearchReadinessTicket? = nil,
         workspaceManager: WorkspaceManagerViewModel? = nil
     ) async throws {
+        let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.rootScopeAvailabilityGate)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.rootScopeAvailabilityGate, perfState) }
         let availability = await store.rootScopeAvailability(rootScope)
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         guard availability == .available else {
@@ -445,6 +447,8 @@ enum StoreBackedWorkspaceSearch {
         store: WorkspaceFileContextStore,
         workspaceManager: WorkspaceManagerViewModel?
     ) async throws -> WorkspaceSearchReadinessTicket? {
+        let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.workspaceReadinessAcquireGate)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.workspaceReadinessAcquireGate, perfState) }
         guard let workspaceManager else {
             try await ensureVisibleWorkspaceLoaded(
                 store: store,
@@ -495,11 +499,13 @@ enum StoreBackedWorkspaceSearch {
         workspaceManager: WorkspaceManagerViewModel?
     ) async throws {
         guard let ticket else { return }
+        let perfState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.workspaceReadinessValidationGate)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.workspaceReadinessValidationGate, perfState) }
         guard let workspaceManager else {
             preconditionFailure("A workspace readiness ticket requires its issuing manager")
         }
         do {
-            try await workspaceManager.validateWorkspaceSearchReadiness(ticket)
+            try workspaceManager.validateWorkspaceSearchReadinessSnapshot(ticket)
         } catch is CancellationError {
             throw CancellationError()
         } catch let error as WorkspaceSearchReadinessWaitError {

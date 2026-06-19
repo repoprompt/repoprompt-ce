@@ -612,8 +612,8 @@ enum MCPIntegrationHelper {
         CodexIntegrationConfiguration.removeInstallEntry()
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt V4 MCP policy:
-    /// the preserved 10,000-active-second server timeout and disabled parallel tool calls.
+    /// Ensures existing Codex CLI configs include the RepoPrompt V5 MCP policy:
+    /// the preserved 10,000-active-second server timeout and enabled parallel tool calls.
     /// Codex has no per-tool timeout exemption, so the long timeout protects synchronous
     /// Oracle and Context Builder operations.
     /// - Parameter force: When true, bypasses the once-per-install guard and rechecks the file.

@@ -108,6 +108,73 @@ struct WorkspaceDisplayRootRefsSnapshot: Equatable {
     let allRoots: [WorkspaceRootRef]
 }
 
+private final class WorkspaceSessionRootLifetimeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func advance() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    func snapshot(physicalRootPaths: [String]) -> WorkspaceSessionRootLifetimeSnapshot {
+        lock.lock()
+        let capturedGeneration = generation
+        lock.unlock()
+        return WorkspaceSessionRootLifetimeSnapshot(
+            clock: self,
+            generation: capturedGeneration,
+            physicalRootPaths: physicalRootPaths
+        )
+    }
+
+    func performIfGenerationCurrent(
+        generation expectedGeneration: UInt64,
+        operation: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return false }
+        operation()
+        return true
+    }
+}
+
+struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
+    fileprivate let clock: WorkspaceSessionRootLifetimeClock
+    fileprivate let generation: UInt64
+    fileprivate let physicalRootPaths: [String]
+
+    func isGenerationCurrent() -> Bool {
+        clock.performIfGenerationCurrent(
+            generation: generation,
+            operation: {}
+        )
+    }
+
+    func isCurrent() async -> Bool {
+        let physicalRootPaths = physicalRootPaths
+        let rootsExist = await Task.detached(priority: .userInitiated) {
+            physicalRootPaths.allSatisfy { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        }.value
+        guard rootsExist else { return false }
+        return isGenerationCurrent()
+    }
+
+    @discardableResult
+    func performIfGenerationCurrent(_ operation: () -> Void) -> Bool {
+        clock.performIfGenerationCurrent(
+            generation: generation,
+            operation: operation
+        )
+    }
+}
+
 actor WorkspaceFileContextStore {
     private struct RootState {
         let lifetimeID: UUID
@@ -565,6 +632,8 @@ actor WorkspaceFileContextStore {
             let publishedShardCount: Int
             let totalBuildCount: Int
             let totalBackstopCount: Int
+            let singleShardCompositionReuseCount: Int
+            let genericMergeElementVisitCount: Int
             let shadowComparisonCount: Int
             let shadowMismatchCount: Int
             let lastShadowByteCount: Int
@@ -673,6 +742,8 @@ actor WorkspaceFileContextStore {
         private var rootCatalogShardFallbackReasonCountsByRootID: [UUID: [String: Int]] = [:]
         private var rootCatalogShardBackstopCountsByRootID: [UUID: Int] = [:]
         private var rootCatalogShardMaxLiveGenerationCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardSingleShardCompositionReuseCount = 0
+        private var rootCatalogShardGenericMergeElementVisitCount = 0
         private var rootCatalogShardShadowComparisonCount = 0
         private var rootCatalogShardShadowMismatchCount = 0
         private var rootCatalogShardLastShadowByteCount = 0
@@ -926,6 +997,8 @@ actor WorkspaceFileContextStore {
                 publishedShardCount: publishedRootCatalogShardsByRootID.count,
                 totalBuildCount: rootCatalogShardBuildCountsByRootID.values.reduce(0, +),
                 totalBackstopCount: rootCatalogShardBackstopCountsByRootID.values.reduce(0, +),
+                singleShardCompositionReuseCount: rootCatalogShardSingleShardCompositionReuseCount,
+                genericMergeElementVisitCount: rootCatalogShardGenericMergeElementVisitCount,
                 shadowComparisonCount: rootCatalogShardShadowComparisonCount,
                 shadowMismatchCount: rootCatalogShardShadowMismatchCount,
                 lastShadowByteCount: rootCatalogShardLastShadowByteCount,
@@ -952,6 +1025,8 @@ actor WorkspaceFileContextStore {
                 "all_loaded"
             case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
                 "session_bound_workspace(logical=\(logicalRootPaths.sorted().joined(separator: ","));physical=\(physicalRootPaths.sorted().joined(separator: ",")))"
+            case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+                "validated_session_bound_workspace(logical=\(canonicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ","));physical=\(physicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ",")))"
             }
         }
 
@@ -1293,6 +1368,7 @@ actor WorkspaceFileContextStore {
         var lastAccessSequence: UInt64
     }
 
+    private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -1388,17 +1464,20 @@ actor WorkspaceFileContextStore {
     private var codeScanResultTask: Task<Void, Never>?
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
+        private let isCatalogShardShadowValidationEnabled: Bool
     #endif
 
     #if DEBUG
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
-            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            enableCatalogShardShadowValidation: Bool = true
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -2510,21 +2589,74 @@ actor WorkspaceFileContextStore {
         )
     }
 
-    func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
-        guard case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths) = rootScope else {
-            return .available
+    func sessionBoundRootScopeValidationSnapshot(
+        _ rootScope: WorkspaceLookupRootScope,
+        expectedPhysicalRoots: [WorkspaceRootRef]
+    ) -> WorkspaceSessionRootLifetimeSnapshot? {
+        guard !expectedPhysicalRoots.isEmpty else { return nil }
+        let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
+        let requestedMatches: Bool = switch rootScope {
+        case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
+            Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            }) == expectedPaths
+        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
+            requestedPhysicalRoots == Set(expectedPhysicalRoots)
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+            false
         }
-        let requested = Set(requestedPhysicalRootPaths.map {
-            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
-        })
-        let missing = requested.filter { path in
-            guard let rootID = rootIDsByStandardizedPath[path],
-                  rootStatesByID[rootID]?.root.kind == .sessionWorktree
-            else { return true }
-            var isDirectory: ObjCBool = false
-            return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
-                !isDirectory.boolValue
-        }.sorted()
+        guard requestedMatches,
+              expectedPhysicalRoots.allSatisfy({ expectedRoot in
+                  guard let currentRoot = rootStatesByID[expectedRoot.id]?.root else { return false }
+                  return currentRoot.kind == .sessionWorktree
+                      && currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+              })
+        else { return nil }
+        guard rootScopeAvailability(rootScope) == .available else { return nil }
+
+        return sessionRootLifetimeClock.snapshot(physicalRootPaths: expectedPaths.sorted())
+    }
+
+    func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
+        let missing: [String]
+        switch rootScope {
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+            return .available
+        case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths):
+            guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            let requested = Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            })
+            missing = requested.filter { path in
+                guard let rootID = rootIDsByStandardizedPath[path],
+                      rootStatesByID[rootID]?.root.kind == .sessionWorktree
+                else { return true }
+                var isDirectory: ObjCBool = false
+                return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
+                    !isDirectory.boolValue
+            }.sorted()
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            missing = (
+                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
+                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+            )
+            .compactMap { expectedRoot, expectedKind in
+                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
+                      currentRoot.kind == expectedKind,
+                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+                else { return expectedRoot.standardizedFullPath }
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(
+                    atPath: currentRoot.standardizedFullPath,
+                    isDirectory: &isDirectory
+                ) && isDirectory.boolValue ? nil : currentRoot.standardizedFullPath
+            }.sorted()
+        }
         return missing.isEmpty
             ? .available
             : .sessionWorktreeUnavailable(missingPhysicalRootPaths: missing)
@@ -2563,7 +2695,7 @@ actor WorkspaceFileContextStore {
             let rebuildStart = DispatchTime.now().uptimeNanoseconds
         #endif
         let roots = rootsForPathLookup(scope: rootScope)
-        let generation = scopedSnapshotGeneration(scope: rootScope)
+        let generation = scopedSnapshotGeneration(scope: rootScope, validationToken: validationToken)
         var shouldCacheSnapshot = false
         let snapshot: WorkspaceSearchCatalogSnapshot
         if let shards = prepareAndPublishRootCatalogShardBatch(for: roots) {
@@ -2575,27 +2707,29 @@ actor WorkspaceFileContextStore {
             )
             shouldCacheSnapshot = true
             #if DEBUG
-                let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
-                    rootScope: rootScope,
-                    generation: generation,
-                    roots: roots,
-                    includePathIndexes: false
-                )
-                let composedBytes = catalogShadowBytes(composedSnapshot)
-                let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
-                let shadowMatches = composedBytes == authoritativeBytes
-                recordRootCatalogShardShadowComparison(
-                    matched: shadowMatches,
-                    byteCount: authoritativeBytes.count
-                )
-                if !shadowMatches {
-                    assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
-                    composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                if isCatalogShardShadowValidationEnabled {
+                    let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
                         rootScope: rootScope,
                         generation: generation,
-                        roots: roots
+                        roots: roots,
+                        includePathIndexes: false
                     )
-                    shouldCacheSnapshot = false
+                    let composedBytes = catalogShadowBytes(composedSnapshot)
+                    let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
+                    let shadowMatches = composedBytes == authoritativeBytes
+                    recordRootCatalogShardShadowComparison(
+                        matched: shadowMatches,
+                        byteCount: authoritativeBytes.count
+                    )
+                    if !shadowMatches {
+                        assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
+                        composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                            rootScope: rootScope,
+                            generation: generation,
+                            roots: roots
+                        )
+                        shouldCacheSnapshot = false
+                    }
                 }
             #endif
             snapshot = composedSnapshot
@@ -3226,7 +3360,18 @@ actor WorkspaceFileContextStore {
         roots: [WorkspaceRootRecord],
         shards: [RootCatalogShard]
     ) -> WorkspaceSearchCatalogSnapshot {
-        let merged = mergeRootCatalogShards(shards)
+        let merged: (files: [WorkspaceFileRecord], entries: [WorkspaceSearchCatalogEntry])
+        if let shard = shards.first, shards.count == 1 {
+            merged = (shard.files, shard.entries)
+            #if DEBUG
+                rootCatalogShardSingleShardCompositionReuseCount += 1
+            #endif
+        } else {
+            merged = mergeRootCatalogShards(shards)
+            #if DEBUG
+                rootCatalogShardGenericMergeElementVisitCount += merged.files.count
+            #endif
+        }
         let diagnostics = WorkspaceCatalogDiagnostics(
             generation: generation,
             rootScope: rootScope,
@@ -4963,6 +5108,9 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        if root.kind == .sessionWorktree {
+            sessionRootLifetimeClock.advance()
+        }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
@@ -5067,6 +5215,9 @@ actor WorkspaceFileContextStore {
                 watcherInfrastructureFlightsByKey.removeValue(forKey: watcherKey)?.task.cancel()
             }
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+            if rootStatesByID[rootID]?.root.kind == .sessionWorktree {
+                sessionRootLifetimeClock.advance()
+            }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }
@@ -6138,7 +6289,19 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
-    func createFile(rootID: UUID, relativePath: String, content: String) async throws -> WorkspaceFileCatalogMaterializationResult {
+    func createFile(
+        rootID: UUID,
+        relativePath: String,
+        content: String,
+        validating rootScope: WorkspaceLookupRootScope? = nil
+    ) async throws -> WorkspaceFileCatalogMaterializationResult {
+        if let rootScope {
+            guard rootScopeAvailability(rootScope) == .available,
+                  rootsForPathLookup(scope: rootScope).contains(where: { $0.id == rootID })
+            else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
+            }
+        }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
@@ -7591,7 +7754,16 @@ actor WorkspaceFileContextStore {
     #endif
 
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
-        let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
+        scopedSnapshotGeneration(
+            scope: scope,
+            validationToken: searchCatalogSnapshotValidationToken(scope: scope)
+        )
+    }
+
+    private func scopedSnapshotGeneration(
+        scope: WorkspaceLookupRootScope,
+        validationToken: SearchCatalogSnapshotValidationToken
+    ) -> UInt64 {
         switch validationToken {
         case let .staticScope(generation):
             return generation
@@ -7621,6 +7793,28 @@ actor WorkspaceFileContextStore {
         case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
             let normalizedLogicalRootPaths = normalizedSessionSelectorPaths(logicalRootPaths).sorted()
             let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths).sorted()
+            let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
+                guard let state = rootStatesByID[root.id] else { return nil }
+                return SearchCatalogRootDependency(
+                    canonicalIdentity: root.standardizedFullPath,
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    generation: catalogGenerationsByRootID[root.id] ?? 0
+                )
+            }.sorted {
+                if $0.canonicalIdentity == $1.canonicalIdentity {
+                    return $0.rootID.uuidString < $1.rootID.uuidString
+                }
+                return $0.canonicalIdentity < $1.canonicalIdentity
+            }
+            return .sessionBound(
+                logicalRootPaths: normalizedLogicalRootPaths,
+                physicalRootPaths: normalizedPhysicalRootPaths,
+                dependencies: dependencies
+            )
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let normalizedLogicalRootPaths = canonicalRoots.map(\.standardizedFullPath).sorted()
+            let normalizedPhysicalRootPaths = physicalRoots.map(\.standardizedFullPath).sorted()
             let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
                 guard let state = rootStatesByID[root.id] else { return nil }
                 return SearchCatalogRootDependency(
@@ -7687,6 +7881,12 @@ actor WorkspaceFileContextStore {
             hasher.combine(normalizedSessionSelectorPaths(canonicalRootPaths).sorted())
             hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
             return UInt64(bitPattern: Int64(hasher.finalize()))
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            var hasher = Hasher()
+            hasher.combine("validatedSessionBoundWorkspace")
+            hasher.combine(canonicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
+            hasher.combine(physicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
+            return UInt64(bitPattern: Int64(hasher.finalize()))
         }
     }
 
@@ -7724,7 +7924,7 @@ actor WorkspaceFileContextStore {
             kinds.contains(.primaryWorkspace) || kinds.contains(.workspaceGitData)
         case .allLoaded:
             true
-        case .sessionBoundWorkspace:
+        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
             kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
         }
     }
@@ -7751,6 +7951,19 @@ actor WorkspaceFileContextStore {
                     normalizedCanonicalRootPaths.contains(root.standardizedFullPath)
                 case .sessionWorktree:
                     normalizedPhysicalRootPaths.contains(root.standardizedFullPath)
+                case .workspaceGitData, .supplementalSystem:
+                    false
+                }
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
+            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            return allRoots.filter { root in
+                switch root.kind {
+                case .primaryWorkspace:
+                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                case .sessionWorktree:
+                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }

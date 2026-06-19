@@ -28,6 +28,7 @@ enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
     case missingConfiguredCommand
     case unsafeConfiguredCommand(String)
     case exactPathNotFound(String)
+    case noValidLaunchCandidate(String, [String])
     case environmentDiscoveryRequired(String)
     case unsafeApplicationPath(String)
     case unsafeCanonicalBasename(String)
@@ -40,6 +41,8 @@ enum CursorACPLaunchResolutionError: Error, Equatable, LocalizedError {
             "Refusing unsafe Cursor ACP command `\(command)`. Configure the CLI-only `cursor-agent` executable."
         case let .exactPathNotFound(command):
             "Cursor Agent CLI was not found as a valid executable regular file for `\(command)`. Install `cursor-agent` or configure its absolute path."
+        case let .noValidLaunchCandidate(command, failures):
+            "Cursor Agent CLI was not found as a valid executable regular file for `\(command)`. Tried: \(failures.joined(separator: "; "))"
         case let .environmentDiscoveryRequired(command):
             "Cursor Agent CLI path discovery has not completed for `\(command)`. Run the Cursor ACP support preflight or configure an absolute `cursor-agent` path."
         case let .unsafeApplicationPath(path):
@@ -151,15 +154,12 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             return try resolveExplicitLaunch(for: config, environment: environment)
         }
 
-        let effectiveHints = CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints)
-        let resolved = CommandPathResolver.resolve(
-            CursorACPLaunchCandidate.cursorAgentACP.command,
-            environment: environment,
-            additionalPaths: effectiveHints,
-            preferredBasenames: CLILaunchProfiles.cursor.preferredBasenames
-        )
-        return try validatedLaunch(
-            entryPath: resolved,
+        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
+        return try firstValidLaunch(
+            candidates: launchCandidates(
+                additionalPathHints: effectiveHints,
+                environment: environment
+            ),
             configuredCommand: configuredCommand,
             additionalPathHints: effectiveHints,
             environment: environment
@@ -174,7 +174,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         guard configuredCommand.contains("/") else {
             throw CursorACPLaunchResolutionError.environmentDiscoveryRequired(configuredCommand)
         }
-        let effectiveHints = CLIPathHints.nativeDefaultsSupplemented(with: config.additionalPathHints)
+        let effectiveHints = CLILaunchProfiles.providerSpecificPathsSupplementedWithNativeDefaults(config.additionalPathHints)
         let expanded = CommandPathResolver.expandPath(configuredCommand, environment: environment)
         return try validatedLaunch(
             entryPath: expanded,
@@ -191,7 +191,7 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         }
         let expectedCommand = CursorACPLaunchCandidate.cursorAgentACP.command
         if configuredCommand.contains("/") {
-            guard URL(fileURLWithPath: configuredCommand).lastPathComponent.caseInsensitiveCompare(expectedCommand) == .orderedSame else {
+            guard (configuredCommand as NSString).lastPathComponent.caseInsensitiveCompare(expectedCommand) == .orderedSame else {
                 throw CursorACPLaunchResolutionError.unsafeConfiguredCommand(configuredCommand)
             }
         } else if configuredCommand.caseInsensitiveCompare(expectedCommand) != .orderedSame {
@@ -204,10 +204,11 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         entryPath: String,
         configuredCommand: String,
         additionalPathHints: [String],
-        environment: [String: String]
+        environment: [String: String],
+        preserveValidationError: Bool = false
     ) throws -> CursorACPResolvedLaunch {
         guard entryPath.hasPrefix("/"),
-              URL(fileURLWithPath: entryPath).lastPathComponent.caseInsensitiveCompare(CursorACPLaunchCandidate.cursorAgentACP.command) == .orderedSame
+              (entryPath as NSString).lastPathComponent.caseInsensitiveCompare(CursorACPLaunchCandidate.cursorAgentACP.command) == .orderedSame
         else {
             throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
@@ -216,14 +217,14 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
         do {
             identity = try ExecutableFileIdentity.captureForTrustedPathLaunch(atPath: entryPath)
         } catch {
+            if preserveValidationError { throw error }
             throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
         }
 
-        let canonicalURL = URL(fileURLWithPath: identity.canonicalPath)
-        if canonicalURL.pathComponents.contains(where: { $0.lowercased().hasSuffix(".app") }) {
+        if identity.canonicalPath.split(separator: "/").contains(where: { $0.lowercased().hasSuffix(".app") }) {
             throw CursorACPLaunchResolutionError.unsafeApplicationPath(identity.canonicalPath)
         }
-        if canonicalURL.lastPathComponent.caseInsensitiveCompare("cursor") == .orderedSame {
+        if (identity.canonicalPath as NSString).lastPathComponent.caseInsensitiveCompare("cursor") == .orderedSame {
             throw CursorACPLaunchResolutionError.unsafeCanonicalBasename(identity.canonicalPath)
         }
 
@@ -234,6 +235,66 @@ final class CursorACPLaunchResolver: @unchecked Sendable {
             environment: environment,
             executableIdentity: identity
         )
+    }
+
+    private func launchCandidates(
+        additionalPathHints: [String],
+        environment: [String: String]
+    ) -> [String] {
+        var candidates: [String] = []
+        var seen = Set<String>()
+
+        func append(_ candidate: String) {
+            let expanded = CommandPathResolver.expandPath(candidate, environment: environment)
+            guard !expanded.isEmpty,
+                  expanded.hasPrefix("/"),
+                  FileManager.default.fileExists(atPath: expanded),
+                  seen.insert(expanded).inserted
+            else { return }
+            candidates.append(expanded)
+        }
+
+        append(
+            CommandPathResolver.resolve(
+                CursorACPLaunchCandidate.cursorAgentACP.command,
+                environment: environment,
+                additionalPaths: additionalPathHints,
+                preferredBasenames: CLILaunchProfiles.cursor.preferredBasenames
+            )
+        )
+        for directory in CommandPathResolver.mergedPathComponents(
+            environment: environment,
+            additionalPaths: additionalPathHints
+        ) {
+            append((directory as NSString).appendingPathComponent(CursorACPLaunchCandidate.cursorAgentACP.command))
+        }
+        return candidates
+    }
+
+    private func firstValidLaunch(
+        candidates: [String],
+        configuredCommand: String,
+        additionalPathHints: [String],
+        environment: [String: String]
+    ) throws -> CursorACPResolvedLaunch {
+        var failures: [String] = []
+        for candidate in candidates {
+            do {
+                return try validatedLaunch(
+                    entryPath: candidate,
+                    configuredCommand: configuredCommand,
+                    additionalPathHints: additionalPathHints,
+                    environment: environment,
+                    preserveValidationError: true
+                )
+            } catch {
+                failures.append("\(candidate): \(error.localizedDescription)")
+            }
+        }
+        if failures.isEmpty {
+            throw CursorACPLaunchResolutionError.exactPathNotFound(configuredCommand)
+        }
+        throw CursorACPLaunchResolutionError.noValidLaunchCandidate(configuredCommand, failures)
     }
 
     private func cachedLaunch(forKey key: String) -> CursorACPResolvedLaunch? {

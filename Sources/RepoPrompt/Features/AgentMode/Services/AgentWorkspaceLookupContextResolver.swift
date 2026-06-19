@@ -82,6 +82,11 @@ struct AgentWorkspaceLookupContextIdentity: Hashable {
 }
 
 enum AgentWorkspaceLookupContextResolver {
+    static let failClosedLookupContext = WorkspaceLookupContext(
+        rootScope: .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: []),
+        bindingProjection: nil
+    )
+
     static func requiredLookupContext(
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
@@ -129,6 +134,49 @@ enum AgentWorkspaceLookupContextResolver {
         }
     }
 
+    static func canReuseAuthoritativeLookupContext(
+        _ lookupContext: WorkspaceLookupContext,
+        source: AgentWorkspaceLookupContextSource,
+        store: WorkspaceFileContextStore
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              let sessionID = source.activeAgentSessionID,
+              case let .hydrated(bindings) = source.worktreeBindingState,
+              !bindings.isEmpty,
+              let projection = lookupContext.bindingProjection,
+              projection.sessionID == sessionID,
+              projection.isFullyMaterialized,
+              lookupContext.rootScope == projection.lookupRootScope,
+              AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
+              == AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(
+                  projection.boundRootsForMetadata.map(\.binding)
+              )
+        else { return false }
+
+        do {
+            try AgentWorktreeRuntimeWorkspaceResolver.validateBindingsAvailable(bindings)
+        } catch {
+            return false
+        }
+
+        let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        guard !Task.isCancelled else { return false }
+        let visibleRootIDsByPath = Dictionary(
+            visibleRoots.map { ($0.standardizedFullPath, $0.id) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        guard projection.logicalRootRefs.allSatisfy({ visibleRootIDsByPath[$0.standardizedFullPath] == $0.id }) else {
+            return false
+        }
+
+        let sessionRootSnapshot = await store.sessionBoundRootScopeValidationSnapshot(
+            projection.lookupRootScope,
+            expectedPhysicalRoots: projection.physicalRootRefs
+        )
+        guard !Task.isCancelled, let sessionRootSnapshot else { return false }
+        return sessionRootSnapshot.isGenerationCurrent()
+    }
+
     static func authoritativeLookupContextOrFailClosed(
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
@@ -136,10 +184,7 @@ enum AgentWorkspaceLookupContextResolver {
         do {
             return try await requiredLookupContext(source: source, store: store)
         } catch {
-            return WorkspaceLookupContext(
-                rootScope: .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: []),
-                bindingProjection: nil
-            )
+            return failClosedLookupContext
         }
     }
 

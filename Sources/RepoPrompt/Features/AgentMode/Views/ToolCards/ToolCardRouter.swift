@@ -37,79 +37,17 @@ func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
     return toolName == "apply_edits" || toolName == "apply_patch" || toolName == "edit"
 }
 
-struct AgentOracleOpenContext {
-    let windowID: Int
-    let workspaceID: UUID?
-    let tabID: UUID?
-    let chatID: String?
-
-    init(windowID: Int, workspaceID: UUID?, tabID: UUID?, chatID: String? = nil) {
-        self.windowID = windowID
-        self.workspaceID = workspaceID
-        self.tabID = tabID
-        self.chatID = chatID
-    }
-}
-
 enum AgentOracleToolRouting {
     static func operationPopoverUserInfo(
         openContext: AgentOracleOpenContext?,
         chatID: String?,
         tabID: UUID? = nil
     ) -> [AnyHashable: Any]? {
-        guard let openContext,
-              let workspaceID = openContext.workspaceID,
-              let tabID = tabID ?? openContext.tabID,
-              let chatID = nonEmptyValue(chatID)
-        else { return nil }
-        return [
-            "windowID": openContext.windowID,
-            "workspaceID": workspaceID,
-            "tabID": tabID,
-            "chatID": chatID
-        ]
-    }
-
-    static func authoritativeChatID(from json: String?) -> String? {
-        guard let json else { return nil }
-        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard let data = trimmed.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
-              object["chatID"] == nil,
-              !containsChatID(in: object, excludingAuthoritativeRoot: true),
-              let chatID = object["chat_id"] as? String
-        else {
-            return nil
-        }
-        return nonEmptyValue(chatID)
-    }
-
-    private static func nonEmptyValue(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-
-    private static func containsChatID(in value: Any, excludingAuthoritativeRoot: Bool = false) -> Bool {
-        if let dictionary = value as? [String: Any] {
-            for (key, nested) in dictionary {
-                if key == "chat_id" || key == "chatID" {
-                    if !(excludingAuthoritativeRoot && key == "chat_id") {
-                        return true
-                    }
-                    continue
-                }
-                if containsChatID(in: nested) { return true }
-            }
-        }
-        if let array = value as? [Any] {
-            for element in array {
-                if containsChatID(in: element) { return true }
-            }
-        }
-        return false
+        AgentOraclePopoverRoute(
+            openContext: openContext,
+            chatID: chatID,
+            tabID: tabID
+        )?.notificationUserInfo
     }
 }
 
@@ -795,7 +733,7 @@ func oracleToolCallPopoverUserInfo(
     guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
           toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
     else { return nil }
-    let chatID = AgentOracleToolRouting.authoritativeChatID(from: item.toolArgsJSON)
+    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
     return AgentOracleToolRouting.operationPopoverUserInfo(
         openContext: openContext,
         chatID: chatID

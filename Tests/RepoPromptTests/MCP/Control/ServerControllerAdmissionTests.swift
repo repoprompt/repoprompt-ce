@@ -53,4 +53,31 @@ final class ServerControllerAdmissionTests: XCTestCase {
             throw XCTSkip("DEBUG-only ServerController admission seams are unavailable in release builds: testDefaultAllowListDoesNotIncludeRepoPromptCLI, testDefaultAllowListIncludesSynchronousACPClients")
         #endif
     }
+
+    func testBuiltInAlwaysAllowedClientRecognizesConfiguredDefaultsAndVariants() throws {
+        #if DEBUG
+            for clientID in ServerController.test_defaultAlwaysAllowedClients {
+                XCTAssertTrue(
+                    ServerController.isBuiltInAlwaysAllowedClient(clientID),
+                    "Expected configured default to be recognized: \(clientID)"
+                )
+            }
+
+            for clientID in ["Claude Code v2.1", "cursor-agent"] {
+                XCTAssertTrue(
+                    ServerController.isBuiltInAlwaysAllowedClient(clientID),
+                    "Expected supported family variant to be recognized: \(clientID)"
+                )
+            }
+
+            for clientID in ["my-custom-client", "RepoPrompt CLI", "claude-code-wrapper", "cursor-agent-wrapper"] {
+                XCTAssertFalse(
+                    ServerController.isBuiltInAlwaysAllowedClient(clientID),
+                    "Expected non-built-in client to require approval: \(clientID)"
+                )
+            }
+        #else
+            throw XCTSkip("DEBUG-only default allow-list seam is unavailable in release builds")
+        #endif
+    }
 }

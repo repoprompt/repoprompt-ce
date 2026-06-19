@@ -1321,6 +1321,11 @@ struct AgentComposerView: View, Equatable {
     private var claudeToolsPopoverContent: some View {
         if let claudeTools = props.providerControls?.claudeTools {
             Form {
+                ClaudeToolSettingsActiveRunNotice(
+                    isVisible: props.selectedAgent.usesClaudeTooling && props.runState.isActive,
+                    fontPreset: fontPreset
+                )
+
                 Section {
                     Toggle("Bash", isOn: Binding(
                         get: { claudeTools.bashToolEnabled },

@@ -65,9 +65,13 @@ struct WorkspaceRootBindingProjection: Equatable {
     }
 
     var lookupRootScope: WorkspaceLookupRootScope {
-        .sessionBoundWorkspace(
-            canonicalRootPaths: canonicalRootPaths,
-            physicalRootPaths: lookupPhysicalRootPaths
+        .validatedSessionBoundWorkspace(
+            canonicalRoots: Set(visibleLogicalRootRefs.filter {
+                canonicalRootPaths.contains($0.standardizedFullPath)
+            }),
+            physicalRoots: Set(physicalRootRefs.filter {
+                lookupPhysicalRootPaths.contains($0.standardizedFullPath)
+            })
         )
     }
 

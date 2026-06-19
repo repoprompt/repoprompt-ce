@@ -9,7 +9,7 @@ import SystemPackage
 // MARK: - Version Constants
 
 /// Update this when releasing new versions
-let CLI_VERSION = "1.0.19"
+let CLI_VERSION = "1.0.20"
 
 /// CLI verbose mode - controls debug output (enabled by --verbose flag)
 var cliVerboseMode = false
@@ -752,6 +752,26 @@ enum CLIProxyRuntimePolicy {
             return true
         default:
             return false
+        }
+    }
+}
+
+enum MCPServiceProxyTaskOutcome {
+    case killSignalWaitCancelled
+    case ppidWatchdogCancelled
+    case transportCompleted
+}
+
+enum MCPServiceProxyTaskGroupPolicy {
+    static func terminalRuntimeError(
+        firstCompletedOutcome outcome: MCPServiceProxyTaskOutcome,
+        serviceTaskIsCancelled: Bool
+    ) -> CLIRuntimeError? {
+        switch outcome {
+        case .transportCompleted:
+            serviceTaskIsCancelled ? .hostDisconnected(.taskCancelled) : nil
+        case .killSignalWaitCancelled, .ppidWatchdogCancelled:
+            .hostDisconnected(.taskCancelled)
         }
     }
 }
@@ -1765,12 +1785,11 @@ actor MCPService: Service {
 
         do {
             // Race between transport loop, kill signal, and PPID watchdog
-            try await withThrowingTaskGroup(of: Void.self) { group in
+            try await withThrowingTaskGroup(of: MCPServiceProxyTaskOutcome.self) { group in
                 // Kill signal monitor task
                 group.addTask {
                     guard let signal = await self.waitForKillSignal() else {
-                        // Task was cancelled - just return without throwing
-                        return
+                        return .killSignalWaitCancelled
                     }
                     throw CLIRuntimeError.terminatedByServer(CLIServerTerminationProvenance(
                         reason: signal.reason,
@@ -1781,21 +1800,35 @@ actor MCPService: Service {
                 // PPID watchdog - detect orphaned CLI when parent dies
                 group.addTask {
                     try await self.runPPIDWatchdog(initialPPID: initialPPID)
+                    return .ppidWatchdogCancelled
                 }
 
                 // Main transport task
                 group.addTask {
                     try await self.runTransport()
+                    return .transportCompleted
                 }
 
-                // Wait for first to complete (either kill signal, orphan detection, or transport exit)
+                // Wait for first to complete (either kill signal, orphan detection, or transport exit),
+                // then stop the watcher tasks so a clean transport exit can return promptly.
                 do {
-                    while let _ = try await group.next() {}
+                    guard let outcome = try await group.next() else {
+                        group.cancelAll()
+                        throw CancellationError()
+                    }
+                    group.cancelAll()
+                    if let runtimeError = MCPServiceProxyTaskGroupPolicy.terminalRuntimeError(
+                        firstCompletedOutcome: outcome,
+                        serviceTaskIsCancelled: Task.isCancelled
+                    ) {
+                        throw runtimeError
+                    }
                 } catch {
                     group.cancelAll()
                     throw error
                 }
             }
+            try Task.checkCancellation()
             await persistProxyTerminalRecord(
                 runtimeError: nil,
                 fallbackReason: "proxy_task_group_completed",

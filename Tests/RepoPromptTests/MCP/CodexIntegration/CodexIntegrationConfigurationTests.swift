@@ -55,11 +55,11 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(content.contains("command = \"\(serverCommand)\""))
         XCTAssertTrue(content.contains("args = []"))
         XCTAssertTrue(content.contains("tool_timeout_sec = 10000"))
-        XCTAssertTrue(content.contains("supports_parallel_tool_calls = false"))
+        XCTAssertTrue(content.contains("supports_parallel_tool_calls = true"))
         XCTAssertTrue(content.contains("enabled = false"))
         XCTAssertTrue(
             content.contains(
-                "command = \"\(serverCommand)\"\nargs = []\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = false\nenabled = false"
+                "command = \"\(serverCommand)\"\nargs = []\ntool_timeout_sec = 10000\nsupports_parallel_tool_calls = true\nenabled = false"
             )
         )
 
@@ -212,19 +212,19 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertEqual(second.content, first.content)
         XCTAssertEqual(occurrences(of: "[mcp_servers.\"RepoPromptCE\"]", in: second.content), 1)
         XCTAssertEqual(occurrences(of: "tool_timeout_sec = 10000", in: second.content), 1)
-        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls = false", in: second.content), 1)
+        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls = true", in: second.content), 1)
     }
 
-    func testV4PolicyConstantsPreserveLongActiveTimeoutAndDisableParallelCalls() {
-        XCTAssertEqual(CodexIntegrationConfiguration.toolTimeoutDefaultsKey, "CodexToolTimeoutMigratedV4")
+    func testV5PolicyConstantsPreserveLongActiveTimeoutAndEnableParallelCalls() {
+        XCTAssertEqual(CodexIntegrationConfiguration.toolTimeoutDefaultsKey, "CodexToolTimeoutMigratedV5")
         XCTAssertEqual(
             CodexIntegrationConfiguration.desiredToolTimeoutSeconds,
             MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
         )
-        XCTAssertFalse(CodexIntegrationConfiguration.desiredSupportsParallelToolCalls)
+        XCTAssertTrue(CodexIntegrationConfiguration.desiredSupportsParallelToolCalls)
     }
 
-    func testV4MigrationRestoresLongTimeoutAndParallelPolicyTogether() {
+    func testV5MigrationRestoresLongTimeoutAndParallelPolicyTogether() {
         let input = """
         tool_output_token_limit = 25_000
 
@@ -241,17 +241,34 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(result.foundTarget)
         XCTAssertTrue(result.changed)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000"))
-        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = true"))
         XCTAssertFalse(result.content.contains("tool_timeout_sec = 600"))
-        XCTAssertFalse(result.content.contains("supports_parallel_tool_calls = true"))
+        XCTAssertFalse(result.content.contains("supports_parallel_tool_calls = false"))
 
         let second = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: result.content)
         XCTAssertTrue(second.foundTarget)
         XCTAssertFalse(second.changed)
         XCTAssertEqual(second.content, result.content)
+
+        let disabledInput = """
+        tool_output_token_limit = 25_000
+
+        [mcp_servers.RepoPromptCE]
+        command = "\(serverCommand)"
+        args = []
+        tool_timeout_sec = 10000
+        supports_parallel_tool_calls = false
+        enabled = true
+        """
+        let enabledResult = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: disabledInput)
+        XCTAssertTrue(enabledResult.foundTarget)
+        XCTAssertTrue(enabledResult.changed)
+        XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls", in: enabledResult.content), 1)
+        XCTAssertTrue(enabledResult.content.contains("supports_parallel_tool_calls = true"))
+        XCTAssertFalse(enabledResult.content.contains("supports_parallel_tool_calls = false"))
     }
 
-    func testV4MigrationCollapsesDuplicatePolicyAssignments() {
+    func testV5MigrationCollapsesDuplicatePolicyAssignments() {
         let input = """
         tool_output_token_limit = 25_000
 
@@ -260,8 +277,8 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         args = []
         tool_timeout_sec = 10000 # keep first equivalent
         tool_timeout_sec = 600
-        supports_parallel_tool_calls = false # keep first equivalent
-        supports_parallel_tool_calls = true
+        supports_parallel_tool_calls = true # keep first equivalent
+        supports_parallel_tool_calls = false
         """
 
         let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -271,10 +288,10 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "tool_timeout_sec", in: result.content), 1)
         XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls", in: result.content), 1)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # keep first equivalent"))
-        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # keep first equivalent"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = true # keep first equivalent"))
     }
 
-    func testV4MigrationPreservesLaterEquivalentDuplicateAssignments() {
+    func testV5MigrationPreservesLaterEquivalentDuplicateAssignments() {
         let input = """
         tool_output_token_limit = 25_000
 
@@ -283,8 +300,8 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         args = []
         tool_timeout_sec = 600
         tool_timeout_sec = 10000 # preserve compliant timeout
-        supports_parallel_tool_calls = true
-        supports_parallel_tool_calls = false # preserve compliant parallel policy
+        supports_parallel_tool_calls = false
+        supports_parallel_tool_calls = true # preserve compliant parallel policy
         """
 
         let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -294,10 +311,10 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertEqual(occurrences(of: "tool_timeout_sec", in: result.content), 1)
         XCTAssertEqual(occurrences(of: "supports_parallel_tool_calls", in: result.content), 1)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # preserve compliant timeout"))
-        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # preserve compliant parallel policy"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = true # preserve compliant parallel policy"))
     }
 
-    func testV4MigrationLeavesOtherServerPolicyUntouched() {
+    func testV5MigrationLeavesOtherServerPolicyUntouched() {
         let otherServerBlock = """
         [mcp_servers.OtherServer]
         command = "/tmp/other"
@@ -332,7 +349,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         command = "\(serverCommand)" # stable helper
         args = []
         tool_timeout_sec = 10000 # already equivalent
-        supports_parallel_tool_calls = false # serialized by V4
+        supports_parallel_tool_calls = true # serialized by V5
         """
 
         let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -340,7 +357,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(result.foundTarget)
         XCTAssertFalse(result.changed)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000 # already equivalent"))
-        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false # serialized by V4"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = true # serialized by V5"))
     }
 
     func testToolTimeoutMutationAcceptsIntegerRadixAndSignVariants() {
@@ -359,7 +376,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             command = "\(serverCommand)"
             args = []
             tool_timeout_sec = \(value)
-            supports_parallel_tool_calls = false
+            supports_parallel_tool_calls = true
             """
 
             let result = CodexIntegrationConfiguration.mutatedToolTimeoutConfigContent(from: input)
@@ -368,6 +385,45 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
             XCTAssertFalse(result.changed, value)
             XCTAssertTrue(result.content.contains("tool_timeout_sec = \(value)"), value)
         }
+    }
+
+    func testRuntimePoliciesDoNotForceParallelToolCallsOff() {
+        let policy = CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: CodexIntegrationConfiguration.desiredToolOutputTokenLimit,
+            shellToolEnabled: false,
+            webSearchRequestEnabled: false,
+            viewImageToolEnabled: false,
+            includeApplyPatchTool: false
+        )
+        let cliOverrides = CodexOverrides.cliConfigArgs(toolPolicy: policy)
+        XCTAssertFalse(cliOverrides.contains { $0.contains("features.parallel_tool_calls") })
+
+        let appServerOverrides = CodexOverrides.appServerConfigMap(toolPolicy: policy)
+        XCTAssertNil(appServerOverrides["features.parallel_tool_calls"])
+
+        let nativeOverrides = CodexOverrides.appServerConfigMap(
+            toolPolicy: CodexNativeSessionController.defaultAppServerToolPolicy(
+                shellToolEnabled: false,
+                webSearchRequestEnabled: false,
+                forceExperimentalSteering: false
+            )
+        )
+        XCTAssertNil(nativeOverrides["features.parallel_tool_calls"])
+
+        let interactiveOverrides = CodexOverrides.appServerConfigMap(
+            toolPolicy: CodexCLIProvider.interactiveToolPolicy()
+        )
+        XCTAssertNil(interactiveOverrides["features.parallel_tool_calls"])
+
+        let headlessOverrides = CodexIntegrationConfiguration.configOverrides(for: .agentRun)
+        XCTAssertFalse(headlessOverrides.contains { $0.contains("features.parallel_tool_calls") })
+
+        let execArguments = CodexExecAgentProvider.buildCodexExecArguments(
+            selectedModelString: nil,
+            serverEntries: [],
+            brokenServers: []
+        ).args
+        XCTAssertFalse(execArguments.contains { $0.contains("features.parallel_tool_calls") })
     }
 
     func testToolTimeoutMutationRejectsQuotedNumericTimeout() {
@@ -386,7 +442,7 @@ final class CodexIntegrationConfigurationTests: XCTestCase {
         XCTAssertTrue(result.foundTarget)
         XCTAssertTrue(result.changed)
         XCTAssertTrue(result.content.contains("tool_timeout_sec = 10000"))
-        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = false"))
+        XCTAssertTrue(result.content.contains("supports_parallel_tool_calls = true"))
         XCTAssertFalse(result.content.contains("tool_timeout_sec = \"10000\""))
         XCTAssertFalse(result.content.contains("supports_parallel_tool_calls = \"false\""))
     }

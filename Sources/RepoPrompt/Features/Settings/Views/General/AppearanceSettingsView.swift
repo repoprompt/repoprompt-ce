@@ -43,6 +43,13 @@ struct AppearanceSettingsView: View {
         )
     }
 
+    private var showDatesInMessageTimestampsBinding: Binding<Bool> {
+        Binding(
+            get: { globalSettings.showDatesInMessageTimestamps() },
+            set: { globalSettings.setShowDatesInMessageTimestamps($0) }
+        )
+    }
+
     private var experimentalAttributedTextEditorBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.experimentalAttributedTextEditor() },
@@ -124,6 +131,12 @@ struct AppearanceSettingsView: View {
                             title: "Show Tooltips",
                             description: "Enable tooltips when hovering over elements.",
                             isOn: showTooltipsBinding
+                        )
+
+                        SettingToggle(
+                            title: "Show dates in message timestamps",
+                            description: "Add Yesterday, weekday, or date labels to message and tool timestamps.",
+                            isOn: showDatesInMessageTimestampsBinding
                         )
                     }
                 }

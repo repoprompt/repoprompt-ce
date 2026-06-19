@@ -1882,6 +1882,126 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         }
 
         @MainActor
+        func testWorkspaceSearchReadinessSnapshotFenceMatchesMainActorAuthorityAcrossGenerationChange() async throws {
+            let sourceRoot = try makeTemporaryRoot(name: "ReadinessFenceSource")
+            let targetRoot = try makeTemporaryRoot(name: "ReadinessFenceTarget")
+            try write("let sourceNeedle = true\n", to: sourceRoot.appendingPathComponent("Source.swift"))
+            try write("let targetNeedle = true\n", to: targetRoot.appendingPathComponent("Target.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Readiness Fence Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [sourceRoot.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let sourceTicket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+            XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(sourceTicket))
+            let sourceAcceptedOffMain = await Task.detached {
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    return true
+                } catch {
+                    return false
+                }
+            }.value
+            XCTAssertTrue(sourceAcceptedOffMain)
+
+            var generationAdvanceProbeCount = 0
+            manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting {
+                generationAdvanceProbeCount += 1
+                do {
+                    try manager.validateWorkspaceSearchReadiness(sourceTicket)
+                    XCTFail("Expected main-actor readiness authority to reject the old ticket")
+                } catch {
+                    XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+                }
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    XCTFail("Expected the readiness snapshot fence to reject the old ticket")
+                } catch {
+                    XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+                }
+            }
+            let invalidationGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await invalidationGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Readiness Fence Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [targetRoot.path],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "readinessFenceEquivalence")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting(nil)
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await invalidationGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedInvalidationGate = await invalidationGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedInvalidationGate)
+            XCTAssertEqual(generationAdvanceProbeCount, 1)
+
+            XCTAssertThrowsError(try manager.validateWorkspaceSearchReadiness(sourceTicket)) { error in
+                XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+            }
+            let invalidatedTicketRejectedOffMain = await Task.detached {
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    return false
+                } catch let error as WorkspaceSearchReadinessWaitError {
+                    return error == .superseded
+                } catch {
+                    return false
+                }
+            }.value
+            XCTAssertTrue(invalidatedTicketRejectedOffMain)
+
+            manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting(nil)
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await invalidationGate.release()
+            let targetSwitchResult = await switchTask.value
+            XCTAssertTrue(targetSwitchResult.didSwitch)
+            let targetTicket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+            XCTAssertEqual(targetTicket.workspaceID, target.id)
+            XCTAssertNotEqual(targetTicket, sourceTicket)
+            XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(targetTicket))
+
+            let generationValidation = await Task.detached {
+                let targetAccepted: Bool
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(targetTicket)
+                    targetAccepted = true
+                } catch {
+                    targetAccepted = false
+                }
+                let oldRejected: Bool
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    oldRejected = false
+                } catch let error as WorkspaceSearchReadinessWaitError {
+                    oldRejected = error == .superseded
+                } catch {
+                    oldRejected = false
+                }
+                return (targetAccepted, oldRejected)
+            }.value
+            XCTAssertTrue(generationValidation.0)
+            XCTAssertTrue(generationValidation.1)
+        }
+
+        @MainActor
         func testQueuedBroadSearchRejectsSupersededReadinessTicketAfterAdmission() async throws {
             let root = try makeTemporaryRoot(name: "QueuedReadinessSupersession")
             try write("let queuedReadinessNeedle = true\n", to: root.appendingPathComponent("Old.swift"))

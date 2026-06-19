@@ -496,18 +496,6 @@ extension AgentModeViewModel {
 
         var claudeController: (any NativeAgentRuntimeControlling)?
         var acpController: ACPAgentSessionController?
-        /// The Claude runtime variant the current controller was created with.
-        /// Used to prevent reusing a standard Claude process after switching to a
-        /// compatible backend such as CC Zai, CC Moonshot, or CC Custom.
-        var claudeControllerRuntimeVariant: ClaudeCodeRuntimeVariant?
-        /// The effective workspace path the current Claude controller was created with.
-        /// Used to recycle the provider when a session worktree binding changes cwd.
-        var claudeControllerWorkspacePath: String?
-        /// The effective permission mode the current Claude controller was created with,
-        /// after runtime-only model-aware Claude Auto fallback resolution.
-        /// Used to detect when MCP control or model changes require controller recycling.
-        var claudeControllerPermissionMode: String?
-        var pendingClaudeResumeTransferTask: Task<NativeAgentRuntimeSessionRef, Never>?
         var codexEventTask: Task<Void, Never>?
         var codexEventTaskRunID: UUID?
         var codexLastEventAt: Date?

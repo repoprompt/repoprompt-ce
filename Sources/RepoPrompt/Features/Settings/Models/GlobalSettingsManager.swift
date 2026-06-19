@@ -453,6 +453,16 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    func showDatesInMessageTimestamps() -> Bool {
+        scalarPreferences.ui?.showDatesInMessageTimestamps ?? false
+    }
+
+    func setShowDatesInMessageTimestamps(_ enabled: Bool, commit: Bool = true) {
+        updateUIScalar(commit: commit) { settings in
+            settings.showDatesInMessageTimestamps = enabled
+        }
+    }
+
     func experimentalAttributedTextEditor() -> Bool {
         scalarPreferences.ui?.experimentalAttributedTextEditor ?? false
     }

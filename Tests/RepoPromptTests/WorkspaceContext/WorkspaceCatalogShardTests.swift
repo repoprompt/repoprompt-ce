@@ -19,6 +19,37 @@ import XCTest
             try await super.tearDown()
         }
 
+        func testDefaultColdCompositionReusesSingleShardAndSkipsShadowValidation() async throws {
+            let rootAURL = try makeTemporaryRoot(name: "ColdCompositionA")
+            let rootBURL = try makeTemporaryRoot(name: "ColdCompositionB")
+            try write("a", to: rootAURL.appendingPathComponent("A.swift"))
+            try write("b", to: rootBURL.appendingPathComponent("B.swift"))
+
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            stores.append(store)
+            let rootA = try await loadStoppedRoot(in: store, path: rootAURL.path)
+            let singleRootSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+
+            XCTAssertEqual(singleRootSnapshot.roots.map(\.id), [rootA.id])
+            XCTAssertEqual(singleRootSnapshot.files.map(\.standardizedRelativePath), ["A.swift"])
+            var diagnostics = await store.storeWorkDiagnosticsSnapshot().rootCatalogShards
+            XCTAssertEqual(diagnostics.singleShardCompositionReuseCount, 1)
+            XCTAssertEqual(diagnostics.genericMergeElementVisitCount, 0)
+            XCTAssertEqual(diagnostics.shadowComparisonCount, 0)
+            XCTAssertEqual(diagnostics.lastShadowByteCount, 0)
+
+            let rootB = try await loadStoppedRoot(in: store, path: rootBURL.path)
+            let multiRootSnapshot = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+
+            XCTAssertEqual(multiRootSnapshot.roots.map(\.id), [rootA.id, rootB.id])
+            XCTAssertEqual(multiRootSnapshot.files.map(\.standardizedRelativePath), ["A.swift", "B.swift"])
+            diagnostics = await store.storeWorkDiagnosticsSnapshot().rootCatalogShards
+            XCTAssertEqual(diagnostics.singleShardCompositionReuseCount, 1)
+            XCTAssertEqual(diagnostics.genericMergeElementVisitCount, 2)
+            XCTAssertEqual(diagnostics.shadowComparisonCount, 0)
+            XCTAssertEqual(diagnostics.shadowMismatchCount, 0)
+        }
+
         func testTopologyChurnRebuildsOnlyAffectedRootShardsAndShadowMatchesAuthoritativeBytes() async throws {
             let visibleAURL = try makeTemporaryRoot(name: "ShardVisibleA")
             let visibleBURL = try makeTemporaryRoot(name: "ShardVisibleB")
@@ -375,7 +406,7 @@ import XCTest
         }
 
         private func makeStore() -> WorkspaceFileContextStore {
-            let store = WorkspaceFileContextStore()
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: true)
             stores.append(store)
             return store
         }

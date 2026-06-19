@@ -161,10 +161,7 @@ import MCP
             guard let parsedRunID = debugOptionalUUID(arguments, "run_id", op: op) else {
                 return debugDiagnosticsError(op: op, code: "invalid_params", message: "run_id must be a UUID string.")
             }
-            guard let runID = parsedRunID else {
-                return debugDiagnosticsError(op: op, code: "invalid_params", message: "run_id is required.")
-            }
-            return debugDiagnosticsResult(debugRunRoutingHistoryPayload(runID: runID, limit: limit))
+            return debugDiagnosticsResult(debugRunRoutingHistoryPayload(runID: parsedRunID, limit: limit))
         }
 
         func debugClearConnectionHistoryToolPayload(op: String, arguments: [String: Value]) -> CallTool.Result {

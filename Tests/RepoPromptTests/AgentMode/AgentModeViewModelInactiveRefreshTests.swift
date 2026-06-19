@@ -1277,8 +1277,8 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         let newerChildRowIndex = try XCTUnwrap(
             transitionRows.firstIndex(where: { $0.tabID == newerChildTabID })
         )
-        XCTAssertLessThan(rootRowIndex, activeChildRowIndex)
-        XCTAssertLessThan(activeChildRowIndex, newerChildRowIndex)
+        XCTAssertLessThan(rootRowIndex, newerChildRowIndex)
+        XCTAssertLessThan(newerChildRowIndex, activeChildRowIndex)
         let activeOlderChildRow = try XCTUnwrap(
             transitionRows.first(where: { $0.tabID == activeOlderChildTabID })
         )
@@ -1286,6 +1286,28 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(activeOlderChildRow.parentSessionID, rootSessionID)
         XCTAssertEqual(activeOlderChildRow.activityDate, Date(timeIntervalSince1970: 100))
         XCTAssertEqual(activeOlderChildRow.worktreeMergeAttention?.operationID, mergeSummary.id)
+
+        let newerActiveRows = viewModel.filteredSidebarSessions(
+            for: transitionWorkspace.composeTabs,
+            currentTabID: newerChildTabID,
+            searchText: ""
+        )
+        XCTAssertEqual(transitionRows.map(\.tabID), newerActiveRows.map(\.tabID))
+
+        let searchRowsWithoutActivePromotion = viewModel.filteredSidebarSessions(
+            for: transitionWorkspace.composeTabs,
+            currentTabID: nil,
+            searchText: "root"
+        )
+        let searchRowsWithStaleRootActive = viewModel.filteredSidebarSessions(
+            for: transitionWorkspace.composeTabs,
+            currentTabID: staleRootTabID,
+            searchText: "root"
+        )
+        XCTAssertEqual(
+            searchRowsWithStaleRootActive.map(\.tabID),
+            searchRowsWithoutActivePromotion.map(\.tabID)
+        )
 
         let currentCascade = viewModel.test_sessionTreeCascadePlan(
             forComposeTabIDs: [rootTabID],

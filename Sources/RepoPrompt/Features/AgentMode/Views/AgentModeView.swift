@@ -2544,6 +2544,7 @@ struct AgentModeChatDetailView: View {
                 .id(block.id)
         }
         .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
+        .messageTimestampEnvironment()
     }
 
     @ViewBuilder
