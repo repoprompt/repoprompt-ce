@@ -40,10 +40,6 @@ enum AgentToolResultSanitizationPurpose {
 
 enum AgentToolResultPersistencePolicy {
     static let maxPersistedToolSummaryBytes = 2048
-    private static let cursorACPPersistedDiffBytesLimit = 1200
-    private static let cursorACPFallbackPersistedDiffBytesLimit = 600
-    private static let cursorACPGeneratedDiffInputBytesLimit = 16384
-    private static let cursorACPGeneratedDiffInputLineLimit = 800
     private static let promptExportFileMetadataLimit = 12
 
     static func sanitizeItem(_ item: AgentChatItem) -> AgentChatItem {
@@ -461,33 +457,6 @@ enum AgentToolResultPersistencePolicy {
             }
             return file
         }
-    }
-
-    private static func storageSafeCursorACPStructuredSummary(
-        _ resultJSON: String?,
-        normalizedToolName: String?,
-        statusWord: String,
-        processID: String?,
-        exitCode: Int?,
-        context: AgentToolResultProcessingContext?
-    ) -> String? {
-        guard let resultJSON = resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !resultJSON.isEmpty,
-              let object = jsonObject(from: resultJSON, context: context),
-              stringValue(object, keys: ["acp_status"]) != nil
-        else { return nil }
-        if boolValue(object, keys: ["summary_only", "summaryOnly"]) == true,
-           !exceedsPersistedToolSummaryBudget(resultJSON)
-        {
-            return resultJSON
-        }
-        return cursorACPSummaryJSON(
-            normalizedToolName: normalizedToolName,
-            statusWord: statusWord,
-            processID: processID,
-            exitCode: exitCode,
-            rawObject: object
-        )
     }
 
     static func sanitizeTranscript(_ transcript: AgentTranscript) -> AgentTranscript {
@@ -1621,251 +1590,6 @@ enum AgentToolResultPersistencePolicy {
         }
     }
 
-    private static func cursorACPSummaryJSON(
-        normalizedToolName: String?,
-        statusWord: String,
-        processID: String?,
-        exitCode: Int?,
-        rawObject: [String: Any]?
-    ) -> String? {
-        guard let rawObject,
-              stringValue(rawObject, keys: ["acp_status"]) != nil
-        else { return nil }
-
-        let isEdit = normalizedToolName == "edit"
-        var object = cursorACPBaseSummaryObject(
-            normalizedToolName: normalizedToolName,
-            statusWord: statusWord,
-            processID: processID,
-            exitCode: exitCode,
-            rawObject: rawObject
-        )
-        if let content = cursorACPContentSummary(
-            from: rawObject,
-            isEdit: isEdit,
-            diffLimit: cursorACPPersistedDiffBytesLimit
-        ), !content.isEmpty {
-            object["content"] = content
-            if isEdit {
-                object["change_count"] = content.count
-            }
-        }
-        if let rawOutput = cursorACPRawOutputSummary(from: rawObject["rawOutput"]) {
-            object["rawOutput"] = rawOutput
-        }
-        if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
-            return json
-        }
-        guard isEdit,
-              let compactContent = cursorACPContentSummary(
-                  from: rawObject,
-                  isEdit: true,
-                  diffLimit: cursorACPFallbackPersistedDiffBytesLimit
-              ), !compactContent.isEmpty
-        else { return nil }
-        object["content"] = compactContent
-        object["change_count"] = compactContent.count
-        return jsonString(from: object).flatMap { exceedsPersistedToolSummaryBudget($0) ? nil : $0 }
-    }
-
-    private static func cursorACPBaseSummaryObject(
-        normalizedToolName: String?,
-        statusWord: String,
-        processID: String?,
-        exitCode: Int?,
-        rawObject: [String: Any]
-    ) -> [String: Any] {
-        var object = genericSummaryObject(
-            normalizedToolName: normalizedToolName,
-            statusWord: statusWord,
-            processID: processID,
-            exitCode: exitCode
-        )
-        if let acpStatus = smallStringValue(rawObject, keys: ["acp_status"]) {
-            object["acp_status"] = acpStatus
-        }
-        if let kind = smallStringValue(rawObject, keys: ["kind"]) {
-            object["kind"] = kind
-        }
-        if let title = smallStringValue(rawObject, keys: ["title"]) {
-            object["title"] = title
-        }
-        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
-           let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"])
-        {
-            object["chat_id"] = chatID
-        }
-        return object
-    }
-
-    private static func cursorACPContentSummary(
-        from rawObject: [String: Any],
-        isEdit: Bool,
-        diffLimit: Int
-    ) -> [[String: Any]]? {
-        guard let rawContent = rawObject["content"] as? [[String: Any]] else { return nil }
-        let summaries: [[String: Any]] = rawContent.compactMap { entry in
-            let type = stringValue(entry, keys: ["type"])?.trimmingCharacters(in: .whitespacesAndNewlines)
-            let path = stringValue(entry, keys: ["path"])?.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard type?.isEmpty == false || path?.isEmpty == false else { return nil }
-            return isEdit
-                ? cursorACPEditContentSummary(entry: entry, type: type, path: path, diffLimit: diffLimit)
-                : cursorACPNonEditContentSummary(entry: entry, type: type, path: path)
-        }
-        return summaries.isEmpty ? nil : summaries
-    }
-
-    private static func cursorACPEditContentSummary(
-        entry: [String: Any],
-        type: String?,
-        path: String?,
-        diffLimit: Int
-    ) -> [String: Any]? {
-        var summary: [String: Any] = [:]
-        if let type, !type.isEmpty { summary["type"] = type }
-        if let path, !path.isEmpty { summary["path"] = path }
-        if let oldTextTruncated = boolValue(entry, keys: ["oldText_truncated", "old_text_truncated", "oldTextTruncated"]) {
-            summary["oldText_truncated"] = oldTextTruncated
-        }
-        if let newTextTruncated = boolValue(entry, keys: ["newText_truncated", "new_text_truncated", "newTextTruncated"]) {
-            summary["newText_truncated"] = newTextTruncated
-        }
-        if let diffTruncated = boolValue(entry, keys: ["diff_truncated", "diffTruncated"]) {
-            summary["diff_truncated"] = diffTruncated
-        }
-        if let existingDiff = stringValue(entry, keys: ["unified_diff", "card_unified_diff"]),
-           let clipped = clippedCursorACPString(existingDiff, limit: diffLimit)
-        {
-            summary["unified_diff"] = clipped.value
-            if clipped.wasTruncated {
-                summary["diff_truncated"] = true
-            }
-            return summary.isEmpty ? nil : summary
-        }
-        if let path, !path.isEmpty,
-           let oldText = stringValue(entry, keys: ["oldText", "old_text"]),
-           let newText = stringValue(entry, keys: ["newText", "new_text"])
-        {
-            copyCursorACPStringMetrics(from: entry, key: "oldText", into: &summary)
-            copyCursorACPStringMetrics(from: entry, key: "newText", into: &summary)
-            guard shouldGenerateCursorACPDiff(oldText: oldText, newText: newText) else {
-                summary["diff_truncated"] = true
-                return summary.isEmpty ? nil : summary
-            }
-            guard let diff = cursorACPUnifiedDiff(path: path, oldText: oldText, newText: newText),
-                  let clipped = clippedCursorACPString(diff, limit: diffLimit) else { return summary.isEmpty ? nil : summary }
-            summary["unified_diff"] = clipped.value
-            if clipped.wasTruncated {
-                summary["diff_truncated"] = true
-            }
-        }
-        return summary.isEmpty ? nil : summary
-    }
-
-    private static func cursorACPNonEditContentSummary(
-        entry: [String: Any],
-        type: String?,
-        path: String?
-    ) -> [String: Any]? {
-        var summary: [String: Any] = [:]
-        if let type, !type.isEmpty { summary["type"] = type }
-        if let path, !path.isEmpty { summary["path"] = path }
-        for key in ["text", "content", "output", "oldText", "newText"] {
-            copyCursorACPStringMetrics(from: entry, key: key, into: &summary)
-        }
-        return summary.isEmpty ? nil : summary
-    }
-
-    private static func shouldGenerateCursorACPDiff(oldText: String, newText: String) -> Bool {
-        let totalBytes = oldText.utf8.count + newText.utf8.count
-        guard totalBytes <= cursorACPGeneratedDiffInputBytesLimit else { return false }
-        let totalLines = oldText.split(separator: "\n", omittingEmptySubsequences: false).count
-            + newText.split(separator: "\n", omittingEmptySubsequences: false).count
-        return totalLines <= cursorACPGeneratedDiffInputLineLimit
-    }
-
-    private static func cursorACPUnifiedDiff(path: String, oldText: String, newText: String) -> String? {
-        let oldLines = String.splitContentPreservingLineEndings(oldText).0
-        let newLines = String.splitContentPreservingLineEndings(newText).0
-        let chunks = UnifiedDiffGenerator.diffChunks(
-            oldLines: oldLines,
-            newLines: newLines,
-            context: 2
-        )
-        let diff = UnifiedDiffGenerator.build(filePath: path, chunks: chunks, context: 2)
-        let trimmed = diff.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : diff
-    }
-
-    private static func cursorACPRawOutputSummary(from rawOutput: Any?) -> [String: Any]? {
-        guard let rawOutput = rawOutput as? [String: Any], !rawOutput.isEmpty else { return nil }
-        var summary: [String: Any] = [:]
-        for key in ["success", "truncated", "totalFiles", "exitCode", "code", "stdoutSanitized"] {
-            if let value = rawOutput[key], value is Bool || value is NSNumber || value is Int || value is Double {
-                summary[key] = value
-            }
-        }
-        for key in ["stdout", "stderr", "content", "output"] {
-            copyCursorACPStringMetrics(from: rawOutput, key: key, into: &summary)
-            copyExistingCursorACPStringMetrics(from: rawOutput, key: key, into: &summary)
-        }
-        for key in ["error", "errorMessage", "message"] {
-            copyClippedCursorACPString(from: rawOutput, key: key, into: &summary)
-        }
-        return summary.isEmpty ? nil : summary
-    }
-
-    private static func copyCursorACPStringMetrics(
-        from object: [String: Any],
-        key: String,
-        into summary: inout [String: Any]
-    ) {
-        guard let raw = stringValue(object, keys: [key]),
-              !raw.isEmpty else { return }
-        summary["\(key)_bytes"] = raw.utf8.count
-        summary["\(key)_line_count"] = raw.isEmpty ? 0 : raw.split(separator: "\n", omittingEmptySubsequences: false).count
-        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
-            summary["\(key)_truncated"] = true
-        }
-    }
-
-    private static func copyExistingCursorACPStringMetrics(
-        from object: [String: Any],
-        key: String,
-        into summary: inout [String: Any]
-    ) {
-        if let bytes = intValue(object, keys: ["\(key)_bytes", "\(key)Bytes"]) {
-            summary["\(key)_bytes"] = bytes
-        }
-        if let lineCount = intValue(object, keys: ["\(key)_line_count", "\(key)LineCount"]) {
-            summary["\(key)_line_count"] = lineCount
-        }
-        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
-            summary["\(key)_truncated"] = true
-        }
-    }
-
-    private static func copyClippedCursorACPString(
-        from object: [String: Any],
-        key: String,
-        into summary: inout [String: Any]
-    ) {
-        guard let raw = stringValue(object, keys: [key]),
-              let clipped = clippedCursorACPString(raw) else { return }
-        summary[key] = clipped.value
-        if clipped.wasTruncated {
-            summary["\(key)_truncated"] = true
-        }
-    }
-
-    private static func clippedCursorACPString(_ raw: String, limit: Int = 600) -> (value: String, wasTruncated: Bool)? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard trimmed.count > limit else { return (trimmed, false) }
-        let prefix = trimmed.prefix(limit).trimmingCharacters(in: .whitespacesAndNewlines)
-        return prefix.isEmpty ? nil : (prefix + "…", true)
-    }
-
     private static func agentRunSummaryJSON(
         normalizedToolName: String?,
         statusWord: String,
@@ -2402,5 +2126,286 @@ enum AgentToolResultPersistencePolicy {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Cursor ACP Persistence
+
+private extension AgentToolResultPersistencePolicy {
+    private static let cursorACPPersistedDiffBytesLimit = 1200
+    private static let cursorACPFallbackPersistedDiffBytesLimit = 600
+    private static let cursorACPGeneratedDiffInputBytesLimit = 16384
+    private static let cursorACPGeneratedDiffInputLineLimit = 800
+
+    private static func storageSafeCursorACPStructuredSummary(
+        _ resultJSON: String?,
+        normalizedToolName: String?,
+        statusWord: String,
+        processID: String?,
+        exitCode: Int?,
+        context: AgentToolResultProcessingContext?
+    ) -> String? {
+        guard let resultJSON = resultJSON?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !resultJSON.isEmpty,
+              let object = jsonObject(from: resultJSON, context: context),
+              stringValue(object, keys: ["acp_status"]) != nil
+        else { return nil }
+        if boolValue(object, keys: ["summary_only", "summaryOnly"]) == true,
+           !exceedsPersistedToolSummaryBudget(resultJSON)
+        {
+            return resultJSON
+        }
+        return cursorACPSummaryJSON(
+            normalizedToolName: normalizedToolName,
+            statusWord: statusWord,
+            processID: processID,
+            exitCode: exitCode,
+            rawObject: object
+        )
+    }
+
+    private static func cursorACPSummaryJSON(
+        normalizedToolName: String?,
+        statusWord: String,
+        processID: String?,
+        exitCode: Int?,
+        rawObject: [String: Any]?
+    ) -> String? {
+        guard let rawObject,
+              stringValue(rawObject, keys: ["acp_status"]) != nil
+        else { return nil }
+
+        let isEdit = normalizedToolName == "edit"
+        var object = cursorACPBaseSummaryObject(
+            normalizedToolName: normalizedToolName,
+            statusWord: statusWord,
+            processID: processID,
+            exitCode: exitCode,
+            rawObject: rawObject
+        )
+        if let content = cursorACPContentSummary(
+            from: rawObject,
+            isEdit: isEdit,
+            diffLimit: cursorACPPersistedDiffBytesLimit
+        ), !content.isEmpty {
+            object["content"] = content
+            if isEdit {
+                object["change_count"] = content.count
+            }
+        }
+        if let rawOutput = cursorACPRawOutputSummary(from: rawObject["rawOutput"]) {
+            object["rawOutput"] = rawOutput
+        }
+        if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
+            return json
+        }
+        guard isEdit,
+              let compactContent = cursorACPContentSummary(
+                  from: rawObject,
+                  isEdit: true,
+                  diffLimit: cursorACPFallbackPersistedDiffBytesLimit
+              ), !compactContent.isEmpty
+        else { return nil }
+        object["content"] = compactContent
+        object["change_count"] = compactContent.count
+        return jsonString(from: object).flatMap { exceedsPersistedToolSummaryBudget($0) ? nil : $0 }
+    }
+
+    private static func cursorACPBaseSummaryObject(
+        normalizedToolName: String?,
+        statusWord: String,
+        processID: String?,
+        exitCode: Int?,
+        rawObject: [String: Any]
+    ) -> [String: Any] {
+        var object = genericSummaryObject(
+            normalizedToolName: normalizedToolName,
+            statusWord: statusWord,
+            processID: processID,
+            exitCode: exitCode
+        )
+        if let acpStatus = smallStringValue(rawObject, keys: ["acp_status"]) {
+            object["acp_status"] = acpStatus
+        }
+        if let kind = smallStringValue(rawObject, keys: ["kind"]) {
+            object["kind"] = kind
+        }
+        if let title = smallStringValue(rawObject, keys: ["title"]) {
+            object["title"] = title
+        }
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+           let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"])
+        {
+            object["chat_id"] = chatID
+        }
+        return object
+    }
+
+    private static func cursorACPContentSummary(
+        from rawObject: [String: Any],
+        isEdit: Bool,
+        diffLimit: Int
+    ) -> [[String: Any]]? {
+        guard let rawContent = rawObject["content"] as? [[String: Any]] else { return nil }
+        let summaries: [[String: Any]] = rawContent.compactMap { entry in
+            let type = stringValue(entry, keys: ["type"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let path = stringValue(entry, keys: ["path"])?.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard type?.isEmpty == false || path?.isEmpty == false else { return nil }
+            return isEdit
+                ? cursorACPEditContentSummary(entry: entry, type: type, path: path, diffLimit: diffLimit)
+                : cursorACPNonEditContentSummary(entry: entry, type: type, path: path)
+        }
+        return summaries.isEmpty ? nil : summaries
+    }
+
+    private static func cursorACPEditContentSummary(
+        entry: [String: Any],
+        type: String?,
+        path: String?,
+        diffLimit: Int
+    ) -> [String: Any]? {
+        var summary: [String: Any] = [:]
+        if let type, !type.isEmpty { summary["type"] = type }
+        if let path, !path.isEmpty { summary["path"] = path }
+        if let oldTextTruncated = boolValue(entry, keys: ["oldText_truncated", "old_text_truncated", "oldTextTruncated"]) {
+            summary["oldText_truncated"] = oldTextTruncated
+        }
+        if let newTextTruncated = boolValue(entry, keys: ["newText_truncated", "new_text_truncated", "newTextTruncated"]) {
+            summary["newText_truncated"] = newTextTruncated
+        }
+        if let diffTruncated = boolValue(entry, keys: ["diff_truncated", "diffTruncated"]) {
+            summary["diff_truncated"] = diffTruncated
+        }
+        if let existingDiff = stringValue(entry, keys: ["unified_diff", "card_unified_diff"]),
+           let clipped = clippedCursorACPString(existingDiff, limit: diffLimit)
+        {
+            summary["unified_diff"] = clipped.value
+            if clipped.wasTruncated {
+                summary["diff_truncated"] = true
+            }
+            return summary.isEmpty ? nil : summary
+        }
+        if let path, !path.isEmpty,
+           let oldText = stringValue(entry, keys: ["oldText", "old_text"]),
+           let newText = stringValue(entry, keys: ["newText", "new_text"])
+        {
+            copyCursorACPStringMetrics(from: entry, key: "oldText", into: &summary)
+            copyCursorACPStringMetrics(from: entry, key: "newText", into: &summary)
+            guard shouldGenerateCursorACPDiff(oldText: oldText, newText: newText) else {
+                summary["diff_truncated"] = true
+                return summary.isEmpty ? nil : summary
+            }
+            guard let diff = cursorACPUnifiedDiff(path: path, oldText: oldText, newText: newText),
+                  let clipped = clippedCursorACPString(diff, limit: diffLimit) else { return summary.isEmpty ? nil : summary }
+            summary["unified_diff"] = clipped.value
+            if clipped.wasTruncated {
+                summary["diff_truncated"] = true
+            }
+        }
+        return summary.isEmpty ? nil : summary
+    }
+
+    private static func cursorACPNonEditContentSummary(
+        entry: [String: Any],
+        type: String?,
+        path: String?
+    ) -> [String: Any]? {
+        var summary: [String: Any] = [:]
+        if let type, !type.isEmpty { summary["type"] = type }
+        if let path, !path.isEmpty { summary["path"] = path }
+        for key in ["text", "content", "output", "oldText", "newText"] {
+            copyCursorACPStringMetrics(from: entry, key: key, into: &summary)
+        }
+        return summary.isEmpty ? nil : summary
+    }
+
+    private static func shouldGenerateCursorACPDiff(oldText: String, newText: String) -> Bool {
+        let totalBytes = oldText.utf8.count + newText.utf8.count
+        guard totalBytes <= cursorACPGeneratedDiffInputBytesLimit else { return false }
+        let totalLines = oldText.split(separator: "\n", omittingEmptySubsequences: false).count
+            + newText.split(separator: "\n", omittingEmptySubsequences: false).count
+        return totalLines <= cursorACPGeneratedDiffInputLineLimit
+    }
+
+    private static func cursorACPUnifiedDiff(path: String, oldText: String, newText: String) -> String? {
+        let oldLines = String.splitContentPreservingLineEndings(oldText).0
+        let newLines = String.splitContentPreservingLineEndings(newText).0
+        let chunks = UnifiedDiffGenerator.diffChunks(
+            oldLines: oldLines,
+            newLines: newLines,
+            context: 2
+        )
+        let diff = UnifiedDiffGenerator.build(filePath: path, chunks: chunks, context: 2)
+        let trimmed = diff.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : diff
+    }
+
+    private static func cursorACPRawOutputSummary(from rawOutput: Any?) -> [String: Any]? {
+        guard let rawOutput = rawOutput as? [String: Any], !rawOutput.isEmpty else { return nil }
+        var summary: [String: Any] = [:]
+        for key in ["success", "truncated", "totalFiles", "exitCode", "code", "stdoutSanitized"] {
+            if let value = rawOutput[key], value is Bool || value is NSNumber || value is Int || value is Double {
+                summary[key] = value
+            }
+        }
+        for key in ["stdout", "stderr", "content", "output"] {
+            copyCursorACPStringMetrics(from: rawOutput, key: key, into: &summary)
+            copyExistingCursorACPStringMetrics(from: rawOutput, key: key, into: &summary)
+        }
+        for key in ["error", "errorMessage", "message"] {
+            copyClippedCursorACPString(from: rawOutput, key: key, into: &summary)
+        }
+        return summary.isEmpty ? nil : summary
+    }
+
+    private static func copyCursorACPStringMetrics(
+        from object: [String: Any],
+        key: String,
+        into summary: inout [String: Any]
+    ) {
+        guard let raw = stringValue(object, keys: [key]),
+              !raw.isEmpty else { return }
+        summary["\(key)_bytes"] = raw.utf8.count
+        summary["\(key)_line_count"] = raw.isEmpty ? 0 : raw.split(separator: "\n", omittingEmptySubsequences: false).count
+        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
+            summary["\(key)_truncated"] = true
+        }
+    }
+
+    private static func copyExistingCursorACPStringMetrics(
+        from object: [String: Any],
+        key: String,
+        into summary: inout [String: Any]
+    ) {
+        if let bytes = intValue(object, keys: ["\(key)_bytes", "\(key)Bytes"]) {
+            summary["\(key)_bytes"] = bytes
+        }
+        if let lineCount = intValue(object, keys: ["\(key)_line_count", "\(key)LineCount"]) {
+            summary["\(key)_line_count"] = lineCount
+        }
+        if boolValue(object, keys: ["\(key)_truncated", "\(key)Truncated"]) == true {
+            summary["\(key)_truncated"] = true
+        }
+    }
+
+    private static func copyClippedCursorACPString(
+        from object: [String: Any],
+        key: String,
+        into summary: inout [String: Any]
+    ) {
+        guard let raw = stringValue(object, keys: [key]),
+              let clipped = clippedCursorACPString(raw) else { return }
+        summary[key] = clipped.value
+        if clipped.wasTruncated {
+            summary["\(key)_truncated"] = true
+        }
+    }
+
+    private static func clippedCursorACPString(_ raw: String, limit: Int = 600) -> (value: String, wasTruncated: Bool)? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed.count > limit else { return (trimmed, false) }
+        let prefix = trimmed.prefix(limit).trimmingCharacters(in: .whitespacesAndNewlines)
+        return prefix.isEmpty ? nil : (prefix + "…", true)
     }
 }

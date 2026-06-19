@@ -976,209 +976,6 @@ final class ClaudeAgentModeCoordinator {
         }
     }
 
-    /// Detaches the current Claude controller and its tool tracker synchronously
-    /// so a replacement run cannot be affected by the old controller's async cleanup.
-    func prepareClaudeCancelSync(_ session: AgentModeViewModel.TabSession) -> DetachedClaudeController? {
-        guard session.selectedAgent.usesClaudeNativeRuntime else { return nil }
-        invalidateControllerRetirement(for: session)
-        let detached = session.claudeController.flatMap {
-            detachClaudeController($0, from: session, removeToolTracking: true)
-        }
-        if detached == nil {
-            clearClaudeControllerLaunchMetadata(for: session)
-        }
-        session.runID = nil
-        session.pendingSupersedingTurnCompletions = 0
-        session.claudeSupersedingProtectedTurnIDs.removeAll()
-        return detached
-    }
-
-    private func prepareClaudeProviderIdentityResetSync(
-        _ session: AgentModeViewModel.TabSession
-    ) -> DetachedClaudeController? {
-        let detached = prepareClaudeCancelSync(session)
-        invalidatePendingClaudeResumeTransfer(for: session)
-        session.providerSessionID = nil
-        return detached
-    }
-
-    func handleProviderIdentityTransitionSync(
-        session: AgentModeViewModel.TabSession,
-        from previousAgent: AgentProviderKind,
-        to nextAgent: AgentProviderKind
-    ) {
-        guard previousAgent.usesClaudeNativeRuntime,
-              !nextAgent.usesClaudeNativeRuntime || previousAgent != nextAgent
-        else {
-            return
-        }
-        let detached = prepareClaudeProviderIdentityResetSync(session)
-        Task { await cancelClaudeRun(session, oldController: detached) }
-    }
-
-    func handleProviderIdentityTransition(
-        session: AgentModeViewModel.TabSession,
-        from previousAgent: AgentProviderKind,
-        to nextAgent: AgentProviderKind
-    ) async {
-        guard previousAgent.usesClaudeNativeRuntime,
-              !nextAgent.usesClaudeNativeRuntime || previousAgent != nextAgent
-        else {
-            return
-        }
-        let detached = prepareClaudeProviderIdentityResetSync(session)
-        await cancelClaudeRun(session, oldController: detached)
-    }
-
-    func prepareForConversationResetSync(_ session: AgentModeViewModel.TabSession) {
-        let detached = prepareClaudeCancelSync(session)
-        invalidatePendingClaudeResumeTransfer(for: session)
-        Task { await cancelClaudeRun(session, oldController: detached) }
-    }
-
-    func beginClaudeResumeTransferIfNeeded(
-        for session: AgentModeViewModel.TabSession,
-        oldController: DetachedClaudeController?
-    ) {
-        guard let oldController else { return }
-        guard pendingResumeTransferTasksByTabID[session.tabID] == nil else {
-            let task = Task { @MainActor [self, session] in
-                await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
-            }
-            retiredResumeTransferTasksByTabID[session.tabID, default: []].append(task)
-            return
-        }
-        let generation = UUID()
-        pendingResumeTransferGenerationByTabID[session.tabID] = generation
-        pendingResumeTransferTasksByTabID[session.tabID] = Task { @MainActor [self, session] in
-            await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
-        }
-    }
-
-    func awaitPendingClaudeResumeTransferIfNeeded(
-        for session: AgentModeViewModel.TabSession,
-        scheduleProviderSessionSave: Bool = true
-    ) async {
-        let retiredTasks = retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID) ?? []
-        for task in retiredTasks {
-            _ = await task.value
-        }
-
-        guard let task = pendingResumeTransferTasksByTabID[session.tabID],
-              let generation = pendingResumeTransferGenerationByTabID[session.tabID]
-        else {
-            return
-        }
-        let sessionRef = await task.value
-        guard pendingResumeTransferGenerationByTabID[session.tabID] == generation else { return }
-        pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
-        pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
-        updateProviderSessionIDIfNeeded(
-            sessionRef.sessionID,
-            for: session,
-            scheduleSave: scheduleProviderSessionSave
-        )
-    }
-
-    func hasPendingResumeTransfer(
-        for session: AgentModeViewModel.TabSession
-    ) -> Bool {
-        pendingResumeTransferTasksByTabID[session.tabID] != nil
-            || retiredResumeTransferTasksByTabID[session.tabID]?.isEmpty == false
-    }
-
-    func invalidatePendingClaudeResumeTransfer(
-        for session: AgentModeViewModel.TabSession
-    ) {
-        if let task = pendingResumeTransferTasksByTabID[session.tabID] {
-            retiredResumeTransferTasksByTabID[session.tabID, default: []].append(task)
-        }
-        pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
-        pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
-    }
-
-    /// Async cleanup for a synchronously detached controller after cancel.
-    func cancelClaudeRun(
-        _ session: AgentModeViewModel.TabSession,
-        oldController: DetachedClaudeController?
-    ) async {
-        guard let oldController else { return }
-        _ = await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
-    }
-
-    private func cancelClaudeRunAndCaptureSessionRef(
-        _ session: AgentModeViewModel.TabSession,
-        oldController: DetachedClaudeController
-    ) async -> NativeAgentRuntimeSessionRef {
-        let controller = oldController.controller
-        let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
-        await stopToolTracking(oldController, for: session)
-        if interruptOutcome == .acknowledged {
-            // Give Claude ~200 ms to persist any in-flight state before we
-            // tear down the process. The UI doesn't block on this — the
-            // controller was already detached by prepareClaudeCancelSync.
-            try? await Task.sleep(nanoseconds: 200_000_000)
-        }
-        let sessionRef = await controller.currentSessionRef()
-        await controller.shutdown()
-        return sessionRef
-    }
-
-    func shutdownClaudeSessionIfNeeded(_ session: AgentModeViewModel.TabSession) async {
-        guard session.claudeController != nil
-            || hasPendingResumeTransfer(for: session)
-            || session.selectedAgent.usesClaudeNativeRuntime
-        else {
-            return
-        }
-        await shutdownClaudeSession(session)
-    }
-
-    func shutdownClaudeSession(
-        _ session: AgentModeViewModel.TabSession,
-        clearTabScopedCoordinatorState: Bool = true
-    ) async {
-        await awaitPendingClaudeResumeTransferIfNeeded(
-            for: session,
-            scheduleProviderSessionSave: clearTabScopedCoordinatorState
-        )
-        if let controller = session.claudeController {
-            guard let detached = detachClaudeController(
-                controller,
-                from: session,
-                removeToolTracking: clearTabScopedCoordinatorState
-            ) else {
-                return
-            }
-            guard await retireClaudeController(
-                detached,
-                for: session,
-                captureProviderSessionID: true,
-                scheduleProviderSessionSave: clearTabScopedCoordinatorState
-            ) else {
-                return
-            }
-        } else {
-            invalidateControllerRetirement(for: session)
-            clearClaudeControllerLaunchMetadata(for: session)
-        }
-        session.runID = nil
-        session.pendingSupersedingTurnCompletions = 0
-        session.claudeSupersedingProtectedTurnIDs.removeAll()
-        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
-        session.setRunningStatus(nil, source: nil)
-        if clearTabScopedCoordinatorState {
-            await clearClaudeToolTracking(for: session)
-        }
-    }
-
-    private func clearClaudeToolTracking(
-        for session: AgentModeViewModel.TabSession
-    ) async {
-        guard let handler = toolHandlerByTabID.removeValue(forKey: session.tabID) else { return }
-        await handler.stopTracking(for: session)
-    }
-
     // MARK: - Tool Tracking Delegation
 
     /// Forwarding wrapper for callers that still reference the coordinator for provider tool calls.
@@ -1351,5 +1148,212 @@ final class ClaudeAgentModeCoordinator {
             instructions: instructions,
             delivery: ClaudeAgentToolPreferences.agentModePromptDelivery()
         )
+    }
+}
+
+// MARK: - Claude Cancel, Resume, and Shutdown Lifecycle
+
+private extension ClaudeAgentModeCoordinator {
+    /// Detaches the current Claude controller and its tool tracker synchronously
+    /// so a replacement run cannot be affected by the old controller's async cleanup.
+    internal func prepareClaudeCancelSync(_ session: AgentModeViewModel.TabSession) -> DetachedClaudeController? {
+        guard session.selectedAgent.usesClaudeNativeRuntime else { return nil }
+        invalidateControllerRetirement(for: session)
+        let detached = session.claudeController.flatMap {
+            detachClaudeController($0, from: session, removeToolTracking: true)
+        }
+        if detached == nil {
+            clearClaudeControllerLaunchMetadata(for: session)
+        }
+        session.runID = nil
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        return detached
+    }
+
+    private func prepareClaudeProviderIdentityResetSync(
+        _ session: AgentModeViewModel.TabSession
+    ) -> DetachedClaudeController? {
+        let detached = prepareClaudeCancelSync(session)
+        invalidatePendingClaudeResumeTransfer(for: session)
+        session.providerSessionID = nil
+        return detached
+    }
+
+    internal func handleProviderIdentityTransitionSync(
+        session: AgentModeViewModel.TabSession,
+        from previousAgent: AgentProviderKind,
+        to nextAgent: AgentProviderKind
+    ) {
+        guard previousAgent.usesClaudeNativeRuntime,
+              !nextAgent.usesClaudeNativeRuntime || previousAgent != nextAgent
+        else {
+            return
+        }
+        let detached = prepareClaudeProviderIdentityResetSync(session)
+        Task { await cancelClaudeRun(session, oldController: detached) }
+    }
+
+    internal func handleProviderIdentityTransition(
+        session: AgentModeViewModel.TabSession,
+        from previousAgent: AgentProviderKind,
+        to nextAgent: AgentProviderKind
+    ) async {
+        guard previousAgent.usesClaudeNativeRuntime,
+              !nextAgent.usesClaudeNativeRuntime || previousAgent != nextAgent
+        else {
+            return
+        }
+        let detached = prepareClaudeProviderIdentityResetSync(session)
+        await cancelClaudeRun(session, oldController: detached)
+    }
+
+    internal func prepareForConversationResetSync(_ session: AgentModeViewModel.TabSession) {
+        let detached = prepareClaudeCancelSync(session)
+        invalidatePendingClaudeResumeTransfer(for: session)
+        Task { await cancelClaudeRun(session, oldController: detached) }
+    }
+
+    internal func beginClaudeResumeTransferIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        oldController: DetachedClaudeController?
+    ) {
+        guard let oldController else { return }
+        guard pendingResumeTransferTasksByTabID[session.tabID] == nil else {
+            let task = Task { @MainActor [self, session] in
+                await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
+            }
+            retiredResumeTransferTasksByTabID[session.tabID, default: []].append(task)
+            return
+        }
+        let generation = UUID()
+        pendingResumeTransferGenerationByTabID[session.tabID] = generation
+        pendingResumeTransferTasksByTabID[session.tabID] = Task { @MainActor [self, session] in
+            await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
+        }
+    }
+
+    internal func awaitPendingClaudeResumeTransferIfNeeded(
+        for session: AgentModeViewModel.TabSession,
+        scheduleProviderSessionSave: Bool = true
+    ) async {
+        let retiredTasks = retiredResumeTransferTasksByTabID.removeValue(forKey: session.tabID) ?? []
+        for task in retiredTasks {
+            _ = await task.value
+        }
+
+        guard let task = pendingResumeTransferTasksByTabID[session.tabID],
+              let generation = pendingResumeTransferGenerationByTabID[session.tabID]
+        else {
+            return
+        }
+        let sessionRef = await task.value
+        guard pendingResumeTransferGenerationByTabID[session.tabID] == generation else { return }
+        pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
+        pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
+        updateProviderSessionIDIfNeeded(
+            sessionRef.sessionID,
+            for: session,
+            scheduleSave: scheduleProviderSessionSave
+        )
+    }
+
+    internal func hasPendingResumeTransfer(
+        for session: AgentModeViewModel.TabSession
+    ) -> Bool {
+        pendingResumeTransferTasksByTabID[session.tabID] != nil
+            || retiredResumeTransferTasksByTabID[session.tabID]?.isEmpty == false
+    }
+
+    internal func invalidatePendingClaudeResumeTransfer(
+        for session: AgentModeViewModel.TabSession
+    ) {
+        if let task = pendingResumeTransferTasksByTabID[session.tabID] {
+            retiredResumeTransferTasksByTabID[session.tabID, default: []].append(task)
+        }
+        pendingResumeTransferTasksByTabID.removeValue(forKey: session.tabID)
+        pendingResumeTransferGenerationByTabID.removeValue(forKey: session.tabID)
+    }
+
+    /// Async cleanup for a synchronously detached controller after cancel.
+    internal func cancelClaudeRun(
+        _ session: AgentModeViewModel.TabSession,
+        oldController: DetachedClaudeController?
+    ) async {
+        guard let oldController else { return }
+        _ = await cancelClaudeRunAndCaptureSessionRef(session, oldController: oldController)
+    }
+
+    private func cancelClaudeRunAndCaptureSessionRef(
+        _ session: AgentModeViewModel.TabSession,
+        oldController: DetachedClaudeController
+    ) async -> NativeAgentRuntimeSessionRef {
+        let controller = oldController.controller
+        let interruptOutcome = await controller.interruptTurn(reason: "interrupt")
+        await stopToolTracking(oldController, for: session)
+        if interruptOutcome == .acknowledged {
+            // Give Claude ~200 ms to persist any in-flight state before we
+            // tear down the process. The UI doesn't block on this — the
+            // controller was already detached by prepareClaudeCancelSync.
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        let sessionRef = await controller.currentSessionRef()
+        await controller.shutdown()
+        return sessionRef
+    }
+
+    internal func shutdownClaudeSessionIfNeeded(_ session: AgentModeViewModel.TabSession) async {
+        guard session.claudeController != nil
+            || hasPendingResumeTransfer(for: session)
+            || session.selectedAgent.usesClaudeNativeRuntime
+        else {
+            return
+        }
+        await shutdownClaudeSession(session)
+    }
+
+    internal func shutdownClaudeSession(
+        _ session: AgentModeViewModel.TabSession,
+        clearTabScopedCoordinatorState: Bool = true
+    ) async {
+        await awaitPendingClaudeResumeTransferIfNeeded(
+            for: session,
+            scheduleProviderSessionSave: clearTabScopedCoordinatorState
+        )
+        if let controller = session.claudeController {
+            guard let detached = detachClaudeController(
+                controller,
+                from: session,
+                removeToolTracking: clearTabScopedCoordinatorState
+            ) else {
+                return
+            }
+            guard await retireClaudeController(
+                detached,
+                for: session,
+                captureProviderSessionID: true,
+                scheduleProviderSessionSave: clearTabScopedCoordinatorState
+            ) else {
+                return
+            }
+        } else {
+            invalidateControllerRetirement(for: session)
+            clearClaudeControllerLaunchMetadata(for: session)
+        }
+        session.runID = nil
+        session.pendingSupersedingTurnCompletions = 0
+        session.claudeSupersedingProtectedTurnIDs.removeAll()
+        session.clearClaudeReasoningStatus(clearDisplayedStatus: true)
+        session.setRunningStatus(nil, source: nil)
+        if clearTabScopedCoordinatorState {
+            await clearClaudeToolTracking(for: session)
+        }
+    }
+
+    private func clearClaudeToolTracking(
+        for session: AgentModeViewModel.TabSession
+    ) async {
+        guard let handler = toolHandlerByTabID.removeValue(forKey: session.tabID) else { return }
+        await handler.stopTracking(for: session)
     }
 }
