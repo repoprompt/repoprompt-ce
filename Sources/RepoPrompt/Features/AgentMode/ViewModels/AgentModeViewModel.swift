@@ -614,6 +614,8 @@ final class AgentModeViewModel: ObservableObject {
     private var workspaceSwitchBackgroundCleanupTasks: [UUID: Task<Void, Never>] = [:]
     #if DEBUG
         private var test_workspaceSwitchBackgroundCleanupDrainTasks: [UUID: Task<Void, Never>] = [:]
+        private var test_workspaceSwitchBackgroundCleanupDrainWaiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+        private var test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks: [UUID: Task<Void, Never>] = [:]
     #endif
     var sidebarAutoArchiveTask: Task<Void, Never>?
     var isApplyingSidebarAutoArchive = false
@@ -829,16 +831,53 @@ final class AgentModeViewModel: ObservableObject {
             }
         }
 
-        func test_drainWorkspaceSwitchBackgroundCleanup() async {
-            while true {
-                let tasks = Array(test_workspaceSwitchBackgroundCleanupDrainTasks.values)
-                guard !tasks.isEmpty else { return }
+        func test_drainWorkspaceSwitchBackgroundCleanup(
+            timeoutNanoseconds: UInt64 = 5_000_000_000
+        ) async throws {
+            guard !test_workspaceSwitchBackgroundCleanupDrainTasks.isEmpty else { return }
 
-                for task in tasks {
-                    await task.value
+            let waiterID = UUID()
+            try await withCheckedThrowingContinuation { continuation in
+                test_workspaceSwitchBackgroundCleanupDrainWaiters[waiterID] = continuation
+                test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks[waiterID] = Task { @MainActor in
+                    do {
+                        try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                    } catch {
+                        return
+                    }
+                    self.test_timeoutWorkspaceSwitchBackgroundCleanupDrain(
+                        waiterID: waiterID,
+                        timeoutNanoseconds: timeoutNanoseconds
+                    )
                 }
-                await Task.yield()
             }
+        }
+
+        private func test_completeWorkspaceSwitchBackgroundCleanup(_ cleanupID: UUID) {
+            test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
+            guard test_workspaceSwitchBackgroundCleanupDrainTasks.isEmpty else { return }
+
+            let waiters = Array(test_workspaceSwitchBackgroundCleanupDrainWaiters.values)
+            test_workspaceSwitchBackgroundCleanupDrainWaiters.removeAll()
+            let timeoutTasks = Array(test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.values)
+            test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.removeAll()
+            timeoutTasks.forEach { $0.cancel() }
+            waiters.forEach { $0.resume() }
+        }
+
+        private func test_timeoutWorkspaceSwitchBackgroundCleanupDrain(
+            waiterID: UUID,
+            timeoutNanoseconds: UInt64
+        ) {
+            guard let waiter = test_workspaceSwitchBackgroundCleanupDrainWaiters.removeValue(forKey: waiterID) else {
+                return
+            }
+            test_workspaceSwitchBackgroundCleanupDrainTimeoutTasks.removeValue(forKey: waiterID)
+            waiter.resume(
+                throwing: AgentModeWorkspaceSwitchCleanupDrainTimeoutError(
+                    timeoutNanoseconds: timeoutNanoseconds
+                )
+            )
         }
 
         func test_setActiveWorkspaceIDForSessionIndex(_ workspaceID: UUID?) {
@@ -9505,7 +9544,7 @@ final class AgentModeViewModel: ObservableObject {
         let task = Task(priority: .utility) { @MainActor [weak self] in
             #if DEBUG
                 defer {
-                    self?.test_workspaceSwitchBackgroundCleanupDrainTasks.removeValue(forKey: cleanupID)
+                    self?.test_completeWorkspaceSwitchBackgroundCleanup(cleanupID)
                 }
             #endif
             await Task.yield()
@@ -15798,3 +15837,15 @@ final class AgentModeViewModel: ObservableObject {
         )
     }
 }
+
+#if DEBUG
+    private struct AgentModeWorkspaceSwitchCleanupDrainTimeoutError: LocalizedError {
+        let timeoutNanoseconds: UInt64
+
+        var errorDescription: String? {
+            let timeoutSeconds = Double(timeoutNanoseconds) / 1_000_000_000
+            return "Timed out waiting for workspace-switch background cleanup after \(timeoutSeconds)s."
+        }
+    }
+
+#endif
