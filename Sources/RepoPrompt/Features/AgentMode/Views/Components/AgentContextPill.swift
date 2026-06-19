@@ -26,11 +26,12 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.effectiveContextWindowTokens
     }
 
+    private var selectionSummary: AgentContextSelectionSummary {
+        AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
+    }
+
     private var fileCount: Int {
-        AgentContextExportResolver.displayFileCount(
-            resolvedModel: nil,
-            sourceSelection: currentExportSourceSelection
-        )
+        selectionSummary.totalExplicitFileCount
     }
 
     private var currentExportSourceSelection: StoredSelection {
@@ -56,7 +57,7 @@ struct AgentContextPill: View {
     }
 
     private var fileSummaryText: String {
-        "\(fileCount) file\(fileCount == 1 ? "" : "s")"
+        selectionSummary.headlineText
     }
 
     private var contextUsageTooltip: String {
@@ -95,6 +96,7 @@ struct AgentContextPill: View {
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
 
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
@@ -138,7 +140,7 @@ struct AgentContextPill: View {
                     Text("Selected")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                         .foregroundStyle(.tertiary)
-                    Text("\(fileCount) files")
+                    Text(fileSummaryText)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
                 }
             }

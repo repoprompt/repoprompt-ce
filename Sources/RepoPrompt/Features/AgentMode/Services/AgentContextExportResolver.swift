@@ -34,6 +34,20 @@ struct AgentContextExportIdentity: Equatable {
     let worktreeBindingFingerprint: String
 }
 
+struct AgentContextSelectionSummary: Equatable {
+    let totalExplicitFileCount: Int
+    let fullFileCount: Int
+    let slicedFileCount: Int
+    let sliceRangeCount: Int
+
+    var headlineText: String {
+        let fileText = "\(totalExplicitFileCount) file\(totalExplicitFileCount == 1 ? "" : "s")"
+        guard slicedFileCount > 0 else { return fileText }
+        let rangeText = "\(sliceRangeCount) range\(sliceRangeCount == 1 ? "" : "s")"
+        return "\(fileText) · \(slicedFileCount) sliced · \(rangeText)"
+    }
+}
+
 struct AgentContextExportSourceBuildRequest {
     let requestedTabID: UUID?
     let activeComposeTabID: UUID?
@@ -167,22 +181,35 @@ enum AgentContextExportResolver {
         let canRemove: Bool
     }
 
-    static func explicitSelectionFileCount(_ selection: StoredSelection) -> Int {
-        var seen = Set<String>()
-        for path in selection.selectedPaths {
-            seen.insert(normalizedSelectionKey(path))
-        }
+    static func selectionSummary(for selection: StoredSelection) -> AgentContextSelectionSummary {
+        var explicitFileKeys = Set(selection.selectedPaths.map(normalizedSelectionKey))
+        var slicedFileKeys = Set<String>()
+        var sliceRangeCount = 0
+
         for (path, ranges) in selection.slices where !ranges.isEmpty {
-            seen.insert(normalizedSelectionKey(path))
+            let key = normalizedSelectionKey(path)
+            explicitFileKeys.insert(key)
+            slicedFileKeys.insert(key)
+            sliceRangeCount += ranges.count
         }
-        return seen.count
+
+        return AgentContextSelectionSummary(
+            totalExplicitFileCount: explicitFileKeys.count,
+            fullFileCount: explicitFileKeys.count - slicedFileKeys.count,
+            slicedFileCount: slicedFileKeys.count,
+            sliceRangeCount: sliceRangeCount
+        )
+    }
+
+    static func explicitSelectionFileCount(_ selection: StoredSelection) -> Int {
+        selectionSummary(for: selection).totalExplicitFileCount
     }
 
     static func displayFileCount(
         resolvedModel _: AgentContextExportModel?,
         sourceSelection: StoredSelection
     ) -> Int {
-        explicitSelectionFileCount(sourceSelection)
+        selectionSummary(for: sourceSelection).totalExplicitFileCount
     }
 
     static func lookupContext(

@@ -30,6 +30,106 @@ final class AgentContextExportResolverTests: XCTestCase {
         )
     }
 
+    func testSelectionSummaryDistinguishesFullAndSlicedFiles() {
+        let selection = StoredSelection(
+            selectedPaths: ["Sources/Full.swift", "Sources/Sliced.swift"],
+            slices: [
+                "Sources/Sliced.swift": [
+                    LineRange(start: 2, end: 4),
+                    LineRange(start: 8, end: 10)
+                ]
+            ],
+            codemapAutoEnabled: false
+        )
+
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
+
+        XCTAssertEqual(summary.totalExplicitFileCount, 2)
+        XCTAssertEqual(summary.fullFileCount, 1)
+        XCTAssertEqual(summary.slicedFileCount, 1)
+        XCTAssertEqual(summary.sliceRangeCount, 2)
+        XCTAssertEqual(summary.headlineText, "2 files · 1 sliced · 2 ranges")
+    }
+
+    func testSelectionSummaryIncludesLegacySliceOnlyKey() {
+        let selection = StoredSelection(
+            slices: ["Sources/SliceOnly.swift": [LineRange(start: 3, end: 7)]],
+            codemapAutoEnabled: false
+        )
+
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
+
+        XCTAssertEqual(summary.totalExplicitFileCount, 1)
+        XCTAssertEqual(summary.fullFileCount, 0)
+        XCTAssertEqual(summary.slicedFileCount, 1)
+        XCTAssertEqual(summary.sliceRangeCount, 1)
+        XCTAssertEqual(summary.headlineText, "1 file · 1 sliced · 1 range")
+    }
+
+    func testSelectionSummaryDeduplicatesSelectedPathWithSlices() {
+        let selection = StoredSelection(
+            selectedPaths: ["Sources/App.swift"],
+            slices: ["Sources/App.swift": [LineRange(start: 1, end: 2)]],
+            codemapAutoEnabled: false
+        )
+
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
+
+        XCTAssertEqual(summary.totalExplicitFileCount, 1)
+        XCTAssertEqual(summary.fullFileCount, 0)
+        XCTAssertEqual(summary.slicedFileCount, 1)
+        XCTAssertEqual(summary.sliceRangeCount, 1)
+    }
+
+    func testSelectionSummaryExcludesEmptySlicesAndAutoCodemaps() {
+        let selection = StoredSelection(
+            autoCodemapPaths: ["Sources/Dependency.swift"],
+            slices: ["Sources/Empty.swift": []],
+            codemapAutoEnabled: true
+        )
+
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
+
+        XCTAssertEqual(summary.totalExplicitFileCount, 0)
+        XCTAssertEqual(summary.fullFileCount, 0)
+        XCTAssertEqual(summary.slicedFileCount, 0)
+        XCTAssertEqual(summary.sliceRangeCount, 0)
+        XCTAssertEqual(summary.headlineText, "0 files")
+    }
+
+    func testSelectionSummaryRetainsFullOnlyFormatting() {
+        let singular = AgentContextExportResolver.selectionSummary(
+            for: StoredSelection(selectedPaths: ["One.swift"], codemapAutoEnabled: false)
+        )
+        let plural = AgentContextExportResolver.selectionSummary(
+            for: StoredSelection(selectedPaths: ["One.swift", "Two.swift"], codemapAutoEnabled: false)
+        )
+
+        XCTAssertEqual(singular.headlineText, "1 file")
+        XCTAssertEqual(plural.headlineText, "2 files")
+    }
+
+    func testSelectionSummaryDeduplicatesNormalizedAliasesAndSumsStoredRanges() {
+        let selection = StoredSelection(
+            slices: [
+                "Sources/Alias.swift": [LineRange(start: 1, end: 2)],
+                " Sources/Alias.swift ": [
+                    LineRange(start: 4, end: 5),
+                    LineRange(start: 8, end: 9)
+                ]
+            ],
+            codemapAutoEnabled: false
+        )
+
+        let summary = AgentContextExportResolver.selectionSummary(for: selection)
+
+        XCTAssertEqual(summary.totalExplicitFileCount, 1)
+        XCTAssertEqual(summary.fullFileCount, 0)
+        XCTAssertEqual(summary.slicedFileCount, 1)
+        XCTAssertEqual(summary.sliceRangeCount, 3)
+        XCTAssertEqual(summary.headlineText, "1 file · 1 sliced · 3 ranges")
+    }
+
     func testAutoCodemapExportResolutionBatchesPopoverPathLookups() async throws {
         #if DEBUG
             let root = try makeTemporaryRoot(name: "AgentExportAutoCodemapBatch")

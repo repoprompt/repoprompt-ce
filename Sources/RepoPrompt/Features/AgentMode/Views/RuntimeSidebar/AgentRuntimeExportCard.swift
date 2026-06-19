@@ -26,10 +26,9 @@ struct AgentExportCard: View {
         makeExportSource(flushPendingUI: false).exportContextIdentity
     }
 
-    private var displayFileCount: Int {
-        AgentContextExportResolver.displayFileCount(
-            resolvedModel: currentExportModel,
-            sourceSelection: makeExportSource(flushPendingUI: false).selection
+    private var selectionSummary: AgentContextSelectionSummary {
+        AgentContextExportResolver.selectionSummary(
+            for: makeExportSource(flushPendingUI: false).selection
         )
     }
 
@@ -103,7 +102,8 @@ struct AgentExportCard: View {
     // MARK: - Files Button
 
     private var filesButton: some View {
-        let selectionCount = displayFileCount
+        let summary = selectionSummary
+        let selectionCount = summary.totalExplicitFileCount
 
         return Button {
             showSelectedFilesPopover.toggle()
@@ -112,9 +112,10 @@ struct AgentExportCard: View {
                 Image(systemName: "doc.on.doc")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                Text("\(selectionCount) file\(selectionCount == 1 ? "" : "s")")
+                Text(summary.headlineText)
                     .font(.system(size: 10, weight: .medium))
-                    .lineLimit(1)
+                    .multilineTextAlignment(.trailing)
+                    .lineLimit(2)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
