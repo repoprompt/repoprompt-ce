@@ -154,6 +154,39 @@ final class MCPServerViewModel: ObservableObject {
         _ rootScope: WorkspaceLookupRootScope
     ) async throws -> SearchResults
 
+    struct FileToolLookupContextCacheKey: Hashable {
+        let connectionID: UUID
+        let windowID: Int
+        let workspaceID: UUID?
+        let tabID: UUID
+        let runID: UUID?
+        let bindingGeneration: UInt64
+        let baseScope: WorkspaceLookupRootScope
+        let sourceIdentity: AgentWorkspaceLookupContextIdentity
+        let visibleRootFingerprint: String
+    }
+
+    struct FileToolLookupContextCacheEntry {
+        let key: FileToolLookupContextCacheKey
+        let context: WorkspaceLookupContext
+        let sessionRootLifetimeSnapshot: WorkspaceSessionRootLifetimeSnapshot
+    }
+
+    struct PendingFileToolLookupContextResolution {
+        let id: UUID
+        let key: FileToolLookupContextCacheKey
+        let task: Task<WorkspaceLookupContext, Never>
+    }
+
+    #if DEBUG
+        struct FileToolLookupContextCacheStats: Equatable {
+            let hits: Int
+            let misses: Int
+            let coalescedWaits: Int
+            let staleCompletions: Int
+        }
+    #endif
+
     struct MCPSelectionSlicesMutationResult: Equatable {
         let invalidPaths: [String]
         let resolvedMap: [String: String]
@@ -215,8 +248,56 @@ final class MCPServerViewModel: ObservableObject {
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
     var agentWorktreeBindingStateResolver: (@MainActor (UUID, UUID?) async -> AgentSessionWorktreeBindingState)?
+    var fileToolLookupContextCacheByConnectionID: [UUID: FileToolLookupContextCacheEntry] = [:]
+    var pendingFileToolLookupContextResolutionByConnectionID: [UUID: PendingFileToolLookupContextResolution] = [:]
+    #if DEBUG
+        var fileToolLookupContextCacheHitCount = 0
+        var fileToolLookupContextCacheMissCount = 0
+        var fileToolLookupContextCoalescedWaitCount = 0
+        var fileToolLookupContextStaleCompletionCount = 0
+        var debugBeforeFileToolLookupContextResolutionForTesting: (@MainActor @Sendable () async -> Void)?
+        var debugAfterFileToolLookupContextRootValidationForTesting: (@MainActor @Sendable () async -> Void)?
+        var debugFileToolLookupContextDidCoalesceForTesting: (@MainActor @Sendable () async -> Void)?
+
+        func setBeforeFileToolLookupContextResolutionForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            debugBeforeFileToolLookupContextResolutionForTesting = handler
+        }
+
+        func setAfterFileToolLookupContextRootValidationForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            debugAfterFileToolLookupContextRootValidationForTesting = handler
+        }
+
+        func setFileToolLookupContextDidCoalesceForTesting(
+            _ handler: (@MainActor @Sendable () async -> Void)?
+        ) {
+            debugFileToolLookupContextDidCoalesceForTesting = handler
+        }
+
+        func fileToolLookupContextCacheStatsForTesting() -> FileToolLookupContextCacheStats {
+            FileToolLookupContextCacheStats(
+                hits: fileToolLookupContextCacheHitCount,
+                misses: fileToolLookupContextCacheMissCount,
+                coalescedWaits: fileToolLookupContextCoalescedWaitCount,
+                staleCompletions: fileToolLookupContextStaleCompletionCount
+            )
+        }
+
+        func resetFileToolLookupContextCacheStatsForTesting() {
+            fileToolLookupContextCacheHitCount = 0
+            fileToolLookupContextCacheMissCount = 0
+            fileToolLookupContextCoalescedWaitCount = 0
+            fileToolLookupContextStaleCompletionCount = 0
+        }
+    #endif
 
     func registerAgentWorktreeBindingsProvider(_ provider: @escaping @MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState) {
+        pendingFileToolLookupContextResolutionByConnectionID.values.forEach { $0.task.cancel() }
+        pendingFileToolLookupContextResolutionByConnectionID.removeAll()
+        fileToolLookupContextCacheByConnectionID.removeAll()
         agentWorktreeBindingStateProvider = provider
         // The async resolver is paired with the provider that registered it. A later provider
         // replacement must not let the stale resolver overwrite that provider's hydrated state.
@@ -226,6 +307,9 @@ final class MCPServerViewModel: ObservableObject {
     func registerAgentWorktreeBindingsResolver(
         _ resolver: @escaping @MainActor (UUID, UUID?) async -> AgentSessionWorktreeBindingState
     ) {
+        pendingFileToolLookupContextResolutionByConnectionID.values.forEach { $0.task.cancel() }
+        pendingFileToolLookupContextResolutionByConnectionID.removeAll()
+        fileToolLookupContextCacheByConnectionID.removeAll()
         agentWorktreeBindingStateResolver = resolver
     }
 

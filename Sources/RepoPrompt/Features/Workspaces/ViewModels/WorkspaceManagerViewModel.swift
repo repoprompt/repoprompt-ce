@@ -8,6 +8,23 @@ private func defaultWorkspaceRoot() -> URL {
     WorkspaceStoragePaths.defaultRoot
 }
 
+private final class WorkspaceSearchReadinessFence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var currentTicket: WorkspaceSearchReadinessTicket?
+
+    func publish(_ ticket: WorkspaceSearchReadinessTicket?) {
+        lock.lock()
+        currentTicket = ticket
+        lock.unlock()
+    }
+
+    func contains(_ ticket: WorkspaceSearchReadinessTicket) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentTicket == ticket
+    }
+}
+
 private enum WorkspaceExitPerf {
     #if DEBUG || EDIT_FLOW_PERF
         typealias State = OSSignpostIntervalState
@@ -238,6 +255,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     @Published private(set) var activeWorkspaceID: UUID? = nil {
         didSet {
             guard oldValue != activeWorkspaceID else { return }
+            workspaceSearchReadinessFence.publish(nil)
             refreshSelectionMirrorContextRevision()
         }
     }
@@ -582,6 +600,7 @@ class WorkspaceManagerViewModel: ObservableObject {
         private var workspaceSwitchPhaseDidChangeHandlerForTesting: ((WorkspaceSwitchPhase) -> Void)?
         private var workspaceSwitchRecoveryWillBeginHandlerForTesting: (@MainActor () async -> Void)?
         private var workspaceSwitchReadinessDidInvalidateHandlerForTesting: (@MainActor () async -> Void)?
+        private var workspaceHydrationGenerationDidAdvanceHandlerForTesting: (@MainActor () -> Void)?
     #endif
 
     private struct WorkspaceDidSwitchListener {
@@ -811,8 +830,13 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private(set) var isSwitchingWorkspace = false
+    private nonisolated let workspaceSearchReadinessFence = WorkspaceSearchReadinessFence()
     @Published private(set) var workspaceSearchReadinessState: WorkspaceSearchReadinessState = .idle {
         didSet {
+            let ticket = workspaceSearchReadinessState.isSearchAdmissible
+                ? workspaceSearchReadinessState.ticket
+                : nil
+            workspaceSearchReadinessFence.publish(ticket)
             reconcileWorkspaceSearchReadinessWaiters()
         }
     }
@@ -2542,6 +2566,12 @@ class WorkspaceManagerViewModel: ObservableObject {
         ) {
             workspaceSwitchReadinessDidInvalidateHandlerForTesting = handler
         }
+
+        func setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting(
+            _ handler: (@MainActor () -> Void)?
+        ) {
+            workspaceHydrationGenerationDidAdvanceHandlerForTesting = handler
+        }
     #endif
 
     func awaitWorkspaceSearchReadiness(
@@ -2603,6 +2633,14 @@ class WorkspaceManagerViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 self?.failWorkspaceSearchReadinessWaiter(waiterID, throwing: CancellationError())
             }
+        }
+    }
+
+    nonisolated func validateWorkspaceSearchReadinessSnapshot(
+        _ ticket: WorkspaceSearchReadinessTicket
+    ) throws {
+        guard workspaceSearchReadinessFence.contains(ticket) else {
+            throw WorkspaceSearchReadinessWaitError.superseded
         }
     }
 
@@ -5809,17 +5847,26 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     private func beginWorkspaceHydration(for workspace: WorkspaceModel) -> UInt64 {
-        workspaceHydrationGeneration &+= 1
-        let generation = workspaceHydrationGeneration
+        let generation = advanceWorkspaceHydrationGeneration()
         cancelPostCatalogRootWorkTasks()
         workspaceSearchReadinessState = .activating(workspaceID: workspace.id, generation: generation)
         return generation
     }
 
     private func invalidateWorkspaceSearchReadiness() {
-        workspaceHydrationGeneration &+= 1
+        advanceWorkspaceHydrationGeneration()
         workspaceSearchReadinessState = .idle
         cancelPostCatalogRootWorkTasks()
+    }
+
+    @discardableResult
+    private func advanceWorkspaceHydrationGeneration() -> UInt64 {
+        workspaceSearchReadinessFence.publish(nil)
+        workspaceHydrationGeneration &+= 1
+        #if DEBUG
+            workspaceHydrationGenerationDidAdvanceHandlerForTesting?()
+        #endif
+        return workspaceHydrationGeneration
     }
 
     private func isHydrationGenerationCurrent(_ generation: UInt64, workspaceID: UUID?) -> Bool {

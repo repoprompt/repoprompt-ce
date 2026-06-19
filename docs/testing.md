@@ -164,6 +164,35 @@ python3 Scripts/test_suite_optimizer.py baseline \
 
 Normal timing samples must not enable XCTest stall diagnostics or wake probes. Diagnostic/wake-probe runs are invalid timing samples and may be retained only as separate lifecycle evidence. The scoreboard must report method, contract, and scenario deltas; exact replacement/removal mappings; comparable sample counts; focused/full-root outcomes; and artifact paths.
 
+## Live Agent Mode file-tool performance diagnostic
+
+`Scripts/benchmark_agent_mode_file_tools.py` measures paired `file_search` and `read_file` calls from exactly two concurrent Explore sessions: the normal workspace root and a linked worktree. It requires an already-running RepoPrompt CE DEBUG app and never launches, stops, or relaunches the app.
+
+```bash
+python3 Scripts/benchmark_agent_mode_file_tools.py \
+  --window-id 1 \
+  --marker debugDiagnosticsToolName \
+  --path Sources/RepoPrompt/Features/Diagnostics/MCP/MCPConnectionManager+DebugDiagnostics.swift
+```
+
+By default the driver creates a detached temporary worktree and removes it only when it remains clean and both sessions are terminal; pass `--worktree /absolute/path` to use and preserve an existing linked worktree from the same Git common directory. The manifest records the benchmark worktree's SHA and dirty state. Each run writes a private (`0700`), non-overwriting directory under `/tmp/rpce-agent-file-tools/v1/`; use `--output-root` to override it. Artifacts include provenance, raw CLI calls and agent logs, capture/runtime snapshots, `samples.ndjson`, and `summary.json`, and may contain sensitive workspace snippets, so review them before sharing. Samples and exact workload counts/order come from DEBUG capture timelines (`Received` through the `event_completion` `MainActorExited`); start/wait binding metadata independently proves local-versus-worktree route provenance, while compacted agent logs validate only surfaced call arguments and the final response. Latency is report-only and has no arbitrary failure threshold. Harness, tool-count, nonempty-marker, read-success, and cleanup invariants are enforced.
+
+Offline replay performs no CLI, model, or app calls and accepts either a checked-in fixture or a prior artifact directory:
+
+```bash
+python3 Scripts/benchmark_agent_mode_file_tools.py \
+  --replay Scripts/Fixtures/agent-mode-file-tools/v1/paired-success
+```
+
+The checked-in success and negative fixtures are privacy-scrubbed subsets derived from real paired captures. They retain relevant event/stage timing shapes but contain no raw agent prose, user paths, UUIDs, or raw logs.
+
+Pure harness validation:
+
+```bash
+python3 -m py_compile Scripts/benchmark_agent_mode_file_tools.py Scripts/test_agent_mode_file_tools_benchmark.py
+python3 Scripts/test_agent_mode_file_tools_benchmark.py
+```
+
 ## Handoff checklist
 
 - Protected contract, plausible defect, chosen layer, and observable oracle.

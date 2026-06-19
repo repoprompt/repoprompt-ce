@@ -1401,7 +1401,11 @@ final class TabContextRoutingTests: XCTestCase {
         XCTAssertEqual(reboundContext.worktreeBindingState, .unavailable)
 
         await hydrationGate.release()
-        _ = await lookupTask.value
+        let supersededLookupContext = await lookupTask.value
+        XCTAssertEqual(
+            supersededLookupContext,
+            AgentWorkspaceLookupContextResolver.failClosedLookupContext
+        )
 
         let finalContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
         XCTAssertEqual(finalContext.activeAgentSessionID, replacementSessionID)

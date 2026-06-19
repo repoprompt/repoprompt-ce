@@ -108,6 +108,69 @@ struct WorkspaceDisplayRootRefsSnapshot: Equatable {
     let allRoots: [WorkspaceRootRef]
 }
 
+private final class WorkspaceSessionRootLifetimeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func advance() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    func snapshot(physicalRootPaths: [String]) -> WorkspaceSessionRootLifetimeSnapshot {
+        lock.lock()
+        let capturedGeneration = generation
+        lock.unlock()
+        return WorkspaceSessionRootLifetimeSnapshot(
+            clock: self,
+            generation: capturedGeneration,
+            physicalRootPaths: physicalRootPaths
+        )
+    }
+
+    func performIfCurrent(
+        generation expectedGeneration: UInt64,
+        physicalRootPaths: [String],
+        operation: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration,
+              physicalRootPaths.allSatisfy({ path in
+                  var isDirectory: ObjCBool = false
+                  return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                      && isDirectory.boolValue
+              })
+        else { return false }
+        operation()
+        return true
+    }
+}
+
+struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
+    fileprivate let clock: WorkspaceSessionRootLifetimeClock
+    fileprivate let generation: UInt64
+    fileprivate let physicalRootPaths: [String]
+
+    func isCurrent() -> Bool {
+        clock.performIfCurrent(
+            generation: generation,
+            physicalRootPaths: physicalRootPaths,
+            operation: {}
+        )
+    }
+
+    @discardableResult
+    func performIfCurrent(_ operation: () -> Void) -> Bool {
+        clock.performIfCurrent(
+            generation: generation,
+            physicalRootPaths: physicalRootPaths,
+            operation: operation
+        )
+    }
+}
+
 actor WorkspaceFileContextStore {
     private struct RootState {
         let lifetimeID: UUID
@@ -1299,6 +1362,7 @@ actor WorkspaceFileContextStore {
         var lastAccessSequence: UInt64
     }
 
+    private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -2517,6 +2581,30 @@ actor WorkspaceFileContextStore {
             admissionClass: admissionClass,
             operation: operation
         )
+    }
+
+    func sessionBoundRootScopeValidationSnapshot(
+        _ rootScope: WorkspaceLookupRootScope,
+        expectedPhysicalRoots: [WorkspaceRootRef]
+    ) -> WorkspaceSessionRootLifetimeSnapshot? {
+        guard case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths) = rootScope,
+              !expectedPhysicalRoots.isEmpty
+        else { return nil }
+
+        let requestedPaths = Set(requestedPhysicalRootPaths.map {
+            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+        })
+        let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
+        guard requestedPaths == expectedPaths,
+              expectedPhysicalRoots.allSatisfy({ expectedRoot in
+                  guard let currentRoot = rootStatesByID[expectedRoot.id]?.root else { return false }
+                  return currentRoot.kind == .sessionWorktree
+                      && currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+              })
+        else { return nil }
+        guard rootScopeAvailability(rootScope) == .available else { return nil }
+
+        return sessionRootLifetimeClock.snapshot(physicalRootPaths: expectedPaths.sorted())
     }
 
     func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
@@ -4988,6 +5076,9 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        if root.kind == .sessionWorktree {
+            sessionRootLifetimeClock.advance()
+        }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
         completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
@@ -5092,6 +5183,9 @@ actor WorkspaceFileContextStore {
                 watcherInfrastructureFlightsByKey.removeValue(forKey: watcherKey)?.task.cancel()
             }
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+            if rootStatesByID[rootID]?.root.kind == .sessionWorktree {
+                sessionRootLifetimeClock.advance()
+            }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }

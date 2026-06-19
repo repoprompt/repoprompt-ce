@@ -490,9 +490,16 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await dependencies.captureRequestMetadata()
+        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+            await dependencies.captureRequestMetadata()
+        }
         try Task.checkCancellation()
-        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        let lookupContext = await EditFlowPerf.measure(
+            EditFlowPerf.Stage.Search.providerLookupContextResolution,
+            EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+        ) {
+            await dependencies.resolveFileToolLookupContext(metadata)
+        }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)

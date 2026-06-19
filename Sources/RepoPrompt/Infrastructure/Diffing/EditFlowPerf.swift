@@ -575,7 +575,12 @@ enum EditFlowPerf {
             static let dtoCapAccounting: StaticString = "EditFlow.Search.DTOBuild.CapAccounting"
             static let dtoAssembly: StaticString = "EditFlow.Search.DTOBuild.Assembly"
             static let providerTotal: StaticString = "EditFlow.Search.ProviderTotal"
+            static let providerRequestMetadata: StaticString = "EditFlow.Search.ProviderRequestMetadata"
+            static let providerLookupContextResolution: StaticString = "EditFlow.Search.ProviderLookupContextResolution"
             static let providerWorkspaceSearchAwait: StaticString = "EditFlow.Search.ProviderWorkspaceSearchAwait"
+            static let rootScopeAvailabilityGate: StaticString = "EditFlow.Search.RootScopeAvailabilityGate"
+            static let workspaceReadinessAcquireGate: StaticString = "EditFlow.Search.WorkspaceReadinessAcquireGate"
+            static let workspaceReadinessValidationGate: StaticString = "EditFlow.Search.WorkspaceReadinessValidationGate"
             static let providerAutoSelection: StaticString = "EditFlow.Search.ProviderAutoSelection"
             static let providerValueEncoding: StaticString = "EditFlow.Search.ProviderValueEncoding"
 

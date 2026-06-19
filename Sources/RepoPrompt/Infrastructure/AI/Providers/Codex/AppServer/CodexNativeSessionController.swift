@@ -7318,6 +7318,23 @@ final class CodexNativeSessionController {
         }
     }
 
+    static func defaultAppServerToolPolicy(
+        shellToolEnabled: Bool,
+        webSearchRequestEnabled: Bool,
+        forceExperimentalSteering: Bool
+    ) -> CodexOverrides.ToolPolicy {
+        CodexOverrides.ToolPolicy(
+            toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
+            shellToolEnabled: shellToolEnabled,
+            webSearchRequestEnabled: webSearchRequestEnabled,
+            viewImageToolEnabled: true,
+            // Best-effort only; native FileChange events are still the authoritative patch signal.
+            includeApplyPatchTool: false,
+            multiAgentEnabled: false,
+            experimentalSteeringEnabled: forceExperimentalSteering ? true : nil
+        )
+    }
+
     static func defaultAppServerConfigOverrides(
         forceExperimentalSteering: Bool,
         approvalPolicy: CodexAgentToolPreferences.ApprovalPolicy? = nil,
@@ -7330,16 +7347,10 @@ final class CodexNativeSessionController {
     ) -> [String: Any] {
         let serverEntries = MCPIntegrationHelper.codexMCPServerEntries()
         let preferences = CodexAgentToolPreferences.snapshot(for: serverEntries)
-        let toolPolicy = CodexOverrides.ToolPolicy(
-            toolOutputTokenLimit: MCPIntegrationHelper.desiredCodexToolOutputTokenLimit,
+        let toolPolicy = defaultAppServerToolPolicy(
             shellToolEnabled: shellToolEnabled ?? preferences.bashToolEnabled,
             webSearchRequestEnabled: preferences.searchToolEnabled,
-            viewImageToolEnabled: true,
-            // Best-effort only; native FileChange events are still the authoritative patch signal.
-            includeApplyPatchTool: false,
-            parallelToolCallsEnabled: false,
-            multiAgentEnabled: false,
-            experimentalSteeringEnabled: forceExperimentalSteering ? true : nil
+            forceExperimentalSteering: forceExperimentalSteering
         )
         var overrides = CodexOverrides.appServerConfigMap(
             toolPolicy: toolPolicy,

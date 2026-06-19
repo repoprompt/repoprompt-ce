@@ -478,6 +478,503 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         }
     #endif
 
+    #if DEBUG
+        func testFileToolLookupCacheCoalescesConcurrentCurrentMisses() async throws {
+            let workspaceRoot = try makeTemporaryRoot(name: "LookupCacheCoalescingWorkspace")
+            let worktreeRoot = try makeTemporaryRoot(name: "LookupCacheCoalescingWorktree")
+            defer {
+                try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
+            }
+            let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
+            let physicalFile = worktreeRoot.appendingPathComponent("Shared.swift")
+            try write("struct Canonical {}\n", to: logicalFile)
+            try write("struct Worktree {}\n", to: physicalFile)
+
+            let tabID = UUID()
+            let sessionID = UUID()
+            let connectionID = UUID()
+            let (window, workspaceID) = await makeWindow(
+                root: workspaceRoot,
+                tabID: tabID,
+                selection: StoredSelection()
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: workspaceRoot.path
+            )
+            let physicalRoot = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeRoot.path,
+                kind: .sessionWorktree
+            )
+            let binding = makeBinding(
+                logicalRoot: WorkspaceRootRef(
+                    id: logicalRoot.id,
+                    name: logicalRoot.name,
+                    fullPath: logicalRoot.standardizedFullPath
+                ),
+                physicalRoot: WorkspaceRootRef(
+                    id: physicalRoot.id,
+                    name: physicalRoot.name,
+                    fullPath: physicalRoot.standardizedFullPath
+                )
+            )
+
+            var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            liveTab.activeAgentSessionID = sessionID
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+            window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+                guard requestedSessionID == sessionID, requestedTabID == tabID else { return .unavailable }
+                return .hydrated([binding])
+            }
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "lookup-cache-coalescing-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "lookup-cache-coalescing-test",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun
+            )
+
+            let resolutionGate = TokenAccountingGate()
+            let coalescingGate = TokenAccountingGate()
+            window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting {
+                await resolutionGate.markStartedAndWaitForRelease()
+            }
+            window.mcpServer.setFileToolLookupContextDidCoalesceForTesting {
+                await coalescingGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await MainActor.run {
+                    window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting(nil)
+                    window.mcpServer.setFileToolLookupContextDidCoalesceForTesting(nil)
+                }
+                await coalescingGate.release()
+                await resolutionGate.release()
+            }
+            window.mcpServer.resetFileToolLookupContextCacheStatsForTesting()
+
+            let firstLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            await resolutionGate.waitUntilStarted()
+            let secondLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            addTeardownBlock {
+                firstLookup.cancel()
+                secondLookup.cancel()
+                await coalescingGate.release()
+                await resolutionGate.release()
+                _ = await firstLookup.value
+                _ = await secondLookup.value
+            }
+            await coalescingGate.waitUntilStarted()
+            await coalescingGate.release()
+            await resolutionGate.release()
+
+            let first = await firstLookup.value
+            let second = await secondLookup.value
+            XCTAssertEqual(first, second)
+            XCTAssertEqual(first.translateInputPath(logicalFile.path), physicalFile.path)
+            XCTAssertEqual(second.translateInputPath(logicalFile.path), physicalFile.path)
+            XCTAssertEqual(
+                window.mcpServer.fileToolLookupContextCacheStatsForTesting(),
+                .init(hits: 0, misses: 1, coalescedWaits: 1, staleCompletions: 0)
+            )
+        }
+
+        func testFileToolLookupCacheRejectsSessionRootReplacementBeforePublication() async throws {
+            let workspaceRoot = try makeTemporaryRoot(name: "LookupCachePublicationWorkspace")
+            let worktreeRoot = try makeTemporaryRoot(name: "LookupCachePublicationWorktree")
+            defer {
+                try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeRoot.deletingLastPathComponent())
+            }
+            let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
+            try write("struct Canonical {}\n", to: logicalFile)
+            try write("struct Worktree {}\n", to: worktreeRoot.appendingPathComponent("Shared.swift"))
+
+            let tabID = UUID()
+            let sessionID = UUID()
+            let connectionID = UUID()
+            let (window, workspaceID) = await makeWindow(
+                root: workspaceRoot,
+                tabID: tabID,
+                selection: StoredSelection()
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: workspaceRoot.path
+            )
+            let physicalRoot = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeRoot.path,
+                kind: .sessionWorktree
+            )
+            let binding = makeBinding(
+                logicalRoot: WorkspaceRootRef(
+                    id: logicalRoot.id,
+                    name: logicalRoot.name,
+                    fullPath: logicalRoot.standardizedFullPath
+                ),
+                physicalRoot: WorkspaceRootRef(
+                    id: physicalRoot.id,
+                    name: physicalRoot.name,
+                    fullPath: physicalRoot.standardizedFullPath
+                )
+            )
+
+            var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            liveTab.activeAgentSessionID = sessionID
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+            window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+                guard requestedSessionID == sessionID, requestedTabID == tabID else { return .unavailable }
+                return .hydrated([binding])
+            }
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "lookup-cache-publication-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "lookup-cache-publication-test",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun
+            )
+
+            let postValidationGate = TokenAccountingGate()
+            let coalescingGate = TokenAccountingGate()
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting {
+                await postValidationGate.markStartedAndWaitForRelease()
+            }
+            window.mcpServer.setFileToolLookupContextDidCoalesceForTesting {
+                await coalescingGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await MainActor.run {
+                    window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+                    window.mcpServer.setFileToolLookupContextDidCoalesceForTesting(nil)
+                }
+                await coalescingGate.release()
+                await postValidationGate.release()
+            }
+            window.mcpServer.resetFileToolLookupContextCacheStatsForTesting()
+
+            let ownerLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            await postValidationGate.waitUntilStarted()
+            let followerLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            addTeardownBlock {
+                ownerLookup.cancel()
+                followerLookup.cancel()
+                await coalescingGate.release()
+                await postValidationGate.release()
+                _ = await ownerLookup.value
+                _ = await followerLookup.value
+            }
+            await coalescingGate.waitUntilStarted()
+            await coalescingGate.release()
+            await postValidationGate.waitUntilStarted(count: 2)
+
+            await window.workspaceFileContextStore.unloadRoot(id: physicalRoot.id)
+            let replacementPhysicalRoot = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeRoot.path,
+                kind: .sessionWorktree
+            )
+            XCTAssertNotEqual(replacementPhysicalRoot.id, physicalRoot.id)
+            await postValidationGate.release()
+
+            let ownerResult = await ownerLookup.value
+            let followerResult = await followerLookup.value
+            XCTAssertEqual(ownerResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            XCTAssertEqual(followerResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+            window.mcpServer.setFileToolLookupContextDidCoalesceForTesting(nil)
+            let retry = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(retry.bindingProjection?.physicalRootRefs.map(\.id), [replacementPhysicalRoot.id])
+
+            let cacheUseGate = TokenAccountingGate()
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting {
+                await cacheUseGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await MainActor.run {
+                    window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+                }
+                await cacheUseGate.release()
+            }
+            let cachedLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            addTeardownBlock {
+                cachedLookup.cancel()
+                await cacheUseGate.release()
+                _ = await cachedLookup.value
+            }
+            await cacheUseGate.waitUntilStarted()
+            await window.workspaceFileContextStore.unloadRoot(id: replacementPhysicalRoot.id)
+            let latestPhysicalRoot = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeRoot.path,
+                kind: .sessionWorktree
+            )
+            XCTAssertNotEqual(latestPhysicalRoot.id, replacementPhysicalRoot.id)
+            await cacheUseGate.release()
+
+            let cachedResult = await cachedLookup.value
+            XCTAssertEqual(cachedResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            window.mcpServer.setAfterFileToolLookupContextRootValidationForTesting(nil)
+            let latestRetry = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(latestRetry.bindingProjection?.physicalRootRefs.map(\.id), [latestPhysicalRoot.id])
+            XCTAssertEqual(
+                window.mcpServer.fileToolLookupContextCacheStatsForTesting(),
+                .init(hits: 0, misses: 3, coalescedWaits: 1, staleCompletions: 3)
+            )
+        }
+
+        func testFileToolLookupCacheInvalidatesWithoutLeakingStaleRoots() async throws {
+            let workspaceRoot = try makeTemporaryRoot(name: "LookupCacheWorkspace")
+            let replacementWorkspaceRoot = try makeTemporaryRoot(name: "LookupCacheReplacementWorkspace")
+            let worktreeA = try makeTemporaryRoot(name: "LookupCacheWorktreeA")
+            let worktreeB = try makeTemporaryRoot(name: "LookupCacheWorktreeB")
+            defer {
+                try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: replacementWorkspaceRoot.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeA.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeB.deletingLastPathComponent())
+            }
+            try write("struct CanonicalA {}\n", to: workspaceRoot.appendingPathComponent("Shared.swift"))
+            try write("struct CanonicalB {}\n", to: replacementWorkspaceRoot.appendingPathComponent("Shared.swift"))
+            try write("struct WorktreeA {}\n", to: worktreeA.appendingPathComponent("Shared.swift"))
+            try write("struct WorktreeB {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+
+            let tabID = UUID()
+            let sessionID = UUID()
+            let connectionID = UUID()
+            let runB = UUID()
+            let (window, workspaceID) = await makeWindow(
+                root: workspaceRoot,
+                tabID: tabID,
+                selection: StoredSelection()
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: workspaceRoot.path
+            )
+            let physicalRootA = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeA.path,
+                kind: .sessionWorktree
+            )
+            let physicalRootB = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeB.path,
+                kind: .sessionWorktree
+            )
+            let logicalRootRef = WorkspaceRootRef(
+                id: logicalRoot.id,
+                name: logicalRoot.name,
+                fullPath: logicalRoot.standardizedFullPath
+            )
+            let physicalRootRefA = WorkspaceRootRef(
+                id: physicalRootA.id,
+                name: physicalRootA.name,
+                fullPath: physicalRootA.standardizedFullPath
+            )
+            let physicalRootRefB = WorkspaceRootRef(
+                id: physicalRootB.id,
+                name: physicalRootB.name,
+                fullPath: physicalRootB.standardizedFullPath
+            )
+            let bindingA = makeBinding(logicalRoot: logicalRootRef, physicalRoot: physicalRootRefA)
+            let bindingB = makeBinding(logicalRoot: logicalRootRef, physicalRoot: physicalRootRefB)
+            var currentBinding = bindingA
+
+            var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            liveTab.activeAgentSessionID = sessionID
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+            window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+                guard requestedSessionID == sessionID, requestedTabID == tabID else { return .unavailable }
+                return .hydrated([currentBinding])
+            }
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "lookup-cache-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID,
+                runID: nil
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "lookup-cache-test",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun
+            )
+            window.mcpServer.resetFileToolLookupContextCacheStatsForTesting()
+
+            let first = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            let second = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(
+                first.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
+                worktreeA.appendingPathComponent("Shared.swift").path
+            )
+            XCTAssertEqual(second, first)
+            XCTAssertEqual(
+                window.mcpServer.fileToolLookupContextCacheStatsForTesting(),
+                .init(hits: 1, misses: 1, coalescedWaits: 0, staleCompletions: 0)
+            )
+
+            currentBinding = bindingB
+            let resolutionGate = TokenAccountingGate()
+            let coalescingGate = TokenAccountingGate()
+            window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting {
+                await resolutionGate.markStartedAndWaitForRelease()
+            }
+            window.mcpServer.setFileToolLookupContextDidCoalesceForTesting {
+                await coalescingGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await MainActor.run {
+                    window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting(nil)
+                    window.mcpServer.setFileToolLookupContextDidCoalesceForTesting(nil)
+                }
+                await coalescingGate.release()
+                await resolutionGate.release()
+            }
+            let staleLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            await resolutionGate.waitUntilStarted()
+            let coalescedLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            addTeardownBlock {
+                staleLookup.cancel()
+                coalescedLookup.cancel()
+                await coalescingGate.release()
+                await resolutionGate.release()
+                _ = await staleLookup.value
+                _ = await coalescedLookup.value
+            }
+            await coalescingGate.waitUntilStarted()
+            await coalescingGate.release()
+            XCTAssertEqual(window.mcpServer.fileToolLookupContextCacheStatsForTesting().coalescedWaits, 1)
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "lookup-cache-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID,
+                runID: runB
+            )
+            await resolutionGate.release()
+            let staleResult = await staleLookup.value
+            let coalescedResult = await coalescedLookup.value
+            XCTAssertEqual(staleResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            XCTAssertEqual(coalescedResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting(nil)
+            window.mcpServer.setFileToolLookupContextDidCoalesceForTesting(nil)
+
+            let rebound = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            let reboundHit = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(
+                rebound.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
+                worktreeB.appendingPathComponent("Shared.swift").path
+            )
+            XCTAssertEqual(reboundHit, rebound)
+            XCTAssertEqual(
+                window.mcpServer.fileToolLookupContextCacheStatsForTesting(),
+                .init(hits: 2, misses: 3, coalescedWaits: 1, staleCompletions: 2)
+            )
+
+            try FileManager.default.removeItem(at: worktreeB)
+            let afterWorktreeDeletion = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(afterWorktreeDeletion, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            try FileManager.default.createDirectory(at: worktreeB, withIntermediateDirectories: true)
+            try write("struct WorktreeBRestored {}\n", to: worktreeB.appendingPathComponent("Shared.swift"))
+            let afterWorktreeRestore = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(
+                afterWorktreeRestore.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
+                worktreeB.appendingPathComponent("Shared.swift").path
+            )
+
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "lookup-cache-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID,
+                runID: nil
+            )
+            let nonRunContext = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(
+                nonRunContext.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
+                worktreeB.appendingPathComponent("Shared.swift").path
+            )
+
+            let replacementSessionID = UUID()
+            var sessionChangedTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            sessionChangedTab.activeAgentSessionID = replacementSessionID
+            XCTAssertTrue(
+                window.workspaceManager.updateComposeTabStoredOnly(
+                    sessionChangedTab,
+                    inWorkspaceID: workspaceID
+                )
+            )
+            let afterSessionChange = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(afterSessionChange, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+
+            sessionChangedTab.activeAgentSessionID = sessionID
+            XCTAssertTrue(
+                window.workspaceManager.updateComposeTabStoredOnly(
+                    sessionChangedTab,
+                    inWorkspaceID: workspaceID
+                )
+            )
+            let restoredSession = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(
+                restoredSession.translateInputPath(workspaceRoot.appendingPathComponent("Shared.swift").path),
+                worktreeB.appendingPathComponent("Shared.swift").path
+            )
+
+            let replacementWorkspace = WorkspaceModel(
+                name: "Lookup Cache Replacement",
+                repoPaths: [replacementWorkspaceRoot.path],
+                ephemeralFlag: true,
+                composeTabs: [ComposeTabState(name: "Replacement")]
+            )
+            window.workspaceManager.workspaces.append(replacementWorkspace)
+            await window.workspaceManager.switchWorkspace(
+                to: replacementWorkspace,
+                saveState: false,
+                reason: "fileToolLookupCacheInvalidationTest"
+            )
+            let switchedRoots = await window.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+            XCTAssertTrue(switchedRoots.contains { $0.standardizedFullPath == StandardizedPath.absolute(replacementWorkspaceRoot.path) })
+            XCTAssertFalse(switchedRoots.contains { $0.standardizedFullPath == StandardizedPath.absolute(workspaceRoot.path) })
+
+            let afterWorkspaceSwitch = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(afterWorkspaceSwitch, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            XCTAssertEqual(
+                window.mcpServer.fileToolLookupContextCacheStatsForTesting(),
+                .init(hits: 2, misses: 8, coalescedWaits: 1, staleCompletions: 2)
+            )
+        }
+    #endif
+
     func testActiveCompatibilityLookupContextPreservesActiveSessionAuthority() async throws {
         let workspaceRoot = try makeTemporaryRoot(name: "CompatibilityWorkspace")
         let worktreeRoot = try makeTemporaryRoot(name: "CompatibilityWorktree")
