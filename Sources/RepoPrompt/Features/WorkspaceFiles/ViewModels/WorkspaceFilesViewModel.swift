@@ -5758,7 +5758,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         switch scope {
         case .allLoaded:
             return getAllFileViewModels()
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .sessionBoundWorkspace:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .sessionBoundWorkspace,
+             .validatedSessionBoundWorkspace:
             let allowedRoots = allowedRootPaths(in: scope)
             return allFilesSnapshot(sorted: false).filter {
                 allowedRoots.contains($0.standardizedRootFolderPath)
@@ -8097,16 +8098,23 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func roots(in scope: LookupRootScope) -> [FolderViewModel] {
         switch scope {
         case .visibleWorkspace:
-            visibleRootFolders
+            return visibleRootFolders
         case .visibleWorkspacePlusGitData:
-            visibleRootFolders + gitDataRootFolders()
+            return visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
-            rootFolders
+            return rootFolders
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
-            rootFolders.filter { root in
+            return rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
                     && canonicalRootPaths.contains(root.standardizedFullPath)
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let allowedRootsByID = Dictionary(
+                uniqueKeysWithValues: canonicalRoots.union(physicalRoots).map { ($0.id, $0) }
+            )
+            return rootFolders.filter { root in
+                allowedRootsByID[root.id]?.standardizedFullPath == root.standardizedFullPath
             }
         }
     }

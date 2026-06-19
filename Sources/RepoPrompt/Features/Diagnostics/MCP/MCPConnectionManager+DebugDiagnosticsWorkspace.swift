@@ -539,6 +539,8 @@ import MCP
                 "allLoaded"
             case .sessionBoundWorkspace:
                 "sessionBoundWorkspace"
+            case .validatedSessionBoundWorkspace:
+                "validatedSessionBoundWorkspace"
             }
         }
 

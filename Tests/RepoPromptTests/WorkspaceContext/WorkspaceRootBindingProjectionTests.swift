@@ -288,7 +288,7 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         XCTAssertFalse(failClosedProjection.isFullyMaterialized)
         XCTAssertEqual(
             failClosedProjection.lookupRootScope,
-            .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: [])
+            .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: [])
         )
         XCTAssertEqual(scopeAvailability, .sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
         XCTAssertEqual(

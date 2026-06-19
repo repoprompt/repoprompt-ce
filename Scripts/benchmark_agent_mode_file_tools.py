@@ -103,6 +103,42 @@ def find_string(value: Any, key: str) -> str | None:
     return None
 
 
+def response_session_ids(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    result: set[str] = set()
+    for key in ("session_id", "sessionId"):
+        direct = value.get(key)
+        if isinstance(direct, str) and direct:
+            result.add(direct)
+    session = value.get("session")
+    if isinstance(session, dict):
+        nested = session.get("id")
+        if isinstance(nested, str) and nested:
+            result.add(nested)
+    return result
+
+
+def response_session_id(value: Any) -> str | None:
+    values = response_session_ids(value)
+    return values.pop() if len(values) == 1 else None
+
+
+def response_run_ids(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    return {
+        direct
+        for key in ("run_id", "runId")
+        if isinstance((direct := value.get(key)), str) and direct
+    }
+
+
+def response_run_id(value: Any) -> str | None:
+    values = response_run_ids(value)
+    return values.pop() if len(values) == 1 else None
+
+
 def extract_capture(value: Any) -> dict[str, Any]:
     return find_object(value, "capture").get("capture")
 
@@ -158,12 +194,41 @@ def build_samples(capture: dict[str, Any]) -> list[dict[str, Any]]:
             })
             previous = offset
         identity = first.get("request_identity") if isinstance(first.get("request_identity"), dict) else {}
+        completion_dimensions = parse_dimensions(str(last.get("sanitized_dimensions", "")))
+        run_id = completion_dimensions.get("runID")
+        if not isinstance(run_id, str) or not run_id:
+            raise BenchmarkError(f"{tool} timeline {join_key} event_completion omitted runID")
+        worktree_projection: bool | None = None
+        search_match_count: int | None = None
+        if tool == "file_search":
+            projection_events = [
+                stage for stage in stages
+                if stage.get("event") == "Search.ProviderDTOReady"
+                and isinstance(stage.get("dimensions"), dict)
+                and stage["dimensions"].get("outcome") in {"completed", "capped"}
+            ]
+            projections = {
+                stage["dimensions"].get("usesWorktreeProjection")
+                for stage in projection_events
+            }
+            if len(projections) != 1 or not all(isinstance(value, bool) for value in projections):
+                raise BenchmarkError(
+                    f"{tool} timeline {join_key} requires one successful usesWorktreeProjection value"
+                )
+            worktree_projection = projections.pop()
+            match_counts = {stage["dimensions"].get("matchCount") for stage in projection_events}
+            if len(match_counts) != 1 or not all(isinstance(value, int) for value in match_counts):
+                raise BenchmarkError(f"{tool} timeline {join_key} requires one successful matchCount value")
+            search_match_count = match_counts.pop()
         samples.append({
             "schema_version": SCHEMA_VERSION,
             "join_key": join_key,
             "route": None,
             "tool": tool,
             "connection_id": identity.get("connection_id"),
+            "run_id": run_id,
+            "uses_worktree_projection": worktree_projection,
+            "search_match_count": search_match_count,
             "request_identity": identity,
             "received_offset_ms": start,
             "main_actor_exited_offset_ms": end,
@@ -174,7 +239,12 @@ def build_samples(capture: dict[str, Any]) -> list[dict[str, Any]]:
     return sorted(samples, key=lambda item: (item["received_offset_ms"], item["join_key"]))
 
 
-def classify_routes(samples: list[dict[str, Any]], search_count: int, read_count: int) -> dict[str, str]:
+def classify_routes(
+    samples: list[dict[str, Any]],
+    search_count: int,
+    read_count: int,
+    expected_run_ids: dict[str, str],
+) -> dict[str, str]:
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
         connection = sample.get("connection_id")
@@ -189,11 +259,18 @@ def classify_routes(samples: list[dict[str, Any]], search_count: int, read_count
     }
     routes: dict[str, str] = {}
     for connection, group in grouped.items():
-        signature = [sample["tool"] for sample in sorted(group, key=lambda item: item["received_offset_ms"])]
-        matches = [route for route, route_signature in expected.items() if signature == route_signature]
+        run_ids = {str(sample.get("run_id") or "") for sample in group}
+        if len(run_ids) != 1:
+            raise BenchmarkError(f"connection {connection} spans multiple agent runs: {sorted(run_ids)}")
+        run_id = run_ids.pop()
+        matches = [route for route, expected_run_id in expected_run_ids.items() if run_id == expected_run_id]
         if len(matches) != 1:
-            raise BenchmarkError(f"connection {connection} has unexpected signature {signature}")
-        routes[connection] = matches[0]
+            raise BenchmarkError(f"connection {connection} belongs to unexpected agent run {run_id!r}")
+        route = matches[0]
+        signature = [sample["tool"] for sample in sorted(group, key=lambda item: item["received_offset_ms"])]
+        if signature != expected[route]:
+            raise BenchmarkError(f"{route} connection {connection} has unexpected signature {signature}")
+        routes[connection] = route
     if set(routes.values()) != {"local", "worktree"}:
         raise BenchmarkError("route signatures were not unique")
     for sample in samples:
@@ -213,6 +290,24 @@ def sequential_call_failures(samples: list[dict[str, Any]]) -> list[str]:
                 failures.append(
                     f"connection {connection} overlapped {previous['join_key']} and {current['join_key']}"
                 )
+    return failures
+
+
+def search_projection_failures(samples: list[dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    for sample in samples:
+        if sample.get("tool") != "file_search":
+            continue
+        expected = sample.get("route") == "worktree"
+        if sample.get("uses_worktree_projection") != expected:
+            failures.append(
+                f"{sample.get('route')} search {sample.get('join_key')} reported "
+                f"usesWorktreeProjection={sample.get('uses_worktree_projection')!r}"
+            )
+        if int(sample.get("search_match_count") or 0) <= 0:
+            failures.append(
+                f"{sample.get('route')} search {sample.get('join_key')} reported no matches"
+            )
     return failures
 
 
@@ -315,6 +410,37 @@ def validate_agent_completion(agent_results: dict[str, dict[str, Any]], transcri
     return failures
 
 
+def validate_agent_session_identity(agent_results: dict[str, dict[str, Any]]) -> list[str]:
+    failures: list[str] = []
+    seen_session_ids: set[str] = set()
+    for route in ("local", "worktree"):
+        result = agent_results.get(route) or {}
+        expected = result.get("session_id")
+        start_ids = response_session_ids(result.get("start_response"))
+        wait_ids = response_session_ids(result.get("wait_response"))
+        session_ids = {str(value) for value in (expected,) if value}.union(start_ids, wait_ids)
+        if len(session_ids) != 1 or len(start_ids) != 1 or len(wait_ids) != 1:
+            failures.append(f"{route} agent start/wait session identity mismatch: {sorted(session_ids)}")
+            continue
+        seen_session_ids.update(session_ids)
+    if len(seen_session_ids) != 2:
+        failures.append("local and worktree agents did not report two distinct session IDs")
+    return failures
+
+
+def expected_agent_run_ids(agent_results: dict[str, dict[str, Any]]) -> dict[str, str]:
+    run_ids: dict[str, str] = {}
+    for route in ("local", "worktree"):
+        wait_response = (agent_results.get(route) or {}).get("wait_response")
+        run_id = response_run_id(wait_response)
+        if not run_id:
+            raise BenchmarkError(f"{route} agent wait response omitted run_id")
+        run_ids[route] = run_id
+    if len(set(run_ids.values())) != len(run_ids):
+        raise BenchmarkError("local and worktree agents reported the same run_id")
+    return run_ids
+
+
 def validate_transcript_arguments(
     transcript_xml: str,
     marker: str,
@@ -351,15 +477,19 @@ def validate_transcript_arguments(
             raise BenchmarkError(f"surfaced read calls used unknown enrichment: {sorted(unexpected_keys)}")
 
 
-def positive_search_stage_count(capture: dict[str, Any]) -> int:
-    count = 0
+def positive_search_projection_counts(capture: dict[str, Any]) -> Counter[bool]:
+    counts: Counter[bool] = Counter()
     for stage in capture.get("stages", []):
         if not isinstance(stage, dict) or stage.get("stage_name") != "EditFlow.Search.DTOBuild":
             continue
         dimensions = parse_dimensions(str(stage.get("sanitized_dimensions", "")))
-        if int(dimensions.get("matchCount", 0)) > 0 and dimensions.get("outcome") in {"completed", "capped"}:
-            count += int(stage.get("sample_count", 0))
-    return count
+        if int(dimensions.get("matchCount", 0)) <= 0 or dimensions.get("outcome") not in {"completed", "capped"}:
+            continue
+        projection = dimensions.get("usesWorktreeProjection")
+        if not isinstance(projection, bool):
+            raise BenchmarkError("search DTO stage omitted usesWorktreeProjection")
+        counts[projection] += int(stage.get("sample_count", 0))
+    return counts
 
 
 def validate_integrity(
@@ -384,10 +514,17 @@ def validate_integrity(
         success_event = "Search.ProviderResultReady" if sample["tool"] == "file_search" else "ReadFile.ProviderResultReady"
         if success_event not in sample["event_names"]:
             failures.append(f"{sample['route']} {sample['tool']} omitted {success_event}")
-    if positive_search_stage_count(capture) != 2 * search_count:
-        failures.append("search DTO stages do not prove a nonempty result for every search")
+    projection_counts = positive_search_projection_counts(capture)
+    expected_projection_counts = Counter({False: search_count, True: search_count})
+    if projection_counts != expected_projection_counts:
+        failures.append(
+            "search DTO stages do not prove the expected local/worktree projections: "
+            f"{dict(projection_counts)}"
+        )
     failures.extend(sequential_call_failures(samples))
+    failures.extend(search_projection_failures(samples))
     failures.extend(validate_agent_completion(agent_results, transcripts))
+    failures.extend(validate_agent_session_identity(agent_results))
     failures.extend(validate_route_binding_metadata(agent_results, configured_worktree))
     for route in ("local", "worktree"):
         try:
@@ -514,6 +651,7 @@ def replay_artifact(source: Path) -> dict[str, Any]:
     agent_results = {
         route: {
             "status": (agents.get(route) or {}).get("status"),
+            "session_id": response_session_id((agents.get(route) or {}).get("start_response")),
             "start_response": (agents.get(route) or {}).get("start_response"),
             "wait_response": (agents.get(route) or {}).get("wait_response"),
         }
@@ -523,7 +661,7 @@ def replay_artifact(source: Path) -> dict[str, Any]:
     failures: list[str] = []
     try:
         samples = build_samples(capture)
-        classify_routes(samples, search_count, read_count)
+        classify_routes(samples, search_count, read_count, expected_agent_run_ids(agent_results))
         failures.extend(validate_integrity(
             capture,
             samples,
@@ -820,7 +958,7 @@ def main(argv: list[str] | None = None) -> int:
             for route, future in futures.items():
                 try:
                     _, response = future.result()
-                    session_id = find_string(response, "session_id") or find_string(response, "sessionId")
+                    session_id = response_session_id(response)
                     if not session_id:
                         raise BenchmarkError(f"{route} start omitted session_id")
                     sessions[route] = {
@@ -946,7 +1084,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         try:
             samples = build_samples(capture)
-            classify_routes(samples, args.search_count, args.read_count)
+            classify_routes(samples, args.search_count, args.read_count, expected_agent_run_ids(sessions))
             failures.extend(validate_integrity(
                 capture,
                 samples,

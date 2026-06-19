@@ -4488,10 +4488,9 @@ final class MCPServerViewModel: ObservableObject {
         let roots = await store.rootRefs(scope: lookupContext.rootScope)
         try Task.checkCancellation()
         let scopedRootIDs = Set(roots.map(\.id))
-        let requiresScopedRootMembership = if case .sessionBoundWorkspace = lookupContext.rootScope {
-            true
-        } else {
-            false
+        let requiresScopedRootMembership = switch lookupContext.rootScope {
+        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace: true
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded: false
         }
         var codeStructureFiles: [CodeStructureFile] = []
         var seenPaths = Set<String>()

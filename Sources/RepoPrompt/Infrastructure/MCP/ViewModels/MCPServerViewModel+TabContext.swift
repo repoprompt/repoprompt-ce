@@ -2222,6 +2222,14 @@ extension MCPServerViewModel {
         connectionID: UUID?,
         expectedBindingGeneration: UInt64? = nil
     ) -> Bool {
+        if snapshot.runID == nil,
+           let workspaceID = snapshot.workspaceID
+        {
+            guard let liveTab = workspaceManager?.composeTab(
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: snapshot.tabID)
+            ), liveTab.activeAgentSessionID == snapshot.activeAgentSessionID
+            else { return false }
+        }
         guard let connectionID else { return true }
         guard let current = tabContextByConnectionID[connectionID],
               fileToolLookupSnapshotMatches(current, snapshot)

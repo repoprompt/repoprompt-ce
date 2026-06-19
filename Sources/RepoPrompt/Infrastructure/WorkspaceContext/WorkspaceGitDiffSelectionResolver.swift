@@ -118,7 +118,7 @@ enum WorkspaceGitDiffSelectionResolver {
 extension WorkspaceLookupRootScope {
     var allowsSelectedGitDiffFilesystemFallback: Bool {
         switch self {
-        case .sessionBoundWorkspace:
+        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
             false
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
             true

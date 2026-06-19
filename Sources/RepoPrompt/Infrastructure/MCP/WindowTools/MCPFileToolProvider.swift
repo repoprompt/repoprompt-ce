@@ -658,7 +658,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 )
             }
             endDTOBuildIfNeeded()
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerDTOReady, EditFlowPerf.Dimensions(outcome: "completed", countOnly: true))
+            EditFlowPerf.lifecycleEvent(
+                EditFlowPerf.Lifecycle.Search.providerDTOReady,
+                EditFlowPerf.Dimensions(
+                    outcome: "completed",
+                    matchCount: reply.totalMatches,
+                    usesWorktreeProjection: usesWorktreeProjection,
+                    countOnly: true
+                )
+            )
             EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned, EditFlowPerf.Dimensions(outcome: "skippedCountOnly"))
             return reply
         }
@@ -788,7 +796,13 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.Search.providerDTOReady,
-            EditFlowPerf.Dimensions(outcome: dtoBuildOutcome, searchMode: mode.rawValue, countOnly: false)
+            EditFlowPerf.Dimensions(
+                outcome: dtoBuildOutcome,
+                matchCount: reply.totalMatches,
+                usesWorktreeProjection: usesWorktreeProjection,
+                searchMode: mode.rawValue,
+                countOnly: false
+            )
         )
         try Task.checkCancellation()
         await EditFlowPerf.measure(

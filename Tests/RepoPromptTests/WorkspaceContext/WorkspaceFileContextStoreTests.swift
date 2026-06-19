@@ -4065,6 +4065,101 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertNotEqual(unloaded.generation, reloaded.generation)
         }
 
+        func testValidatedSessionScopeRejectsSamePathRootReplacement() async throws {
+            let logicalRoot = try makeTemporaryRoot(name: "ValidatedSessionLogical")
+            let worktree = try makeTemporaryRoot(name: "ValidatedSessionWorktree")
+            try write("logical", to: logicalRoot.appendingPathComponent("Logical.swift"))
+            try write("initial", to: worktree.appendingPathComponent("Target.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
+            let initialWorktreeRecord = try await store.loadRoot(
+                path: worktree.path,
+                kind: .sessionWorktree
+            )
+            let scope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+                canonicalRoots: [WorkspaceRootRef(
+                    id: logicalRecord.id,
+                    name: logicalRecord.name,
+                    fullPath: logicalRecord.standardizedFullPath
+                )],
+                physicalRoots: [WorkspaceRootRef(
+                    id: initialWorktreeRecord.id,
+                    name: initialWorktreeRecord.name,
+                    fullPath: initialWorktreeRecord.standardizedFullPath
+                )]
+            )
+            let initialAvailability = await store.rootScopeAvailability(scope)
+            let initialRootIDs = await Set(store.rootRefs(scope: scope).map(\.id))
+            XCTAssertEqual(initialAvailability, .available)
+            XCTAssertEqual(
+                initialRootIDs,
+                [logicalRecord.id, initialWorktreeRecord.id]
+            )
+
+            await store.unloadRoot(id: initialWorktreeRecord.id)
+            try write("replacement", to: worktree.appendingPathComponent("Target.swift"))
+            let replacement = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
+            XCTAssertNotEqual(replacement.id, initialWorktreeRecord.id)
+
+            let replacementAvailability = await store.rootScopeAvailability(scope)
+            let replacementScopedRootIDs = await store.rootRefs(scope: scope).map(\.id)
+            let replacementCatalogAccess = await store.searchCatalogAccess(rootScope: scope)
+            let replacementLookup = await store.lookupPath(
+                worktree.appendingPathComponent("Target.swift").path,
+                profile: .mcpRead,
+                rootScope: scope
+            )
+            XCTAssertEqual(
+                replacementAvailability,
+                .sessionWorktreeUnavailable(missingPhysicalRootPaths: [worktree.standardizedFileURL.path])
+            )
+            XCTAssertEqual(replacementScopedRootIDs, [logicalRecord.id])
+            XCTAssertEqual(
+                replacementCatalogAccess,
+                .unavailable(.sessionWorktreeUnavailable(
+                    missingPhysicalRootPaths: [worktree.standardizedFileURL.path]
+                ))
+            )
+            XCTAssertNil(replacementLookup)
+            let replacementTarget = worktree.appendingPathComponent("Target.swift")
+            let rejectedCreate = worktree.appendingPathComponent("ShouldNotExist.swift")
+            let rejectedCanonicalCreate = logicalRoot.appendingPathComponent("ShouldAlsoNotExist.swift")
+            do {
+                _ = try await WorkspaceFileMutationService(store: store).createFileWithPostcondition(
+                    userPath: rejectedCreate.path,
+                    content: "must not be written",
+                    rootScope: scope
+                )
+                XCTFail("Expected stale validated scope to reject mutation")
+            } catch {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: rejectedCreate.path))
+            }
+            do {
+                _ = try await WorkspaceFileMutationService(store: store).createFileWithPostcondition(
+                    userPath: rejectedCanonicalCreate.path,
+                    content: "must not be written",
+                    rootScope: scope
+                )
+                XCTFail("Expected unavailable validated scope to reject canonical-root mutation")
+            } catch {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: rejectedCanonicalCreate.path))
+            }
+            let atomicallyRejectedCreate = logicalRoot.appendingPathComponent("AtomicShouldNotExist.swift")
+            do {
+                _ = try await store.createFile(
+                    rootID: logicalRecord.id,
+                    relativePath: atomicallyRejectedCreate.lastPathComponent,
+                    content: "must not be written",
+                    validating: scope
+                )
+                XCTFail("Expected store write admission to revalidate the full scope atomically")
+            } catch {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: atomicallyRejectedCreate.path))
+            }
+            XCTAssertEqual(try String(contentsOf: replacementTarget, encoding: .utf8), "replacement")
+        }
+
         func testSearchCatalogSnapshotCacheEvictsOnlyLeastRecentlyUsedEntryAtCapacity() async {
             let store = WorkspaceFileContextStore()
             let scopes = (0 ... 16).map { index in

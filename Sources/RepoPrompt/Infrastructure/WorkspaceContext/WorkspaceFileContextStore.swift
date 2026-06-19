@@ -1021,6 +1021,8 @@ actor WorkspaceFileContextStore {
                 "all_loaded"
             case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
                 "session_bound_workspace(logical=\(logicalRootPaths.sorted().joined(separator: ","));physical=\(physicalRootPaths.sorted().joined(separator: ",")))"
+            case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+                "validated_session_bound_workspace(logical=\(canonicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ","));physical=\(physicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ",")))"
             }
         }
 
@@ -2587,15 +2589,19 @@ actor WorkspaceFileContextStore {
         _ rootScope: WorkspaceLookupRootScope,
         expectedPhysicalRoots: [WorkspaceRootRef]
     ) -> WorkspaceSessionRootLifetimeSnapshot? {
-        guard case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths) = rootScope,
-              !expectedPhysicalRoots.isEmpty
-        else { return nil }
-
-        let requestedPaths = Set(requestedPhysicalRootPaths.map {
-            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
-        })
+        guard !expectedPhysicalRoots.isEmpty else { return nil }
         let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
-        guard requestedPaths == expectedPaths,
+        let requestedMatches: Bool = switch rootScope {
+        case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
+            Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            }) == expectedPaths
+        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
+            requestedPhysicalRoots == Set(expectedPhysicalRoots)
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+            false
+        }
+        guard requestedMatches,
               expectedPhysicalRoots.allSatisfy({ expectedRoot in
                   guard let currentRoot = rootStatesByID[expectedRoot.id]?.root else { return false }
                   return currentRoot.kind == .sessionWorktree
@@ -2608,23 +2614,45 @@ actor WorkspaceFileContextStore {
     }
 
     func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
-        guard case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths) = rootScope else {
+        let missing: [String]
+        switch rootScope {
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
             return .available
+        case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths):
+            guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            let requested = Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            })
+            missing = requested.filter { path in
+                guard let rootID = rootIDsByStandardizedPath[path],
+                      rootStatesByID[rootID]?.root.kind == .sessionWorktree
+                else { return true }
+                var isDirectory: ObjCBool = false
+                return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
+                    !isDirectory.boolValue
+            }.sorted()
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            missing = (
+                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
+                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+            )
+            .compactMap { expectedRoot, expectedKind in
+                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
+                      currentRoot.kind == expectedKind,
+                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+                else { return expectedRoot.standardizedFullPath }
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(
+                    atPath: currentRoot.standardizedFullPath,
+                    isDirectory: &isDirectory
+                ) && isDirectory.boolValue ? nil : currentRoot.standardizedFullPath
+            }.sorted()
         }
-        guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
-            return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
-        }
-        let requested = Set(requestedPhysicalRootPaths.map {
-            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
-        })
-        let missing = requested.filter { path in
-            guard let rootID = rootIDsByStandardizedPath[path],
-                  rootStatesByID[rootID]?.root.kind == .sessionWorktree
-            else { return true }
-            var isDirectory: ObjCBool = false
-            return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
-                !isDirectory.boolValue
-        }.sorted()
         return missing.isEmpty
             ? .available
             : .sessionWorktreeUnavailable(missingPhysicalRootPaths: missing)
@@ -6257,7 +6285,19 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
-    func createFile(rootID: UUID, relativePath: String, content: String) async throws -> WorkspaceFileCatalogMaterializationResult {
+    func createFile(
+        rootID: UUID,
+        relativePath: String,
+        content: String,
+        validating rootScope: WorkspaceLookupRootScope? = nil
+    ) async throws -> WorkspaceFileCatalogMaterializationResult {
+        if let rootScope {
+            guard rootScopeAvailability(rootScope) == .available,
+                  rootsForPathLookup(scope: rootScope).contains(where: { $0.id == rootID })
+            else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
+            }
+        }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
@@ -7768,6 +7808,28 @@ actor WorkspaceFileContextStore {
                 physicalRootPaths: normalizedPhysicalRootPaths,
                 dependencies: dependencies
             )
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let normalizedLogicalRootPaths = canonicalRoots.map(\.standardizedFullPath).sorted()
+            let normalizedPhysicalRootPaths = physicalRoots.map(\.standardizedFullPath).sorted()
+            let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
+                guard let state = rootStatesByID[root.id] else { return nil }
+                return SearchCatalogRootDependency(
+                    canonicalIdentity: root.standardizedFullPath,
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    generation: catalogGenerationsByRootID[root.id] ?? 0
+                )
+            }.sorted {
+                if $0.canonicalIdentity == $1.canonicalIdentity {
+                    return $0.rootID.uuidString < $1.rootID.uuidString
+                }
+                return $0.canonicalIdentity < $1.canonicalIdentity
+            }
+            return .sessionBound(
+                logicalRootPaths: normalizedLogicalRootPaths,
+                physicalRootPaths: normalizedPhysicalRootPaths,
+                dependencies: dependencies
+            )
         }
     }
 
@@ -7815,6 +7877,12 @@ actor WorkspaceFileContextStore {
             hasher.combine(normalizedSessionSelectorPaths(canonicalRootPaths).sorted())
             hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
             return UInt64(bitPattern: Int64(hasher.finalize()))
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            var hasher = Hasher()
+            hasher.combine("validatedSessionBoundWorkspace")
+            hasher.combine(canonicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
+            hasher.combine(physicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
+            return UInt64(bitPattern: Int64(hasher.finalize()))
         }
     }
 
@@ -7852,7 +7920,7 @@ actor WorkspaceFileContextStore {
             kinds.contains(.primaryWorkspace) || kinds.contains(.workspaceGitData)
         case .allLoaded:
             true
-        case .sessionBoundWorkspace:
+        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
             kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
         }
     }
@@ -7879,6 +7947,19 @@ actor WorkspaceFileContextStore {
                     normalizedCanonicalRootPaths.contains(root.standardizedFullPath)
                 case .sessionWorktree:
                     normalizedPhysicalRootPaths.contains(root.standardizedFullPath)
+                case .workspaceGitData, .supplementalSystem:
+                    false
+                }
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
+            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            return allRoots.filter { root in
+                switch root.kind {
+                case .primaryWorkspace:
+                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                case .sessionWorktree:
+                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }

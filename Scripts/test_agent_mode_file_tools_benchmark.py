@@ -34,15 +34,29 @@ def event(ordinal: int, offset: float, name: str, connection: str, invocation: s
     }
 
 
-def timeline(connection: str, invocation: str, tool: str, start: float) -> list[dict]:
+def timeline(connection: str, invocation: str, tool: str, start: float, run_id: str | None = None) -> list[dict]:
     success = "Search.ProviderResultReady" if tool == "file_search" else "ReadFile.ProviderResultReady"
-    return [
+    run_id = run_id or f"{connection}-run"
+    events = [
         event(1, start, benchmark.RECEIVED, connection, invocation, f"tool={tool}"),
         event(2, start + 1, "MCP.ToolCall.RoutingSnapshotCompleted", connection, invocation, f"tool={tool}"),
-        event(3, start + 3, success, connection, invocation),
-        event(4, start + 5, benchmark.MAIN_ACTOR_EXITED, connection, invocation,
-              f"tool={tool} observerType=event_completion"),
     ]
+    if tool == "file_search":
+        projected = connection in {"connection-b", "worktree-connection"}
+        events.append(event(
+            3,
+            start + 2,
+            "Search.ProviderDTOReady",
+            connection,
+            invocation,
+            f"outcome=completed matchCount=1 usesWorktreeProjection={str(projected).lower()}",
+        ))
+    events.extend([
+        event(4, start + 3, success, connection, invocation),
+        event(5, start + 5, benchmark.MAIN_ACTOR_EXITED, connection, invocation,
+              f"tool={tool} observerType=event_completion runID={run_id}"),
+    ])
+    return events
 
 
 class CaptureParsingTests(unittest.TestCase):
@@ -50,7 +64,7 @@ class CaptureParsingTests(unittest.TestCase):
         events = timeline("local-connection", "one", "file_search", 10)
         events.insert(-1, event(3, 14, benchmark.MAIN_ACTOR_EXITED, "local-connection", "one",
                                 "tool=file_search observerType=provider_projection_capture"))
-        events.append(event(5, 17, benchmark.MAIN_ACTOR_EXITED, "local-connection", "one",
+        events.append(event(6, 17, benchmark.MAIN_ACTOR_EXITED, "local-connection", "one",
                             "tool=file_search observerType=provider_projection_resume"))
         sample = benchmark.build_samples({"lifecycle_events": events})[0]
         self.assertEqual(sample["envelope_ms"], 5)
@@ -61,6 +75,13 @@ class CaptureParsingTests(unittest.TestCase):
     def test_build_samples_rejects_missing_envelope_endpoint(self) -> None:
         events = timeline("local", "one", "read_file", 0)[:-1]
         with self.assertRaisesRegex(benchmark.BenchmarkError, "event_completion MainActorExited"):
+            benchmark.build_samples({"lifecycle_events": events})
+
+    def test_build_samples_requires_run_id_on_event_completion(self) -> None:
+        events = timeline("local", "one", "read_file", 0)
+        events[1]["sanitized_dimensions"] = "tool=read_file runID=earlier-only"
+        events[-1]["sanitized_dimensions"] = "tool=read_file observerType=event_completion"
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "event_completion omitted runID"):
             benchmark.build_samples({"lifecycle_events": events})
 
     def test_parse_dimensions_preserves_typed_stage_metadata(self) -> None:
@@ -75,20 +96,44 @@ class RoutingTests(unittest.TestCase):
         events = []
         offset = 0.0
         for index, tool in enumerate(["file_search", "file_search", "read_file"]):
-            events += timeline("connection-a", f"a-{index}", tool, offset)
+            events += timeline("connection-a", f"a-{index}", tool, offset, "local-run")
             offset += 10
         for index, tool in enumerate(["read_file", "file_search", "file_search"]):
-            events += timeline("connection-b", f"b-{index}", tool, offset)
+            events += timeline("connection-b", f"b-{index}", tool, offset, "worktree-run")
             offset += 10
         samples = benchmark.build_samples({"lifecycle_events": events})
-        routes = benchmark.classify_routes(samples, search_count=2, read_count=1)
+        routes = benchmark.classify_routes(
+            samples,
+            search_count=2,
+            read_count=1,
+            expected_run_ids={"local": "local-run", "worktree": "worktree-run"},
+        )
         self.assertEqual(routes, {"connection-a": "local", "connection-b": "worktree"})
         self.assertEqual({sample["route"] for sample in samples}, {"local", "worktree"})
 
     def test_unexpected_or_extra_connection_fails_classification(self) -> None:
         samples = benchmark.build_samples({"lifecycle_events": timeline("only", "one", "file_search", 0)})
         with self.assertRaisesRegex(benchmark.BenchmarkError, "two file-tool connections"):
-            benchmark.classify_routes(samples, search_count=1, read_count=1)
+            benchmark.classify_routes(
+                samples,
+                search_count=1,
+                read_count=1,
+                expected_run_ids={"local": "local-run", "worktree": "worktree-run"},
+            )
+
+    def test_classification_rejects_capture_from_unexpected_agent_run(self) -> None:
+        events = timeline("connection-a", "a-search", "file_search", 0, "unrelated-run")
+        events += timeline("connection-a", "a-read", "read_file", 10, "unrelated-run")
+        events += timeline("connection-b", "b-read", "read_file", 20, "worktree-run")
+        events += timeline("connection-b", "b-search", "file_search", 30, "worktree-run")
+        samples = benchmark.build_samples({"lifecycle_events": events})
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "unexpected agent run"):
+            benchmark.classify_routes(
+                samples,
+                search_count=1,
+                read_count=1,
+                expected_run_ids={"local": "local-run", "worktree": "worktree-run"},
+            )
 
 
 class StatisticsAndSchemaTests(unittest.TestCase):
@@ -260,6 +305,72 @@ class IntegrityAndCleanupTests(unittest.TestCase):
         self.assertTrue(any("status was failed" in failure for failure in failures))
         self.assertTrue(any("final response" in failure for failure in failures))
 
+    def test_agent_session_identity_requires_matching_distinct_start_and_wait_sessions(self) -> None:
+        results = {
+            "local": {
+                "session_id": "local-session",
+                "start_response": {"session_id": "local-session"},
+                "wait_response": {"session_id": "local-session"},
+            },
+            "worktree": {
+                "session_id": "worktree-session",
+                "start_response": {"session_id": "worktree-session"},
+                "wait_response": {"session_id": "worktree-session"},
+            },
+        }
+        self.assertEqual(benchmark.validate_agent_session_identity(results), [])
+        results["worktree"]["wait_response"] = {"session_id": "local-session"}
+        failures = benchmark.validate_agent_session_identity(results)
+        self.assertTrue(any("worktree agent start/wait" in failure for failure in failures))
+        results["worktree"]["wait_response"] = {
+            "session_id": "worktree-session",
+            "sessionId": "conflicting-alias-session",
+        }
+        failures = benchmark.validate_agent_session_identity(results)
+        self.assertTrue(any("worktree agent start/wait" in failure for failure in failures))
+        results["worktree"]["wait_response"] = {
+            "session_id": "worktree-session",
+            "session": {"id": "conflicting-session"},
+        }
+        failures = benchmark.validate_agent_session_identity(results)
+        self.assertTrue(any("worktree agent start/wait" in failure for failure in failures))
+
+    def test_agent_run_identity_rejects_conflicting_aliases(self) -> None:
+        results = {
+            "local": {"wait_response": {"run_id": "local-run", "runId": "conflict"}},
+            "worktree": {"wait_response": {"run_id": "worktree-run"}},
+        }
+        with self.assertRaisesRegex(benchmark.BenchmarkError, "local agent wait response omitted run_id"):
+            benchmark.expected_agent_run_ids(results)
+
+    def test_positive_search_stages_require_local_and_worktree_projection_counts(self) -> None:
+        capture = {
+            "stages": [
+                {
+                    "stage_name": "EditFlow.Search.DTOBuild",
+                    "sample_count": 2,
+                    "sanitized_dimensions": (
+                        "outcome=completed matchCount=1 usesWorktreeProjection=false"
+                    ),
+                },
+                {
+                    "stage_name": "EditFlow.Search.DTOBuild",
+                    "sample_count": 2,
+                    "sanitized_dimensions": (
+                        "outcome=completed matchCount=1 usesWorktreeProjection=true"
+                    ),
+                },
+            ]
+        }
+        self.assertEqual(
+            benchmark.positive_search_projection_counts(capture),
+            {False: 2, True: 2},
+        )
+        capture["stages"][1]["sanitized_dimensions"] = (
+            "outcome=completed matchCount=1 usesWorktreeProjection=false"
+        )
+        self.assertEqual(benchmark.positive_search_projection_counts(capture), {False: 4})
+
     def test_sequential_calls_reject_same_connection_overlap_but_allow_cross_agent_overlap(self) -> None:
         samples = [
             {"connection_id": "a", "join_key": "a1", "received_offset_ms": 0, "main_actor_exited_offset_ms": 5},
@@ -326,6 +437,55 @@ class ReplayFixtureTests(unittest.TestCase):
         self.assertFalse(summary["integrity"]["ok"])
         self.assertTrue(any(
             fixture["expected"]["failure_contains"] in failure
+            for failure in summary["integrity"]["failures"]
+        ))
+
+    def test_success_fixture_rejects_missing_worktree_projection(self) -> None:
+        fixture = json.loads((FIXTURE_ROOT / "paired-success" / "replay.json").read_text(encoding="utf-8"))
+        for stage in fixture["capture"]["stages"]:
+            stage["sanitized_dimensions"] = stage["sanitized_dimensions"].replace(
+                "usesWorktreeProjection=true", "usesWorktreeProjection=false"
+            )
+        with mock.patch.object(benchmark, "load_replay_input", return_value=fixture):
+            summary = benchmark.replay_artifact(Path("fixture.json"))
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(any("local/worktree projections" in failure for failure in summary["integrity"]["failures"]))
+
+    def test_success_fixture_rejects_inverted_per_run_worktree_projection(self) -> None:
+        fixture = json.loads((FIXTURE_ROOT / "paired-success" / "replay.json").read_text(encoding="utf-8"))
+        for event_value in fixture["capture"]["lifecycle_events"]:
+            if event_value.get("event_name") != "Search.ProviderDTOReady":
+                continue
+            dimensions = event_value["sanitized_dimensions"]
+            if "usesWorktreeProjection=true" in dimensions:
+                event_value["sanitized_dimensions"] = dimensions.replace(
+                    "usesWorktreeProjection=true", "usesWorktreeProjection=false"
+                )
+            else:
+                event_value["sanitized_dimensions"] = dimensions.replace(
+                    "usesWorktreeProjection=false", "usesWorktreeProjection=true"
+                )
+        with mock.patch.object(benchmark, "load_replay_input", return_value=fixture):
+            summary = benchmark.replay_artifact(Path("fixture.json"))
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(any(
+            "reported usesWorktreeProjection" in failure
+            for failure in summary["integrity"]["failures"]
+        ))
+
+    def test_success_fixture_rejects_zero_match_per_run_evidence(self) -> None:
+        fixture = json.loads((FIXTURE_ROOT / "paired-success" / "replay.json").read_text(encoding="utf-8"))
+        for event_value in fixture["capture"]["lifecycle_events"]:
+            if event_value.get("event_name") == "Search.ProviderDTOReady":
+                event_value["sanitized_dimensions"] = re.sub(
+                    r"matchCount=\d+", "matchCount=0", event_value["sanitized_dimensions"]
+                )
+                break
+        with mock.patch.object(benchmark, "load_replay_input", return_value=fixture):
+            summary = benchmark.replay_artifact(Path("fixture.json"))
+        self.assertEqual(summary["status"], "failed")
+        self.assertTrue(any(
+            "reported no matches" in failure
             for failure in summary["integrity"]["failures"]
         ))
 
