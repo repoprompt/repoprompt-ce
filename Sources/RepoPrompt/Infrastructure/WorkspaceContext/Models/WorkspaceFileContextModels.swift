@@ -172,6 +172,24 @@ final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
     }
 }
 
+enum WorkspaceSearchCatalogAccessRequirement: Equatable {
+    case recordsOnly
+    case recordsAndPathIndexes
+
+    func satisfies(_ requirement: WorkspaceSearchCatalogAccessRequirement) -> Bool {
+        switch (self, requirement) {
+        case (.recordsAndPathIndexes, _), (.recordsOnly, .recordsOnly):
+            true
+        case (.recordsOnly, .recordsAndPathIndexes):
+            false
+        }
+    }
+
+    var requiresPathIndexes: Bool {
+        self == .recordsAndPathIndexes
+    }
+}
+
 struct WorkspaceSearchCatalogSnapshot: Equatable {
     let generation: UInt64
     let rootScope: WorkspaceLookupRootScope
@@ -200,6 +218,19 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         self.rootPathIndexes = rootPathIndexes
         self.diagnostics = diagnostics
         self.generationLease = generationLease
+    }
+
+    func recordsOnlyProjection() -> WorkspaceSearchCatalogSnapshot {
+        guard !rootPathIndexes.isEmpty else { return self }
+        return WorkspaceSearchCatalogSnapshot(
+            generation: generation,
+            rootScope: rootScope,
+            roots: roots,
+            files: files,
+            entries: entries,
+            diagnostics: diagnostics,
+            generationLease: generationLease
+        )
     }
 
     static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {

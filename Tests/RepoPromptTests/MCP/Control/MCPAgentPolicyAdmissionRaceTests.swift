@@ -493,6 +493,9 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let secondSelection = StoredSelection(selectedPaths: ["/tmp/second-agent.swift"])
             let windowID = window.windowID
             let sessionKey = "retained-connection-pinning-\(UUID().uuidString)"
+            // This fixture intentionally uses synthetic nonexistent paths; suspend snapshot mirroring during reactivation.
+            window.workspaceManager.beginApplyingTabContext(forTabID: firstTabID)
+            defer { window.workspaceManager.endApplyingTabContext(forTabID: firstTabID) }
             let workspace = window.workspaceManager.createWorkspace(
                 name: "Retained connection selection isolation \(UUID().uuidString.prefix(8))",
                 repoPaths: [],

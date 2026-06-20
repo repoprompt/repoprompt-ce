@@ -75,6 +75,15 @@ enum StoreBackedWorkspaceSearch {
         store: WorkspaceFileContextStore,
         workspaceManager: WorkspaceManagerViewModel?
     ) async throws -> SearchResults {
+        #if DEBUG
+            let diagnosticCollector = WorkspaceFileSearchDebugContext.collector
+            let diagnosticSearchStart = WorkspaceFileSearchDebugTiming.now()
+            defer {
+                if Task.isCancelled {
+                    diagnosticCollector?.finish(status: .cancelled)
+                }
+            }
+        #endif
         try Task.checkCancellation()
         try await ensureRootScopeAvailable(rootScope, store: store)
         let readinessTicket = try await acquireSearchReadiness(
@@ -160,6 +169,15 @@ enum StoreBackedWorkspaceSearch {
                 try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
             }
             try Task.checkCancellation()
+            #if DEBUG
+                let diagnosticPreambleEnd = WorkspaceFileSearchDebugTiming.now()
+                diagnosticCollector?.recordReadinessFreshnessPreamble(
+                    nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: diagnosticSearchStart,
+                        through: diagnosticPreambleEnd
+                    )
+                )
+            #endif
 
             return try await performSearch(
                 pattern: pattern,
@@ -273,7 +291,28 @@ enum StoreBackedWorkspaceSearch {
         }
 
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
-        let catalogAccess = await store.searchCatalogAccess(rootScope: rootScope)
+        #if DEBUG
+            let diagnosticCatalogStart = WorkspaceFileSearchDebugTiming.now()
+        #endif
+        let catalogRequirement: WorkspaceSearchCatalogAccessRequirement = switch mode {
+        case .path:
+            .recordsOnly
+        case .auto, .content, .both:
+            .recordsAndPathIndexes
+        }
+        let catalogAccess = await store.searchCatalogAccess(
+            rootScope: rootScope,
+            requirement: catalogRequirement
+        )
+        #if DEBUG
+            let diagnosticCatalogEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.collector?.recordFirstCatalogAccess(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: diagnosticCatalogStart,
+                    through: diagnosticCatalogEnd
+                )
+            )
+        #endif
         try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         let snapshot: WorkspaceSearchCatalogSnapshot
         switch catalogAccess {
@@ -367,8 +406,15 @@ enum StoreBackedWorkspaceSearch {
         let aliasByRootPath = pathSearchAliasByRootPath(roots: visibleRootRecords)
         var wasAutoCorrected: Bool? = nil
         var results: SearchResults
+        #if DEBUG
+            var diagnosticActorStart: UInt64?
+        #endif
         do {
             try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
+            #if DEBUG
+                WorkspaceFileSearchDebugContext.collector?.setRequestedPathLimit(max(0, maxPaths))
+                diagnosticActorStart = WorkspaceFileSearchDebugTiming.now()
+            #endif
             results = try await EditFlowPerf.measure(
                 EditFlowPerf.Stage.Search.actorSearchCall,
                 EditFlowPerf.Dimensions(
@@ -405,8 +451,30 @@ enum StoreBackedWorkspaceSearch {
                     aliasByRootPath: aliasByRootPath
                 )
             }
+            #if DEBUG
+                if let diagnosticActorStart {
+                    let diagnosticActorEnd = WorkspaceFileSearchDebugTiming.now()
+                    WorkspaceFileSearchDebugContext.collector?.recordFileSearchActor(
+                        nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: diagnosticActorStart,
+                            through: diagnosticActorEnd
+                        )
+                    )
+                }
+            #endif
             try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)
         } catch {
+            #if DEBUG
+                if let diagnosticActorStart {
+                    let diagnosticActorEnd = WorkspaceFileSearchDebugTiming.now()
+                    WorkspaceFileSearchDebugContext.collector?.recordFileSearchActor(
+                        nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: diagnosticActorStart,
+                            through: diagnosticActorEnd
+                        )
+                    )
+                }
+            #endif
             entryPerfStatus = "error"
             throw error
         }
@@ -414,6 +482,9 @@ enum StoreBackedWorkspaceSearch {
         if wasAutoCorrected == true {
             results.warningMessage = searchAutoCorrectionWarning(isRegex: isRegex)
         }
+        #if DEBUG
+            WorkspaceFileSearchDebugContext.collector?.finish(status: .completed)
+        #endif
         return results
     }
 

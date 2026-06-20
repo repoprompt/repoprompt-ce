@@ -174,8 +174,38 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 startSearchCatalogSnapshotCapture(label: "snapshot-reuse")
                 defer { EditFlowPerf.resetDebugCaptureForTesting() }
 
-                let cold = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-                let warm = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                let cold = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(cold.rootPathIndexes.isEmpty, caseLabel)
+                let coldCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(coldCacheCount, 1, caseLabel)
+                let warm = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(warm.rootPathIndexes.isEmpty, caseLabel)
+                let warmCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(warmCacheCount, 1, caseLabel)
+
+                let indexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertEqual(indexed.generation, cold.generation, caseLabel)
+                XCTAssertEqual(indexed.rootPathIndexes.count, 2, caseLabel)
+                let indexedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(indexedCacheCount, 1, caseLabel)
+                let repeatedIndexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertTrue(indexed.rootPathIndexes[0] === repeatedIndexed.rootPathIndexes[0], caseLabel)
+                XCTAssertTrue(indexed.rootPathIndexes[1] === repeatedIndexed.rootPathIndexes[1], caseLabel)
+                let projected = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(projected.rootPathIndexes.isEmpty, caseLabel)
+                XCTAssertEqual(projected.generation, indexed.generation, caseLabel)
+                let projectedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(projectedCacheCount, 1, caseLabel)
+
                 let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
                 let buckets = searchCatalogSnapshotBuckets(capture)
 
@@ -185,13 +215,16 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertEqual(cold.diagnostics.rootCount, 2, caseLabel)
                 XCTAssertEqual(cold.diagnostics.folderCount, 3, caseLabel)
                 XCTAssertEqual(cold.diagnostics.fileCount, 3, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 1, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 2, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 3, caseLabel)
                 XCTAssertEqual(capture.droppedSampleCount, 0, caseLabel)
                 let work = await store.storeWorkDiagnosticsSnapshot()
-                XCTAssertEqual(work.catalogRebuild.rebuildCount, 1, caseLabel)
+                XCTAssertEqual(work.catalogRebuild.rebuildCount, 2, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastFileCount, 3, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastRootCount, 2, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.authoritativeRebuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.pathIndexBuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.patchCount == 0 }, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.filterMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.sortMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(

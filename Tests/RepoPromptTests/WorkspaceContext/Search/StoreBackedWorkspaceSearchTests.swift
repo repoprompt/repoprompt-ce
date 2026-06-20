@@ -199,6 +199,359 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     }
 
     #if DEBUG
+        func testDebugColdScopedPathSearchPhaseAccounting() async throws {
+            let visibleRoot = try makeTemporaryRoot(name: "DebugPhaseVisible")
+            try write("visible", to: visibleRoot.appendingPathComponent("Visible.swift"))
+            let worktreeRoot = try makeTemporaryRoot(name: "DebugPhaseWorktree")
+            let expectedRelativePath = "Sources/00-FirstPhaseNeedle.swift"
+            let expected = worktreeRoot.appendingPathComponent(expectedRelativePath)
+            for index in 1 ... 4 {
+                try write(
+                    "other \(index)",
+                    to: worktreeRoot.appendingPathComponent(String(format: "Sources/%02d-Other.swift", index))
+                )
+            }
+
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            _ = try await store.loadRoot(path: visibleRoot.path)
+            let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+            let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [worktreeRoot.standardizedFileURL.path]
+            )
+
+            try write("needle", to: expected)
+            await store.replayObservedFileSystemDeltas(
+                rootID: worktreeRecord.id,
+                deltas: [.fileAdded(expectedRelativePath)]
+            )
+            let beforeFirstPathDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(beforeFirstPathDiagnostics.catalogRebuild.rebuildCount, 0)
+            let beforeFirstPathShard = try XCTUnwrap(
+                beforeFirstPathDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertNil(beforeFirstPathShard.publishedTopologyGeneration)
+            XCTAssertEqual(beforeFirstPathShard.buildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.authoritativeRebuildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.pathIndexBuildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.overlayPathIndexBuildCount, 0)
+
+            let collector = WorkspaceFileSearchPhaseCollector()
+            let started = DispatchTime.now()
+            let result = try await WorkspaceFileSearchDebugContext.$collector.withValue(collector) {
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "FirstPhaseNeedle",
+                    mode: .path,
+                    maxPaths: 1,
+                    rootScope: scope,
+                    store: store,
+                    workspaceManager: nil
+                )
+            }
+            let finished = DispatchTime.now()
+            let phases = collector.snapshot(
+                readySearchNanoseconds: finished.uptimeNanoseconds - started.uptimeNanoseconds
+            )
+
+            XCTAssertEqual(result.paths, [expected.path])
+            XCTAssertEqual(phases.status, .completed)
+            XCTAssertGreaterThanOrEqual(phases.topLevel.residualOrchestrationMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.fileActor.residualMicroseconds, 0)
+
+            XCTAssertEqual(phases.catalog.sortInvocationCount, 1)
+            XCTAssertEqual(phases.catalog.sortFileInputCount, 5)
+            XCTAssertEqual(phases.catalog.sortFolderInputCount, 2)
+            XCTAssertGreaterThanOrEqual(phases.catalog.fileSortMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.catalog.folderSortMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.catalog.sortResidualMicroseconds, 0)
+            let nestedSortChildren = phases.catalog.fileSortMicroseconds
+                + phases.catalog.folderSortMicroseconds
+                + phases.catalog.sortResidualMicroseconds
+            XCTAssertLessThanOrEqual(nestedSortChildren, phases.catalog.sortMicroseconds + 1000)
+            XCTAssertLessThanOrEqual(abs(phases.catalog.sortReconciliationDeltaMicroseconds), 1000)
+
+            let catalogChildren = phases.catalog.filterMicroseconds
+                + phases.catalog.sortMicroseconds
+                + phases.catalog.materializationMicroseconds
+                + phases.catalog.pathIndexKeyMicroseconds
+                + phases.catalog.pathIndexConstructionMicroseconds
+                + phases.catalog.compositionCacheResidualMicroseconds
+            XCTAssertLessThanOrEqual(catalogChildren, phases.catalog.totalMicroseconds + 1000)
+
+            let actorChildren = phases.fileActor.descriptorMicroseconds
+                + phases.fileActor.filterMicroseconds
+                + phases.fileActor.sortAndInputMicroseconds
+                + phases.fileActor.batchConstructionAndInitialEnqueueMicroseconds
+                + phases.fileActor.deterministicDrainToHitMicroseconds
+                + phases.fileActor.postHitResidualMicroseconds
+            XCTAssertLessThanOrEqual(
+                actorChildren,
+                phases.topLevel.fileSearchActorMicroseconds + 1000
+            )
+
+            let reconciledReadyMicroseconds = Int64(phases.topLevel.readinessFreshnessPreambleMicroseconds)
+                + Int64(phases.topLevel.firstCatalogAccessMicroseconds)
+                + Int64(phases.topLevel.fileSearchActorMicroseconds)
+                + phases.topLevel.residualOrchestrationMicroseconds
+            XCTAssertLessThanOrEqual(
+                abs(reconciledReadyMicroseconds - Int64(phases.topLevel.readySearchMicroseconds)),
+                1000
+            )
+            XCTAssertLessThanOrEqual(abs(phases.topLevel.reconciliationDeltaMicroseconds), 1000)
+
+            XCTAssertEqual(phases.counts.sourceFileCount, 5)
+            XCTAssertEqual(phases.counts.descriptorsBuilt, 5)
+            XCTAssertEqual(phases.counts.admittedFileCount, 5)
+            XCTAssertEqual(phases.counts.sortInputCount, 5)
+            XCTAssertEqual(phases.counts.totalBatchCount, 1)
+            XCTAssertEqual(phases.counts.initiallyEnqueuedBatchCount, 1)
+            XCTAssertEqual(phases.counts.deterministicallyDrainedBatchCount, 1)
+            XCTAssertEqual(phases.counts.entriesExaminedByDrainedBatches, 5)
+            XCTAssertEqual(phases.counts.returnedHitPrefixLength, 1)
+
+            XCTAssertEqual(phases.catalog.rebuildCount, 1)
+            XCTAssertEqual(phases.catalog.rootCount, 1)
+            XCTAssertEqual(phases.catalog.fileCount, 5)
+            XCTAssertEqual(phases.catalog.pathIndexKeyMicroseconds, 0)
+            XCTAssertEqual(phases.catalog.pathIndexConstructionMicroseconds, 0)
+            let recordsOnlySnapshot = await store.searchCatalogSnapshot(
+                rootScope: scope,
+                requirement: .recordsOnly
+            )
+            XCTAssertTrue(recordsOnlySnapshot.rootPathIndexes.isEmpty)
+            let coldDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(coldDiagnostics.catalogRebuild.rebuildCount, 1)
+            let worktreeShard = try XCTUnwrap(
+                coldDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(worktreeShard.authoritativeRebuildCount, 1)
+            XCTAssertEqual(worktreeShard.pathIndexBuildCount, 0)
+            XCTAssertEqual(worktreeShard.overlayPathIndexBuildCount, 0)
+
+            let warm = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .path,
+                maxPaths: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(warm.paths, [expected.path])
+            var warmDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.rebuildCount, 1)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortInvocationCount, 1)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortFileInputCount, 5)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortFolderInputCount, 2)
+            XCTAssertLessThanOrEqual(
+                abs(warmDiagnostics.catalogRebuild.sortReconciliationDeltaMicroseconds),
+                1000
+            )
+            var warmShard = try XCTUnwrap(
+                warmDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(warmShard.buildCount, worktreeShard.buildCount)
+            XCTAssertEqual(warmShard.pathIndexBuildCount, 0)
+
+            let auto = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .auto,
+                maxPaths: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(auto.paths, [expected.path])
+            warmDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            warmShard = try XCTUnwrap(
+                warmDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(warmShard.authoritativeRebuildCount, 1)
+            XCTAssertEqual(warmShard.buildCount, worktreeShard.buildCount + 1)
+            XCTAssertEqual(warmShard.pathIndexBuildCount, 1)
+            XCTAssertEqual(warmShard.overlayPathIndexBuildCount, 0)
+
+            _ = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .both,
+                maxPaths: 1,
+                maxMatches: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            let bothDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            let bothShard = try XCTUnwrap(
+                bothDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(bothShard.buildCount, warmShard.buildCount)
+            XCTAssertEqual(bothShard.pathIndexBuildCount, 1)
+            XCTAssertEqual(bothShard.overlayPathIndexBuildCount, 0)
+
+            let probeContainer = try makeTemporaryRoot(name: "DebugCatalogSortProbe")
+            let nestedRoot = probeContainer.appendingPathComponent("Nested")
+            let probePaths = [
+                "a.swift",
+                "É-Precomposed.swift",
+                "Prefix-long",
+                "File-2.swift",
+                "E\u{301}-Decomposed.swift",
+                "A.swift",
+                "Prefix",
+                "中.swift",
+                "File-10.swift",
+                "Ω.swift",
+                "relative/Child.swift"
+            ]
+            for relativePath in probePaths {
+                try write(
+                    relativePath,
+                    to: nestedRoot.appendingPathComponent(relativePath)
+                )
+            }
+            try write("absolute", to: probeContainer.appendingPathComponent("Absolute.swift"))
+
+            let probeStore = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            let parentRecord = try await probeStore.loadRoot(path: probeContainer.path)
+            let nestedRecord = try await probeStore.loadRoot(path: nestedRoot.path, kind: .sessionWorktree)
+            let probeScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [probeContainer.standardizedFileURL.path],
+                physicalRootPaths: [nestedRoot.standardizedFileURL.path]
+            )
+            let expectedFiles = await probeStore.files(inRoot: parentRecord.id)
+                + probeStore.files(inRoot: nestedRecord.id)
+            let nestedPrefix = nestedRoot.standardizedFileURL.path + "/"
+            let expectedNestedPathOrder = [
+                "E\u{301}-Decomposed.swift",
+                "E\u{301}-Precomposed.swift",
+                "File-10.swift",
+                "File-2.swift",
+                "Prefix",
+                "Prefix-long",
+                "a.swift",
+                "relative/Child.swift",
+                "Ω.swift",
+                "中.swift"
+            ]
+            let absolutePath = probeContainer
+                .appendingPathComponent("Absolute.swift")
+                .standardizedFileURL.path
+            let expectedUniquePaths = [absolutePath]
+                + expectedNestedPathOrder.map { nestedPrefix + $0 }
+            let expectedOrderedPaths = [absolutePath]
+                + expectedNestedPathOrder.flatMap { relativePath in
+                    Array(repeating: nestedPrefix + relativePath, count: 2)
+                }
+            let expectedOrder = expectedUniquePaths.flatMap { expectedPath in
+                expectedFiles
+                    .filter {
+                        $0.standardizedFullPath.utf8.elementsEqual(expectedPath.utf8)
+                    }
+                    .sorted {
+                        $0.id.uuidString.utf8.lexicographicallyPrecedes($1.id.uuidString.utf8)
+                    }
+            }
+            XCTAssertEqual(expectedOrder.map(\.standardizedFullPath), expectedOrderedPaths)
+            let expectedFolderCount = await probeStore.folders(inRoot: parentRecord.id).count
+                + probeStore.folders(inRoot: nestedRecord.id).count
+            let singleRootScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [nestedRoot.standardizedFileURL.path]
+            )
+            let expectedSingleRootFiles = await probeStore.files(inRoot: nestedRecord.id)
+            let expectedSingleRootOrder = expectedSingleRootFiles.sorted { lhs, rhs in
+                if lhs.standardizedRelativePath.utf8.elementsEqual(rhs.standardizedRelativePath.utf8) {
+                    return lhs.id.uuidString.utf8.lexicographicallyPrecedes(rhs.id.uuidString.utf8)
+                }
+                return lhs.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+                    rhs.standardizedRelativePath.utf8
+                )
+            }
+            XCTAssertEqual(
+                expectedSingleRootOrder.map(\.standardizedRelativePath),
+                expectedNestedPathOrder
+            )
+            let expectedSingleRootFolderCount = await probeStore.folders(inRoot: nestedRecord.id).count
+            let workBeforeProbe = await probeStore.storeWorkDiagnosticsSnapshot()
+            let catalogCacheCountBeforeProbe = await probeStore.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheCountBeforeProbe = await probeStore.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationBeforeProbe = await probeStore.sessionCatalogGenerationForTesting(scope: probeScope)
+            let singleRootGenerationBeforeProbe = await probeStore
+                .sessionCatalogGenerationForTesting(scope: singleRootScope)
+
+            let singleRootProbe = await probeStore.debugAuthoritativeCatalogSortProbe(
+                rootScope: singleRootScope
+            )
+            XCTAssertEqual(singleRootProbe.status, .completed)
+            XCTAssertEqual(singleRootProbe.sourceFileCount, expectedSingleRootFiles.count)
+            XCTAssertEqual(singleRootProbe.sourceFolderCount, expectedSingleRootFolderCount)
+            XCTAssertEqual(singleRootProbe.samples.count, 3)
+            XCTAssertTrue(singleRootProbe.directAndProjectedOrdersMatch)
+            XCTAssertNil(singleRootProbe.firstMismatchIndex)
+            XCTAssertEqual(singleRootProbe.orderedFileIDs, expectedSingleRootOrder.map(\.id))
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy(\.directAndProjectedOrdersMatch))
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.firstMismatchIndex == nil })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.directFileComparatorCalls > 0 })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.projectedFileComparatorCalls > 0 })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.folderComparatorCalls > 0 })
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.directFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.projectedFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.folderComparatorCalls)).count, 1)
+
+            let probe = await probeStore.debugAuthoritativeCatalogSortProbe(rootScope: probeScope)
+            XCTAssertEqual(probe.status, .completed)
+            XCTAssertEqual(probe.sourceFileCount, expectedFiles.count)
+            XCTAssertEqual(probe.sourceFolderCount, expectedFolderCount)
+            XCTAssertEqual(probe.samples.count, 3)
+            XCTAssertTrue(probe.directAndProjectedOrdersMatch)
+            XCTAssertNil(probe.firstMismatchIndex)
+            XCTAssertEqual(probe.orderedFileIDs, expectedOrder.map(\.id))
+            XCTAssertTrue(probe.samples.allSatisfy(\.directAndProjectedOrdersMatch))
+            XCTAssertTrue(probe.samples.allSatisfy { $0.firstMismatchIndex == nil })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.directFileComparatorCalls > 0 })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.projectedFileComparatorCalls > 0 })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.folderComparatorCalls > 0 })
+            XCTAssertEqual(Set(probe.samples.map(\.directFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(probe.samples.map(\.projectedFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(probe.samples.map(\.folderComparatorCalls)).count, 1)
+
+            let duplicateGroups = Dictionary(
+                grouping: expectedFiles,
+                by: { Array($0.standardizedFullPath.utf8) }
+            )
+            .values
+            .filter { $0.count > 1 }
+            XCTAssertFalse(duplicateGroups.isEmpty)
+            for group in duplicateGroups {
+                let orderedIDs = probe.orderedFileIDs.filter { id in group.contains { $0.id == id } }
+                XCTAssertEqual(
+                    orderedIDs,
+                    group.map(\.id).sorted {
+                        $0.uuidString.utf8.lexicographicallyPrecedes($1.uuidString.utf8)
+                    }
+                )
+            }
+
+            let unavailableScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [probeContainer.appendingPathComponent("Missing").path]
+            )
+            let unavailable = await probeStore.debugAuthoritativeCatalogSortProbe(rootScope: unavailableScope)
+            XCTAssertEqual(unavailable.status, .unavailable)
+            XCTAssertTrue(unavailable.samples.isEmpty)
+
+            let workAfterProbe = await probeStore.storeWorkDiagnosticsSnapshot()
+            let catalogCacheCountAfterProbe = await probeStore.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheCountAfterProbe = await probeStore.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationAfterProbe = await probeStore.sessionCatalogGenerationForTesting(scope: probeScope)
+            let singleRootGenerationAfterProbe = await probeStore
+                .sessionCatalogGenerationForTesting(scope: singleRootScope)
+            XCTAssertEqual(workAfterProbe, workBeforeProbe)
+            XCTAssertEqual(catalogCacheCountAfterProbe, catalogCacheCountBeforeProbe)
+            XCTAssertEqual(staticCacheCountAfterProbe, staticCacheCountBeforeProbe)
+            XCTAssertEqual(sessionGenerationAfterProbe, sessionGenerationBeforeProbe)
+            XCTAssertEqual(singleRootGenerationAfterProbe, singleRootGenerationBeforeProbe)
+        }
+
         func testWatcherQualifiedWarmSearchSkipsPerFileMetadataValidation() async throws {
             let root = try makeTemporaryRoot(name: "WatcherQualifiedWarmSearch")
             let fileCount = 48
@@ -2298,7 +2651,9 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         let performSearchStart = try XCTUnwrap(source.range(of: "private static func performSearch("))
         try assertOrdered([
             "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
-            "let catalogAccess = await store.searchCatalogAccess(rootScope: rootScope)",
+            "let catalogRequirement: WorkspaceSearchCatalogAccessRequirement = switch mode",
+            "let catalogAccess = await store.searchCatalogAccess(",
+            "requirement: catalogRequirement",
             "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
             "let visibleRootRefs = await store.rootRefs(scope: .visibleWorkspace)",
             "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
