@@ -406,7 +406,9 @@ struct SettingsView: View {
                 promptVM: promptViewModel,
                 apiSettingsVM: apiSettingsViewModel,
                 windowID: windowState.windowID,
+                workspaceID: windowState.workspaceManager.activeWorkspace?.id,
                 workspaceName: windowState.workspaceManager.activeWorkspace?.name,
+                settingsManager: windowState.settingsManager,
                 onNavigate: { tab in selectedTab = tab }
             )
             .transition(.opacity.animation(.easeInOut(duration: 0.15)))

@@ -44,10 +44,68 @@ protocol SettingsManaging {
     func planningModelRaw() -> String?
     func setPlanningModelRaw(_ raw: String?, commit: Bool, reason: String?, honorSync: Bool)
     func syncChatModelWithOracle() -> Bool
+    func globalAgentModelsProfile() -> AgentModelsSettingsProfile
+    func setGlobalAgentModelsProfile(_ profile: AgentModelsSettingsProfile)
+    func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings
+    func setWorkspaceAgentModelsInheritanceMode(workspaceID: UUID, mode: AgentModelsInheritanceMode)
+    func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile?
+    func setWorkspaceAgentModelsProfile(workspaceID: UUID, profile: AgentModelsSettingsProfile)
+    func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile
+    func setAgentModelsPlanningModelRaw(_ raw: String?, scope: AgentModelsEditingScope)
+    func setAgentModelsPreferredComposeModelRaw(_ raw: String?, scope: AgentModelsEditingScope)
+    func setAgentModelsSyncChatModelWithOracle(_ enabled: Bool, scope: AgentModelsEditingScope)
+    func setAgentModelsContextBuilderAgentRaw(_ raw: String?, scope: AgentModelsEditingScope)
+    func setAgentModelsContextBuilderModelRaw(_ raw: String?, forAgentRaw agentRaw: String?, scope: AgentModelsEditingScope)
+    func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope)
+    func setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, scope: AgentModelsEditingScope)
+    func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope)
     func maxBackgroundAgentComposeTabs() -> Int
     func commitWorkspace(_ workspaceID: UUID)
     func discardWindowOverrides(for workspaceID: UUID)
     func commitAllVisitedWorkspaces()
+}
+
+extension GlobalSettingsStore: SettingsManaging {
+    func updateCopySettings(_ settings: CopyGlobalSettings, commit: Bool?) {
+        updateCopySettings(settings, commit: commit ?? true)
+    }
+
+    func updateChatSettings(_ settings: ChatGlobalSettings, commit: Bool?) {
+        updateChatSettings(settings, commit: commit ?? true)
+    }
+
+    func setGlobalContextBuilderAgentSelection(agentRaw: String, modelRaw: String, markUserDefined: Bool) {
+        setGlobalContextBuilderAgentSelection(
+            agentRaw: agentRaw,
+            modelRaw: modelRaw,
+            markUserDefined: markUserDefined,
+            reason: nil
+        )
+    }
+
+    func setPreferredComposeModelRaw(_ raw: String?, commit: Bool, reason: String?, honorSync: Bool) {
+        setPreferredComposeModelRaw(
+            raw,
+            commit: commit,
+            reason: reason,
+            honorSync: honorSync
+        )
+    }
+
+    func setPlanningModelRaw(_ raw: String?, commit: Bool, reason: String?, honorSync: Bool) {
+        setPlanningModelRaw(
+            raw,
+            commit: commit,
+            reason: reason,
+            honorSync: honorSync
+        )
+    }
+
+    func commitWorkspace(_: UUID) {}
+
+    func discardWindowOverrides(for _: UUID) {}
+
+    func commitAllVisitedWorkspaces() {}
 }
 
 // MARK: - Window Settings Manager
@@ -248,6 +306,72 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
 
     func syncChatModelWithOracle() -> Bool {
         store.syncChatModelWithOracle()
+    }
+
+    // MARK: - Scoped Agent Models settings
+
+    func globalAgentModelsProfile() -> AgentModelsSettingsProfile {
+        store.globalAgentModelsProfile()
+    }
+
+    func setGlobalAgentModelsProfile(_ profile: AgentModelsSettingsProfile) {
+        store.setGlobalAgentModelsProfile(profile)
+    }
+
+    func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings {
+        store.workspaceAgentModelsSettings(for: workspaceID)
+    }
+
+    func setWorkspaceAgentModelsInheritanceMode(workspaceID: UUID, mode: AgentModelsInheritanceMode) {
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: mode)
+    }
+
+    func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile? {
+        store.workspaceAgentModelsProfile(for: workspaceID)
+    }
+
+    func setWorkspaceAgentModelsProfile(workspaceID: UUID, profile: AgentModelsSettingsProfile) {
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+    }
+
+    func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile {
+        store.effectiveAgentModelsProfile(workspaceID: workspaceID)
+    }
+
+    func setAgentModelsPlanningModelRaw(_ raw: String?, scope: AgentModelsEditingScope) {
+        store.setAgentModelsPlanningModelRaw(raw, scope: scope)
+    }
+
+    func setAgentModelsPreferredComposeModelRaw(_ raw: String?, scope: AgentModelsEditingScope) {
+        store.setAgentModelsPreferredComposeModelRaw(raw, scope: scope)
+    }
+
+    func setAgentModelsSyncChatModelWithOracle(_ enabled: Bool, scope: AgentModelsEditingScope) {
+        store.setAgentModelsSyncChatModelWithOracle(enabled, scope: scope)
+    }
+
+    func setAgentModelsContextBuilderAgentRaw(_ raw: String?, scope: AgentModelsEditingScope) {
+        store.setAgentModelsContextBuilderAgentRaw(raw, scope: scope)
+    }
+
+    func setAgentModelsContextBuilderModelRaw(
+        _ raw: String?,
+        forAgentRaw agentRaw: String?,
+        scope: AgentModelsEditingScope
+    ) {
+        store.setAgentModelsContextBuilderModelRaw(raw, forAgentRaw: agentRaw, scope: scope)
+    }
+
+    func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope) {
+        store.setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
+    }
+
+    func setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, scope: AgentModelsEditingScope) {
+        store.setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(enabled, scope: scope)
+    }
+
+    func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope) {
+        store.copyAgentModelsProfile(from: source, to: destination)
     }
 
     func maxBackgroundAgentComposeTabs() -> Int {

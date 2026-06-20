@@ -27,29 +27,36 @@ struct AgentModelsSettingsView: View {
     @ObservedObject var promptVM: PromptViewModel
     @ObservedObject var apiSettingsVM: APISettingsViewModel
     let windowID: Int
+    let workspaceID: UUID?
     let workspaceName: String?
     var onNavigate: ((SettingsTab) -> Void)?
 
     @StateObject private var viewModel: AgentModelsSettingsViewModel
     @State private var showAdvanced: Bool = false
     @State private var showSettingsPopover: Bool = false
+    @State private var showCopyWorkspaceToGlobalConfirmation: Bool = false
 
     init(
         promptVM: PromptViewModel,
         apiSettingsVM: APISettingsViewModel,
         windowID: Int,
+        workspaceID: UUID? = nil,
         workspaceName: String? = nil,
+        settingsManager: (any SettingsManaging)? = nil,
         onNavigate: ((SettingsTab) -> Void)? = nil,
         viewModel: AgentModelsSettingsViewModel? = nil
     ) {
         self.promptVM = promptVM
         self.apiSettingsVM = apiSettingsVM
         self.windowID = windowID
+        self.workspaceID = workspaceID
         self.workspaceName = workspaceName
         self.onNavigate = onNavigate
         _viewModel = StateObject(wrappedValue: viewModel ?? AgentModelsSettingsViewModel(
-            promptVM: promptVM,
-            apiSettingsVM: apiSettingsVM
+            apiSettingsVM: apiSettingsVM,
+            workspaceID: workspaceID,
+            workspaceName: workspaceName,
+            settingsManager: settingsManager
         ))
     }
 
@@ -57,11 +64,15 @@ struct AgentModelsSettingsView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
-                recommendationBanner
+                scopeRoutingSection
+                if viewModel.showsRecommendationActions {
+                    recommendationBanner
+                }
                 oracleSection
                 contextBuilderSection
                 roleDefaultsSection
                 advancedSection
+                copySettingsSection
                 relatedSettingsSection
                 Spacer(minLength: 0)
             }
@@ -69,7 +80,26 @@ struct AgentModelsSettingsView: View {
             .padding(16)
         }
         .onAppear {
+            viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: workspaceName)
             viewModel.refresh()
+        }
+        .onChange(of: workspaceID) { _, newWorkspaceID in
+            viewModel.updateWorkspaceContext(workspaceID: newWorkspaceID, workspaceName: workspaceName)
+        }
+        .onChange(of: workspaceName) { _, newWorkspaceName in
+            viewModel.updateWorkspaceContext(workspaceID: workspaceID, workspaceName: newWorkspaceName)
+        }
+        .confirmationDialog(
+            "Copy workspace settings to global?",
+            isPresented: $showCopyWorkspaceToGlobalConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Copy to Global", role: .destructive) {
+                viewModel.copyWorkspaceSettingsToGlobal()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This overwrites the global Agent Models profile used by all workspaces that inherit global settings.")
         }
     }
 
@@ -90,8 +120,11 @@ struct AgentModelsSettingsView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
-                scopeChip(label: "Scope: Global", systemImage: "globe")
-                if let workspaceName, !workspaceName.isEmpty {
+                scopeChip(
+                    label: viewModel.effectiveScopeDescription,
+                    systemImage: viewModel.isEditingWorkspaceSettings ? "rectangle.stack.badge.person.crop" : "globe"
+                )
+                if let workspaceName = viewModel.workspaceDisplayName {
                     scopeChip(label: "Workspace: \(workspaceName)", systemImage: "rectangle.stack")
                 }
             }
@@ -110,6 +143,61 @@ struct AgentModelsSettingsView: View {
         .padding(.vertical, 4)
         .background(Color.secondary.opacity(0.08))
         .cornerRadius(4)
+    }
+
+    // MARK: - Scope routing
+
+    private var scopeRoutingSection: some View {
+        settingsCard {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: viewModel.isEditingWorkspaceSettings ? "slider.horizontal.3" : "globe")
+                        .foregroundColor(.accentColor)
+                    Text(viewModel.editingScopeTitle)
+                        .font(.headline)
+                    Spacer(minLength: 0)
+                }
+
+                if viewModel.hasWorkspace {
+                    Picker("Agent Models scope", selection: Binding(
+                        get: { viewModel.inheritanceMode },
+                        set: { viewModel.setInheritanceMode($0) }
+                    )) {
+                        Text("Use global settings").tag(AgentModelsInheritanceMode.useGlobalSettings)
+                        Text("Use workspace overrides").tag(AgentModelsInheritanceMode.useWorkspaceOverrides)
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("Agent Models inheritance mode")
+
+                    Text(scopeRoutingExplanation)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "info.circle")
+                            .foregroundColor(.secondary)
+                        Text(viewModel.noWorkspaceExplanation)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(8)
+                    .background(Color.primary.opacity(0.03))
+                    .cornerRadius(6)
+                }
+            }
+        }
+    }
+
+    private var scopeRoutingExplanation: String {
+        switch viewModel.inheritanceMode {
+        case .useGlobalSettings:
+            "This workspace inherits the global Agent Models profile. Changes below edit global settings."
+        case .useWorkspaceOverrides:
+            "This workspace uses its own complete Agent Models profile. Changes below do not affect other workspaces."
+        }
     }
 
     // MARK: - Recommendation Banner
@@ -231,7 +319,8 @@ struct AgentModelsSettingsView: View {
 
                 Spacer(minLength: 0)
 
-                if let recommendedName = viewModel.recommendedOracleModelName,
+                if viewModel.showsRecommendationActions,
+                   let recommendedName = viewModel.recommendedOracleModelName,
                    !viewModel.isOracleRecommendationSatisfied
                 {
                     Text("Recommended: \(recommendedName)")
@@ -263,7 +352,7 @@ struct AgentModelsSettingsView: View {
         settingsCard {
             sectionHeader(title: "Context Builder Agent", subtitle: "Used to discover files and build optimized context for Oracle, plans, and reviews.")
 
-            if promptVM.availableAgentKinds.isEmpty {
+            if !viewModel.hasConnectedCLIProvider {
                 HStack(spacing: 8) {
                     Image(systemName: "info.circle")
                         .foregroundColor(.secondary)
@@ -293,9 +382,9 @@ struct AgentModelsSettingsView: View {
                                 .font(.callout)
                                 .foregroundColor(.secondary)
                             AgentModelSelectionSummaryLabel(
-                                agentKind: promptVM.contextBuilderAgent,
-                                rawModel: promptVM.contextBuilderAgentModelRaw,
-                                title: "\(promptVM.contextBuilderAgent.displayName) · \(promptVM.contextBuilderAgentModelDisplayName)",
+                                agentKind: viewModel.selectedContextBuilderAgent,
+                                rawModel: viewModel.selectedContextBuilderModelRaw,
+                                title: "\(viewModel.selectedContextBuilderAgent.displayName) · \(viewModel.selectedContextBuilderDisplayName)",
                                 iconFont: .caption
                             )
                             .font(.callout)
@@ -311,7 +400,8 @@ struct AgentModelsSettingsView: View {
 
                     Spacer(minLength: 0)
 
-                    if let recommendedCB = viewModel.recommendedContextBuilderDescription,
+                    if viewModel.showsRecommendationActions,
+                       let recommendedCB = viewModel.recommendedContextBuilderDescription,
                        !viewModel.isContextBuilderRecommendationSatisfied
                     {
                         Text("Recommended: \(recommendedCB)")
@@ -529,6 +619,62 @@ struct AgentModelsSettingsView: View {
                 .padding(.top, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .transition(.opacity)
+            }
+        }
+    }
+
+    // MARK: - Copy Settings
+
+    @ViewBuilder
+    private var copySettingsSection: some View {
+        if viewModel.hasWorkspace {
+            settingsCard {
+                sectionHeader(
+                    title: "Copy settings",
+                    subtitle: "Move the complete Agent Models profile between global settings and this workspace."
+                )
+
+                if viewModel.isEditingWorkspaceSettings {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "arrow.up.doc")
+                            .foregroundColor(.accentColor)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Copy workspace settings to global")
+                                .font(.callout).bold()
+                            Text("Overwrite global Agent Models settings with this workspace’s current overrides. The workspace override stays active.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Copy to Global") {
+                            showCopyWorkspaceToGlobalConfirmation = true
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                } else {
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: "arrow.down.doc")
+                            .foregroundColor(.accentColor)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Copy global settings to workspace overrides")
+                                .font(.callout).bold()
+                            Text("Snapshot the current global Agent Models profile into this workspace and switch it to Use workspace overrides.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                        Button("Copy to Workspace") {
+                            viewModel.copyGlobalSettingsToWorkspaceOverrides()
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                }
             }
         }
     }
