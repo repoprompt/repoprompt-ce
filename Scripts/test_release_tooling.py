@@ -1166,6 +1166,27 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("missing required SwiftPM resource bundle directory", result.stderr)
         self.assertIn("KeyboardShortcuts_KeyboardShortcuts.bundle", result.stderr)
 
+    def test_resource_bundle_normalizer_rewrites_flat_keyboard_shortcuts_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = root / "RepoPrompt.app"
+            bundle = app / "Contents" / "Resources" / "KeyboardShortcuts_KeyboardShortcuts.bundle"
+            (bundle / "en.lproj").mkdir(parents=True)
+            (bundle / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
+            (bundle / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
+
+            result = subprocess.run(
+                [str(SCRIPT_DIR / "normalize_swiftpm_resource_bundles.sh"), str(app)],
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((bundle / "Contents" / "Info.plist").is_file())
+            self.assertTrue((bundle / "Contents" / "Resources" / "en.lproj" / "Localizable.strings").is_file())
+            self.assertFalse((bundle / "Info.plist").exists())
+            self.assertFalse((bundle / "en.lproj").exists())
+
     def test_staged_release_validator_rejects_missing_keyboard_shortcuts_patch_marker(self) -> None:
         approved, staged, scripts = self.make_staged_release_fixture()
         app = staged / ".build" / "release" / "RepoPrompt.app"
@@ -1972,9 +1993,10 @@ esac
 
     @staticmethod
     def write_keyboard_shortcuts_bundle(bundle: Path) -> None:
-        (bundle / "en.lproj").mkdir(parents=True, exist_ok=True)
-        (bundle / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
-        (bundle / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
+        resources = bundle / "Contents" / "Resources"
+        (resources / "en.lproj").mkdir(parents=True, exist_ok=True)
+        (bundle / "Contents" / "Info.plist").write_text("<plist/>\n", encoding="utf-8")
+        (resources / "en.lproj" / "Localizable.strings").write_text('"record_shortcut" = "Record Shortcut";\n', encoding="utf-8")
 
     @staticmethod
     def run_staged_validation(approved: Path, staged: Path, scripts: Path) -> subprocess.CompletedProcess[str]:

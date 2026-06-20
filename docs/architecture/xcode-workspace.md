@@ -20,7 +20,7 @@ The generator writes `.build/xcode/RepoPromptCE.xcworkspace`. Everything under `
 
 Xcode exposes SwiftPM product schemes, including `RepoPrompt` and `repoprompt-mcp`, alongside three repository convenience schemes:
 
-- `RepoPrompt CE App` delegates to conductor to assemble the real debug app through the existing packaging flow, then runs `.build/debug/RepoPrompt.app`.
+- `RepoPrompt CE App` delegates to conductor to assemble the real debug app through the existing packaging flow, verifies the `.build/debug/RepoPrompt.app` compatibility path, then runs the local debug bundle under `~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`.
 - `RepoPrompt CE MCP` delegates to conductor to build and run `.build/debug/repoprompt-mcp`.
 - `RepoPrompt CE Tests` delegates to the conductor test runner. It is a legacy build target rather than a native Xcode test bundle because `RepoPromptMCP` is an executable-only SwiftPM target.
 

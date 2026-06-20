@@ -103,10 +103,15 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertIn(generator.MCP_SCHEME, project)
         self.assertIn(generator.TEST_SCHEME, project)
 
+    def test_convenience_targets_do_not_pass_xcode_build_settings(self) -> None:
+        project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
+        self.assertEqual(project.count("passBuildSettingsInEnvironment = 0;"), 3)
+        self.assertNotIn("passBuildSettingsInEnvironment = 1;", project)
+
     def test_app_scheme_has_runnable_markers_and_prepare_action(self) -> None:
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.APP_SCHEME}.xcscheme"
         scheme = self.outputs[path].decode()
-        self.assertIn(".build/debug/RepoPrompt.app", scheme)
+        self.assertIn(str(generator.DEFAULT_DEBUG_APP_BUNDLE), scheme)
         self.assertIn("REPOPROMPT_LAUNCH_SOURCE", scheme)
         self.assertIn("__XCODE_BUILT_PRODUCTS_DIR_PATHS", scheme)
         self.assertIn("prepare-app-run", scheme)
@@ -127,6 +132,15 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
             expected_working_directory,
         )
         self.assertTrue(Path(expected_working_directory).is_dir())
+        expected_runnable = str(generator.DEFAULT_DEBUG_APP_BUNDLE)
+        self.assertEqual(
+            launch_action.find("PathRunnable").attrib["FilePath"],
+            expected_runnable,
+        )
+        self.assertEqual(
+            profile_action.find("PathRunnable").attrib["FilePath"],
+            expected_runnable,
+        )
 
         environment = {
             item.attrib["key"]: item.attrib["value"]

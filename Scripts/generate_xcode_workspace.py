@@ -36,6 +36,9 @@ TEST_SCHEME = "RepoPrompt CE Tests"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DESTINATION = REPO_ROOT / ".build/xcode"
 CUSTOM_DESTINATION_ROOT = REPO_ROOT / ".build/xcode-custom"
+DEFAULT_DEBUG_APP_BUNDLE = (
+    Path.home() / "Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app"
+)
 
 
 class GeneratorError(RuntimeError):
@@ -108,12 +111,14 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
         if isinstance(value, list):
             unsafe_flags.append(value)
-    required_flags = [
-        "-import-objc-header",
-        "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
-        "-disable-bridging-pch",
-    ]
-    if required_flags not in unsafe_flags:
+    expected_header = repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
+    if not any(
+        len(flags) == 3
+        and flags[0] == "-import-objc-header"
+        and Path(flags[1]) == expected_header
+        and flags[2] == "-disable-bridging-pch"
+        for flags in unsafe_flags
+    ):
         raise GeneratorError(
             "RepoPrompt must retain the Objective-C bridging-header unsafe flags"
         )
@@ -266,7 +271,7 @@ def render_project(repository_relative_path: str) -> str:
 \t\t\tdependencies = (
 \t\t\t);
 \t\t\tname = \"{APP_SCHEME}\";
-\t\t\tpassBuildSettingsInEnvironment = 1;
+\t\t\tpassBuildSettingsInEnvironment = 0;
 \t\t\tproductName = \"{APP_SCHEME}\";
 \t\t}};
 \t\t{mcp_target_id} /* {MCP_SCHEME} */ = {{
@@ -280,7 +285,7 @@ def render_project(repository_relative_path: str) -> str:
 \t\t\tdependencies = (
 \t\t\t);
 \t\t\tname = \"{MCP_SCHEME}\";
-\t\t\tpassBuildSettingsInEnvironment = 1;
+\t\t\tpassBuildSettingsInEnvironment = 0;
 \t\t\tproductName = \"{MCP_SCHEME}\";
 \t\t}};
 \t\t{test_target_id} /* {TEST_SCHEME} */ = {{
@@ -294,7 +299,7 @@ def render_project(repository_relative_path: str) -> str:
 \t\t\tdependencies = (
 \t\t\t);
 \t\t\tname = \"{TEST_SCHEME}\";
-\t\t\tpassBuildSettingsInEnvironment = 1;
+\t\t\tpassBuildSettingsInEnvironment = 0;
 \t\t\tproductName = \"{TEST_SCHEME}\";
 \t\t}};
 /* End PBXLegacyTarget section */
@@ -374,14 +379,14 @@ def render_project(repository_relative_path: str) -> str:
 def render_scheme(
     name: str,
     target_label: str,
-    runnable_relative_path: str,
+    runnable_path: str,
     app: bool,
     repository_relative_path: str,
     working_directory: Path,
 ) -> str:
     target_id = stable_id(target_label)
     repository_path = f"$(PROJECT_DIR)/{repository_relative_path}"
-    runnable_path = f"{repository_path}/{runnable_relative_path}"
+    escaped_runnable_path = xml_escape(runnable_path)
     escaped_working_directory = xml_escape(str(working_directory))
     environment = ""
     preactions = ""
@@ -416,10 +421,10 @@ def render_scheme(
       <Testables/>
    </TestAction>
    <LaunchAction buildConfiguration = "Debug" selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB" launchStyle = "0" useCustomWorkingDirectory = "YES" customWorkingDirectory = "{escaped_working_directory}" ignoresPersistentStateOnLaunch = "NO" debugDocumentVersioning = "YES" debugServiceExtension = "internal" allowLocationSimulation = "YES">{preactions}
-      <PathRunnable runnableDebuggingMode = "0" FilePath = "{runnable_path}"/>{environment}
+      <PathRunnable runnableDebuggingMode = "0" FilePath = "{escaped_runnable_path}"/>{environment}
    </LaunchAction>
    <ProfileAction buildConfiguration = "Debug" shouldUseLaunchSchemeArgsEnv = "YES" savedToolIdentifier = "" useCustomWorkingDirectory = "YES" customWorkingDirectory = "{escaped_working_directory}" debugDocumentVersioning = "YES">
-      <PathRunnable runnableDebuggingMode = "0" FilePath = "{runnable_path}"/>
+      <PathRunnable runnableDebuggingMode = "0" FilePath = "{escaped_runnable_path}"/>
    </ProfileAction>
    <AnalyzeAction buildConfiguration = "Debug"/>
    <ArchiveAction buildConfiguration = "Release" revealArchiveInOrganizer = "NO"/>
@@ -473,9 +478,11 @@ test action is not the supported test workflow because Xcode does not expose the
 XCFramework also declares an omitted dSYMs directory; this generator deliberately does
 not mutate `Vendor/` to compensate. Use the convenience schemes above.
 
-Xcode does not expand project macros in an external runnable's custom working-directory
-field, so generated schemes record the current worktree root there. Regenerate after
-moving the checkout; all other repository references remain relative.
+Xcode does not expand project macros reliably for every external runnable field. The
+generated app scheme records the current worktree root as the working directory and the
+local debug app bundle path as the Run/Profile runnable. Regenerate after moving the
+checkout or changing the local debug app bundle location; build-time repository
+references remain relative.
 """
 
 
@@ -526,7 +533,7 @@ def render_outputs(
         Path(PROJECT_NAME) / f"xcshareddata/xcschemes/{APP_SCHEME}.xcscheme": render_scheme(
             APP_SCHEME,
             "target:app",
-            ".build/debug/RepoPrompt.app",
+            str(DEFAULT_DEBUG_APP_BUNDLE),
             app=True,
             repository_relative_path=relative_repo,
             working_directory=repo_root,
@@ -534,7 +541,7 @@ def render_outputs(
         Path(PROJECT_NAME) / f"xcshareddata/xcschemes/{MCP_SCHEME}.xcscheme": render_scheme(
             MCP_SCHEME,
             "target:mcp",
-            ".build/debug/repoprompt-mcp",
+            f"$(PROJECT_DIR)/{relative_repo}/.build/debug/repoprompt-mcp",
             app=False,
             repository_relative_path=relative_repo,
             working_directory=repo_root,
