@@ -16,6 +16,26 @@ extension MCPServerViewModel {
         let context: TabScopedContext
     }
 
+    struct ContextBuilderCommittedTabSnapshot {
+        let identity: WorkspaceSelectionIdentity
+        let nestedRunID: UUID
+        let tab: ComposeTabState
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
+    struct ContextBuilderTabContextCommitResult {
+        let outcome: ContextBuilderTabContextCommitOutcome
+        let committedTab: ContextBuilderCommittedTabSnapshot?
+    }
+
+    private struct CommittedTabWrite {
+        let identity: WorkspaceSelectionIdentity
+        let tab: ComposeTabState
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
     enum ContextBuilderTabContextCommitOutcome: Equatable {
         case committed
         case staleOrNoLongerCurrent
@@ -175,6 +195,8 @@ extension MCPServerViewModel {
         let windowID: Int
         let workspaceID: UUID?
         var promptText: String
+        /// True when terminal commit copied assistant output into an otherwise empty prompt.
+        var usedAgentOutputAsPrompt: Bool
         var selection: StoredSelection
         /// Monotonic canonical selection revision observed when this snapshot last synchronized.
         /// A final commit uses it to avoid overwriting selection persisted by a newer connection.
@@ -210,6 +232,7 @@ extension MCPServerViewModel {
             windowID: Int,
             workspaceID: UUID?,
             promptText: String,
+            usedAgentOutputAsPrompt: Bool = false,
             selection: StoredSelection,
             selectionRevision: UInt64 = 0,
             selectedMetaPromptIDs: [UUID],
@@ -227,6 +250,7 @@ extension MCPServerViewModel {
             self.windowID = windowID
             self.workspaceID = workspaceID
             self.promptText = promptText
+            self.usedAgentOutputAsPrompt = usedAgentOutputAsPrompt
             self.selection = selection
             self.selectionRevision = selectionRevision
             self.selectedMetaPromptIDs = selectedMetaPromptIDs
@@ -3813,11 +3837,15 @@ extension MCPServerViewModel {
         expectedRunID: UUID,
         isStillCurrent: @MainActor () -> Bool,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
-        deferRunMappingCleanupUntilCaller: Bool = false
-    ) async -> ContextBuilderTabContextCommitOutcome {
+        deferRunMappingCleanupUntilCaller: Bool = false,
+        promptFallback: String? = nil
+    ) async -> ContextBuilderTabContextCommitResult {
         guard isStillCurrent(), !Task.isCancelled else {
             discardDetachedContextBuilderTabContext(runID: expectedRunID)
-            return .staleOrNoLongerCurrent
+            return ContextBuilderTabContextCommitResult(
+                outcome: .staleOrNoLongerCurrent,
+                committedTab: nil
+            )
         }
 
         let alreadyFinishedAutoSelection: Bool
@@ -3833,10 +3861,24 @@ extension MCPServerViewModel {
             tabContextByConnectionID[connectionID] = detached.context
             alreadyFinishedAutoSelection = true
         } else {
-            return .missingFinalContext(runID: expectedRunID, connectionID: connectionID)
+            return ContextBuilderTabContextCommitResult(
+                outcome: .missingFinalContext(runID: expectedRunID, connectionID: connectionID),
+                committedTab: nil
+            )
         }
 
-        let committed = await commitAndClearTabContext(
+        if var finalContext = tabContextByConnectionID[connectionID],
+           finalContext.runID == expectedRunID,
+           finalContext.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let promptFallback,
+           !promptFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            finalContext.promptText = promptFallback
+            finalContext.usedAgentOutputAsPrompt = true
+            tabContextByConnectionID[connectionID] = finalContext
+        }
+
+        let committedWrite = await commitAndClearTabContextSnapshot(
             connectionID: connectionID,
             expectedRunID: expectedRunID,
             isStillCurrent: isStillCurrent,
@@ -3852,13 +3894,29 @@ extension MCPServerViewModel {
             detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
         }
 
-        if committed {
-            return .committed
+        if let committedWrite {
+            let committedTab = ContextBuilderCommittedTabSnapshot(
+                identity: committedWrite.identity,
+                nestedRunID: expectedRunID,
+                tab: committedWrite.tab,
+                selectionRevision: committedWrite.selectionRevision,
+                usedAgentOutputAsPrompt: committedWrite.usedAgentOutputAsPrompt
+            )
+            return ContextBuilderTabContextCommitResult(
+                outcome: .committed,
+                committedTab: committedTab
+            )
         }
         if !isStillCurrent() || Task.isCancelled {
-            return .staleOrNoLongerCurrent
+            return ContextBuilderTabContextCommitResult(
+                outcome: .staleOrNoLongerCurrent,
+                committedTab: nil
+            )
         }
-        return .failed("Context Builder could not commit its final context for run \(expectedRunID.uuidString).")
+        return ContextBuilderTabContextCommitResult(
+            outcome: .failed("Context Builder could not commit its final context for run \(expectedRunID.uuidString)."),
+            committedTab: nil
+        )
     }
 
     @MainActor
@@ -3871,10 +3929,29 @@ extension MCPServerViewModel {
         deferRunMappingCleanupUntilCaller: Bool = false,
         readFileAutoSelectionAlreadyFinished: Bool = false
     ) async -> Bool {
+        await commitAndClearTabContextSnapshot(
+            connectionID: connectionID,
+            expectedRunID: expectedRunID,
+            isStillCurrent: isStillCurrent,
+            progressReporter: progressReporter,
+            deferRunMappingCleanupUntilCaller: deferRunMappingCleanupUntilCaller,
+            readFileAutoSelectionAlreadyFinished: readFileAutoSelectionAlreadyFinished
+        ) != nil
+    }
+
+    @MainActor
+    private func commitAndClearTabContextSnapshot(
+        connectionID: UUID,
+        expectedRunID: UUID? = nil,
+        isStillCurrent: @MainActor () -> Bool = { true },
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        deferRunMappingCleanupUntilCaller: Bool = false,
+        readFileAutoSelectionAlreadyFinished: Bool = false
+    ) async -> CommittedTabWrite? {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
         // but it cannot invalidate this locally owned snapshot.
-        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return false }
+        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return nil }
 
         // Decide whether we will commit stored UI state for this context.
         // Mismatch or logical cancellation => clear binding only.
@@ -3918,25 +3995,20 @@ extension MCPServerViewModel {
             connectionIDToRunID.removeValue(forKey: connectionID)
         }
 
-        guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return false }
+        guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return nil }
 
         tabContextLog("commitAndClearTabContext committing tab=\(commitOwnedContext.tabID) connectionID=\(connectionID) runID=\(commitOwnedContext.runID?.uuidString ?? "nil")")
 
         // IMPORTANT: Await the commit to ensure tab state is written before caller reads it.
         // The immutable payload remains owned by this run even if transport cleanup proceeds.
         await progressReporter?(.tabContextCommit)
-        let didCommit = await commitTabContext(commitOwnedContext, isStillCurrent: isStillCurrent)
-        guard didCommit, isStillCurrent(), !Task.isCancelled else { return false }
+        guard let committedTab = await commitTabContext(
+            commitOwnedContext,
+            isStillCurrent: isStillCurrent
+        ), isStillCurrent(), !Task.isCancelled else { return nil }
 
-        var discoveredTabName: String?
-        if let manager = workspaceManager,
-           let tab = manager.composeTab(with: commitOwnedContext.tabID)
-        {
-            discoveredTabName = tab.name
-        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == commitOwnedContext.tabID }) {
-            discoveredTabName = tab.name
-        }
-        if let tabName = discoveredTabName, !tabName.isEmpty {
+        if !committedTab.tab.name.isEmpty {
+            let tabName = committedTab.tab.name
             NotificationService.shared.notifyContextBuilderComplete(
                 tabName: tabName,
                 fallbackToDockBounce: true
@@ -3944,10 +4016,11 @@ extension MCPServerViewModel {
         }
 
         // End-of-run flush: persist this run's final state to disk (coalesced by DiskWriter)
-        guard let manager = workspaceManager else { return false }
+        guard let manager = workspaceManager else { return nil }
         await progressReporter?(.statePersistence)
         await manager.pollAndSaveStateAsync(source: .mcpTabContextEndOfRun)
-        return isStillCurrent() && !Task.isCancelled
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        return committedTab
     }
 
     #if DEBUG
@@ -4086,11 +4159,11 @@ extension MCPServerViewModel {
     private func commitTabContext(
         _ context: TabScopedContext,
         isStillCurrent: @MainActor () -> Bool = { true }
-    ) async -> Bool {
-        guard isStillCurrent(), !Task.isCancelled else { return false }
+    ) async -> CommittedTabWrite? {
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
         guard let manager = workspaceManager else {
             tabContextLog("[warning] commitTabContext missing workspace manager for windowID \(context.windowID); skipping commit.")
-            return false
+            return nil
         }
         tabContextLog("commitTabContext using workspaceManager \(ObjectIdentifier(manager)) for context.windowID=\(context.windowID) self.windowID=\(windowID)")
         let targetWorkspaceID = context.workspaceID ?? manager.activeWorkspace?.id
@@ -4099,7 +4172,7 @@ extension MCPServerViewModel {
               let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == context.tabID })
         else {
             tabContextLog("[warning] commitTabContext skipping commit for tab \(context.tabID) – workspace unavailable.")
-            return false
+            return nil
         }
 
         var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
@@ -4115,6 +4188,10 @@ extension MCPServerViewModel {
             updatedTab.selection = context.selection
         }
         updatedTab.promptText = context.promptText
+        if context.usedAgentOutputAsPrompt {
+            updatedTab.contextOverrides.useOverridePrompt = false
+            updatedTab.contextOverrides.overridePromptText = ""
+        }
         updatedTab.selectedMetaPromptIDs = context.selectedMetaPromptIDs
         updatedTab.lastModified = Date()
 
@@ -4127,20 +4204,35 @@ extension MCPServerViewModel {
         }
 
         // 1) Persist to backing store without publishing UI snapshots (prevents tool echo)
-        guard isStillCurrent(), !Task.isCancelled else { return false }
-        _ = manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID)
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        guard manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID) else { return nil }
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        guard let storedTab = manager.composeTab(for: identity),
+              storedTab.selection == updatedTab.selection
+        else { return nil }
+        let committedSelectionRevision = manager.selectionRevisionForMCP(
+            workspaceID: identity.workspaceID,
+            tabID: identity.tabID
+        )
+        guard committedSelectionRevision >= context.selectionRevision else { return nil }
+        let committedTab = CommittedTabWrite(
+            identity: identity,
+            tab: storedTab,
+            selectionRevision: committedSelectionRevision,
+            usedAgentOutputAsPrompt: context.usedAgentOutputAsPrompt
+        )
         tabContextLog("commitTabContext stored selection/prompt tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil") workspaceID=\(workspaceID)")
 
         // 2) Apply to live UI ONLY if this tab is the active tab and the run still owns commit.
         guard isActive else {
             tabContextLog("commitTabContext skipping live UI apply (tab not active) tab=\(updatedTab.id)")
-            return true
+            return committedTab
         }
         guard !canonicalSelectionAdvanced else {
             tabContextLog("commitTabContext skipping stale live UI apply tab=\(updatedTab.id)")
-            return true
+            return committedTab
         }
-        guard isStillCurrent(), !Task.isCancelled else { return false }
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
 
         let applyTab = updatedTab
 
@@ -4150,6 +4242,7 @@ extension MCPServerViewModel {
         await manager.applyComposeTabState(applyTab)
         manager.endApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext UI applied: tab=\(applyTab.id)")
-        return isStillCurrent() && !Task.isCancelled
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        return committedTab
     }
 }

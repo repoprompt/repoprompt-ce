@@ -90,6 +90,12 @@ private struct ContextBuilderToolResult: Codable {
     }
 }
 
+enum ContextBuilderResponseDisposition {
+    case contextOnly
+    case generate(HeadlessMode)
+    case failed(String)
+}
+
 @MainActor
 final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
     let group: MCPWindowToolGroup = .contextBuilder
@@ -205,6 +211,13 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         } ?? activeWorkspace
         let workspaceContext = tabResolution.workspaceContext
         let lookupContext = workspaceContext?.lookupContext ?? tabResolution.lookupContext
+        let resolvedIdentity = WorkspaceSelectionIdentity(
+            workspaceID: tabResolution.workspaceID ?? workspace.id,
+            tabID: finalTabID
+        )
+        guard let initialResultTab = targetWindow.workspaceManager.composeTab(for: resolvedIdentity) else {
+            throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
+        }
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -347,21 +360,55 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "Context Builder run complete, building selection..."
                 )
 
-                let resultTab = await MainActor.run {
-                    snapshot.finalState ?? targetWindow.workspaceManager.composeTab(with: finalTabID)
-                }
-                guard let resultTab else {
-                    throw MCPError.internalError("Tab state missing after Context Builder run")
+                let resultTab: ComposeTabState
+                switch snapshot.terminalDisposition {
+                case .completed:
+                    guard let committedTab = snapshot.committedTab else {
+                        throw MCPError.internalError(
+                            "Context Builder completed without an exact committed tab snapshot"
+                        )
+                    }
+                    guard committedTab.nestedRunID == snapshot.runID,
+                          committedTab.identity == resolvedIdentity,
+                          committedTab.tab.id == finalTabID
+                    else {
+                        throw MCPError.internalError(
+                            "Context Builder committed tab identity does not match the completed run"
+                        )
+                    }
+                    let canonicalState = await MainActor.run { () -> (ComposeTabState?, UInt64) in
+                        let manager = targetWindow.workspaceManager
+                        return (
+                            manager.composeTab(for: committedTab.identity),
+                            manager.selectionRevisionForMCP(
+                                workspaceID: committedTab.identity.workspaceID,
+                                tabID: committedTab.identity.tabID
+                            )
+                        )
+                    }
+                    guard let canonicalTab = canonicalState.0,
+                          canonicalState.1 >= committedTab.selectionRevision,
+                          canonicalState.1 != committedTab.selectionRevision ||
+                          canonicalTab.selection == committedTab.tab.selection
+                    else {
+                        throw MCPError.internalError(
+                            "Context Builder committed tab snapshot is no longer valid"
+                        )
+                    }
+                    resultTab = committedTab.tab
+                case .cancelled, .failed:
+                    // Genuine discovery failures retain the exact immutable pre-run tab instead of
+                    // falling back to an active or duplicate tab after child cleanup.
+                    resultTab = initialResultTab
                 }
 
                 let overrides = resultTab.contextOverrides
                 let effectivePrompt = overrides.useOverridePrompt ? overrides.overridePromptText : resultTab.promptText
 
-                let status = switch snapshot.runState {
+                let status = switch snapshot.terminalDisposition {
                 case .completed: "completed"
                 case .cancelled: "cancelled"
                 case let .failed(message): "failed: \(message)"
-                default: "completed"
                 }
 
                 try workspaceContext?.validateAvailability()
@@ -383,13 +430,19 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 var followUpHint: String? = nil
                 var oracleExportFile: OracleExportFile? = nil
 
-                let mode = responseType?.headlessMode
+                let responseDisposition = Self.responseDisposition(
+                    responseType: responseType,
+                    terminalDisposition: snapshot.terminalDisposition,
+                    usedAgentOutputAsPrompt: snapshot.usedAgentOutputAsPrompt,
+                    effectivePrompt: effectivePrompt
+                )
 
-                if let mode,
-                   snapshot.runState == .completed,
-                   !snapshot.usedAgentOutputAsPrompt,
-                   !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                {
+                switch responseDisposition {
+                case .contextOnly:
+                    break
+                case let .failed(message):
+                    throw MCPError.internalError(message)
+                case let .generate(mode):
                     try Task.checkCancellation()
 
                     let modeLabel = responseType?.generationLabel ?? "question"
@@ -515,6 +568,35 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 )
             }
             return try await runContextBuilderAndPlan()
+        }
+    }
+
+    nonisolated static func responseDisposition(
+        responseType: ContextBuilderResponseType?,
+        terminalDisposition: ContextBuilderRunTerminalOutcome,
+        usedAgentOutputAsPrompt: Bool,
+        effectivePrompt: String
+    ) -> ContextBuilderResponseDisposition {
+        guard responseType?.wantsResponse == true else { return .contextOnly }
+
+        switch terminalDisposition {
+        case .cancelled, .failed:
+            return .contextOnly
+        case .completed:
+            guard !usedAgentOutputAsPrompt else {
+                return .failed(
+                    "Context Builder completed without a typed direct response for the requested \(responseType?.rawValue ?? "response")"
+                )
+            }
+            guard !effectivePrompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return .failed(
+                    "Context Builder completed without a prompt for the requested \(responseType?.rawValue ?? "response")"
+                )
+            }
+            guard let mode = responseType?.headlessMode else {
+                return .failed("Context Builder requested response mode is unavailable")
+            }
+            return .generate(mode)
         }
     }
 

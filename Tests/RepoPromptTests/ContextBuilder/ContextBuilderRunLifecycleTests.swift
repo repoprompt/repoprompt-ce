@@ -13,7 +13,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let ownership = session.beginRunAttempt(source: "test")
         var capturedRecord: ContextBuilderRunRecord?
 
-        let waiter = Task<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error> { @MainActor in
+        let waiter = Task<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error> { @MainActor in
             try await withCheckedThrowingContinuation { continuation in
                 capturedRecord = ContextBuilderRunRecord(
                     runID: UUID(),
@@ -41,19 +41,91 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
         let continuation = try XCTUnwrap(record.takeContinuation())
         XCTAssertNil(record.takeContinuation())
         continuation.resume(
-            returning: ContextBuilderAgentViewModel.ContextBuilderRunSnapshot(
+            returning: ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion(
                 runID: record.runID,
                 tabID: tabID,
-                finalState: nil,
-                runState: .completed,
+                terminalDisposition: .completed,
                 agentOutput: "done",
-                usedAgentOutputAsPrompt: false
+                usedAgentOutputAsPrompt: false,
+                committedTab: nil
             )
         )
 
         let snapshot = try await waiter.value
         XCTAssertEqual(snapshot.runID, record.runID)
         XCTAssertEqual(snapshot.agentOutput, "done")
+    }
+
+    func testTerminalCommitCapturesPromptFallbackBeforeContextCleanup() async throws {
+        let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+        GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+        let window = WindowState()
+        GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+        WindowStatesManager.shared.registerWindowState(window)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        await window.workspaceManager.awaitInitialized()
+
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ContextBuilderPromptFallbackTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let workspace = window.workspaceManager.createWorkspace(
+            name: "Context Builder prompt fallback test",
+            repoPaths: [root.path],
+            ephemeral: true
+        )
+        await window.workspaceManager.switchWorkspace(
+            to: workspace,
+            saveState: false,
+            reason: "ContextBuilderRunLifecycleTests.promptFallback"
+        )
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let tabID = try XCTUnwrap(
+            window.workspaceManager.activeWorkspace?.activeComposeTabID
+                ?? window.workspaceManager.activeWorkspace?.composeTabs.first?.id
+        )
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        var tab = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        tab.promptText = ""
+        tab.contextOverrides.useOverridePrompt = true
+        tab.contextOverrides.overridePromptText = "stale override"
+        XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: workspaceID))
+
+        let connectionID = UUID()
+        let runID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "context-builder-prompt-fallback-test",
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID,
+            runID: runID
+        )
+
+        let result = await window.mcpServer.commitContextBuilderTabContext(
+            connectionID: connectionID,
+            expectedRunID: runID,
+            isStillCurrent: { true },
+            promptFallback: "Discovery response"
+        )
+        let committed = try XCTUnwrap(result.committedTab)
+        XCTAssertEqual(result.outcome, .committed)
+        XCTAssertTrue(committed.usedAgentOutputAsPrompt)
+        XCTAssertEqual(committed.tab.promptText, "Discovery response")
+        XCTAssertFalse(committed.tab.contextOverrides.useOverridePrompt)
+        XCTAssertEqual(committed.tab.contextOverrides.overridePromptText, "")
+
+        let stored = try XCTUnwrap(window.workspaceManager.composeTab(for: identity))
+        XCTAssertEqual(stored.promptText, committed.tab.promptText)
+        XCTAssertEqual(stored.contextOverrides, committed.tab.contextOverrides)
+        XCTAssertEqual(
+            window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            ),
+            committed.selectionRevision
+        )
     }
 
     func testSuccessfulCommitPrecedesChildTerminationAndCleanupWaitsForJoin() async {
@@ -302,7 +374,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 expectedRunID: runID,
                 isStillCurrent: { true }
             )
-            XCTAssertEqual(commitOutcome, .committed)
+            XCTAssertEqual(commitOutcome.outcome, .committed)
+            XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, runID)
+            XCTAssertEqual(commitOutcome.committedTab?.identity.workspaceID, activeWorkspace.id)
+            XCTAssertEqual(commitOutcome.committedTab?.identity.tabID, tabID)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
             XCTAssertFalse(
                 window.mcpServer.isDetachedContextBuilderConnection(
@@ -317,7 +392,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 isStillCurrent: { true }
             )
             XCTAssertEqual(
-                secondCommitOutcome,
+                secondCommitOutcome.outcome,
                 .missingFinalContext(runID: runID, connectionID: connectionID)
             )
 
@@ -396,7 +471,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                             isStillCurrent: { true },
                             deferRunMappingCleanupUntilCaller: true
                         )
-                        return outcome == .committed
+                        return outcome.outcome == .committed
                     },
                     beforeTerminationRequest: {},
                     requestTermination: { requestedID in
@@ -465,7 +540,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 isStillCurrent: { true }
             )
             XCTAssertEqual(
-                transitioningSecondCommit,
+                transitioningSecondCommit.outcome,
                 .missingFinalContext(
                     runID: transitioningRunID,
                     connectionID: transitioningConnectionID
@@ -519,7 +594,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 expectedRunID: cancelledRunID,
                 isStillCurrent: { false }
             )
-            XCTAssertEqual(cancelledOutcome, .staleOrNoLongerCurrent)
+            XCTAssertEqual(cancelledOutcome.outcome, .staleOrNoLongerCurrent)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, transitioningPrompt)
             XCTAssertFalse(
                 window.mcpServer.isDetachedContextBuilderConnection(
@@ -578,7 +653,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                     isStillCurrent: { true }
                 )
                 XCTAssertEqual(
-                    excludedCommitOutcome,
+                    excludedCommitOutcome.outcome,
                     .missingFinalContext(
                         runID: excludedRunID,
                         connectionID: excludedConnectionID
@@ -629,10 +704,15 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
                 authoritative: false
             )
 
-            let missingOutcome = MCPServerViewModel.ContextBuilderTabContextCommitOutcome
-                .missingFinalContext(runID: cancelledRunID, connectionID: cancelledConnectionID)
+            let missingResult = MCPServerViewModel.ContextBuilderTabContextCommitResult(
+                outcome: .missingFinalContext(
+                    runID: cancelledRunID,
+                    connectionID: cancelledConnectionID
+                ),
+                committedTab: nil
+            )
             guard case let .failed(message) = ContextBuilderAgentViewModel.terminalOutcome(
-                forContextCommitOutcome: missingOutcome
+                forContextCommitResult: missingResult
             ) else {
                 return XCTFail("Missing final ownership must be classified as failed")
             }

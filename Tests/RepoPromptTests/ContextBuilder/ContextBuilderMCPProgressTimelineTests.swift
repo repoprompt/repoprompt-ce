@@ -378,6 +378,75 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
         #endif
     }
 
+    func testResponseDispositionRoutesRequestedModesAndFailsClosedOnMissingFollowUpState() {
+        func assertGenerates(
+            _ responseType: ContextBuilderResponseType,
+            expectedMode: String,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) {
+            let disposition = MCPContextBuilderToolProvider.responseDisposition(
+                responseType: responseType,
+                terminalDisposition: .completed,
+                usedAgentOutputAsPrompt: false,
+                effectivePrompt: "Committed prompt"
+            )
+            guard case let .generate(mode) = disposition else {
+                return XCTFail("Expected generate for \(responseType.rawValue)", file: file, line: line)
+            }
+            XCTAssertEqual(mode.mcpModeName, expectedMode, file: file, line: line)
+        }
+
+        assertGenerates(.plan, expectedMode: "plan")
+        assertGenerates(.review, expectedMode: "review")
+        assertGenerates(.question, expectedMode: "chat")
+
+        for responseType in [ContextBuilderResponseType?.none, .some(.clarify)] {
+            guard case .contextOnly = MCPContextBuilderToolProvider.responseDisposition(
+                responseType: responseType,
+                terminalDisposition: .completed,
+                usedAgentOutputAsPrompt: false,
+                effectivePrompt: "Committed prompt"
+            ) else {
+                return XCTFail("Context-only response type must not generate a follow-up")
+            }
+        }
+
+        for terminalDisposition in [
+            ContextBuilderRunTerminalOutcome.cancelled,
+            .failed("discovery failed")
+        ] {
+            guard case .contextOnly = MCPContextBuilderToolProvider.responseDisposition(
+                responseType: .plan,
+                terminalDisposition: terminalDisposition,
+                usedAgentOutputAsPrompt: false,
+                effectivePrompt: "Committed prompt"
+            ) else {
+                return XCTFail("Failed or cancelled discovery must preserve its terminal result")
+            }
+        }
+
+        guard case let .failed(directResponseError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .plan,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: true,
+            effectivePrompt: "Agent output"
+        ) else {
+            return XCTFail("Untyped agent output must not silently satisfy a requested response")
+        }
+        XCTAssertTrue(directResponseError.contains("typed direct response"))
+
+        guard case let .failed(emptyPromptError) = MCPContextBuilderToolProvider.responseDisposition(
+            responseType: .review,
+            terminalDisposition: .completed,
+            usedAgentOutputAsPrompt: false,
+            effectivePrompt: "  \n"
+        ) else {
+            return XCTFail("Empty committed prompt must fail a requested response")
+        }
+        XCTAssertTrue(emptyPromptError.contains("without a prompt"))
+    }
+
     @MainActor
     func testCommitAndClearTabContextReportsPersistenceSubphasesInOrder() async throws {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
