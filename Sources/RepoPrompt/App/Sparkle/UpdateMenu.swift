@@ -13,9 +13,7 @@ import SwiftUI
 
 /// Main Commands implementation – now identical in behaviour to the Settings UI
 struct UpdateMenu: Commands {
-    private var sparkleManager: SparkleUpdaterManager {
-        SparkleUpdaterManager.shared
-    }
+    @ObservedObject var sparkleManager: SparkleUpdaterManager
 
     var body: some Commands {
         CommandGroup(after: .appInfo) {
