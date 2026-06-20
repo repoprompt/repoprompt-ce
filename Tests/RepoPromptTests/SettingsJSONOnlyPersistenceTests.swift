@@ -143,7 +143,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
     func testWorktreeVisualIdentityDecodesMissingUXFieldsWithDefaults() throws {
         let json = """
-        {"schemaVersion":2,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{"worktreeVisualIdentitiesByRepositoryID":{"gitrepo_alpha":{"identitiesByWorktreeID":{"wt_feature":{"label":"Feature","colorHex":"#112233"}}}}},"scalarPreferences":{}}
+        {"schemaVersion":4,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{"worktreeVisualIdentitiesByRepositoryID":{"gitrepo_alpha":{"identitiesByWorktreeID":{"wt_feature":{"label":"Feature","colorHex":"#112233"}}}}},"scalarPreferences":{}}
         """
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
@@ -168,7 +168,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
     }
 
     func testWorktreeVisualIdentityDecodesMissingFieldWithoutSchemaBump() throws {
-        let json = #"{"schemaVersion":2,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{}}"#
+        let json = #"{"schemaVersion":4,"updatedAt":"2026-05-20T00:00:00Z","copySettingsByWorkspaceID":{},"chatSettingsByWorkspaceID":{},"globalDefaults":{},"scalarPreferences":{}}"#
         let temp = try makeTempDirectory()
         defer { try? FileManager.default.removeItem(at: temp) }
         let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
@@ -180,7 +180,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             fileStore: GlobalSettingsFileStore(fileURL: fileURL)
         )
 
-        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 2)
+        XCTAssertEqual(GlobalSettingsDocument.currentSchemaVersion, 4)
         XCTAssertTrue(store.worktreeVisualIdentitiesByRepositoryID().isEmpty)
     }
 
@@ -331,10 +331,536 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertTrue(reloaded.showDatesInMessageTimestamps())
     }
 
+    func testAgentModelsMissingDefaultsResolveGlobalWithoutPersistingWorkspaceProfile() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let store = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: fileStore
+        )
+        let workspaceID = UUID()
+        let before = try String(contentsOf: fileURL, encoding: .utf8)
+
+        XCTAssertEqual(store.globalAgentModelsProfile(), AgentModelsSettingsProfile())
+        XCTAssertEqual(
+            store.workspaceAgentModelsSettings(for: workspaceID),
+            WorkspaceAgentModelsSettings()
+        )
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID))
+        XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID), store.globalAgentModelsProfile())
+        XCTAssertEqual(try String(contentsOf: fileURL, encoding: .utf8), before)
+        XCTAssertTrue(try (fileStore.load()).agentModelsSettings.isEmpty)
+    }
+
+    func testAgentModelsPreviousSchemaLoadSavesAsV4WithWorkspaceProfiles() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let codexAgent = AgentProviderKind.codexExec.rawValue
+        let codexModel = AgentModelCatalog.defaultModelRaw(for: .codexExec)
+        let planningModel = AIModel.gpt54Pro.rawValue
+        let composeModel = AIModel.claude4Sonnet.rawValue
+        let json = """
+        {
+          "schemaVersion": 3,
+          "updatedAt": "2026-05-20T00:00:00Z",
+          "copySettingsByWorkspaceID": {},
+          "chatSettingsByWorkspaceID": {},
+          "globalDefaults": {
+            "discoverAgentRaw": "\(codexAgent)",
+            "discoverModelsByAgent": { "\(codexAgent)": "\(codexModel)" },
+            "mcpAgentRoleOverrides": { "plan": " codexExec:test-model " }
+          },
+          "scalarPreferences": {
+            "fileSystem": { "globalIgnoreDefaults": "" },
+            "modelSelection": {
+              "planningModel": "\(planningModel)",
+              "preferredComposeModel": "\(composeModel)",
+              "syncChatModelWithOracle": false
+            },
+            "agentMode": { "restrictMCPAgentDiscoveryToRoleLabels": true }
+          }
+        }
+        """
+        try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data(json.utf8).write(to: fileURL)
+
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let workspaceID = UUID()
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+
+        let saved = try fileStore.load()
+        XCTAssertEqual(saved.schemaVersion, 4)
+        XCTAssertEqual(
+            saved.agentModelsSettings[workspaceID]?.profile,
+            AgentModelsSettingsProfile(
+                planningModelRaw: planningModel,
+                preferredComposeModelRaw: composeModel,
+                syncChatModelWithOracle: false,
+                contextBuilderAgentRaw: codexAgent,
+                contextBuilderModelsByAgent: [codexAgent: codexModel],
+                mcpAgentRoleOverrides: ["plan": "codexExec:test-model"],
+                restrictMCPAgentDiscoveryToRoleLabels: true
+            )
+        )
+    }
+
+    func testAgentModelsWorkspaceProfilesSurviveUnrelatedWrites() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileURL = temp.appendingPathComponent("Settings/globalSettings.json")
+        let fileStore = GlobalSettingsFileStore(fileURL: fileURL)
+        let workspaceID = UUID()
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            contextBuilderModelsByAgent: [
+                AgentProviderKind.claudeCode.rawValue: AgentModelCatalog.defaultModelRaw(for: .claudeCode)
+            ],
+            mcpAgentRoleOverrides: ["review": "claudeCode:opus"],
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        try fileStore.save(GlobalSettingsDocument(
+            agentModelsSettings: [
+                workspaceID: WorkspaceAgentModelsSettings(
+                    inheritanceMode: .useWorkspaceOverrides,
+                    profile: profile
+                )
+            ],
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+
+        store.setShowDatesInMessageTimestamps(true)
+        store.updateCopySettings(CopyGlobalSettings(workspaceID: UUID()))
+
+        let saved = try fileStore.load()
+        XCTAssertEqual(saved.agentModelsSettings[workspaceID]?.inheritanceMode, .useWorkspaceOverrides)
+        XCTAssertEqual(saved.agentModelsSettings[workspaceID]?.profile, profile)
+        XCTAssertEqual(saved.scalarPreferences?.ui?.showDatesInMessageTimestamps, true)
+        XCTAssertFalse(saved.copySettings.isEmpty)
+    }
+
+    func testAgentModelsGlobalProfileRoundTripsExistingFieldsWithOneSaveAndNotification() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+        let codexAgent = AgentProviderKind.codexExec.rawValue
+        let profile = AgentModelsSettingsProfile(
+            planningModelRaw: " \(AIModel.gpt54Pro.rawValue) ",
+            preferredComposeModelRaw: " \(AIModel.claude4Sonnet.rawValue) ",
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: codexAgent,
+            contextBuilderModelsByAgent: [codexAgent: AgentModelCatalog.defaultModelRaw(for: .codexExec)],
+            mcpAgentRoleOverrides: [" plan ": " codexExec:test-model "],
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+
+        store.setGlobalAgentModelsProfile(profile)
+
+        let expected = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: codexAgent,
+            contextBuilderModelsByAgent: [codexAgent: AgentModelCatalog.defaultModelRaw(for: .codexExec)],
+            mcpAgentRoleOverrides: ["plan": "codexExec:test-model"],
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        XCTAssertEqual(fileStore.saveCount, 1)
+        let notifications = recorder.snapshot()
+        XCTAssertEqual(notifications.count, 1)
+        XCTAssertEqual(notifications.first?.scope, AgentModelsSettingsNotification.Scope.global.rawValue)
+        XCTAssertNil(notifications.first?.workspaceID)
+        XCTAssertEqual(store.globalAgentModelsProfile(), expected)
+        let diagnostic = try XCTUnwrap(store.recentSettingsWriteDiagnostics().last)
+        XCTAssertEqual(diagnostic.key, "agentModelsProfile.global")
+        XCTAssertEqual(diagnostic.reason, "agent_models.profile.global")
+        XCTAssertTrue(diagnostic.newValue?.contains("planning=\(AIModel.gpt54Pro.rawValue)") == true)
+        XCTAssertEqual(fileStore.document.scalarPreferences?.modelSelection?.planningModel, expected.planningModelRaw)
+        XCTAssertEqual(fileStore.document.scalarPreferences?.modelSelection?.preferredComposeModel, expected.preferredComposeModelRaw)
+        XCTAssertEqual(fileStore.document.scalarPreferences?.modelSelection?.syncChatModelWithOracle, false)
+        XCTAssertEqual(fileStore.document.scalarPreferences?.agentMode?.restrictMCPAgentDiscoveryToRoleLabels, true)
+        XCTAssertEqual(fileStore.document.globalDefaults.discoverAgentRaw, codexAgent)
+        XCTAssertEqual(fileStore.document.globalDefaults.discoverModelsByAgent, expected.contextBuilderModelsByAgent)
+        XCTAssertEqual(fileStore.document.globalDefaults.mcpAgentRoleOverrides, expected.mcpAgentRoleOverrides)
+    }
+
+    func testLegacyGlobalContextBuilderSetterPostsAgentModelsNotification() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+        let codexAgent = AgentProviderKind.codexExec.rawValue
+        let codexModel = AgentModelCatalog.defaultModelRaw(for: .codexExec)
+
+        store.setGlobalContextBuilderAgentSelection(
+            agentRaw: codexAgent,
+            modelRaw: codexModel,
+            markUserDefined: true
+        )
+
+        var notifications = recorder.snapshot()
+        XCTAssertEqual(fileStore.saveCount, 1)
+        XCTAssertEqual(notifications.count, 1)
+        XCTAssertEqual(notifications.last?.scope, AgentModelsSettingsNotification.Scope.global.rawValue)
+        XCTAssertNil(notifications.last?.workspaceID)
+        XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, codexAgent)
+        XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderModelsByAgent?[codexAgent], codexModel)
+
+        store.setGlobalContextBuilderAgentSelection(
+            agentRaw: AgentProviderKind.claudeCode.rawValue,
+            modelRaw: String?.none,
+            markUserDefined: true
+        )
+
+        notifications = recorder.snapshot()
+        XCTAssertEqual(fileStore.saveCount, 2)
+        XCTAssertEqual(notifications.count, 2)
+        XCTAssertEqual(notifications.last?.scope, AgentModelsSettingsNotification.Scope.global.rawValue)
+        XCTAssertNil(notifications.last?.workspaceID)
+        XCTAssertEqual(store.globalAgentModelsProfile().contextBuilderAgentRaw, AgentProviderKind.claudeCode.rawValue)
+    }
+
+    func testAgentModelsWorkspaceOverrideMaterializesAndCopiesGlobalToWorkspace() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let workspaceID = UUID()
+        let globalProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+            syncChatModelWithOracle: true,
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            contextBuilderModelsByAgent: [
+                AgentProviderKind.claudeCode.rawValue: AgentModelCatalog.defaultModelRaw(for: .claudeCode)
+            ],
+            mcpAgentRoleOverrides: ["code": "claudeCode:sonnet"],
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        store.setGlobalAgentModelsProfile(globalProfile)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+
+        XCTAssertEqual(fileStore.saveCount, 1)
+        XCTAssertEqual(recorder.snapshot().count, 1)
+        XCTAssertEqual(
+            store.workspaceAgentModelsSettings(for: workspaceID),
+            WorkspaceAgentModelsSettings(inheritanceMode: .useWorkspaceOverrides, profile: globalProfile)
+        )
+        XCTAssertEqual(store.effectiveAgentModelsProfile(workspaceID: workspaceID), globalProfile)
+        let diagnostic = try XCTUnwrap(store.recentSettingsWriteDiagnostics().last)
+        XCTAssertEqual(diagnostic.key, "agentModelsProfile.workspace.\(workspaceID.uuidString)")
+        XCTAssertEqual(diagnostic.reason, "agent_models.profile.workspace")
+
+        let secondWorkspaceID = UUID()
+        store.copyAgentModelsProfile(from: .global, to: .workspace(secondWorkspaceID))
+        XCTAssertEqual(
+            store.workspaceAgentModelsSettings(for: secondWorkspaceID),
+            WorkspaceAgentModelsSettings(inheritanceMode: .useWorkspaceOverrides, profile: globalProfile)
+        )
+    }
+
+    func testAgentModelsCopyWorkspaceToGlobalOverwritesContextBuilderModelMap() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let workspaceID = UUID()
+        let codexAgent = AgentProviderKind.codexExec.rawValue
+        let claudeAgent = AgentProviderKind.claudeCode.rawValue
+        store.setGlobalAgentModelsProfile(AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: true,
+            contextBuilderAgentRaw: codexAgent,
+            contextBuilderModelsByAgent: [codexAgent: AgentModelCatalog.defaultModelRaw(for: .codexExec)],
+            mcpAgentRoleOverrides: ["old": "codexExec:old"],
+            restrictMCPAgentDiscoveryToRoleLabels: false
+        ))
+        let workspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: nil,
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: claudeAgent,
+            contextBuilderModelsByAgent: [claudeAgent: AgentModelCatalog.defaultModelRaw(for: .claudeCode)],
+            mcpAgentRoleOverrides: ["new": "claudeCode:new"],
+            restrictMCPAgentDiscoveryToRoleLabels: true
+        )
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        store.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.copyAgentModelsProfile(from: .workspace(workspaceID), to: .global)
+
+        XCTAssertEqual(fileStore.saveCount, 1)
+        let notifications = recorder.snapshot()
+        XCTAssertEqual(notifications.count, 1)
+        XCTAssertEqual(notifications.first?.scope, AgentModelsSettingsNotification.Scope.global.rawValue)
+        XCTAssertEqual(store.globalAgentModelsProfile(), workspaceProfile)
+        XCTAssertEqual(fileStore.document.globalDefaults.discoverModelsByAgent, workspaceProfile.contextBuilderModelsByAgent)
+        XCTAssertNil(fileStore.document.globalDefaults.discoverModelsByAgent?[codexAgent])
+        XCTAssertEqual(fileStore.document.globalDefaults.mcpAgentRoleOverrides, workspaceProfile.mcpAgentRoleOverrides)
+    }
+
+    func testAgentModelsWindowSettingsManagerBoundaryRoutesScopedWritesAndCopies() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -101, store: store)
+        let workspaceID = UUID()
+        let globalProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: true
+        )
+        let workspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            contextBuilderModelsByAgent: [
+                AgentProviderKind.claudeCode.rawValue: AgentModelCatalog.defaultModelRaw(for: .claudeCode)
+            ]
+        )
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        manager.setGlobalAgentModelsProfile(globalProfile)
+        manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        manager.setAgentModelsPlanningModelRaw(AIModel.codexCliGpt55CodexHigh.rawValue, scope: .workspace(workspaceID))
+
+        XCTAssertEqual(store.globalAgentModelsProfile(), globalProfile)
+        XCTAssertEqual(
+            manager.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.codexCliGpt55CodexHigh.rawValue
+        )
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.codexCliGpt55CodexHigh.rawValue
+        )
+
+        manager.copyAgentModelsProfile(from: .workspace(workspaceID), to: .global)
+
+        XCTAssertEqual(store.globalAgentModelsProfile(), manager.workspaceAgentModelsProfile(for: workspaceID))
+        let notifications = recorder.snapshot()
+        XCTAssertTrue(notifications.contains { $0.scope == AgentModelsSettingsNotification.Scope.global.rawValue })
+        XCTAssertTrue(notifications.contains { entry in
+            entry.scope == AgentModelsSettingsNotification.Scope.workspace.rawValue && entry.workspaceID == workspaceID
+        })
+    }
+
+    func testAgentModelsViewModelUsesInjectedSettingsManagerForScopedWritesCopiesAndNotifications() async throws {
+        let managerFileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let managerStore = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: managerFileStore)
+        let engineStore = try GlobalSettingsStore(
+            defaults: makeIsolatedDefaults(),
+            fileStore: CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+                globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+                scalarPreferences: seededScalarPreferences()
+            ))
+        )
+        let manager = WindowSettingsManager(windowID: -202, store: managerStore)
+        let workspaceID = UUID()
+        let globalProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: true
+        )
+        var workspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: false,
+            contextBuilderAgentRaw: AgentProviderKind.claudeCode.rawValue,
+            contextBuilderModelsByAgent: [
+                AgentProviderKind.claudeCode.rawValue: AgentModelCatalog.defaultModelRaw(for: .claudeCode)
+            ]
+        )
+        manager.setGlobalAgentModelsProfile(globalProfile)
+        manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        manager.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+
+        let apiSettings = makeAPISettingsViewModel()
+        apiSettings.isOpenAIKeyValid = true
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: apiSettings,
+            workspaceID: workspaceID,
+            workspaceName: "Scoped test",
+            settingsManager: manager,
+            settingsStore: engineStore
+        )
+
+        XCTAssertTrue(viewModel.isEditingWorkspaceSettings)
+        XCTAssertEqual(viewModel.profileSnapshot.planningModelRaw, workspaceProfile.planningModelRaw)
+
+        viewModel.setOracleModel(raw: AIModel.codexCliGpt55CodexHigh.rawValue)
+
+        XCTAssertEqual(
+            managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.codexCliGpt55CodexHigh.rawValue
+        )
+        XCTAssertNil(
+            engineStore.workspaceAgentModelsProfile(for: workspaceID),
+            "Scoped writes must route through the injected SettingsManaging boundary, not the engine/global store."
+        )
+        XCTAssertEqual(managerStore.globalAgentModelsProfile(), globalProfile)
+
+        viewModel.applyOracleRecommendation()
+
+        XCTAssertEqual(
+            managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
+        XCTAssertNil(
+            engineStore.workspaceAgentModelsProfile(for: workspaceID),
+            "Recommendation apply must also route scoped Agent Models writes through the injected SettingsManaging boundary."
+        )
+
+        workspaceProfile.planningModelRaw = AIModel.claude4Opus.rawValue
+        manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        await drainMainQueue()
+
+        XCTAssertEqual(viewModel.profileSnapshot.planningModelRaw, AIModel.claude4Opus.rawValue)
+
+        viewModel.copyWorkspaceSettingsToGlobal()
+
+        XCTAssertEqual(managerStore.globalAgentModelsProfile(), workspaceProfile)
+        XCTAssertNotEqual(engineStore.globalAgentModelsProfile(), workspaceProfile)
+    }
+
+    private func makeAPISettingsViewModel() -> APISettingsViewModel {
+        let keyManager = KeyManager(
+            secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())
+        )
+        return APISettingsViewModel(
+            aiQueriesService: AIQueriesService(keyManager: keyManager),
+            keyManager: keyManager,
+            loadStoredDataOnInit: false
+        )
+    }
+
+    private func drainMainQueue() async {
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async {
+            drained.fulfill()
+        }
+        await fulfillment(of: [drained], timeout: 1.0)
+    }
+
+    private func makeIsolatedDefaults() throws -> UserDefaults {
+        let suiteName = "SettingsJSONOnlyPersistenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        return defaults
+    }
+
+    private func seededScalarPreferences(
+        ui: GlobalScalarPreferences.UISettings? = nil,
+        modelSelection: GlobalScalarPreferences.ModelSelectionSettings? = nil,
+        agentMode: GlobalScalarPreferences.AgentModeSettings? = nil
+    ) -> GlobalScalarPreferences {
+        GlobalScalarPreferences(
+            ui: ui,
+            modelSelection: modelSelection,
+            fileSystem: .init(globalIgnoreDefaults: IgnoreSettingsDefaults.canonicalGlobalIgnoreDefaults),
+            agentMode: agentMode
+        )
+    }
+
     private func makeTempDirectory() throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("SettingsJSONOnlyPersistenceTests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+}
+
+private final class CountingGlobalSettingsFileStore: GlobalSettingsFileStoring {
+    let fileURL: URL
+    var document: GlobalSettingsDocument
+    var saveCount = 0
+
+    init(document: GlobalSettingsDocument) {
+        fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("CountingGlobalSettingsFileStore-\(UUID().uuidString).json")
+        self.document = document
+    }
+
+    func load() throws -> GlobalSettingsDocument {
+        document
+    }
+
+    func loadOrCreateDefault() -> GlobalSettingsDocument {
+        document
+    }
+
+    func save(_ document: GlobalSettingsDocument) throws {
+        saveCount += 1
+        var saved = document
+        saved.schemaVersion = max(saved.schemaVersion, GlobalSettingsDocument.currentSchemaVersion)
+        self.document = saved
+    }
+}
+
+private final class AgentModelsNotificationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entries: [(scope: String?, workspaceID: UUID?)] = []
+    private var token: NSObjectProtocol?
+
+    init(observing object: AnyObject) {
+        token = NotificationCenter.default.addObserver(
+            forName: .agentModelsSettingsDidChange,
+            object: object,
+            queue: nil
+        ) { [weak self] notification in
+            self?.record(notification)
+        }
+    }
+
+    func invalidate() {
+        guard let token else { return }
+        NotificationCenter.default.removeObserver(token)
+        self.token = nil
+    }
+
+    func snapshot() -> [(scope: String?, workspaceID: UUID?)] {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries
+    }
+
+    private func record(_ notification: Notification) {
+        let scope = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        lock.lock()
+        entries.append((scope: scope, workspaceID: workspaceID))
+        lock.unlock()
     }
 }

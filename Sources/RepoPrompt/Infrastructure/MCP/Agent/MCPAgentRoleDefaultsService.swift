@@ -2,19 +2,35 @@ import Foundation
 
 // MARK: - MCP Agent Role Defaults Storage
 
-/// Storage boundary for global MCP Agent Mode role defaults.
-/// Role defaults are global across workspaces; legacy workspace-scoped values are migrated by GlobalSettingsStore.
+/// Storage boundary for MCP Agent Mode role defaults.
+/// Role defaults resolve from the effective Agent Models profile for a workspace;
+/// `nil` workspace IDs resolve and mutate global settings.
 @MainActor
 protocol MCPAgentRoleDefaultsStoring: AnyObject {
-    func globalMCPAgentRoleOverrides() -> [String: String]?
-    func updateGlobalMCPAgentRoleOverrides(_ overrides: [String: String]?, commit: Bool)
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]?
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID: UUID?, commit: Bool)
 }
 
-extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {}
+extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {
+    func mcpAgentRoleOverrides(workspaceID: UUID?) -> [String: String]? {
+        effectiveAgentModelsProfile(workspaceID: workspaceID).mcpAgentRoleOverrides
+    }
+
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID: UUID?, commit _: Bool) {
+        let scope: AgentModelsEditingScope = if let workspaceID,
+                                                workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            .workspace(workspaceID)
+        } else {
+            .global
+        }
+        setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
+    }
+}
 
 // MARK: - MCP Agent Role Defaults Service
 
-/// Centralized resolution and persistence for global MCP agent role defaults.
+/// Centralized resolution and persistence for MCP agent role defaults.
 /// Used by the recommendation wizard, settings UI, and MCP runtime.
 @MainActor
 enum MCPAgentRoleDefaultsService {
@@ -43,15 +59,16 @@ enum MCPAgentRoleDefaultsService {
 
     // MARK: - Resolve All
 
-    /// Returns global resolutions for all task label roles in canonical order.
+    /// Returns resolutions for all task label roles in canonical order.
     static func resolutions(
         availability: AgentModelCatalog.AvailabilityContext = .current,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext? = nil,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> [RoleDefaultResolution] {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        let overrides = settingsStore.globalMCPAgentRoleOverrides()
+        let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
         let recommendationAvailability = recommendedAvailability ?? defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
         return AgentModelCatalog.TaskLabelKind.allCases.compactMap { kind in
             resolve(
@@ -64,16 +81,17 @@ enum MCPAgentRoleDefaultsService {
         }
     }
 
-    /// Resolve one role's effective global selection.
+    /// Resolve one role's effective selection.
     static func effectiveSelection(
         for role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
         recommendedAvailability: AgentModelCatalog.AvailabilityContext? = nil,
         codexDynamicModels: [CodexAppServerClient.RemoteModel]? = nil,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> RoleDefaultResolution? {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        let overrides = settingsStore.globalMCPAgentRoleOverrides()
+        let overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID)
         return resolve(
             kind: role,
             overrides: overrides,
@@ -87,56 +105,62 @@ enum MCPAgentRoleDefaultsService {
     static func effectiveNormalizedSelection(
         for role: AgentModelCatalog.TaskLabelKind,
         availability: AgentModelCatalog.AvailabilityContext = .current,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> AgentModelCatalog.NormalizedAgentSelection? {
         effectiveSelection(
             for: role,
             availability: availability,
+            workspaceID: workspaceID,
             settingsStore: settingsStore
         )?.effective
     }
 
     // MARK: - Mutations
 
-    /// Set a user-selected global override for a role. An explicit selection is always
+    /// Set a user-selected override for a role. An explicit selection is always
     /// persisted; revert a role to the (recommendation-tracking) default via
     /// `clearOverride` / `clearAllOverrides`.
     @discardableResult
     static func setSelection(
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind,
+        availability _: AgentModelCatalog.AvailabilityContext = .current,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> Bool {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let selectionID = AgentModelSelectionID(agentRaw: selection.agent.rawValue, modelRaw: selection.modelRaw)
-        var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
+        var overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID) ?? [:]
         // An explicit role pick is a durable choice. Do NOT erase it just because it
         // currently equals a transient, availability-dependent recommendation — doing so
         // dropped the override and the role silently drifted to a different model after
         // restart or availability change. Reverting to the recommended default stays an
         // explicit action via clearOverride / clearAllOverrides.
         overrides[role.rawValue] = selectionID.rawValue
-        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(overrides, workspaceID: workspaceID, commit: true)
         return true
     }
 
-    /// Clear one role's global override.
+    /// Clear one role's override.
     static func clearOverride(
         for role: AgentModelCatalog.TaskLabelKind,
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
+        var overrides = settingsStore.mcpAgentRoleOverrides(workspaceID: workspaceID) ?? [:]
         overrides.removeValue(forKey: role.rawValue)
-        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides.isEmpty ? nil : overrides, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(overrides.isEmpty ? nil : overrides, workspaceID: workspaceID, commit: true)
     }
 
-    /// Clear all global role overrides (revert to recommended defaults).
+    /// Clear all role overrides (revert to recommended defaults).
     static func clearAllOverrides(
+        workspaceID: UUID? = nil,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        settingsStore.updateGlobalMCPAgentRoleOverrides(nil, commit: true)
+        settingsStore.updateMCPAgentRoleOverrides(nil, workspaceID: workspaceID, commit: true)
     }
 
     // MARK: - Private

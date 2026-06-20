@@ -490,7 +490,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 isRestoringState = false
             }
             updateDynamicModelPolling()
-            persistAgentModelGlobally()
+            persistAgentModelToEffectiveProfile()
             if let session = activeSession {
                 persistSessionConfig(session)
             }
@@ -514,7 +514,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectedModel = resolvedKnownModel
                 isRestoringState = false
             }
-            persistAgentModelGlobally()
+            persistAgentModelToEffectiveProfile()
             if let session = activeSession {
                 persistSessionConfig(session)
             }
@@ -538,7 +538,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                 selectedModelRaw = raw
                 isRestoringState = false
             } else {
-                persistAgentModelGlobally()
+                persistAgentModelToEffectiveProfile()
                 if let session = activeSession {
                     persistSessionConfig(session)
                 }
@@ -904,7 +904,14 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     // Note: ContextBuilderAgentViewModel uses GlobalSettingsStore directly (no overlay),
                     // so no need to discard - just re-apply from workspace
                 }
-                applyGlobalAgentModel()
+                applyEffectiveAgentModel()
+            }
+            .store(in: &cancellables)
+
+        NotificationCenter.default.publisher(for: .agentModelsSettingsDidChange)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] notification in
+                self?.handleAgentModelsSettingsDidChange(notification)
             }
             .store(in: &cancellables)
 
@@ -973,19 +980,32 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         )
     }
 
-    private func resolvedPersistedContextBuilderSelection() -> AgentModelCatalog.NormalizedAgentSelection? {
+    private func resolvedPersistedContextBuilderSelection(workspaceID: UUID? = nil) -> AgentModelCatalog.NormalizedAgentSelection? {
         guard let apiSettingsViewModel = promptManager.apiSettingsViewModel,
               apiSettingsViewModel.isContextBuilderProviderValidationComplete
         else {
             return nil
         }
-        let persisted = settingsManager.persistedGlobalContextBuilderAgentSelection()
+        let profile = settingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID ?? currentWorkspaceID)
+        let agentRaw = profile.contextBuilderAgentRaw
+        let modelRaw = agentRaw.flatMap { profile.contextBuilderModelsByAgent?[$0] }
         return AutoRecommendationEngine.resolveContextBuilderSelection(
-            persistedAgentRaw: persisted.agentRaw,
-            persistedModelRaw: persisted.modelRaw,
+            persistedAgentRaw: agentRaw,
+            persistedModelRaw: modelRaw,
             availability: apiSettingsViewModel.contextBuilderRestorationAvailabilityContext,
             enabledRecommendationProviders: settingsManager.globalRecommendationProviderFilter()
         )
+    }
+
+    private func handleAgentModelsSettingsDidChange(_ notification: Notification) {
+        let scopeRaw = notification.userInfo?[AgentModelsSettingsNotification.scopeKey] as? String
+        let workspaceID = notification.userInfo?[AgentModelsSettingsNotification.workspaceIDKey] as? UUID
+        if scopeRaw == AgentModelsSettingsNotification.Scope.workspace.rawValue,
+           workspaceID != currentWorkspaceID
+        {
+            return
+        }
+        applyEffectiveAgentModel()
     }
 
     private func refreshAvailableAgents() {
@@ -1155,7 +1175,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selectedModelRaw = preferredModelRaw
         selectedModel = AgentModel.resolvedModel(forRaw: preferredModelRaw, agentKind: agent) ?? .defaultModel
         isRestoringState = false
-        persistAgentModelGlobally()
+        persistAgentModelToEffectiveProfile()
         if let session = activeSession {
             persistSessionConfig(session)
         }
@@ -1169,7 +1189,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         lastProcessedTabID = id
         guard let id else {
             clearBindings()
-            applyGlobalAgentModel()
+            applyEffectiveAgentModel()
             applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
@@ -1183,7 +1203,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
     func refreshActiveSessionBindings() {
         guard let tabID = currentTabID else {
             clearBindings()
-            applyGlobalAgentModel()
+            applyEffectiveAgentModel()
             applyWorkspaceDiscoverySettings(from: workspaceManager?.activeWorkspace)
             return
         }
@@ -1213,9 +1233,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Load tab-specific context builder prompt IDs
         session.selectedContextBuilderPromptIDs = Set(tabState.contextBuilder.selectedContextBuilderPromptIDs)
 
-        // Agent/model selection: always from GLOBAL settings (not workspace, not tab)
-        // This ensures consistent behavior across all workspaces and tabs
-        let normalizedAgentSelection = resolvedPersistedContextBuilderSelection()
+        // Agent/model selection comes from the effective Agent Models profile (global or workspace override).
+        let normalizedAgentSelection = resolvedPersistedContextBuilderSelection(
+            workspaceID: manager.activeWorkspace?.id ?? currentWorkspaceID
+        )
 
         // Load workspace-scoped settings (tokenBudget, enhancementMode, etc.)
         let workspaceSettings = settingsManager.chatSettings(for: manager.activeWorkspace?.id ?? currentWorkspaceID ?? UUID())
@@ -1258,7 +1279,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         // Plan token budget: workspace setting only, defaults to 120k
         planTokenBudget = workspaceSettings.discoveryPlanTokenBudget ?? 120_000
 
-        // Apply agent/model from global settings when a configured provider is currently available.
+        // Apply agent/model from the effective Agent Models profile when a configured provider is currently available.
         if let normalizedAgentSelection {
             selectedAgent = normalizedAgentSelection.agent
             selectedModelRaw = normalizedAgentSelection.modelRaw
@@ -1408,7 +1429,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
 
         guard let workspace else { return }
         // Apply workspace defaults after clearing bindings (will be overridden by tab-specific settings when tab loads)
-        applyGlobalAgentModel()
+        applyEffectiveAgentModel()
         applyWorkspaceDiscoverySettings(from: workspace)
         // Manually trigger tab reload since $activeComposeTabID uses .removeDuplicates()
         // and won't emit if the tab ID hasn't changed. Since we just set lastProcessedTabID = nil,
@@ -1459,13 +1480,10 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         }
     }
 
-    /// Load agent/model defaults from workspace settings.
+    /// Load agent/model defaults from the effective Agent Models profile.
     /// Used during workspace switch to initialize defaults before tab-specific settings are loaded.
-    /// Apply global Context Builder agent/model selection.
-    /// Used during workspace switch to initialize agent/model from global settings.
-    private func applyGlobalAgentModel() {
-        // Agent/model are now GLOBAL (not workspace-scoped)
-        guard let normalized = resolvedPersistedContextBuilderSelection() else {
+    private func applyEffectiveAgentModel(workspaceID: UUID? = nil) {
+        guard let normalized = resolvedPersistedContextBuilderSelection(workspaceID: workspaceID) else {
             refreshAvailableAgents()
             return
         }
@@ -1503,24 +1521,36 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         isRestoringState = false
     }
 
-    /// Update GLOBAL agent/model selection.
-    /// Agent/model are now global (shared across all workspaces), not workspace-scoped.
-    private func persistAgentModelGlobally() {
+    /// Update the effective Agent Models profile's Context Builder selection.
+    private func persistAgentModelToEffectiveProfile() {
         guard !isRestoringState else { return }
 
-        // Update global settings (single source of truth)
-        settingsManager.setGlobalContextBuilderAgentSelection(
-            agentRaw: selectedAgent.rawValue,
-            modelRaw: selectedModelRaw,
-            markUserDefined: true
-        )
+        var profile = settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
+        profile.contextBuilderAgentRaw = selectedAgent.rawValue
+        profile = profile.replacingContextBuilderModel(selectedModelRaw, for: selectedAgent.rawValue)
 
-        // Notify recommendation system that inputs have changed
-        // This triggers wizard recompute without affecting PromptVM overlays
+        let wroteWorkspaceID: UUID? = if let workspaceID = currentWorkspaceID,
+                                         settingsManager.workspaceAgentModelsSettings(for: workspaceID).inheritanceMode == .useWorkspaceOverrides
+        {
+            workspaceID
+        } else {
+            nil
+        }
+        if let wroteWorkspaceID {
+            settingsManager.setWorkspaceAgentModelsProfile(workspaceID: wroteWorkspaceID, profile: profile)
+        } else {
+            settingsManager.setGlobalAgentModelsProfile(profile)
+        }
+
+        // Notify recommendation system that inputs have changed.
+        var userInfo: [String: Any] = ["reason": "discoverAgentChanged"]
+        if let wroteWorkspaceID {
+            userInfo["workspaceID"] = wroteWorkspaceID
+        }
         NotificationCenter.default.post(
             name: .recommendationsShouldRefresh,
             object: nil,
-            userInfo: ["reason": "discoverAgentChanged"]
+            userInfo: userInfo
         )
     }
 
