@@ -17,12 +17,16 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         await viewModel.handleWorkspaceSwitch(nil)
 
         XCTAssertTrue(viewModel.sessions.isEmpty)
+        try await provider.waitUntilDisposeIsSuspended()
+        let startedBeforeRelease = await provider.isDisposeStarted()
         let finishedBeforeRelease = await provider.isDisposeFinished()
+        XCTAssertTrue(startedBeforeRelease)
         XCTAssertFalse(finishedBeforeRelease)
 
-        try await waitUntil { await provider.isDisposeStarted() }
         await provider.releaseDispose()
-        try await waitUntil { await provider.isDisposeFinished() }
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        let finishedAfterDrain = await provider.isDisposeFinished()
+        XCTAssertTrue(finishedAfterDrain)
     }
 
     func testWorkspaceSwitchReleasesSessionWorktreeOwnershipBeforeDiscardingSessions() async throws {
@@ -55,6 +59,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertEqual(ownership.installedOwnerCount, 0)
         XCTAssertEqual(ownership.provisionalOwnerCount, 0)
         XCTAssertEqual(ownership.rootClaimCount, 0)
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
     }
 
     func testWorkspaceSwitchBackgroundCleanupUsesCapturedRunIDAfterForegroundSessionsAreCleared() async throws {
@@ -78,7 +83,9 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         await viewModel.handleWorkspaceSwitch(nil)
 
         XCTAssertTrue(viewModel.sessions.isEmpty)
-        try await waitUntil { await routing.contains(runID: oldRunID, reason: "workspace_switch") }
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        let routingCleaned = await routing.contains(runID: oldRunID, reason: "workspace_switch")
+        XCTAssertTrue(routingCleaned)
         XCTAssertTrue(cancelled.containsSync(runID: oldRunID, reason: "workspace_switch"))
     }
 
@@ -103,7 +110,9 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         newSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
         viewModel.test_setMCPControlledTabIDs([tabID])
 
-        try await waitUntil { await routing.contains(runID: oldRunID, reason: "workspace_switch") }
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        let routingCleaned = await routing.contains(runID: oldRunID, reason: "workspace_switch")
+        XCTAssertTrue(routingCleaned)
         XCTAssertEqual(newSession.mcpControlContext?.sessionID, mcpSessionID)
     }
 
@@ -127,9 +136,16 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         newSession.runID = newRunID
         newSession.runState = .running
 
-        try await waitUntil { await provider.isDisposeStarted() }
+        try await provider.waitUntilDisposeIsSuspended()
+        let startedBeforeRelease = await provider.isDisposeStarted()
+        let finishedBeforeRelease = await provider.isDisposeFinished()
+        XCTAssertTrue(startedBeforeRelease)
+        XCTAssertFalse(finishedBeforeRelease)
+
         await provider.releaseDispose()
-        try await waitUntil { await provider.isDisposeFinished() }
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        let finishedAfterDrain = await provider.isDisposeFinished()
+        XCTAssertTrue(finishedAfterDrain)
 
         XCTAssertTrue(viewModel.sessions[tabID] === newSession)
         XCTAssertEqual(newSession.providerSessionID, "new-provider-session")
@@ -166,24 +182,13 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
             testWorkspaceFileContextStore: workspaceFileContextStore
         )
     }
-
-    private func waitUntil(
-        timeout: TimeInterval = 2.0,
-        file: StaticString = #filePath,
-        line: UInt = #line,
-        _ condition: @escaping () async -> Bool
-    ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTFail("Timed out waiting for condition", file: file, line: line)
-    }
 }
 
 private actor BlockingHeadlessProvider: HeadlessAgentProvider {
     private var disposeContinuation: CheckedContinuation<Void, Never>?
+    private var disposeSuspendedWaiter: CheckedContinuation<Void, Error>?
+    private var disposeSuspendedWaiterTimeoutTask: Task<Void, Never>?
+    private var disposeReleaseRequested = false
     private(set) var disposeStarted = false
     private(set) var disposeFinished = false
 
@@ -195,15 +200,54 @@ private actor BlockingHeadlessProvider: HeadlessAgentProvider {
 
     func dispose() async {
         disposeStarted = true
-        await withCheckedContinuation { continuation in
-            disposeContinuation = continuation
+        if !disposeReleaseRequested {
+            await withCheckedContinuation { continuation in
+                disposeContinuation = continuation
+                resumeDisposeSuspendedWaiter()
+            }
         }
         disposeFinished = true
     }
 
+    func waitUntilDisposeIsSuspended(
+        timeoutNanoseconds: UInt64 = 5_000_000_000
+    ) async throws {
+        guard disposeContinuation == nil else { return }
+        try await withCheckedThrowingContinuation { continuation in
+            precondition(disposeSuspendedWaiter == nil)
+            disposeSuspendedWaiter = continuation
+            disposeSuspendedWaiterTimeoutTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                } catch {
+                    return
+                }
+                await self?.timeoutDisposeSuspendedWaiter(timeoutNanoseconds: timeoutNanoseconds)
+            }
+        }
+    }
+
     func releaseDispose() {
+        guard !disposeFinished else { return }
+        disposeReleaseRequested = true
         disposeContinuation?.resume()
         disposeContinuation = nil
+    }
+
+    private func resumeDisposeSuspendedWaiter() {
+        disposeSuspendedWaiterTimeoutTask?.cancel()
+        disposeSuspendedWaiterTimeoutTask = nil
+        disposeSuspendedWaiter?.resume()
+        disposeSuspendedWaiter = nil
+    }
+
+    private func timeoutDisposeSuspendedWaiter(timeoutNanoseconds: UInt64) {
+        guard let disposeSuspendedWaiter else { return }
+        self.disposeSuspendedWaiter = nil
+        disposeSuspendedWaiterTimeoutTask = nil
+        disposeSuspendedWaiter.resume(
+            throwing: BlockingHeadlessProviderTimeoutError(timeoutNanoseconds: timeoutNanoseconds)
+        )
     }
 
     func isDisposeStarted() -> Bool {
@@ -212,6 +256,15 @@ private actor BlockingHeadlessProvider: HeadlessAgentProvider {
 
     func isDisposeFinished() -> Bool {
         disposeFinished
+    }
+}
+
+private struct BlockingHeadlessProviderTimeoutError: LocalizedError {
+    let timeoutNanoseconds: UInt64
+
+    var errorDescription: String? {
+        let timeoutSeconds = Double(timeoutNanoseconds) / 1_000_000_000
+        return "Timed out waiting for dispose() to reach its suspension point after \(timeoutSeconds)s."
     }
 }
 
