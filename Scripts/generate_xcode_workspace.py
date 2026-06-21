@@ -33,6 +33,21 @@ PROJECT_NAME = "RepoPromptCE.xcodeproj"
 APP_SCHEME = "RepoPrompt CE App"
 MCP_SCHEME = "RepoPrompt CE MCP"
 TEST_SCHEME = "RepoPrompt CE Tests"
+REQUIRED_EXECUTABLE_PRODUCTS = ("RepoPrompt", "repoprompt-mcp", "repoprompt-headless")
+REQUIRED_PACKAGE_TARGETS = (
+    "RepoPrompt",
+    "RepoPromptMCP",
+    "RepoPromptShared",
+    "RepoPromptCore",
+    "RepoPromptCoreMacOS",
+    "RepoPromptPOSIXSupport",
+    "RepoPromptSyntaxCBridge",
+    "RepoPromptHeadless",
+    "RepoPromptC",
+    "CSwiftPCRE2",
+    "TreeSitterScannerSupport",
+    "RepoPromptTests",
+)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DESTINATION = REPO_ROOT / ".build/xcode"
 CUSTOM_DESTINATION_ROOT = REPO_ROOT / ".build/xcode-custom"
@@ -87,22 +102,13 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         raise GeneratorError("Package.swift must define package 'RepoPromptCE'")
 
     products = {product.get("name"): product for product in manifest.get("products", [])}
-    for name in ("RepoPrompt", "repoprompt-mcp"):
+    for name in REQUIRED_EXECUTABLE_PRODUCTS:
         product = products.get(name)
         if product is None or "executable" not in product.get("type", {}):
             raise GeneratorError(f"Package.swift must retain executable product '{name}'")
 
     targets = _target_map(manifest)
-    required_targets = (
-        "RepoPrompt",
-        "RepoPromptMCP",
-        "RepoPromptShared",
-        "RepoPromptC",
-        "CSwiftPCRE2",
-        "TreeSitterScannerSupport",
-        "RepoPromptTests",
-    )
-    for name in required_targets:
+    for name in REQUIRED_PACKAGE_TARGETS:
         if name not in targets:
             raise GeneratorError(f"Package.swift must retain target '{name}'")
 
@@ -472,6 +478,12 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
 - `RepoPrompt CE Tests` builds the authoritative XCTest suite through conductor. Set
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
+The native package reference exposes the Phase 1 Core, CoreMacOS, POSIX, syntax C
+bridge, and headless scaffold targets for source browsing and indexing. It also
+exposes the `repoprompt-headless` package scheme for direct SwiftPM builds. Phase 1
+intentionally adds no fourth convenience workflow and no standalone packaging or
+smoke behavior.
+
 The root Swift package reference provides source browsing and indexing. Its native Xcode
 test action is not the supported test workflow because Xcode does not expose the
 `RepoPromptMCP` executable dependency as an importable test module. The vendored Sparkle
@@ -829,7 +841,7 @@ def validate_xcodebuild_list(destination: Path) -> None:
     except json.JSONDecodeError as error:
         raise GeneratorError(f"xcodebuild -list returned invalid JSON: {error}") from error
     schemes = set(payload.get("workspace", {}).get("schemes", []))
-    required = {APP_SCHEME, MCP_SCHEME, TEST_SCHEME, "RepoPrompt"}
+    required = {APP_SCHEME, MCP_SCHEME, TEST_SCHEME, "RepoPrompt", "repoprompt-headless"}
     missing = sorted(required - schemes)
     if missing:
         available = ", ".join(sorted(schemes)) or "none"

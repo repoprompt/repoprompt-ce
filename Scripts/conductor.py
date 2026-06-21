@@ -35,7 +35,7 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 10
 TERMINAL_STATES = {"completed", "failed", "canceled"}
 LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
@@ -72,6 +72,15 @@ SHORT_TIMEOUT_SECONDS = 5 * 60
 MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
+
+SWIFT_BUILD_PRODUCTS = ("RepoPrompt", "repoprompt-mcp", "repoprompt-headless")
+SWIFT_BUILD_TARGETS = (
+    "RepoPromptCore",
+    "RepoPromptCoreMacOS",
+    "RepoPromptPOSIXSupport",
+    "RepoPromptSyntaxCBridge",
+    "RepoPromptHeadless",
+)
 
 IMPLEMENTED_OPERATIONS = {
     "doctor",
@@ -126,7 +135,8 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-headless|all
+  ./conductor swift-build --target RepoPromptCore|RepoPromptCoreMacOS|RepoPromptPOSIXSupport|RepoPromptSyntaxCBridge|RepoPromptHeadless
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
@@ -1098,10 +1108,15 @@ class OperationRegistry:
             return [script("install_format_tools.sh"), "install"], ["style"], cwd, env, effective_timeout
         if operation == "swift-build":
             product = args.get("product")
+            target = args.get("target")
             lanes = ["build"]
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            if product:
+                return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            if target:
+                return ["swift", "build", "--target", str(target)], lanes, cwd, env, effective_timeout
+            raise ConductorError("swift-build requires a product or target")
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -3461,7 +3476,7 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
+    for product in SWIFT_BUILD_PRODUCTS:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
         if code != 0:
             return code
@@ -3706,9 +3721,14 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
-        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        selector = parser.add_mutually_exclusive_group(required=True)
+        selector.add_argument("--product", choices=[*SWIFT_BUILD_PRODUCTS, "all"])
+        selector.add_argument("--target", choices=SWIFT_BUILD_TARGETS)
         ns = parser.parse_args(rest)
-        args["product"] = ns.product
+        if ns.product:
+            args["product"] = ns.product
+        if ns.target:
+            args["target"] = ns.target
     elif operation == "package":
         parser = argparse.ArgumentParser(prog="conductor package")
         parser.add_argument("config", choices=["debug", "release"])

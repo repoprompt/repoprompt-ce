@@ -13,10 +13,11 @@ Add a test only when all four answers are concrete:
 
 Search existing direct and outcome-level coverage first. Prefer a test that fails against known-bad behavior. Do not add invocation-only, no-crash, non-nil-only, source-shape, symbol-presence, constant-restatement, arbitrary-sleep, or coverage-driven tests unless that fact is itself the contract and no stronger oracle exists.
 
-## Add a root or provider XCTest
+## Add an XCTest at the lowest faithful target
 
 - **Root target:** place app-integrated and root-package tests under `Tests/RepoPromptTests` and validate with `make dev-test`.
 - **Provider target:** place provider protocol, codec, translation, launch-argument, or model-mapping tests under `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` and validate with `make dev-provider-test`.
+- **Isolated targets:** when a meaningful contract belongs wholly to `RepoPromptCore`, `RepoPromptCoreMacOS`, `RepoPromptPOSIXSupport`, `RepoPromptSyntaxCBridge`, or `RepoPromptHeadless`, place it in the matching reserved `Tests/<Target>Tests` root. A dedicated SwiftPM test target, conductor lane/list operation, Make wrapper, and CI job are added atomically with that first executable test—never add placeholder XCTest methods merely to activate a lane.
 - Keep one coherent contract per method. Labeled tables are appropriate when cases differ only by input, boundary, or expected outcome.
 - Control time, randomness, environment, resources, ordering, and concurrency. Prefer gates, clocks, or continuations over sleeps, and verify meaningful cleanup or ownership.
 
@@ -33,28 +34,36 @@ Use the narrowest relevant filter, then broaden only for the affected boundary.
 
 ## Authoritative executable IDs
 
-Never derive the executable census from source text or a stale build. Use:
+Never derive the executable census from source text or a stale build. The currently declared targets use:
 
 ```bash
 make dev-test-list
 make dev-provider-test-list
 ```
 
-Listed XCTest IDs have these shapes:
+The seven reserved ledger prefixes and target names are:
 
-```text
-RepoPromptTests.<Suite>/testMethod
-RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
-```
+| Prefix | SwiftPM test target | Reserved source root |
+| --- | --- | --- |
+| `root/` | `RepoPromptTests` | `Tests/RepoPromptTests` |
+| `provider/` | `RepoPromptClaudeCompatibleProviderTests` | `Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests` |
+| `core/` | `RepoPromptCoreTests` | `Tests/RepoPromptCoreTests` |
+| `core-macos/` | `RepoPromptCoreMacOSTests` | `Tests/RepoPromptCoreMacOSTests` |
+| `posix/` | `RepoPromptPOSIXSupportTests` | `Tests/RepoPromptPOSIXSupportTests` |
+| `syntax-c-bridge/` | `RepoPromptSyntaxCBridgeTests` | `Tests/RepoPromptSyntaxCBridgeTests` |
+| `headless/` | `RepoPromptHeadlessTests` | `Tests/RepoPromptHeadlessTests` |
 
-The curated ledger prefixes the target:
+`Scripts/test_suite_optimizer.py` reads the manifests before listing. A reserved prefix whose test target is absent contributes zero methods and triggers no conductor call. Once a test target is declared, its dedicated conductor/Make list lane is mandatory and must produce at least one executable XCTest ID. The declaration landing must document that new exact list command here.
+
+Listed XCTest IDs are shaped as `<Module>.<Suite>/testMethod`; the curated ledger prepends the reserved prefix, for example:
 
 ```text
 root/RepoPromptTests.<Suite>/testMethod
 provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
+core/RepoPromptCoreTests.<Suite>/testMethod
 ```
 
-Treat these strings as exact, case-sensitive identifiers.
+Treat these strings as exact, case-sensitive identifiers. Existing unmoved root/provider IDs never change merely because the additional vocabulary is reserved.
 
 ## Maintain the contract ledger surgically
 
@@ -94,7 +103,7 @@ python3 Scripts/test_suite_optimizer.py verify-ledger \
   --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv
 ```
 
-This command validates the exact header schema, duplicate ledger IDs, and equality between live root/provider executable IDs and ledger IDs. It **does not** validate scenario totals, contract metadata completeness, disposition correctness, replacement mappings, or the truth of any descriptive field. Review those manually.
+This command validates the exact header schema, all seven reserved prefixes, agreement between each row's `target` and `method_id` prefix, duplicate ledger IDs, and equality between every manifest-declared target's live executable IDs and ledger IDs. Reserved prefixes with no declared target must have zero rows; a declared target must have a successful, nonempty authoritative list. It **does not** validate scenario totals, contract metadata completeness, disposition correctness, replacement mappings, or the truth of any descriptive field. Review those manually.
 
 ## Summarize scenario totals
 
@@ -130,8 +139,8 @@ For consolidations, a zero repository and affected-suite scenario delta is the d
 
 At minimum, provide:
 
-1. the focused root or provider test command and result;
-2. the affected target's authoritative list command and result;
+1. the focused owning-target test command and result;
+2. the affected declared target's authoritative list command and result;
 3. the `verify-ledger` command and result;
 4. required style/guardrail validation from `AGENTS.md` when applicable.
 
@@ -141,7 +150,7 @@ Ordinary additions, fixes, renames, and removals do not need timing artifacts me
 
 In addition to ordinary evidence, create new append-only inventory, baseline, focused, and full-root artifacts and append the result to `prompt-exports/optimize-test-suite-runs.md`. Never rewrite earlier artifacts or scoreboard history.
 
-Collect 3–5 comparable normal timing samples per measured series. Root and provider timings remain separate. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
+Collect 3–5 comparable normal timing samples per measured series. Timings for every declared target remain separate. `baseline --target` accepts the seven reserved prefixes but rejects a prefix until its SwiftPM test target and coordinated lane are declared. Use a fresh temporary generated ledger path when creating the append-only inventory artifact; never use the curated ledger as inventory output:
 
 ```bash
 label=example-campaign
@@ -198,7 +207,7 @@ python3 Scripts/test_agent_mode_file_tools_benchmark.py
 - Protected contract, plausible defect, chosen layer, and observable oracle.
 - Added/renamed/consolidated/removed exact IDs, including complete `old -> new/removed` mappings.
 - Surgical ledger update confirmed; curated ledger was not regenerated or overwritten.
-- `scenario_count` rationale and before/after affected-suite plus root/provider/repository totals for consolidations.
+- `scenario_count` rationale and before/after affected-suite plus owning-target/repository totals for consolidations.
 - Exact focused test, list, ledger verification, style, and guardrail commands with exit results.
 - For campaigns only: append-only inventory/baseline/focused/root artifact paths, scoreboard entry, sample validity, and timing comparison.
 - Any coverage deliberately omitted, removed, moved to diagnostics, or replaced by a guardrail, with justification.

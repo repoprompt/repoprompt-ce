@@ -58,6 +58,84 @@ XCTEST_CASE_RE = re.compile(
     r"(?P<status>passed|failed|skipped)(?: \((?P<paren_seconds>[0-9.]+) seconds\)"
     r"| after (?P<after_seconds>[0-9.]+) seconds)?\.\s*$"
 )
+@dataclasses.dataclass(frozen=True)
+class TestTargetConfig:
+    prefix: str
+    target_name: str
+    manifest: str
+    source_root: str
+    conductor_operation: str
+    domain: str
+    layer: str
+
+
+TEST_TARGET_CONFIGS = (
+    TestTargetConfig(
+        prefix="root",
+        target_name="RepoPromptTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptTests",
+        conductor_operation="test",
+        domain="Root",
+        layer="root_swiftpm",
+    ),
+    TestTargetConfig(
+        prefix="provider",
+        target_name="RepoPromptClaudeCompatibleProviderTests",
+        manifest="Packages/RepoPromptAgentProviders/Package.swift",
+        source_root="Packages/RepoPromptAgentProviders/Tests/RepoPromptClaudeCompatibleProviderTests",
+        conductor_operation="provider-test",
+        domain="Provider",
+        layer="provider_package",
+    ),
+    TestTargetConfig(
+        prefix="core",
+        target_name="RepoPromptCoreTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptCoreTests",
+        conductor_operation="core-test",
+        domain="Core",
+        layer="core_swiftpm",
+    ),
+    TestTargetConfig(
+        prefix="core-macos",
+        target_name="RepoPromptCoreMacOSTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptCoreMacOSTests",
+        conductor_operation="core-macos-test",
+        domain="CoreMacOS",
+        layer="core_macos_swiftpm",
+    ),
+    TestTargetConfig(
+        prefix="posix",
+        target_name="RepoPromptPOSIXSupportTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptPOSIXSupportTests",
+        conductor_operation="posix-test",
+        domain="POSIX",
+        layer="posix_swiftpm",
+    ),
+    TestTargetConfig(
+        prefix="syntax-c-bridge",
+        target_name="RepoPromptSyntaxCBridgeTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptSyntaxCBridgeTests",
+        conductor_operation="syntax-c-bridge-test",
+        domain="SyntaxCBridge",
+        layer="syntax_c_bridge_swiftpm",
+    ),
+    TestTargetConfig(
+        prefix="headless",
+        target_name="RepoPromptHeadlessTests",
+        manifest="Package.swift",
+        source_root="Tests/RepoPromptHeadlessTests",
+        conductor_operation="headless-test",
+        domain="Headless",
+        layer="headless_swiftpm",
+    ),
+)
+TEST_TARGETS = {config.prefix: config for config in TEST_TARGET_CONFIGS}
+TEST_TARGET_PREFIXES = tuple(config.prefix for config in TEST_TARGET_CONFIGS)
 
 
 class OptimizerError(RuntimeError):
@@ -127,6 +205,7 @@ def utc_now() -> str:
 
 
 def parse_test_list(text: str, target: str) -> list[ListedTest]:
+    config = test_target_config(target)
     tests: list[ListedTest] = []
     seen: set[str] = set()
     for raw_line in text.splitlines():
@@ -134,7 +213,13 @@ def parse_test_list(text: str, target: str) -> list[ListedTest]:
         match = LISTED_TEST_RE.fullmatch(line)
         if not match:
             continue
-        test = ListedTest(target=target, suite=match.group("suite"), method=match.group("method"))
+        suite = match.group("suite")
+        if not suite.startswith(f"{config.target_name}."):
+            raise OptimizerError(
+                f"{target} list returned suite {suite!r} outside expected "
+                f"module {config.target_name!r}"
+            )
+        test = ListedTest(target=target, suite=suite, method=match.group("method"))
         if test.method_id in seen:
             raise OptimizerError(f"duplicate listed test identifier: {test.method_id}")
         seen.add(test.method_id)
@@ -221,14 +306,104 @@ def parse_conductor_json(stdout: str) -> dict[str, Any]:
     return payload
 
 
+def test_target_config(target: str) -> TestTargetConfig:
+    try:
+        return TEST_TARGETS[target]
+    except KeyError as exc:
+        raise OptimizerError(f"unknown test target prefix: {target}") from exc
+
+
+def dump_package_targets(repo_root: Path, manifest_relative: str) -> dict[str, dict[str, Any]]:
+    manifest = repo_root / manifest_relative
+    if not manifest.is_file():
+        raise OptimizerError(f"test target manifest is missing: {manifest}")
+    package_root = manifest.parent
+    command = [
+        "swift",
+        "package",
+        "dump-package",
+        "--package-path",
+        str(package_root),
+    ]
+    completed = run_command(command, repo_root)
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()[-1000:]
+        raise OptimizerError(
+            f"failed to evaluate test target manifest {manifest_relative}: {detail}"
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise OptimizerError(
+            f"swift package dump-package returned invalid JSON for {manifest_relative}: {exc}"
+        ) from exc
+    raw_targets = payload.get("targets") if isinstance(payload, dict) else None
+    if not isinstance(raw_targets, list):
+        raise OptimizerError(
+            f"swift package dump-package omitted targets for {manifest_relative}"
+        )
+    targets: dict[str, dict[str, Any]] = {}
+    for raw_target in raw_targets:
+        if not isinstance(raw_target, dict) or not isinstance(raw_target.get("name"), str):
+            raise OptimizerError(
+                f"swift package dump-package returned a malformed target for {manifest_relative}"
+            )
+        targets[str(raw_target["name"])] = raw_target
+    return targets
+
+
+def declared_test_targets(repo_root: Path) -> list[TestTargetConfig]:
+    targets_by_manifest: dict[str, dict[str, dict[str, Any]]] = {}
+    for config in TEST_TARGET_CONFIGS:
+        if config.manifest in targets_by_manifest:
+            continue
+        targets_by_manifest[config.manifest] = dump_package_targets(repo_root, config.manifest)
+    declared: list[TestTargetConfig] = []
+    for config in TEST_TARGET_CONFIGS:
+        target = targets_by_manifest[config.manifest].get(config.target_name)
+        if target is None:
+            continue
+        if target.get("type") != "test":
+            raise OptimizerError(
+                f"reserved test target {config.target_name} in {config.manifest} "
+                f"has type {target.get('type')!r}, expected 'test'"
+            )
+        package_root = (repo_root / config.manifest).parent
+        expected_path = (repo_root / config.source_root).relative_to(package_root)
+        actual_path = target.get("path")
+        if not isinstance(actual_path, str) or Path(actual_path) != expected_path:
+            raise OptimizerError(
+                f"reserved test target {config.target_name} in {config.manifest} has path "
+                f"{actual_path!r}, expected {str(expected_path)!r}"
+            )
+        declared.append(config)
+    return declared
+
+
+def require_declared_test_target(repo_root: Path, target: str) -> TestTargetConfig:
+    config = test_target_config(target)
+    declared = {item.prefix for item in declared_test_targets(repo_root)}
+    if target not in declared:
+        raise OptimizerError(
+            f"{target} test target {config.target_name} is not declared in {config.manifest}"
+        )
+    return config
+
+
 def run_conductor(repo_root: Path, target: str, list_mode: bool = False) -> ConductorRun:
-    operation = "test" if target == "root" else "provider-test"
-    command = [str(repo_root / "conductor"), operation]
+    config = test_target_config(target)
+    command = [str(repo_root / "conductor"), config.conductor_operation]
     if list_mode:
         command.append("--list")
     command.append("--json")
     completed = run_command(command, repo_root)
-    payload = parse_conductor_json(completed.stdout)
+    try:
+        payload = parse_conductor_json(completed.stdout)
+    except OptimizerError as exc:
+        raise OptimizerError(
+            f"{target} test target {config.target_name} requires conductor operation "
+            f"{config.conductor_operation!r}, but it returned no valid result: {exc}"
+        ) from exc
     result = payload["result"]
     log_path = Path(str(result.get("logPath") or ""))
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.is_file() else ""
@@ -243,15 +418,7 @@ def run_conductor(repo_root: Path, target: str, list_mode: bool = False) -> Cond
 
 
 def source_roots(repo_root: Path, target: str) -> list[Path]:
-    if target == "root":
-        return [repo_root / "Tests" / "RepoPromptTests"]
-    return [
-        repo_root
-        / "Packages"
-        / "RepoPromptAgentProviders"
-        / "Tests"
-        / "RepoPromptClaudeCompatibleProviderTests"
-    ]
+    return [repo_root / test_target_config(target).source_root]
 
 
 def source_files(repo_root: Path, target: str) -> list[Path]:
@@ -262,11 +429,13 @@ def source_files(repo_root: Path, target: str) -> list[Path]:
 
 
 def domain_for_file(repo_root: Path, target: str, path: Path) -> str:
+    config = test_target_config(target)
     root = source_roots(repo_root, target)[0]
     relative = path.relative_to(root)
-    if target == "provider":
-        return f"Provider/{relative.parts[0] if len(relative.parts) > 1 else 'General'}"
-    return relative.parts[0] if len(relative.parts) > 1 else "Root"
+    child = relative.parts[0] if len(relative.parts) > 1 else "General"
+    if target == "root":
+        return relative.parts[0] if len(relative.parts) > 1 else "Root"
+    return f"{config.domain}/{child}"
 
 
 def build_source_index(
@@ -338,7 +507,7 @@ def ledger_rows(
                 "primary_contract_id": "unreviewed",
                 "secondary_contract_tags": "",
                 "validation_class": "unreviewed",
-                "layer": "root_swiftpm" if test.target == "root" else "provider_package",
+                "layer": test_target_config(test.target).layer,
                 "scenario_count": "1",
                 "fixture_ids": "",
                 "observable_oracle": "unreviewed",
@@ -371,7 +540,28 @@ def read_ledger_ids(path: Path) -> list[str]:
         reader = csv.DictReader(handle, delimiter="\t")
         if reader.fieldnames != LEDGER_COLUMNS:
             raise OptimizerError("ledger columns do not match the required schema")
-        ids = [str(row.get("method_id") or "") for row in reader]
+        ids: list[str] = []
+        errors: list[str] = []
+        for line, row in enumerate(reader, start=2):
+            method_id = str(row.get("method_id") or "")
+            target = str(row.get("target") or "")
+            prefix = method_id.split("/", 1)[0]
+            if prefix not in TEST_TARGETS:
+                errors.append(f"line {line}: unknown method_id prefix {prefix!r}")
+            elif target != prefix:
+                errors.append(
+                    f"line {line}: target {target!r} does not match method_id prefix {prefix!r}"
+                )
+            elif not method_id.startswith(
+                f"{prefix}/{TEST_TARGETS[prefix].target_name}."
+            ):
+                errors.append(
+                    f"line {line}: method_id {method_id!r} does not use expected "
+                    f"module {TEST_TARGETS[prefix].target_name!r}"
+                )
+            ids.append(method_id)
+    if errors:
+        raise OptimizerError("ledger target vocabulary is invalid:\n" + "\n".join(errors[:100]))
     if len(ids) != len(set(ids)):
         raise OptimizerError("ledger contains duplicate method_id rows")
     return ids
@@ -536,15 +726,15 @@ def scoreboard_scaffold() -> str:
 
 - Primary metric: warm local root `swift test` conductor execution seconds.
 - Structural target: approximately 877 executable first-party XCTest methods.
-- Count authority: coordinated root/provider `swift test list`.
-- Root and provider timings remain separate.
+- Count authority: coordinated manifest-declared target `swift test list` lanes.
+- Target timings remain separate.
 - CI class-per-process timing is not summed as local root wall clock.
 - Rows and corrections are append-only; corrections supersede rather than rewrite history.
 
 ## Baseline summary
 
-| Date/commit | Topology | Samples | Root methods | Provider methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---|
+| Date/commit | Topology | Samples | Root methods | Provider methods | Isolated methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
 
 ## Iteration ledger
 
@@ -584,7 +774,8 @@ def append_baseline_scoreboard(
     counts = method_counts or {}
     root_count = counts.get("root", 0)
     provider_count = counts.get("provider", 0)
-    total_count = root_count + provider_count if counts else 0
+    isolated_count = sum(counts.get(prefix, 0) for prefix in TEST_TARGET_PREFIXES[2:])
+    total_count = sum(counts.values()) if counts else 0
     lines = [
         f"### {payload['timestamp']} — {target} — {payload['label']}",
         "",
@@ -611,9 +802,9 @@ def append_baseline_scoreboard(
     lines.extend(
         [
             "",
-            "| Date/commit | Topology | Samples | Root methods | Provider methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |",
-            "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
-            "| {date}/{commit} | warm local {target} one-process conductor run | {valid} valid + {invalid} invalid | {root} | {provider} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise}; build-lane coordinated |".format(
+            "| Date/commit | Topology | Samples | Root methods | Provider methods | Isolated methods | Total | Median seconds | Observed p95 | Relative MAD | Notes |",
+            "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+            "| {date}/{commit} | warm local {target} one-process conductor run | {valid} valid + {invalid} invalid | {root} | {provider} | {isolated} | {total} | {median:.3f} | {p95:.3f} | {mad:.4f} | {noise}; build-lane coordinated |".format(
                 date=payload["timestamp"],
                 commit=metadata["commit"][:12],
                 target=target,
@@ -621,6 +812,7 @@ def append_baseline_scoreboard(
                 invalid=summary["invalid_samples"],
                 root=root_count or "",
                 provider=provider_count or "",
+                isolated=isolated_count or "",
                 total=total_count or "",
                 median=summary["median_seconds"],
                 p95=summary["observed_p95_seconds"],
@@ -657,23 +849,43 @@ def write_json_new(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def require_successful_list_run(config: TestTargetConfig, run: ConductorRun) -> None:
+    if (
+        run.process_exit_code != 0
+        or run.result.get("state") != "completed"
+        or run.result.get("exitCode") != 0
+    ):
+        raise OptimizerError(
+            f"{config.prefix} test list failed via conductor operation "
+            f"{config.conductor_operation!r}; log: {run.result.get('logPath')}"
+        )
+
+
+def empty_test_counts() -> dict[str, int]:
+    return {prefix: 0 for prefix in TEST_TARGET_PREFIXES}
+
+
 def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -> dict[str, Any]:
-    runs = {target: run_conductor(repo_root, target, list_mode=True) for target in ("root", "provider")}
+    configs = declared_test_targets(repo_root)
+    runs = {
+        config.prefix: run_conductor(repo_root, config.prefix, list_mode=True)
+        for config in configs
+    }
     tests: list[ListedTest] = []
-    for target, run in runs.items():
-        if run.process_exit_code != 0 or run.result.get("state") != "completed" or run.result.get("exitCode") != 0:
-            raise OptimizerError(f"{target} test list failed; log: {run.result.get('logPath')}")
-        tests.extend(parse_test_list(run.log_text, target))
+    for config in configs:
+        run = runs[config.prefix]
+        require_successful_list_run(config, run)
+        tests.extend(parse_test_list(run.log_text, config.prefix))
     locations = map_test_sources(repo_root, tests)
     write_tsv(ledger, ledger_rows(tests, locations), force=force)
-    counts = {
-        "root": sum(test.target == "root" for test in tests),
-        "provider": sum(test.target == "provider" for test in tests),
-    }
+    counts = empty_test_counts()
+    for test in tests:
+        counts[test.target] += 1
     payload = {
         "timestamp": utc_now(),
         "git": git_metadata(repo_root),
-        "counts": {**counts, "total": counts["root"] + counts["provider"]},
+        "counts": {**counts, "total": sum(counts.values())},
+        "declared_targets": [config.prefix for config in configs],
         "ledger": str(ledger),
         "list_runs": {
             target: {
@@ -696,12 +908,15 @@ def inventory(repo_root: Path, ledger: Path, output: Path | None, force: bool) -
 def verify_ledger(repo_root: Path, ledger: Path) -> dict[str, Any]:
     listed: list[ListedTest] = []
     logs: dict[str, str] = {}
-    for target in ("root", "provider"):
-        run = run_conductor(repo_root, target, list_mode=True)
-        if run.process_exit_code != 0 or run.result.get("exitCode") != 0:
-            raise OptimizerError(f"{target} test list failed; log: {run.result.get('logPath')}")
-        listed.extend(parse_test_list(run.log_text, target))
-        logs[target] = str(run.result.get("logPath") or "")
+    configs = declared_test_targets(repo_root)
+    counts = empty_test_counts()
+    for config in configs:
+        run = run_conductor(repo_root, config.prefix, list_mode=True)
+        require_successful_list_run(config, run)
+        target_tests = parse_test_list(run.log_text, config.prefix)
+        listed.extend(target_tests)
+        counts[config.prefix] = len(target_tests)
+        logs[config.prefix] = str(run.result.get("logPath") or "")
     listed_ids = sorted(test.method_id for test in listed)
     ledger_ids = sorted(read_ledger_ids(ledger))
     missing = sorted(set(listed_ids) - set(ledger_ids))
@@ -711,7 +926,13 @@ def verify_ledger(repo_root: Path, ledger: Path) -> dict[str, Any]:
             f"ledger mismatch: missing={len(missing)} stale={len(stale)} "
             f"missing_examples={missing[:5]} stale_examples={stale[:5]}"
         )
-    return {"count": len(listed_ids), "logs": logs, "ledger": str(ledger)}
+    return {
+        "count": len(listed_ids),
+        "counts": {**counts, "total": sum(counts.values())},
+        "declared_targets": [config.prefix for config in configs],
+        "logs": logs,
+        "ledger": str(ledger),
+    }
 
 
 def baseline(
@@ -725,8 +946,9 @@ def baseline(
 ) -> dict[str, Any]:
     if samples_requested <= 0:
         raise OptimizerError("--samples must be greater than zero")
+    config = require_declared_test_target(repo_root, target)
     samples: list[Sample] = []
-    command = [str(repo_root / "conductor"), "test" if target == "root" else "provider-test", "--json"]
+    command = [str(repo_root / "conductor"), config.conductor_operation, "--json"]
     for index in range(1, samples_requested + 1):
         before = measurement_source_fingerprint(repo_root)
         run = run_conductor(repo_root, target, list_mode=False)
@@ -753,7 +975,7 @@ def load_counts(path: Path | None) -> dict[str, int] | None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     counts = payload.get("counts") or {}
-    return {"root": int(counts.get("root") or 0), "provider": int(counts.get("provider") or 0)}
+    return {prefix: int(counts.get(prefix) or 0) for prefix in TEST_TARGET_PREFIXES}
 
 
 def combine_baselines(paths: Sequence[Path], top: int = 20) -> dict[str, Any]:
@@ -867,7 +1089,7 @@ def build_parser() -> argparse.ArgumentParser:
     inventory_parser.add_argument("--force", action="store_true")
 
     baseline_parser = subparsers.add_parser("baseline", help="collect coordinated warm timing samples")
-    baseline_parser.add_argument("--target", choices=["root", "provider"], required=True)
+    baseline_parser.add_argument("--target", choices=TEST_TARGET_PREFIXES, required=True)
     baseline_parser.add_argument("--samples", type=int, required=True)
     baseline_parser.add_argument("--label", default="warm-baseline")
     baseline_parser.add_argument("--scoreboard", type=Path, required=True)

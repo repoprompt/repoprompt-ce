@@ -1,10 +1,10 @@
 # Core Isolation Execution Packet
 
 **Created:** 2026-06-21
-**Current phase:** Phase 0 — closed, see [phase-0.md](phases/phase-0.md)
-**Disposition:** GO for Phase 1, subject to the frozen graph and contracts in this packet
+**Current phase:** Phase 1 — closed, see [phase-1.md](phases/phase-1.md)
+**Disposition:** GO for Phase 2 as a separate declaration/test-move change
 **Production behavior change:** none
-**Phase 1 scaffolding present:** no
+**Phase 1 scaffolding present:** yes; five production targets and the no-I/O `repoprompt-headless` executable scaffold
 
 This directory is the compact execution record for
 [Core Isolation Reconstruction](../plans/core-isolation-reconstruction-2026-06-20.md).
@@ -49,6 +49,7 @@ contract. No later phase may depend on fetching those two objects.
 - [Standalone headless v1 contract](contracts/headless-v1.md)
 - [Phase 1–2 migration ledger](migration-ledger.tsv)
 - [Phase 0 evidence and disposition](phases/phase-0.md)
+- [Phase 1 evidence and disposition](phases/phase-1.md)
 - [Deferred Phase 9+ work](deferred-work.md)
 
 ## Mutation policy
@@ -78,5 +79,7 @@ Phase 0 freezes:
   four comparable warm packaged app-proxy smoke samples, and one cold lifecycle
   smoke sample.
 
-Phase 1 may add package/control-plane scaffolding only. Runtime ownership and
-behavior remain out of scope until their owning phases.
+Phase 1 added and validated package/control-plane scaffolding only. Runtime
+ownership remains unchanged. Phase 2 may move only its ledger-owned neutral
+declarations with faithful tests; later behavior remains out of scope until its
+owning phase.

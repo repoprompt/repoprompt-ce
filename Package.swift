@@ -9,7 +9,8 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+        .executable(name: "repoprompt-headless", targets: ["RepoPromptHeadless"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
@@ -43,10 +44,65 @@ let package = Package(
         .package(path: "Packages/RepoPromptAgentProviders")
     ],
     targets: [
+        .target(
+            name: "RepoPromptSyntaxCBridge",
+            dependencies: [
+                "TreeSitterScannerSupport",
+                .product(name: "TreeSitterC", package: "tree-sitter-c"),
+                .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
+                .product(name: "TreeSitterGo", package: "tree-sitter-go"),
+                .product(name: "TreeSitterJava", package: "tree-sitter-java"),
+                .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
+                .product(name: "TreeSitterPython", package: "tree-sitter-python"),
+                .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
+                .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
+                .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
+                .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
+                .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
+                .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
+                .product(name: "TreeSitterPHP", package: "tree-sitter-php")
+            ],
+            path: "Sources/RepoPromptSyntaxCBridge"
+        ),
+        .target(
+            name: "RepoPromptCore",
+            dependencies: [
+                "RepoPromptC",
+                "CSwiftPCRE2",
+                "RepoPromptSyntaxCBridge",
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter")
+            ],
+            path: "Sources/RepoPromptCore"
+        ),
+        .target(
+            name: "RepoPromptPOSIXSupport",
+            path: "Sources/RepoPromptPOSIXSupport"
+        ),
+        .target(
+            name: "RepoPromptCoreMacOS",
+            dependencies: [
+                "RepoPromptCore",
+                "RepoPromptPOSIXSupport",
+                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
+                .product(name: "Cuchardet", package: "UniversalCharsetDetection")
+            ],
+            path: "Sources/RepoPromptCoreMacOS"
+        ),
+        .executableTarget(
+            name: "RepoPromptHeadless",
+            dependencies: [
+                "RepoPromptShared",
+                "RepoPromptCore",
+                "RepoPromptCoreMacOS",
+                "RepoPromptPOSIXSupport",
+                .product(name: "Logging", package: "swift-log")
+            ],
+            path: "Sources/RepoPromptHeadless"
+        ),
         .executableTarget(
             name: "RepoPrompt",
             dependencies: [
-                "RepoPromptShared",
+                "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS",
                 "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
                 "Sparkle",
                 .product(name: "Logging", package: "swift-log"),
@@ -90,7 +146,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptShared", "RepoPromptPOSIXSupport", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),

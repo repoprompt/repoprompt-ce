@@ -75,7 +75,65 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 9)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+
+    def test_swift_build_cli_accepts_products_and_phase_one_targets(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        selections = [
+            (["--product", product], {"product": product})
+            for product in (*conductor.SWIFT_BUILD_PRODUCTS, "all")
+        ] + [
+            (["--target", target], {"target": target})
+            for target in conductor.SWIFT_BUILD_TARGETS
+        ]
+
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            for argv, expected_args in selections:
+                with self.subTest(argv=argv):
+                    self.assertEqual(
+                        conductor.handle_real_operation(state.paths, "swift-build", argv),
+                        0,
+                    )
+                    self.assertEqual(enqueue.call_args.args[2], expected_args)
+
+        with self.assertRaises(SystemExit):
+            conductor.handle_real_operation(
+                state.paths,
+                "swift-build",
+                ["--product", "RepoPrompt", "--target", "RepoPromptCore"],
+            )
+
+    def test_swift_build_target_uses_build_lane_and_exact_swiftpm_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            for target in conductor.SWIFT_BUILD_TARGETS:
+                with self.subTest(target=target):
+                    argv, lanes, cwd, _env, timeout = registry.prepare(
+                        {"operation": "swift-build", "args": {"target": target}}
+                    )
+                    self.assertEqual(argv, ["swift", "build", "--target", target])
+                    self.assertEqual(lanes, ["build"])
+                    self.assertEqual(cwd, Path(tmp))
+                    self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+
+    def test_swift_build_all_compiles_three_products_in_frozen_order(self) -> None:
+        completed = subprocess.CompletedProcess(["swift", "build"], 0, "", "")
+        with mock.patch.object(
+            conductor.subprocess,
+            "run",
+            return_value=completed,
+        ) as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(conductor.operation_swift_build_all(Path.cwd()), 0)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(
+            commands,
+            [
+                ["swift", "build", "--product", product]
+                for product in conductor.SWIFT_BUILD_PRODUCTS
+            ],
+        )
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()

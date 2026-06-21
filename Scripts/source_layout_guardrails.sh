@@ -26,6 +26,11 @@ required_dirs=(
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
+  "Sources/RepoPromptCore"
+  "Sources/RepoPromptCoreMacOS"
+  "Sources/RepoPromptPOSIXSupport"
+  "Sources/RepoPromptSyntaxCBridge"
+  "Sources/RepoPromptHeadless"
   "Sources/RepoPromptShared/MCP"
   "Tests/RepoPromptTests"
 )
@@ -34,6 +39,18 @@ for dir in "${required_dirs[@]}"; do
     fail "required source layout directory missing: $dir"
   fi
 done
+
+# Phase 1 target/dependency/import/declaration/C-symbol/package separation is
+# executable policy. Its deterministic negative tests must pass before checking
+# the live tree so reverse edges and forbidden imports cannot silently weaken it.
+if ! core_isolation_guard_test_output="$(python3 Scripts/test_core_isolation_guardrails.py --quiet 2>&1)"; then
+  fail "Core isolation guardrail negative tests failed"
+  printf '%s\n' "$core_isolation_guard_test_output" >&2
+fi
+if ! core_isolation_guard_output="$(python3 Scripts/core_isolation_guardrails.py 2>&1)"; then
+  fail "Core isolation target/source/symbol/package guardrails failed"
+  printf '%s\n' "$core_isolation_guard_output" >&2
+fi
 
 shared_mcp_required_files=(
   "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
@@ -301,6 +318,7 @@ allowed_tracked_docs=(
   "docs/core-isolation/deferred-work.md"
   "docs/core-isolation/migration-ledger.tsv"
   "docs/core-isolation/phases/phase-0.md"
+  "docs/core-isolation/phases/phase-1.md"
   "docs/investigations/core-isolation-reconstruction-2026-06-20.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

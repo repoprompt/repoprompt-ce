@@ -48,6 +48,22 @@ jobs:
       - name: Build MCP product
         run: swift build --product repoprompt-mcp
 
+      - name: Build isolated scaffold targets
+        run: |
+          set -euo pipefail
+          for target in \
+            RepoPromptCore \
+            RepoPromptCoreMacOS \
+            RepoPromptPOSIXSupport \
+            RepoPromptSyntaxCBridge \
+            RepoPromptHeadless
+          do
+            swift build --target "$target"
+          done
+
+      - name: Build headless scaffold product
+        run: swift build --product repoprompt-headless
+
       - name: Run app tests
         shell: bash
         run: |
