@@ -151,9 +151,7 @@ struct AgentModelsSettingsView: View {
         settingsCard {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
-                    Image(systemName: viewModel.isEditingWorkspaceSettings ? "slider.horizontal.3" : "globe")
-                        .foregroundColor(.accentColor)
-                    Text(viewModel.editingScopeTitle)
+                    Text(viewModel.workspaceAgentModelsTitle)
                         .font(.headline)
                     Spacer(minLength: 0)
                 }
@@ -194,9 +192,9 @@ struct AgentModelsSettingsView: View {
     private var scopeRoutingExplanation: String {
         switch viewModel.inheritanceMode {
         case .useGlobalSettings:
-            "This workspace inherits the global Agent Models profile. Changes below edit global settings."
+            "This workspace will use global Agent Models settings. Changes below edit global settings."
         case .useWorkspaceOverrides:
-            "This workspace uses its own complete Agent Models profile. Changes below do not affect other workspaces."
+            "This workspace will use workspace-specific Agent Models overrides. Changes below edit this workspace only."
         }
     }
 

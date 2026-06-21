@@ -88,7 +88,10 @@ extension GlobalSettingsStore: SettingsManaging {
             raw,
             commit: commit,
             reason: reason,
-            honorSync: honorSync
+            honorSync: honorSync,
+            fileID: #fileID,
+            line: #line,
+            function: #function
         )
     }
 
@@ -97,7 +100,10 @@ extension GlobalSettingsStore: SettingsManaging {
             raw,
             commit: commit,
             reason: reason,
-            honorSync: honorSync
+            honorSync: honorSync,
+            fileID: #fileID,
+            line: #line,
+            function: #function
         )
     }
 

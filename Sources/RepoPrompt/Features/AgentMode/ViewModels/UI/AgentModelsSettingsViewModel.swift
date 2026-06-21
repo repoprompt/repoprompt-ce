@@ -143,8 +143,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         isEditingWorkspaceSettings ? "Using workspace overrides" : "Using global settings"
     }
 
-    var editingScopeTitle: String {
-        isEditingWorkspaceSettings ? "Editing workspace settings" : "Editing global settings"
+    var workspaceAgentModelsTitle: String {
+        if let workspaceDisplayName {
+            return "Agent Models for Workspace: \(workspaceDisplayName)"
+        }
+        return "Agent Models"
     }
 
     var noWorkspaceExplanation: String {
