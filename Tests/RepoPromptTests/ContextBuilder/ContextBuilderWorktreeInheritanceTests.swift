@@ -620,6 +620,59 @@ import XCTest
                             .translateInputPath(logicalBranchOnly.path),
                         worktreeBranchOnly.standardizedFileURL.path
                     )
+                    // Reproduce the parent connection's stale pre-discovery snapshot. The direct
+                    // Git read must stabilize from the committed tab without a selection mutation.
+                    fixture.contextA.window.mcpServer
+                        .tabContextByConnectionID[outerEndpoint.connectionID] = frozenContext
+                    let parentFrozenBeforeGit = try XCTUnwrap(
+                        fixture.contextA.window.mcpServer
+                            .tabContextByConnectionID[outerEndpoint.connectionID]
+                    )
+                    XCTAssertEqual(parentFrozenBeforeGit.selection, emptySelection)
+                    XCTAssertEqual(parentFrozenBeforeGit.selectionRevision, selectionRevision)
+
+                    let directGitResponse = try await outerEndpoint.callTool(
+                        name: MCPWindowToolName.git,
+                        arguments: [
+                            "op": "diff",
+                            "compare": "main",
+                            "scope": "selected",
+                            "detail": "patches",
+                            "artifacts": true,
+                            "mode": "deep"
+                        ],
+                        timeoutSeconds: 45
+                    )
+                    _ = try toolResultText(directGitResponse)
+                    let publishedSelection = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(for: selectionIdentity)
+                    ).selection
+                    XCTAssertTrue(publishedSelection.selectedPaths.contains(logicalBranchOnly.path))
+                    let artifactPaths = publishedSelection.selectedPaths.filter {
+                        $0.contains("/_git_data/")
+                    }
+                    let mapPath = try XCTUnwrap(artifactPaths.first { $0.hasSuffix("/MAP.txt") })
+                    let manifestURL = URL(fileURLWithPath: mapPath)
+                        .deletingLastPathComponent()
+                        .appendingPathComponent("manifest.json")
+                    let manifest = try XCTUnwrap(
+                        JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL))
+                            as? [String: Any]
+                    )
+                    XCTAssertEqual(manifest["requestedPaths"] as? [String], ["Sources/DeferredOnly.swift"])
+                    XCTAssertEqual(
+                        (manifest["repoRoot"] as? String).map(GitRepoRootAuthorization.canonicalPath),
+                        GitRepoRootAuthorization.canonicalPath(worktreeRoot.path)
+                    )
+                    XCTAssertEqual(manifest["isWorktree"] as? Bool, true)
+                    XCTAssertFalse(publishedSelection.selectedPaths.contains(worktreeBranchOnly.path))
+                    let files = try XCTUnwrap(manifest["files"] as? [[String: Any]])
+                    let patchPath = try XCTUnwrap(files.first?["patchPath"] as? String)
+                    let patch = try String(
+                        contentsOf: manifestURL.deletingLastPathComponent().appendingPathComponent(patchPath),
+                        encoding: .utf8
+                    )
+                    XCTAssertTrue(patch.contains("DeferredOnlyAgentRoute"), patch)
 
                     @MainActor func installEmptyFrozenContext() async throws {
                         _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
