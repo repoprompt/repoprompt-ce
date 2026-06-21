@@ -72,7 +72,6 @@ struct AgentModelsSettingsView: View {
                 contextBuilderSection
                 roleDefaultsSection
                 advancedSection
-                copySettingsSection
                 relatedSettingsSection
                 Spacer(minLength: 0)
             }
@@ -172,6 +171,8 @@ struct AgentModelsSettingsView: View {
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    scopeCopySettingsFooter
                 } else {
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "info.circle")
@@ -196,6 +197,52 @@ struct AgentModelsSettingsView: View {
         case .useWorkspaceOverrides:
             "This workspace will use workspace-specific Agent Models overrides. Changes below edit this workspace only."
         }
+    }
+
+    private var scopeCopySettingsFooter: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Divider()
+                .padding(.top, 2)
+
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(scopeCopySettingsTitle)
+                        .font(.callout).bold()
+                    Text(scopeCopySettingsDescription)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                Button(scopeCopySettingsButtonTitle) {
+                    if viewModel.isEditingWorkspaceSettings {
+                        showCopyWorkspaceToGlobalConfirmation = true
+                    } else {
+                        viewModel.copyGlobalSettingsToWorkspaceOverrides()
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private var scopeCopySettingsTitle: String {
+        viewModel.isEditingWorkspaceSettings
+            ? "Copy workspace settings to global"
+            : "Copy global settings to workspace"
+    }
+
+    private var scopeCopySettingsDescription: String {
+        viewModel.isEditingWorkspaceSettings
+            ? "Overwrite global Agent Models settings with this workspace’s current overrides."
+            : "Create workspace overrides from the current global Agent Models settings and switch this workspace to Use workspace overrides."
+    }
+
+    private var scopeCopySettingsButtonTitle: String {
+        viewModel.isEditingWorkspaceSettings ? "Copy to Global" : "Copy to Workspace"
     }
 
     // MARK: - Recommendation Banner
@@ -617,62 +664,6 @@ struct AgentModelsSettingsView: View {
                 .padding(.top, 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .transition(.opacity)
-            }
-        }
-    }
-
-    // MARK: - Copy Settings
-
-    @ViewBuilder
-    private var copySettingsSection: some View {
-        if viewModel.hasWorkspace {
-            settingsCard {
-                sectionHeader(
-                    title: "Copy settings",
-                    subtitle: "Move the complete Agent Models profile between global settings and this workspace."
-                )
-
-                if viewModel.isEditingWorkspaceSettings {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "arrow.up.doc")
-                            .foregroundColor(.accentColor)
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Copy workspace settings to global")
-                                .font(.callout).bold()
-                            Text("Overwrite global Agent Models settings with this workspace’s current overrides. The workspace override stays active.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer(minLength: 8)
-                        Button("Copy to Global") {
-                            showCopyWorkspaceToGlobalConfirmation = true
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                } else {
-                    HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "arrow.down.doc")
-                            .foregroundColor(.accentColor)
-                            .frame(width: 18)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text("Copy global settings to workspace overrides")
-                                .font(.callout).bold()
-                            Text("Snapshot the current global Agent Models profile into this workspace and switch it to Use workspace overrides.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer(minLength: 8)
-                        Button("Copy to Workspace") {
-                            viewModel.copyGlobalSettingsToWorkspaceOverrides()
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                    }
-                }
             }
         }
     }
