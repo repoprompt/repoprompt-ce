@@ -5541,6 +5541,56 @@ extension PromptViewModel {
         )
     }
 
+    func preAssembleStrictPromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        sourceTabID: UUID,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> PromptContextPreAssemblyResult {
+        let effectiveBase: String? = switch reviewGitContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
+        let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(store: workspaceFileContextStore)
+        )
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return try await PromptContextPreAssemblyService.resolveStrict(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: selection,
+                store: workspaceFileContextStore,
+                lookupContext: lookupContext,
+                filePathDisplay: filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .expandFolders,
+                selectedGitDiffLookupProfile: .uiAssisted,
+                reviewGitContext: reviewGitContext,
+                sourceTabID: sourceTabID,
+                finalReviewAuthorization: finalReviewAuthorization,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
+                },
+                completeGitDiffProvider: { [gitVM] in
+                    await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+                }
+            )
+        )
+    }
+
     func freezePromptGitReviewContext(
         workspaceID: UUID? = nil,
         tabID: UUID? = nil,

@@ -219,7 +219,9 @@ struct SelectedGitDiffArtifactAuthorizationService {
             capability.gitDataRoot.standardizedFullPath == expectedGitDataPath &&
             currentGitDataRoot == capability.gitDataRoot
 
-        for rawPath in Self.selectionCandidatePaths(from: request.physicalSelection) {
+        for rawPath in SelectedGitArtifactSelectionClassifier.selectionCandidatePaths(
+            from: request.physicalSelection
+        ) {
             guard let path = exactAbsolutePath(rawPath) else {
                 if rawPath.hasPrefix(capability.gitDataRoot.standardizedFullPath + "/") {
                     consumedPaths.insert(rawPath)
@@ -433,27 +435,6 @@ struct SelectedGitDiffArtifactAuthorizationService {
               !StandardizedPath.containsNUL(relativePath)
         else { return nil }
         return "_git_data/\(relativePath)"
-    }
-
-    /// Enumerates every path representation that may contain a selected Git artifact.
-    /// Classification remains owned by the caller until Batch 3 installs the shared classifier.
-    static func selectionCandidatePaths(from selection: StoredSelection) -> [String] {
-        var candidates: [String] = []
-        var seen = Set<String>()
-
-        func append(_ path: String) {
-            guard seen.insert(path).inserted else { return }
-            candidates.append(path)
-        }
-
-        selection.selectedPaths.forEach(append)
-        selection.slices
-            .filter { !$0.value.isEmpty }
-            .map(\.key)
-            .sorted()
-            .forEach(append)
-        selection.autoCodemapPaths.forEach(append)
-        return candidates
     }
 
     private func candidate(for path: String, gitDataRootPath: String) -> Candidate? {

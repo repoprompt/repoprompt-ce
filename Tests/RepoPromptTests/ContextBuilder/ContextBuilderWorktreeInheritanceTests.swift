@@ -219,7 +219,7 @@ import XCTest
                         )
                     }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
+                        _, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
                         XCTAssertEqual(agentModeSessionID, sessionID)
                         XCTAssertEqual(agentModeRunID, parentRunID)
                         XCTAssertEqual(reviewGitContext.compareIntent, .uncommittedHEAD)
@@ -227,13 +227,15 @@ import XCTest
                             reviewGitContext.displayContext.roots.first?.physicalRootPath,
                             worktreeRoot.standardizedFileURL.path
                         )
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        XCTAssertEqual(finalReviewAuthorization == nil, mode != .review)
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
                                 selection: selection,
                                 lookupContext: lookupContext,
-                                reviewGitContext: reviewGitContext
+                                reviewGitContext: reviewGitContext,
+                                finalReviewAuthorization: finalReviewAuthorization
                             ),
                             model: fixture.contextA.window.promptManager.preferredAIModel,
                             mode: mode
@@ -566,10 +568,11 @@ import XCTest
                     )
 
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, _, routedSessionID, routedRunID, mode, _, selection, lookupContext, _, _, _ in
+                        _, _, routedSessionID, routedRunID, mode, _, selection, lookupContext, _, finalReviewAuthorization, _, _ in
                         XCTAssertEqual(routedSessionID, sessionID)
                         XCTAssertEqual(routedRunID, parentRunID)
                         XCTAssertEqual(mode, .review)
+                        XCTAssertNotNil(finalReviewAuthorization)
                         XCTAssertTrue(selection.selectedPaths.contains(logicalBranchOnly.path))
                         state.recordFollowUp(
                             mode: mode,
@@ -902,16 +905,17 @@ import XCTest
                             )
                         }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, routedSessionID, routedRunID, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
+                        _, tabID, routedSessionID, routedRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
                         XCTAssertEqual(routedSessionID, sessionID)
                         XCTAssertEqual(routedRunID, parentRunID)
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
                                 selection: selection,
                                 lookupContext: lookupContext,
-                                reviewGitContext: reviewGitContext
+                                reviewGitContext: reviewGitContext,
+                                finalReviewAuthorization: finalReviewAuthorization
                             ),
                             model: fixture.contextA.window.promptManager.preferredAIModel,
                             mode: mode
@@ -1160,14 +1164,15 @@ import XCTest
                             )
                         }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
-                        _, tabID, _, _, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        _, tabID, _, _, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, _, _ in
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
                                 selection: selection,
                                 lookupContext: lookupContext,
-                                reviewGitContext: reviewGitContext
+                                reviewGitContext: reviewGitContext,
+                                finalReviewAuthorization: finalReviewAuthorization
                             ),
                             model: fixture.contextA.window.promptManager.preferredAIModel,
                             mode: mode

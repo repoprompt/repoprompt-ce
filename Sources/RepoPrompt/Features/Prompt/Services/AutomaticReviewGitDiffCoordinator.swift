@@ -1,9 +1,46 @@
 import Foundation
 
+enum AutomaticReviewGitDiffSource: Equatable {
+    case discover(WorkspaceSelectedGitPathResolution)
+    case finalized(ContextBuilderFinalReviewAuthorization)
+}
+
 struct AutomaticReviewGitDiffRequest: Equatable {
-    let pathResolution: WorkspaceSelectedGitPathResolution
+    let source: AutomaticReviewGitDiffSource
     let compareIntent: ReviewGitCompareIntent
     let displayContext: ReviewGitDisplayContext
+
+    init(
+        pathResolution: WorkspaceSelectedGitPathResolution,
+        compareIntent: ReviewGitCompareIntent,
+        displayContext: ReviewGitDisplayContext
+    ) {
+        source = .discover(pathResolution)
+        self.compareIntent = compareIntent
+        self.displayContext = displayContext
+    }
+
+    init(
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization,
+        compareIntent: ReviewGitCompareIntent,
+        displayContext: ReviewGitDisplayContext
+    ) {
+        source = .finalized(finalReviewAuthorization)
+        self.compareIntent = compareIntent
+        self.displayContext = displayContext
+    }
+
+    var pathResolution: WorkspaceSelectedGitPathResolution {
+        switch source {
+        case let .discover(pathResolution):
+            pathResolution
+        case let .finalized(authorization):
+            WorkspaceSelectedGitPathResolution(
+                paths: authorization.checkoutAuthorizations.flatMap(\.ordinaryPhysicalPaths),
+                unresolvedCandidates: []
+            )
+        }
+    }
 }
 
 struct AutomaticReviewGitDiffResult: Equatable {
@@ -18,6 +55,7 @@ struct AutomaticReviewGitDiffResult: Equatable {
     let completeness: Completeness
     let outcomes: [ReviewGitCheckoutOutcome]
     let pathIssues: [ReviewGitPathIssue]
+    var authorizationFailure: ContextBuilderReviewTargetUnavailableReason?
 }
 
 struct ReviewGitCheckout: Equatable {
@@ -72,11 +110,15 @@ struct AutomaticReviewGitDiffCoordinator {
         var resolveRef: @Sendable (String, URL) async throws -> String
         var mergeBase: @Sendable (_ headID: String, _ baseID: String, _ repoURL: URL) async throws -> String
         var buildDiff: @Sendable (_ compare: GitDiffCompareSpec, _ paths: [String], _ repoURL: URL) async throws -> String?
+        var revalidateFinalAuthorization: @Sendable (
+            ContextBuilderFinalReviewAuthorization
+        ) async -> ContextBuilderReviewTargetUnavailableReason? = { _ in .staleWorkspaceRoot }
 
         static func live(
             vcsService: VCSService = .shared,
             gitService: GitService = GitService(),
-            diffEngine: GitDiffEngine? = nil
+            diffEngine: GitDiffEngine? = nil,
+            store: WorkspaceFileContextStore? = nil
         ) -> Dependencies {
             let engine = diffEngine ?? GitDiffEngine(vcsService: vcsService, gitService: gitService)
             return Dependencies(
@@ -107,6 +149,11 @@ struct AutomaticReviewGitDiffCoordinator {
                         generateDiffText: true
                     )
                     return result.diffText
+                },
+                revalidateFinalAuthorization: { authorization in
+                    guard let store else { return .staleWorkspaceRoot }
+                    return await ContextBuilderReviewTargetResolver(vcsService: vcsService)
+                        .revalidate(authorization.target, store: store)
                 }
             )
         }
@@ -133,6 +180,14 @@ struct AutomaticReviewGitDiffCoordinator {
                 outcomes: [],
                 pathIssues: []
             )
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            return AutomaticReviewGitDiffResult(
+                text: nil,
+                completeness: .failed,
+                outcomes: [],
+                pathIssues: [],
+                authorizationFailure: reason
+            )
         } catch {
             // All operational failures are handled per checkout. This is a defensive fail-closed
             // result for an unexpected cancellation-compatible error path.
@@ -148,24 +203,53 @@ struct AutomaticReviewGitDiffCoordinator {
         }
     }
 
+    func resolveStrict(
+        _ request: AutomaticReviewGitDiffRequest
+    ) async throws -> AutomaticReviewGitDiffResult {
+        try await resolveCheckingCancellation(request)
+    }
+
     private func resolveCheckingCancellation(
         _ request: AutomaticReviewGitDiffRequest
     ) async throws -> AutomaticReviewGitDiffResult {
         try Task.checkCancellation()
 
-        let ownership = try await ReviewGitSelectedPathOwnershipResolver(
-            dependencies: .init(
-                resolveRepo: dependencies.resolveRepo,
-                resolveLayout: dependencies.resolveLayout
-            )
-        ).resolve(request.pathResolution, displayContext: request.displayContext)
-        let pathIssues = ownership.pathIssues
-        let checkouts = ownership.checkouts.map {
-            ReviewGitCheckout(
-                checkoutRootPath: $0.checkoutRootPath,
-                displayLabel: $0.displayLabel,
-                selectedPaths: $0.selectedPaths
-            )
+        let finalAuthorization: ContextBuilderFinalReviewAuthorization?
+        let pathIssues: [ReviewGitPathIssue]
+        let checkouts: [ReviewGitCheckout]
+        switch request.source {
+        case let .discover(pathResolution):
+            let ownership = try await ReviewGitSelectedPathOwnershipResolver(
+                dependencies: .init(
+                    resolveRepo: dependencies.resolveRepo,
+                    resolveLayout: dependencies.resolveLayout
+                )
+            ).resolve(pathResolution, displayContext: request.displayContext)
+            finalAuthorization = nil
+            pathIssues = ownership.pathIssues
+            checkouts = ownership.checkouts.map {
+                ReviewGitCheckout(
+                    checkoutRootPath: $0.checkoutRootPath,
+                    displayLabel: $0.displayLabel,
+                    selectedPaths: $0.selectedPaths
+                )
+            }
+
+        case let .finalized(authorization):
+            try validateFinalizedStructure(authorization)
+            try await revalidate(authorization)
+            finalAuthorization = authorization
+            pathIssues = []
+            checkouts = authorization.checkoutAuthorizations.map { checkoutAuthorization in
+                let checkout = checkoutAuthorization.checkout
+                return ReviewGitCheckout(
+                    checkoutRootPath: checkout.checkoutRootPath,
+                    displayLabel: request.displayContext.checkoutLabel(
+                        for: checkout.checkoutRootPath
+                    ),
+                    selectedPaths: checkoutAuthorization.ordinaryPhysicalPaths
+                )
+            }
         }
         var frozenPlans: [FrozenCheckoutPlan] = []
         frozenPlans.reserveCapacity(checkouts.count)
@@ -173,10 +257,12 @@ struct AutomaticReviewGitDiffCoordinator {
         // Resolve every immutable boundary before executing any working-tree diff.
         for checkout in checkouts {
             try Task.checkCancellation()
+            try await revalidate(finalAuthorization)
             let rootURL = URL(fileURLWithPath: checkout.checkoutRootPath, isDirectory: true)
             do {
                 let headID = try await dependencies.resolveHead(rootURL)
                 try Task.checkCancellation()
+                try await revalidate(finalAuthorization)
                 let compare: GitDiffCompareSpec
                 switch request.compareIntent {
                 case .uncommittedHEAD:
@@ -184,14 +270,19 @@ struct AutomaticReviewGitDiffCoordinator {
                 case let .uncommittedMergeBase(symbolicBase):
                     let baseID = try await dependencies.resolveRef(symbolicBase, rootURL)
                     try Task.checkCancellation()
+                    try await revalidate(finalAuthorization)
                     let mergeBaseID = try await dependencies.mergeBase(headID, baseID, rootURL)
                     try Task.checkCancellation()
+                    try await revalidate(finalAuthorization)
                     compare = .uncommitted(base: mergeBaseID)
                 }
                 frozenPlans.append(.ready(checkout: checkout, compare: compare))
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+                throw reason
             } catch {
+                try await revalidate(finalAuthorization)
                 frozenPlans.append(.baseFailure(
                     checkout: checkout,
                     summary: "Comparison base resolution failed."
@@ -204,14 +295,21 @@ struct AutomaticReviewGitDiffCoordinator {
 
         for plan in frozenPlans {
             try Task.checkCancellation()
+            try await revalidate(finalAuthorization)
             switch plan {
             case let .baseFailure(checkout, summary):
                 outcomes.append(.baseResolutionFailed(checkout: checkout, summary: summary))
             case let .ready(checkout, compare):
+                if checkout.selectedPaths.isEmpty {
+                    outcomes.append(.noChanges(checkout: checkout))
+                    continue
+                }
                 let rootURL = URL(fileURLWithPath: checkout.checkoutRootPath, isDirectory: true)
                 do {
+                    try await revalidate(finalAuthorization)
                     let text = try await dependencies.buildDiff(compare, checkout.selectedPaths, rootURL)
                     try Task.checkCancellation()
+                    try await revalidate(finalAuthorization)
                     if let text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         outcomes.append(.diff(checkout: checkout, text: text))
                     } else {
@@ -219,7 +317,10 @@ struct AutomaticReviewGitDiffCoordinator {
                     }
                 } catch is CancellationError {
                     throw CancellationError()
+                } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+                    throw reason
                 } catch {
+                    try await revalidate(finalAuthorization)
                     outcomes.append(.commandFailed(
                         checkout: checkout,
                         summary: "Git diff generation failed."
@@ -229,6 +330,7 @@ struct AutomaticReviewGitDiffCoordinator {
         }
 
         try Task.checkCancellation()
+        try await revalidate(finalAuthorization)
 
         let hasFailures = !pathIssues.isEmpty || outcomes.contains { !$0.isSuccessful }
         let hasSuccessfulCheckout = outcomes.contains { $0.isSuccessful }
@@ -247,6 +349,44 @@ struct AutomaticReviewGitDiffCoordinator {
             outcomes: outcomes,
             pathIssues: pathIssues
         )
+    }
+
+    private func revalidate(
+        _ authorization: ContextBuilderFinalReviewAuthorization?
+    ) async throws {
+        guard let authorization,
+              let reason = await dependencies.revalidateFinalAuthorization(authorization)
+        else { return }
+        throw reason
+    }
+
+    private func validateFinalizedStructure(
+        _ authorization: ContextBuilderFinalReviewAuthorization
+    ) throws {
+        guard authorization.workspaceID == authorization.target.workspaceID,
+              authorization.tabID == authorization.target.tabID,
+              authorization.committedSelectionRevision == authorization.target.sourceSelectionRevision,
+              authorization.checkoutAuthorizations.map(\.checkout) == authorization.target.checkouts
+        else {
+            throw ContextBuilderReviewTargetUnavailableReason.workspaceOrTabMismatch
+        }
+
+        var seenPaths = Set<String>()
+        for checkoutAuthorization in authorization.checkoutAuthorizations {
+            let root = GitRepoRootAuthorization.canonicalPath(
+                checkoutAuthorization.checkout.checkoutRootPath
+            )
+            for rawPath in checkoutAuthorization.ordinaryPhysicalPaths {
+                let path = GitRepoRootAuthorization.canonicalPath(rawPath)
+                guard rawPath.hasPrefix("/"),
+                      path != root,
+                      StandardizedPath.isDescendant(path, of: root),
+                      seenPaths.insert(path).inserted
+                else {
+                    throw ContextBuilderReviewTargetUnavailableReason.selectionOwnershipChanged
+                }
+            }
+        }
     }
 
     private func renderText(

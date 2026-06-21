@@ -23,6 +23,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         func count() -> Int {
             requests.count
         }
+
+        func lastRequest() -> AutomaticReviewGitDiffRequest? {
+            requests.last
+        }
     }
 
     private struct ArtifactFixture {
@@ -302,6 +306,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             codemapAutoEnabled: false
         )
         let capture = ProviderCapture()
+        let finalAuthorization = try await makeFinalAuthorization(
+            fixture: fixture,
+            selection: selection
+        )
         let baseRequest = PromptContextPreAssemblyRequest(
             cfg: makeConfig(gitInclusion: .selected),
             selection: selection,
@@ -312,13 +320,15 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             showCodeMapMarkers: true,
             selectedGitDiffFolderPolicy: .expandFolders,
             reviewGitContext: fixture.reviewContext,
+            sourceTabID: finalAuthorization.tabID,
+            finalReviewAuthorization: finalAuthorization,
             selectedGitDiffProvider: { request in
                 await capture.record(request)
                 return Self.automaticResult("automatic diff must not appear")
             },
             completeGitDiffProvider: { "unexpected complete provider" }
         )
-        let includeResult = await PromptContextPreAssemblyService.resolve(baseRequest)
+        let includeResult = try await PromptContextPreAssemblyService.resolveStrict(baseRequest)
         let providerInvocationCount = await capture.count()
 
         XCTAssertEqual(includeResult.gitDiff, diffText)
@@ -479,12 +489,17 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
     func testEmptyAuthorizedPatchFallsBackExactlyOnce() async throws {
         let fixture = try await makeArtifactFixture(patchContent: " \n")
         let capture = ProviderCapture()
+        let selection = StoredSelection(
+            selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
+            codemapAutoEnabled: false
+        )
+        let finalAuthorization = try await makeFinalAuthorization(
+            fixture: fixture,
+            selection: selection
+        )
         let request = PromptContextPreAssemblyRequest(
             cfg: makeConfig(gitInclusion: .selected),
-            selection: StoredSelection(
-                selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
-                codemapAutoEnabled: false
-            ),
+            selection: selection,
             store: fixture.store,
             lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
             filePathDisplay: .relative,
@@ -492,6 +507,8 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             showCodeMapMarkers: true,
             selectedGitDiffFolderPolicy: .filesOnly,
             reviewGitContext: fixture.reviewContext,
+            sourceTabID: finalAuthorization.tabID,
+            finalReviewAuthorization: finalAuthorization,
             selectedGitDiffProvider: { automaticRequest in
                 await capture.record(automaticRequest)
                 return Self.automaticResult("automatic fallback")
@@ -499,7 +516,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             completeGitDiffProvider: { nil }
         )
 
-        let result = await PromptContextPreAssemblyService.resolve(request)
+        let result = try await PromptContextPreAssemblyService.resolveStrict(request)
         let providerInvocationCount = await capture.count()
 
         XCTAssertEqual(result.gitDiff, "automatic fallback")
@@ -507,11 +524,26 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         guard case .automatic = result.gitDiffResolution else {
             return XCTFail("Expected structured automatic resolution")
         }
+        guard case .finalized = await capture.lastRequest()?.source else {
+            return XCTFail("Expected the empty authorized patch to use finalized checkout authority")
+        }
     }
 
     func testSliceOnlyAndAutoCodemapOnlyAuthorizedPatchSelectionsRemainArtifacts() async throws {
         let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n"
         let fixture = try await makeArtifactFixture(patchContent: diffText)
+        let noncanonicalPatchPath = fixture.patchURL.deletingLastPathComponent().path
+            + "/../diff/all.patch"
+        XCTAssertEqual(
+            SelectedGitArtifactSelectionClassifier.artifactCandidatePaths(
+                from: StoredSelection(
+                    selectedPaths: [noncanonicalPatchPath],
+                    codemapAutoEnabled: false
+                ),
+                capability: fixture.reviewContext.artifactCapability
+            ),
+            [fixture.patchURL.path]
+        )
         let selections = [
             StoredSelection(
                 slices: [fixture.patchURL.path: [LineRange(start: 1, end: 1)]],
@@ -525,6 +557,10 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
 
         for selection in selections {
             let capture = ProviderCapture()
+            let finalAuthorization = try await makeFinalAuthorization(
+                fixture: fixture,
+                selection: selection
+            )
             let request = PromptContextPreAssemblyRequest(
                 cfg: makeConfig(gitInclusion: .selected),
                 selection: selection,
@@ -535,6 +571,8 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 showCodeMapMarkers: true,
                 selectedGitDiffFolderPolicy: .filesOnly,
                 reviewGitContext: fixture.reviewContext,
+                sourceTabID: finalAuthorization.tabID,
+                finalReviewAuthorization: finalAuthorization,
                 selectedGitDiffProvider: { automaticRequest in
                     await capture.record(automaticRequest)
                     return Self.automaticResult("automatic diff must not appear")
@@ -542,7 +580,7 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
                 completeGitDiffProvider: { nil }
             )
 
-            let result = await PromptContextPreAssemblyService.resolve(request)
+            let result = try await PromptContextPreAssemblyService.resolveStrict(request)
             let providerInvocationCount = await capture.count()
 
             XCTAssertEqual(result.gitDiff, diffText)
@@ -550,6 +588,159 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             XCTAssertEqual(result.entries.map(\.role), [.authorizedGitDiffArtifact])
             XCTAssertEqual(result.entries.first?.lineRanges, nil)
         }
+    }
+
+    func testStrictReviewRejectsChangedArtifactProvenanceBeforeAutomaticFallback() async throws {
+        let fixture = try await makeArtifactFixture(patchContent: "diff --git a/A b/A\n")
+        let selection = StoredSelection(
+            selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
+            codemapAutoEnabled: false
+        )
+        let authorized = try await makeFinalAuthorization(fixture: fixture, selection: selection)
+        let originalArtifact = try XCTUnwrap(authorized.selectedArtifactAuthorizations.first)
+        let changedArtifact = ContextBuilderFinalSelectedArtifactAuthorization(
+            absolutePath: originalArtifact.absolutePath,
+            kind: originalArtifact.kind,
+            readability: originalArtifact.readability,
+            provenance: SelectedGitArtifactCheckoutProvenance(
+                checkoutRootPath: originalArtifact.provenance.checkoutRootPath,
+                repoKey: originalArtifact.provenance.repoKey,
+                repositoryID: originalArtifact.provenance.repositoryID,
+                worktreeID: "changed-worktree",
+                kind: originalArtifact.provenance.kind
+            )
+        )
+        let changedAuthorization = ContextBuilderFinalReviewAuthorization(
+            electionOrigin: authorized.electionOrigin,
+            workspaceID: authorized.workspaceID,
+            tabID: authorized.tabID,
+            committedSelectionRevision: authorized.committedSelectionRevision,
+            committedSelection: authorized.committedSelection,
+            lookupContext: authorized.lookupContext,
+            reviewGitContext: authorized.reviewGitContext,
+            target: authorized.target,
+            checkoutAuthorizations: authorized.checkoutAuthorizations,
+            selectedArtifactAuthorizations: [changedArtifact]
+        )
+        let capture = ProviderCapture()
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .selected),
+            selection: selection,
+            store: fixture.store,
+            lookupContext: changedAuthorization.lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: fixture.reviewContext,
+            sourceTabID: changedAuthorization.tabID,
+            finalReviewAuthorization: changedAuthorization,
+            selectedGitDiffProvider: { automaticRequest in
+                await capture.record(automaticRequest)
+                return Self.automaticResult("forbidden fallback")
+            },
+            completeGitDiffProvider: { nil }
+        )
+
+        do {
+            _ = try await PromptContextPreAssemblyService.resolveStrict(request)
+            XCTFail("Expected changed artifact provenance to fail closed")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            guard case .unauthorizedSelectedArtifact = reason else {
+                return XCTFail("Unexpected rejection: \(reason)")
+            }
+        }
+        let providerCount = await capture.count()
+        XCTAssertEqual(providerCount, 0)
+    }
+
+    func testStrictReviewRejectedArtifactNeverInvokesAutomaticFallback() async throws {
+        let fixture = try await makeArtifactFixture(patchContent: "diff --git a/A b/A\n")
+        let selection = StoredSelection(
+            selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
+            codemapAutoEnabled: false
+        )
+        let authorization = try await makeFinalAuthorization(
+            fixture: fixture,
+            selection: selection
+        )
+        try FileManager.default.removeItem(at: fixture.patchURL)
+        let capture = ProviderCapture()
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .selected),
+            selection: selection,
+            store: fixture.store,
+            lookupContext: authorization.lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: fixture.reviewContext,
+            sourceTabID: authorization.tabID,
+            finalReviewAuthorization: authorization,
+            selectedGitDiffProvider: { automaticRequest in
+                await capture.record(automaticRequest)
+                return Self.automaticResult("forbidden fallback")
+            },
+            completeGitDiffProvider: { nil }
+        )
+
+        do {
+            _ = try await PromptContextPreAssemblyService.resolveStrict(request)
+            XCTFail("Expected the removed artifact to fail closed")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            guard case .unauthorizedSelectedArtifact = reason else {
+                return XCTFail("Unexpected rejection: \(reason)")
+            }
+        }
+        let providerCount = await capture.count()
+        XCTAssertEqual(providerCount, 0)
+    }
+
+    func testStrictReviewRejectsMismatchedFrozenGitContextBeforeFallback() async throws {
+        let fixture = try await makeArtifactFixture(patchContent: "diff --git a/A b/A\n")
+        let selection = StoredSelection(
+            selectedPaths: [fixture.patchURL.path, fixture.sourceURL.path],
+            codemapAutoEnabled: false
+        )
+        let authorization = try await makeFinalAuthorization(
+            fixture: fixture,
+            selection: selection
+        )
+        let mismatchedContext = FrozenPromptGitReviewContext(
+            artifactCapability: fixture.reviewContext.artifactCapability,
+            artifactDelegationConsumer: fixture.reviewContext.artifactDelegationConsumer,
+            compareIntent: .uncommittedMergeBase(symbolicBase: "unexpected/base"),
+            displayContext: fixture.reviewContext.displayContext
+        )
+        let capture = ProviderCapture()
+        let request = PromptContextPreAssemblyRequest(
+            cfg: makeConfig(gitInclusion: .selected),
+            selection: selection,
+            store: fixture.store,
+            lookupContext: authorization.lookupContext,
+            filePathDisplay: .relative,
+            onlyIncludeRootsWithSelectedFiles: true,
+            showCodeMapMarkers: true,
+            selectedGitDiffFolderPolicy: .filesOnly,
+            reviewGitContext: mismatchedContext,
+            sourceTabID: authorization.tabID,
+            finalReviewAuthorization: authorization,
+            selectedGitDiffProvider: { automaticRequest in
+                await capture.record(automaticRequest)
+                return Self.automaticResult("forbidden fallback")
+            },
+            completeGitDiffProvider: { nil }
+        )
+
+        do {
+            _ = try await PromptContextPreAssemblyService.resolveStrict(request)
+            XCTFail("Expected mismatched frozen Git context to fail closed")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .workspaceOrTabMismatch)
+        }
+        let providerCount = await capture.count()
+        XCTAssertEqual(providerCount, 0)
     }
 
     func testGitDataSelectionWithoutCapabilityFailsClosedWithoutArtifactClassification() async throws {
@@ -686,6 +877,29 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             sourceURL: sourceURL,
             store: store,
             reviewContext: reviewContext
+        )
+    }
+
+    private func makeFinalAuthorization(
+        fixture: ArtifactFixture,
+        selection: StoredSelection
+    ) async throws -> ContextBuilderFinalReviewAuthorization {
+        let capability = try XCTUnwrap(fixture.reviewContext.artifactCapability)
+        let lookupContext = WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil)
+        let input = ContextBuilderReviewTargetInput(
+            workspaceID: capability.workspaceID,
+            tabID: capability.creatorTabID,
+            selectionRevision: 1,
+            selection: selection,
+            lookupContext: lookupContext,
+            reviewGitContext: fixture.reviewContext
+        )
+        let resolver = ContextBuilderReviewTargetResolver()
+        let initial = try await resolver.resolve(input: input, store: fixture.store)
+        return try await resolver.finalizeSelection(
+            input: input,
+            initialResolution: initial,
+            store: fixture.store
         )
     }
 

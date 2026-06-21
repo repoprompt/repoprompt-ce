@@ -23,6 +23,8 @@ struct PromptContextPreAssemblyRequest {
     let includeLocalDefinitionsInFileTree: Bool
     let selectedGitDiffArtifactPolicy: SelectedGitDiffArtifactPolicy
     let reviewGitContext: FrozenPromptGitReviewContext
+    let sourceTabID: UUID?
+    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
     let selectedGitDiffProvider: (AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult
     let completeGitDiffProvider: () async -> String?
 
@@ -42,6 +44,8 @@ struct PromptContextPreAssemblyRequest {
         includeLocalDefinitionsInFileTree: Bool = false,
         selectedGitDiffArtifactPolicy: SelectedGitDiffArtifactPolicy = .includeBeforeGitInclusion,
         reviewGitContext: FrozenPromptGitReviewContext,
+        sourceTabID: UUID? = nil,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         selectedGitDiffProvider: @escaping (AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult,
         completeGitDiffProvider: @escaping () async -> String?
     ) {
@@ -60,6 +64,8 @@ struct PromptContextPreAssemblyRequest {
         self.includeLocalDefinitionsInFileTree = includeLocalDefinitionsInFileTree
         self.selectedGitDiffArtifactPolicy = selectedGitDiffArtifactPolicy
         self.reviewGitContext = reviewGitContext
+        self.sourceTabID = sourceTabID
+        self.finalReviewAuthorization = finalReviewAuthorization
         self.selectedGitDiffProvider = selectedGitDiffProvider
         self.completeGitDiffProvider = completeGitDiffProvider
     }
@@ -107,13 +113,68 @@ struct PromptContextPreAssemblyResult {
 }
 
 enum PromptContextPreAssemblyService {
+    private struct ArtifactSnapshotEntry: Equatable {
+        let path: String
+        let content: String?
+    }
+
     static func resolve(_ request: PromptContextPreAssemblyRequest) async -> PromptContextPreAssemblyResult {
+        precondition(
+            request.finalReviewAuthorization == nil,
+            "Strict Context Builder review packaging must use resolveStrict"
+        )
         let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
-        let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
         let artifactAuthorization = await authorizeSelectedGitArtifacts(
             request: request,
             physicalSelection: physicalSelection
         )
+        do {
+            return try await resolveCore(
+                request,
+                physicalSelection: physicalSelection,
+                artifactAuthorization: artifactAuthorization
+            )
+        } catch {
+            preconditionFailure("Non-strict prompt preassembly unexpectedly failed: \(error)")
+        }
+    }
+
+    static func resolveStrict(
+        _ request: PromptContextPreAssemblyRequest
+    ) async throws -> PromptContextPreAssemblyResult {
+        guard let authorization = request.finalReviewAuthorization else {
+            return await resolve(request)
+        }
+        let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
+        let artifactAuthorization = try await validateStrictAuthorization(
+            request: request,
+            physicalSelection: physicalSelection,
+            authorization: authorization
+        )
+        let result = try await resolveCore(
+            request,
+            physicalSelection: physicalSelection,
+            artifactAuthorization: artifactAuthorization
+        )
+        let finalArtifactAuthorization = try await validateStrictAuthorization(
+            request: request,
+            physicalSelection: physicalSelection,
+            authorization: authorization
+        )
+        guard artifactSnapshot(finalArtifactAuthorization) == artifactSnapshot(artifactAuthorization) else {
+            throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                count: authorization.selectedArtifactAuthorizations.count
+            )
+        }
+        return result
+    }
+
+    private static func resolveCore(
+        _ request: PromptContextPreAssemblyRequest,
+        physicalSelection: StoredSelection,
+        artifactAuthorization: SelectedGitArtifactAuthorizationResult
+    ) async throws -> PromptContextPreAssemblyResult {
+        let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
         let ordinarySelection = selection(
             physicalSelection,
             excluding: artifactAuthorization.consumedSelectionPaths
@@ -137,7 +198,7 @@ enum PromptContextPreAssemblyService {
             rootScope: ordinaryRootScope
         )
         let allEntries = artifactAuthorization.entries + resolution.entries
-        let gitDiffResolution = await resolveGitDiff(
+        let gitDiffResolution = try await resolveGitDiff(
             request: request,
             physicalSelection: ordinarySelection,
             entries: allEntries,
@@ -158,6 +219,131 @@ enum PromptContextPreAssemblyService {
             lookupContext: request.lookupContext,
             filePathDisplay: request.filePathDisplay
         )
+    }
+
+    private static func validateStrictAuthorization(
+        request: PromptContextPreAssemblyRequest,
+        physicalSelection: StoredSelection,
+        authorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> SelectedGitArtifactAuthorizationResult {
+        guard request.sourceTabID == authorization.tabID,
+              request.selection == authorization.committedSelection,
+              request.lookupContext == authorization.lookupContext,
+              request.reviewGitContext == authorization.reviewGitContext,
+              authorization.workspaceID == authorization.target.workspaceID,
+              authorization.tabID == authorization.target.tabID,
+              authorization.committedSelectionRevision == authorization.target.sourceSelectionRevision,
+              authorization.reviewGitContext.artifactCapability == authorization.target.artifactCapability,
+              authorization.reviewGitContext.displayContext == authorization.target.displayContext
+        else {
+            throw ContextBuilderReviewTargetUnavailableReason.workspaceOrTabMismatch
+        }
+        guard authorization.selectedArtifactAuthorizations.allSatisfy({ artifact in
+            authorization.target.checkouts.contains { $0.matches(artifact.provenance) }
+        }) else {
+            throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                count: authorization.selectedArtifactAuthorizations.count
+            )
+        }
+
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(
+            authorization.target,
+            store: request.store
+        ) {
+            throw reason
+        }
+
+        let candidatePaths = SelectedGitArtifactSelectionClassifier.artifactCandidatePaths(
+            from: physicalSelection,
+            capability: request.reviewGitContext.artifactCapability
+        )
+        let candidateIdentities = try Set(candidatePaths.map { rawPath -> String in
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/"), !StandardizedPath.containsNUL(trimmed) else {
+                throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                    count: candidatePaths.count
+                )
+            }
+            return StandardizedPath.absolute(trimmed)
+        })
+        let expectedIdentities = Set(
+            authorization.selectedArtifactAuthorizations.map(\.absolutePath)
+        )
+        guard candidateIdentities == expectedIdentities else {
+            throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                count: max(candidateIdentities.count, expectedIdentities.count)
+            )
+        }
+
+        let artifactAuthorization: SelectedGitArtifactAuthorizationResult
+        if let capability = request.reviewGitContext.artifactCapability {
+            artifactAuthorization = await SelectedGitDiffArtifactAuthorizationService().authorize(
+                SelectedGitArtifactAuthorizationRequest(
+                    physicalSelection: physicalSelection,
+                    capability: capability,
+                    store: request.store,
+                    delegationConsumer: request.reviewGitContext.artifactDelegationConsumer
+                )
+            )
+        } else {
+            guard candidateIdentities.isEmpty, expectedIdentities.isEmpty else {
+                throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                    count: max(candidateIdentities.count, expectedIdentities.count)
+                )
+            }
+            artifactAuthorization = SelectedGitArtifactAuthorizationResult(
+                entries: [],
+                consumedSelectionPaths: [],
+                dispositions: []
+            )
+        }
+
+        guard artifactAuthorization.rejectedDisplayDiagnostics.isEmpty else {
+            throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                count: artifactAuthorization.rejectedDisplayDiagnostics.count
+            )
+        }
+        let actualAuthorizations = artifactAuthorization.dispositions.compactMap {
+            disposition -> ContextBuilderFinalSelectedArtifactAuthorization? in
+            guard case let .authorized(path, kind, readability) = disposition,
+                  let provenance = artifactAuthorization.checkoutProvenanceByAbsolutePath[path]
+            else { return nil }
+            return ContextBuilderFinalSelectedArtifactAuthorization(
+                absolutePath: path,
+                kind: kind,
+                readability: readability,
+                provenance: provenance
+            )
+        }.sorted { $0.absolutePath < $1.absolutePath }
+        let expectedAuthorizations = authorization.selectedArtifactAuthorizations.sorted {
+            $0.absolutePath < $1.absolutePath
+        }
+        guard actualAuthorizations == expectedAuthorizations else {
+            throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
+                count: max(actualAuthorizations.count, expectedAuthorizations.count)
+            )
+        }
+
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(
+            authorization.target,
+            store: request.store
+        ) {
+            throw reason
+        }
+        return artifactAuthorization
+    }
+
+    private static func artifactSnapshot(
+        _ authorization: SelectedGitArtifactAuthorizationResult
+    ) -> [ArtifactSnapshotEntry] {
+        authorization.entries
+            .map {
+                ArtifactSnapshotEntry(
+                    path: $0.file.standardizedFullPath,
+                    content: $0.loadedContent
+                )
+            }
+            .sorted { $0.path < $1.path }
     }
 
     private static func authorizeSelectedGitArtifacts(
@@ -241,7 +427,7 @@ enum PromptContextPreAssemblyService {
         physicalSelection: StoredSelection,
         entries: [ResolvedPromptFileEntry],
         rootScope: WorkspaceLookupRootScope
-    ) async -> PromptGitDiffResolution {
+    ) async throws -> PromptGitDiffResolution {
         let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(entries)
         if request.selectedGitDiffArtifactPolicy == .respectGitInclusion,
            request.cfg.gitInclusion == .none
@@ -249,34 +435,49 @@ enum PromptContextPreAssemblyService {
             return .none
         }
 
-        return await PromptPackagingService.resolveGitDiffResolution(fromDiffEntries: diffEntries) {
-            switch request.cfg.gitInclusion {
-            case .none:
-                return .none
-            case .selected:
-                let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
-                    for: physicalSelection,
-                    store: request.store,
-                    rootScope: rootScope,
-                    folderPolicy: request.selectedGitDiffFolderPolicy,
-                    profile: request.selectedGitDiffLookupProfile,
-                    allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
-                    excluding: []
-                )
+        if let selected = PromptPackagingService.selectedGitDiffText(fromDiffEntries: diffEntries) {
+            return .selectedArtifact(selected)
+        }
+
+        switch request.cfg.gitInclusion {
+        case .none:
+            return .none
+        case .selected:
+            if let authorization = request.finalReviewAuthorization {
                 let result = await request.selectedGitDiffProvider(
                     AutomaticReviewGitDiffRequest(
-                        pathResolution: pathResolution,
+                        finalReviewAuthorization: authorization,
                         compareIntent: request.reviewGitContext.compareIntent,
-                        displayContext: request.reviewGitContext.displayContext
+                        displayContext: authorization.target.displayContext
                     )
                 )
-                return .automatic(result)
-            case .complete:
-                if request.lookupContext.bindingProjection != nil {
-                    return .complete(PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
+                if let failure = result.authorizationFailure {
+                    throw failure
                 }
-                return await .complete(request.completeGitDiffProvider())
+                return .automatic(result)
             }
+            let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
+                for: physicalSelection,
+                store: request.store,
+                rootScope: rootScope,
+                folderPolicy: request.selectedGitDiffFolderPolicy,
+                profile: request.selectedGitDiffLookupProfile,
+                allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
+                excluding: []
+            )
+            let result = await request.selectedGitDiffProvider(
+                AutomaticReviewGitDiffRequest(
+                    pathResolution: pathResolution,
+                    compareIntent: request.reviewGitContext.compareIntent,
+                    displayContext: request.reviewGitContext.displayContext
+                )
+            )
+            return .automatic(result)
+        case .complete:
+            if request.lookupContext.bindingProjection != nil {
+                return .complete(PromptContextGitDiffPolicy.deferredCompleteWorktreeGitDiffMessage)
+            }
+            return await .complete(request.completeGitDiffProvider())
         }
     }
 }

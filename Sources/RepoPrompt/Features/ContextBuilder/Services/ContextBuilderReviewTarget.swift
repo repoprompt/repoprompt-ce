@@ -150,6 +150,7 @@ struct ContextBuilderFinalReviewAuthorization: Equatable {
     let committedSelectionRevision: UInt64
     let committedSelection: StoredSelection
     let lookupContext: WorkspaceLookupContext
+    let reviewGitContext: FrozenPromptGitReviewContext
     let target: ContextBuilderReviewTarget
     let checkoutAuthorizations: [ContextBuilderFinalReviewCheckoutAuthorization]
     let selectedArtifactAuthorizations: [ContextBuilderFinalSelectedArtifactAuthorization]
@@ -770,6 +771,7 @@ struct ContextBuilderReviewTargetResolver {
             committedSelectionRevision: input.selectionRevision,
             committedSelection: input.selection,
             lookupContext: input.lookupContext,
+            reviewGitContext: input.reviewGitContext,
             target: finalTarget,
             checkoutAuthorizations: finalTarget.checkouts.map { checkout in
                 ContextBuilderFinalReviewCheckoutAuthorization(
@@ -947,24 +949,9 @@ struct ContextBuilderReviewTargetResolver {
         from selection: StoredSelection,
         capability: SelectedGitArtifactCapability?
     ) -> [String] {
-        SelectedGitDiffArtifactAuthorizationService.selectionCandidatePaths(from: selection)
-            .filter { rawPath in
-                guard let capability else {
-                    return looksLikeGitDataPath(rawPath)
-                }
-                let expanded = (rawPath as NSString).expandingTildeInPath
-                let path = expanded.hasPrefix("/")
-                    ? StandardizedPath.absolute(expanded)
-                    : StandardizedPath.relative(expanded)
-                return StandardizedPath.isDescendant(
-                    path,
-                    of: capability.gitDataRoot.standardizedFullPath
-                ) || looksLikeGitDataPath(rawPath)
-            }
-    }
-
-    private static func looksLikeGitDataPath(_ rawPath: String) -> Bool {
-        let normalized = rawPath.replacingOccurrences(of: "\\", with: "/")
-        return normalized.hasPrefix("_git_data/") || normalized.contains("/_git_data/")
+        SelectedGitArtifactSelectionClassifier.artifactCandidatePaths(
+            from: selection,
+            capability: capability
+        )
     }
 }

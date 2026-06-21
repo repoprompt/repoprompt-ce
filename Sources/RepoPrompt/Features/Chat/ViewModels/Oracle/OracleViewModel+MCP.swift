@@ -1570,7 +1570,7 @@ extension OracleViewModel {
         try Task.checkCancellation()
 
         // 3) Build AIMessage from snapshot
-        let aiMessage = await promptViewModel.buildHeadlessAIMessage(
+        let aiMessage = try await promptViewModel.buildHeadlessAIMessage(
             from: snapshot,
             model: model,
             mode: mode,

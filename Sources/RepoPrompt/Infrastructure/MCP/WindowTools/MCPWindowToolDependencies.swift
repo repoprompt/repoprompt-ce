@@ -94,6 +94,7 @@ struct MCPWindowToolDependencies {
         _ selection: StoredSelection,
         _ lookupContext: WorkspaceLookupContext?,
         _ reviewGitContext: FrozenPromptGitReviewContext,
+        _ finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?,
         _ progressReporter: ContextBuilderMCPProgressReporter?,
         _ activityReporter: ContextBuilderMCPActivityReporter?
     ) async throws -> ChatSendReply
