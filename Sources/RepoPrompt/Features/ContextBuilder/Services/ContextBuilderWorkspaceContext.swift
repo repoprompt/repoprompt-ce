@@ -17,7 +17,8 @@ struct ContextBuilderWorkspaceContext {
         from snapshot: MCPServerViewModel.TabContextSnapshot,
         workspaceRepoPaths: [String],
         workspaceDirectoryPath: String,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink? = nil
     ) async throws -> ContextBuilderWorkspaceContext {
         guard let parentAgentSessionID = snapshot.activeAgentSessionID else {
             throw ContextBuilderWorkspaceContextError.missingParentAgentSession
@@ -75,7 +76,9 @@ struct ContextBuilderWorkspaceContext {
             base: "HEAD",
             store: store
         )
-        let reviewTargetResolution = await ContextBuilderReviewTargetResolver().resolve(
+        let reviewTargetResolution = try await ContextBuilderReviewTargetResolver(
+            diagnosticSink: reviewDiagnosticSink
+        ).resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: snapshot.tabID,
@@ -152,7 +155,7 @@ struct ContextBuilderWorkspaceContext {
             if case let .unavailable(reason) = reviewTargetResolution { throw reason }
             throw ContextBuilderReviewTargetUnavailableReason.missingFrozenTarget
         }
-        if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
+        if let reason = try await ContextBuilderReviewTargetResolver().validateSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,

@@ -11,6 +11,48 @@ struct WorkspaceSessionWorktreeOwnedRoot: Hashable {
     let standardizedPhysicalPath: String
 }
 
+/// Ephemeral authority for one exact root owned by an Agent session. This value is
+/// request-local and is never persisted or encoded.
+struct WorkspaceSessionRootAuthorization: Hashable {
+    let sessionID: UUID
+    let ownershipGeneration: UInt64
+    let root: WorkspaceRootRef
+    let lifetimeID: UUID
+}
+
+enum WorkspaceSessionRootAuthorizationMismatch: String, Equatable {
+    case token
+    case generation
+    case rootClaim
+    case rootID
+    case lifetime
+    case kind
+    case path
+}
+
+enum WorkspaceAuthorizedSelectionCandidateRoute: String, Equatable {
+    case catalogFile
+    case materializedFile
+    case catalogFolder
+}
+
+enum WorkspaceAuthorizedSelectionCandidateBlock: String, Equatable {
+    case invalidPath
+    case outsideAuthorizedRoot
+    case symbolicLink
+    case symlinkComponent
+    case outsideCanonicalRoot
+    case nonRegularFile
+    case materializationFailed
+}
+
+enum WorkspaceAuthorizedSelectionCandidateResolution: Equatable {
+    case resolved(files: [WorkspaceFileRecord], route: WorkspaceAuthorizedSelectionCandidateRoute)
+    case noCandidate
+    case blockedOrAmbiguous(WorkspaceAuthorizedSelectionCandidateBlock)
+    case staleAuthority(WorkspaceSessionRootAuthorizationMismatch)
+}
+
 struct WorkspaceSessionWorktreeOwnershipPreparation {
     let token: WorkspaceSessionWorktreeOwnershipToken
     let bindingFingerprint: String

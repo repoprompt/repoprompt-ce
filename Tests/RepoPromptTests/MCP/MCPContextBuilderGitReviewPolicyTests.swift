@@ -293,7 +293,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             base: "HEAD",
             store: store
         )
-        let resolution = await ContextBuilderReviewTargetResolver().resolve(
+        let resolution = try await ContextBuilderReviewTargetResolver().resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,

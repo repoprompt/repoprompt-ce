@@ -108,4 +108,233 @@ final class WorkspaceFileContextStoreExactCapabilityTests: XCTestCase {
         XCTAssertNil(staleRecord)
         XCTAssertNil(staleContent)
     }
+
+    func testContextBuilderExactCandidateResolvesOnlyAuthorizedWorktreeContent() async throws {
+        let logicalRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderExactLogical")
+        let worktreeRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderExactWorktree")
+        let siblingRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderExactSibling")
+        let relativePath = "Sources/BranchOnly.swift"
+        let canonicalFile = logicalRoot.appendingPathComponent(relativePath)
+        let seedFile = worktreeRoot.appendingPathComponent("Sources/Seed.swift")
+        let siblingFile = siblingRoot.appendingPathComponent(relativePath)
+        try FileSystemTestSupport.write("canonical", to: canonicalFile)
+        try FileSystemTestSupport.write("seed", to: seedFile)
+        try FileSystemTestSupport.write("sibling", to: siblingFile)
+
+        let store = WorkspaceFileContextStore()
+        let fixture = try await makeSessionAuthorization(
+            store: store,
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot
+        )
+        let worktreeOnlyFile = worktreeRoot.appendingPathComponent(relativePath)
+        try FileSystemTestSupport.write("branch only", to: worktreeOnlyFile)
+        let symlink = worktreeRoot.appendingPathComponent("Sources/CanonicalLink.swift")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: canonicalFile)
+
+        let resolved = try await store.resolveContextBuilderSelectionCandidate(
+            path: worktreeOnlyFile.path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        guard case let .resolved(files, route) = resolved else {
+            return XCTFail("Expected exact worktree-only resolution, got \(resolved)")
+        }
+        XCTAssertEqual(route, .materializedFile)
+        XCTAssertEqual(files.map(\.standardizedFullPath), [worktreeOnlyFile.standardizedFileURL.path])
+        XCTAssertEqual(files.map(\.rootID), [fixture.authorization.root.id])
+
+        let folder = try await store.resolveContextBuilderSelectionCandidate(
+            path: worktreeRoot.appendingPathComponent("Sources").path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        guard case let .resolved(folderFiles, folderRoute) = folder else {
+            return XCTFail("Expected exact folder expansion, got \(folder)")
+        }
+        XCTAssertEqual(folderRoute, .catalogFolder)
+        XCTAssertEqual(
+            Set(folderFiles.map(\.standardizedRelativePath)),
+            ["Sources/BranchOnly.swift", "Sources/Seed.swift"]
+        )
+
+        let rootFolder = try await store.resolveContextBuilderSelectionCandidate(
+            path: worktreeRoot.path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        guard case let .resolved(rootFiles, rootRoute) = rootFolder else {
+            return XCTFail("Expected exact authorized root expansion, got \(rootFolder)")
+        }
+        XCTAssertEqual(rootRoute, .catalogFolder)
+        XCTAssertEqual(
+            Set(rootFiles.map(\.standardizedRelativePath)),
+            ["Sources/BranchOnly.swift", "Sources/Seed.swift"]
+        )
+
+        let canonicalResult = try await store.resolveContextBuilderSelectionCandidate(
+            path: canonicalFile.path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        let siblingResult = try await store.resolveContextBuilderSelectionCandidate(
+            path: siblingFile.path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        let symlinkResult = try await store.resolveContextBuilderSelectionCandidate(
+            path: symlink.path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        XCTAssertEqual(canonicalResult, .blockedOrAmbiguous(.outsideAuthorizedRoot))
+        XCTAssertEqual(siblingResult, .blockedOrAmbiguous(.outsideAuthorizedRoot))
+        XCTAssertEqual(symlinkResult, .blockedOrAmbiguous(.symbolicLink))
+    }
+
+    func testContextBuilderExactCandidateClassifiesReleasedAndReplacedRootAsStale() async throws {
+        let logicalRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderStaleLogical")
+        let worktreeRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderStaleWorktree")
+        let relativePath = "Sources/Target.swift"
+        try FileSystemTestSupport.write(
+            "canonical",
+            to: logicalRoot.appendingPathComponent(relativePath)
+        )
+        try FileSystemTestSupport.write(
+            "worktree",
+            to: worktreeRoot.appendingPathComponent(relativePath)
+        )
+
+        let store = WorkspaceFileContextStore()
+        let fixture = try await makeSessionAuthorization(
+            store: store,
+            logicalRoot: logicalRoot,
+            worktreeRoot: worktreeRoot
+        )
+        await store.releaseSessionWorktreeOwnership(ownerID: fixture.sessionID)
+        let replacement = try await store.loadRoot(
+            path: worktreeRoot.path,
+            kind: .sessionWorktree
+        )
+        XCTAssertNotEqual(replacement.id, fixture.authorization.root.id)
+
+        let result = try await store.resolveContextBuilderSelectionCandidate(
+            path: worktreeRoot.appendingPathComponent(relativePath).path,
+            authorization: fixture.authorization,
+            folderPolicy: .expandFolders
+        )
+        guard case .staleAuthority = result else {
+            return XCTFail("Expected stale authority, got \(result)")
+        }
+    }
+
+    #if DEBUG
+        func testContextBuilderExactCandidateClassifiesReplacementDuringEligibilityAsStale() async throws {
+            let logicalRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderRaceLogical")
+            let worktreeRoot = try temporaryRoots.makeRoot(suiteName: "ContextBuilderRaceWorktree")
+            let store = WorkspaceFileContextStore()
+            let fixture = try await makeSessionAuthorization(
+                store: store,
+                logicalRoot: logicalRoot,
+                worktreeRoot: worktreeRoot
+            )
+            let worktreeOnlyFile = worktreeRoot.appendingPathComponent("Sources/Raced.swift")
+            try FileSystemTestSupport.write("raced", to: worktreeOnlyFile)
+
+            let gate = ContextBuilderCandidateGate()
+            await store.setContextBuilderSelectionCandidateEligibilityDidResolveHandler { rootID in
+                guard rootID == fixture.authorization.root.id else { return }
+                await gate.enterAndWait()
+            }
+            defer {
+                Task {
+                    await store.setContextBuilderSelectionCandidateEligibilityDidResolveHandler(nil)
+                }
+            }
+
+            let resolutionTask = Task {
+                try await store.resolveContextBuilderSelectionCandidate(
+                    path: worktreeOnlyFile.path,
+                    authorization: fixture.authorization,
+                    folderPolicy: .expandFolders
+                )
+            }
+            await gate.waitUntilEntered()
+            await store.releaseSessionWorktreeOwnership(ownerID: fixture.sessionID)
+            let replacement = try await store.loadRoot(
+                path: worktreeRoot.path,
+                kind: .sessionWorktree
+            )
+            XCTAssertNotEqual(replacement.id, fixture.authorization.root.id)
+            await gate.release()
+
+            let result = try await resolutionTask.value
+            guard case .staleAuthority = result else {
+                return XCTFail("Expected stale authority after replacement, got \(result)")
+            }
+            await store.setContextBuilderSelectionCandidateEligibilityDidResolveHandler(nil)
+        }
+    #endif
+
+    private func makeSessionAuthorization(
+        store: WorkspaceFileContextStore,
+        logicalRoot: URL,
+        worktreeRoot: URL
+    ) async throws -> (sessionID: UUID, authorization: WorkspaceSessionRootAuthorization) {
+        _ = try await store.loadRoot(path: logicalRoot.path, kind: .primaryWorkspace)
+        let sessionID = UUID()
+        let binding = AgentSessionWorktreeBinding(
+            id: UUID().uuidString,
+            repositoryID: "repo-id",
+            repoKey: logicalRoot.path,
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: logicalRoot.lastPathComponent,
+            worktreeID: UUID().uuidString,
+            worktreeRootPath: worktreeRoot.path,
+            worktreeName: worktreeRoot.lastPathComponent,
+            branch: "feature/exact-candidate",
+            source: "test"
+        )
+        let projectionValue = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: sessionID,
+            bindings: [binding]
+        )
+        let projection = try XCTUnwrap(projectionValue)
+        let boundRoot = try XCTUnwrap(projection.boundRootsForMetadata.first)
+        return try (sessionID, XCTUnwrap(boundRoot.sessionRootAuthorization))
+    }
 }
+
+#if DEBUG
+    private actor ContextBuilderCandidateGate {
+        private var entered = false
+        private var released = false
+        private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+        func enterAndWait() async {
+            entered = true
+            let waiters = enteredWaiters
+            enteredWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+            guard !released else { return }
+            await withCheckedContinuation { continuation in
+                releaseWaiters.append(continuation)
+            }
+        }
+
+        func waitUntilEntered() async {
+            guard !entered else { return }
+            await withCheckedContinuation { continuation in
+                enteredWaiters.append(continuation)
+            }
+        }
+
+        func release() {
+            released = true
+            let waiters = releaseWaiters
+            releaseWaiters.removeAll()
+            waiters.forEach { $0.resume() }
+        }
+    }
+#endif

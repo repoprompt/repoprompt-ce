@@ -181,7 +181,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             ),
             bindingProjection: nil
         )
-        let targetResolution = await ContextBuilderReviewTargetResolver().resolve(
+        let targetResolution = try await ContextBuilderReviewTargetResolver().resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: capability.workspaceID,
                 tabID: linkedTabID,
@@ -309,7 +309,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             base: "HEAD",
             store: store
         )
-        let targetResolution = await ContextBuilderReviewTargetResolver().resolve(
+        let targetResolution = try await ContextBuilderReviewTargetResolver().resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,

@@ -2544,7 +2544,7 @@ extension MCPServerViewModel {
             compareIntent: .uncommittedHEAD,
             displayContext: target.displayContext
         )
-        if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
+        if let reason = try await ContextBuilderReviewTargetResolver().validateSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: resolved.snapshot.tabID,

@@ -74,6 +74,95 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(nested.readFileAutoSelectionGeneration, 7)
     }
 
+    func testResolveElectsWorktreeOnlyTargetAndRejectsCanonicalRescueAfterLifetimeLoss() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "ContextBuilderWorktreeOnlyElection")
+        defer { fixture.cleanup() }
+        let canonical = try fixture.makeRepository(
+            named: "canonical",
+            files: ["Sources/Shared.swift": "let source = \"canonical\"\n"]
+        )
+        let worktree = try fixture.makeLinkedWorktree(
+            from: canonical,
+            named: "worktree",
+            branch: "feature/context-builder-worktree-only"
+        )
+        let branchOnly = worktree.appendingPathComponent("Sources/BranchOnly.swift")
+        try write("let source = \"worktree only\"\n", to: branchOnly)
+        let logicalBranchOnly = canonical.appendingPathComponent("Sources/BranchOnly.swift")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalBranchOnly.path))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: canonical.path, kind: .primaryWorkspace)
+        let sessionID = UUID()
+        let binding = try makeGitBinding(
+            logicalRoot: canonical,
+            worktreeRoot: worktree,
+            branch: "feature/context-builder-worktree-only"
+        )
+        let recorder = ContextBuilderReviewDiagnosticRecorder()
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 47,
+            workspaceID: UUID(),
+            promptText: "Review the worktree-only file",
+            selection: StoredSelection(
+                selectedPaths: [logicalBranchOnly.path],
+                codemapAutoEnabled: false
+            ),
+            selectionRevision: 11,
+            selectedMetaPromptIDs: [],
+            tabName: "Worktree only",
+            runID: UUID(),
+            activeAgentSessionID: sessionID,
+            worktreeBindings: [binding],
+            explicitlyBound: false
+        )
+
+        let context = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot,
+            workspaceRepoPaths: [canonical.path],
+            workspaceDirectoryPath: fixture.sandbox.path,
+            store: store,
+            reviewDiagnosticSink: recorder.append
+        )
+        let target = try XCTUnwrap(context.reviewTargetResolution.availableTarget)
+        XCTAssertEqual(target.primaryCheckout.checkoutRootPath, worktree.standardizedFileURL.path)
+        XCTAssertEqual(target.initialOrdinarySelectionIdentities, [branchOnly.standardizedFileURL.path])
+        XCTAssertNotNil(target.primaryCheckout.sessionRootAuthorization)
+        XCTAssertEqual(
+            context.lookupContext.displayPath(
+                forPhysicalPath: branchOnly.path,
+                display: .full
+            ),
+            logicalBranchOnly.standardizedFileURL.path
+        )
+        let event = try XCTUnwrap(recorder.snapshot().last)
+        XCTAssertEqual(event.phase, .initialElection)
+        XCTAssertEqual(event.outcome, .resolved)
+        XCTAssertEqual(event.sessionID, sessionID)
+        XCTAssertEqual(event.rootID, target.primaryCheckout.physicalWorkspaceRoot.id)
+        XCTAssertEqual(event.candidateCount, 1)
+        XCTAssertEqual(event.resolvedCount, 1)
+        XCTAssertEqual(event.unresolvedCount, 0)
+
+        await store.releaseSessionWorktreeOwnership(ownerID: sessionID)
+        do {
+            try await context.validateFinalReviewSelection(
+                StoredSelection(
+                    selectedPaths: [canonical.appendingPathComponent("Sources/Shared.swift").path],
+                    codemapAutoEnabled: false
+                ),
+                workspaceID: target.workspaceID,
+                tabID: target.tabID,
+                selectionRevision: 12,
+                store: store
+            )
+            XCTFail("Expected released worktree authority to reject canonical same-path rescue")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .staleWorkspaceRoot)
+        }
+    }
+
     func testResolveWithoutBindingsFreezesCanonicalWorkspaceLookup() async throws {
         let logicalRoot = try makeTemporaryDirectory(name: "ContextBuilderUnbound")
         let otherWorkspaceRoot = try makeTemporaryDirectory(name: "ContextBuilderOtherWorkspace")
@@ -402,6 +491,38 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
 
+    private func makeGitBinding(
+        logicalRoot: URL,
+        worktreeRoot: URL,
+        branch: String
+    ) throws -> AgentSessionWorktreeBinding {
+        let layout = try XCTUnwrap(
+            GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: worktreeRoot)
+        )
+        let repositoryIdentity = GitWorktreeIdentity.repositoryIdentity(
+            commonGitDir: layout.commonDir,
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
+        )
+        let worktreeID = GitWorktreeIdentity.worktreeID(
+            repositoryID: repositoryIdentity.repositoryID,
+            gitDir: layout.gitDir,
+            isMain: false,
+            path: layout.workTreeRoot
+        )
+        return AgentSessionWorktreeBinding(
+            id: UUID().uuidString,
+            repositoryID: repositoryIdentity.repositoryID,
+            repoKey: logicalRoot.path,
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: logicalRoot.lastPathComponent,
+            worktreeID: worktreeID,
+            worktreeRootPath: worktreeRoot.path,
+            worktreeName: worktreeRoot.lastPathComponent,
+            branch: branch,
+            source: "test"
+        )
+    }
+
     private func makeBinding(logicalRoot: URL, worktreeRoot: URL) -> AgentSessionWorktreeBinding {
         AgentSessionWorktreeBinding(
             id: UUID().uuidString,
@@ -416,5 +537,22 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             head: "deadbeef",
             source: "test"
         )
+    }
+}
+
+private final class ContextBuilderReviewDiagnosticRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var events: [ContextBuilderReviewDiagnosticEvent] = []
+
+    func append(_ event: ContextBuilderReviewDiagnosticEvent) {
+        lock.lock()
+        events.append(event)
+        lock.unlock()
+    }
+
+    func snapshot() -> [ContextBuilderReviewDiagnosticEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return events
     }
 }

@@ -50,6 +50,7 @@ struct ContextBuilderReviewCheckoutTarget: Equatable, Hashable {
     let repositoryID: String
     let worktreeID: String
     let kind: FrozenVisibleGitCheckoutKind
+    let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
 
     var identityKey: String {
         [repoKey, repositoryID, worktreeID, GitRepoRootAuthorization.canonicalPath(checkoutRootPath)]
@@ -149,9 +150,14 @@ struct ContextBuilderReviewTargetResolver {
 
     private let ownershipResolver: ReviewGitSelectedPathOwnershipResolver
     private let vcsService: VCSService
+    private let diagnosticSink: ContextBuilderReviewDiagnosticSink
 
-    init(vcsService: VCSService = .shared) {
+    init(
+        vcsService: VCSService = .shared,
+        diagnosticSink: ContextBuilderReviewDiagnosticSink? = nil
+    ) {
         self.vcsService = vcsService
+        self.diagnosticSink = diagnosticSink ?? ContextBuilderReviewDiagnosticTracer.emit
         ownershipResolver = ReviewGitSelectedPathOwnershipResolver(
             dependencies: .live(vcsService: vcsService)
         )
@@ -160,8 +166,12 @@ struct ContextBuilderReviewTargetResolver {
     func resolve(
         input: ContextBuilderReviewTargetInput,
         store: WorkspaceFileContextStore
-    ) async -> ContextBuilderReviewTargetResolution {
-        switch await resolveOwnership(input: input, store: store) {
+    ) async throws -> ContextBuilderReviewTargetResolution {
+        switch try await resolveOwnership(
+            input: input,
+            store: store,
+            phase: .initialElection
+        ) {
         case let .unavailable(reason):
             .unavailable(reason)
         case let .available(ownership):
@@ -181,8 +191,9 @@ struct ContextBuilderReviewTargetResolver {
 
     private func resolveOwnership(
         input: ContextBuilderReviewTargetInput,
-        store: WorkspaceFileContextStore
-    ) async -> OwnershipPipelineResolution {
+        store: WorkspaceFileContextStore,
+        phase: ContextBuilderReviewDiagnosticEvent.Phase
+    ) async throws -> OwnershipPipelineResolution {
         let physicalSelection = input.lookupContext.physicalizeSelection(input.selection)
         let candidates = WorkspaceGitDiffSelectionResolver.candidates(from: physicalSelection)
         guard !candidates.isEmpty else { return .unavailable(.emptySelection) }
@@ -222,16 +233,116 @@ struct ContextBuilderReviewTargetResolver {
             }
         }
 
-        let ordinaryResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
-            for: physicalSelection,
-            store: store,
-            rootScope: input.lookupContext.rootScope.excludingWorkspaceGitData,
-            folderPolicy: .expandFolders,
-            profile: .mcpSelection,
-            allowFilesystemFallback: false,
-            excluding: Set(artifactPaths)
+        let artifactPathSet = Set(artifactPaths)
+        let ordinaryCandidates = candidates.filter { !artifactPathSet.contains($0) }
+        var resolvedOrdinaryPaths: [String] = []
+        var seenResolvedPaths = Set<String>()
+        var unresolvedCandidates: [String] = []
+        var canonicalCandidates: [String] = []
+        var exactCandidateCount = 0
+        var exactResolvedCandidateCount = 0
+        var exactUnresolvedCandidateCount = 0
+        var exactBlockedCount = 0
+        var exactAuthorizations: [WorkspaceSessionRootAuthorization] = []
+
+        func appendResolved(_ path: String) {
+            let standardized = StandardizedPath.absolute(path)
+            guard seenResolvedPaths.insert(standardized).inserted else { return }
+            resolvedOrdinaryPaths.append(standardized)
+        }
+
+        for candidate in ordinaryCandidates {
+            let expanded = (candidate as NSString).expandingTildeInPath
+            let standardized = expanded.hasPrefix("/")
+                ? StandardizedPath.absolute(expanded)
+                : StandardizedPath.relative(expanded)
+            guard standardized.hasPrefix("/"),
+                  let boundRoot = input.lookupContext.bindingProjection?
+                  .boundRoot(containingPhysicalAbsolutePath: standardized)
+            else {
+                canonicalCandidates.append(candidate)
+                continue
+            }
+
+            exactCandidateCount += 1
+            guard let authorization = boundRoot.sessionRootAuthorization else {
+                emitResolutionDiagnostic(
+                    input: input,
+                    phase: phase,
+                    outcome: .staleAuthority,
+                    candidateCount: exactCandidateCount,
+                    resolvedCount: exactResolvedCandidateCount,
+                    unresolvedCount: exactUnresolvedCandidateCount,
+                    authorizations: exactAuthorizations,
+                    mismatch: .token
+                )
+                return .unavailable(.staleWorkspaceRoot)
+            }
+            exactAuthorizations.append(authorization)
+            switch try await store.resolveContextBuilderSelectionCandidate(
+                path: standardized,
+                authorization: authorization,
+                folderPolicy: .expandFolders
+            ) {
+            case let .resolved(files, _):
+                exactResolvedCandidateCount += 1
+                files.forEach { appendResolved($0.standardizedFullPath) }
+            case .noCandidate:
+                exactUnresolvedCandidateCount += 1
+                unresolvedCandidates.append(candidate)
+            case .blockedOrAmbiguous:
+                exactBlockedCount += 1
+                exactUnresolvedCandidateCount += 1
+                unresolvedCandidates.append(candidate)
+            case let .staleAuthority(mismatch):
+                emitResolutionDiagnostic(
+                    input: input,
+                    phase: phase,
+                    outcome: .staleAuthority,
+                    candidateCount: exactCandidateCount,
+                    resolvedCount: exactResolvedCandidateCount,
+                    unresolvedCount: exactUnresolvedCandidateCount,
+                    authorizations: exactAuthorizations,
+                    mismatch: mismatch
+                )
+                return .unavailable(.staleWorkspaceRoot)
+            }
+        }
+
+        if !canonicalCandidates.isEmpty {
+            let canonicalResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
+                for: StoredSelection(
+                    selectedPaths: canonicalCandidates,
+                    codemapAutoEnabled: false
+                ),
+                store: store,
+                rootScope: input.lookupContext.rootScope.excludingWorkspaceGitData,
+                folderPolicy: .expandFolders,
+                profile: .mcpSelection,
+                allowFilesystemFallback: false,
+                excluding: []
+            )
+            canonicalResolution.paths.forEach(appendResolved)
+            unresolvedCandidates.append(contentsOf: canonicalResolution.unresolvedCandidates)
+        }
+
+        let ordinaryResolution = WorkspaceSelectedGitPathResolution(
+            paths: resolvedOrdinaryPaths,
+            unresolvedCandidates: unresolvedCandidates
         )
         guard ordinaryResolution.unresolvedCandidates.isEmpty else {
+            if exactCandidateCount > 0 {
+                emitResolutionDiagnostic(
+                    input: input,
+                    phase: phase,
+                    outcome: exactBlockedCount > 0 ? .blocked : .noCandidate,
+                    candidateCount: exactCandidateCount,
+                    resolvedCount: exactResolvedCandidateCount,
+                    unresolvedCount: exactUnresolvedCandidateCount,
+                    authorizations: exactAuthorizations,
+                    mismatch: nil
+                )
+            }
             return .unavailable(.unresolvedSelection(count: ordinaryResolution.unresolvedCandidates.count))
         }
 
@@ -248,7 +359,39 @@ struct ContextBuilderReviewTargetResolver {
             return .unavailable(.nonGitSelection(count: ownership.pathIssues.count))
         }
 
+        if let stale = await firstStaleAuthorization(
+            in: exactAuthorizations,
+            store: store
+        ) {
+            emitResolutionDiagnostic(
+                input: input,
+                phase: phase,
+                outcome: .staleAuthority,
+                candidateCount: exactCandidateCount,
+                resolvedCount: exactResolvedCandidateCount,
+                unresolvedCount: exactUnresolvedCandidateCount,
+                authorizations: exactAuthorizations,
+                mismatch: stale
+            )
+            return .unavailable(.staleWorkspaceRoot)
+        }
         let scopedRoots = await store.rootRefs(scope: input.lookupContext.rootScope.excludingWorkspaceGitData)
+        if let stale = await firstStaleAuthorization(
+            in: exactAuthorizations,
+            store: store
+        ) {
+            emitResolutionDiagnostic(
+                input: input,
+                phase: phase,
+                outcome: .staleAuthority,
+                candidateCount: exactCandidateCount,
+                resolvedCount: exactResolvedCandidateCount,
+                unresolvedCount: exactUnresolvedCandidateCount,
+                authorizations: exactAuthorizations,
+                mismatch: stale
+            )
+            return .unavailable(.staleWorkspaceRoot)
+        }
         let ordinaryTargets: [ContextBuilderReviewCheckoutTarget]
         do {
             ordinaryTargets = try ownership.checkouts.map {
@@ -263,6 +406,8 @@ struct ContextBuilderReviewTargetResolver {
                     lookupContext: input.lookupContext
                 )
             }
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            return .unavailable(reason)
         } catch {
             return .unavailable(.ambiguousOwnership)
         }
@@ -281,6 +426,8 @@ struct ContextBuilderReviewTargetResolver {
                     lookupContext: input.lookupContext
                 )
             }
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            return .unavailable(reason)
         } catch {
             return .unavailable(.ambiguousOwnership)
         }
@@ -315,6 +462,18 @@ struct ContextBuilderReviewTargetResolver {
             targets[0]
         }
 
+        if exactCandidateCount > 0 {
+            emitResolutionDiagnostic(
+                input: input,
+                phase: phase,
+                outcome: .resolved,
+                candidateCount: exactCandidateCount,
+                resolvedCount: exactResolvedCandidateCount,
+                unresolvedCount: exactUnresolvedCandidateCount,
+                authorizations: exactAuthorizations,
+                mismatch: nil
+            )
+        }
         return .available(OwnershipPipelineResult(
             ordinarySelectionIdentities: ordinaryResolution.paths.sorted(),
             selectedArtifactIdentities: artifactPaths.map(StandardizedPath.absolute).sorted(),
@@ -328,13 +487,40 @@ struct ContextBuilderReviewTargetResolver {
         _ target: ContextBuilderReviewTarget,
         store: WorkspaceFileContextStore
     ) async -> ContextBuilderReviewTargetUnavailableReason? {
+        var sessionAuthorizations: [WorkspaceSessionRootAuthorization] = []
         for checkout in target.checkouts {
-            guard await store.exactRootRef(
-                path: checkout.physicalWorkspaceRoot.standardizedFullPath,
-                kind: checkout.physicalWorkspaceRootKind
-            ) == checkout.physicalWorkspaceRoot else {
-                return .staleWorkspaceRoot
+            let sessionAuthorization: WorkspaceSessionRootAuthorization?
+            if checkout.physicalWorkspaceRootKind == .sessionWorktree {
+                guard let authorization = checkout.sessionRootAuthorization else {
+                    emitRevalidationDiagnostic(
+                        target: target,
+                        outcome: .staleAuthority,
+                        authorization: nil,
+                        mismatch: .token
+                    )
+                    return .staleWorkspaceRoot
+                }
+                if let mismatch = await store.validateSessionRootAuthorization(authorization) {
+                    emitRevalidationDiagnostic(
+                        target: target,
+                        outcome: .staleAuthority,
+                        authorization: authorization,
+                        mismatch: mismatch
+                    )
+                    return .staleWorkspaceRoot
+                }
+                sessionAuthorizations.append(authorization)
+                sessionAuthorization = authorization
+            } else {
+                guard await store.exactRootRef(
+                    path: checkout.physicalWorkspaceRoot.standardizedFullPath,
+                    kind: checkout.physicalWorkspaceRootKind
+                ) == checkout.physicalWorkspaceRoot else {
+                    return .staleWorkspaceRoot
+                }
+                sessionAuthorization = nil
             }
+
             guard let resolved = await vcsService.resolveRepo(
                 from: URL(fileURLWithPath: checkout.checkoutRootPath, isDirectory: true)
             ),
@@ -343,6 +529,19 @@ struct ContextBuilderReviewTargetResolver {
                 == GitRepoRootAuthorization.canonicalPath(checkout.checkoutRootPath),
                 let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: resolved.rootURL)
             else { return .checkoutIdentityChanged }
+
+            if let authorization = sessionAuthorization,
+               let mismatch = await store.validateSessionRootAuthorization(authorization)
+            {
+                emitRevalidationDiagnostic(
+                    target: target,
+                    outcome: .staleAuthority,
+                    authorization: authorization,
+                    mismatch: mismatch
+                )
+                return .staleWorkspaceRoot
+            }
+
             let identity = GitWorktreeIdentity.repositoryIdentity(
                 commonGitDir: layout.commonDir,
                 mainWorktreeRoot: layout.knownMainWorktreeRoot
@@ -359,6 +558,34 @@ struct ContextBuilderReviewTargetResolver {
                   (layout.isLinkedWorktree ? FrozenVisibleGitCheckoutKind.linkedWorktree : .canonical) == checkout.kind
             else { return .checkoutIdentityChanged }
         }
+
+        if let stale = await firstStaleAuthorization(
+            in: sessionAuthorizations,
+            store: store
+        ) {
+            let authorization = Set(sessionAuthorizations).count == 1
+                ? sessionAuthorizations.first
+                : nil
+            emitRevalidationDiagnostic(
+                target: target,
+                outcome: .staleAuthority,
+                authorization: authorization,
+                mismatch: stale
+            )
+            return .staleWorkspaceRoot
+        }
+
+        if let authorization = Set(sessionAuthorizations).count == 1
+            ? sessionAuthorizations.first
+            : nil
+        {
+            emitRevalidationDiagnostic(
+                target: target,
+                outcome: .resolved,
+                authorization: authorization,
+                mismatch: nil
+            )
+        }
         return nil
     }
 
@@ -366,12 +593,16 @@ struct ContextBuilderReviewTargetResolver {
         input: ContextBuilderReviewTargetInput,
         frozenTarget: ContextBuilderReviewTarget,
         store: WorkspaceFileContextStore
-    ) async -> ContextBuilderReviewTargetUnavailableReason? {
+    ) async throws -> ContextBuilderReviewTargetUnavailableReason? {
         guard frozenTarget.workspaceID == input.workspaceID, frozenTarget.tabID == input.tabID else {
             return .workspaceOrTabMismatch
         }
         let current: OwnershipPipelineResult
-        switch await resolveOwnership(input: input, store: store) {
+        switch try await resolveOwnership(
+            input: input,
+            store: store,
+            phase: .revalidation
+        ) {
         case let .available(ownership):
             current = ownership
         case let .unavailable(reason):
@@ -422,6 +653,15 @@ struct ContextBuilderReviewTargetResolver {
         case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             false
         }
+        let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
+        if isSessionWorktreeRoot {
+            guard let authorization = boundRoot?.sessionRootAuthorization else {
+                throw ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot
+            }
+            sessionRootAuthorization = authorization
+        } else {
+            sessionRootAuthorization = nil
+        }
         return ContextBuilderReviewCheckoutTarget(
             logicalWorkspaceRoot: boundRoot?.logicalRoot ?? physicalRoot,
             physicalWorkspaceRoot: physicalRoot,
@@ -430,8 +670,73 @@ struct ContextBuilderReviewTargetResolver {
             repoKey: repoKey,
             repositoryID: repositoryID,
             worktreeID: worktreeID,
-            kind: kind
+            kind: kind,
+            sessionRootAuthorization: sessionRootAuthorization
         )
+    }
+
+    private func firstStaleAuthorization(
+        in authorizations: [WorkspaceSessionRootAuthorization],
+        store: WorkspaceFileContextStore
+    ) async -> WorkspaceSessionRootAuthorizationMismatch? {
+        for authorization in Set(authorizations) {
+            if let mismatch = await store.validateSessionRootAuthorization(authorization) {
+                return mismatch
+            }
+        }
+        return nil
+    }
+
+    private func emitResolutionDiagnostic(
+        input: ContextBuilderReviewTargetInput,
+        phase: ContextBuilderReviewDiagnosticEvent.Phase,
+        outcome: ContextBuilderReviewDiagnosticEvent.Outcome,
+        candidateCount: Int,
+        resolvedCount: Int,
+        unresolvedCount: Int,
+        authorizations: [WorkspaceSessionRootAuthorization],
+        mismatch: WorkspaceSessionRootAuthorizationMismatch?
+    ) {
+        let distinctAuthorizations = Set(authorizations)
+        let authorization = distinctAuthorizations.count == 1
+            ? distinctAuthorizations.first
+            : nil
+        diagnosticSink(ContextBuilderReviewDiagnosticEvent(
+            phase: phase,
+            outcome: outcome,
+            workspaceID: input.workspaceID,
+            tabID: input.tabID,
+            sessionID: authorization?.sessionID ?? input.lookupContext.bindingProjection?.sessionID,
+            rootID: authorization?.root.id,
+            ownershipGeneration: authorization?.ownershipGeneration,
+            lifetimeID: authorization?.lifetimeID,
+            candidateCount: candidateCount,
+            resolvedCount: resolvedCount,
+            unresolvedCount: unresolvedCount,
+            mismatch: mismatch
+        ))
+    }
+
+    private func emitRevalidationDiagnostic(
+        target: ContextBuilderReviewTarget,
+        outcome: ContextBuilderReviewDiagnosticEvent.Outcome,
+        authorization: WorkspaceSessionRootAuthorization?,
+        mismatch: WorkspaceSessionRootAuthorizationMismatch?
+    ) {
+        diagnosticSink(ContextBuilderReviewDiagnosticEvent(
+            phase: .revalidation,
+            outcome: outcome,
+            workspaceID: target.workspaceID,
+            tabID: target.tabID,
+            sessionID: authorization?.sessionID,
+            rootID: authorization?.root.id,
+            ownershipGeneration: authorization?.ownershipGeneration,
+            lifetimeID: authorization?.lifetimeID,
+            candidateCount: target.checkouts.count,
+            resolvedCount: outcome == .resolved ? target.checkouts.count : 0,
+            unresolvedCount: outcome == .resolved ? 0 : 1,
+            mismatch: mismatch
+        ))
     }
 
     private static func looksLikeGitDataPath(_ rawPath: String) -> Bool {
