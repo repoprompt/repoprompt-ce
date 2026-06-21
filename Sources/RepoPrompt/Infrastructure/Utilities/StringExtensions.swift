@@ -7,6 +7,7 @@
 
 import Darwin
 import Foundation
+import RepoPromptC
 
 public extension String {
     internal static func truncateModelName(_ text: String, maxLength: Int = 40) -> String {

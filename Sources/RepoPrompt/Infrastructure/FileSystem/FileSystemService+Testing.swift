@@ -1,106 +1,12 @@
-import CoreFoundation
-import CoreServices
 import Foundation
+import RepoPromptCore
 
 #if DEBUG
     extension FileSystemService {
         // MARK: - Testing Support
 
-        nonisolated static func deepCopiedEventPathForTesting(_ source: NSString) -> String? {
-            deepCopyEventPath(source as CFString)
-        }
-
-        nonisolated static func buildOwnedFSEventPayloadForTesting(
-            pathObjects: [Any],
-            flags: [FSEventStreamEventFlags],
-            ids: [FSEventStreamEventId],
-            limit: Int? = nil
-        ) -> (paths: [String], flags: [FSEventStreamEventFlags], ids: [FSEventStreamEventId])? {
-            let safeCount = min(limit ?? pathObjects.count, pathObjects.count, flags.count, ids.count)
-            guard safeCount > 0 else { return nil }
-
-            var copiedPaths: [String] = []
-            var copiedFlags: [FSEventStreamEventFlags] = []
-            var copiedIDs: [FSEventStreamEventId] = []
-            copiedPaths.reserveCapacity(safeCount)
-            copiedFlags.reserveCapacity(safeCount)
-            copiedIDs.reserveCapacity(safeCount)
-
-            for index in 0 ..< safeCount {
-                let copiedPath: String? = switch pathObjects[index] {
-                case let string as NSString:
-                    deepCopyEventPath(string as CFString)
-                case let string as String:
-                    deepCopySwiftString(string)
-                default:
-                    nil
-                }
-
-                guard let copiedPath else { continue }
-                copiedPaths.append(copiedPath)
-                copiedFlags.append(flags[index])
-                copiedIDs.append(ids[index])
-            }
-
-            guard !copiedPaths.isEmpty else { return nil }
-            return (copiedPaths, copiedFlags, copiedIDs)
-        }
-
-        nonisolated static func fseventCallbackEntryCountForTesting(
-            pathObjects: [AnyObject],
-            flags: [FSEventStreamEventFlags],
-            ids: [FSEventStreamEventId],
-            limit: Int? = nil
-        ) -> Int {
-            let safeCount = min(limit ?? pathObjects.count, pathObjects.count, flags.count, ids.count)
-            guard safeCount > 0 else { return 0 }
-            let cfArray = pathObjects as CFArray
-            let eventPaths = UnsafeMutableRawPointer(Unmanaged.passUnretained(cfArray).toOpaque())
-            return flags.withUnsafeBufferPointer { flagBuffer in
-                guard let flagBase = flagBuffer.baseAddress else { return 0 }
-                return ids.withUnsafeBufferPointer { idBuffer in
-                    guard let idBase = idBuffer.baseAddress else { return 0 }
-                    return buildOwnedFSEventPayload(
-                        numEvents: safeCount,
-                        eventPaths: eventPaths,
-                        eventFlags: flagBase,
-                        eventIds: idBase
-                    )?.entries.count ?? 0
-                }
-            }
-        }
-
-        nonisolated static func buildOwnedFSEventPayloadFromCFArrayForTesting(
-            pathObjects: [AnyObject],
-            flags: [FSEventStreamEventFlags],
-            ids: [FSEventStreamEventId],
-            limit: Int? = nil
-        ) -> (paths: [String], flags: [FSEventStreamEventFlags], ids: [FSEventStreamEventId])? {
-            let safeCount = min(limit ?? pathObjects.count, pathObjects.count, flags.count, ids.count)
-            guard safeCount > 0 else { return nil }
-            let cfArray = pathObjects as CFArray
-            let eventPaths = UnsafeMutableRawPointer(Unmanaged.passUnretained(cfArray).toOpaque())
-            return flags.withUnsafeBufferPointer { flagBuffer in
-                guard let flagBase = flagBuffer.baseAddress else { return nil }
-                return ids.withUnsafeBufferPointer { idBuffer in
-                    guard let idBase = idBuffer.baseAddress else { return nil }
-                    guard let payload = buildOwnedFSEventPayload(
-                        numEvents: safeCount,
-                        eventPaths: eventPaths,
-                        eventFlags: flagBase,
-                        eventIds: idBase
-                    ) else { return nil }
-                    return (
-                        payload.entries.map(\.path),
-                        payload.entries.map(\.flags),
-                        payload.entries.map(\.id)
-                    )
-                }
-            }
-        }
-
         func simulateFSEvents(
-            _ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)]
+            _ events: [(absolutePath: String, flags: FileSystemWatchEventFlags, eventId: FileSystemWatchEventID)]
         ) async -> [FileSystemDelta] {
             // Clear any previous deltas
             processedFolders.removeAll()
@@ -129,14 +35,14 @@ import Foundation
 
         /// Test-only method to get event ID coalescing state
         func getCoalescingState() -> (
-            pendingScanTargets: [String: FSEventStreamEventId],
-            lastScannedEventIdByFolder: [String: FSEventStreamEventId]
+            pendingScanTargets: [String: FileSystemWatchEventID],
+            lastScannedEventIdByFolder: [String: FileSystemWatchEventID]
         ) {
             (pendingScanTargets, lastScannedEventIdByFolder)
         }
 
         func enqueuePendingRawEventsForTesting(
-            _ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)]
+            _ events: [(absolutePath: String, flags: FileSystemWatchEventFlags, eventId: FileSystemWatchEventID)]
         ) {
             let payload = FSEventCallbackPayload(
                 entries: events.map { event in
@@ -149,7 +55,7 @@ import Foundation
 
         @discardableResult
         func acceptWatcherPayloadForTesting(
-            _ events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
+            _ events: [(absolutePath: String, flags: FileSystemWatchEventFlags, eventId: FileSystemWatchEventID)],
             scheduleDrain: Bool = true
         ) -> FileSystemWatcherIngressMailbox.Watermark? {
             watcherIngressMailbox.startAccepting()
@@ -230,18 +136,18 @@ import Foundation
         }
 
         func isWatchingForChangesForTesting() -> Bool {
-            fseventStreamRef != nil
+            fileSystemWatcher.isWatching
         }
 
         func watcherStateForTesting() -> (
             pendingRawEventCount: Int,
             hasPendingOverflowRescan: Bool,
             overflowChangedIgnoreDirs: Set<String>,
-            pendingScanTargets: [String: FSEventStreamEventId],
+            pendingScanTargets: [String: FileSystemWatchEventID],
             pendingQuietFolderScanTargets: Set<String>,
             dirtyRecoveryScanTargets: Set<String>,
             recoveryScanFailureCountByFolder: [String: Int],
-            lastScannedEventIdByFolder: [String: FSEventStreamEventId],
+            lastScannedEventIdByFolder: [String: FileSystemWatchEventID],
             lastVerifiedAtByFolder: [String: TimeInterval],
             fileEventCountSinceLastScan: [String: Int]
         ) {

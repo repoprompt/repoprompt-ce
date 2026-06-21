@@ -6,17 +6,8 @@
 //
 
 import Foundation
+import RepoPromptSyntaxCBridge
 import SwiftTreeSitter
-import TreeSitterC
-import TreeSitterDart
-import TreeSitterGo
-import TreeSitterJava
-import TreeSitterJavaScript
-import TreeSitterPython
-import TreeSitterRuby
-import TreeSitterRust
-import TreeSitterTSX
-import TreeSitterTypeScript
 
 enum LanguageType: String, Comparable, Codable {
     case swift, js, c_sharp, python, c, rust, cpp, go, java, dart, ts, tsx,

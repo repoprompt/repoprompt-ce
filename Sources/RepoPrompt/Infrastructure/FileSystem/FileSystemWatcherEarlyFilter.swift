@@ -1,5 +1,5 @@
-import CoreServices
 import Foundation
+import RepoPromptCore
 
 /// Filters only callback entries proven ignored by the current immutable root rules.
 final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
@@ -115,10 +115,9 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
               !explicitlyManagedIgnoredFiles.contains(relativePath)
         else { return false }
 
-        let rawFlags = UInt32(entry.flags)
-        let isFile = (rawFlags & UInt32(kFSEventStreamEventFlagItemIsFile)) != 0
-        let isDirectory = (rawFlags & UInt32(kFSEventStreamEventFlagItemIsDir)) != 0
-        let isSymlink = (rawFlags & UInt32(kFSEventStreamEventFlagItemIsSymlink)) != 0
+        let isFile = entry.flags.contains(.itemIsFile)
+        let isDirectory = entry.flags.contains(.itemIsDirectory)
+        let isSymlink = entry.flags.contains(.itemIsSymlink)
         guard isFile != isDirectory, !isSymlink else { return false }
 
         let components = relativePath.split(separator: "/")
@@ -142,13 +141,7 @@ final class FileSystemWatcherEarlyFilter: @unchecked Sendable {
         return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
     }
 
-    private static func hasRecoveryFlags(_ flags: FSEventStreamEventFlags) -> Bool {
-        let mask = FSEventStreamEventFlags(
-            kFSEventStreamEventFlagMustScanSubDirs
-                | kFSEventStreamEventFlagUserDropped
-                | kFSEventStreamEventFlagKernelDropped
-                | kFSEventStreamEventFlagRootChanged
-        )
-        return (flags & mask) != 0
+    private static func hasRecoveryFlags(_ flags: FileSystemWatchEventFlags) -> Bool {
+        !flags.intersection([.mustScanSubdirectories, .droppedEvents, .rootChanged]).isEmpty
     }
 }

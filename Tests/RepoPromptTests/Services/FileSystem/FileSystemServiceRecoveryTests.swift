@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -59,9 +58,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             let publications = LockedPublications()
             let publisher = await service.publisherForChanges()
             let cancellable = publisher.sink { publications.append($0) }
-            let flags = FSEventStreamEventFlags(
-                kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
-            )
+            let flags: FileSystemWatchEventFlags = [.contentChanged, .itemIsFile]
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
                 (absolutePath: fileURL.path, flags: flags, eventId: 7)
             ], scheduleDrain: false)
@@ -113,9 +110,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
                 isTestMode: true,
                 maxFoldersPerBatchOverride: 2
             )
-            let flags = FSEventStreamEventFlags(
-                kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-            )
+            let flags: FileSystemWatchEventFlags = [.itemCreated, .itemIsFile]
             let watermarkValue = await service.acceptWatcherPayloadForTesting(folders.map { folder in
                 (
                     absolutePath: root.appendingPathComponent("\(folder)/new.txt").path,
@@ -134,7 +129,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             XCTAssertTrue(state.pendingScanTargets.isEmpty)
             XCTAssertEqual(
                 state.lastScannedEventIdByFolder,
-                Dictionary(uniqueKeysWithValues: folders.map { ($0, FSEventStreamEventId(1)) })
+                Dictionary(uniqueKeysWithValues: folders.map { ($0, FileSystemWatchEventID(1)) })
             )
             XCTAssertEqual(publication.lastPublishedWatcherAcceptedWatermark, watermark)
         }
@@ -173,9 +168,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             try "recovered".write(to: addedFileURL, atomically: true, encoding: .utf8)
             await service.setFolderScanFailureCountForTesting(4, folder: "A")
 
-            let flags = FSEventStreamEventFlags(
-                kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-            )
+            let flags: FileSystemWatchEventFlags = [.itemCreated, .itemIsFile]
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
                 (absolutePath: addedFileURL.path, flags: flags, eventId: 10)
             ], scheduleDrain: false)
@@ -405,9 +398,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
             await service.setWatcherBatchWillProcessHandlerForTesting {
                 await batchGate.markStartedAndWaitForRelease()
             }
-            let flags = FSEventStreamEventFlags(
-                kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-            )
+            let flags: FileSystemWatchEventFlags = [.itemCreated, .itemIsFile]
             let initialWatermarkValue = await service.acceptWatcherPayloadForTesting(folders.map { folder in
                 (
                     absolutePath: root.appendingPathComponent("\(folder)/initial.txt").path,
@@ -426,7 +417,7 @@ final class FileSystemServiceRecoveryTests: XCTestCase {
                 // Keep churn paths absent so every accepted event deterministically requires parent verification.
                 let churnURL = root.appendingPathComponent("A/churn-\(eventID).txt")
                 let churnWatermark = await service.acceptWatcherPayloadForTesting([
-                    (absolutePath: churnURL.path, flags: flags, eventId: FSEventStreamEventId(eventID))
+                    (absolutePath: churnURL.path, flags: flags, eventId: FileSystemWatchEventID(eventID))
                 ], scheduleDrain: false)
                 latestWatermark = try XCTUnwrap(churnWatermark)
                 await service.drainAcceptedWatcherIngressMailbox()

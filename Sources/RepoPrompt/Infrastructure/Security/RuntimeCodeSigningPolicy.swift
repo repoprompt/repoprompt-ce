@@ -1,56 +1,5 @@
 import Foundation
 
-enum RuntimeCodeSigningDomain: Hashable {
-    case developerID
-    case appleDevelopmentDebug
-    case localSelfSigned
-}
-
-enum RuntimeCodeSigningFailureCategory: Equatable {
-    case codeObjectUnavailable
-    case signatureInvalid
-    case signingInformationUnavailable
-    case requirementUnavailable
-}
-
-enum RuntimeCodeSigningValidationResult: Equatable {
-    case valid(domains: Set<RuntimeCodeSigningDomain>)
-    case invalid(RuntimeCodeSigningFailureCategory)
-
-    func validates(_ domain: RuntimeCodeSigningDomain) -> Bool {
-        guard case let .valid(domains) = self else { return false }
-        return domains.contains(domain)
-    }
-}
-
-struct RuntimeCodeSigningInfo: Equatable {
-    let codeIdentifier: String?
-    let teamIdentifier: String?
-    let signingFlags: UInt32?
-    let isAdHoc: Bool
-    let leafCertificateSHA256: String?
-    let validationResult: RuntimeCodeSigningValidationResult
-
-    static func synthetic(
-        codeIdentifier: String? = nil,
-        teamIdentifier: String? = nil,
-        isAdHoc: Bool = false,
-        leafCertificateSHA256: String? = nil,
-        validatedDomains: Set<RuntimeCodeSigningDomain> = [],
-        failure: RuntimeCodeSigningFailureCategory? = nil
-    ) -> RuntimeCodeSigningInfo {
-        RuntimeCodeSigningInfo(
-            codeIdentifier: codeIdentifier,
-            teamIdentifier: teamIdentifier,
-            signingFlags: isAdHoc ? 0x2 : 0,
-            isAdHoc: isAdHoc,
-            leafCertificateSHA256: leafCertificateSHA256,
-            validationResult: failure.map(RuntimeCodeSigningValidationResult.invalid)
-                ?? .valid(domains: validatedDomains)
-        )
-    }
-}
-
 enum RuntimeSecureStorageDomain: Equatable {
     case officialDeveloperID
     case localSelfSigned

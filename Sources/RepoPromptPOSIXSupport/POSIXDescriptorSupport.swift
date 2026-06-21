@@ -1,12 +1,12 @@
 import Darwin
 import Darwin.POSIX.fcntl
 
-public enum POSIXDescriptorConfigurationError: Error, Equatable, Sendable {
+package enum POSIXDescriptorConfigurationError: Error, Equatable {
     case invalidFileDescriptor(fd: Int32)
     case getDescriptorFlagsFailed(fd: Int32, errno: Int32)
     case setDescriptorFlagsFailed(fd: Int32, errno: Int32)
 
-    public var errnoValue: Int32 {
+    package var errnoValue: Int32 {
         switch self {
         case .invalidFileDescriptor:
             EBADF
@@ -16,8 +16,8 @@ public enum POSIXDescriptorConfigurationError: Error, Equatable, Sendable {
     }
 }
 
-public enum POSIXDescriptorSupport {
-    public static func setCloseOnExec(_ fd: Int32) throws {
+package enum POSIXDescriptorSupport {
+    package static func setCloseOnExec(_ fd: Int32) throws {
         guard fd >= 0 else {
             throw POSIXDescriptorConfigurationError.invalidFileDescriptor(fd: fd)
         }
@@ -32,7 +32,7 @@ public enum POSIXDescriptorSupport {
         }
     }
 
-    public static func shutdownSocketReadWrite(_ fd: Int32) {
+    package static func shutdownSocketReadWrite(_ fd: Int32) {
         guard fd >= 0 else { return }
         _ = shutdown(fd, SHUT_RDWR)
     }

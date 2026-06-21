@@ -128,11 +128,11 @@ resolved = json.loads(Path("Package.resolved").read_text())
 resolved_pins = {pin["identity"]: pin for pin in resolved["pins"]}
 package = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
 targets = {target["name"]: target for target in package["targets"]}
-repo_prompt = targets.get("RepoPrompt", {})
-repo_prompt_dependencies = repo_prompt.get("dependencies", [])
-repo_prompt_products = {
+syntax_bridge = targets.get("RepoPromptSyntaxCBridge", {})
+syntax_bridge_dependencies = syntax_bridge.get("dependencies", [])
+syntax_bridge_products = {
     (dependency["product"][0], dependency["product"][1])
-    for dependency in repo_prompt_dependencies
+    for dependency in syntax_bridge_dependencies
     if "product" in dependency
 }
 
@@ -145,8 +145,8 @@ for identity, (url, revision, product) in expected_packages.items():
         errors.append(f"Package.resolved missing pin: {identity}")
     elif pin.get("location") != url or pin.get("state", {}).get("revision") != revision:
         errors.append(f"Package.resolved pin drift: {identity}")
-    if (product, identity) not in repo_prompt_products:
-        errors.append(f"RepoPrompt missing upstream grammar product dependency: {product} ({identity})")
+    if (product, identity) not in syntax_bridge_products:
+        errors.append(f"RepoPromptSyntaxCBridge missing upstream grammar product dependency: {product} ({identity})")
 
 support = targets.get("TreeSitterScannerSupport")
 if support is None:
@@ -157,8 +157,8 @@ else:
     expected_sources = ["src/javascript/scanner.c", "src/python/scanner.c"]
     if sorted(support.get("sources", [])) != expected_sources:
         errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_dependencies):
-    errors.append("RepoPrompt must directly depend on TreeSitterScannerSupport")
+if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in syntax_bridge_dependencies):
+    errors.append("RepoPromptSyntaxCBridge must directly depend on TreeSitterScannerSupport")
 
 if errors:
     raise SystemExit("\n".join(errors))
@@ -320,6 +320,7 @@ allowed_tracked_docs=(
   "docs/core-isolation/phases/phase-0.md"
   "docs/core-isolation/phases/phase-1.md"
   "docs/core-isolation/phases/phase-2.md"
+  "docs/core-isolation/phases/phase-3.md"
   "docs/investigations/core-isolation-reconstruction-2026-06-20.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

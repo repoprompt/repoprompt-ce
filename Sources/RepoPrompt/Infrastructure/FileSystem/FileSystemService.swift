@@ -1,13 +1,11 @@
 import Combine
-import CoreServices
 import Dispatch
 import Foundation
+import RepoPromptCore
+import RepoPromptCoreMacOS
 #if DEBUG || EDIT_FLOW_PERF
     import os
 #endif
-import CoreFoundation
-import Cuchardet
-import UniversalCharsetDetection
 #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
     import Darwin
 #else
@@ -34,9 +32,10 @@ actor FileSystemService {
     nonisolated let watcherIngressMailbox: FileSystemWatcherIngressMailbox
     nonisolated let watcherEarlyFilter: FileSystemWatcherEarlyFilter
     static let maxPendingRawEvents = 50000
-    static let overflowRescanEventFlags = FSEventStreamEventFlags(
-        kFSEventStreamEventFlagMustScanSubDirs | kFSEventStreamEventFlagRootChanged
-    )
+    static let overflowRescanEventFlags: FileSystemWatchEventFlags = [
+        .mustScanSubdirectories,
+        .rootChanged
+    ]
 
     #if DEBUG
         /// Static flag to enable verbose debug logging (default: false)
@@ -172,11 +171,12 @@ actor FileSystemService {
     /// True => directory, False => file
     var visitedItems = [String: Bool]()
 
-    /// The FSEvent stream reference
-    var fseventStreamRef: FSEventStreamRef?
-    /// The last durable FSEvents journal cut. Captured before the initial crawl so
-    /// watcher startup can replay mutations that happen while the crawl is running.
-    var nextFSEventStreamStartEventID: FSEventStreamEventId
+    /// Platform watcher. Ingress, watermarks, and publication remain actor-owned.
+    let fileSystemWatcher: any FileSystemWatching
+    let fileMutationBackend: any WorkspaceFileMutationBackend
+    /// The last durable journal cut. Captured before the initial crawl so watcher
+    /// startup can replay mutations that happen while the crawl is running.
+    var nextFSEventStreamStartEventID: FileSystemWatchEventID
 
     /// Publishes ordered delta envelopes whenever changes or watcher progress occur.
     var changePublisher = PassthroughSubject<FileSystemDeltaPublication, Never>()
@@ -203,9 +203,6 @@ actor FileSystemService {
         var freshnessLastWatcherBatchSize = 0
         var freshnessMaxWatcherBatchSize = 0
     #endif
-
-    /// Retained pointer to self (to avoid deallocation while FSEvent stream is active)
-    var selfPointer: UnsafeMutableRawPointer?
 
     /// The in-memory IgnoreRules instance for our path
     var ignoreRules: IgnoreRules
@@ -256,9 +253,9 @@ actor FileSystemService {
     // MARK: - Event ID-based scan coalescing (prevents dropped events while deduping bursts)
 
     /// Maps folder relative path → highest FSEvent ID that requires scanning
-    var pendingScanTargets: [String: FSEventStreamEventId] = [:]
+    var pendingScanTargets: [String: FileSystemWatchEventID] = [:]
     /// Maps folder relative path → highest FSEvent ID that has already been scanned
-    var lastScannedEventIdByFolder: [String: FSEventStreamEventId] = [:]
+    var lastScannedEventIdByFolder: [String: FileSystemWatchEventID] = [:]
     /// Cap-omitted folders that must be scanned by quiet follow-up watcher batches.
     var pendingQuietFolderScanTargets: Set<String> = []
     /// Recovery targets that failed both parallel and immediate serial scanning.
@@ -333,7 +330,9 @@ actor FileSystemService {
 
         watcherIngressMailbox = FileSystemWatcherIngressMailbox(maxQueuedRawEntries: Self.maxPendingRawEvents)
         watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
-        nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
+        fileSystemWatcher = MacOSFSEventsWatcherFactory().makeWatcher(path: path)
+        fileMutationBackend = MacOSWorkspaceFileMutationBackend()
+        nextFSEventStreamStartEventID = MacOSFSEventsJournal.currentEventID()
 
         // Configure parallelism caps based on available cores
         let cores = ProcessInfo.processInfo.activeProcessorCount
@@ -414,7 +413,9 @@ actor FileSystemService {
                 maxQueuedRawEntries: maxPendingWatcherIngressEntriesOverride ?? Self.maxPendingRawEvents
             )
             watcherEarlyFilter = FileSystemWatcherEarlyFilter(rootPath: path)
-            nextFSEventStreamStartEventID = FSEventsGetCurrentEventId()
+            fileSystemWatcher = MacOSFSEventsWatcherFactory().makeWatcher(path: path)
+            fileMutationBackend = MacOSWorkspaceFileMutationBackend()
+            nextFSEventStreamStartEventID = MacOSFSEventsJournal.currentEventID()
 
             // Configure parallelism caps (allow test overrides)
             let cores = ProcessInfo.processInfo.activeProcessorCount

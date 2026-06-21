@@ -1,26 +1,6 @@
 import Foundation
-#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-    import Darwin
-#else
-    import Glibc
-#endif
-
-struct FileContentFingerprint: Hashable {
-    let deviceID: UInt64
-    let fileNumber: UInt64
-    let byteSize: Int64
-    let modificationSeconds: Int64
-    let modificationNanoseconds: Int64
-    let statusChangeSeconds: Int64
-    let statusChangeNanoseconds: Int64
-
-    var modificationDate: Date {
-        Date(
-            timeIntervalSince1970: TimeInterval(modificationSeconds)
-                + TimeInterval(modificationNanoseconds) / 1_000_000_000
-        )
-    }
-}
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 struct ValidatedFileContentSnapshot {
     let content: String?
@@ -39,67 +19,36 @@ enum FileContentValidationError: Error {
 }
 
 enum FileContentFingerprintReader {
+    private static let reader = MacOSFileContentSnapshotReader()
+
     static func fingerprint(atPath path: String) throws -> FileContentFingerprint {
-        var info = stat()
-        let result = path.withCString { pointer in
-            lstat(pointer, &info)
-        }
-        guard result == 0 else {
-            throw fileSystemError(for: errno)
-        }
-        return try fingerprint(from: info)
+        try map { try reader.fingerprint(atPath: path) }
     }
 
     static func fingerprint(fileDescriptor: Int32) throws -> FileContentFingerprint {
-        var info = stat()
-        guard fstat(fileDescriptor, &info) == 0 else {
-            throw fileSystemError(for: errno)
-        }
-        return try fingerprint(from: info)
+        try map { try reader.fingerprint(fileDescriptor: fileDescriptor) }
     }
 
     static func openReadOnlyFileHandle(atPath path: String) throws -> FileHandle {
-        let descriptor = path.withCString { pointer in
-            open(pointer, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
-        }
-        guard descriptor >= 0 else {
-            throw fileSystemError(for: errno)
-        }
-        return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        try map { try reader.openReadOnlyFileHandle(atPath: path) }
     }
 
-    private static func fingerprint(from info: stat) throws -> FileContentFingerprint {
-        guard (info.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+    private static func map<T>(_ operation: () throws -> T) throws -> T {
+        do {
+            return try operation()
+        } catch MacOSFileContentSnapshotError.notRegularFile {
             throw FileSystemError.invalidRelativePath
-        }
-
-        #if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-            let modificationTime = info.st_mtimespec
-            let statusChangeTime = info.st_ctimespec
-        #else
-            let modificationTime = info.st_mtim
-            let statusChangeTime = info.st_ctim
-        #endif
-
-        return FileContentFingerprint(
-            deviceID: UInt64(info.st_dev),
-            fileNumber: UInt64(info.st_ino),
-            byteSize: Int64(info.st_size),
-            modificationSeconds: Int64(modificationTime.tv_sec),
-            modificationNanoseconds: Int64(modificationTime.tv_nsec),
-            statusChangeSeconds: Int64(statusChangeTime.tv_sec),
-            statusChangeNanoseconds: Int64(statusChangeTime.tv_nsec)
-        )
-    }
-
-    private static func fileSystemError(for errorNumber: Int32) -> FileSystemError {
-        switch errorNumber {
-        case ENOENT, ENOTDIR:
-            .fileNotFound
-        case ELOOP:
-            .invalidRelativePath
-        default:
-            .failedToReadFile
+        } catch let MacOSFileContentSnapshotError.operationFailed(errorNumber) {
+            switch POSIXErrorCode(rawValue: errorNumber) {
+            case .ENOENT?, .ENOTDIR?:
+                throw FileSystemError.fileNotFound
+            case .ELOOP?:
+                throw FileSystemError.invalidRelativePath
+            default:
+                throw FileSystemError.failedToReadFile
+            }
+        } catch {
+            throw FileSystemError.failedToReadFile
         }
     }
 }

@@ -1,6 +1,5 @@
 #if DEBUG
     import Combine
-    import CoreServices
     import MCP
     @testable import RepoPrompt
     import RepoPromptShared
@@ -1192,9 +1191,7 @@
 
             do {
                 await flushGate.waitUntilStarted()
-                let createdFileFlags = FSEventStreamEventFlags(
-                    kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-                )
+                let createdFileFlags: FileSystemWatchEventFlags = [.itemCreated, .itemIsFile]
                 let firstAccepted = try await store.acceptWatcherPayloadForTesting(
                     rootID: record.id,
                     events: [(absolutePath: firstURL.path, flags: createdFileFlags, eventId: 500)],

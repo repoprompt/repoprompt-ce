@@ -28,6 +28,8 @@ make dev-test FILTER=RepoPromptTests.ExampleTests
 make dev-test FILTER=RepoPromptTests.ExampleTests/testBehavior
 make dev-core-test FILTER=RepoPromptCoreTests.ExampleTests
 make dev-core-test FILTER=RepoPromptCoreTests.ExampleTests/testBehavior
+make dev-core-macos-test FILTER=RepoPromptCoreMacOSTests.ExampleTests/testBehavior
+make dev-posix-test FILTER=RepoPromptPOSIXSupportTests.ExampleTests/testBehavior
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests
 make dev-provider-test FILTER=RepoPromptClaudeCompatibleProviderTests.ExampleTests/testBehavior
 ```
@@ -41,6 +43,8 @@ Never derive the executable census from source text or a stale build. The curren
 ```bash
 make dev-test-list
 make dev-core-test-list
+make dev-core-macos-test-list
+make dev-posix-test-list
 make dev-provider-test-list
 ```
 
@@ -56,7 +60,7 @@ The seven reserved ledger prefixes and target names are:
 | `syntax-c-bridge/` | `RepoPromptSyntaxCBridgeTests` | `Tests/RepoPromptSyntaxCBridgeTests` |
 | `headless/` | `RepoPromptHeadlessTests` | `Tests/RepoPromptHeadlessTests` |
 
-`Scripts/test_suite_optimizer.py` reads the manifests before listing. A reserved prefix whose test target is absent contributes zero methods and triggers no conductor call. Once a test target is declared, its dedicated conductor/Make list lane is mandatory and must produce at least one executable XCTest ID. `RepoPromptCoreTests` is now declared; use `make dev-core-test` and `make dev-core-test-list`. The other four isolated prefixes remain reserved and absent.
+`Scripts/test_suite_optimizer.py` reads the manifests before listing. A reserved prefix whose test target is absent contributes zero methods and triggers no conductor call. Once a test target is declared, its dedicated conductor/Make list lane is mandatory and must produce at least one executable XCTest ID. `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, and `RepoPromptPOSIXSupportTests` are declared with dedicated test/list lanes. The syntax-bridge and headless prefixes remain reserved and absent.
 
 Listed XCTest IDs are shaped as `<Module>.<Suite>/testMethod`; the curated ledger prepends the reserved prefix, for example:
 
@@ -64,6 +68,8 @@ Listed XCTest IDs are shaped as `<Module>.<Suite>/testMethod`; the curated ledge
 root/RepoPromptTests.<Suite>/testMethod
 provider/RepoPromptClaudeCompatibleProviderTests.<Suite>/testMethod
 core/RepoPromptCoreTests.<Suite>/testMethod
+core-macos/RepoPromptCoreMacOSTests.<Suite>/testMethod
+posix/RepoPromptPOSIXSupportTests.<Suite>/testMethod
 ```
 
 Treat these strings as exact, case-sensitive identifiers. Existing unmoved root/provider IDs never change merely because the additional vocabulary is reserved.

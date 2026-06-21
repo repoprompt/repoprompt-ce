@@ -1,8 +1,5 @@
 // swift-tools-version: 6.2
-import Foundation
 import PackageDescription
-
-let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
 let package = Package(
     name: "RepoPromptCE",
@@ -62,7 +59,8 @@ let package = Package(
                 .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
                 .product(name: "TreeSitterPHP", package: "tree-sitter-php")
             ],
-            path: "Sources/RepoPromptSyntaxCBridge"
+            path: "Sources/RepoPromptSyntaxCBridge",
+            publicHeadersPath: "include"
         ),
         .target(
             name: "RepoPromptCore",
@@ -103,8 +101,7 @@ let package = Package(
             name: "RepoPrompt",
             dependencies: [
                 "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS",
-                "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
-                "Sparkle",
+                "RepoPromptPOSIXSupport", "RepoPromptSyntaxCBridge", "RepoPromptC", "Sparkle",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),
@@ -112,24 +109,9 @@ let package = Package(
                 .product(name: "SwiftyJSON", package: "SwiftyJSON"),
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
-                .product(name: "TreeSitterC", package: "tree-sitter-c"),
-                .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
-                .product(name: "TreeSitterGo", package: "tree-sitter-go"),
-                .product(name: "TreeSitterJava", package: "tree-sitter-java"),
-                .product(name: "TreeSitterJavaScript", package: "tree-sitter-javascript"),
-                .product(name: "TreeSitterPython", package: "tree-sitter-python"),
-                .product(name: "TreeSitterRust", package: "tree-sitter-rust"),
-                .product(name: "TreeSitterTypeScript", package: "tree-sitter-typescript"),
-                .product(name: "TreeSitterRuby", package: "tree-sitter-ruby"),
-                .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
-                .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
-                .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
-                .product(name: "TreeSitterPHP", package: "tree-sitter-php"),
                 .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
                 .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
                 .product(name: "Neon", package: "Neon"),
-                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
-                .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
                 .product(name: "JSONSchema", package: "JSONSchema"),
                 .product(name: "Ontology", package: "ontology"),
                 .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
@@ -137,11 +119,7 @@ let package = Package(
             path: "Sources/RepoPrompt",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug)),
-                .enableUpcomingFeature("BareSlashRegexLiterals"),
-                .unsafeFlags([
-                    "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
-                    "-disable-bridging-pch"
-                ])
+                .enableUpcomingFeature("BareSlashRegexLiterals")
             ]
         ),
         .executableTarget(
@@ -165,6 +143,16 @@ let package = Package(
             name: "RepoPromptCoreTests",
             dependencies: ["RepoPromptCore"],
             path: "Tests/RepoPromptCoreTests"
+        ),
+        .testTarget(
+            name: "RepoPromptCoreMacOSTests",
+            dependencies: ["RepoPromptCoreMacOS"],
+            path: "Tests/RepoPromptCoreMacOSTests"
+        ),
+        .testTarget(
+            name: "RepoPromptPOSIXSupportTests",
+            dependencies: ["RepoPromptPOSIXSupport"],
+            path: "Tests/RepoPromptPOSIXSupportTests"
         ),
         .testTarget(
             name: "RepoPromptTests",

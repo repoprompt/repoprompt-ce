@@ -1,5 +1,5 @@
-import CoreServices
 import Foundation
+import RepoPromptCore
 #if DEBUG || EDIT_FLOW_PERF
     import os
 #endif
@@ -108,7 +108,7 @@ struct FileSystemDeltaPublication {
     }
 }
 
-typealias PendingFSEvent = (path: String, flags: FSEventStreamEventFlags, id: FSEventStreamEventId)
+typealias PendingFSEvent = (path: String, flags: FileSystemWatchEventFlags, id: FileSystemWatchEventID)
 
 struct PendingFSEventBatch {
     var events: [PendingFSEvent] = []

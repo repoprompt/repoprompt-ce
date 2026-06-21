@@ -1,4 +1,3 @@
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -711,13 +710,11 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             try write("let newOverflowNeedle = true\n", to: fileURL)
             let optionalService = await store.fileSystemServiceForTesting(rootID: record.id)
             let service = try XCTUnwrap(optionalService)
-            let eventID: FSEventStreamEventId = 1
+            let eventID: FileSystemWatchEventID = 1
             let optionalAccepted = await service.acceptWatcherPayloadForTesting(
                 [(
                     absolutePath: fileURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.contentChanged, .itemIsFile],
                     eventId: eventID
                 )],
                 scheduleDrain: false
@@ -767,9 +764,7 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                 rootID: record.id,
                 events: [(
                     absolutePath: fileURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.contentChanged, .itemIsFile],
                     eventId: 1
                 )],
                 scheduleDrain: false

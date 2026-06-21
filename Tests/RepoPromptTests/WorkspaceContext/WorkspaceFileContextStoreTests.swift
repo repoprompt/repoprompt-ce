@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -7292,8 +7291,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             return finalCounters
         }
 
-        private var createdFileFlags: FSEventStreamEventFlags {
-            FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+        private var createdFileFlags: FileSystemWatchEventFlags {
+            [.itemCreated, .itemIsFile]
         }
 
         private actor WorkspaceRootUnloadDiagnosticsRecorder {

@@ -77,8 +77,8 @@ final class SecureStorageAccountCatalogTests: XCTestCase {
         let root = try RepoRoot.url()
         let sourceRoot = root.appendingPathComponent("Sources/RepoPrompt", isDirectory: true)
         let allowedFiles: Set = [
+            "Sources/RepoPrompt/App/CoreCompatibilityAliases.swift",
             "Sources/RepoPrompt/Infrastructure/Security/EphemeralSecureKeyValueStore.swift",
-            "Sources/RepoPrompt/Infrastructure/Security/KeychainService.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureKeyService.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureKeyValueStorageBackend.swift",
             "Sources/RepoPrompt/Infrastructure/Security/SecureStorageRepairService.swift"

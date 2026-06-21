@@ -1,8 +1,41 @@
 import RepoPromptCore
+import RepoPromptCoreMacOS
+import RepoPromptPOSIXSupport
 
 // Phase 2 temporary compatibility aliases.
 // Concrete implementations are owned by RepoPromptCore; these names preserve app call sites
 // until Phase 9 compatibility cleanup.
+
+// MARK: - Phase 3 platform boundaries
+
+typealias FileContentFingerprint = RepoPromptCore.FileContentFingerprint
+typealias SpawnedProcess = RepoPromptCore.SpawnedProcess
+typealias POSIXDescriptorSupport = RepoPromptPOSIXSupport.POSIXDescriptorSupport
+typealias POSIXDescriptorConfigurationError = RepoPromptPOSIXSupport.POSIXDescriptorConfigurationError
+typealias FDWriteSupport = RepoPromptPOSIXSupport.FDWriteSupport
+typealias FDWriteError = RepoPromptPOSIXSupport.FDWriteError
+typealias FileSystemWatchEventID = RepoPromptCore.FileSystemWatchEventID
+typealias FileSystemWatchEventFlags = RepoPromptCore.FileSystemWatchEventFlags
+typealias FileSystemWatchEvent = RepoPromptCore.FileSystemWatchEvent
+typealias FileSystemWatchEventPayload = RepoPromptCore.FileSystemWatchEventPayload
+typealias FSEventCallbackEntry = RepoPromptCore.FileSystemWatchEvent
+typealias FSEventCallbackPayload = RepoPromptCore.FileSystemWatchEventPayload
+typealias SecureStorageAccessMode = RepoPromptCore.SecureStorageAccessMode
+typealias SecureStorageAccessReason = RepoPromptCore.SecureStorageAccessReason
+typealias SecureStorageError = RepoPromptCore.SecureStorageError
+typealias KeychainAccessMode = RepoPromptCore.SecureStorageAccessMode
+typealias KeychainAccessReason = RepoPromptCore.SecureStorageAccessReason
+typealias SecureKeyValueStorageBackend = RepoPromptCore.SecureKeyValueStorageBackend
+typealias RuntimeCodeSigningDomain = RepoPromptCore.RuntimeCodeSigningDomain
+typealias RuntimeCodeSigningFailureCategory = RepoPromptCore.RuntimeCodeSigningFailureCategory
+typealias RuntimeCodeSigningValidationResult = RepoPromptCore.RuntimeCodeSigningValidationResult
+typealias RuntimeCodeSigningInfo = RepoPromptCore.RuntimeCodeSigningInfo
+typealias RuntimeValidatedLocalSigningIdentity = RepoPromptCore.RuntimeValidatedLocalSigningIdentity
+typealias RuntimeLocalSigningExpectation = RepoPromptCore.RuntimeLocalSigningExpectation
+typealias RuntimeCodeSigningRequirements = RepoPromptCore.RuntimeCodeSigningRequirements
+typealias KeychainService = RepoPromptCoreMacOS.KeychainService
+typealias SecItemClient = RepoPromptCoreMacOS.SecItemClient
+typealias SystemSecItemClient = RepoPromptCoreMacOS.SystemSecItemClient
 
 // MARK: - Utilities and slices
 

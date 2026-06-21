@@ -45,9 +45,9 @@ def valid_package() -> dict[str, object]:
                     dependency(("target", "RepoPromptShared", "")),
                     dependency(("target", "RepoPromptCore", "")),
                     dependency(("target", "RepoPromptCoreMacOS", "")),
+                    dependency(("target", "RepoPromptPOSIXSupport", "")),
+                    dependency(("target", "RepoPromptSyntaxCBridge", "")),
                     dependency(("target", "RepoPromptC", "")),
-                    dependency(("target", "CSwiftPCRE2", "")),
-                    dependency(("target", "TreeSitterScannerSupport", "")),
                     dependency(("target", "Sparkle", "")),
                 ],
             },
@@ -196,6 +196,7 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             directory = root / relative
             directory.mkdir(parents=True)
             (directory / "Scaffold.swift").write_text("// scaffold\n")
+        (root / "Package.swift").write_text("// fixture package\n")
         app = root / "Sources/RepoPrompt/Frozen.swift"
         app.parent.mkdir(parents=True)
         declarations = "\n".join(f"struct {name} {{}}" for name in sorted(CORE_DECLARATIONS))

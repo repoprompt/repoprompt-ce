@@ -673,10 +673,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
             ("build", {}, "pipe"),
             ("test", {}, "pipe"),
             ("core-test", {}, "pipe"),
+            ("core-macos-test", {}, "pipe"),
+            ("posix-test", {}, "pipe"),
             ("provider-test", {}, "pipe"),
             ("test", {"list": True, "xctestStallSeconds": 5.0}, "pipe"),
             ("test", {"xctestStallSeconds": 5.0}, "pty"),
             ("core-test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("core-macos-test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("posix-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("provider-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("test", {"xctestStallSeconds": 5.0, "xctestStallWakeProbe": True}, "pty"),
         ]
@@ -1241,6 +1245,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         core_argv, core_lanes, core_cwd, _env, _timeout = registry.prepare(
             {"operation": "core-test", "args": {"list": True}}
         )
+        core_macos_argv, core_macos_lanes, core_macos_cwd, _env, _timeout = registry.prepare(
+            {"operation": "core-macos-test", "args": {"list": True}}
+        )
+        posix_argv, posix_lanes, posix_cwd, _env, _timeout = registry.prepare(
+            {"operation": "posix-test", "args": {"list": True}}
+        )
         provider_argv, provider_lanes, provider_cwd, _env, _timeout = registry.prepare(
             {"operation": "provider-test", "args": {"list": True}}
         )
@@ -1259,6 +1269,20 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         ])
         self.assertEqual(core_lanes, ["build"])
         self.assertEqual(core_cwd, state.paths.repo_root)
+        self.assertEqual(core_macos_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptCoreMacOSTests",
+        ])
+        self.assertEqual(core_macos_lanes, ["build"])
+        self.assertEqual(core_macos_cwd, state.paths.repo_root)
+        self.assertEqual(posix_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptPOSIXSupportTests",
+        ])
+        self.assertEqual(posix_lanes, ["build"])
+        self.assertEqual(posix_cwd, state.paths.repo_root)
         self.assertEqual(provider_argv, ["swift", "test", "list"])
         self.assertEqual(provider_lanes, ["build"])
         self.assertEqual(
@@ -1298,6 +1322,12 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         core_argv, *_ = registry.prepare(
             {"operation": "core-test", "args": {"filter": "ExampleTests/testBehavior"}}
         )
+        core_macos_argv, *_ = registry.prepare(
+            {"operation": "core-macos-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        posix_argv, *_ = registry.prepare(
+            {"operation": "posix-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
         self.assertEqual(
             root_argv,
             ["swift", "test", "--filter", "RepoPromptTests.ExampleTests/testBehavior"],
@@ -1305,6 +1335,14 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(
             core_argv,
             ["swift", "test", "--filter", "RepoPromptCoreTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            core_macos_argv,
+            ["swift", "test", "--filter", "RepoPromptCoreMacOSTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            posix_argv,
+            ["swift", "test", "--filter", "RepoPromptPOSIXSupportTests.ExampleTests/testBehavior"],
         )
 
         with self.assertRaisesRegex(conductor.ConductorError, "cannot target test module"):

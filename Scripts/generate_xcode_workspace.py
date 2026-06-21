@@ -117,17 +117,12 @@ def validate_manifest(manifest: dict, repo_root: Path) -> None:
         value = setting.get("kind", {}).get("unsafeFlags", {}).get("_0")
         if isinstance(value, list):
             unsafe_flags.append(value)
-    expected_header = repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
-    if not any(
-        len(flags) == 3
-        and flags[0] == "-import-objc-header"
-        and Path(flags[1]) == expected_header
-        and flags[2] == "-disable-bridging-pch"
-        for flags in unsafe_flags
-    ):
+    if unsafe_flags:
         raise GeneratorError(
-            "RepoPrompt must retain the Objective-C bridging-header unsafe flags"
+            "RepoPrompt must not restore target-wide bridging-header unsafe flags"
         )
+    if (repo_root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h").exists():
+        raise GeneratorError("RepoPrompt bridging header must remain removed after Phase 3")
 
     resources = [
         (resource.get("path"), "copy" in resource.get("rule", {}))

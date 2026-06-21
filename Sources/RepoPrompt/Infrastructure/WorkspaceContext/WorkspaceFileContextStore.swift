@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 import Dispatch
 import Foundation
 
@@ -2428,7 +2427,7 @@ actor WorkspaceFileContextStore {
 
         func acceptWatcherPayloadForTesting(
             rootID: UUID,
-            events: [(absolutePath: String, flags: FSEventStreamEventFlags, eventId: FSEventStreamEventId)],
+            events: [(absolutePath: String, flags: FileSystemWatchEventFlags, eventId: FileSystemWatchEventID)],
             scheduleDrain: Bool = true
         ) async throws -> FileSystemWatcherIngressMailbox.Watermark? {
             let state = try state(for: rootID)

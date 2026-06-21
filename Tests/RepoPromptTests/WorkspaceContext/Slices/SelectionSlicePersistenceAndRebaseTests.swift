@@ -1,4 +1,3 @@
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -844,11 +843,7 @@ final class SelectionSlicePersistenceAndRebaseTests: XCTestCase {
                 rootID: rootID,
                 events: [(
                     absolutePath: fileURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 9_000_000_000_000_000_000
                 )]
             )

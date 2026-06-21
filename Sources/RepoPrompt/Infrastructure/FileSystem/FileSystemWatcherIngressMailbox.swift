@@ -1,13 +1,7 @@
-import CoreServices
 import Foundation
+import RepoPromptCore
 
-/// Owns deep-copied FSEvent callback payloads synchronously before actor entry.
-///
-/// The FSEvents callback can run outside the `FileSystemService` actor. This mailbox
-/// assigns a per-root monotonic watermark before any task is created, preserves FIFO
-/// payload order, and retains at most one drain task. Under pressure it collapses
-/// queued details to the existing root-rescan sentinel contract without discarding
-/// accepted progress.
+/// Owns deep-copied watcher callback payloads synchronously before actor entry.
 final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
     struct Watermark: Hashable, Comparable {
         let rawValue: UInt64
@@ -21,9 +15,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     struct AcceptedPayload: @unchecked Sendable {
         enum Contents: @unchecked Sendable {
-            case entries([FSEventCallbackEntry])
+            case entries([FileSystemWatchEvent])
             case overflowRootRescan(
-                highestEventID: FSEventStreamEventId,
+                highestEventID: FileSystemWatchEventID,
                 changedIgnoreAbsolutePaths: Set<String>
             )
         }
@@ -35,10 +29,8 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
         var rawEntryCount: Int {
             switch contents {
-            case let .entries(entries):
-                entries.count
-            case .overflowRootRescan:
-                1
+            case let .entries(entries): entries.count
+            case .overflowRootRescan: 1
             }
         }
     }
@@ -97,7 +89,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     @discardableResult
     func accept(
-        _ payload: FSEventCallbackPayload,
+        _ payload: FileSystemWatchEventPayload,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?,
         scheduleDrain: (@Sendable () async -> Void)?
     ) -> Watermark? {
@@ -131,9 +123,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         defer { lock.unlock() }
         guard queuedPayloadHead < queuedPayloads.count else { return nil }
         let first = queuedPayloads[queuedPayloadHead]
-        if let target, first.lowestAcceptedWatermark > target {
-            return nil
-        }
+        if let target, first.lowestAcceptedWatermark > target { return nil }
         queuedPayloadHead += 1
         queuedRawEntryCount -= first.rawEntryCount
         compactConsumedPayloadsIfNeeded()
@@ -158,7 +148,6 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
             collapseQueuedPayloads(with: payload)
             return
         }
-
         let projectedRawEntryCount = queuedRawEntryCount + payload.rawEntryCount
         guard projectedRawEntryCount > maxQueuedRawEntries else {
             queuedPayloads.append(payload)
@@ -172,8 +161,9 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         let payloads = Array(queuedPayloads.dropFirst(queuedPayloadHead)) + [payload]
         var lowestAcceptedWatermark = payload.lowestAcceptedWatermark
         var acceptedHighWatermark = payload.acceptedHighWatermark
-        var highestEventID: FSEventStreamEventId = 0
+        var highestEventID: FileSystemWatchEventID = 0
         var changedIgnoreAbsolutePaths = Set<String>()
+
         for queuedPayload in payloads {
             lowestAcceptedWatermark = min(lowestAcceptedWatermark, queuedPayload.lowestAcceptedWatermark)
             acceptedHighWatermark = max(acceptedHighWatermark, queuedPayload.acceptedHighWatermark)
@@ -190,6 +180,7 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
                 changedIgnoreAbsolutePaths.formUnion(queuedIgnorePaths)
             }
         }
+
         queuedPayloads = [AcceptedPayload(
             lowestAcceptedWatermark: lowestAcceptedWatermark,
             acceptedHighWatermark: acceptedHighWatermark,
@@ -216,8 +207,13 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
         }
     }
 
-    private func scheduleDrainIfNeeded(_ scheduleDrain: @escaping @Sendable () async -> Void) {
-        guard isAccepting, activeDrainToken == nil, queuedPayloadHead < queuedPayloads.count else { return }
+    private func scheduleDrainIfNeeded(
+        _ scheduleDrain: @escaping @Sendable () async -> Void
+    ) {
+        guard isAccepting,
+              activeDrainToken == nil,
+              queuedPayloadHead < queuedPayloads.count
+        else { return }
         nextDrainToken &+= 1
         let token = nextDrainToken
         activeDrainToken = token
@@ -244,6 +240,8 @@ final class FileSystemWatcherIngressMailbox: @unchecked Sendable {
 
     private static func isIgnoreControlPath(_ path: String) -> Bool {
         let filename = (path as NSString).lastPathComponent.lowercased()
-        return filename == ".gitignore" || filename == ".repo_ignore" || filename == ".cursorignore"
+        return filename == ".gitignore"
+            || filename == ".repo_ignore"
+            || filename == ".cursorignore"
     }
 }

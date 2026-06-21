@@ -1,9 +1,5 @@
 import Foundation
-#if os(macOS) || os(iOS) || os(tvOS) || os(watchOS)
-    import Darwin
-#else
-    import Glibc
-#endif
+import RepoPromptCore
 
 extension FileSystemService {
     // MARK: - File and folder manipulation utilities
@@ -50,9 +46,7 @@ extension FileSystemService {
     }
 
     private func pathIsSymbolicLink(_ path: String) -> Bool {
-        var info = stat()
-        guard lstat(path, &info) == 0 else { return false }
-        return info.st_mode & S_IFMT == S_IFLNK
+        fileMutationBackend.isSymbolicLink(atPath: path)
     }
 
     private func requireRegularMutationSource(relativePath: String) async throws {
@@ -146,8 +140,9 @@ extension FileSystemService {
         try fm.createDirectory(atPath: destDir, withIntermediateDirectories: true, attributes: nil)
         _ = try mutationTarget(forRelativePath: newTarget.relativePath)
 
+        let mutationBackend = fileMutationBackend
         let mutation = startUncancellableMutation(.move) {
-            try FileManager.default.moveItem(atPath: oldFull, toPath: newFull)
+            try mutationBackend.moveItem(at: oldTarget.url, to: newTarget.url)
         }
         Task.detached { [weak self] in
             do {
@@ -181,8 +176,12 @@ extension FileSystemService {
             break
         case .ineligible:
             do {
+                let mutationBackend = fileMutationBackend
                 try await Task.detached(priority: .utility) {
-                    try FileManager.default.moveItem(atPath: newFullPath, toPath: oldFullPath)
+                    try mutationBackend.moveItem(
+                        at: URL(fileURLWithPath: newFullPath),
+                        to: URL(fileURLWithPath: oldFullPath)
+                    )
                 }.value
             } catch {
                 forgetTrackedPath(oldRelativePath)
@@ -233,8 +232,9 @@ extension FileSystemService {
             )
         }
 
+        let mutationBackend = fileMutationBackend
         let mutation = startUncancellableMutation(.create) {
-            try FileSystemService.writeFileRobust(to: fullURL, data: data)
+            try mutationBackend.write(data, to: fullURL, atomically: true)
         }
         Task.detached { [weak self] in
             do {
@@ -264,8 +264,9 @@ extension FileSystemService {
         case .eligible, .ineligible(.ignored):
             break
         case .ineligible:
+            let mutationBackend = fileMutationBackend
             _ = try? await Task.detached(priority: .utility) {
-                try FileManager.default.removeItem(at: url)
+                try mutationBackend.removeItem(at: url)
             }.value
             forgetTrackedPath(relativePath)
             completeMutationWaiter(mutationID, error: FileSystemError.invalidRelativePath)
@@ -285,8 +286,9 @@ extension FileSystemService {
         try await requireRegularMutationSource(relativePath: target.relativePath)
         try Task.checkCancellation()
         let url = target.url
+        let mutationBackend = fileMutationBackend
         let mutation = startUncancellableMutation(.delete) {
-            try FileManager.default.removeItem(at: url)
+            try mutationBackend.removeItem(at: url)
         }
         Task.detached { [weak self] in
             do {
@@ -325,12 +327,14 @@ extension FileSystemService {
         let wasDirectory = isDirectory.boolValue
 
         #if DEBUG
+            let mutationBackend = fileMutationBackend
             let moveItemToTrashIO = moveItemToTrashIOForTesting ?? { url in
-                _ = try Self.moveURLToTrashOffActor(url)
+                try mutationBackend.trashItem(at: url)
             }
         #else
+            let mutationBackend = fileMutationBackend
             let moveItemToTrashIO: @Sendable (URL) throws -> Void = { url in
-                _ = try Self.moveURLToTrashOffActor(url)
+                try mutationBackend.trashItem(at: url)
             }
         #endif
         let mutation = startUncancellableMutation(.trash) {
@@ -383,12 +387,6 @@ extension FileSystemService {
         visitedItems.removeValue(forKey: relativePath)
     }
 
-    private nonisolated static func moveURLToTrashOffActor(_ url: URL) throws -> URL? {
-        var resultingItemURL: NSURL?
-        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingItemURL)
-        return resultingItemURL as URL?
-    }
-
     func editFile(atRelativePath relativePath: String, newContent: String) async throws {
         _ = try await editFile(
             atRelativePath: relativePath,
@@ -430,8 +428,9 @@ extension FileSystemService {
             )
         }
 
+        let mutationBackend = fileMutationBackend
         let mutation = startUncancellableMutation(.edit) {
-            try FileSystemService.writeFileRobust(to: fullURL, data: data)
+            try mutationBackend.write(data, to: fullURL, atomically: true)
         }
         Task.detached { [weak self] in
             do {
@@ -535,107 +534,5 @@ extension FileSystemService {
         let fullPath = fullPath(forRelativePath: relativePath)
         guard let attributes = try? fm.attributesOfItem(atPath: fullPath) else { return nil }
         return attributes[.modificationDate] as? Date
-    }
-
-    private static func writeFile(
-        to url: URL,
-        data: Data
-    ) throws {
-        try data.write(to: url, options: .atomic) // blocking write
-    }
-
-    /// Robust write that works across external/network volumes:
-    /// 1) try atomic write
-    /// 2) write to temp in the same directory then move into place (delete destination if needed)
-    /// 3) POSIX open(O_CREAT|O_TRUNC)+write+fsync fallback
-    private static func writeFileRobust(
-        to url: URL,
-        data: Data
-    ) throws {
-        // Fast path: try Foundation's atomic write first.
-        do {
-            try data.write(to: url, options: [.atomic])
-            return
-        } catch {
-            // fall through to robust fallbacks
-        }
-
-        let fm = FileManager.default
-        let dirURL = url.deletingLastPathComponent()
-        let tmpURL = dirURL.appendingPathComponent(".repoprompt.tmp.\(UUID().uuidString)")
-
-        // Fallback #1: write to temp in the same directory then move/replace.
-        do {
-            try data.write(to: tmpURL, options: [])
-            if fm.fileExists(atPath: url.path) {
-                // Removing the destination first avoids exchange/rename restrictions on some filesystems
-                // (exFAT/SMB may reject replace semantics).
-                try? fm.removeItem(at: url)
-            }
-            try fm.moveItem(at: tmpURL, to: url)
-            return
-        } catch {
-            // Clean up temp if it remains
-            try? fm.removeItem(at: tmpURL)
-        }
-
-        // Fallback #2: POSIX open/write/fsync.
-        try writeFilePOSIX(to: url, data: data)
-    }
-
-    /// Low-level write that avoids Foundation's atomic/replace semantics entirely.
-    private static func writeFilePOSIX(
-        to url: URL,
-        data: Data
-    ) throws {
-        let path = url.path
-        let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0o644)
-        if fd == -1 {
-            let code = errno
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(code),
-                userInfo: [NSLocalizedDescriptionKey: "open() failed for \(path) (\(code))"]
-            )
-        }
-
-        var writeError: Int32 = 0
-        data.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) in
-            guard var base = ptr.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-            var remaining = data.count
-            while remaining > 0 {
-                let n = Darwin.write(fd, base, remaining)
-                if n < 0 {
-                    writeError = errno
-                    break
-                }
-                remaining -= n
-                base = base.advanced(by: n)
-            }
-        }
-
-        if writeError == 0 {
-            if fsync(fd) != 0 {
-                writeError = errno
-            }
-        }
-
-        // Always attempt to close; prefer first error if any.
-        let closeResult = close(fd)
-        if writeError != 0 {
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(writeError),
-                userInfo: [NSLocalizedDescriptionKey: "write/fsync failed for \(path) (\(writeError))"]
-            )
-        }
-        if closeResult != 0 {
-            let code = errno
-            throw NSError(
-                domain: NSPOSIXErrorDomain,
-                code: Int(code),
-                userInfo: [NSLocalizedDescriptionKey: "close() failed for \(path) (\(code))"]
-            )
-        }
     }
 }

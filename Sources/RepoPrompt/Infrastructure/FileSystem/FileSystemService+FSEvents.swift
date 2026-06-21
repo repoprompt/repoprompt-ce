@@ -1,22 +1,7 @@
 import Combine
-import CoreFoundation
-import CoreServices
 import Dispatch
 import Foundation
-
-struct FSEventCallbackEntry {
-    let path: String
-    let flags: FSEventStreamEventFlags
-    let id: FSEventStreamEventId
-}
-
-struct FSEventCallbackPayload {
-    let entries: [FSEventCallbackEntry]
-
-    var count: Int {
-        entries.count
-    }
-}
+import RepoPromptCore
 
 extension FileSystemService {
     // MARK: - Public watchers API
@@ -34,9 +19,7 @@ extension FileSystemService {
     /// (Re)start the FSEvent stream if needed and drain the pre-crawl replay cut.
     public func startWatchingForChanges() async throws {
         try startFSEventStream()
-        if let stream = fseventStreamRef {
-            FSEventStreamFlushSync(stream)
-        }
+        fileSystemWatcher.flush()
         let acceptedCut = captureAcceptedWatcherWatermark()
         _ = await flushPendingEventsNow(throughAcceptedWatcherWatermark: acceptedCut)
     }
@@ -183,9 +166,9 @@ extension FileSystemService {
     /// Undelivered macOS FSEvents remain outside that contract, matching `awaitAppliedIngress`.
     func canUseCachedSearchContent(afterAppliedWatcherWatermark appliedWatcherWatermark: UInt64) -> Bool {
         #if DEBUG
-            let watcherIsActive = cachedSearchContentWatcherActiveOverrideForTesting ?? (fseventStreamRef != nil)
+            let watcherIsActive = cachedSearchContentWatcherActiveOverrideForTesting ?? fileSystemWatcher.isWatching
         #else
-            let watcherIsActive = fseventStreamRef != nil
+            let watcherIsActive = fileSystemWatcher.isWatching
         #endif
         guard watcherIsActive,
               captureAcceptedWatcherWatermark().rawValue <= appliedWatcherWatermark,
@@ -287,244 +270,76 @@ extension FileSystemService {
         FileSystemDeltaPreparation.coalesce(deltas, inRoot: canonicalRootPath)
     }
 
-    // MARK: - FSEvent Setup
+    // MARK: - Platform watcher lifecycle
 
     func startFSEventStream() throws {
-        guard fseventStreamRef == nil else { return }
-
+        guard !fileSystemWatcher.isWatching else { return }
         watcherIngressMailbox.startAccepting()
-        selfPointer = Unmanaged.passRetained(self).toOpaque()
-
-        var streamContext = FSEventStreamContext(
-            version: 0,
-            info: selfPointer,
-            retain: nil,
-            release: nil,
-            copyDescription: nil
-        )
-
-        let flags = FSEventStreamCreateFlags(
-            kFSEventStreamCreateFlagUseCFTypes
-                | kFSEventStreamCreateFlagFileEvents
-                | kFSEventStreamCreateFlagNoDefer
-        )
 
         #if DEBUG
             if watcherActivationFailurePointForTesting == .streamCreation {
-                fseventStreamRef = nil
-            } else {
-                fseventStreamRef = FSEventStreamCreate(
-                    kCFAllocatorDefault,
-                    Self.fseventCallback,
-                    &streamContext,
-                    [path] as CFArray,
-                    nextFSEventStreamStartEventID,
-                    0,
-                    flags
-                )
+                resetWatcherIngressState()
+                throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
             }
-        #else
-            fseventStreamRef = FSEventStreamCreate(
-                kCFAllocatorDefault,
-                Self.fseventCallback,
-                &streamContext,
-                [path] as CFArray,
-                nextFSEventStreamStartEventID,
-                0,
-                flags
-            )
         #endif
 
-        guard let stream = fseventStreamRef else {
-            // Release the retained self if creation failed to avoid leaks
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
+        do {
+            try fileSystemWatcher.start(from: nextFSEventStreamStartEventID) { [weak self] payload in
+                self?.acceptPlatformWatcherPayload(payload)
             }
+        } catch let error as FileSystemWatcherStartError {
             resetWatcherIngressState()
-            throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
+            switch error {
+            case .streamCreationFailed:
+                throw FileSystemWatcherActivationError.streamCreationFailed(path: path)
+            case .streamStartFailed:
+                throw FileSystemWatcherActivationError.streamStartFailed(path: path)
+            }
         }
 
-        FSEventStreamSetDispatchQueue(stream, .main)
         #if DEBUG
-            let didStart = watcherActivationFailurePointForTesting == .streamStart ? false : FSEventStreamStart(stream)
-        #else
-            let didStart = FSEventStreamStart(stream)
-        #endif
-        if !didStart {
-            // Clean up to avoid leaks
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            fseventStreamRef = nil
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
+            if watcherActivationFailurePointForTesting == .streamStart {
+                fileSystemWatcher.stop()
+                resetWatcherIngressState()
+                throw FileSystemWatcherActivationError.streamStartFailed(path: path)
             }
-            resetWatcherIngressState()
-            throw FileSystemWatcherActivationError.streamStartFailed(path: path)
-        }
-        fileSystemDebugLog("FSEventStream started for path: \(path) from event ID \(nextFSEventStreamStartEventID)")
+        #endif
+
+        fileSystemDebugLog(
+            "FSEventStream started for path: \(path) from event ID \(nextFSEventStreamStartEventID)"
+        )
     }
 
     func stopFSEventStream() {
-        if let stream = fseventStreamRef {
-            nextFSEventStreamStartEventID = max(
-                nextFSEventStreamStartEventID,
-                FSEventStreamGetLatestEventId(stream)
-            )
-            FSEventStreamStop(stream)
-            FSEventStreamFlushSync(stream)
-            FSEventStreamInvalidate(stream)
-            FSEventStreamRelease(stream)
-            fseventStreamRef = nil
-
-            if let ptr = selfPointer {
-                Unmanaged<FileSystemService>.fromOpaque(ptr).release()
-                selfPointer = nil
-            }
-
-            fileSystemDebugLog("FSEventStream stopped for path: \(path)")
-        } else {
-            fileSystemDebugLog("stream could not be stopped")
+        if let latestEventID = fileSystemWatcher.latestEventID() {
+            nextFSEventStreamStartEventID = max(nextFSEventStreamStartEventID, latestEventID)
         }
-
+        let wasWatching = fileSystemWatcher.isWatching
+        fileSystemWatcher.stop()
+        fileSystemDebugLog(wasWatching ? "FSEventStream stopped for path: \(path)" : "stream could not be stopped")
         resetWatcherIngressState()
     }
 
-    nonisolated static func deepCopySwiftString(_ source: String) -> String {
-        String(decoding: Array(source.utf8), as: UTF8.self)
-    }
-
-    nonisolated static func deepCopyEventPath(_ source: CFString) -> String? {
-        let length = CFStringGetLength(source)
-        if length == 0 { return "" }
-
-        let utf8Encoding = CFStringBuiltInEncodings.UTF8.rawValue
-        if let directUTF8 = CFStringGetCStringPtr(source, utf8Encoding) {
-            return String(cString: directUTF8)
-        }
-        let maxBufferSize = max(CFStringGetMaximumSizeForEncoding(length, utf8Encoding) + 1, 1)
-        var utf8Buffer = [CChar](repeating: 0, count: maxBufferSize)
-        let copiedUTF8 = utf8Buffer.withUnsafeMutableBufferPointer { buffer in
-            CFStringGetCString(source, buffer.baseAddress, buffer.count, utf8Encoding)
-        }
-        if copiedUTF8 {
-            return String(cString: utf8Buffer)
-        }
-
-        var utf16Buffer = [UniChar](repeating: 0, count: length)
-        CFStringGetCharacters(
-            source,
-            CFRange(location: 0, length: length),
-            &utf16Buffer
-        )
-        return String(utf16CodeUnits: utf16Buffer, count: utf16Buffer.count)
-    }
-
-    nonisolated static func buildOwnedFSEventPayload(
-        numEvents: Int,
-        eventPaths: UnsafeMutableRawPointer,
-        eventFlags: UnsafePointer<FSEventStreamEventFlags>,
-        eventIds: UnsafePointer<FSEventStreamEventId>
-    ) -> FSEventCallbackPayload? {
-        let cfArray = Unmanaged<CFArray>.fromOpaque(eventPaths).takeUnretainedValue()
-        let safeCount = min(numEvents, CFArrayGetCount(cfArray))
-        guard safeCount > 0 else { return nil }
-
-        var entries: [FSEventCallbackEntry] = []
-        entries.reserveCapacity(safeCount)
-
-        for index in 0 ..< safeCount {
-            guard let rawValue = CFArrayGetValueAtIndex(cfArray, index) else { continue }
-            let cfObject = unsafeBitCast(rawValue, to: CFTypeRef.self)
-            let copiedPath: String?
-            if CFGetTypeID(cfObject) == CFStringGetTypeID() {
-                let cfString = unsafeBitCast(rawValue, to: CFString.self)
-                copiedPath = deepCopyEventPath(cfString)
-            } else if let string = cfObject as? String {
-                copiedPath = deepCopySwiftString(string)
-            } else {
-                #if DEBUG
-                    if enableDebugLogging {
-                        print("DEBUG: Dropping unexpected FSEvent path payload at index \(index): \(type(of: cfObject))")
-                    }
-                #endif
-                copiedPath = nil
-            }
-
-            guard let copiedPath else { continue }
-            entries.append(
-                FSEventCallbackEntry(
-                    path: copiedPath,
-                    flags: eventFlags[index],
-                    id: eventIds[index]
-                )
-            )
-        }
-
-        guard !entries.isEmpty else { return nil }
-        return FSEventCallbackPayload(entries: entries)
-    }
-
-    /// The static callback that FSEvents uses to report changes. We hand off to Task to enter the actor context.
-    static let fseventCallback: FSEventStreamCallback = {
-        _, context, numEvents, eventPaths, eventFlags, eventIds in
-        // Context must be valid
-        guard let context else { return }
-        let service = Unmanaged<FileSystemService>.fromOpaque(context).takeUnretainedValue()
-
-        let count = Int(numEvents)
-        guard count > 0 else { return }
-
-        // Although these are non-optional in the API, guard against unexpected null pointers defensively
-        if Int(bitPattern: eventPaths) == 0 { return }
-        if Int(bitPattern: eventFlags) == 0 { return }
-        if Int(bitPattern: eventIds) == 0 { return }
-
-        guard let payload = buildOwnedFSEventPayload(
-            numEvents: count,
-            eventPaths: eventPaths,
-            eventFlags: eventFlags,
-            eventIds: eventIds
-        ) else { return }
-
-        #if DEBUG
-            if payload.count != count {
-                print("DEBUG: FSEvents vector length mismatch. numEvents=\(count), payloadCount=\(payload.count)")
-            }
-
-            // Log raw FSEvents as they arrive
-            if enableDebugLogging {
-                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                print("🔔 RAW FSEVENTS CALLBACK: \(payload.count) events")
-                for (index, entry) in payload.entries.enumerated() {
-                    print("  [\(index)] path: \(entry.path)")
-                    print("       flags: \(formatFSEventFlags(entry.flags))")
-                    print("       eventId: \(entry.id)")
-                }
-                print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            }
-        #endif
-
-        let filterResult = service.watcherEarlyFilter.filter(payload)
+    private nonisolated func acceptPlatformWatcherPayload(_ payload: FileSystemWatchEventPayload) {
+        let filterResult = watcherEarlyFilter.filter(payload)
         guard let retainedPayload = filterResult.payload else { return }
 
         let lifecycleCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
-        let acceptedWatermark = service.watcherIngressMailbox.accept(
+        let acceptedWatermark = watcherIngressMailbox.accept(
             retainedPayload,
             lifecycleCorrelation: lifecycleCorrelation
-        ) { [weak service] in
-            await service?.drainAcceptedWatcherIngressMailbox()
+        ) { [weak self] in
+            await self?.drainAcceptedWatcherIngressMailbox()
         }
         guard let acceptedWatermark else { return }
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.FileSystem.callbackAccepted,
             correlation: lifecycleCorrelation,
             EditFlowPerf.Dimensions(
-                sourceItemCount: payload.count,
-                contentItemCount: retainedPayload.count,
+                sourceItemCount: payload.entries.count,
+                contentItemCount: retainedPayload.entries.count,
                 changeCount: filterResult.filteredEntryCount,
-                rootToken: service.diagnosticRootToken.uuidString,
+                rootToken: diagnosticRootToken.uuidString,
                 ingressSequence: acceptedWatermark.rawValue
             )
         )
@@ -561,7 +376,7 @@ extension FileSystemService {
             enqueueFSEventEntries(entries, acceptedHighWatermark: payload.acceptedHighWatermark)
         case let .overflowRootRescan(highestEventID, changedIgnoreAbsolutePaths):
             nextFSEventStreamStartEventID = max(nextFSEventStreamStartEventID, highestEventID)
-            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: changedIgnoreAbsolutePaths.map { ($0, 0, 0) }))
+            overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: changedIgnoreAbsolutePaths.map { ($0, FileSystemWatchEventFlags(), 0) }))
             collapsePendingEventsToRootRescan(
                 upTo: highestEventID,
                 acceptedHighWatermark: payload.acceptedHighWatermark
@@ -726,7 +541,7 @@ extension FileSystemService {
     }
 
     func collapsePendingEventsToRootRescan(
-        upTo eventID: FSEventStreamEventId,
+        upTo eventID: FileSystemWatchEventID,
         acceptedHighWatermark: FileSystemWatcherIngressMailbox.Watermark? = nil
     ) {
         overflowChangedIgnoreDirs.formUnion(ignoreChangeDirs(in: pendingFSEvents))
@@ -761,7 +576,7 @@ extension FileSystemService {
     }
 
     func ignoreChangeDirs(
-        in events: [(String, FSEventStreamEventFlags, FSEventStreamEventId)]
+        in events: [(String, FileSystemWatchEventFlags, FileSystemWatchEventID)]
     ) -> Set<String> {
         var dirs = Set<String>()
         for (absolutePath, _, _) in events {
@@ -801,33 +616,17 @@ extension FileSystemService {
     // MARK: - FSEvents Flag Parsing
 
     #if DEBUG
-        /// Format FSEventStreamEventFlags into a human-readable string for debugging
-        static func formatFSEventFlags(_ flags: FSEventStreamEventFlags) -> String {
-            let raw = UInt32(flags)
-            var parts: [String] = []
-
-            func check(_ flag: Int, _ name: String) {
-                if (raw & UInt32(flag)) != 0 { parts.append(name) }
-            }
-
-            check(kFSEventStreamEventFlagItemCreated, "Created")
-            check(kFSEventStreamEventFlagItemRemoved, "Removed")
-            check(kFSEventStreamEventFlagItemRenamed, "Renamed")
-            check(kFSEventStreamEventFlagItemModified, "Modified")
-            check(kFSEventStreamEventFlagItemInodeMetaMod, "InodeMeta")
-            check(kFSEventStreamEventFlagItemFinderInfoMod, "FinderInfo")
-            check(kFSEventStreamEventFlagItemChangeOwner, "OwnerChange")
-            check(kFSEventStreamEventFlagItemXattrMod, "Xattr")
-            check(kFSEventStreamEventFlagItemIsFile, "IsFile")
-            check(kFSEventStreamEventFlagItemIsDir, "IsDir")
-            check(kFSEventStreamEventFlagItemIsSymlink, "IsSymlink")
-            check(kFSEventStreamEventFlagMustScanSubDirs, "MustScanSubDirs")
-            check(kFSEventStreamEventFlagUserDropped, "UserDropped")
-            check(kFSEventStreamEventFlagKernelDropped, "KernelDropped")
-            check(kFSEventStreamEventFlagRootChanged, "RootChanged")
-
-            let flagStr = parts.isEmpty ? "None" : parts.joined(separator: "|")
-            return "\(raw) [\(flagStr)]"
+        static func formatFSEventFlags(_ flags: FileSystemWatchEventFlags) -> String {
+            let labels: [(FileSystemWatchEventFlags, String)] = [
+                (.itemCreated, "Created"), (.itemRemoved, "Removed"),
+                (.itemRenamed, "Renamed"), (.contentChanged, "Modified"),
+                (.metadataChanged, "Metadata"), (.itemIsFile, "IsFile"),
+                (.itemIsDirectory, "IsDir"), (.itemIsSymlink, "IsSymlink"),
+                (.mustScanSubdirectories, "MustScanSubDirs"),
+                (.droppedEvents, "Dropped"), (.rootChanged, "RootChanged")
+            ]
+            let parts = labels.compactMap { flags.contains($0.0) ? $0.1 : nil }
+            return "\(flags.rawValue) [\(parts.isEmpty ? "None" : parts.joined(separator: "|"))]"
         }
     #endif
 
@@ -853,34 +652,23 @@ extension FileSystemService {
         }
     }
 
-    /// Parse FSEventStreamEventFlags into a structured representation
     static func parseEventFlags(
-        _ flags: FSEventStreamEventFlags,
+        _ flags: FileSystemWatchEventFlags,
         isDirFallback: Bool
     ) -> ParsedEvent {
-        let raw = UInt32(flags)
-
-        /// FSEvents constants are Int on macOS, convert to UInt32 for bitwise comparison
-        func has(_ flag: Int) -> Bool {
-            (raw & UInt32(flag)) != 0
-        }
-
-        let isDirFlag = has(kFSEventStreamEventFlagItemIsDir)
-        let isFileFlag = has(kFSEventStreamEventFlagItemIsFile)
-
+        let isDirFlag = flags.contains(.itemIsDirectory)
+        let isFileFlag = flags.contains(.itemIsFile)
         return ParsedEvent(
             isDir: isDirFlag || (!isFileFlag && isDirFallback),
             isFile: isFileFlag || (!isDirFlag && !isDirFallback),
-            isCreated: has(kFSEventStreamEventFlagItemCreated),
-            isRemoved: has(kFSEventStreamEventFlagItemRemoved),
-            isRenamed: has(kFSEventStreamEventFlagItemRenamed),
-            isContentChange: has(kFSEventStreamEventFlagItemModified) || has(kFSEventStreamEventFlagItemXattrMod),
-            isMetadataChange: has(kFSEventStreamEventFlagItemInodeMetaMod) ||
-                has(kFSEventStreamEventFlagItemFinderInfoMod) ||
-                has(kFSEventStreamEventFlagItemChangeOwner),
-            mustScanSubdirs: has(kFSEventStreamEventFlagMustScanSubDirs),
-            userOrKernelDropped: has(kFSEventStreamEventFlagUserDropped) || has(kFSEventStreamEventFlagKernelDropped),
-            rootChanged: has(kFSEventStreamEventFlagRootChanged)
+            isCreated: flags.contains(.itemCreated),
+            isRemoved: flags.contains(.itemRemoved),
+            isRenamed: flags.contains(.itemRenamed),
+            isContentChange: flags.contains(.contentChanged),
+            isMetadataChange: flags.contains(.metadataChanged),
+            mustScanSubdirs: flags.contains(.mustScanSubdirectories),
+            userOrKernelDropped: flags.contains(.droppedEvents),
+            rootChanged: flags.contains(.rootChanged)
         )
     }
 
@@ -993,13 +781,13 @@ extension FileSystemService {
         #endif
 
         var foldersToScan = Set<String>()
-        var folderMaxEventId: [String: FSEventStreamEventId] = [:] // Track max event ID per folder
+        var folderMaxEventId: [String: FileSystemWatchEventID] = [:] // Track max event ID per folder
         var immediateModifications: [FileSystemDelta] = []
         var changedIgnoreDirs = overflowChangedIgnoreDirs
         overflowChangedIgnoreDirs.removeAll(keepingCapacity: false)
 
         /// Helper to track folder with its event ID
-        func trackFolder(_ folder: String, eventId: FSEventStreamEventId) {
+        func trackFolder(_ folder: String, eventId: FileSystemWatchEventID) {
             foldersToScan.insert(folder)
             folderMaxEventId[folder] = max(folderMaxEventId[folder] ?? 0, eventId)
         }
@@ -1073,7 +861,7 @@ extension FileSystemService {
 
             #if DEBUG
                 if isTestMode, Self.enableDebugLogging {
-                    let isRename = (flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed)) != 0
+                    let isRename = flags.contains(.itemRenamed)
                     print("DEBUG: Processing event for '\(relPath)' - isKnown=\(isKnown), isRename=\(isRename), shouldIgnore=\(shouldIgnore), isIgnoreFile=\(isIgnoreFile(relPath))")
                 }
             #endif
@@ -1112,14 +900,11 @@ extension FileSystemService {
                 // Debug logging for flag analysis
                 if isTestMode, Self.enableDebugLogging, relPath.contains("file.txt") {
                     print("DEBUG: Flags for \(relPath): \(flags)")
-                    print("  ItemModified: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified))")
-                    print("  ItemCreated: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated))")
-                    print("  ItemRemoved: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRemoved))")
-                    print("  ItemRenamed: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed))")
-                    print("  ItemInodeMetaMod: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemInodeMetaMod))")
-                    print("  ItemFinderInfoMod: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemFinderInfoMod))")
-                    print("  ItemChangeOwner: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemChangeOwner))")
-                    print("  ItemXattrMod: \(flags & FSEventStreamEventFlags(kFSEventStreamEventFlagItemXattrMod))")
+                    print("  ContentChanged: \(flags.contains(.contentChanged))")
+                    print("  ItemCreated: \(flags.contains(.itemCreated))")
+                    print("  ItemRemoved: \(flags.contains(.itemRemoved))")
+                    print("  ItemRenamed: \(flags.contains(.itemRenamed))")
+                    print("  MetadataChanged: \(flags.contains(.metadataChanged))")
                     print("  Calculated modified: \(modified)")
                     print("  Calculated removed: \(removed)")
                     print("  Is in visitedPaths: \(visitedPaths.contains(relPath))")

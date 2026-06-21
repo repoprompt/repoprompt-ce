@@ -6,6 +6,7 @@
  */
 
 #include "wildmatch.h"
+#include "repo_wildmatch_wrapper.h"
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -190,14 +191,6 @@ void repo_normalize_pattern(char *dest, const char *src, size_t dest_size)
     
     dest[j] = '\0';
 }
-
-/* Parsed pattern structure for Swift interop */
-typedef struct {
-    char pattern[1024];
-    bool is_negation;
-    bool directory_only;
-    bool absolute;
-} repo_gitignore_pattern;
 
 static void trim_trailing_whitespace_preserving_escapes(char *text)
 {

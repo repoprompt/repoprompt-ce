@@ -76,15 +76,15 @@ EXPECTED_DEPENDENCIES = {
 }
 
 EXPECTED_EXISTING_LOCAL_DEPENDENCIES = {
-    # Phase 1 retains these inventoried app-owned C/regex/scanner edges until
-    # their Phase 2-3 moves, but permits no other upward/reverse local edges.
+    # Phase 3 uses explicit platform/POSIX/syntax modules. RepoPromptC remains
+    # until the Phase 4 engine move because app-owned ignore/search policy still calls it.
     "RepoPrompt": {
         "RepoPromptShared",
         "RepoPromptCore",
         "RepoPromptCoreMacOS",
+        "RepoPromptPOSIXSupport",
+        "RepoPromptSyntaxCBridge",
         "RepoPromptC",
-        "CSwiftPCRE2",
-        "TreeSitterScannerSupport",
         "Sparkle",
     },
     "RepoPromptMCP": {"RepoPromptShared", "RepoPromptPOSIXSupport"},
@@ -374,8 +374,15 @@ def validate_sources(root: Path) -> list[str]:
             errors.append(f"missing Phase 1 source root: {relative}")
             continue
         files = swift_files(root, relative)
-        if not files:
-            errors.append(f"Phase 1 source root has no Swift source: {relative}")
+        if target == "RepoPromptSyntaxCBridge":
+            bridge_sources = sorted(
+                path for path in directory.rglob("*")
+                if path.is_file() and path.suffix.lower() in {".c", ".h"}
+            )
+            if not bridge_sources:
+                errors.append(f"Phase 3 syntax bridge has no C/header source: {relative}")
+        elif not files:
+            errors.append(f"production source root has no Swift source: {relative}")
         allowed = ALLOWED_IMPORTS[target]
         for file in files:
             text = file.read_text(encoding="utf-8")
@@ -399,8 +406,45 @@ def validate_sources(root: Path) -> list[str]:
         if len(locations) != 1:
             errors.append(f"{name} must have exactly one concrete production declaration; found {locations}")
 
+    legacy_bridge = root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
+    if legacy_bridge.exists():
+        errors.append("RepoPrompt target-wide bridging header must remain removed after Phase 3")
+    package_text = (root / "Package.swift").read_text(encoding="utf-8")
+    if "-import-objc-header" in package_text or "-disable-bridging-pch" in package_text:
+        errors.append("Package.swift must not restore RepoPrompt bridging-header flags")
+
+    forbidden_app_imports = {
+        "CoreServices", "Security", "Cuchardet", "UniversalCharsetDetection"
+    }
+    app_root = root / "Sources/RepoPrompt"
+    for file in sorted(app_root.rglob("*.swift")):
+        imported = {name.split(".", 1)[0] for name in IMPORT_RE.findall(file.read_text(encoding="utf-8"))}
+        leaked = sorted(imported & forbidden_app_imports)
+        if leaked:
+            errors.append(
+                f"{file.relative_to(root)} retains Phase 3 platform imports {leaked}"
+            )
+
+    if (root / "Sources/RepoPromptShared/MCP/POSIXDescriptorSupport.swift").exists():
+        errors.append("POSIXDescriptorSupport must have one canonical owner in RepoPromptPOSIXSupport")
+
+    expected_syntax_files = {
+        "Sources/RepoPromptSyntaxCBridge/RepoPromptSyntaxCBridge.c",
+        "Sources/RepoPromptSyntaxCBridge/include/RepoPromptSyntaxCBridge.h",
+    }
+    actual_syntax_files = {
+        str(path.relative_to(root))
+        for path in (root / "Sources/RepoPromptSyntaxCBridge").rglob("*")
+        if path.is_file()
+    }
+    if actual_syntax_files != expected_syntax_files:
+        errors.append(
+            f"syntax bridge files drifted: expected {sorted(expected_syntax_files)}, "
+            f"got {sorted(actual_syntax_files)}"
+        )
+
     bridge_symbols: dict[str, list[str]] = {}
-    bridge_files = [root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"]
+    bridge_files: list[Path] = []
     bridge_files.extend(
         file
         for relative in ("Sources/RepoPromptPOSIXSupport", "Sources/RepoPromptSyntaxCBridge")
@@ -419,6 +463,18 @@ def validate_sources(root: Path) -> list[str]:
             if relative.startswith(("Sources/RepoPromptPOSIXSupport/", "Sources/RepoPromptSyntaxCBridge/")):
                 if not symbol.startswith("rpce_"):
                     errors.append(f"{relative} declares unprefixed CE C symbol {symbol}")
+    expected_tree_sitter_symbols = {
+        "tree_sitter_javascript", "tree_sitter_python", "tree_sitter_c_sharp",
+        "tree_sitter_swift", "tree_sitter_c", "tree_sitter_cpp",
+        "tree_sitter_rust", "tree_sitter_go", "tree_sitter_java",
+        "tree_sitter_dart", "tree_sitter_php", "tree_sitter_ruby",
+        "tree_sitter_typescript", "tree_sitter_tsx",
+    }
+    if set(bridge_symbols) != expected_tree_sitter_symbols:
+        errors.append(
+            f"syntax bridge declarations drifted: expected {sorted(expected_tree_sitter_symbols)}, "
+            f"got {sorted(bridge_symbols)}"
+        )
     for symbol, locations in sorted(bridge_symbols.items()):
         if len(locations) != 1:
             errors.append(f"upstream symbol {symbol} must have one bridge declaration; found {locations}")

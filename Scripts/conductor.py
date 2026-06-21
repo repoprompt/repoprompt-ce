@@ -96,6 +96,8 @@ IMPLEMENTED_OPERATIONS = {
     "package",
     "test",
     "core-test",
+    "core-macos-test",
+    "posix-test",
     "provider-test",
     "install-debug-cli",
     "debug-cli-status",
@@ -142,6 +144,8 @@ Operation commands:
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor core-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor core-macos-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor posix-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor provider-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
@@ -1080,7 +1084,7 @@ class OperationRegistry:
         if operation not in IMPLEMENTED_OPERATIONS:
             raise ConductorError(f"operation '{operation}' is not implemented")
 
-        if operation in {"test", "core-test", "provider-test"}:
+        if operation in {"test", "core-test", "core-macos-test", "posix-test", "provider-test"}:
             self._validate_xctest_stall_options(args)
 
         env = self._base_env(verbose, request)
@@ -1134,6 +1138,16 @@ class OperationRegistry:
             if args.get("list"):
                 return [sys.executable, script("list_swift_tests.py"), "RepoPromptCoreTests"], ["build"], cwd, env, effective_timeout
             argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptCoreTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "core-macos-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptCoreMacOSTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptCoreMacOSTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "posix-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptPOSIXSupportTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptPOSIXSupportTests")]
             return argv, ["build"], cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
@@ -1914,7 +1928,7 @@ class DaemonState:
 
     def _xctest_watchdog_enabled(self, job: Job) -> bool:
         return (
-            job.operation in {"test", "core-test", "provider-test"}
+            job.operation in {"test", "core-test", "core-macos-test", "posix-test", "provider-test"}
             and not bool(job.args.get("list"))
             and job.args.get("xctestStallSeconds") is not None
         )
@@ -3753,7 +3767,7 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
-    elif operation in {"test", "core-test", "provider-test"}:
+    elif operation in {"test", "core-test", "core-macos-test", "posix-test", "provider-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--list", action="store_true")

@@ -10,6 +10,7 @@ import Darwin
 import Dispatch
 import Foundation
 import Logging
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 
 #if DEBUG

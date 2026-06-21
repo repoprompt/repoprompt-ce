@@ -1,5 +1,4 @@
 import Combine
-import CoreServices
 @testable import RepoPrompt
 import XCTest
 
@@ -92,7 +91,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
                 (
                     absolutePath: root.appendingPathComponent(".build/churn-\(eventID).o").path,
                     flags: createdFileFlags,
-                    eventId: FSEventStreamEventId(eventID)
+                    eventId: FileSystemWatchEventID(eventID)
                 )
             ], scheduleDrain: false)
             XCTAssertNil(accepted)
@@ -186,7 +185,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         var highest = FileSystemWatcherIngressMailbox.Watermark.zero
         for eventID in 1 ... 3 {
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
-                (absolutePath: "/outside/overflow-\(eventID).swift", flags: createdFileFlags, eventId: FSEventStreamEventId(eventID))
+                (absolutePath: "/outside/overflow-\(eventID).swift", flags: createdFileFlags, eventId: FileSystemWatchEventID(eventID))
             ], scheduleDrain: false)
             highest = try XCTUnwrap(acceptedPayload)
         }
@@ -256,7 +255,7 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         var highest = FileSystemWatcherIngressMailbox.Watermark.zero
         for eventID in 31 ... 33 {
             let acceptedPayload = await service.acceptWatcherPayloadForTesting([
-                (absolutePath: "/outside/overflow-ignore-\(eventID).swift", flags: createdFileFlags, eventId: FSEventStreamEventId(eventID))
+                (absolutePath: "/outside/overflow-ignore-\(eventID).swift", flags: createdFileFlags, eventId: FileSystemWatchEventID(eventID))
             ], scheduleDrain: false)
             highest = try XCTUnwrap(acceptedPayload)
         }
@@ -325,15 +324,15 @@ final class FileSystemAcceptedIngressBarrierTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
-    private var createdFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile)
+    private var createdFileFlags: FileSystemWatchEventFlags {
+        [.itemCreated, .itemIsFile]
     }
 
-    private var modifiedFileFlags: FSEventStreamEventFlags {
-        FSEventStreamEventFlags(kFSEventStreamEventFlagItemModified | kFSEventStreamEventFlagItemIsFile)
+    private var modifiedFileFlags: FileSystemWatchEventFlags {
+        [.contentChanged, .itemIsFile]
     }
 
-    private func callbackPayload(path: String, eventID: FSEventStreamEventId) -> FSEventCallbackPayload {
+    private func callbackPayload(path: String, eventID: FileSystemWatchEventID) -> FSEventCallbackPayload {
         FSEventCallbackPayload(entries: [
             FSEventCallbackEntry(path: path, flags: createdFileFlags, id: eventID)
         ])

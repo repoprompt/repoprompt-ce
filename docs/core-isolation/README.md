@@ -1,10 +1,10 @@
 # Core Isolation Execution Packet
 
 **Created:** 2026-06-21
-**Current phase:** Phase 2 — closed, see [phase-2.md](phases/phase-2.md)
-**Disposition:** **GO** for Phase 3 planning; Phase 3 implementation has not begun
-**Production behavior change:** none intended; neutral declaration ownership only
-**Phase 1 scaffolding present:** yes; `RepoPromptCoreTests` is now the first activated isolated test target
+**Current phase:** Phase 3 — closed, see [phase-3.md](phases/phase-3.md)
+**Disposition:** **GO** for Phase 4 planning; Phase 4 implementation has not begun
+**Production behavior change:** none intended; neutral platform callbacks and low-level adapters only
+**Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, and `RepoPromptPOSIXSupportTests`
 
 This directory is the compact execution record for
 [Core Isolation Reconstruction](../plans/core-isolation-reconstruction-2026-06-20.md).
@@ -47,10 +47,11 @@ contract. No later phase may depend on fetching those two objects.
 - [Behavior, hazards, tests, and performance](contracts/behavior-and-performance.md)
 - [Persistence schema and compatibility](contracts/persistence-schema.md)
 - [Standalone headless v1 contract](contracts/headless-v1.md)
-- [Phase 1–2 migration ledger](migration-ledger.tsv)
+- [Phase 1–3 migration ledger](migration-ledger.tsv)
 - [Phase 0 evidence and disposition](phases/phase-0.md)
 - [Phase 1 evidence and disposition](phases/phase-1.md)
 - [Phase 2 evidence and disposition](phases/phase-2.md)
+- [Phase 3 evidence and disposition](phases/phase-3.md)
 - [Deferred Phase 9+ work](deferred-work.md)
 
 ## Mutation policy
@@ -80,8 +81,10 @@ Phase 0 freezes:
   four comparable warm packaged app-proxy smoke samples, and one cold lifecycle
   smoke sample.
 
-Phase 1 added and validated package/control-plane scaffolding only. Phase 2
-moved only ledger-owned neutral declarations and faithful deterministic tests;
-runtime authority, platform/C bridges, mutable engines, and later-phase behavior
-remain unchanged and out of scope. The complete Phase 2 ladder passed from
-checkpoint `b3eb2222`; its close disposition is **GO** with no blockers.
+Phase 1 added package/control-plane scaffolding. Phase 2 moved ledger-owned
+neutral declarations and faithful deterministic tests. Phase 3 added neutral
+platform contracts, moved only low-level macOS/POSIX/syntax ownership, and kept
+`WorkspaceFileContextStore`, root lifetime, accepted-ingress watermarks,
+coalescing/recovery, Combine publication, and app policy/orchestration in the
+app. The complete Phase 3 ladder passed from checkpoint `f131b789`; its close
+disposition is **GO** with no blockers. Phase 4 and Phase 5 remain unstarted.

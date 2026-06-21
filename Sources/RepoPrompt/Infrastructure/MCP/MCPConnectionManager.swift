@@ -8,6 +8,7 @@ import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 import SwiftUI
 

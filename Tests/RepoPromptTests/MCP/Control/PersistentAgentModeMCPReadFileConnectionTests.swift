@@ -483,11 +483,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_001
                 )]
             )
@@ -551,11 +547,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_002
                 )]
             )
@@ -677,9 +669,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_101
                 )]
             )
@@ -746,11 +736,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_102
                 )]
             )

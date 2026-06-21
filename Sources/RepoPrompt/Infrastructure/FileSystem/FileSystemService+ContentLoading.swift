@@ -1,33 +1,14 @@
-import Cuchardet
 import Foundation
-import UniversalCharsetDetection
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
-private extension String.Encoding {
-    init(ianaCharsetName name: String) {
-        let cfEnc = CFStringConvertIANACharSetNameToEncoding(name as CFString)
-        self.init(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEnc))
-    }
-}
+private let fileContentDecoder = MacOSFileContentDecoder()
 
-// MARK: - Encoding detection helpers & priority tables
-
-/// Run a streaming detector (Cuchardet) over the entire byte sequence.
-/// Falls back to Foundation’s heuristic if the detector is unavailable.
 private func detectEncodingFull(_ data: Data) -> String.Encoding {
-    // 1) Primary - Cuchardet
-    if let label = data.detectedCharacterEncoding { // DataProtocol extension from Cuchardet
-        return .init(ianaCharsetName: label)
-    }
-
-    // 2) Fallback - Foundation heuristic
-    var lossy = ObjCBool(false)
-    let guess = NSString.stringEncoding(
-        for: data,
-        encodingOptions: [:],
-        convertedString: nil,
-        usedLossyConversion: &lossy
+    String.Encoding(
+        rawValue: fileContentDecoder.detectEncodingRawValue(in: data)
+            ?? String.Encoding.utf8.rawValue
     )
-    return guess != 0 ? .init(rawValue: guess) : .utf8
 }
 
 private enum ContentReadMode {
@@ -1274,7 +1255,7 @@ extension FileSystemService {
         let skipProbe = shouldSkipBinaryProbe(url: validated.url)
         var fullData = Data()
         fullData.reserveCapacity(Int(validated.fileSize))
-        let detector = CharacterEncodingDetector()
+        let detector = fileContentDecoder.makeEncodingDetectionSession()
 
         try await runContentReadChunkHook(request)
         let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
@@ -1323,8 +1304,8 @@ extension FileSystemService {
 
         let encoding: String.Encoding = if let bom = detectBOMEncoding(in: initialData) {
             bom
-        } else if let label = detector.finish() {
-            .init(ianaCharsetName: label)
+        } else if let rawValue = detector.finishEncodingRawValue() {
+            .init(rawValue: rawValue)
         } else {
             .utf8
         }
@@ -1488,17 +1469,13 @@ extension FileSystemService {
     }
 
     private nonisolated static func decodeSmallFileData(_ data: Data) throws -> DetectedText {
-        if data.isEmpty {
-            return DetectedText(string: "", encoding: .utf8)
-        }
-        if let utf8String = String(data: data, encoding: .utf8) {
-            return DetectedText(string: utf8String, encoding: .utf8)
-        }
-        let encoding = detectEncodingFull(data)
-        guard let string = String(data: data, encoding: encoding) else {
+        guard let decoded = fileContentDecoder.decode(data) else {
             throw FileSystemError.failedToReadFile
         }
-        return DetectedText(string: string, encoding: encoding)
+        return DetectedText(
+            string: decoded.string,
+            encoding: String.Encoding(rawValue: decoded.encodingRawValue)
+        )
     }
 
     private nonisolated static func runContentReadChunkHook(_ request: ContentReadRequest) async throws {
@@ -1562,7 +1539,7 @@ extension FileSystemService {
 
             var fullData = Data()
             fullData.reserveCapacity(Int(fileSize))
-            let detector = CharacterEncodingDetector()
+            let detector = fileContentDecoder.makeEncodingDetectionSession()
             let initialData = try handle.read(upToCount: request.chunkSize) ?? Data()
             if !skipProbe, Self.isProbablyBinary(initialData) { return nil }
             fullData.append(initialData)
@@ -1583,8 +1560,8 @@ extension FileSystemService {
 
             let encoding: String.Encoding = if let bom = Self.detectBOMEncoding(in: initialData) {
                 bom
-            } else if let label = detector.finish() {
-                .init(ianaCharsetName: label)
+            } else if let rawValue = detector.finishEncodingRawValue() {
+                .init(rawValue: rawValue)
             } else {
                 .utf8
             }
@@ -1619,8 +1596,8 @@ extension FileSystemService {
         }
 
         // 2) Cuchardet (fast – O(n) on the *same* bytes)
-        if let label = initialData.detectedCharacterEncoding {
-            return .init(ianaCharsetName: label)
+        if let rawValue = fileContentDecoder.detectEncodingRawValue(in: initialData) {
+            return .init(rawValue: rawValue)
         }
 
         // 3) UTF-8 strict
@@ -1692,29 +1669,7 @@ extension FileSystemService {
     /// • Control bytes 0x00–0x1F **except** TAB/LF/CR
     /// • If ≥ 30 % of the bytes in the sample are control bytes → binary
     static func isProbablyBinary(_ data: Data, sampleSize: Int = 8192) -> Bool {
-        guard !data.isEmpty else { return false }
-        let sample = data.prefix(sampleSize)
-
-        // Immediate NUL check
-        if sample.contains(0) { return true }
-
-        var ctrl = 0
-        var printableOrUtf8 = 0
-
-        for byte in sample {
-            switch byte {
-            case 0x09, 0x0A, 0x0D, 0x20 ... 0x7E: // HT, LF, CR, printable ASCII
-                printableOrUtf8 += 1
-            case 0x01 ... 0x08, 0x0B ... 0x0C, 0x0E ... 0x1F: // Other ASCII control chars
-                ctrl += 1
-            default: // 0x80–0xFF → UTF-8 part or extended ASCII
-                printableOrUtf8 += 1
-            }
-        }
-
-        let total = ctrl + printableOrUtf8
-        guard total > 0 else { return false }
-        return Double(ctrl) / Double(total) > 0.30
+        fileContentDecoder.isProbablyBinary(Data(data.prefix(sampleSize)))
     }
 
     // MARK: - Encoding detection helpers & priority tables
@@ -1817,24 +1772,13 @@ extension FileSystemService {
     /// missing NUL-termination in `Data` buffers.
     func readDataAndDetectEncoding(_ fullPath: String) throws -> DetectedText {
         let data = try Data(contentsOf: URL(fileURLWithPath: fullPath))
-
-        // 0 --> return empty string immediately  ✅
-        if data.isEmpty {
-            return DetectedText(string: "", encoding: .utf8)
-        }
-
-        // 1) Fast-path: strict UTF-8 validation over the *whole* buffer
-        //    This is safe because the initializer is length-aware.
-        if let utf8String = String(data: data, encoding: .utf8) {
-            return DetectedText(string: utf8String, encoding: .utf8)
-        }
-
-        // 2) Charset detector (fallback)
-        let enc = detectEncodingFull(data)
-        guard let str = String(data: data, encoding: enc) else {
+        guard let decoded = fileContentDecoder.decode(data) else {
             throw FileSystemError.failedToReadFile
         }
-        return DetectedText(string: str, encoding: enc)
+        return DetectedText(
+            string: decoded.string,
+            encoding: String.Encoding(rawValue: decoded.encodingRawValue)
+        )
     }
 
     /// Quick heuristic: UTF‑16 text usually contains many NUL bytes.

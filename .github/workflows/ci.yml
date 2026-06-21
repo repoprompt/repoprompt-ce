@@ -67,6 +67,12 @@ jobs:
       - name: Run Core tests
         run: swift test --filter RepoPromptCoreTests
 
+      - name: Run Core macOS adapter tests
+        run: swift test --filter RepoPromptCoreMacOSTests
+
+      - name: Run POSIX support tests
+        run: swift test --filter RepoPromptPOSIXSupportTests
+
       - name: Run app tests
         shell: bash
         run: |

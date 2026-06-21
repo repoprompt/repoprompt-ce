@@ -1,28 +1,10 @@
 import Foundation
-
-protocol SecureKeyValueStorageBackend: AnyObject, Sendable {
-    var persistsValuesAcrossLaunches: Bool { get }
-
-    func save(
-        _ value: String,
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws
-
-    func get(
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws -> String
-
-    func delete(
-        for key: String,
-        accessMode: KeychainAccessMode
-    ) throws
-}
+import RepoPromptCore
+import RepoPromptCoreMacOS
 
 struct SecureKeyValueStorageSelection {
     let decision: RuntimeSecureStorageDecision
-    let backend: SecureKeyValueStorageBackend
+    let backend: any SecureKeyValueStorageBackend
 }
 
 enum SecureKeyValueStorageFactory {
@@ -39,7 +21,7 @@ enum SecureKeyValueStorageFactory {
         )
     }()
 
-    static func defaultBackend() -> SecureKeyValueStorageBackend {
+    static func defaultBackend() -> any SecureKeyValueStorageBackend {
         cachedSelection.backend
     }
 
@@ -48,7 +30,7 @@ enum SecureKeyValueStorageFactory {
     }
 
     static func selection(for decision: RuntimeSecureStorageDecision) -> SecureKeyValueStorageSelection {
-        let backend: SecureKeyValueStorageBackend = switch decision.domain {
+        let backend: any SecureKeyValueStorageBackend = switch decision.domain {
         case .officialDeveloperID:
             KeychainService.officialV2Shared
         case .localSelfSigned:

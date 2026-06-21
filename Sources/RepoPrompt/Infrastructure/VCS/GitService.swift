@@ -1,6 +1,7 @@
 import CryptoKit
 import Darwin
 import Foundation
+import RepoPromptPOSIXSupport
 
 /// Async Git helper for fetching repository information
 /// Based on the macOS 14+ Swift Git integration guide
