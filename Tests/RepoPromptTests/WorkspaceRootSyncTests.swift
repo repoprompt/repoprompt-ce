@@ -171,6 +171,114 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertFalse(encoded.contains("discoveryInstructions"), encoded)
     }
 
+    func testWorkspacePersistenceLegacyDecodeCurrentEncodeAndCurrentReaderRoundTripContract() throws {
+        let legacyPayload = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "schemaVersion": 1,
+          "dateModified": 0,
+          "isSystemWorkspace": false,
+          "isHiddenInMenus": false,
+          "ephemeralFlag": false,
+          "name": "Persistence Contract",
+          "repoPaths": ["/tmp/root-b", "/tmp/root-a"],
+          "presets": [],
+          "lastUsed": 42,
+          "currentPromptText": "legacy top-level prompt",
+          "lastSearchQuery": "needle",
+          "selectedMetaPromptIDs": [],
+          "workingFilePaths": ["/tmp/root-b/removed.swift"],
+          "contextBuilderState": {"useOverridePrompt": true},
+          "composeTabs": [{
+            "id": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+            "name": "T1",
+            "lastModified": 5,
+            "isPinned": true,
+            "selection": {
+              "selectedPaths": ["/tmp/root-b/B.swift", "/tmp/root-a/A.swift"],
+              "autoCodemapPaths": ["/tmp/root-a/A.swift"],
+              "slices": {
+                "/tmp/root-b/B.swift": [{"start": 2, "end": 4, "description": "kept"}]
+              },
+              "codemapAutoEnabled": false
+            },
+            "expandedFolders": ["/tmp/root-b", "/tmp/root-a"],
+            "promptText": "tab prompt",
+            "selectedMetaPromptIDs": [],
+            "contextOverrides": {"useOverridePrompt": true, "overridePromptText": "override"},
+            "discover": {
+              "instructions": "review the workspace",
+              "autoGeneratePlan": true,
+              "followUpTypeRaw": "review",
+              "selectedContextBuilderPromptIDs": ["99999999-8888-7777-6666-555555555555"]
+            }
+          }],
+          "activeComposeTabID": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+          "stashedTabs": []
+        }
+        """
+        let expectedCurrentPayload = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "schemaVersion": 1,
+          "dateModified": 0,
+          "isSystemWorkspace": false,
+          "isHiddenInMenus": false,
+          "ephemeralFlag": false,
+          "name": "Persistence Contract",
+          "repoPaths": ["/tmp/root-b", "/tmp/root-a"],
+          "presets": [],
+          "lastUsed": 42,
+          "currentPromptText": "legacy top-level prompt",
+          "lastSearchQuery": "needle",
+          "selectedMetaPromptIDs": [],
+          "composeTabs": [{
+            "id": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+            "name": "T1",
+            "lastModified": 5,
+            "isPinned": true,
+            "selection": {
+              "selectedPaths": ["/tmp/root-b/B.swift", "/tmp/root-a/A.swift"],
+              "autoCodemapPaths": ["/tmp/root-a/A.swift"],
+              "slices": {
+                "/tmp/root-b/B.swift": [{"start": 2, "end": 4, "description": "kept"}]
+              },
+              "codemapAutoEnabled": false
+            },
+            "expandedFolders": ["/tmp/root-b", "/tmp/root-a"],
+            "promptText": "tab prompt",
+            "selectedMetaPromptIDs": [],
+            "contextOverrides": {"useOverridePrompt": true, "overridePromptText": "override"},
+            "discover": {
+              "instructions": "review the workspace",
+              "autoGeneratePlan": true,
+              "followUpTypeRaw": "review",
+              "selectedContextBuilderPromptIDs": ["99999999-8888-7777-6666-555555555555"]
+            }
+          }],
+          "activeComposeTabID": "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE",
+          "stashedTabs": []
+        }
+        """
+
+        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(legacyPayload.utf8))
+        XCTAssertFalse(decoded.normalizationRequiresSave)
+
+        let currentBytes = try JSONEncoder().encode(decoded)
+        XCTAssertEqual(
+            try canonicalJSON(currentBytes),
+            try canonicalJSON(Data(expectedCurrentPayload.utf8))
+        )
+
+        let currentReaderDecoded = try JSONDecoder().decode(WorkspaceModel.self, from: currentBytes)
+        XCTAssertEqual(currentReaderDecoded, decoded)
+        XCTAssertFalse(currentReaderDecoded.normalizationRequiresSave)
+        XCTAssertEqual(
+            try canonicalJSON(JSONEncoder().encode(currentReaderDecoded)),
+            try canonicalJSON(currentBytes)
+        )
+    }
+
     func testWorkspaceFolderLoadConcurrencyLimitIsBounded() {
         XCTAssertEqual(WorkspaceManagerViewModel.boundedWorkspaceRootLoadLimit(forRootCount: 0), 0)
         XCTAssertEqual(WorkspaceManagerViewModel.boundedWorkspaceRootLoadLimit(forRootCount: 1), 1)
@@ -222,5 +330,10 @@ final class WorkspaceRootSyncTests: XCTestCase {
             isExpanded: true,
             isSystemRoot: isSystemRoot
         )
+    }
+
+    private func canonicalJSON(_ data: Data) throws -> Data {
+        let object = try JSONSerialization.jsonObject(with: data)
+        return try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
     }
 }
