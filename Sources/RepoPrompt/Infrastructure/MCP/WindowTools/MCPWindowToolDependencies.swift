@@ -80,6 +80,10 @@ struct MCPWindowToolDependencies {
         _ content: String,
         _ destination: OracleExportDestination
     ) async throws -> String
+    typealias BeforeContextBuilderFinalReviewAuthorization = @MainActor @Sendable () async -> Void
+    typealias DidFinalizeContextBuilderReview = @MainActor @Sendable (
+        _ authorization: ContextBuilderFinalReviewAuthorization
+    ) async -> Void
     typealias RunMCPPlanOrQuestion = @MainActor @Sendable (
         _ contextBuilderVM: ContextBuilderAgentViewModel,
         _ tabID: UUID,
@@ -297,6 +301,8 @@ struct MCPWindowToolDependencies {
     let makeOracleExportDestination: MakeOracleExportDestination
     let resolveDefaultOracleExportPath: ResolveDefaultOracleExportPath
     let writeGeneratedOracleExportFile: WriteGeneratedOracleExportFile
+    let beforeContextBuilderFinalReviewAuthorization: BeforeContextBuilderFinalReviewAuthorization
+    let didFinalizeContextBuilderReview: DidFinalizeContextBuilderReview
     let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
 
     let windowID: Int

@@ -22,6 +22,7 @@ struct MCPContextBuilderGitPublishedOutcome {
 }
 
 enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
+    case targetDeferred
     case targetUnavailable(ContextBuilderReviewTargetUnavailableReason)
     case publicationOutsideFrozenTarget
     case implicitMultiRepositoryOperation
@@ -32,6 +33,8 @@ enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .targetDeferred:
+            "Context Builder review target election is deferred until discovery commits its final selection."
         case let .targetUnavailable(reason):
             reason.localizedDescription
         case .publicationOutsideFrozenTarget:
@@ -78,6 +81,16 @@ struct MCPContextBuilderGitReviewPolicy {
                 throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
             }
             target = availableTarget
+        case .deferred:
+            guard hasExplicitSelector, !requestsArtifactPublication else {
+                throw MCPContextBuilderGitReviewPolicyError.targetDeferred
+            }
+            return MCPContextBuilderGitReviewAdmission(
+                target: nil,
+                implicitRepositories: nil,
+                preferredDefaultRepository: nil,
+                publicationFence: nil
+            )
         case let .unavailable(reason):
             guard hasExplicitSelector, !requestsArtifactPublication else {
                 throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)

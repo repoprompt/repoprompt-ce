@@ -4,6 +4,7 @@ import RepoPromptShared
 struct ContextBuilderReviewDiagnosticEvent: Equatable, CustomStringConvertible {
     enum Phase: String {
         case initialElection = "initial_election"
+        case finalElection = "final_election"
         case revalidation
     }
 

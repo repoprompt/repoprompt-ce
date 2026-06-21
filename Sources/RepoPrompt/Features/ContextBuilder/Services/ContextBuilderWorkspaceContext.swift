@@ -8,6 +8,7 @@ struct ContextBuilderWorkspaceContext {
     let providerWorkspacePath: String
     let reviewGitContext: FrozenPromptGitReviewContext
     let reviewTargetResolution: ContextBuilderReviewTargetResolution
+    private let reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink?
 
     var tabID: UUID {
         frozenTabContext.tabID
@@ -117,7 +118,8 @@ struct ContextBuilderWorkspaceContext {
             lookupContext: lookupContext,
             providerWorkspacePath: StandardizedPath.absolute(providerWorkspacePath),
             reviewGitContext: reviewGitContext,
-            reviewTargetResolution: reviewTargetResolution
+            reviewTargetResolution: reviewTargetResolution,
+            reviewDiagnosticSink: reviewDiagnosticSink
         )
         try context.validateAvailability()
         return context
@@ -144,18 +146,16 @@ struct ContextBuilderWorkspaceContext {
         }
     }
 
-    func validateFinalReviewSelection(
+    func authorizeFinalReviewSelection(
         _ selection: StoredSelection,
         workspaceID: UUID,
         tabID: UUID,
         selectionRevision: UInt64,
         store: WorkspaceFileContextStore
-    ) async throws {
-        guard case let .available(target) = reviewTargetResolution else {
-            if case let .unavailable(reason) = reviewTargetResolution { throw reason }
-            throw ContextBuilderReviewTargetUnavailableReason.missingFrozenTarget
-        }
-        if let reason = try await ContextBuilderReviewTargetResolver().validateSelection(
+    ) async throws -> ContextBuilderFinalReviewAuthorization {
+        try await ContextBuilderReviewTargetResolver(
+            diagnosticSink: reviewDiagnosticSink
+        ).finalizeSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,
@@ -164,11 +164,9 @@ struct ContextBuilderWorkspaceContext {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext
             ),
-            frozenTarget: target,
+            initialResolution: reviewTargetResolution,
             store: store
-        ) {
-            throw reason
-        }
+        )
     }
 
     func nestedDiscoveryTabContext(runID: UUID) -> MCPServerViewModel.TabContextSnapshot {

@@ -104,6 +104,42 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             )
         }
 
+        let deferred = try await resolveDeferred(
+            roots: [classic, ce],
+            workspaceDirectory: fixture.sandbox,
+            store: store
+        )
+        let deferredInspection = try await policy.admit(
+            resolution: deferred,
+            hasExplicitSelector: true,
+            requestsArtifactPublication: false,
+            operation: .show,
+            allRepositories: repositories,
+            store: store
+        )
+        XCTAssertNil(deferredInspection.target)
+        XCTAssertNil(deferredInspection.publicationFence)
+        await assertPolicyError(.targetDeferred) {
+            _ = try await policy.admit(
+                resolution: deferred,
+                hasExplicitSelector: false,
+                requestsArtifactPublication: false,
+                operation: .diff,
+                allRepositories: repositories,
+                store: store
+            )
+        }
+        await assertPolicyError(.targetDeferred) {
+            _ = try await policy.admit(
+                resolution: deferred,
+                hasExplicitSelector: true,
+                requestsArtifactPublication: true,
+                operation: .diff,
+                allRepositories: repositories,
+                store: store
+            )
+        }
+
         let multiResolution = try await resolveTarget(
             selectedPaths: [ceFile, classicFile],
             roots: [classic, ce],
@@ -308,6 +344,49 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             store: store
         )
         _ = try XCTUnwrap(resolution.availableTarget)
+        return resolution
+    }
+
+    private func resolveDeferred(
+        roots: [URL],
+        workspaceDirectory: URL,
+        store: WorkspaceFileContextStore
+    ) async throws -> ContextBuilderReviewTargetResolution {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let rootPaths = roots.map(\.path)
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: Set(rootPaths),
+                physicalRootPaths: []
+            ),
+            bindingProjection: nil
+        )
+        let reviewContext = await FrozenPromptGitReviewContext.make(
+            workspaceID: workspaceID,
+            workspaceDirectoryPath: workspaceDirectory.path,
+            workspaceRootPaths: rootPaths,
+            tabID: tabID,
+            sessionID: nil,
+            bindings: [],
+            base: "HEAD",
+            store: store
+        )
+        let resolution = try await ContextBuilderReviewTargetResolver().resolve(
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selectionRevision: 1,
+                selection: StoredSelection(codemapAutoEnabled: false),
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
+            store: store
+        )
+        guard case .deferred = resolution else {
+            XCTFail("Expected empty review selection to defer")
+            return .unavailable(.emptySelection)
+        }
         return resolution
     }
 

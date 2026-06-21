@@ -481,6 +481,257 @@ import XCTest
             }
         }
 
+        func testAgentModeEmptyInitialSelectionDefersAndRoutesWithoutExplicitContext() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let state = ContextBuilderWorktreeProbeState()
+                let factory = ContextBuilderWorktreeProbeFactory(state: state)
+                let fixture = try await PersistentMCPTestFixture.make(
+                    lease: lease,
+                    contextBuilderProviderFactory: factory.makeProvider
+                )
+                do {
+                    try await activateWorkspace(fixture.contextA)
+                    let logicalRoot = fixture.contextA.rootURL
+                    let gitFixture = try ReviewGitRepositoryFixture(name: "ContextBuilderDeferredAgentRoute")
+                    defer { gitFixture.cleanup() }
+                    _ = try gitFixture.runGit(["init"], at: logicalRoot)
+                    _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: logicalRoot)
+                    _ = try gitFixture.runGit(["config", "user.email", "repoprompt@example.test"], at: logicalRoot)
+                    _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: logicalRoot)
+                    _ = try gitFixture.runGit(["add", "."], at: logicalRoot)
+                    _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: logicalRoot)
+                    let worktreeRoot = try gitFixture.makeLinkedWorktree(
+                        from: logicalRoot,
+                        named: "worktree",
+                        branch: "feature/context-builder-deferred-route"
+                    )
+                    let logicalBranchOnly = logicalRoot.appendingPathComponent("Sources/DeferredOnly.swift")
+                    let worktreeBranchOnly = worktreeRoot.appendingPathComponent("Sources/DeferredOnly.swift")
+                    try write("struct DeferredOnlyAgentRoute {}\n", to: worktreeBranchOnly)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: logicalBranchOnly.path))
+
+                    let selectionIdentity = WorkspaceSelectionIdentity(
+                        workspaceID: fixture.contextA.workspaceID,
+                        tabID: fixture.contextA.tabID
+                    )
+                    let emptySelection = StoredSelection(codemapAutoEnabled: false)
+                    _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                        emptySelection,
+                        for: selectionIdentity,
+                        source: .mcpTabContext,
+                        mirrorToUIIfActive: true
+                    )
+                    var composeTab = try XCTUnwrap(
+                        fixture.contextA.window.workspaceManager.composeTab(for: selectionIdentity)
+                    )
+                    composeTab.promptText = "Discover the worktree-only file"
+                    fixture.contextA.window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+                    let selectionRevision = fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                        workspaceID: selectionIdentity.workspaceID,
+                        tabID: selectionIdentity.tabID
+                    )
+                    let sessionID = UUID()
+                    let parentRunID = UUID()
+                    let binding = try makeGitBinding(
+                        logicalRoot: logicalRoot,
+                        worktreeRoot: worktreeRoot,
+                        suffix: "deferred-route"
+                    )
+                    let frozenContext = MCPServerViewModel.TabContextSnapshot(
+                        tabID: fixture.contextA.tabID,
+                        windowID: fixture.contextA.window.windowID,
+                        workspaceID: fixture.contextA.workspaceID,
+                        promptText: composeTab.promptText,
+                        selection: emptySelection,
+                        selectionRevision: selectionRevision,
+                        selectedMetaPromptIDs: composeTab.selectedMetaPromptIDs,
+                        selectedContextBuilderPromptIDs: composeTab.contextBuilder.selectedContextBuilderPromptIDs,
+                        tabName: composeTab.name,
+                        runID: parentRunID,
+                        activeAgentSessionID: sessionID,
+                        worktreeBindings: [binding],
+                        explicitlyBound: false
+                    )
+                    let outerEndpoint = try fixture.endpointA()
+                    try await configureAgentModeEndpoint(
+                        outerEndpoint,
+                        context: frozenContext,
+                        fixture: fixture,
+                        bindContext: false
+                    )
+                    factory.configure(
+                        networkManager: fixture.networkManager,
+                        logicalFilePath: logicalBranchOnly.path,
+                        searchPattern: "DeferredOnlyAgentRoute"
+                    )
+
+                    fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
+                        _, _, routedSessionID, routedRunID, mode, _, selection, lookupContext, _, _, _ in
+                        XCTAssertEqual(routedSessionID, sessionID)
+                        XCTAssertEqual(routedRunID, parentRunID)
+                        XCTAssertEqual(mode, .review)
+                        XCTAssertTrue(selection.selectedPaths.contains(logicalBranchOnly.path))
+                        state.recordFollowUp(
+                            mode: mode,
+                            fileTree: "",
+                            fileBlocks: [],
+                            gitDiff: nil,
+                            selection: selection,
+                            lookupContext: lookupContext
+                        )
+                        return ChatSendReply(
+                            chatId: UUID(),
+                            shortId: "cb-deferred-review",
+                            mode: mode.mcpModeName,
+                            response: "generated deferred review",
+                            errors: nil
+                        )
+                    }
+                    defer {
+                        fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting(nil)
+                        fixture.contextA.window.mcpServer
+                            .setContextBuilderFinalReviewAuthorizationHooksForTesting(
+                                before: nil,
+                                after: nil
+                            )
+                    }
+
+                    let response = try await outerEndpoint.callTool(
+                        name: MCPWindowToolName.contextBuilder,
+                        arguments: [
+                            "instructions": "Find and review the branch-only file.",
+                            "response_type": "review"
+                        ],
+                        timeoutSeconds: 45
+                    )
+                    let text = try toolResultText(response)
+                    XCTAssertTrue(text.contains("generated deferred review"), text)
+                    XCTAssertEqual(state.providerCreationCount, 1)
+                    XCTAssertEqual(state.followUps.count, 1)
+                    XCTAssertEqual(
+                        state.followUps.first?.selection.selectedPaths,
+                        [logicalBranchOnly.path]
+                    )
+                    XCTAssertEqual(
+                        state.followUps.first?.lookupContext?
+                            .translateInputPath(logicalBranchOnly.path),
+                        worktreeBranchOnly.standardizedFileURL.path
+                    )
+
+                    @MainActor func installEmptyFrozenContext() async throws {
+                        _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                            emptySelection,
+                            for: selectionIdentity,
+                            source: .mcpTabContext,
+                            mirrorToUIIfActive: true
+                        )
+                        let currentTabValue = fixture.contextA.window.workspaceManager
+                            .composeTab(for: selectionIdentity)
+                        let currentTab = try XCTUnwrap(currentTabValue)
+                        let currentRevision = fixture.contextA.window.workspaceManager.selectionRevisionForMCP(
+                            workspaceID: selectionIdentity.workspaceID,
+                            tabID: selectionIdentity.tabID
+                        )
+                        fixture.contextA.window.mcpServer.installFrozenTabContext(
+                            clientID: outerEndpoint.connectionID.uuidString,
+                            clientName: outerEndpoint.clientName,
+                            context: MCPServerViewModel.TabContextSnapshot(
+                                tabID: fixture.contextA.tabID,
+                                windowID: fixture.contextA.window.windowID,
+                                workspaceID: fixture.contextA.workspaceID,
+                                promptText: currentTab.promptText,
+                                selection: emptySelection,
+                                selectionRevision: currentRevision,
+                                selectedMetaPromptIDs: currentTab.selectedMetaPromptIDs,
+                                selectedContextBuilderPromptIDs:
+                                currentTab.contextBuilder.selectedContextBuilderPromptIDs,
+                                tabName: currentTab.name,
+                                runID: parentRunID,
+                                activeAgentSessionID: sessionID,
+                                worktreeBindings: [binding],
+                                explicitlyBound: false
+                            )
+                        )
+                    }
+
+                    try await installEmptyFrozenContext()
+                    fixture.contextA.window.mcpServer
+                        .setContextBuilderFinalReviewAuthorizationHooksForTesting(
+                            before: {
+                                _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                                    emptySelection,
+                                    for: selectionIdentity,
+                                    source: .mcpTabContext,
+                                    mirrorToUIIfActive: true
+                                )
+                            },
+                            after: nil
+                        )
+                    let preFenceRace = try await outerEndpoint.callTool(
+                        name: MCPWindowToolName.contextBuilder,
+                        arguments: [
+                            "instructions": "Exercise the pre-authorization revision fence.",
+                            "response_type": "review"
+                        ],
+                        timeoutSeconds: 45
+                    )
+                    XCTAssertTrue(
+                        preFenceRace.rawJSON.contains(
+                            "selection changed before final repository authorization"
+                        ),
+                        preFenceRace.rawJSON
+                    )
+                    XCTAssertEqual(state.followUps.count, 1)
+
+                    fixture.contextA.window.mcpServer
+                        .setContextBuilderFinalReviewAuthorizationHooksForTesting(
+                            before: nil,
+                            after: nil
+                        )
+                    try await installEmptyFrozenContext()
+                    fixture.contextA.window.mcpServer
+                        .setContextBuilderFinalReviewAuthorizationHooksForTesting(
+                            before: nil,
+                            after: { authorization in
+                                XCTAssertEqual(authorization.electionOrigin, .deferred)
+                                _ = await fixture.contextA.window.selectionCoordinator.persistSelection(
+                                    emptySelection,
+                                    for: selectionIdentity,
+                                    source: .mcpTabContext,
+                                    mirrorToUIIfActive: true
+                                )
+                            }
+                        )
+                    let postFenceRace = try await outerEndpoint.callTool(
+                        name: MCPWindowToolName.contextBuilder,
+                        arguments: [
+                            "instructions": "Exercise the post-authorization revision fence.",
+                            "response_type": "review"
+                        ],
+                        timeoutSeconds: 45
+                    )
+                    XCTAssertTrue(
+                        postFenceRace.rawJSON.contains(
+                            "selection changed after final repository authorization"
+                        ),
+                        postFenceRace.rawJSON
+                    )
+                    XCTAssertEqual(state.followUps.count, 1)
+                    XCTAssertEqual(state.providerCreationCount, 3)
+                    fixture.contextA.window.mcpServer
+                        .setContextBuilderFinalReviewAuthorizationHooksForTesting(
+                            before: nil,
+                            after: nil
+                        )
+
+                    await fixture.cleanup()
+                } catch {
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testAgentModeContextBuilderFailsClosedBeforeProviderCreationWhenWorktreeIsUnavailable() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let state = ContextBuilderWorktreeProbeState()
@@ -1023,12 +1274,15 @@ import XCTest
         private func configureAgentModeEndpoint(
             _ endpoint: PersistentMCPTestEndpoint,
             context: MCPServerViewModel.TabContextSnapshot,
-            fixture: PersistentMCPTestFixture
+            fixture: PersistentMCPTestFixture,
+            bindContext: Bool = true
         ) async throws {
-            _ = try await endpoint.callTool(
-                name: "bind_context",
-                arguments: ["op": "bind", "context_id": context.tabID.uuidString]
-            )
+            if bindContext {
+                _ = try await endpoint.callTool(
+                    name: "bind_context",
+                    arguments: ["op": "bind", "context_id": context.tabID.uuidString]
+                )
+            }
             await fixture.networkManager.setRunPurpose(.agentModeRun, for: endpoint.connectionID)
             try await fixture.networkManager.debugSeedConnectionRunRouting(
                 connectionID: endpoint.connectionID,

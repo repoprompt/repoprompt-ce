@@ -147,7 +147,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
 
         await store.releaseSessionWorktreeOwnership(ownerID: sessionID)
         do {
-            try await context.validateFinalReviewSelection(
+            _ = try await context.authorizeFinalReviewSelection(
                 StoredSelection(
                     selectedPaths: [canonical.appendingPathComponent("Sources/Shared.swift").path],
                     codemapAutoEnabled: false
@@ -161,6 +161,230 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
             XCTAssertEqual(reason, .staleWorkspaceRoot)
         }
+    }
+
+    func testDeferredEmptySelectionFinalizesWorktreeOnlySelectionAndRejectsEmptyOrArtifactFinals() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "ContextBuilderDeferredWorktreeElection")
+        defer { fixture.cleanup() }
+        let canonical = try fixture.makeRepository(
+            named: "canonical",
+            files: ["Sources/Shared.swift": "let source = \"canonical\"\n"]
+        )
+        let worktree = try fixture.makeLinkedWorktree(
+            from: canonical,
+            named: "worktree",
+            branch: "feature/context-builder-deferred"
+        )
+        let branchOnly = worktree.appendingPathComponent("Sources/DeferredOnly.swift")
+        let logicalBranchOnly = canonical.appendingPathComponent("Sources/DeferredOnly.swift")
+        try write("let source = \"deferred worktree\"\n", to: branchOnly)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: logicalBranchOnly.path))
+
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: canonical.path, kind: .primaryWorkspace)
+        let sessionID = UUID()
+        let binding = try makeGitBinding(
+            logicalRoot: canonical,
+            worktreeRoot: worktree,
+            branch: "feature/context-builder-deferred"
+        )
+        let recorder = ContextBuilderReviewDiagnosticRecorder()
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 48,
+            workspaceID: UUID(),
+            promptText: "Discover then review",
+            selection: StoredSelection(codemapAutoEnabled: false),
+            selectionRevision: 50,
+            selectedMetaPromptIDs: [],
+            tabName: "Deferred review",
+            runID: UUID(),
+            activeAgentSessionID: sessionID,
+            worktreeBindings: [binding],
+            explicitlyBound: false
+        )
+
+        let context = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot,
+            workspaceRepoPaths: [canonical.path],
+            workspaceDirectoryPath: fixture.sandbox.path,
+            store: store,
+            reviewDiagnosticSink: recorder.append
+        )
+        guard case .deferred = context.reviewTargetResolution else {
+            return XCTFail("Expected empty initial selection to defer")
+        }
+
+        let finalSelection = StoredSelection(
+            selectedPaths: [logicalBranchOnly.path],
+            codemapAutoEnabled: false
+        )
+        let authorization = try await context.authorizeFinalReviewSelection(
+            finalSelection,
+            workspaceID: XCTUnwrap(snapshot.workspaceID),
+            tabID: snapshot.tabID,
+            selectionRevision: 51,
+            store: store
+        )
+
+        XCTAssertEqual(authorization.electionOrigin, .deferred)
+        XCTAssertEqual(authorization.committedSelectionRevision, 51)
+        XCTAssertEqual(authorization.committedSelection, finalSelection)
+        XCTAssertEqual(authorization.lookupContext, context.lookupContext)
+        XCTAssertEqual(
+            authorization.target.primaryCheckout.checkoutRootPath,
+            worktree.standardizedFileURL.path
+        )
+        XCTAssertEqual(authorization.checkoutAuthorizations.count, 1)
+        XCTAssertEqual(
+            authorization.checkoutAuthorizations[0].ordinaryPhysicalPaths,
+            [branchOnly.standardizedFileURL.path]
+        )
+        XCTAssertTrue(authorization.selectedArtifactAuthorizations.isEmpty)
+        XCTAssertTrue(recorder.snapshot().contains {
+            $0.phase == .finalElection && $0.outcome == .resolved
+        })
+
+        do {
+            _ = try await context.authorizeFinalReviewSelection(
+                StoredSelection(codemapAutoEnabled: false),
+                workspaceID: authorization.workspaceID,
+                tabID: authorization.tabID,
+                selectionRevision: 52,
+                store: store
+            )
+            XCTFail("Expected empty final selection to remain terminal")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .emptySelection)
+        }
+
+        do {
+            _ = try await context.authorizeFinalReviewSelection(
+                StoredSelection(
+                    autoCodemapPaths: ["_git_data/repos/fake/diff/all.patch"],
+                    codemapAutoEnabled: true
+                ),
+                workspaceID: authorization.workspaceID,
+                tabID: authorization.tabID,
+                selectionRevision: 53,
+                store: store
+            )
+            XCTFail("Expected deferred final artifact selection to remain terminal")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .deferredArtifactSelection(count: 1))
+        }
+    }
+
+    func testNonemptyUnresolvedAndArtifactShapedInitialSelectionsNeverDefer() async throws {
+        let root = try makeTemporaryDirectory(name: "ContextBuilderTerminalInitialSelection")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path, kind: .primaryWorkspace)
+
+        func snapshot(selection: StoredSelection) -> MCPServerViewModel.TabContextSnapshot {
+            MCPServerViewModel.TabContextSnapshot(
+                tabID: UUID(),
+                windowID: 49,
+                workspaceID: UUID(),
+                promptText: "Terminal initial selection",
+                selection: selection,
+                selectionRevision: 60,
+                selectedMetaPromptIDs: [],
+                tabName: "Terminal initial",
+                runID: UUID(),
+                activeAgentSessionID: UUID(),
+                worktreeBindings: [],
+                explicitlyBound: false
+            )
+        }
+
+        let unresolvedContext = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot(selection: StoredSelection(
+                selectedPaths: [root.appendingPathComponent("Missing.swift").path],
+                codemapAutoEnabled: false
+            )),
+            workspaceRepoPaths: [root.path],
+            workspaceDirectoryPath: root.path,
+            store: store
+        )
+        XCTAssertEqual(
+            unresolvedContext.reviewTargetResolution,
+            .unavailable(.unresolvedSelection(count: 1))
+        )
+
+        let artifactContext = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot(selection: StoredSelection(
+                autoCodemapPaths: ["_git_data/repos/fake/diff/all.patch"],
+                codemapAutoEnabled: true
+            )),
+            workspaceRepoPaths: [root.path],
+            workspaceDirectoryPath: root.path,
+            store: store
+        )
+        XCTAssertEqual(
+            artifactContext.reviewTargetResolution,
+            .unavailable(.unauthorizedSelectedArtifact(count: 1))
+        )
+    }
+
+    func testDeferredFinalSelectionRetainsMultiCheckoutPolicy() async throws {
+        let fixture = try ReviewGitRepositoryFixture(name: "ContextBuilderDeferredMultiCheckout")
+        defer { fixture.cleanup() }
+        let first = try fixture.makeRepository(
+            named: "first",
+            files: ["Sources/First.swift": "let first = true\n"]
+        )
+        let second = try fixture.makeRepository(
+            named: "second",
+            files: ["Sources/Second.swift": "let second = true\n"]
+        )
+        let firstFile = first.appendingPathComponent("Sources/First.swift")
+        let secondFile = second.appendingPathComponent("Sources/Second.swift")
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: first.path, kind: .primaryWorkspace)
+        _ = try await store.loadRoot(path: second.path, kind: .primaryWorkspace)
+
+        let snapshot = MCPServerViewModel.TabContextSnapshot(
+            tabID: UUID(),
+            windowID: 50,
+            workspaceID: UUID(),
+            promptText: "Discover two repositories",
+            selection: StoredSelection(codemapAutoEnabled: false),
+            selectionRevision: 70,
+            selectedMetaPromptIDs: [],
+            tabName: "Deferred multi checkout",
+            runID: UUID(),
+            activeAgentSessionID: UUID(),
+            worktreeBindings: [],
+            explicitlyBound: false
+        )
+        let context = try await ContextBuilderWorkspaceContext.resolve(
+            from: snapshot,
+            workspaceRepoPaths: [first.path, second.path],
+            workspaceDirectoryPath: fixture.sandbox.path,
+            store: store
+        )
+        guard case .deferred = context.reviewTargetResolution else {
+            return XCTFail("Expected empty multi-root selection to defer")
+        }
+
+        let selection = StoredSelection(
+            selectedPaths: [firstFile.path, secondFile.path],
+            codemapAutoEnabled: false
+        )
+        let authorization = try await context.authorizeFinalReviewSelection(
+            selection,
+            workspaceID: XCTUnwrap(snapshot.workspaceID),
+            tabID: snapshot.tabID,
+            selectionRevision: 71,
+            store: store
+        )
+        XCTAssertEqual(authorization.electionOrigin, .deferred)
+        XCTAssertEqual(authorization.target.checkouts.count, 2)
+        XCTAssertEqual(
+            Set(authorization.checkoutAuthorizations.flatMap(\.ordinaryPhysicalPaths)),
+            Set([firstFile.standardizedFileURL.path, secondFile.standardizedFileURL.path])
+        )
     }
 
     func testResolveWithoutBindingsFreezesCanonicalWorkspaceLookup() async throws {
@@ -198,7 +422,14 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
 
         XCTAssertEqual(context.providerWorkspacePath, logicalRoot.standardizedFileURL.path)
         XCTAssertNil(context.lookupContext.bindingProjection)
-        XCTAssertEqual(context.reviewTargetResolution, .unavailable(.emptySelection))
+        guard case let .deferred(authority) = context.reviewTargetResolution else {
+            return XCTFail("Expected genuinely empty initial selection to defer review election")
+        }
+        XCTAssertEqual(authority.workspaceID, snapshot.workspaceID)
+        XCTAssertEqual(authority.tabID, snapshot.tabID)
+        XCTAssertEqual(authority.initialSelectionRevision, snapshot.selectionRevision)
+        XCTAssertEqual(authority.lookupContext, context.lookupContext)
+        XCTAssertEqual(authority.reviewGitContext, context.reviewGitContext)
 
         _ = try await store.loadRoot(path: otherWorkspaceRoot.path)
         let frozenRoots = await store.rootRefs(scope: context.lookupContext.rootScope)
@@ -267,7 +498,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         XCTAssertEqual(nested.selectionRevision, 37)
         XCTAssertEqual(nested.contextBuilderReviewTargetResolution, context.reviewTargetResolution)
 
-        try await context.validateFinalReviewSelection(
+        _ = try await context.authorizeFinalReviewSelection(
             StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
             workspaceID: target.workspaceID,
             tabID: target.tabID,
@@ -276,7 +507,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         )
 
         do {
-            try await context.validateFinalReviewSelection(
+            _ = try await context.authorizeFinalReviewSelection(
                 StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
                 workspaceID: UUID(),
                 tabID: target.tabID,
@@ -289,7 +520,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         }
 
         do {
-            try await context.validateFinalReviewSelection(
+            _ = try await context.authorizeFinalReviewSelection(
                 StoredSelection(selectedPaths: [classicFile.path], codemapAutoEnabled: false),
                 workspaceID: target.workspaceID,
                 tabID: target.tabID,
