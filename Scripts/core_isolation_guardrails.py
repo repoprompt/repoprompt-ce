@@ -142,6 +142,12 @@ ALLOWED_IMPORTS = {
 }
 
 CORE_DECLARATIONS = {
+    "WorkspaceSessionController",
+    "RepoPromptCoreSession",
+    "RepoPromptCoreSessionHandle",
+    "RepoPromptCoreHost",
+    "RepoPromptAppCoreContainer",
+    "WorkspaceSessionObservationBridge",
     "WorkspacePreset",
     "StoredSelection",
     "ContextBuilderOverrides",
@@ -405,6 +411,111 @@ def validate_sources(root: Path) -> list[str]:
     for name, locations in sorted(declaration_locations.items()):
         if len(locations) != 1:
             errors.append(f"{name} must have exactly one concrete production declaration; found {locations}")
+
+    phase5_expected_owners = {
+        "WorkspaceSessionController": "Sources/RepoPromptCore/Workspaces/Session/WorkspaceSessionController.swift",
+        "RepoPromptCoreSession": "Sources/RepoPromptCore/Workspaces/Session/RepoPromptCoreSession.swift",
+        "RepoPromptCoreSessionHandle": "Sources/RepoPromptCore/Workspaces/Session/RepoPromptCoreSessionHandle.swift",
+        "RepoPromptCoreHost": "Sources/RepoPromptCore/Workspaces/Session/RepoPromptCoreHost.swift",
+        "RepoPromptAppCoreContainer": "Sources/RepoPrompt/App/CoreAdapters/RepoPromptAppCoreContainer.swift",
+        "WorkspaceSessionObservationBridge": "Sources/RepoPrompt/App/CoreAdapters/WorkspaceSessionObservationBridge.swift",
+    }
+    phase5_enabled = (root / "Sources/RepoPromptCore/Workspaces/Session").is_dir()
+    if phase5_enabled:
+        for name, expected in phase5_expected_owners.items():
+            locations = declaration_locations.get(name, [])
+            if locations and locations != [expected]:
+                errors.append(f"{name} Phase 5 owner must remain {expected}; found {locations}")
+
+    container_path = root / "Sources/RepoPrompt/App/CoreAdapters/RepoPromptAppCoreContainer.swift"
+    if container_path.is_file():
+        selection_key = "coreIsolation.workspaceBackend"
+        for file in sorted((root / "Sources").rglob("*.swift")):
+            if file == container_path:
+                continue
+            if selection_key in file.read_text(encoding="utf-8"):
+                errors.append(f"{file.relative_to(root)} must not select the Phase 5 workspace backend")
+
+    bridge_path = root / "Sources/RepoPrompt/App/CoreAdapters/WorkspaceSessionObservationBridge.swift"
+    if bridge_path.is_file():
+        bridge_text = bridge_path.read_text(encoding="utf-8")
+        for forbidden in ("WorkspaceSessionCommandEnvelope", ".execute(", "WorkspaceSessionPersistenceCoordinator"):
+            if forbidden in bridge_text:
+                errors.append(f"WorkspaceSessionObservationBridge must remain observation-only; found {forbidden}")
+
+    manager_path = root / "Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift"
+    if manager_path.is_file():
+        manager_text = manager_path.read_text(encoding="utf-8")
+        for forbidden in (
+            "reconcileWorkspaceProjectionMutation",
+            "reconcileActiveWorkspaceProjectionMutation",
+            "reconcileRejectedProjection",
+            "actor WorkspaceDiskWriter",
+        ):
+            if forbidden in manager_text:
+                errors.append(f"WorkspaceManagerViewModel must remain receipt-first in selected composition; found {forbidden}")
+        if "@Published private(set) var workspaces" not in manager_text:
+            errors.append("WorkspaceManagerViewModel workspaces projection must not have an external production setter")
+
+    session_contracts_path = root / "Sources/RepoPromptCore/Workspaces/Session/WorkspaceSessionContracts.swift"
+    session_path = root / "Sources/RepoPromptCore/Workspaces/Session/RepoPromptCoreSession.swift"
+    handle_path = root / "Sources/RepoPromptCore/Workspaces/Session/RepoPromptCoreSessionHandle.swift"
+    if session_path.is_file():
+        session_text = session_path.read_text(encoding="utf-8")
+        for forbidden in ("hydrateActiveRoots", "unloadRoots"):
+            if forbidden in session_text:
+                errors.append(f"RepoPromptCoreSession must own one opaque lifecycle capability; found {forbidden}")
+    if handle_path.is_file():
+        handle_text = handle_path.read_text(encoding="utf-8")
+        for forbidden in ("WorkspaceFileContextStore", "WorkspaceSessionLifecycleOwner"):
+            if forbidden in handle_text:
+                errors.append(f"RepoPromptCoreSessionHandle must expose immutable queries only; found {forbidden}")
+    if session_contracts_path.is_file():
+        contracts_text = session_contracts_path.read_text(encoding="utf-8")
+        if "WorkspaceSessionQueryCapability" not in contracts_text or "WorkspaceSessionLifecycleOwner" not in contracts_text:
+            errors.append("Phase 5 requires distinct lifecycle-owner and immutable-query capabilities")
+
+    if container_path.is_file():
+        container_text = container_path.read_text(encoding="utf-8")
+        if "let workspaceFileContextStore" in container_text:
+            errors.append("selected runtime bundles must not expose the raw WorkspaceFileContextStore")
+
+    selection_path = root / "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionCoordinator.swift"
+    if selection_path.is_file():
+        selection_text = selection_path.read_text(encoding="utf-8")
+        if "updateComposeTabStoredOnly" in selection_text:
+            errors.append("WorkspaceSelectionCoordinator must not retain a direct canonical tab-write fallback")
+
+    legacy_backend_path = root / "Sources/RepoPrompt/App/CoreAdapters/LegacyWorkspaceSessionBackend.swift"
+    if legacy_backend_path.is_file():
+        legacy_text = legacy_backend_path.read_text(encoding="utf-8")
+        for forbidden in (
+            "legacy rollback command is not supported",
+            "legacy reload requires next-launch reconstruction",
+            "private static let revisionAllocator",
+        ):
+            if forbidden in legacy_text:
+                errors.append(f"LegacyWorkspaceSessionBackend must retain complete rollback parity; found {forbidden}")
+
+    mcp_binding_path = root / "Sources/RepoPrompt/Infrastructure/MCP/MCPBindingResolver.swift"
+    mcp_connection_path = root / "Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"
+    if mcp_binding_path.is_file() and "MCPAdmittedContextBinding" not in mcp_binding_path.read_text(encoding="utf-8"):
+        errors.append("MCP routing requires one coherent admitted context binding")
+    if mcp_connection_path.is_file():
+        mcp_connection_text = mcp_connection_path.read_text(encoding="utf-8")
+        if "currentAdmittedContextBinding" not in mcp_connection_text:
+            errors.append("MCP dispatch must propagate the exact admitted context binding")
+
+    headless_root = root / "Sources/RepoPromptHeadless"
+    if headless_root.is_dir():
+        forbidden_headless = (
+            "WorkspaceSessionController(", "RepoPromptCoreSession(", "RepoPromptCoreHost("
+        )
+        for file in sorted(headless_root.rglob("*.swift")):
+            text = file.read_text(encoding="utf-8")
+            for forbidden in forbidden_headless:
+                if forbidden in text:
+                    errors.append(f"{file.relative_to(root)} must not instantiate Phase 5 app session authority")
 
     legacy_bridge = root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
     if legacy_bridge.exists():

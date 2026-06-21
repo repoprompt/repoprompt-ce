@@ -191,6 +191,86 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             errors = validate_sources(root)
             self.assertTrue(any("WorkspaceModel must have exactly one" in error for error in errors))
 
+    def test_phase_five_backend_selection_outside_container_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            container = root / "Sources/RepoPrompt/App/CoreAdapters/RepoPromptAppCoreContainer.swift"
+            container.parent.mkdir(parents=True)
+            container.write_text("// container\n")
+            leaked = root / "Sources/RepoPrompt/LeakedBackend.swift"
+            leaked.write_text('let key = "coreIsolation.workspaceBackend"\n')
+            errors = validate_sources(root)
+            self.assertTrue(any("must not select the Phase 5 workspace backend" in error for error in errors))
+
+    def test_phase_five_observation_bridge_command_feedback_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            bridge = root / "Sources/RepoPrompt/App/CoreAdapters/WorkspaceSessionObservationBridge.swift"
+            bridge.parent.mkdir(parents=True)
+            bridge.write_text("func bad() { ingress.execute(command) }\n")
+            errors = validate_sources(root)
+            self.assertTrue(any("observation-only" in error for error in errors))
+
+    def test_phase_five_headless_session_authority_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / TARGET_PATHS["RepoPromptHeadless"] / "SessionLeak.swift"
+            leaked.write_text("let host = RepoPromptCoreHost()\n")
+            errors = validate_sources(root)
+            self.assertTrue(any("must not instantiate Phase 5 app session authority" in error for error in errors))
+
+    def test_phase_five_manager_optimistic_projection_feedback_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            manager = root / "Sources/RepoPrompt/Features/Workspaces/ViewModels/WorkspaceManagerViewModel.swift"
+            manager.parent.mkdir(parents=True)
+            manager.write_text("func reconcileWorkspaceProjectionMutation() {}\n")
+            self.assertTrue(any("receipt-first" in error for error in validate_sources(root)))
+
+    def test_phase_five_raw_store_runtime_exposure_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            container = root / "Sources/RepoPrompt/App/CoreAdapters/RepoPromptAppCoreContainer.swift"
+            container.parent.mkdir(parents=True)
+            container.write_text("struct Bundle { let workspaceFileContextStore: WorkspaceFileContextStore }\n")
+            self.assertTrue(any("raw WorkspaceFileContextStore" in error for error in validate_sources(root)))
+
+    def test_phase_five_selection_direct_fallback_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            coordinator = root / "Sources/RepoPrompt/Infrastructure/WorkspaceContext/Selection/WorkspaceSelectionCoordinator.swift"
+            coordinator.parent.mkdir(parents=True)
+            coordinator.write_text("func bad() { updateComposeTabStoredOnly(tab) }\n")
+            self.assertTrue(any("direct canonical tab-write fallback" in error for error in validate_sources(root)))
+
+    def test_phase_five_legacy_unsupported_common_command_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            backend = root / "Sources/RepoPrompt/App/CoreAdapters/LegacyWorkspaceSessionBackend.swift"
+            backend.parent.mkdir(parents=True)
+            backend.write_text('let error = "legacy rollback command is not supported"\n')
+            self.assertTrue(any("complete rollback parity" in error for error in validate_sources(root)))
+
+    def test_phase_five_missing_exact_mcp_binding_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            binding = root / "Sources/RepoPrompt/Infrastructure/MCP/MCPBindingResolver.swift"
+            connection = root / "Sources/RepoPrompt/Infrastructure/MCP/MCPConnectionManager.swift"
+            binding.parent.mkdir(parents=True)
+            binding.write_text("struct Resolver {}\n")
+            connection.write_text("struct Manager {}\n")
+            errors = validate_sources(root)
+            self.assertTrue(any("coherent admitted context binding" in error for error in errors))
+            self.assertTrue(any("propagate the exact admitted" in error for error in errors))
+
     def _write_minimal_sources(self, root: Path) -> None:
         for relative in TARGET_PATHS.values():
             directory = root / relative

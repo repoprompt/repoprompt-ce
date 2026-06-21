@@ -42,3 +42,16 @@ wrap or instantiate the app's current mutable engine as a shortcut.
   or diagnostics-presentation policy into Core.
 - Broader performance optimization unrelated to preserving the frozen Phase 0
   baselines.
+
+## Phase 5 append — selected-session compatibility retirement (2026-06-21)
+
+- Remove `LegacyWorkspaceSessionBackend` and `coreIsolation.workspaceBackend`
+  only after Phase 8 rollback support expires.
+- Remove deferred presentation reconciliation and legacy manager test fallbacks
+  after every UI caller is natively async over command receipts.
+- Phase 5 closed every production selected-path direct fallback. The only
+  compatibility retained for later retirement is an explicitly DEBUG/XCTest,
+  no-session fixture adapter; release composition cannot construct or call it.
+- Converge headless onto the shared Core session graph only in Phase 9+.
+- Phase 7, not Phase 5, owns draining request counts, replacement routing, and
+  weak runtime adapter registries.

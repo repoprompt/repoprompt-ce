@@ -8,6 +8,7 @@ import Logging
 import MCP
 import Ontology
 import OSLog
+import RepoPromptCore
 import RepoPromptPOSIXSupport
 import RepoPromptShared
 import SwiftUI
@@ -2042,6 +2043,8 @@ actor ServerNetworkManager {
     static var currentConnectionID: UUID?
     @TaskLocal
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
+    @TaskLocal
+    static var currentAdmittedContextBinding: MCPAdmittedContextBinding?
     @TaskLocal
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
     @TaskLocal
@@ -6159,7 +6162,9 @@ actor ServerNetworkManager {
                             tabID: candidate.tabID,
                             workspaceID: candidate.workspaceID,
                             workspaceName: candidate.workspaceName,
-                            repoPaths: candidate.repoPaths
+                            repoPaths: candidate.repoPaths,
+                            sessionID: windowState.workspaceSessionID,
+                            sessionAvailability: windowState.workspaceManager.selectedWorkspaceSessionAvailability ?? .created
                         )
                     }
                 }
@@ -6173,7 +6178,9 @@ actor ServerNetworkManager {
                                 tabID: candidate.tabID,
                                 workspaceID: candidate.workspaceID,
                                 workspaceName: candidate.workspaceName,
-                                repoPaths: candidate.repoPaths
+                                repoPaths: candidate.repoPaths,
+                                sessionID: windowState.workspaceSessionID,
+                                sessionAvailability: windowState.workspaceManager.selectedWorkspaceSessionAvailability ?? .created
                             )
                         }
                     }
@@ -10492,15 +10499,52 @@ actor ServerNetworkManager {
                             workingDirs: [],
                             requestedWindowID: extractedWindowID
                         ) {
+                            let workspaceAdmission = await MainActor.run {
+                                WindowStatesManager.shared.allWindows.first(where: {
+                                    $0.windowID == logicalBinding.windowID
+                                        && $0.workspaceSessionID == logicalBinding.sessionID
+                                })?.workspaceManager
+                            }
+                            guard let workspaceAdmission else {
+                                return Self.toolErrorResult(
+                                    rawJSON: capturedRawJSON,
+                                    message: "The selected workspace session is no longer available. Retry after the target window finishes initializing."
+                                )
+                            }
+                            let admittedBinding: MCPAdmittedContextBinding?
+                            if await MainActor.run(body: { workspaceAdmission.selectedWorkspaceSessionID == nil }) {
+                                // Compatibility-only unit-test compositions have no selected
+                                // writable session. Production windows always require the exact
+                                // admitted binding constructed below.
+                                admittedBinding = nil
+                            } else {
+                                guard case let .admitted(admissionToken) = await workspaceAdmission.admitSelectedWorkspaceSession() else {
+                                    return Self.toolErrorResult(
+                                        rawJSON: capturedRawJSON,
+                                        message: "The selected workspace session is still initializing and is not ready for tool admission."
+                                    )
+                                }
+                                guard let binding = MCPAdmittedContextBinding(
+                                    windowID: logicalBinding.windowID,
+                                    tabID: logicalBinding.logicalContext.tabID,
+                                    workspaceID: logicalBinding.logicalContext.workspaceID,
+                                    sessionID: logicalBinding.sessionID,
+                                    admissionToken: admissionToken
+                                ) else {
+                                    return Self.toolErrorResult(
+                                        rawJSON: capturedRawJSON,
+                                        message: "The resolved workspace session returned an incoherent admission token."
+                                    )
+                                }
+                                admittedBinding = binding
+                            }
                             dispatchTabContextHint = MCPServerViewModel.TabContextHint(
                                 tabID: logicalBinding.logicalContext.tabID,
                                 workspaceID: logicalBinding.logicalContext.workspaceID,
-                                windowID: logicalBinding.windowID
+                                windowID: logicalBinding.windowID,
+                                admittedBinding: admittedBinding
                             )
                             preResolvedWindowID = logicalBinding.windowID
-                            if Self.shouldPersistResolvedLogicalContextWindowMapping(for: toolName) {
-                                await setConnectionWindowMapping(connectionID, windowID: logicalBinding.windowID)
-                            }
                             connectionLog(
                                 "Tool call: resolved logical context_id=\(logicalBinding.logicalContext.tabID) workspace=\(logicalBinding.logicalContext.workspaceName) window=\(logicalBinding.windowID)"
                             )
@@ -10620,6 +10664,8 @@ actor ServerNetworkManager {
                 : nil
             let capturedWindowID = extractedWindowID
             let capturedPreResolvedWindowID = preResolvedWindowID
+            let shouldPersistPreResolvedMapping = preResolvedWindowID != nil
+                && Self.shouldPersistResolvedLogicalContextWindowMapping(for: toolName)
             let capturedArguments = dispatchArguments
             let capturedArgsForFormatter = argsForFormatter
 
@@ -10758,8 +10804,11 @@ actor ServerNetworkManager {
 
                                 let (windowCount, allServices, multiWindowModeEffective) = routingSnapshot
                                 var chosenID: Int?
+                                var pendingConnectionWindowMapping = shouldPersistPreResolvedMapping
+                                    ? capturedPreResolvedWindowID
+                                    : nil
+                                var pendingLiveRunMapping: (runID: UUID, windowID: Int)?
                                 let windowStr: String
-                                let observerRunIDForCallbacksFinal: UUID?
                                 do {
                                     let windowRunResolutionState = EditFlowPerf.begin(
                                         EditFlowPerf.Stage.MCPToolCall.windowRunResolution,
@@ -10795,8 +10844,8 @@ actor ServerNetworkManager {
 
                                         chosenID = requestedWindowID
                                         if existingMapping == nil {
-                                            await self.setConnectionWindowMapping(connectionID, windowID: requestedWindowID)
-                                            connectionLog("Tool call: bound unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID")
+                                            pendingConnectionWindowMapping = requestedWindowID
+                                            connectionLog("Tool call: will bind unassigned connection \(connectionID) to window \(requestedWindowID) via _windowID after exact session admission")
                                         } else if let prev = existingMapping, prev != requestedWindowID {
                                             connectionLog("Tool call: applying per-call _windowID override \(prev) → \(requestedWindowID) for connection \(connectionID) (default binding unchanged)")
                                         } else {
@@ -10819,8 +10868,8 @@ actor ServerNetworkManager {
                                        let windowID = await self.reusableWindowForClient(newConnectionID: connectionID, clientName: clientName)
                                     {
                                         chosenID = windowID
-                                        await self.setConnectionWindowMapping(connectionID, windowID: windowID)
-                                        connectionLog("Tool call: auto-routed connection \(connectionID) to window \(windowID) via clientName '\(clientName)' reuse")
+                                        pendingConnectionWindowMapping = windowID
+                                        connectionLog("Tool call: will bind connection \(connectionID) to window \(windowID) via clientName '\(clientName)' reuse after exact session admission")
                                     }
 
                                     // PRIORITY 2b: Same-process live run affinity, then persisted window affinity.
@@ -10834,17 +10883,13 @@ actor ServerNetworkManager {
                                         mcpRoutingInternalDebugLog("[PRIORITY 2b] client='\(clientName)' managerToken=\(managerToken?.prefix(8) ?? "nil") cachedToken=\(cachedToken?.prefix(8) ?? "nil") sessionKey=\(sessionKey?.prefix(8) ?? "nil")")
                                         if let liveAffinity = await self.preferredLiveRunAffinity(for: clientName, sessionKey: sessionKey) {
                                             chosenID = liveAffinity.windowID
-                                            await self.setConnectionWindowMapping(connectionID, windowID: liveAffinity.windowID)
-                                            _ = await self.mapConnectionToRunID(
-                                                connectionID,
-                                                runID: liveAffinity.runID,
-                                                windowID: liveAffinity.windowID
-                                            )
+                                            pendingConnectionWindowMapping = liveAffinity.windowID
+                                            pendingLiveRunMapping = (liveAffinity.runID, liveAffinity.windowID)
                                             connectionLog("Tool call: restored live run affinity for connection \(connectionID) → runID \(liveAffinity.runID)")
                                         } else if let preferredWindowID = await self.preferredWindowID(for: clientName, sessionKey: sessionKey) {
                                             chosenID = preferredWindowID
-                                            await self.setConnectionWindowMapping(connectionID, windowID: preferredWindowID)
-                                            connectionLog("Tool call: auto-routed connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)'")
+                                            pendingConnectionWindowMapping = preferredWindowID
+                                            connectionLog("Tool call: will bind connection \(connectionID) to window \(preferredWindowID) via persisted routing affinity for client '\(clientName)' after exact session admission")
                                         }
                                     }
 
@@ -10869,8 +10914,7 @@ actor ServerNetworkManager {
                                                 : "no policy"
                                             mcpRoutingLog("Auto-routing conn=\(connectionID) to active window=\(activeID) (\(reason))")
                                             chosenID = activeID
-                                            // Store the mapping for this connection
-                                            await self.setConnectionWindowMapping(connectionID, windowID: activeID)
+                                            pendingConnectionWindowMapping = activeID
                                         }
                                     }
 
@@ -10894,14 +10938,79 @@ actor ServerNetworkManager {
                                     windowStr = chosenID.map(String.init) ?? "-"
                                     let logName = (originalName == toolName) ? toolName : "\(originalName)→\(toolName)"
                                     connectionLog("Tool call: \(logName) [conn=\(connectionID) window=\(windowStr)]")
-
-                                    // Notify enhanced tool event observers using the connection's resolved run mapping.
-                                    // Coordination/app-wide routing tools run before a stable window/run context may
-                                    // exist, so avoid re-entering MainActor run lookup on that hot path.
-                                    observerRunIDForCallbacksFinal = Self.shouldBypassWindowRouting(for: toolName)
-                                        ? nil
-                                        : await self.runIDForConnection(connectionID)
                                 }
+
+                                let admittedBindingForDispatch: MCPAdmittedContextBinding?
+                                if !Self.shouldBypassWindowRouting(for: toolName), let chosenID {
+                                    guard let selectedWindow = await MainActor.run(body: {
+                                        WindowStatesManager.shared.allWindows.first(where: { $0.windowID == chosenID })
+                                    }) else {
+                                        return Self.toolErrorResult(
+                                            rawJSON: capturedRawJSON,
+                                            message: "The selected workspace session is no longer available."
+                                        )
+                                    }
+
+                                    let hasSelectedWorkspaceSession = await MainActor.run {
+                                        selectedWindow.workspaceManager.selectedWorkspaceSessionID != nil
+                                    }
+                                    if !hasSelectedWorkspaceSession {
+                                        // Unit-test and explicitly unselected compatibility compositions have no
+                                        // writable session to admit. Production windows always select Core or
+                                        // next-launch legacy before routing reaches this point.
+                                        admittedBindingForDispatch = nil
+                                    } else if let capturedBinding = capturedTabContextHint?.admittedBinding {
+                                        guard await MainActor.run(body: { capturedBinding.isCurrent(in: selectedWindow) }) else {
+                                            return Self.toolErrorResult(
+                                                rawJSON: capturedRawJSON,
+                                                message: "The admitted workspace session changed before dispatch; the request was not retargeted."
+                                            )
+                                        }
+                                        admittedBindingForDispatch = capturedBinding
+                                    } else {
+                                        guard case let .admitted(token) = await selectedWindow.workspaceManager.admitSelectedWorkspaceSession(),
+                                              let binding = await MCPAdmittedContextBinding(
+                                                  windowID: chosenID,
+                                                  tabID: nil,
+                                                  workspaceID: MainActor.run(body: {
+                                                      selectedWindow.workspaceManager.activeWorkspace?.id
+                                                  }),
+                                                  sessionID: selectedWindow.workspaceSessionID,
+                                                  admissionToken: token
+                                              ),
+                                              await MainActor.run(body: { binding.isCurrent(in: selectedWindow) })
+                                        else {
+                                            return Self.toolErrorResult(
+                                                rawJSON: capturedRawJSON,
+                                                message: "The selected workspace session is still initializing or changed before tool admission."
+                                            )
+                                        }
+                                        admittedBindingForDispatch = binding
+                                    }
+
+                                    if let pendingConnectionWindowMapping {
+                                        await self.setConnectionWindowMapping(
+                                            connectionID,
+                                            windowID: pendingConnectionWindowMapping
+                                        )
+                                    }
+                                    if let pendingLiveRunMapping {
+                                        _ = await self.mapConnectionToRunID(
+                                            connectionID,
+                                            runID: pendingLiveRunMapping.runID,
+                                            windowID: pendingLiveRunMapping.windowID
+                                        )
+                                    }
+                                } else {
+                                    admittedBindingForDispatch = nil
+                                }
+
+                                // Notify enhanced tool event observers only after any admitted sticky mapping
+                                // and live-run affinity have been committed.
+                                let observerRunIDForCallbacksFinal = Self.shouldBypassWindowRouting(for: toolName)
+                                    ? nil
+                                    : await self.runIDForConnection(connectionID)
+
                                 let mutationAdmissionLease: MCPToolResourceAdmissionController.Lease?
                                 if admissionClass == .exclusive {
                                     let mutationResource: MCPToolResourceAdmissionController.Resource
@@ -11251,12 +11360,14 @@ actor ServerNetworkManager {
                                                     throw ToolDispatchAdmissionError.windowTerminal
                                                 }
                                             }
-                                            let value = try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
-                                                try await EditFlowPerf.measure(
-                                                    EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
-                                                    EditFlowPerf.Dimensions(toolName: toolName),
-                                                    operation: operation
-                                                )
+                                            let value = try await Self.$currentAdmittedContextBinding.withValue(admittedBindingForDispatch) {
+                                                try await MCPToolExecutionHandlerPhaseContext.$recorder.withValue(handlerPhaseRecorder) {
+                                                    try await EditFlowPerf.measure(
+                                                        EditFlowPerf.Stage.MCPToolCall.resolvedProviderDispatch,
+                                                        EditFlowPerf.Dimensions(toolName: toolName),
+                                                        operation: operation
+                                                    )
+                                                }
                                             }
                                             await emitExecutionTrace(.handlerCompleted, cancellationOutcome: "success")
                                             EditFlowPerf.lifecycleEvent(

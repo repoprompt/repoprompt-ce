@@ -206,7 +206,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             composeTabs: [ComposeTabState(id: tabID, name: "Unrelated", selection: unrelatedSelection)],
             activeComposeTabID: tabID
         )
-        window.workspaceManager.workspaces = [unrelatedWorkspace, targetWorkspace]
+        window.workspaceManager.setWorkspacesForTesting([unrelatedWorkspace, targetWorkspace])
         var targetTab = try XCTUnwrap(window.workspaceManager.composeTab(for: targetIdentity))
         targetTab.selection = logicalSelection
         XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(targetTab, inWorkspaceID: workspaceID))
@@ -1000,7 +1000,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 ephemeralFlag: true,
                 composeTabs: [ComposeTabState(name: "Replacement")]
             )
-            window.workspaceManager.workspaces.append(replacementWorkspace)
+            window.workspaceManager.mutateWorkspacesForTesting { $0.append(replacementWorkspace) }
             await window.workspaceManager.switchWorkspace(
                 to: replacementWorkspace,
                 saveState: false,
@@ -1117,7 +1117,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             composeTabs: [ComposeTabState(id: tabID, name: "Agent", selection: selection)],
             activeComposeTabID: tabID
         )
-        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.setWorkspacesForTesting([workspace])
         await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,

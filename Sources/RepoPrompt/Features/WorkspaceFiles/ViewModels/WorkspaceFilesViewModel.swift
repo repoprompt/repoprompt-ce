@@ -3169,6 +3169,37 @@ class WorkspaceFilesViewModel: ObservableObject {
         preloadedWorkspaceFileContextRootsByRootKey[rootKey] = root
     }
 
+    /// Applies a root-shell projection from the selected session's immutable query facade.
+    /// Store load/unload remains exclusively owned by `WorkspaceSessionLifecycleOwner`.
+    @MainActor
+    func applySessionRootProjection(
+        _ records: [WorkspaceRootRecord],
+        workspaceID: UUID?,
+        orderedPrimaryPaths: [String]
+    ) async {
+        let desiredPrimary = records.filter { $0.kind == .primaryWorkspace }
+        let desiredIDs = Set(desiredPrimary.map(\.id))
+        let obsolete = rootFolders.filter { folder in
+            guard let record = workspaceFileContextRootsByRootKey[rootKey(forPath: folder.fullPath)] else {
+                return false
+            }
+            return record.kind == .primaryWorkspace && !desiredIDs.contains(record.id)
+        }
+        for folder in obsolete {
+            _ = await detachRootShell(forRootPath: folder.fullPath, unloadStoreRoot: false)
+        }
+        for record in desiredPrimary where !rootFolders.contains(where: { $0.id == record.id }) {
+            do {
+                try attachRootShell(for: record, workspaceID: workspaceID)
+            } catch {
+                self.error = .failedToLoadFolder(error)
+            }
+        }
+        currentWorkspaceID = workspaceID
+        reorderRootFolders(to: orderedPrimaryPaths)
+        refreshRootFolderState()
+    }
+
     @MainActor
     func unloadUncommittedPreloadedWorkspaceRoots() async {
         let roots = Array(preloadedWorkspaceFileContextRootsByRootKey.values)

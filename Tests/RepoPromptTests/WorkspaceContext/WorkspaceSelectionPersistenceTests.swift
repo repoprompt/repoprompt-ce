@@ -3,7 +3,7 @@ import XCTest
 
 final class WorkspaceSelectionPersistenceTests: XCTestCase {
     override func tearDown() async throws {
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.removeAllForTesting()
         try await super.tearDown()
     }
 
@@ -14,7 +14,7 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
         let url = tempDir.appendingPathComponent("workspace.json")
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.removeAllForTesting()
 
         let workspaceID = UUID()
         let tabID = UUID()
@@ -32,8 +32,8 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
             activeSelectionRevision: 1
         )
 
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(data: correctData, url: url, metadata: correctMetadata)
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.enqueueWorkspace(data: correctData, url: url, metadata: correctMetadata)
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.flush(url: url)
 
         let stale = Self.workspace(
             id: workspaceID,
@@ -49,8 +49,8 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
             activeSelectionRevision: 0
         )
 
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(data: staleData, url: url, metadata: staleMetadata)
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.enqueueWorkspace(data: staleData, url: url, metadata: staleMetadata)
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.flush(url: url)
 
         let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
         let activeSelection = try XCTUnwrap(decoded.composeTabs.first(where: { $0.id == tabID })?.selection)
@@ -65,7 +65,7 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
         let url = tempDir.appendingPathComponent("workspace.json")
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.removeAllForTesting()
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.removeAllForTesting()
 
         let workspaceID = UUID()
         let tabID = UUID()
@@ -91,12 +91,12 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
             activeSelectionRevision: 2
         )
 
-        try await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.enqueueWorkspace(
+        try await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.enqueueWorkspace(
             data: JSONEncoder().encode(incoming),
             url: url,
             metadata: metadata
         )
-        await WorkspaceManagerViewModel.WorkspaceDiskWriter.shared.flush(url: url)
+        await WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared.flush(url: url)
 
         let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
         XCTAssertEqual(decoded.composeTabs[0].selection, incoming.composeTabs[0].selection)
@@ -110,7 +110,7 @@ final class WorkspaceSelectionPersistenceTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
         let url = tempDir.appendingPathComponent("workspace.json")
-        let writer = WorkspaceManagerViewModel.WorkspaceDiskWriter.shared
+        let writer = WorkspaceManagerViewModel.LegacyWorkspaceDiskWriter.shared
         await writer.removeAllForTesting()
         defer { EditFlowPerf.resetDebugCaptureForTesting() }
 

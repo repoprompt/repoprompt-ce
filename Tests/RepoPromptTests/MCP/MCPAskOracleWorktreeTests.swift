@@ -1187,14 +1187,16 @@ import XCTest
                     }) else {
                         return XCTFail("Expected active fixture workspace")
                     }
-                    window.workspaceManager.workspaces[workspaceIndex].composeTabs.append(
-                        ComposeTabState(
-                            id: explicitTabID,
-                            name: "Explicit inactive launch source",
-                            selection: explicitSelection,
-                            promptText: "EXPLICIT_INACTIVE_PROMPT"
+                    window.workspaceManager.mutateWorkspacesForTesting {
+                        $0[workspaceIndex].composeTabs.append(
+                            ComposeTabState(
+                                id: explicitTabID,
+                                name: "Explicit inactive launch source",
+                                selection: explicitSelection,
+                                promptText: "EXPLICIT_INACTIVE_PROMPT"
+                            )
                         )
-                    )
+                    }
                     let connectionID = UUID()
                     try window.mcpServer.bindTabForConnection(
                         connectionID: connectionID,
@@ -1451,7 +1453,7 @@ import XCTest
                             var workspace = fixture.contextA.window.workspaceManager
                                 .workspaces[workspaceIndex]
                             workspace.repoPaths = [worktreeRoot.path]
-                            fixture.contextA.window.workspaceManager.workspaces[workspaceIndex] = workspace
+                            fixture.contextA.window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex] = workspace }
                             bindings = []
                             frozenContext = MCPServerViewModel.TabContextSnapshot(
                                 tabID: fixture.contextA.tabID,

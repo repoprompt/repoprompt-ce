@@ -1,5 +1,6 @@
 import Combine
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -822,6 +823,136 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
             XCTAssertEqual(decision.owner, .storedComposeTab, scenario.name)
         }
     }
+
+    func testPersistSelectionFailsClosedWithoutCommandIngress() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let requested = StoredSelection(selectedPaths: ["/tmp/requested.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.commandIngressAvailable = false
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let outcome = await coordinator.persistSelectionOutcome(
+            requested,
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        )
+
+        XCTAssertEqual(outcome.disposition, .commandIngressUnavailable)
+        XCTAssertEqual(outcome.selection, initial)
+        XCTAssertEqual(outcome.attempts, 1)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, initial)
+        XCTAssertEqual(harness.manager.updateStoredOnlyCallCount, 0)
+    }
+
+    func testTransformSelectionRebasesOnceOnLatestStaleSnapshot() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let concurrent = StoredSelection(selectedPaths: ["/tmp/concurrent.swift"])
+        let requestedPath = "/tmp/requested.swift"
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.staleSelectionsBeforeCommit = [concurrent]
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let outcome = await coordinator.transformSelectionOutcome(
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        ) { selection in
+            StoredSelection(
+                selectedPaths: selection.selectedPaths + [requestedPath],
+                autoCodemapPaths: selection.autoCodemapPaths,
+                slices: selection.slices,
+                codemapAutoEnabled: selection.codemapAutoEnabled
+            )
+        }
+
+        XCTAssertEqual(outcome.disposition, .committed)
+        XCTAssertEqual(outcome.previousSelection, concurrent)
+        XCTAssertEqual(outcome.selection.selectedPaths, ["/tmp/concurrent.swift", requestedPath])
+        XCTAssertEqual(outcome.attempts, 2)
+        XCTAssertEqual(harness.manager.selectionCommitAttempts.map(\.expectedRevision), [0, 1])
+        XCTAssertEqual(
+            harness.manager.selectionCommitAttempts.map(\.selection.selectedPaths),
+            [
+                ["/tmp/initial.swift", requestedPath],
+                ["/tmp/concurrent.swift", requestedPath]
+            ]
+        )
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, outcome.selection)
+    }
+
+    func testTransformSelectionStopsAfterThreeStaleRebases() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let staleSelections = (1 ... 3).map {
+            StoredSelection(selectedPaths: ["/tmp/concurrent-\($0).swift"])
+        }
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.staleSelectionsBeforeCommit = staleSelections
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+        var changes: [WorkspaceSelectionCoordinator.Change] = []
+        coordinator.changes.sink { changes.append($0) }.store(in: &cancellables)
+
+        let outcome = await coordinator.transformSelectionOutcome(
+            for: harness.identity,
+            source: .mcpTabContext
+        ) { selection in
+            StoredSelection(
+                selectedPaths: selection.selectedPaths + ["/tmp/requested.swift"],
+                autoCodemapPaths: selection.autoCodemapPaths,
+                slices: selection.slices,
+                codemapAutoEnabled: selection.codemapAutoEnabled
+            )
+        }
+
+        XCTAssertEqual(outcome.disposition, .retryLimitExceeded)
+        XCTAssertEqual(outcome.selection, staleSelections.last)
+        XCTAssertEqual(outcome.attempts, 3)
+        XCTAssertEqual(harness.manager.selectionCommitAttempts.count, 3)
+        XCTAssertTrue(changes.isEmpty)
+        XCTAssertTrue(harness.manager.mirrorStartedSelections.isEmpty)
+    }
+
+    func testTransformSelectionStopsRebaseWhenSessionActivationChanges() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let concurrent = StoredSelection(selectedPaths: ["/tmp/concurrent.swift"])
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.staleSelectionsBeforeCommit = [concurrent]
+        harness.manager.rotateSessionOnNextStale = true
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let outcome = await coordinator.transformSelectionOutcome(
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        ) { selection in
+            StoredSelection(selectedPaths: selection.selectedPaths + ["/tmp/requested.swift"])
+        }
+
+        XCTAssertEqual(outcome.disposition, .activationChanged)
+        XCTAssertEqual(outcome.attempts, 1)
+        XCTAssertEqual(harness.manager.selectionCommitAttempts.count, 1)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, concurrent)
+    }
+
+    func testTransformSelectionStopsRebaseWhenActiveIdentityChanges() async {
+        let initial = StoredSelection(selectedPaths: ["/tmp/initial.swift"])
+        let concurrent = StoredSelection(selectedPaths: ["/tmp/concurrent.swift"])
+        let alternateTabID = UUID()
+        let harness = CoordinatorHarness(initialSelection: initial)
+        harness.manager.appendTab(ComposeTabState(id: alternateTabID, name: "Alternate"))
+        harness.manager.staleSelectionsBeforeCommit = [concurrent]
+        harness.manager.activateTabOnNextStale = alternateTabID
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let outcome = await coordinator.transformSelectionOutcome(
+            for: harness.identity,
+            mirrorToUIIfActive: false
+        ) { selection in
+            StoredSelection(selectedPaths: selection.selectedPaths + ["/tmp/requested.swift"])
+        }
+
+        XCTAssertEqual(outcome.disposition, .identityChanged)
+        XCTAssertEqual(outcome.attempts, 1)
+        XCTAssertEqual(harness.manager.selectionCommitAttempts.count, 1)
+        XCTAssertEqual(harness.manager.activeWorkspace?.activeComposeTabID, alternateTabID)
+    }
 }
 
 @MainActor
@@ -921,6 +1052,7 @@ private actor SelectionMirrorCompletion {
 @MainActor
 private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     var activeWorkspace: WorkspaceModel?
+    var selectedWorkspaceSessionID: WorkspaceSessionID? = WorkspaceSessionID()
     private(set) var selectionMirrorContextRevision: UInt64 = 0
     private(set) var liveUISelectionRevision: UInt64 = 0
     let fileManager: WorkspaceFilesViewModel
@@ -947,6 +1079,15 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
     private(set) var acceptedPeerSourceRevisions: [UInt64] = []
     private(set) var rejectedPeerSourceRevisions: [UInt64] = []
     private(set) var propagatedSelections: [StoredSelection] = []
+    var commandIngressAvailable = true
+    var staleSelectionsBeforeCommit: [StoredSelection] = []
+    var rotateSessionOnNextStale = false
+    var activateTabOnNextStale: UUID?
+    private(set) var committedSelectionRevisionValue: UInt64 = 0
+    private(set) var selectionCommitAttempts: [(selection: StoredSelection, expectedRevision: UInt64)] = []
+    private var sessionActivationID = UUID()
+    private var sessionStateGeneration: UInt64 = 1
+    private var sessionSnapshotSequence: UInt64 = 1
 
     init(
         workspace: WorkspaceModel,
@@ -1067,6 +1208,128 @@ private final class FakeWorkspaceSelectionManager: WorkspaceSelectionHost {
 
     func advanceLiveUISelectionRevision() {
         liveUISelectionRevision &+= 1
+    }
+
+    func committedSelectionRevision(for _: WorkspaceSelectionIdentity) -> UInt64 {
+        committedSelectionRevisionValue
+    }
+
+    func commitSelectionThroughSelectedSession(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        expectedRevision: UInt64,
+        source _: String
+    ) async -> WorkspaceSessionCommandResult? {
+        guard commandIngressAvailable else { return nil }
+        selectionCommitAttempts.append((selection, expectedRevision))
+
+        if !staleSelectionsBeforeCommit.isEmpty {
+            let concurrentSelection = staleSelectionsBeforeCommit.removeFirst()
+            applyCanonicalSelection(concurrentSelection, for: identity)
+            committedSelectionRevisionValue &+= 1
+            sessionStateGeneration &+= 1
+            sessionSnapshotSequence &+= 1
+            if rotateSessionOnNextStale {
+                selectedWorkspaceSessionID = WorkspaceSessionID()
+                sessionActivationID = UUID()
+                rotateSessionOnNextStale = false
+            }
+            if let activateTabOnNextStale {
+                setActiveTab(activateTabOnNextStale)
+                self.activateTabOnNextStale = nil
+            }
+            let snapshot = authoritativeSnapshot()
+            return .stale(
+                latestSnapshot: snapshot,
+                conflict: WorkspaceSessionConflict(
+                    kind: .selectionRevision(
+                        key: WorkspaceTabSelectionKey(
+                            workspaceID: identity.workspaceID,
+                            tabID: identity.tabID
+                        ),
+                        expected: expectedRevision,
+                        actual: committedSelectionRevisionValue
+                    )
+                )
+            )
+        }
+
+        guard expectedRevision == committedSelectionRevisionValue else {
+            let snapshot = authoritativeSnapshot()
+            return .stale(
+                latestSnapshot: snapshot,
+                conflict: WorkspaceSessionConflict(
+                    kind: .selectionRevision(
+                        key: WorkspaceTabSelectionKey(
+                            workspaceID: identity.workspaceID,
+                            tabID: identity.tabID
+                        ),
+                        expected: expectedRevision,
+                        actual: committedSelectionRevisionValue
+                    )
+                )
+            )
+        }
+        guard composeTab(for: identity)?.selection != selection else {
+            return .unchanged(commandReceipt(selectionRevision: committedSelectionRevisionValue))
+        }
+
+        applyCanonicalSelection(selection, for: identity)
+        committedSelectionRevisionValue &+= 1
+        sessionStateGeneration &+= 1
+        sessionSnapshotSequence &+= 1
+        updateStoredOnlyCallCount += 1
+        return .committed(commandReceipt(selectionRevision: committedSelectionRevisionValue))
+    }
+
+    private func applyCanonicalSelection(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity
+    ) {
+        guard var workspace = activeWorkspace,
+              workspace.id == identity.workspaceID,
+              let index = workspace.composeTabs.firstIndex(where: { $0.id == identity.tabID })
+        else { return }
+        workspace.composeTabs[index].selection = selection
+        activeWorkspace = workspace
+    }
+
+    private func commandReceipt(selectionRevision: UInt64) -> WorkspaceSessionCommandReceipt {
+        WorkspaceSessionCommandReceipt(
+            commandID: UUID(),
+            sessionID: selectedWorkspaceSessionID ?? WorkspaceSessionID(),
+            activationID: sessionActivationID,
+            resultingGeneration: sessionStateGeneration,
+            selectionRevision: selectionRevision,
+            snapshotSequence: sessionSnapshotSequence
+        )
+    }
+
+    private func authoritativeSnapshot() -> WorkspaceSessionSnapshot {
+        let workspace = activeWorkspace
+        let revisions: [WorkspaceTabSelectionKey: UInt64] = if let workspace,
+                                                               let tabID = workspace.activeComposeTabID
+        {
+            [
+                WorkspaceTabSelectionKey(workspaceID: workspace.id, tabID: tabID):
+                    committedSelectionRevisionValue
+            ]
+        } else {
+            [:]
+        }
+        return WorkspaceSessionSnapshot(
+            sessionID: selectedWorkspaceSessionID ?? WorkspaceSessionID(),
+            snapshotSequence: sessionSnapshotSequence,
+            stateGeneration: sessionStateGeneration,
+            workspaces: workspace.map { [$0] } ?? [],
+            activeWorkspaceID: workspace?.id,
+            selectionRevisions: revisions,
+            dirtyGenerations: workspace.map { [$0.id: sessionStateGeneration] } ?? [:],
+            savedGenerations: [:],
+            switchState: .idle,
+            readiness: WorkspaceSessionReadiness(generation: 1, isReady: true),
+            availability: .active
+        )
     }
 
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {

@@ -325,7 +325,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             composeTabs: [ComposeTabState(id: tabID, name: "Copy", selection: selection)],
             activeComposeTabID: tabID
         )
-        window.workspaceManager.workspaces = [workspace]
+        window.workspaceManager.setWorkspacesForTesting([workspace])
         await window.workspaceManager.switchWorkspace(
             to: workspace,
             saveState: false,

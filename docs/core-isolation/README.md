@@ -1,9 +1,9 @@
 # Core Isolation Execution Packet
 
 **Created:** 2026-06-21
-**Current phase:** Phase 4 — closed after approved lifecycle continuation; see [phase-4.md](phases/phase-4.md)
-**Disposition:** **GO**; Phase 5 implementation has not begun
-**Production behavior change:** none intended; workspace/file-context engine ownership extraction only
+**Current phase:** Phase 5 — atomic workspace-authority cutover complete; see [phase-5.md](phases/phase-5.md)
+**Disposition:** **GO**
+**Production behavior change:** one selected workspace authority with next-launch legacy rollback
 **Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, and `RepoPromptPOSIXSupportTests`
 
 This directory is the compact execution record for
@@ -54,6 +54,7 @@ contract. No later phase may depend on fetching those two objects.
 - [Phase 2 evidence and disposition](phases/phase-2.md)
 - [Phase 3 evidence and disposition](phases/phase-3.md)
 - [Phase 4 evidence, lifecycle continuation, and final GO disposition](phases/phase-4.md)
+- [Phase 5 authority-cutover execution record](phases/phase-5.md)
 - [Deferred Phase 9+ work](deferred-work.md)
 
 ## Mutation policy
@@ -94,5 +95,7 @@ workspace authority. Its deterministic behavior, performance, lists/ledgers,
 style, guardrails, builds, full tests, and non-launching debug package gates are
 green. An explicitly approved continuation launched the matching packaged CE
 debug app, passed one cold and four warm app-proxy smokes, stopped the matching
-app, and confirmed no matching process remained. Phase 4 is **GO**. Phase 5
-remains unstarted.
+app, and confirmed no matching process remained. Phase 4 is **GO**. Phase 5 began
+from clean checkpoint `e76b39f1` and is now **GO**: the atomic authority cutover,
+rollback parity, deterministic/package ladder, curated Oracle review, approved
+packaged live smokes, and exact stopped-process proof are all complete.

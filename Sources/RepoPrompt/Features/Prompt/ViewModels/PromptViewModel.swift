@@ -2346,7 +2346,13 @@ class PromptViewModel: ObservableObject {
             name: currentName,
             base: manager.workspaces[index].composeTabs[activeIdx]
         )
-        manager.workspaces[index].composeTabs[activeIdx] = snapshot
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: manager.workspaces[index].id,
+            source: "prompt-snapshot-active-tab"
+        ) { workspace in
+            guard let tabIndex = workspace.composeTabs.firstIndex(where: { $0.id == snapshot.id }) else { return }
+            workspace.composeTabs[tabIndex] = snapshot
+        }
     }
 
     /// Flush pending editor state and snapshot the active tab before transitioning away.
@@ -2542,9 +2548,14 @@ class PromptViewModel: ObservableObject {
             flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
         }
 
-        manager.workspaces[index].composeTabs.append(newTab)
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-create-compose-tab"
+        ) { projected in
+            projected.composeTabs.append(newTab)
+            projected.activeComposeTabID = newTab.id
+        }
         await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
-            manager.workspaces[index].activeComposeTabID = newTab.id
             activeComposeTabID = newTab.id
             dirtyTabIDs.remove(newTab.id)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2638,7 +2649,10 @@ class PromptViewModel: ObservableObject {
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
 
         // Append but do NOT change activeComposeTabID
-        manager.workspaces[index].composeTabs.append(newTab)
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-create-background-compose-tab"
+        ) { $0.composeTabs.append(newTab) }
         // Keep existing active tab; just sync lists
         loadComposeTabsFromWorkspace(manager.workspaces[index])
 
@@ -2661,7 +2675,10 @@ class PromptViewModel: ObservableObject {
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
         await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
-            manager.workspaces[index].activeComposeTabID = id
+            manager.mutateWorkspaceReceiptFirst(
+                workspaceID: workspace.id,
+                source: "prompt-activate-compose-tab"
+            ) { $0.activeComposeTabID = id }
             activeComposeTabID = id
 
             loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2689,8 +2706,14 @@ class PromptViewModel: ObservableObject {
               let workspace = manager.activeWorkspace,
               let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id }),
               let tabIndex = manager.workspaces[index].composeTabs.firstIndex(where: { $0.id == id }) else { return }
-        manager.workspaces[index].composeTabs[tabIndex].name = trimmed
-        manager.workspaces[index].composeTabs[tabIndex].lastModified = Date()
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-rename-compose-tab"
+        ) { projected in
+            guard let index = projected.composeTabs.firstIndex(where: { $0.id == id }) else { return }
+            projected.composeTabs[index].name = trimmed
+            projected.composeTabs[index].lastModified = Date()
+        }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
         loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2820,10 +2843,15 @@ class PromptViewModel: ObservableObject {
             for tabID in tabsBeingClosed {
                 guard let refreshedTab = refreshedTabs.first(where: { $0.id == tabID }) else { continue }
                 let stashedTab = StashedTab(tab: refreshedTab)
-                if let existingIndex = manager.workspaces[index].stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
-                    manager.workspaces[index].stashedTabs[existingIndex] = stashedTab
-                } else {
-                    manager.workspaces[index].stashedTabs.append(stashedTab)
+                manager.mutateWorkspaceReceiptFirst(
+                    workspaceID: workspace.id,
+                    source: "prompt-stash-compose-tab"
+                ) { projected in
+                    if let existingIndex = projected.stashedTabs.firstIndex(where: { $0.tab.id == tabID }) {
+                        projected.stashedTabs[existingIndex] = stashedTab
+                    } else {
+                        projected.stashedTabs.append(stashedTab)
+                    }
                 }
             }
             tabs = refreshedTabs
@@ -2840,7 +2868,10 @@ class PromptViewModel: ObservableObject {
         dirtyTabIDs.subtract(resolvedIDs)
 
         let previousActiveID = manager.workspaces[index].activeComposeTabID
-        manager.workspaces[index].composeTabs = tabs
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-close-compose-tabs"
+        ) { $0.composeTabs = tabs }
 
         if tabs.isEmpty {
             await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
@@ -2880,14 +2911,20 @@ class PromptViewModel: ObservableObject {
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
             await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
-                manager.workspaces[index].activeComposeTabID = newActiveID
+                manager.mutateWorkspaceReceiptFirst(
+                    workspaceID: workspace.id,
+                    source: "prompt-close-compose-tabs-activate"
+                ) { $0.activeComposeTabID = newActiveID }
                 activeComposeTabID = newActiveID
                 await withComposeTabSwitching(targetTabID: newActiveID) {
                     await manager.applyComposeTabState(tab)
                 }
             }
         } else {
-            manager.workspaces[index].activeComposeTabID = newActiveID
+            manager.mutateWorkspaceReceiptFirst(
+                workspaceID: workspace.id,
+                source: "prompt-close-compose-tabs-active-fallback"
+            ) { $0.activeComposeTabID = newActiveID }
             activeComposeTabID = newActiveID
         }
 
@@ -2948,9 +2985,15 @@ class PromptViewModel: ObservableObject {
             workspaceIndex: workspaceIndex,
             manager: manager
         ) else { return }
-        manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
+        let workspaceID = manager.workspaces[workspaceIndex].id
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspaceID,
+            source: "prompt-replacement-blank-tab"
+        ) { projected in
+            projected.composeTabs.append(blankTab)
+            projected.activeComposeTabID = blankTab.id
+        }
         await withComposeTabActivationSnapshotSuspended(targetTabID: blankTab.id, manager: manager) {
-            manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
             activeComposeTabID = blankTab.id
             dirtyTabIDs.remove(blankTab.id)
             await withComposeTabSwitching(targetTabID: blankTab.id) {
@@ -2990,7 +3033,10 @@ class PromptViewModel: ObservableObject {
         let clamped = max(0, min(destinationIndex, tabs.count - 1))
         let item = tabs.remove(at: sourceIndex)
         tabs.insert(item, at: clamped)
-        manager.workspaces[index].composeTabs = tabs
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-reorder-compose-tabs"
+        ) { $0.composeTabs = tabs }
         loadComposeTabsFromWorkspace(manager.workspaces[index])
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
@@ -3204,16 +3250,20 @@ class PromptViewModel: ObservableObject {
         }
         restoredTab.lastModified = Date()
 
-        // Remove from stashed tabs
-        manager.workspaces[index].stashedTabs.remove(at: stashIndex)
-
-        // Add to compose tabs
-        manager.workspaces[index].composeTabs.append(restoredTab)
-        manager.workspaces[index].dateModified = Date()
-        currentStashedTabs = manager.workspaces[index].stashedTabs
-
-        // Switch to the restored tab
-        await switchComposeTab(restoredTab.id)
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-restore-stashed-tab"
+        ) { projected in
+            projected.stashedTabs.removeAll { $0.id == stashedTabID }
+            projected.composeTabs.append(restoredTab)
+            projected.activeComposeTabID = restoredTab.id
+            projected.dateModified = Date()
+        }
+        currentStashedTabs = manager.workspaces[index].stashedTabs.filter { $0.id != stashedTabID }
+        activeComposeTabID = restoredTab.id
+        await withComposeTabSwitching(targetTabID: restoredTab.id) {
+            await manager.applyComposeTabState(restoredTab)
+        }
 
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
@@ -3268,7 +3318,10 @@ class PromptViewModel: ObservableObject {
                 var remainingComposeTabs = composeTabsBeforeDelete
                 remainingComposeTabs.removeAll { composeTabIDsBeingDeleted.contains($0.id) }
                 dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
-                manager.workspaces[index].composeTabs = remainingComposeTabs
+                manager.mutateWorkspaceReceiptFirst(
+                    workspaceID: workspace.id,
+                    source: "prompt-delete-compose-tabs"
+                ) { $0.composeTabs = remainingComposeTabs }
                 if remainingComposeTabs.isEmpty {
                     await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
                 } else {
@@ -3291,14 +3344,20 @@ class PromptViewModel: ObservableObject {
                        let tab = remainingComposeTabs.first(where: { $0.id == newActiveID })
                     {
                         await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
-                            manager.workspaces[index].activeComposeTabID = newActiveID
+                            manager.mutateWorkspaceReceiptFirst(
+                                workspaceID: workspace.id,
+                                source: "prompt-delete-compose-tabs-activate"
+                            ) { $0.activeComposeTabID = newActiveID }
                             activeComposeTabID = newActiveID
                             await withComposeTabSwitching(targetTabID: newActiveID) {
                                 await manager.applyComposeTabState(tab)
                             }
                         }
                     } else {
-                        manager.workspaces[index].activeComposeTabID = newActiveID
+                        manager.mutateWorkspaceReceiptFirst(
+                            workspaceID: workspace.id,
+                            source: "prompt-delete-compose-tabs-active-fallback"
+                        ) { $0.activeComposeTabID = newActiveID }
                         activeComposeTabID = newActiveID
                     }
                 }
@@ -3311,7 +3370,12 @@ class PromptViewModel: ObservableObject {
         let tabIDs = Set(stashedTabsToDelete.map(\.tab.id))
         await notifyComposeTabsWillClose(tabIDs, reason: .deleteStashed)
         deleteGitDataForClosingTabs(tabIDs: tabIDs)
-        manager.workspaces[index].stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-delete-stashed-tabs"
+        ) { projected in
+            projected.stashedTabs.removeAll { resolvedStashedTabIDs.contains($0.id) }
+        }
         loadComposeTabsFromWorkspace(manager.workspaces[index])
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
@@ -3355,7 +3419,13 @@ class PromptViewModel: ObservableObject {
         else { return }
         guard manager.workspaces[index].composeTabs[tabIndex].isPinned != pinned else { return }
 
-        manager.workspaces[index].composeTabs[tabIndex].isPinned = pinned
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-pin-compose-tab"
+        ) { projected in
+            guard let index = projected.composeTabs.firstIndex(where: { $0.id == tabID }) else { return }
+            projected.composeTabs[index].isPinned = pinned
+        }
         loadComposeTabsFromWorkspace(manager.workspaces[index])
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
@@ -3411,8 +3481,14 @@ class PromptViewModel: ObservableObject {
 
         guard manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides != overrides else { return }
 
-        manager.workspaces[workspaceIndex].composeTabs[tabIndex].contextOverrides = overrides
-        manager.workspaces[workspaceIndex].dateModified = Date()
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-context-overrides"
+        ) { projected in
+            guard let index = projected.composeTabs.firstIndex(where: { $0.id == tabID }) else { return }
+            projected.composeTabs[index].contextOverrides = overrides
+            projected.dateModified = Date()
+        }
         manager.markWorkspaceDirty()
     }
 
@@ -3442,13 +3518,19 @@ class PromptViewModel: ObservableObject {
         await manager.createPreset(for: workspace, name: tab.name)
 
         guard let presetIndex = manager.workspaces[index].presets.firstIndex(where: { $0.id == manager.workspaces[index].activePresetID }) else { return }
-        manager.workspaces[index].presets[presetIndex].capturesFileSelection = true
-        manager.workspaces[index].presets[presetIndex].capturesFileTreeExpansion = true
-        manager.workspaces[index].presets[presetIndex].capturesSelectedPrompts = true
-        manager.workspaces[index].presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
-        manager.workspaces[index].presets[presetIndex].expandedFolders = tab.expandedFolders
-        manager.workspaces[index].presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
-        manager.workspaces[index].presets[presetIndex].lastUpdated = Date()
+        manager.mutateWorkspaceReceiptFirst(
+            workspaceID: workspace.id,
+            source: "prompt-save-compose-tab-preset"
+        ) { projected in
+            guard projected.presets.indices.contains(presetIndex) else { return }
+            projected.presets[presetIndex].capturesFileSelection = true
+            projected.presets[presetIndex].capturesFileTreeExpansion = true
+            projected.presets[presetIndex].capturesSelectedPrompts = true
+            projected.presets[presetIndex].selectedFilePaths = tab.selection.selectedPaths
+            projected.presets[presetIndex].expandedFolders = tab.expandedFolders
+            projected.presets[presetIndex].selectedPromptIDs = tab.selectedMetaPromptIDs
+            projected.presets[presetIndex].lastUpdated = Date()
+        }
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()
     }

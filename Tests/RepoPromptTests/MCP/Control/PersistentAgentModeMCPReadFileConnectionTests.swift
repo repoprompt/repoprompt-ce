@@ -2222,7 +2222,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if workspaceWithoutTab.activeComposeTabID == Fixture.tabID {
                 workspaceWithoutTab.activeComposeTabID = workspaceWithoutTab.composeTabs.first?.id
             }
-            manager.workspaces[workspaceIndex] = workspaceWithoutTab
+            manager.mutateWorkspacesForTesting { $0[workspaceIndex] = workspaceWithoutTab }
 
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
@@ -2231,7 +2231,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(boundSelection?.selectedPaths, [])
             XCTAssertEqual(boundSelection?.slices, [:])
 
-            manager.workspaces[workspaceIndex] = originalWorkspace
+            manager.mutateWorkspacesForTesting { $0[workspaceIndex] = originalWorkspace }
         }
 
         func assertWorkspaceReorderDuringAutoSelectionPersistence(fixture: Fixture) async throws {
@@ -2257,8 +2257,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             decoy.composeTabs = []
             let decoyID = decoy.id
-            manager.workspaces.insert(decoy, at: originalIndex)
-            defer { manager.workspaces.removeAll { $0.id == decoyID } }
+            manager.mutateWorkspacesForTesting { $0.insert(decoy, at: originalIndex) }
+            defer { manager.mutateWorkspacesForTesting { $0.removeAll { $0.id == decoyID } } }
 
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
@@ -2276,9 +2276,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let manager = fixture.window.workspaceManager
             let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
             let replacementTabID = UUID()
-            manager.workspaces[workspaceIndex].composeTabs.append(
-                ComposeTabState(id: replacementTabID, name: "Replacement Auto-Selection Owner")
-            )
+            manager.mutateWorkspacesForTesting {
+                $0[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: replacementTabID, name: "Replacement Auto-Selection Owner")
+                )
+            }
 
             let gate = PersistentAsyncGate()
             fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
@@ -2727,8 +2729,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         at: 0
                     )
                 }
-                window.workspaceManager.workspaces[workspaceIndex].composeTabs = composeTabs
-                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = inactiveAgentTab ? activeTabID : tabID
+                window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].composeTabs = composeTabs }
+                window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = inactiveAgentTab ? activeTabID : tabID }
                 let configuredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
                 await window.workspaceManager.switchWorkspace(
                     to: configuredWorkspace,
@@ -3211,8 +3213,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ],
                 activeComposeTabID: Self.tabID
             )
-            routingGuardWindow.workspaceManager.workspaces.append(unrelatedWorkspace)
-            routingGuardWindow.workspaceManager.workspaces.append(peerWorkspace)
+            routingGuardWindow.workspaceManager.mutateWorkspacesForTesting { $0.append(unrelatedWorkspace) }
+            routingGuardWindow.workspaceManager.mutateWorkspacesForTesting { $0.append(peerWorkspace) }
             await routingGuardWindow.workspaceManager.switchWorkspace(
                 to: peerWorkspace,
                 saveState: false,

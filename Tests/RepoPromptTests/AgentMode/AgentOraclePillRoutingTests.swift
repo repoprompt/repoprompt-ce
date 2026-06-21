@@ -362,7 +362,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         workspace.composeTabs = [ComposeTabState(id: tabID), ComposeTabState(id: otherTabID)]
         workspace.activeComposeTabID = tabID
         if let index = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
-            composition.workspaceManager.workspaces[index] = workspace
+            composition.workspaceManager.mutateWorkspacesForTesting { $0[index] = workspace }
         }
         composition.oracleViewModel.sessions = []
 

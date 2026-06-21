@@ -1,7 +1,14 @@
 import Foundation
+import RepoPromptCore
 
 @MainActor
 struct WindowStateComposition {
+    let workspaceSessionID: WorkspaceSessionID
+    let workspaceSessionCommandClient: WorkspaceSessionCommandClient?
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
+    let workspaceSessionObservationBridge: WorkspaceSessionObservationBridge?
+    let workspaceSessionActivationTask: Task<Void, Never>?
+    let workspaceSessionShutdown: @Sendable () async -> Void
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -25,10 +32,16 @@ struct WindowStateComposition {
 
 @MainActor
 enum WindowStateCompositionFactory {
+    private static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        appCoreContainer injectedAppCoreContainer: RepoPromptAppCoreContainer? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
@@ -36,16 +49,81 @@ enum WindowStateCompositionFactory {
         loadStoredAPISettingsDataOnInit: Bool = true,
         codexModelPollingService: CodexModelPollingService = .shared
     ) -> WindowStateComposition {
+        let appCoreContainer = injectedAppCoreContainer ?? .shared
+        let useSelectedSessionComposition = injectedAppCoreContainer != nil || !isRunningUnitTests
         // 1) Workspace file context store + visible file-tree UI adapter
         LegacyWorkspaceGlobalIgnoreDefaults.shared.update(GlobalSettingsStore.shared.globalIgnoreDefaults())
-        #if DEBUG
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                enableCatalogShardShadowValidation: false
+        let storageRoot = resolvedWorkspaceStorageRoot()
+        let workspaceFileContextStore: WorkspaceFileContextStore = if let injectedWorkspaceFileContextStore {
+            injectedWorkspaceFileContextStore
+        } else {
+            #if DEBUG
+                WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            #else
+                WorkspaceFileContextStore()
+            #endif
+        }
+        let workspaceSessionLifecycleOwner = useSelectedSessionComposition
+            ? WorkspaceSessionStoreLifecycleFactory.make(
+                store: workspaceFileContextStore,
+                configuration: {
+                    let settings = await MainActor.run {
+                        GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
+                    }
+                    return WorkspaceSessionRootLoadConfiguration(
+                        respectGitignore: settings.respectGitignore,
+                        respectRepoIgnore: settings.respectRepoIgnore,
+                        respectCursorignore: settings.respectCursorignore,
+                        skipSymlinks: settings.skipSymlinks,
+                        enableHierarchicalIgnores: settings.enableHierarchicalIgnores
+                    )
+                }
             )
-        #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore()
-        #endif
-        let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
+            : nil
+        let runtimeBootstrap = useSelectedSessionComposition ? appCoreContainer.beginRuntime(
+            windowID: windowID,
+            coreDependencies: {
+                RepoPromptCoreSessionDependencies(
+                    load: { try loadWorkspaceHydrationInput(storageRoot: storageRoot) },
+                    lifecycleOwner: workspaceSessionLifecycleOwner!,
+                    workspaceURL: { workspace in
+                        workspace.customStoragePath?.appendingPathComponent("workspace.json")
+                            ?? storageRoot
+                            .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)")
+                            .appendingPathComponent("workspace.json")
+                    },
+                    indexURL: { storageRoot.appendingPathComponent("workspacesIndex.json") }
+                )
+            },
+            legacyFactory: { sessionID in
+                let backend = LegacyWorkspaceSessionBackend(
+                    sessionID: sessionID,
+                    load: { try loadWorkspaceHydrationInput(storageRoot: storageRoot) },
+                    lifecycleOwner: workspaceSessionLifecycleOwner!,
+                    workspaceURL: { workspace in
+                        workspace.customStoragePath?.appendingPathComponent("workspace.json")
+                            ?? storageRoot
+                            .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)")
+                            .appendingPathComponent("workspace.json")
+                    },
+                    indexURL: { storageRoot.appendingPathComponent("workspacesIndex.json") }
+                )
+                return WorkspaceSessionRuntimeBundle(
+                    sessionID: sessionID,
+                    commandIngress: backend,
+                    hydrate: { await backend.hydrate() },
+                    activateAfterApplyingFirstSnapshot: { sequence in
+                        await backend.activate(appliedSnapshotSequence: sequence)
+                    },
+                    shutdown: { await backend.shutdown() }
+                )
+            }
+        ) : nil
+        let workspaceSessionID = runtimeBootstrap?.sessionID ?? WorkspaceSessionID()
+        let workspaceSessionCommandClient = runtimeBootstrap.map {
+            WorkspaceSessionCommandClient(sessionID: $0.sessionID, ingress: $0.commandIngress)
+        }
+        let workspaceSessionQuery = workspaceSessionLifecycleOwner?.makeQueryCapability()
         let workspaceSearchService = WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
@@ -79,8 +157,36 @@ enum WindowStateCompositionFactory {
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            performInitialWorkspaceActivation: runtimeBootstrap == nil,
+            workspaceSessionClient: workspaceSessionCommandClient,
+            deferSelectedSessionInitialization: runtimeBootstrap != nil
         )
+        let workspaceSessionObservationBridge = runtimeBootstrap.map { bootstrap in
+            WorkspaceSessionObservationBridge(
+                snapshotProvider: { await bootstrap.commandIngress.currentSnapshot() },
+                observationProvider: { sequence in
+                    await bootstrap.commandIngress.observations(after: sequence)
+                },
+                applySnapshot: { [weak workspaceManager] snapshot in
+                    workspaceManager?.applyAuthoritativeSessionSnapshot(snapshot)
+                    guard let workspaceManager else { return }
+                    let roots = await workspaceSessionQuery?.roots() ?? []
+                    await workspaceFilesViewModel.applySessionRootProjection(
+                        roots,
+                        workspaceID: snapshot.activeWorkspaceID,
+                        orderedPrimaryPaths: snapshot.workspaces.first(where: {
+                            $0.id == snapshot.activeWorkspaceID
+                        })?.repoPaths ?? []
+                    )
+                }
+            )
+        }
+        if let workspaceSessionCommandClient, let workspaceSessionObservationBridge {
+            workspaceSessionCommandClient.bindProjectionWaiter { sequence in
+                await workspaceSessionObservationBridge.waitUntilApplied(sequence: sequence)
+            }
+        }
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
             store: workspaceFileContextStore
@@ -184,6 +290,62 @@ enum WindowStateCompositionFactory {
                 oracleViewModel: oracleViewModel
             )
         )
+
+        let workspaceSessionActivationTask: Task<Void, Never>? = if let runtimeBootstrap,
+                                                                    let workspaceSessionObservationBridge,
+                                                                    let workspaceSessionCommandClient
+        {
+            Task { @MainActor in
+                do {
+                    let runtime = try await runtimeBootstrap.runtimeTask.value
+                    switch await runtime.hydrate() {
+                    case let .awaitingFirstSnapshotApplication(firstSnapshot):
+                        await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(firstSnapshot)
+                        workspaceSessionObservationBridge.startObserving()
+                        let activation = await runtime.activateAfterApplyingFirstSnapshot(
+                            firstSnapshot.snapshotSequence
+                        )
+                        guard case .activated = activation else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        guard case .admitted = await workspaceSessionCommandClient.acquireAdmission() else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        workspaceManager.completeSelectedSessionInitialization()
+                    case let .alreadyHydrated(snapshot):
+                        guard let snapshot else {
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(snapshot)
+                        workspaceSessionObservationBridge.startObserving()
+                        guard case .admitted = await workspaceSessionCommandClient.acquireAdmission() else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        workspaceManager.completeSelectedSessionInitialization()
+                    case .failed:
+                        await runtime.shutdown()
+                        appCoreContainer.releaseRuntime(windowID: windowID)
+                        return
+                    }
+                } catch {
+                    appCoreContainer.releaseRuntime(windowID: windowID)
+                    return
+                }
+            }
+        } else {
+            nil
+        }
         workspaceManager.registerSwitchSessionProvider(
             ContextBuilderWorkspaceSwitchSessionProvider(
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel
@@ -197,6 +359,17 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                workspaceSessionID: workspaceSessionID,
+                workspaceSessionCommandClient: workspaceSessionCommandClient,
+                workspaceSessionQuery: workspaceSessionQuery,
+                workspaceSessionObservationBridge: workspaceSessionObservationBridge,
+                workspaceSessionActivationTask: workspaceSessionActivationTask,
+                workspaceSessionShutdown: {
+                    if let runtimeBootstrap, let runtime = try? await runtimeBootstrap.runtimeTask.value {
+                        await runtime.shutdown()
+                        await MainActor.run { appCoreContainer.releaseRuntime(windowID: windowID) }
+                    }
+                },
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -217,6 +390,17 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                workspaceSessionID: workspaceSessionID,
+                workspaceSessionCommandClient: workspaceSessionCommandClient,
+                workspaceSessionQuery: workspaceSessionQuery,
+                workspaceSessionObservationBridge: workspaceSessionObservationBridge,
+                workspaceSessionActivationTask: workspaceSessionActivationTask,
+                workspaceSessionShutdown: {
+                    if let runtimeBootstrap, let runtime = try? await runtimeBootstrap.runtimeTask.value {
+                        await runtime.shutdown()
+                        await MainActor.run { appCoreContainer.releaseRuntime(windowID: windowID) }
+                    }
+                },
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -235,5 +419,39 @@ enum WindowStateCompositionFactory {
                 workspaceManager: workspaceManager
             )
         #endif
+    }
+
+    private static func resolvedWorkspaceStorageRoot() -> URL {
+        if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
+            return URL(fileURLWithPath: path)
+        }
+        return WorkspaceStoragePaths.defaultRoot
+    }
+
+    private nonisolated static func loadWorkspaceHydrationInput(
+        storageRoot: URL
+    ) throws -> WorkspaceSessionHydrationInput {
+        let indexURL = storageRoot.appendingPathComponent("workspacesIndex.json")
+        let entries: [WorkspaceIndexEntry] = if FileManager.default.fileExists(atPath: indexURL.path) {
+            (try? JSONDecoder().decode([WorkspaceIndexEntry].self, from: Data(contentsOf: indexURL))) ?? []
+        } else {
+            []
+        }
+        var workspaces: [WorkspaceModel] = []
+        for entry in entries {
+            let url = entry.customStoragePath?.appendingPathComponent("workspace.json")
+                ?? storageRoot
+                .appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                .appendingPathComponent("workspace.json")
+            guard FileManager.default.fileExists(atPath: url.path),
+                  let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            else { continue }
+            workspaces.append(workspace)
+        }
+        if workspaces.isEmpty {
+            workspaces = [WorkspaceModel(name: "Default", repoPaths: [], isSystemWorkspace: true)]
+        }
+        let activeID = workspaces.first(where: \.isSystemWorkspace)?.id ?? workspaces.first?.id
+        return WorkspaceSessionHydrationInput(workspaces: workspaces, activeWorkspaceID: activeID)
     }
 }

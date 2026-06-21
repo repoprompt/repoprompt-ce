@@ -1463,7 +1463,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
             promptViewModel: prompt,
             performInitialWorkspaceActivation: false
         )
-        manager.workspaces = workspaces
+        manager.setWorkspacesForTesting(workspaces)
         return (manager, prompt)
     }
 

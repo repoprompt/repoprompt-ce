@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCore
 
 struct WorkspaceSelectionIdentity: Hashable {
     let workspaceID: UUID
@@ -42,13 +43,18 @@ private struct WorkspaceSelectionMirrorTarget: Equatable {
 @MainActor
 protocol WorkspaceSelectionHost: AnyObject {
     var activeWorkspace: WorkspaceModel? { get }
+    var selectedWorkspaceSessionID: WorkspaceSessionID? { get }
     var selectionMirrorContextRevision: UInt64 { get }
     var liveUISelectionRevision: UInt64 { get }
     func composeTab(with id: UUID) -> ComposeTabState?
     func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState?
     func publishActiveComposeTabSnapshot(commitToMemory: Bool, touchModified: Bool)
-    @discardableResult
-    func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool
+    func commitSelectionThroughSelectedSession(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        expectedRevision: UInt64,
+        source: String
+    ) async -> WorkspaceSessionCommandResult?
     func updateComposeTabSelectionPresentation(_ selection: StoredSelection, for identity: WorkspaceSelectionIdentity)
     func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64
     func registerMCPSelectionSourceMutation(
@@ -65,11 +71,24 @@ protocol WorkspaceSelectionHost: AnyObject {
 }
 
 extension WorkspaceSelectionHost {
+    var selectedWorkspaceSessionID: WorkspaceSessionID? {
+        nil
+    }
+
     var liveUISelectionRevision: UInt64 {
         0
     }
 
     func updateComposeTabSelectionPresentation(_: StoredSelection, for _: WorkspaceSelectionIdentity) {}
+
+    func commitSelectionThroughSelectedSession(
+        _: StoredSelection,
+        for _: WorkspaceSelectionIdentity,
+        expectedRevision _: UInt64,
+        source _: String
+    ) async -> WorkspaceSessionCommandResult? {
+        nil
+    }
 
     func committedSelectionRevision(for _: WorkspaceSelectionIdentity) -> UInt64 {
         0
@@ -109,6 +128,31 @@ private extension WorkspaceSelectionHost {
 extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
     func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
         selectionRevisionForMCP(workspaceID: identity.workspaceID, tabID: identity.tabID)
+    }
+}
+
+enum WorkspaceSelectionMutationDisposition: Equatable {
+    case committed
+    case unchanged
+    case stale
+    case notReady
+    case rejected
+    case failed
+    case commandIngressUnavailable
+    case identityChanged
+    case activationChanged
+    case retryLimitExceeded
+}
+
+struct WorkspaceSelectionMutationOutcome: Equatable {
+    let disposition: WorkspaceSelectionMutationDisposition
+    let previousSelection: StoredSelection
+    let selection: StoredSelection
+    let revision: UInt64?
+    let attempts: Int
+
+    var committed: Bool {
+        disposition == .committed || disposition == .unchanged
     }
 }
 
@@ -165,8 +209,8 @@ final class WorkspaceSelectionCoordinator {
         let liveUISelectionRevision: UInt64
     }
 
-    private var nextSelectionRevision: UInt64 = 0
-    private var selectionRevisionByIdentity: [WorkspaceSelectionIdentity: UInt64] = [:]
+    private var nextMirrorRevision: UInt64 = 0
+    private var mirrorRevisionByIdentity: [WorkspaceSelectionIdentity: UInt64] = [:]
     private var deferredUISelectionFenceByIdentity: [WorkspaceSelectionIdentity: DeferredUISelectionFence] = [:]
     private var nextSelectionMirrorTaskID: UInt64 = 0
     private var mcpSelectionMirrorTail: MCPSelectionMirrorTail?
@@ -317,20 +361,64 @@ final class WorkspaceSelectionCoordinator {
         peerSourceRevision: UInt64? = nil,
         peerMutationFence: MCPSelectionPeerMutationFence? = nil
     ) async -> StoredSelection {
+        let outcome = await persistSelectionOutcome(
+            selection,
+            for: identity,
+            source: source,
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            expectedCurrentSelection: expectedCurrentSelection,
+            peerSourceRevision: peerSourceRevision,
+            peerMutationFence: peerMutationFence
+        )
+        return outcome.selection
+    }
+
+    @discardableResult
+    func persistSelectionOutcome(
+        _ selection: StoredSelection,
+        for identity: WorkspaceSelectionIdentity,
+        source: Source = .runtimeMutation,
+        mirrorToUIIfActive: Bool = true,
+        expectedCurrentSelection: StoredSelection? = nil,
+        peerSourceRevision: UInt64? = nil,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil
+    ) async -> WorkspaceSelectionMutationOutcome {
         guard let workspaceManager,
               let currentSelection = workspaceManager.composeTab(for: identity)?.selection
-        else { return selection }
+        else {
+            return mutationOutcome(
+                .identityChanged,
+                previous: selection,
+                selection: selection,
+                attempts: 0
+            )
+        }
+        let mutationFence = makeMutationFence(for: identity, workspaceManager: workspaceManager)
         if let expectedCurrentSelection,
            currentSelection != expectedCurrentSelection
         {
-            return currentSelection
+            return mutationOutcome(
+                .stale,
+                previous: expectedCurrentSelection,
+                selection: currentSelection,
+                revision: workspaceManager.committedSelectionRevision(for: identity),
+                attempts: 0
+            )
         }
         if source == .mcpPeerContext {
             guard let peerSourceRevision,
                   let peerMutationFence,
                   workspaceManager.canCommitMCPSelectionPeerMutation(peerMutationFence),
                   workspaceManager.acceptMCPPeerSelectionRevision(peerSourceRevision, for: identity)
-            else { return currentSelection }
+            else {
+                return mutationOutcome(
+                    .activationChanged,
+                    previous: currentSelection,
+                    selection: currentSelection,
+                    revision: workspaceManager.committedSelectionRevision(for: identity),
+                    attempts: 0
+                )
+            }
         }
 
         let propagationRegistration = source == .mcpTabContext
@@ -344,83 +432,68 @@ final class WorkspaceSelectionCoordinator {
                 peerMutationFence,
                 source: source,
                 workspaceManager: workspaceManager
-            ) else { return currentSelection }
-            if source.isMCPSelectionSource {
-                updateMCPSelectionPresentation(
-                    selection,
-                    for: identity,
-                    workspaceManager: workspaceManager
+            ) else {
+                return mutationOutcome(
+                    .activationChanged,
+                    previous: currentSelection,
+                    selection: currentSelection,
+                    revision: workspaceManager.committedSelectionRevision(for: identity),
+                    attempts: 0
                 )
             }
-            if mirrorToUI, source.isMCPSelectionSource {
-                let revision = recordSelectionRevision(for: identity)
-                await enqueueMCPSelectionMirror(
-                    selection,
-                    for: identity,
-                    revision: revision,
-                    peerMutationFence: peerMutationFence
-                )
-            }
-            if let propagationRegistration {
-                await workspaceManager.propagateMCPSelectionToPeerHosts(
-                    MCPSelectionPeerPropagation(
-                        identity: identity,
-                        selection: selection,
-                        sourceRevision: propagationRegistration.sourceRevision,
-                        peerHostIDs: propagationRegistration.peerHostIDs,
-                        mirrorToUIIfActive: mirrorToUIIfActive
-                    )
-                )
-            }
-            return selection
+            await finalizeSelectionMutation(
+                previous: currentSelection,
+                selection: selection,
+                identity: identity,
+                source: source,
+                mirrorToUI: mirrorToUI,
+                mirrorToUIIfActive: mirrorToUIIfActive,
+                propagationRegistration: propagationRegistration,
+                peerMutationFence: peerMutationFence,
+                workspaceManager: workspaceManager
+            )
+            return mutationOutcome(
+                .unchanged,
+                previous: currentSelection,
+                selection: selection,
+                revision: workspaceManager.committedSelectionRevision(for: identity),
+                attempts: 0
+            )
         }
 
         let requiredPeerMutationFence = source == .mcpPeerContext ? peerMutationFence : nil
-        guard let revision = persist(
+        let outcome = await commitCanonicalSelection(
             selection,
             for: identity,
-            peerMutationFence: requiredPeerMutationFence
-        ) else { return currentSelection }
+            expectedRevision: workspaceManager.committedSelectionRevision(for: identity),
+            previousSelection: currentSelection,
+            attempts: 1,
+            peerMutationFence: requiredPeerMutationFence,
+            workspaceManager: workspaceManager
+        )
+        guard outcome.committed else { return outcome }
+        guard mutationFenceFailure(
+            mutationFence,
+            for: identity,
+            workspaceManager: workspaceManager
+        ) == nil else { return outcome }
         guard canCommitPeerMutation(
             peerMutationFence,
             source: source,
             workspaceManager: workspaceManager
-        ) else { return selection }
-        if source.isMCPSelectionSource {
-            updateMCPSelectionPresentation(
-                selection,
-                for: identity,
-                workspaceManager: workspaceManager
-            )
-        }
-        let change = Change(tabID: identity.tabID, selection: selection, source: source)
-        if mirrorToUI, source.isMCPSelectionSource {
-            changeSubject.send(change)
-            await enqueueMCPSelectionMirror(
-                selection,
-                for: identity,
-                revision: revision,
-                peerMutationFence: peerMutationFence
-            )
-        } else if mirrorToUI {
-            await applySelectionMirror {
-                changeSubject.send(change)
-            }
-        } else {
-            changeSubject.send(change)
-        }
-        if let propagationRegistration {
-            await workspaceManager.propagateMCPSelectionToPeerHosts(
-                MCPSelectionPeerPropagation(
-                    identity: identity,
-                    selection: selection,
-                    sourceRevision: propagationRegistration.sourceRevision,
-                    peerHostIDs: propagationRegistration.peerHostIDs,
-                    mirrorToUIIfActive: mirrorToUIIfActive
-                )
-            )
-        }
-        return selection
+        ) else { return outcome }
+        await finalizeSelectionMutation(
+            previous: currentSelection,
+            selection: outcome.selection,
+            identity: identity,
+            source: source,
+            mirrorToUI: mirrorToUI,
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            propagationRegistration: propagationRegistration,
+            peerMutationFence: peerMutationFence,
+            workspaceManager: workspaceManager
+        )
+        return outcome
     }
 
     /// Applies a synchronous transform to the latest canonical tab selection and stores the
@@ -433,65 +506,134 @@ final class WorkspaceSelectionCoordinator {
         mirrorToUIIfActive: Bool = true,
         _ transform: (StoredSelection) -> StoredSelection
     ) async -> TransactionResult? {
-        guard let workspaceManager,
-              let before = workspaceManager.composeTab(for: identity)?.selection
-        else { return nil }
+        let outcome = await transformSelectionOutcome(
+            for: identity,
+            source: source,
+            mirrorToUIIfActive: mirrorToUIIfActive,
+            transform
+        )
+        guard outcome.committed, let revision = outcome.revision else { return nil }
+        return TransactionResult(
+            identity: identity,
+            before: outcome.previousSelection,
+            after: outcome.selection,
+            revision: revision
+        )
+    }
 
-        let after = transform(before)
+    @discardableResult
+    func transformSelectionOutcome(
+        for identity: WorkspaceSelectionIdentity,
+        source: Source = .runtimeMutation,
+        mirrorToUIIfActive: Bool = true,
+        _ transform: (StoredSelection) -> StoredSelection
+    ) async -> WorkspaceSelectionMutationOutcome {
+        guard let workspaceManager,
+              var before = workspaceManager.composeTab(for: identity)?.selection
+        else {
+            return mutationOutcome(
+                .identityChanged,
+                previous: StoredSelection(),
+                selection: StoredSelection(),
+                attempts: 0
+            )
+        }
+
+        let mutationFence = makeMutationFence(for: identity, workspaceManager: workspaceManager)
         let propagationRegistration = source == .mcpTabContext
             ? workspaceManager.registerMCPSelectionSourceMutation(for: identity)
             : nil
         let isActive = identity == activeSelectionIdentity()
         let mirrorToUI = isActive && mirrorToUIIfActive
-        let canonicalRevision: UInt64
-        let mirrorRevision: UInt64
+        var expectedRevision = workspaceManager.committedSelectionRevision(for: identity)
 
-        if after == before {
-            canonicalRevision = workspaceManager.committedSelectionRevision(for: identity)
-            mirrorRevision = selectionRevisionByIdentity[identity] ?? recordSelectionRevision(for: identity)
-        } else {
-            guard let persistedRevision = persist(after, for: identity) else { return nil }
-            canonicalRevision = workspaceManager.committedSelectionRevision(for: identity)
-            mirrorRevision = persistedRevision
-        }
+        for attempt in 1 ... 3 {
+            if let failure = mutationFenceFailure(
+                mutationFence,
+                for: identity,
+                workspaceManager: workspaceManager
+            ) {
+                return mutationOutcome(
+                    failure,
+                    previous: before,
+                    selection: before,
+                    revision: expectedRevision,
+                    attempts: attempt - 1
+                )
+            }
 
-        if source.isMCPSelectionSource {
-            updateMCPSelectionPresentation(after, for: identity, workspaceManager: workspaceManager)
-        }
-        if after != before, !mirrorToUI || source.isMCPSelectionSource {
-            changeSubject.send(Change(tabID: identity.tabID, selection: after, source: source))
-        }
+            let after = transform(before)
+            if after == before {
+                await finalizeSelectionMutation(
+                    previous: before,
+                    selection: after,
+                    identity: identity,
+                    source: source,
+                    mirrorToUI: mirrorToUI,
+                    mirrorToUIIfActive: mirrorToUIIfActive,
+                    propagationRegistration: propagationRegistration,
+                    peerMutationFence: nil,
+                    workspaceManager: workspaceManager
+                )
+                return mutationOutcome(
+                    .unchanged,
+                    previous: before,
+                    selection: after,
+                    revision: expectedRevision,
+                    attempts: attempt - 1
+                )
+            }
 
-        if mirrorToUI, source.isMCPSelectionSource {
-            await enqueueMCPSelectionMirror(
+            let outcome = await commitCanonicalSelection(
                 after,
                 for: identity,
-                revision: mirrorRevision,
-                peerMutationFence: nil
+                expectedRevision: expectedRevision,
+                previousSelection: before,
+                attempts: attempt,
+                workspaceManager: workspaceManager
             )
-        } else if mirrorToUI, after != before {
-            await applySelectionMirror {
-                changeSubject.send(Change(tabID: identity.tabID, selection: after, source: source))
+            switch outcome.disposition {
+            case .committed, .unchanged:
+                guard mutationFenceFailure(
+                    mutationFence,
+                    for: identity,
+                    workspaceManager: workspaceManager
+                ) == nil else { return outcome }
+                await finalizeSelectionMutation(
+                    previous: before,
+                    selection: outcome.selection,
+                    identity: identity,
+                    source: source,
+                    mirrorToUI: mirrorToUI,
+                    mirrorToUIIfActive: mirrorToUIIfActive,
+                    propagationRegistration: propagationRegistration,
+                    peerMutationFence: nil,
+                    workspaceManager: workspaceManager
+                )
+                return outcome
+            case .stale:
+                before = outcome.selection
+                expectedRevision = outcome.revision ?? expectedRevision
+                if attempt == 3 {
+                    return mutationOutcome(
+                        .retryLimitExceeded,
+                        previous: before,
+                        selection: before,
+                        revision: expectedRevision,
+                        attempts: attempt
+                    )
+                }
+            default:
+                return outcome
             }
         }
 
-        if let propagationRegistration {
-            await workspaceManager.propagateMCPSelectionToPeerHosts(
-                MCPSelectionPeerPropagation(
-                    identity: identity,
-                    selection: after,
-                    sourceRevision: propagationRegistration.sourceRevision,
-                    peerHostIDs: propagationRegistration.peerHostIDs,
-                    mirrorToUIIfActive: mirrorToUIIfActive
-                )
-            )
-        }
-
-        return TransactionResult(
-            identity: identity,
-            before: before,
-            after: after,
-            revision: canonicalRevision
+        return mutationOutcome(
+            .retryLimitExceeded,
+            previous: before,
+            selection: before,
+            revision: expectedRevision,
+            attempts: 3
         )
     }
 
@@ -572,7 +714,7 @@ final class WorkspaceSelectionCoordinator {
               target.tabID == tabID,
               target.selection == selection
         else { return }
-        let revision = selectionRevisionByIdentity[target.identity]
+        let revision = mirrorRevisionByIdentity[target.identity]
         await enqueueSelectionMirror(target, selectionRevision: revision == 0 ? nil : revision)
     }
 
@@ -612,7 +754,7 @@ final class WorkspaceSelectionCoordinator {
             }
 
             let revisionIsCurrent = selectionRevision.map {
-                self.selectionRevisionByIdentity[target.identity] == $0
+                self.mirrorRevisionByIdentity[target.identity] == $0
             } ?? true
             var attemptedTarget: WorkspaceSelectionMirrorTarget?
             if revisionIsCurrent,
@@ -755,22 +897,216 @@ final class WorkspaceSelectionCoordinator {
 
     @discardableResult
     private func recordSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
-        nextSelectionRevision &+= 1
-        selectionRevisionByIdentity[identity] = nextSelectionRevision
-        return nextSelectionRevision
+        nextMirrorRevision &+= 1
+        mirrorRevisionByIdentity[identity] = nextMirrorRevision
+        return nextMirrorRevision
     }
 
-    private func persist(
+    private struct SelectionMutationFence {
+        let hostID: ObjectIdentifier
+        let sessionID: WorkspaceSessionID?
+        let activeContextRevision: UInt64?
+    }
+
+    private func makeMutationFence(
+        for identity: WorkspaceSelectionIdentity,
+        workspaceManager: any WorkspaceSelectionHost
+    ) -> SelectionMutationFence {
+        SelectionMutationFence(
+            hostID: ObjectIdentifier(workspaceManager),
+            sessionID: workspaceManager.selectedWorkspaceSessionID,
+            activeContextRevision: identity == activeSelectionIdentity()
+                ? workspaceManager.selectionMirrorContextRevision
+                : nil
+        )
+    }
+
+    private func mutationFenceFailure(
+        _ fence: SelectionMutationFence,
+        for identity: WorkspaceSelectionIdentity,
+        workspaceManager: any WorkspaceSelectionHost
+    ) -> WorkspaceSelectionMutationDisposition? {
+        guard ObjectIdentifier(workspaceManager) == fence.hostID,
+              workspaceManager.selectedWorkspaceSessionID == fence.sessionID
+        else { return .activationChanged }
+        guard workspaceManager.composeTab(for: identity) != nil else { return .identityChanged }
+        if let activeContextRevision = fence.activeContextRevision {
+            guard identity == activeSelectionIdentity(),
+                  workspaceManager.selectionMirrorContextRevision == activeContextRevision
+            else { return .identityChanged }
+        }
+        return nil
+    }
+
+    private func mutationOutcome(
+        _ disposition: WorkspaceSelectionMutationDisposition,
+        previous: StoredSelection,
+        selection: StoredSelection,
+        revision: UInt64? = nil,
+        attempts: Int
+    ) -> WorkspaceSelectionMutationOutcome {
+        WorkspaceSelectionMutationOutcome(
+            disposition: disposition,
+            previousSelection: previous,
+            selection: selection,
+            revision: revision,
+            attempts: attempts
+        )
+    }
+
+    private func commitCanonicalSelection(
         _ selection: StoredSelection,
         for identity: WorkspaceSelectionIdentity,
-        peerMutationFence: MCPSelectionPeerMutationFence? = nil
-    ) -> UInt64? {
-        guard let workspaceManager, var tab = workspaceManager.composeTab(for: identity) else { return nil }
-        guard tab.selection != selection else { return nil }
-        guard canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager) else { return nil }
-        tab.selection = selection
-        tab.lastModified = Date()
-        guard workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: identity.workspaceID) else { return nil }
-        return recordSelectionRevision(for: identity)
+        expectedRevision: UInt64,
+        previousSelection: StoredSelection,
+        attempts: Int,
+        peerMutationFence: MCPSelectionPeerMutationFence? = nil,
+        workspaceManager: any WorkspaceSelectionHost
+    ) async -> WorkspaceSelectionMutationOutcome {
+        guard canApplyPeerMirror(peerMutationFence, workspaceManager: workspaceManager) else {
+            return mutationOutcome(
+                .activationChanged,
+                previous: previousSelection,
+                selection: previousSelection,
+                revision: expectedRevision,
+                attempts: attempts
+            )
+        }
+
+        guard let result = await workspaceManager.commitSelectionThroughSelectedSession(
+            selection,
+            for: identity,
+            expectedRevision: expectedRevision,
+            source: "workspace-selection-coordinator"
+        ) else {
+            return mutationOutcome(
+                .commandIngressUnavailable,
+                previous: previousSelection,
+                selection: previousSelection,
+                revision: expectedRevision,
+                attempts: attempts
+            )
+        }
+
+        switch result {
+        case let .committed(receipt):
+            return mutationOutcome(
+                .committed,
+                previous: previousSelection,
+                selection: selection,
+                revision: receipt.selectionRevision ?? expectedRevision,
+                attempts: attempts
+            )
+        case let .unchanged(receipt):
+            return mutationOutcome(
+                .unchanged,
+                previous: previousSelection,
+                selection: selection,
+                revision: receipt.selectionRevision ?? expectedRevision,
+                attempts: attempts
+            )
+        case let .stale(snapshot, _):
+            guard let latest = snapshot.selection(
+                workspaceID: identity.workspaceID,
+                tabID: identity.tabID
+            ) else {
+                return mutationOutcome(
+                    .identityChanged,
+                    previous: previousSelection,
+                    selection: previousSelection,
+                    revision: expectedRevision,
+                    attempts: attempts
+                )
+            }
+            return mutationOutcome(
+                .stale,
+                previous: previousSelection,
+                selection: latest,
+                revision: snapshot.selectionRevision(
+                    workspaceID: identity.workspaceID,
+                    tabID: identity.tabID
+                ),
+                attempts: attempts
+            )
+        case .notReady:
+            return mutationOutcome(
+                .notReady,
+                previous: previousSelection,
+                selection: previousSelection,
+                revision: expectedRevision,
+                attempts: attempts
+            )
+        case .rejected:
+            return mutationOutcome(
+                .rejected,
+                previous: previousSelection,
+                selection: previousSelection,
+                revision: expectedRevision,
+                attempts: attempts
+            )
+        case .failed:
+            return mutationOutcome(
+                .failed,
+                previous: previousSelection,
+                selection: previousSelection,
+                revision: expectedRevision,
+                attempts: attempts
+            )
+        }
+    }
+
+    private func finalizeSelectionMutation(
+        previous: StoredSelection,
+        selection: StoredSelection,
+        identity: WorkspaceSelectionIdentity,
+        source: Source,
+        mirrorToUI: Bool,
+        mirrorToUIIfActive: Bool,
+        propagationRegistration: MCPSelectionPropagationRegistration?,
+        peerMutationFence: MCPSelectionPeerMutationFence?,
+        workspaceManager: any WorkspaceSelectionHost
+    ) async {
+        let changed = previous != selection
+        if source.isMCPSelectionSource {
+            updateMCPSelectionPresentation(selection, for: identity, workspaceManager: workspaceManager)
+        }
+
+        if changed {
+            let change = Change(tabID: identity.tabID, selection: selection, source: source)
+            if mirrorToUI, source.isMCPSelectionSource {
+                changeSubject.send(change)
+                await enqueueMCPSelectionMirror(
+                    selection,
+                    for: identity,
+                    revision: recordSelectionRevision(for: identity),
+                    peerMutationFence: peerMutationFence
+                )
+            } else if mirrorToUI {
+                await applySelectionMirror {
+                    changeSubject.send(change)
+                }
+            } else {
+                changeSubject.send(change)
+            }
+        } else if mirrorToUI, source.isMCPSelectionSource {
+            await enqueueMCPSelectionMirror(
+                selection,
+                for: identity,
+                revision: recordSelectionRevision(for: identity),
+                peerMutationFence: peerMutationFence
+            )
+        }
+
+        if let propagationRegistration {
+            await workspaceManager.propagateMCPSelectionToPeerHosts(
+                MCPSelectionPeerPropagation(
+                    identity: identity,
+                    selection: selection,
+                    sourceRevision: propagationRegistration.sourceRevision,
+                    peerHostIDs: propagationRegistration.peerHostIDs,
+                    mirrorToUIIfActive: mirrorToUIIfActive
+                )
+            )
+        }
     }
 }

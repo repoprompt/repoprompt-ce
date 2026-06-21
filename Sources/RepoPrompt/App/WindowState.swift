@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -110,6 +111,12 @@ class WindowState: ObservableObject {
 
     private(set) static var windowCounter = 0
     let windowID: Int
+    let workspaceSessionID: WorkspaceSessionID
+    let workspaceSessionCommandClient: WorkspaceSessionCommandClient?
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
+    let workspaceSessionObservationBridge: WorkspaceSessionObservationBridge?
+    private let workspaceSessionActivationTask: Task<Void, Never>?
+    private let workspaceSessionShutdown: @Sendable () async -> Void
 
     @Published var kind: WindowKind = .standard
 
@@ -363,6 +370,12 @@ class WindowState: ObservableObject {
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore
+        workspaceSessionID = composition.workspaceSessionID
+        workspaceSessionCommandClient = composition.workspaceSessionCommandClient
+        workspaceSessionQuery = composition.workspaceSessionQuery
+        workspaceSessionObservationBridge = composition.workspaceSessionObservationBridge
+        workspaceSessionActivationTask = composition.workspaceSessionActivationTask
+        workspaceSessionShutdown = composition.workspaceSessionShutdown
         workspaceSearchService = composition.workspaceSearchService
         selectionCoordinator = composition.selectionCoordinator
         workspaceFilesViewModel = composition.workspaceFilesViewModel
@@ -1194,7 +1207,7 @@ class WindowState: ObservableObject {
                 // If ephemeral == true, mark existing workspace ephemeral (edge case)
                 if shouldBeEphemeral {
                     if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
+                        workspaceManager.setWorkspaceEphemeral(workspaceManager.workspaces[index].id, true)
                     }
                 }
 
@@ -1234,7 +1247,7 @@ class WindowState: ObservableObject {
                 // If ephemeral == true, mark that workspace ephemeral
                 if shouldBeEphemeral {
                     if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
+                        workspaceManager.setWorkspaceEphemeral(workspaceManager.workspaces[index].id, true)
                     }
                 }
 
@@ -1302,6 +1315,9 @@ class WindowState: ObservableObject {
     func tearDown() async {
         beginClose()
         await promptManager.gitViewModel.shutdownForWindowClose()
+        workspaceSessionObservationBridge?.stop()
+        workspaceSessionActivationTask?.cancel()
+        await workspaceSessionShutdown()
 
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG
