@@ -4,6 +4,11 @@ struct AgentSessionSidebarSnapshot: Equatable {
     var searchText: String
     var visibleSessionCount: Int
     var collapsedThreadKeys: Set<AgentSidebarThreadKey> = []
+    /// Thread keys that have already received one-shot default collapse handling
+    /// during this view-model lifetime. Explicit user expand/collapse actions
+    /// and Expand All mark keys handled so later renders do not immediately
+    /// re-collapse them by default.
+    var defaultCollapsedThreadKeysHandled: Set<AgentSidebarThreadKey> = []
     /// Per-tab "unseen" run-state attention. Populated when a session's run
     /// transitions to a user-relevant state (completed / failed / waiting) in
     /// the background — i.e. while the user is looking at a different tab —
@@ -39,6 +44,7 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         } else {
             next.collapsedThreadKeys.remove(key)
         }
+        next.defaultCollapsedThreadKeysHandled.insert(key)
         _ = publish(next, eventName: "sessionSidebar.threadCollapse", force: false)
     }
 
@@ -50,6 +56,22 @@ final class AgentSessionSidebarUIStore: ObservableObject {
         var next = snapshot
         next.collapsedThreadKeys.removeAll()
         _ = publish(next, eventName: "sessionSidebar.threadCollapse.clear", force: false)
+    }
+
+    func expandAllSidebarThreads(eligibleKeys: [AgentSidebarThreadKey]) {
+        var next = snapshot
+        next.collapsedThreadKeys.removeAll()
+        next.defaultCollapsedThreadKeysHandled.formUnion(eligibleKeys)
+        _ = publish(next, eventName: "sessionSidebar.threadCollapse.expandAll", force: false)
+    }
+
+    func seedDefaultCollapsedThreads(eligibleKeys: [AgentSidebarThreadKey]) {
+        let newKeys = eligibleKeys.filter { !snapshot.defaultCollapsedThreadKeysHandled.contains($0) }
+        guard !newKeys.isEmpty else { return }
+        var next = snapshot
+        next.collapsedThreadKeys.formUnion(newKeys)
+        next.defaultCollapsedThreadKeysHandled.formUnion(newKeys)
+        _ = publish(next, eventName: "sessionSidebar.threadCollapse.seedDefaults", force: false)
     }
 
     // MARK: - Run-state attention

@@ -349,20 +349,56 @@ extension AgentModeViewModel {
 
     func collapsibleSidebarThreadKeys(
         for tabs: [ComposeTabState],
-        currentTabID: UUID?,
+        currentTabID _: UUID?,
         searchText: String,
-        diagnosticSource: String? = nil
+        diagnosticSource _: String? = nil
     ) -> [AgentSidebarThreadKey] {
-        filteredSidebarSessions(
+        guard searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
+        let rows = sidebarSessions(for: tabs)
+        guard !rows.isEmpty else { return [] }
+        return rows.indices.compactMap { index in
+            let nextIndex = rows.index(after: index)
+            guard nextIndex < rows.endIndex,
+                  rows[nextIndex].depth > rows[index].depth
+            else { return nil }
+            return AgentSidebarThreadKey.key(sessionID: rows[index].sessionID, tabID: rows[index].tabID)
+        }
+    }
+
+    func displaySidebarSessions(
+        for tabs: [ComposeTabState],
+        currentTabID: UUID?,
+        searchText: String? = nil,
+        diagnosticSource: String? = nil
+    ) -> [SidebarSession] {
+        let effectiveSearchText = searchText ?? sessionSidebarSearchText
+        if effectiveSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            seedDefaultCollapsedSidebarThreads(
+                for: tabs,
+                currentTabID: currentTabID,
+                diagnosticSource: diagnosticSource.map { "\($0).seedDefaults" } ?? "display.seedDefaults"
+            )
+        }
+        return filteredSidebarSessions(
             for: tabs,
             currentTabID: currentTabID,
-            searchText: searchText,
+            searchText: effectiveSearchText,
             diagnosticSource: diagnosticSource
         )
-        .compactMap { row in
-            guard row.depth == 0, row.hasThreadChildren, let key = row.threadKey else { return nil }
-            return key
-        }
+    }
+
+    private func seedDefaultCollapsedSidebarThreads(
+        for tabs: [ComposeTabState],
+        currentTabID: UUID?,
+        diagnosticSource: String
+    ) {
+        let eligibleKeys = collapsibleSidebarThreadKeys(
+            for: tabs,
+            currentTabID: currentTabID,
+            searchText: "",
+            diagnosticSource: diagnosticSource
+        )
+        ui.sessionSidebar.seedDefaultCollapsedThreads(eligibleKeys: eligibleKeys)
     }
 
     func filteredSidebarSessions(
