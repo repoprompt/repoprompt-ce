@@ -895,6 +895,17 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
                 )
             )
             var currentBindings = [bindingA, secondaryBindingA]
+            let materializer = WorkspaceRootBindingProjectionMaterializer(
+                store: window.workspaceFileContextStore
+            )
+            let commitOwnership: ([AgentSessionWorktreeBinding]) async throws -> Void = { bindings in
+                let preparation = try await materializer.prepare(
+                    sessionID: sessionID,
+                    bindings: bindings
+                )
+                let projection = try await materializer.commit(preparation)
+                XCTAssertTrue(projection?.isFullyMaterialized == true)
+            }
 
             var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
             liveTab.activeAgentSessionID = sessionID
@@ -951,6 +962,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             window.mcpServer.tabContextByConnectionID[connectionID] = oldPhysicalSnapshot
 
             currentBindings = [bindingB, secondaryBindingB]
+            try await commitOwnership(currentBindings)
             window.mcpServer.publishLiveWorktreeBindingSwitch(
                 sessionID: sessionID,
                 tabID: tabID,
@@ -1008,6 +1020,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             await resolutionGate.waitUntilStarted()
 
             currentBindings = [bindingA, secondaryBindingB]
+            try await commitOwnership(currentBindings)
             window.mcpServer.publishLiveWorktreeBindingSwitch(
                 sessionID: sessionID,
                 tabID: tabID,
