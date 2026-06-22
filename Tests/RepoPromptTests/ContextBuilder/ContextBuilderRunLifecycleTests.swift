@@ -321,6 +321,10 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             )
             let clientName = "context-builder-cleanup-commit-test"
             let expectedPrompt = "context retained after peer EOF cleanup"
+            var tab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            tab.promptText = expectedPrompt
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(tab, inWorkspaceID: activeWorkspace.id))
+            window.workspaceManager.promptViewModel.promptText = expectedPrompt
 
             let connectionID = UUID()
             let runID = UUID()
@@ -378,6 +382,7 @@ final class ContextBuilderRunLifecycleTests: XCTestCase {
             XCTAssertEqual(commitOutcome.committedTab?.nestedRunID, runID)
             XCTAssertEqual(commitOutcome.committedTab?.identity.workspaceID, activeWorkspace.id)
             XCTAssertEqual(commitOutcome.committedTab?.identity.tabID, tabID)
+            XCTAssertEqual(commitOutcome.committedTab?.tab.promptText, expectedPrompt)
             XCTAssertEqual(window.workspaceManager.composeTab(with: tabID)?.promptText, expectedPrompt)
             XCTAssertFalse(
                 window.mcpServer.isDetachedContextBuilderConnection(
