@@ -344,12 +344,22 @@ class WindowState: ObservableObject {
             )
         }
 
+        convenience init(appCoreContainer: RepoPromptAppCoreContainer) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                appCoreContainer: appCoreContainer
+            )
+        }
+
     #endif
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
-        codexModelPollingService: CodexModelPollingService
+        codexModelPollingService: CodexModelPollingService,
+        appCoreContainer: RepoPromptAppCoreContainer? = nil
     ) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
@@ -368,6 +378,7 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            appCoreContainer: appCoreContainer,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
             codexModelPollingService: codexModelPollingService

@@ -2667,13 +2667,32 @@ class PromptViewModel: ObservableObject {
         flushAndSnapshotSourceTabIfNeeded(for: strategy, in: manager, workspaceIndex: index)
         guard let newTab = makeComposeTab(for: strategy, explicitName: name, workspaceIndex: index, manager: manager) else { return nil }
 
-        // Append but do NOT change activeComposeTabID
-        manager.mutateWorkspaceReceiptFirst(
-            workspaceID: workspace.id,
+        // Selected-session composition must project the new tab before callers bind Agent state to it.
+        // Legacy and direct-mutation test fixtures retain their existing local mutation behavior.
+        let selectedCreateResult = await manager.executeSelectedWorkspaceCommand(
+            .composeTab(.create(workspaceID: workspace.id, tab: newTab, makeActive: false)),
             source: "prompt-create-background-compose-tab"
-        ) { $0.composeTabs.append(newTab) }
+        )
+        switch selectedCreateResult {
+        case .committed, .unchanged:
+            break
+        case nil:
+            manager.mutateWorkspaceReceiptFirst(
+                workspaceID: workspace.id,
+                source: "prompt-create-background-compose-tab"
+            ) { $0.composeTabs.append(newTab) }
+        case .stale, .notReady, .rejected, .failed:
+            return nil
+        }
+
+        guard
+            let projectedWorkspace = manager.workspace(withID: workspace.id),
+            projectedWorkspace.composeTabs.contains(where: { $0.id == newTab.id }),
+            manager.activeWorkspace?.id == workspace.id
+        else { return nil }
+
         // Keep existing active tab; just sync lists
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
+        loadComposeTabsFromWorkspace(projectedWorkspace)
 
         manager.markWorkspaceDirty()
         manager.pollAndSaveState()

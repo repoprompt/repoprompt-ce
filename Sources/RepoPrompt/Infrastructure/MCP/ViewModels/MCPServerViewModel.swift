@@ -406,6 +406,10 @@ final class MCPServerViewModel: ObservableObject {
             try await agentRunToolService.execute(args: args)
         }
 
+        func executeAgentManageForTesting(args: [String: Value]) async throws -> Value {
+            try await agentManageToolService.execute(args: args)
+        }
+
         func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
             try await oracleToolService.executeAskOracle(args: args)
         }

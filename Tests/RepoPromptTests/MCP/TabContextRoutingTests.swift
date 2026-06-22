@@ -2411,6 +2411,138 @@ final class TabContextRoutingTests: XCTestCase {
             )
             await window.tearDown()
         }
+
+        @MainActor
+        func testAgentRunPublicStartCommitsSelectedBackgroundTabBeforeBinding() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState(appCoreContainer: RepoPromptAppCoreContainer(debugOverride: .core))
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            addTeardownBlock { @MainActor in
+                window.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+                window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+                WindowStatesManager.shared.unregisterWindowState(window)
+                await window.tearDown()
+            }
+
+            await window.workspaceManager.awaitInitialized()
+            let client = try XCTUnwrap(window.workspaceSessionCommandClient)
+            let sourceTabID = UUID()
+            let workspace = WorkspaceModel(
+                name: "Selected Agent Run binding",
+                repoPaths: [],
+                ephemeralFlag: true,
+                composeTabs: [ComposeTabState(id: sourceTabID, name: "Source")],
+                activeComposeTabID: sourceTabID
+            )
+            let workspaceResult = await client.execute(
+                .workspace(.create(workspace, makeActive: false)),
+                source: WorkspaceSessionCommandSource(kind: "test-agent-run-selected-workspace")
+            )
+            switch workspaceResult {
+            case .committed, .unchanged:
+                break
+            default:
+                return XCTFail("Expected selected workspace installation, got \(workspaceResult)")
+            }
+            let installedWorkspace = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+            let switchResult = await window.workspaceManager.switchWorkspace(
+                to: installedWorkspace,
+                saveState: false,
+                reason: "test-agent-run-selected-workspace"
+            )
+            XCTAssertEqual(switchResult, .switched)
+            XCTAssertEqual(window.workspaceManager.activeWorkspace?.id, workspace.id)
+            XCTAssertEqual(window.promptManager.activeComposeTabID, sourceTabID)
+
+            let connectionID = UUID()
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: connectionID,
+                clientName: "public-start-selected-binding",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: MCPExplicitWindowRoutingHint(
+                    connectionID: connectionID,
+                    toolName: "agent_run",
+                    windowID: window.windowID,
+                    windowStateIdentity: ObjectIdentifier(window),
+                    serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                    runtimeAdapterTicket: nil,
+                    provenance: .hiddenWindowArgument
+                )
+            ))
+            window.apiSettingsViewModel.isCodexConnected = true
+            var dispatchedTabID: UUID?
+            window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                _, tabID, _, _, viewModel in
+                dispatchedTabID = tabID
+                let session = viewModel.session(for: tabID)
+                let runID = UUID()
+                session.runID = runID
+                session.runState = .running
+                guard viewModel.mcpBindPendingAgentRunOracleReviewContext(
+                    tabID: tabID,
+                    runID: runID
+                ) != nil else {
+                    throw MCPError.internalError("Selected Agent Run did not promote its launch source.")
+                }
+                return .startedRun
+            }
+
+            let sessionName = "Selected detached explore"
+            let startValue = try await window.mcpServer.executeAgentRunForTesting(args: [
+                "op": .string("start"),
+                "message": .string("Inspect the selected-session binding race."),
+                "model_id": .string("explore"),
+                "session_name": .string(sessionName),
+                "detach": .bool(true),
+                "timeout": .int(0)
+            ])
+            let startObject = try XCTUnwrap(startValue.objectValue)
+            let returnedSessionID = try XCTUnwrap(
+                startObject["session_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            let returnedTabID = try XCTUnwrap(
+                startObject["session"]?.objectValue?["context_id"]?.stringValue.flatMap(UUID.init(uuidString:))
+            )
+            XCTAssertEqual(dispatchedTabID, returnedTabID)
+
+            _ = await client.flushTrackedTasks()
+            let projectedWorkspace = try XCTUnwrap(window.workspaceManager.workspace(withID: workspace.id))
+            let namedTabs = projectedWorkspace.composeTabs.filter { $0.name == sessionName }
+            XCTAssertEqual(namedTabs.count, 1)
+            let namedTab = try XCTUnwrap(namedTabs.first)
+            XCTAssertEqual(namedTab.id, returnedTabID)
+            XCTAssertEqual(namedTab.activeAgentSessionID, returnedSessionID)
+            XCTAssertEqual(
+                window.agentModeViewModel.session(for: returnedTabID).activeAgentSessionID,
+                returnedSessionID
+            )
+            guard case let .unique(boundTabID) = window.agentModeViewModel.test_bindingResolution(
+                sessionID: returnedSessionID
+            ) else {
+                return XCTFail("Expected a unique Agent session binding")
+            }
+            XCTAssertEqual(boundTabID, returnedTabID)
+
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: nil,
+                clientName: "public-start-selected-list-sessions",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            ))
+            let listValue = try await window.mcpServer.executeAgentManageForTesting(args: [
+                "op": .string("list_sessions")
+            ])
+            let listedSessions = try XCTUnwrap(listValue.objectValue?["sessions"]?.arrayValue)
+            let matchingSessions = listedSessions.compactMap(\.objectValue).filter {
+                $0["session_id"]?.stringValue == returnedSessionID.uuidString
+            }
+            XCTAssertEqual(matchingSessions.count, 1)
+            XCTAssertEqual(matchingSessions.first?["name"]?.stringValue, sessionName)
+            XCTAssertEqual(matchingSessions.first?["is_live"]?.boolValue, true)
+        }
     #endif
 
     #if DEBUG
