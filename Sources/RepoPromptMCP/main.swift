@@ -388,6 +388,104 @@ actor ClientIdentityCache {
     }
 }
 
+struct MCPInitializeReplayPlan: Equatable {
+    let initializeFrame: Data
+    let initializeRequestID: JSONRPCBridgeID
+    let initializedFrame: Data
+}
+
+enum MCPInitializeReplayUnavailableReason: String, Swift.Error, Equatable {
+    case missingInitializeFrame = "mcp_session_resume_unsupported_missing_initialize_frame"
+    case initializeResponseNotDelivered = "mcp_session_resume_unsupported_initialize_response_not_delivered"
+    case missingInitializedNotification = "mcp_session_resume_unsupported_missing_initialized_notification"
+
+    var terminalReason: String {
+        rawValue
+    }
+}
+
+actor MCPInitializeReplayState {
+    private var initializeFrame: Data?
+    private var initializeRequestID: JSONRPCBridgeID?
+    private var initializedFrame: Data?
+    private var initializeResponseDeliveredToHost = false
+
+    func recordForwardedClientFrame(_ frame: Data) {
+        guard let object = Self.jsonObject(from: frame),
+              let method = object["method"] as? String
+        else {
+            return
+        }
+
+        if method == "initialize",
+           initializeFrame == nil,
+           let id = Self.jsonRPCID(from: object["id"]),
+           id != .null
+        {
+            initializeFrame = frame
+            initializeRequestID = id
+            debugLog("MCPInitializeReplayState: cached initialize frame id=\(id)")
+            return
+        }
+
+        if method == "notifications/initialized",
+           object["id"] == nil
+        {
+            initializedFrame = frame
+            debugLog("MCPInitializeReplayState: cached initialized notification")
+        }
+    }
+
+    func recordDeliveredServerFrame(_ frame: Data) {
+        guard !initializeResponseDeliveredToHost,
+              let initializeRequestID,
+              let object = Self.jsonObject(from: frame),
+              let id = Self.jsonRPCID(from: object["id"]),
+              id == initializeRequestID,
+              object["result"] != nil,
+              object["error"] == nil
+        else {
+            return
+        }
+
+        initializeResponseDeliveredToHost = true
+        debugLog("MCPInitializeReplayState: initialize response delivered to host id=\(id)")
+    }
+
+    func replayPlan() -> Result<MCPInitializeReplayPlan, MCPInitializeReplayUnavailableReason> {
+        guard let initializeFrame, let initializeRequestID else {
+            return .failure(.missingInitializeFrame)
+        }
+        guard initializeResponseDeliveredToHost else {
+            return .failure(.initializeResponseNotDelivered)
+        }
+        guard let initializedFrame else {
+            return .failure(.missingInitializedNotification)
+        }
+
+        return .success(MCPInitializeReplayPlan(
+            initializeFrame: initializeFrame,
+            initializeRequestID: initializeRequestID,
+            initializedFrame: initializedFrame
+        ))
+    }
+
+    static func jsonObject(from frame: Data) -> [String: Any]? {
+        (try? JSONSerialization.jsonObject(with: frame)) as? [String: Any]
+    }
+
+    static func jsonRPCID(from value: Any?) -> JSONRPCBridgeID? {
+        guard let value else { return nil }
+        if value is NSNull { return .null }
+        if let string = value as? String { return .string(string) }
+        if let number = value as? NSNumber {
+            guard CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+            return .number(number.int64Value)
+        }
+        return nil
+    }
+}
+
 /// Socket proxy errors
 enum SocketProxyError: Swift.Error, LocalizedError {
     case socketCreationFailed(errno: Int32)
@@ -785,6 +883,8 @@ actor BootstrapSocketProxy {
     private let sessionToken: String
     private let clientName: String?
     private let identityCache: ClientIdentityCache
+    private let initializeReplayState: MCPInitializeReplayState
+    private let replayInitializationOnStart: Bool
     private let bridgeLedger: JSONRPCBridgeLedger
     private let faultRule: JSONRPCBridgeFaultRule?
     private var socketFD: Int32 = -1
@@ -793,6 +893,8 @@ actor BootstrapSocketProxy {
         sessionToken: String,
         clientName: String?,
         identityCache: ClientIdentityCache,
+        initializeReplayState: MCPInitializeReplayState,
+        replayInitializationOnStart: Bool,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?
     ) {
@@ -800,6 +902,8 @@ actor BootstrapSocketProxy {
         self.sessionToken = sessionToken
         self.clientName = clientName
         self.identityCache = identityCache
+        self.initializeReplayState = initializeReplayState
+        self.replayInitializationOnStart = replayInitializationOnStart
         self.bridgeLedger = bridgeLedger
         self.faultRule = faultRule
     }
@@ -826,6 +930,10 @@ actor BootstrapSocketProxy {
         case "accepted":
             log.debug("BootstrapSocketProxy: Handshake accepted, starting bridge")
             debugLog("Handshake accepted, starting stdin/stdout bridge")
+            if replayInitializationOnStart {
+                let plan = try await Self.requireReplayPlan(from: initializeReplayState)
+                try await Self.replayInitializedSession(plan, socketFD: socketFD)
+            }
 
         case "rejected":
             log.warning("BootstrapSocketProxy: Handshake rejected: \(response.reason ?? "unknown")")
@@ -847,11 +955,13 @@ actor BootstrapSocketProxy {
         // preventing stdin→socket from ever running again.
         let fd = socketFD
         let cache = identityCache
+        let replayState = initializeReplayState
         let ledger = bridgeLedger
         let faultRule = faultRule
         try await Self.runBridge(
             socketFD: fd,
             identityCache: cache,
+            initializeReplayState: replayState,
             bridgeLedger: ledger,
             faultRule: faultRule
         )
@@ -1076,11 +1186,97 @@ private actor BridgeDrainState {
 }
 
 extension BootstrapSocketProxy {
+    private static func requireReplayPlan(
+        from replayState: MCPInitializeReplayState
+    ) async throws -> MCPInitializeReplayPlan {
+        switch await replayState.replayPlan() {
+        case let .success(plan):
+            return plan
+        case let .failure(reason):
+            throw JSONRPCBridgeLedgerError.terminal(reason.terminalReason)
+        }
+    }
+
+    static func replayInitializedSession(
+        _ plan: MCPInitializeReplayPlan,
+        socketFD: Int32,
+        timeout: TimeInterval = MCPBootstrapTiming.initialResponseTimeout
+    ) async throws {
+        debugLog("BootstrapSocketProxy: replaying MCP initialize after reconnect")
+        try writeToSocket(plan.initializeFrame, socketFD: socketFD)
+        try await readReplayInitializeResponse(
+            socketFD: socketFD,
+            expectedID: plan.initializeRequestID,
+            timeout: timeout
+        )
+        try writeToSocket(plan.initializedFrame, socketFD: socketFD)
+        debugLog("BootstrapSocketProxy: replayed MCP initialized notification after reconnect")
+    }
+
+    private static func readReplayInitializeResponse(
+        socketFD: Int32,
+        expectedID: JSONRPCBridgeID,
+        timeout: TimeInterval
+    ) async throws {
+        var buffer = Data()
+        var readBuffer = [UInt8](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            if Task.isCancelled {
+                throw SocketProxyError.cancelled
+            }
+
+            var pfd = pollfd(fd: socketFD, events: Int16(POLLIN), revents: 0)
+            let remaining = Int32(deadline.timeIntervalSinceNow * 1000)
+            let pollResult = poll(&pfd, 1, min(100, max(1, remaining)))
+
+            if pollResult < 0 {
+                if errno == EINTR { continue }
+                throw SocketProxyError.pollFailed(errno: errno)
+            }
+            if pollResult == 0 { continue }
+
+            if pfd.revents & Int16(POLLHUP | POLLERR) != 0 {
+                throw SocketProxyError.connectionReset
+            }
+
+            let bytesRead = readBuffer.withUnsafeMutableBufferPointer { ptr in
+                Darwin.read(socketFD, ptr.baseAddress!, ptr.count)
+            }
+            if bytesRead < 0 {
+                if errno == EAGAIN || errno == EINTR { continue }
+                throw SocketProxyError.readFailed(errno: errno)
+            }
+            if bytesRead == 0 {
+                throw SocketProxyError.serverClosed
+            }
+
+            buffer.append(contentsOf: readBuffer[0 ..< bytesRead])
+            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                let frame = Data(buffer[...newline])
+                guard let response = MCPInitializeReplayState.jsonObject(from: frame),
+                      let responseID = MCPInitializeReplayState.jsonRPCID(from: response["id"]),
+                      responseID == expectedID
+                else {
+                    throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_response_mismatch")
+                }
+                guard response["result"] != nil, response["error"] == nil else {
+                    throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_rejected")
+                }
+                return
+            }
+        }
+
+        throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_timeout")
+    }
+
     static func runBridge(
         socketFD: Int32,
         stdinFD: Int32 = STDIN_FILENO,
         stdoutFD: Int32 = STDOUT_FILENO,
         identityCache: ClientIdentityCache,
+        initializeReplayState: MCPInitializeReplayState? = nil,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
@@ -1097,6 +1293,7 @@ extension BootstrapSocketProxy {
                     socketFD: socketFD,
                     stdinFD: stdinFD,
                     identityCache: identityCache,
+                    initializeReplayState: initializeReplayState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule
                 )
@@ -1109,6 +1306,7 @@ extension BootstrapSocketProxy {
                     socketFD: socketFD,
                     stdoutFD: stdoutFD,
                     drainState: drainState,
+                    initializeReplayState: initializeReplayState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule,
                     socketPoller: socketPoller,
@@ -1152,6 +1350,7 @@ extension BootstrapSocketProxy {
         socketFD: Int32,
         stdinFD: Int32 = STDIN_FILENO,
         identityCache: ClientIdentityCache,
+        initializeReplayState: MCPInitializeReplayState?,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?
     ) async throws {
@@ -1244,6 +1443,7 @@ extension BootstrapSocketProxy {
                         phase: "socket_write_completed",
                         prepared: prepared
                     )
+                    await initializeReplayState?.recordForwardedClientFrame(payload)
                 }
             }
 
@@ -1342,6 +1542,7 @@ extension BootstrapSocketProxy {
         socketFD: Int32,
         stdoutFD: Int32 = STDOUT_FILENO,
         drainState: BridgeDrainState,
+        initializeReplayState: MCPInitializeReplayState?,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
@@ -1482,6 +1683,7 @@ extension BootstrapSocketProxy {
                         publicationPending: false,
                         terminalBarrier: false
                     )
+                    await initializeReplayState?.recordDeliveredServerFrame(delivered)
                 }
             }
 
@@ -1654,8 +1856,12 @@ actor MCPService: Service {
     /// Persists across startup-only reconnects so the app sees the correct client name.
     private let identityCache = ClientIdentityCache()
 
-    /// Process-lifetime correlation ledger. It deliberately survives startup reconnect attempts
-    /// so a protocol-active bridge can never be silently replaced.
+    /// Helper-owned MCP initialize replay state for app-socket reconnects after
+    /// the host session is already initialized and idle.
+    private let initializeReplayState = MCPInitializeReplayState()
+
+    /// Process-lifetime correlation ledger. It deliberately survives reconnect attempts
+    /// so only idle, fully correlated bridge states can be resumed.
     private let bridgeLedger: JSONRPCBridgeLedger
 
     // Kill signal watcher state
@@ -1953,9 +2159,10 @@ actor MCPService: Service {
                 // If runSocketLoop() returns without throwing, treat as clean exit
                 return
             } catch let err as CLIRuntimeError {
-                // Reconnection is legal only while the process is still in startup state.
-                // Once any complete protocol frame has committed—or delivery is uncertain—
-                // preserve JSON-RPC correlation by failing the stdio session closed.
+                // Reconnection is legal while the bridge ledger can prove there is no
+                // active request, pending transaction, or response in delivery. If the
+                // session already initialized, the next socket loop replays initialize
+                // privately before normal host traffic resumes.
                 let protocolActiveFailure = await bridgeLedger.recordConnectionFailure(
                     transportFailureReason(for: err)
                 )
@@ -2004,6 +2211,20 @@ actor MCPService: Service {
 
     /// Single connection attempt to the bootstrap socket.
     private func runSocketLoop() async throws {
+        let snapshotBeforeReconnect = await bridgeLedger.snapshot()
+        let replayInitialization = snapshotBeforeReconnect.hasForwardedProtocolFrame
+        if replayInitialization {
+            switch await initializeReplayState.replayPlan() {
+            case .success:
+                break
+            case let .failure(reason):
+                let terminalReason = await bridgeLedger.terminalizeConnection(reason: reason.terminalReason)
+                throw CLIRuntimeError.connectionFailed(
+                    underlying: JSONRPCBridgeLedgerError.terminal(terminalReason)
+                )
+            }
+        }
+
         _ = try await bridgeLedger.beginConnection()
 
         // Build the best available client name for the handshake:
@@ -2020,6 +2241,8 @@ actor MCPService: Service {
             sessionToken: sessionToken,
             clientName: displayName,
             identityCache: identityCache,
+            initializeReplayState: initializeReplayState,
+            replayInitializationOnStart: replayInitialization,
             bridgeLedger: bridgeLedger,
             faultRule: Self.responseDeliveryFaultRuleFromEnvironment()
         )

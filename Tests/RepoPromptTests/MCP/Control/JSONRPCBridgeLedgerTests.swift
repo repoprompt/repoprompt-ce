@@ -340,7 +340,7 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertEqual(recentCompletionCount, 2)
     }
 
-    func testStartupOnlyReconnectState() async throws {
+    func testReconnectStateAllowsStartupAndIdleInitializedFailuresOnly() async throws {
         let ledger = try await makeLedger()
         var reconnectSnapshot = await ledger.snapshot()
         XCTAssertTrue(reconnectSnapshot.canReconnect)
@@ -350,11 +350,20 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertTrue(reconnectSnapshot.canReconnect)
         _ = try await ledger.beginConnection()
 
+        try await forward(
+            line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"fixture"}}}"#),
+            .clientToServer,
+            ledger
+        )
+        try await forward(line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#), .serverToClient, ledger)
         try await forward(line(#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), .clientToServer, ledger)
-        let activeFailureWasTerminal = await ledger.recordConnectionFailure("socket_reset_after_traffic")
-        XCTAssertTrue(activeFailureWasTerminal)
+        let idleInitializedFailureWasTerminal = await ledger.recordConnectionFailure("app_socket_closed")
+        XCTAssertFalse(idleInitializedFailureWasTerminal)
         reconnectSnapshot = await ledger.snapshot()
-        XCTAssertFalse(reconnectSnapshot.canReconnect)
+        XCTAssertTrue(reconnectSnapshot.hasForwardedProtocolFrame)
+        XCTAssertTrue(reconnectSnapshot.canReconnect)
+        let resumedGeneration = try await ledger.beginConnection()
+        XCTAssertEqual(resumedGeneration, 3)
 
         let preparedLedger = try await makeLedger()
         _ = try await preparedLedger.prepare(
@@ -374,6 +383,14 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         let terminalPreparedSnapshot = await preparedLedger.snapshot()
         XCTAssertEqual(terminalPreparedSnapshot.terminalReason, "socket_reset_with_prepared_transaction")
         XCTAssertFalse(terminalPreparedSnapshot.canReconnect)
+
+        let activeLedger = try await makeLedger()
+        try await forward(request(id: "2", method: "tools/list"), .clientToServer, activeLedger)
+        let activeFailureWasTerminal = await activeLedger.recordConnectionFailure("socket_reset_with_active_request")
+        XCTAssertTrue(activeFailureWasTerminal)
+        let activeSnapshot = await activeLedger.snapshot()
+        XCTAssertEqual(activeSnapshot.terminalReason, "socket_reset_with_active_request")
+        XCTAssertFalse(activeSnapshot.canReconnect)
     }
 
     func testTraceMetadataContainsHashAndNeverPayload() async throws {

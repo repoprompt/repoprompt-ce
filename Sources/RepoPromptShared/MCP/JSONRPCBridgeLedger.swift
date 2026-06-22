@@ -429,8 +429,7 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public let terminalReason: String?
 
     public var canReconnect: Bool {
-        !hasForwardedProtocolFrame
-            && activeRequestCount == 0
+        activeRequestCount == 0
             && responseInDeliveryCount == 0
             && pendingTransactionCount == 0
             && terminalReason == nil
@@ -607,7 +606,7 @@ public actor JSONRPCBridgeLedger {
         guard terminalReason == nil else {
             throw JSONRPCBridgeLedgerError.terminal(terminalReason ?? "unknown")
         }
-        guard !hasForwardedProtocolFrame, active.isEmpty, pendingTransactions.isEmpty else {
+        guard active.isEmpty, pendingTransactions.isEmpty else {
             throw failTerminal("reconnection_attempted_after_protocol_traffic")
         }
         connectionGeneration &+= 1
@@ -1026,13 +1025,24 @@ public actor JSONRPCBridgeLedger {
             emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: terminalReason)
             return true
         }
-        guard hasForwardedProtocolFrame || !active.isEmpty || !pendingTransactions.isEmpty else {
-            emit(phase: "startup_connection_failure", direction: nil, messages: [], prepared: nil, terminalReason: nil)
+        guard !active.isEmpty || !pendingTransactions.isEmpty else {
+            let phase = hasForwardedProtocolFrame ? "idle_connection_failure" : "startup_connection_failure"
+            emit(phase: phase, direction: nil, messages: [], prepared: nil, terminalReason: nil)
             return false
         }
         _ = failTerminal(reason)
         emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
         return true
+    }
+
+    @discardableResult
+    public func terminalizeConnection(reason: String) -> String {
+        if let terminalReason {
+            return terminalReason
+        }
+        _ = failTerminal(reason)
+        emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
+        return reason
     }
 
     public func snapshot(now: TimeInterval = Date().timeIntervalSinceReferenceDate) -> JSONRPCBridgeLedgerSnapshot {
