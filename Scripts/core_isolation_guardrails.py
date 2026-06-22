@@ -133,6 +133,7 @@ ALLOWED_IMPORTS = {
     "RepoPromptHeadless": {
         "Foundation",
         "Dispatch",
+        "Darwin",
         "RepoPromptShared",
         "RepoPromptCore",
         "RepoPromptCoreMacOS",
@@ -312,6 +313,9 @@ def validate_package(package: dict[str, Any]) -> list[str]:
                 f"{name} local dependencies drifted: expected {sorted(expected_targets)}, "
                 f"got {sorted(actual_targets)}"
             )
+
+    if "RepoPromptHeadlessTests" not in targets:
+        errors.append("Phase 8 requires the RepoPromptHeadlessTests target")
 
     for name, expected in EXPECTED_EXISTING_LOCAL_DEPENDENCIES.items():
         target = targets.get(name)
@@ -678,11 +682,63 @@ def validate_sources(root: Path) -> list[str]:
             "CorePromptFactualContextProvider(", "LegacyPromptFactualContextProvider(",
             "WorkspaceRuntimeLifecycleRegistry(", "MCPAppRuntimeAdapterRegistry("
         )
+        combined_headless = ""
         for file in sorted(headless_root.rglob("*.swift")):
             text = file.read_text(encoding="utf-8")
+            combined_headless += "\n" + text
             for forbidden in forbidden_headless:
                 if forbidden in text:
                     errors.append(f"{file.relative_to(root)} must not instantiate Phase 5 app session authority")
+            for forbidden in ("MCPFilesystemIdentity", "UserDefaults", "repoprompt-ce-D-", "repoprompt-ce-"):
+                if forbidden in text:
+                    errors.append(f"{file.relative_to(root)} leaks app/proxy identity into standalone headless")
+            if "FileHandle.standardOutput" in text and file.name not in {"HeadlessStdoutWriter.swift", "HeadlessOutput.swift"}:
+                errors.append(f"{file.relative_to(root)} writes stdout outside the reviewed headless writers")
+        required_markers = (
+            '"bind_context"', '"manage_workspaces"', '"manage_selection"',
+            '"workspace_context"', '"get_file_tree"', '"get_code_structure"',
+            '"read_file"', '"file_search"', '"prompt"',
+            '"com.pvncher.repoprompt.ce.headless.keychain"',
+            '.appendingPathComponent("v1", isDirectory: true)',
+            "HeadlessSecureFileAccess", "O_NOFOLLOW", "openat(",
+        )
+        for marker in required_markers:
+            if marker not in combined_headless:
+                errors.append(f"RepoPromptHeadless is missing frozen Phase 8 marker: {marker}")
+        registry = root / "Sources/RepoPromptHeadless/MCP/HeadlessToolRegistry.swift"
+        if registry.is_file():
+            registry_text = registry.read_text(encoding="utf-8")
+            registrations = re.findall(r'Registration\(name: "([^"]+)", capability: \.safeProfile\)', registry_text)
+            expected_tools = [
+                "bind_context", "manage_workspaces", "manage_selection", "workspace_context",
+                "get_file_tree", "get_code_structure", "read_file", "file_search", "prompt",
+            ]
+            if registrations != expected_tools:
+                errors.append(f"headless safe tool registry drifted: expected {expected_tools}, got {registrations}")
+        for tool_file in sorted((headless_root / "MCP/Tools").glob("*.swift")):
+            tool_text = tool_file.read_text(encoding="utf-8")
+            for forbidden in ("Data(contentsOf:", "String(contentsOf:", "FileHandle(forReadingFrom:"):
+                if forbidden in tool_text:
+                    errors.append(f"{tool_file.relative_to(root)} bypasses HeadlessSecureFileAccess")
+
+    required_headless_scripts = (
+        "Scripts/package_headless.sh",
+        "Scripts/build_headless_release_product.sh",
+        "Scripts/headless_artifact_manifest.py",
+        "Scripts/verify_headless_package.sh",
+        "Scripts/install_headless.sh",
+        "Scripts/smoke_packaged_headless_roundtrip.sh",
+    )
+    for relative in required_headless_scripts:
+        if not (root / relative).is_file():
+            errors.append(f"missing Phase 8 standalone control-plane file: {relative}")
+    for relative in ("Scripts/package_headless.sh", "Scripts/install_headless.sh", "Scripts/build_headless_release_product.sh"):
+        path = root / relative
+        if path.is_file():
+            text = path.read_text(encoding="utf-8")
+            for forbidden in ("package_app.sh", "install_debug_cli.sh", "smoke_packaged_mcp_roundtrip.sh", "MCPFilesystemIdentity", "repoprompt-ce-D-7.sock", "repoprompt-ce-7.sock"):
+                if forbidden in text:
+                    errors.append(f"{relative} must remain standalone; found {forbidden}")
 
     legacy_bridge = root / "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h"
     if legacy_bridge.exists():
@@ -761,7 +817,7 @@ def validate_sources(root: Path) -> list[str]:
     if package_script.is_file() and re.search(
         r"RepoPromptHeadless|repoprompt-headless|rpce-headless", package_script.read_text(encoding="utf-8")
     ):
-        errors.append("Scripts/package_app.sh must remain app/proxy-only until Phase 8")
+        errors.append("Scripts/package_app.sh must remain app/proxy-only and exclude standalone headless")
     app_bundle = root / "AppBundle"
     if app_bundle.is_dir():
         for file in sorted(path for path in app_bundle.rglob("*") if path.is_file()):

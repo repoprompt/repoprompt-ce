@@ -18,13 +18,13 @@ The generator writes `.build/xcode/RepoPromptCE.xcworkspace`. Everything under `
 
 ## Schemes in Xcode 26.3
 
-Xcode exposes SwiftPM product schemes, including `RepoPrompt`, `repoprompt-mcp`, and the Phase 1 `repoprompt-headless` scaffold, alongside exactly three repository convenience schemes. The generated project also reflects the `RepoPromptCore`, `RepoPromptCoreMacOS`, `RepoPromptPOSIXSupport`, and `RepoPromptSyntaxCBridge` target roots for indexing without redefining their package dependencies:
+Xcode exposes SwiftPM product schemes, including `RepoPrompt`, `repoprompt-mcp`, and the active Phase 8 `repoprompt-headless` build/test scheme, alongside exactly three repository convenience schemes. The generated project also reflects the `RepoPromptCore`, `RepoPromptCoreMacOS`, `RepoPromptPOSIXSupport`, and `RepoPromptSyntaxCBridge` target roots for indexing without redefining their package dependencies:
 
 - `RepoPrompt CE App` delegates to conductor to assemble the real debug app through the existing packaging flow, verifies the `.build/debug/RepoPrompt.app` compatibility path, then runs the local debug bundle under `~/Library/Application Support/RepoPrompt CE/DebugApps/RepoPrompt.app`.
 - `RepoPrompt CE MCP` delegates to conductor to build and run `.build/debug/repoprompt-mcp`.
 - `RepoPrompt CE Tests` delegates to the conductor test runner. It is a legacy build target rather than a native Xcode test bundle because `RepoPromptMCP` is an executable-only SwiftPM target.
 
-The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported current root test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. Dedicated isolated test targets and workflows are omitted until their first meaningful executable contract test is declared together with an authoritative conductor list lane. No fourth headless convenience workflow is generated: any future one must delegate to conductor rather than create another build graph. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
+The native product schemes are useful for source navigation and indexing. Use `RepoPrompt CE Tests` for the supported current root test workflow; optional `REPOPROMPT_XCODE_TEST_FILTER` narrows the delegated run. The active `RepoPromptHeadlessTests` target is attached to the native headless package workflow and has an authoritative conductor list lane. No fourth headless convenience workflow is generated: standalone package/provenance/install/direct-stdio smoke remain conductor operations rather than another build graph. Sparkle's vendored XCFramework declares a `dSYMs` directory that is not present in the repository, so native Xcode package builds involving the app can fail before compilation. The generator deliberately does not mutate `Vendor/`; the packaged app convenience scheme remains the supported app build.
 
 ## Boundaries
 
@@ -34,4 +34,4 @@ Generated app, MCP, and test builds are conductor-coordinated. Xcode cancellatio
 
 ## Validation ownership
 
-`Scripts/test_xcode_workspace_generator.py` protects deterministic output, all five Phase 1 production target roots, manifest assumptions, the three convenience schemes, declaration-triggered test-target handling, safe destinations, and stale-output detection. CI runs both `make xcode-generator-test` and `make xcode-validate`; existing SwiftPM/conductor build and test jobs remain authoritative.
+`Scripts/test_xcode_workspace_generator.py` protects deterministic output, all five isolated production target roots plus the active headless test target, manifest assumptions, the three convenience schemes, declaration-triggered test-target handling, safe destinations, and stale-output detection. CI runs both `make xcode-generator-test` and `make xcode-validate`; existing SwiftPM/conductor build and test jobs remain authoritative.

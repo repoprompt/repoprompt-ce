@@ -1,1 +1,11 @@
-// Phase 1 executable scaffold. The direct-stdio runtime is introduced only in Phase 8.
+import Darwin
+import Foundation
+
+let cli = HeadlessCLI()
+let exitCode = await cli.run(
+    arguments: Array(CommandLine.arguments.dropFirst()),
+    environment: ProcessInfo.processInfo.environment
+)
+if exitCode != 0 {
+    Darwin.exit(Int32(exitCode))
+}

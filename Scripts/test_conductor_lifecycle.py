@@ -75,7 +75,7 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 10)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
 
     def test_swift_build_cli_accepts_products_and_phase_one_targets(self) -> None:
         tmp, state = self.make_state()
@@ -116,6 +116,32 @@ class LifecycleQueueTests(LifecycleTestCase):
                     self.assertEqual(lanes, ["build"])
                     self.assertEqual(cwd, Path(tmp))
                     self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+
+    def test_headless_operations_use_independent_artifact_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = conductor.OperationRegistry(root)
+            script = lambda name: str(root / "Scripts" / name)
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-build", "args": {}})
+            self.assertEqual(argv, ["swift", "build", "--product", "repoprompt-headless"])
+            self.assertEqual(lanes, ["build"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-package", "args": {"configuration": "release"}})
+            self.assertEqual(argv, [script("package_headless.sh"), "release"])
+            self.assertEqual(lanes, ["build", "headlessArtifact", "release"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-provenance", "args": {"configuration": "debug"}})
+            self.assertEqual(argv, [script("verify_headless_package.sh"), "debug"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-smoke", "args": {"configuration": "debug", "skipPackage": True}})
+            self.assertEqual(argv, [script("smoke_packaged_headless_roundtrip.sh"), "--configuration", "debug", "--skip-package"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-uninstall", "args": {"configuration": "debug", "deleteState": True}})
+            self.assertEqual(argv, [script("install_headless.sh"), "uninstall", "--configuration", "debug", "--delete-state"])
+            self.assertEqual(lanes, ["headlessArtifact"])
 
     def test_swift_build_all_compiles_three_products_in_frozen_order(self) -> None:
         completed = subprocess.CompletedProcess(["swift", "build"], 0, "", "")
@@ -1251,6 +1277,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         posix_argv, posix_lanes, posix_cwd, _env, _timeout = registry.prepare(
             {"operation": "posix-test", "args": {"list": True}}
         )
+        headless_argv, headless_lanes, headless_cwd, _env, _timeout = registry.prepare(
+            {"operation": "headless-test", "args": {"list": True}}
+        )
         provider_argv, provider_lanes, provider_cwd, _env, _timeout = registry.prepare(
             {"operation": "provider-test", "args": {"list": True}}
         )
@@ -1283,6 +1312,13 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         ])
         self.assertEqual(posix_lanes, ["build"])
         self.assertEqual(posix_cwd, state.paths.repo_root)
+        self.assertEqual(headless_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptHeadlessTests",
+        ])
+        self.assertEqual(headless_lanes, ["build"])
+        self.assertEqual(headless_cwd, state.paths.repo_root)
         self.assertEqual(provider_argv, ["swift", "test", "list"])
         self.assertEqual(provider_lanes, ["build"])
         self.assertEqual(
@@ -1328,6 +1364,9 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         posix_argv, *_ = registry.prepare(
             {"operation": "posix-test", "args": {"filter": "ExampleTests/testBehavior"}}
         )
+        headless_argv, *_ = registry.prepare(
+            {"operation": "headless-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
         self.assertEqual(
             root_argv,
             ["swift", "test", "--filter", "RepoPromptTests.ExampleTests/testBehavior"],
@@ -1343,6 +1382,10 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         self.assertEqual(
             posix_argv,
             ["swift", "test", "--filter", "RepoPromptPOSIXSupportTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            headless_argv,
+            ["swift", "test", "--filter", "RepoPromptHeadlessTests.ExampleTests/testBehavior"],
         )
 
         with self.assertRaisesRegex(conductor.ConductorError, "cannot target test module"):

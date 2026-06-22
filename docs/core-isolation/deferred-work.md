@@ -33,6 +33,21 @@ Headless v1 intentionally duplicates mutable runtime components:
 Convergence requires a separate characterized migration. Headless v1 must not
 wrap or instantiate the app's current mutable engine as a shortcut.
 
+## Phase 8 append — concrete duplicate mapping (2026-06-22)
+
+| Phase 8 owner | Phase 9+ convergence target |
+| --- | --- |
+| `Configuration/HeadlessConfigurationStore.swift`, `HeadlessStateFileSecurity.swift`, `HeadlessFileLock.swift` | selected Core session persistence transaction and platform descriptor adapters |
+| `Runtime/HeadlessWorkspaceStore.swift`, `HeadlessWorkspaceModels.swift`, `HeadlessHost.swift` | `WorkspaceSessionController` / `RepoPromptCoreSession` authority |
+| `Configuration/HeadlessRootAccessPolicy.swift`, `Runtime/HeadlessPathResolver.swift`, `HeadlessSecureFileAccess.swift` | shared Core root capability plus CoreMacOS/POSIX descriptor services |
+| `Runtime/HeadlessFileCatalog.swift`, `HeadlessSearchService.swift`, `HeadlessCodeStructureService.swift` | `WorkspaceFileContextStore` immutable catalog/search/codemap services |
+| `MCP/HeadlessMCPServer.swift`, `HeadlessStdioTransport.swift`, `HeadlessToolRegistry.swift` | shared runtime admission/tool services with a product-specific policy profile |
+| `MCP/Tools/HeadlessSelectionTools.swift`, `HeadlessPromptTools.swift`, `HeadlessWorkspaceTools.swift` | shared Core selection/session/prompt command ingress |
+
+These duplicates are intentional Phase 8 product boundaries. They must not be
+replaced by app/Core runtime construction during Phase 8, and this mapping does
+not authorize Phase 9 work.
+
 ## Separately planned work
 
 - Additional MCP provider/catalog/DTO/formatter/dispatch extraction.

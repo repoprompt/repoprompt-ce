@@ -10,7 +10,7 @@ Sources/
   RepoPromptCoreMacOS/            # macOS watcher, filesystem, content, process, security, and signing adapters
   RepoPromptPOSIXSupport/          # narrow descriptor/socket/POSIX helpers shared by app and CLI targets
   RepoPromptSyntaxCBridge/         # canonical Tree-sitter declaration/link boundary; no upstream implementation
-  RepoPromptHeadless/              # standalone executable scaffold; Phase 8 owns direct-stdio runtime behavior
+  RepoPromptHeadless/              # standalone direct-stdio v1 runtime; no app/proxy authority
   RepoPrompt/
     Support/                     # bridging-header-free app support that must remain source-layout sensitive
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
@@ -60,7 +60,7 @@ Tests/
   RepoPromptCoreMacOSTests/      # direct macOS adapter contract tests and authoritative CoreMacOS list lane
   RepoPromptPOSIXSupportTests/   # direct POSIX helper contract tests and authoritative POSIX list lane
   RepoPromptSyntaxCBridgeTests/  # reserved; declare only with the first meaningful syntax-bridge contract test
-  RepoPromptHeadlessTests/       # reserved; declare only with the first meaningful headless contract test
+  RepoPromptHeadlessTests/       # active standalone transport/security/tool/package contracts
 ```
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
@@ -89,7 +89,7 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - `Sources/RepoPromptCoreMacOS` owns concrete macOS filesystem/watcher/content-decoding/process/security/signing adapters. App path selection, UserDefaults, approvals, product policy, root lifetime, event ingress/coalescing, Combine publication, and diagnostics presentation stay in `RepoPrompt` until their explicit later phase.
 - `Sources/RepoPromptPOSIXSupport` is limited to narrowly prefixed descriptor/socket/system helpers. Every new CE-defined externally visible C symbol uses the reserved `rpce_` prefix.
 - `Sources/RepoPromptSyntaxCBridge` owns Tree-sitter declarations/linkage without reimplementing or renaming upstream `tree_sitter_*` symbols.
-- `Sources/RepoPromptHeadless` is the standalone `repoprompt-headless` executable owner. Phase 1 contains packaging-safe scaffold behavior only; do not add the Phase 8 direct-stdio runtime, app-proxy compatibility, or app/`RepoPromptMCP` dependencies here.
+- `Sources/RepoPromptHeadless` owns the Phase 8 standalone direct-NDJSON runtime, isolated v1 state/root/secret policy, and exact safe tool profile. It must not import or instantiate app/`RepoPromptMCP`, window routing, Phase 5/7 runtime authority, app sockets/state/defaults, or app packaging.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App`.
 - Keep app support that is sensitive to target layout under `Sources/RepoPrompt/Support`. The retired `RepoPrompt-Bridging-Header.h` and `-import-objc-header` package flags must not be restored; import `RepoPromptSyntaxCBridge`, `RepoPromptPOSIXSupport`, or `RepoPromptC` explicitly.
@@ -202,6 +202,10 @@ make dev-core-macos-test
 make dev-core-macos-test-list
 make dev-posix-test
 make dev-posix-test-list
+make dev-headless-test
+make dev-headless-test-list
+make dev-headless-package HEADLESS_CONFIGURATION=debug
+make dev-headless-smoke HEADLESS_CONFIGURATION=debug SKIP_PACKAGE=1
 make dev-test FILTER=CodexIntegrationConfigurationTests
 make dev-test FILTER=WorkspaceFileContextStoreTests
 make guardrails

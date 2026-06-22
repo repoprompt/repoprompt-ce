@@ -31,8 +31,9 @@ required_dirs=(
   "Sources/RepoPromptPOSIXSupport"
   "Sources/RepoPromptSyntaxCBridge"
   "Sources/RepoPromptHeadless"
-  "Sources/RepoPromptShared/MCP"
-  "Tests/RepoPromptTests"
+    "Sources/RepoPromptShared/MCP"
+    "Tests/RepoPromptHeadlessTests"
+    "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
   if [[ ! -d "$dir" ]]; then
@@ -325,7 +326,8 @@ allowed_tracked_docs=(
   "docs/core-isolation/phases/phase-4.md"
   "docs/core-isolation/phases/phase-5.md"
   "docs/core-isolation/phases/phase-6.md"
-  "docs/core-isolation/phases/phase-7.md"
+    "docs/core-isolation/phases/phase-7.md"
+    "docs/core-isolation/phases/phase-8.md"
   "docs/investigations/core-isolation-reconstruction-2026-06-20.md"
   "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
   "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"

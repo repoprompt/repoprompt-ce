@@ -43,6 +43,7 @@ REQUIRED_PACKAGE_TARGETS = (
     "RepoPromptPOSIXSupport",
     "RepoPromptSyntaxCBridge",
     "RepoPromptHeadless",
+    "RepoPromptHeadlessTests",
     "RepoPromptC",
     "CSwiftPCRE2",
     "TreeSitterScannerSupport",
@@ -473,11 +474,11 @@ This directory is disposable. Regenerate it with `make xcode-generate`; do not e
 - `RepoPrompt CE Tests` builds the authoritative XCTest suite through conductor. Set
   `REPOPROMPT_XCODE_TEST_FILTER` before building to run a focused filter.
 
-The native package reference exposes the Phase 1 Core, CoreMacOS, POSIX, syntax C
-bridge, and headless scaffold targets for source browsing and indexing. It also
-exposes the `repoprompt-headless` package scheme for direct SwiftPM builds. Phase 1
-intentionally adds no fourth convenience workflow and no standalone packaging or
-smoke behavior.
+The native package reference exposes Core, CoreMacOS, POSIX, syntax C bridge,
+and the active standalone `RepoPromptHeadless`/`RepoPromptHeadlessTests` targets
+for source browsing and indexing. Its `repoprompt-headless` scheme provides the
+native build/test workflow; standalone packaging, provenance, install, and direct
+stdio smoke remain conductor-owned and never enter the app bundle.
 
 The root Swift package reference provides source browsing and indexing. Its native Xcode
 test action is not the supported test workflow because Xcode does not expose the

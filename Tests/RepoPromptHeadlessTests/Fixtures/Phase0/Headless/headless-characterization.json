@@ -1,0 +1,953 @@
+{
+  "argument_coercion" : [
+    {
+      "input" : {
+        "workspace" : 7
+      },
+      "observed" : null,
+      "tool" : "bind_context"
+    },
+    {
+      "input" : {
+        "roots" : "Phase0Root"
+      },
+      "observed" : [
+        "Phase0Root"
+      ],
+      "tool" : "manage_workspaces"
+    },
+    {
+      "input" : {
+        "paths" : [
+          "a",
+          7,
+          "b"
+        ]
+      },
+      "observed" : [
+        "a",
+        "b"
+      ],
+      "tool" : "manage_selection"
+    },
+    {
+      "input" : {
+        "include" : "prompt"
+      },
+      "observed" : [
+        "prompt"
+      ],
+      "tool" : "workspace_context"
+    },
+    {
+      "input" : {
+        "max_depth" : "3"
+      },
+      "observed" : 3,
+      "tool" : "get_file_tree"
+    },
+    {
+      "input" : {
+        "max_results" : 4
+      },
+      "observed" : 4,
+      "tool" : "get_code_structure"
+    },
+    {
+      "input" : {
+        "start_line" : "2"
+      },
+      "observed" : 2,
+      "tool" : "read_file"
+    },
+    {
+      "input" : {
+        "regex" : "yes"
+      },
+      "observed" : true,
+      "tool" : "file_search"
+    },
+    {
+      "input" : {
+        "text" : 7
+      },
+      "observed" : null,
+      "tool" : "prompt"
+    }
+  ],
+  "baseline_commit" : "487cd71d892dbc3104689cc42fdb39f6c038e8fb",
+  "descriptors" : [
+    {
+      "description" : "List, inspect, or bind the single headless session to a configured workspace.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "op" : {
+            "enum" : [
+              "list",
+              "get",
+              "status",
+              "bind"
+            ],
+            "type" : "string"
+          },
+          "workspace" : {
+            "description" : "Workspace id or name for bind.",
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "bind_context"
+    },
+    {
+      "description" : "Manage headless workspaces without adding arbitrary filesystem roots.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "action" : {
+            "description" : "Alias for op.",
+            "type" : "string"
+          },
+          "name" : {
+            "description" : "Workspace name.",
+            "type" : "string"
+          },
+          "new_name" : {
+            "description" : "New workspace name for rename.",
+            "type" : "string"
+          },
+          "op" : {
+            "enum" : [
+              "list",
+              "get",
+              "create",
+              "select",
+              "switch",
+              "rename"
+            ],
+            "type" : "string"
+          },
+          "roots" : {
+            "description" : "Configured root ids/names/paths to include.",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "workspace" : {
+            "description" : "Workspace id or name.",
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "manage_workspaces"
+    },
+    {
+      "description" : "Read or mutate the active workspace selection using allowed root-contained paths only.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "mode" : {
+            "enum" : [
+              "full",
+              "slices",
+              "codemap_only"
+            ],
+            "type" : "string"
+          },
+          "op" : {
+            "enum" : [
+              "get",
+              "preview",
+              "add",
+              "remove",
+              "set",
+              "clear"
+            ],
+            "type" : "string"
+          },
+          "path" : {
+            "description" : "Single-path alias.",
+            "type" : "string"
+          },
+          "paths" : {
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "slices" : {
+            "type" : "array"
+          },
+          "view" : {
+            "enum" : [
+              "summary",
+              "files",
+              "content",
+              "codemaps"
+            ],
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "manage_selection"
+    },
+    {
+      "description" : "Render or export the active workspace prompt/selection/code/files/tree context.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "include" : {
+            "description" : "prompt, selection, code, tokens, files, tree",
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "op" : {
+            "enum" : [
+              "snapshot",
+              "export"
+            ],
+            "type" : "string"
+          },
+          "path" : {
+            "description" : "Export path; relative paths stay under state Exports/.",
+            "type" : "string"
+          },
+          "path_display" : {
+            "enum" : [
+              "relative",
+              "full"
+            ],
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "workspace_context"
+    },
+    {
+      "annotations" : {
+        "readOnlyHint" : true
+      },
+      "description" : "Return an ASCII tree for configured roots, a subpath, or selected files.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "max_depth" : {
+            "type" : "integer"
+          },
+          "mode" : {
+            "enum" : [
+              "auto",
+              "full",
+              "folders",
+              "selected"
+            ],
+            "type" : "string"
+          },
+          "path" : {
+            "type" : "string"
+          },
+          "type" : {
+            "enum" : [
+              "files",
+              "roots"
+            ],
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "get_file_tree"
+    },
+    {
+      "annotations" : {
+        "readOnlyHint" : true
+      },
+      "description" : "Return lightweight headless code signatures for paths or selected files.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "max_results" : {
+            "type" : "integer"
+          },
+          "paths" : {
+            "items" : {
+              "type" : "string"
+            },
+            "type" : "array"
+          },
+          "scope" : {
+            "enum" : [
+              "paths",
+              "selected"
+            ],
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "get_code_structure"
+    },
+    {
+      "annotations" : {
+        "readOnlyHint" : true
+      },
+      "description" : "Read a UTF-8 file under configured roots with optional line slicing.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "limit" : {
+            "type" : "integer"
+          },
+          "path" : {
+            "type" : "string"
+          },
+          "start_line" : {
+            "type" : "integer"
+          }
+        },
+        "required" : [
+          "path"
+        ],
+        "type" : "object"
+      },
+      "name" : "read_file"
+    },
+    {
+      "annotations" : {
+        "readOnlyHint" : true
+      },
+      "description" : "Search paths and/or UTF-8 file contents under configured roots.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "context_lines" : {
+            "type" : "integer"
+          },
+          "count_only" : {
+            "type" : "boolean"
+          },
+          "filter" : {
+            "type" : "object"
+          },
+          "max_results" : {
+            "type" : "integer"
+          },
+          "mode" : {
+            "enum" : [
+              "auto",
+              "path",
+              "content",
+              "both"
+            ],
+            "type" : "string"
+          },
+          "path" : {
+            "type" : "string"
+          },
+          "pattern" : {
+            "type" : "string"
+          },
+          "regex" : {
+            "type" : "boolean"
+          },
+          "whole_word" : {
+            "type" : "boolean"
+          }
+        },
+        "required" : [
+          "pattern"
+        ],
+        "type" : "object"
+      },
+      "name" : "file_search"
+    },
+    {
+      "description" : "Get, set, append, clear, export, or list the built-in headless prompt preset.",
+      "inputSchema" : {
+        "additionalProperties" : true,
+        "properties" : {
+          "op" : {
+            "enum" : [
+              "get",
+              "set",
+              "append",
+              "clear",
+              "export",
+              "list_presets"
+            ],
+            "type" : "string"
+          },
+          "path" : {
+            "description" : "Export path; relative paths stay under state Exports/.",
+            "type" : "string"
+          },
+          "text" : {
+            "type" : "string"
+          }
+        },
+        "type" : "object"
+      },
+      "name" : "prompt"
+    }
+  ],
+  "format_version" : 1,
+  "initialize" : {
+    "capabilities" : {
+      "tools" : {
+
+      }
+    },
+    "headless" : {
+      "configuredRootCount" : 1,
+      "safeToolsEnabled" : true,
+      "stateDirectory" : "$STATE"
+    },
+    "instructions" : "RepoPrompt Headless is running the standalone read-oriented safe profile over direct stdio. Configure allowed roots with `repoprompt-headless config roots add /absolute/path --name NAME`. Only bind_context, constrained manage_workspaces, manage_selection, workspace_context, get_file_tree, get_code_structure, read_file, file_search, and prompt are enabled.",
+    "protocolVersion" : "2024-11-05",
+    "serverInfo" : {
+      "name" : "RepoPrompt Headless",
+      "version" : "1.0.6"
+    }
+  },
+  "responses" : [
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported bind_context op 'phase0_invalid'. Supported ops: list, get, bind.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Headless Context Binding ✅\n- **Active workspace**: Phase 0 Headless V1 (`22222222-2222-2222-2222-222222222222`)\n- **Roots**: Phase0Root\n- **State directory**: `bound`",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "config" : {
+            "active_workspace_id" : "22222222-2222-2222-2222-222222222222",
+            "allowed_roots" : [
+              {
+                "added_at" : "$TIMESTAMP",
+                "id" : "11111111-1111-1111-1111-111111111111",
+                "name" : "Phase0Root",
+                "path" : "$ROOT",
+                "resolved_path" : "$ROOT"
+              }
+            ],
+            "created_at" : "$TIMESTAMP",
+            "permissions" : {
+              "export_outside_state_directory" : false,
+              "launch_agents" : false,
+              "vcs_write" : false,
+              "write_files" : false
+            },
+            "schema_version" : 1,
+            "updated_at" : "$TIMESTAMP"
+          },
+          "roots" : [
+            {
+              "added_at" : "$TIMESTAMP",
+              "id" : "11111111-1111-1111-1111-111111111111",
+              "name" : "Phase0Root",
+              "path" : "$ROOT",
+              "resolved_path" : "$ROOT"
+            }
+          ],
+          "workspace" : {
+            "created_at" : "$TIMESTAMP",
+            "id" : "22222222-2222-2222-2222-222222222222",
+            "name" : "Phase 0 Headless V1",
+            "prompt_text" : "phase zero headless prompt\nsecond line",
+            "root_ids" : [
+              "11111111-1111-1111-1111-111111111111"
+            ],
+            "schema_version" : 1,
+            "selection" : [
+              {
+                "mode" : "full",
+                "ranges" : [
+
+                ],
+                "relative_path" : "Sources/Full.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              },
+              {
+                "mode" : "slices",
+                "ranges" : [
+                  {
+                    "description" : "phase zero slice",
+                    "end_line" : 4,
+                    "start_line" : 2
+                  }
+                ],
+                "relative_path" : "Sources/Sliced.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              },
+              {
+                "mode" : "codemap_only",
+                "ranges" : [
+
+                ],
+                "relative_path" : "Sources/Structure.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              }
+            ],
+            "updated_at" : "$TIMESTAMP"
+          }
+        }
+      },
+      "tool" : "bind_context"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported manage_workspaces op 'phase0_invalid'. Supported ops: list, get, create, select, rename.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Headless Workspaces ✅\n- **Workspaces**: 1\n- **Active**: `22222222-2222-2222-2222-222222222222`\n* Phase 0 Headless V1 (`22222222-2222-2222-2222-222222222222`) roots=1 selection=3",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "active_workspace_id" : "22222222-2222-2222-2222-222222222222",
+          "workspaces" : [
+            {
+              "created_at" : "$TIMESTAMP",
+              "id" : "22222222-2222-2222-2222-222222222222",
+              "name" : "Phase 0 Headless V1",
+              "prompt_text" : "phase zero headless prompt\nsecond line",
+              "root_ids" : [
+                "11111111-1111-1111-1111-111111111111"
+              ],
+              "schema_version" : 1,
+              "selection" : [
+                {
+                  "mode" : "full",
+                  "ranges" : [
+
+                  ],
+                  "relative_path" : "Sources/Full.swift",
+                  "root_id" : "11111111-1111-1111-1111-111111111111"
+                },
+                {
+                  "mode" : "slices",
+                  "ranges" : [
+                    {
+                      "description" : "phase zero slice",
+                      "end_line" : 4,
+                      "start_line" : 2
+                    }
+                  ],
+                  "relative_path" : "Sources/Sliced.swift",
+                  "root_id" : "11111111-1111-1111-1111-111111111111"
+                },
+                {
+                  "mode" : "codemap_only",
+                  "ranges" : [
+
+                  ],
+                  "relative_path" : "Sources/Structure.swift",
+                  "root_id" : "11111111-1111-1111-1111-111111111111"
+                }
+              ],
+              "updated_at" : "$TIMESTAMP"
+            }
+          ]
+        }
+      },
+      "tool" : "manage_workspaces"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported manage_selection op 'phase0_invalid'. Supported ops: get, preview, add, remove, set, clear.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Selection ✅\n- **Files**: 3\n- **Auto-codemap**: disabled in headless v1\n- `Phase0Root/Sources/Full.swift` (full)\n- `Phase0Root/Sources/Sliced.swift` (slices, lines 2-4)\n- `Phase0Root/Sources/Structure.swift` (codemap_only)",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "codemap_auto_enabled" : false,
+          "files" : [
+            {
+              "mode" : "full",
+              "ranges" : [
+
+              ],
+              "relative_path" : "Sources/Full.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            },
+            {
+              "mode" : "slices",
+              "ranges" : [
+                {
+                  "description" : "phase zero slice",
+                  "end_line" : 4,
+                  "start_line" : 2
+                }
+              ],
+              "relative_path" : "Sources/Sliced.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            },
+            {
+              "mode" : "codemap_only",
+              "ranges" : [
+
+              ],
+              "relative_path" : "Sources/Structure.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            }
+          ],
+          "summary" : "3 selected entries",
+          "total_tokens" : 0
+        }
+      },
+      "tool" : "manage_selection"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported workspace_context op 'phase0_invalid'. Supported ops: snapshot, export.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Prompt Context ✅\n- **Workspace**: Phase 0 Headless V1\n- **Copy preset**: Headless Default\n\n### Prompt\n```text\nphase zero headless prompt\nsecond line\n```\n\n### Selection\n- Phase0Root/Sources/Full.swift (full)\n- Phase0Root/Sources/Sliced.swift (slices)\n- Phase0Root/Sources/Structure.swift (codemap_only)",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "include" : [
+            "prompt",
+            "selection"
+          ],
+          "prompt" : "phase zero headless prompt\nsecond line",
+          "roots" : [
+            {
+              "added_at" : "$TIMESTAMP",
+              "id" : "11111111-1111-1111-1111-111111111111",
+              "name" : "Phase0Root",
+              "path" : "$ROOT",
+              "resolved_path" : "$ROOT"
+            }
+          ],
+          "selection" : [
+            {
+              "mode" : "full",
+              "ranges" : [
+
+              ],
+              "relative_path" : "Sources/Full.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            },
+            {
+              "mode" : "slices",
+              "ranges" : [
+                {
+                  "description" : "phase zero slice",
+                  "end_line" : 4,
+                  "start_line" : 2
+                }
+              ],
+              "relative_path" : "Sources/Sliced.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            },
+            {
+              "mode" : "codemap_only",
+              "ranges" : [
+
+              ],
+              "relative_path" : "Sources/Structure.swift",
+              "root_id" : "11111111-1111-1111-1111-111111111111"
+            }
+          ],
+          "workspace" : {
+            "created_at" : "$TIMESTAMP",
+            "id" : "22222222-2222-2222-2222-222222222222",
+            "name" : "Phase 0 Headless V1",
+            "prompt_text" : "phase zero headless prompt\nsecond line",
+            "root_ids" : [
+              "11111111-1111-1111-1111-111111111111"
+            ],
+            "schema_version" : 1,
+            "selection" : [
+              {
+                "mode" : "full",
+                "ranges" : [
+
+                ],
+                "relative_path" : "Sources/Full.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              },
+              {
+                "mode" : "slices",
+                "ranges" : [
+                  {
+                    "description" : "phase zero slice",
+                    "end_line" : 4,
+                    "start_line" : 2
+                  }
+                ],
+                "relative_path" : "Sources/Sliced.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              },
+              {
+                "mode" : "codemap_only",
+                "ranges" : [
+
+                ],
+                "relative_path" : "Sources/Structure.swift",
+                "root_id" : "11111111-1111-1111-1111-111111111111"
+              }
+            ],
+            "updated_at" : "$TIMESTAMP"
+          }
+        }
+      },
+      "tool" : "workspace_context"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Path is not available under the active workspace roots: Missing",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## File Tree ✅\n- **Roots**: 1\n\n- Phase0Root: `$ROOT`",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "roots" : [
+            {
+              "added_at" : "$TIMESTAMP",
+              "id" : "11111111-1111-1111-1111-111111111111",
+              "name" : "Phase0Root",
+              "path" : "$ROOT",
+              "resolved_path" : "$ROOT"
+            }
+          ],
+          "roots_count" : 1
+        }
+      },
+      "tool" : "get_file_tree"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported get_code_structure scope 'phase0_invalid'. Expected paths or selected.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Code Structure ✅\n- **Files with codemap**: 1\n- **Parser**: `headless-lightweight`\n\n```text\nFile: Phase0Root/Sources/Structure.swift\nParser: headless-lightweight\nL1: struct Structure\n```",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "files" : [
+            {
+              "parser" : "headless-lightweight",
+              "path" : "Phase0Root/Sources/Structure.swift",
+              "relative_path" : "Sources/Structure.swift",
+              "symbols" : [
+                {
+                  "kind" : "type",
+                  "line" : 1,
+                  "signature" : "struct Structure"
+                }
+              ]
+            }
+          ],
+          "files_with_codemap" : 1,
+          "parser" : "headless-lightweight",
+          "skipped" : [
+
+          ]
+        }
+      },
+      "tool" : "get_code_structure"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Missing required argument 'path'.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## File Read ✅\n- **Path**: `Phase0Root/Sources/Full.swift`\n- **Lines**: 1–1 of 1\n\n\n```swift\nstruct Full {}\n\n```",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "content" : "struct Full {}\n",
+          "display_path" : "Phase0Root/Sources/Full.swift",
+          "first_line" : 1,
+          "last_line" : 1,
+          "message" : null,
+          "path" : "$ROOT/Sources/Full.swift",
+          "total_lines" : 1
+        }
+      },
+      "tool" : "read_file"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Missing required argument 'pattern'.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Search Results ✅\n- **Pattern**: `struct Full`\n- **Mode**: `content`\n- **Total matches**: 1\n- **Path matches**: 0\n- **Content matches**: 1\n- **Returned matches**: 1\n- **Omitted by max_results**: 0\n- **Catalog entries scanned**: 5\n- **Catalog entry limit**: 20000 across 1 scan(s)\n\n### Content Matches\n- `Phase0Root/Sources/Full.swift:1` struct Full {}",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "catalog_entries_considered" : 5,
+          "catalog_entries_scanned" : 5,
+          "catalog_entry_limit" : 20000,
+          "catalog_scan_count" : 1,
+          "catalog_skipped_entries" : 0,
+          "catalog_truncated" : false,
+          "content_files_scanned" : 3,
+          "content_files_skipped" : 0,
+          "content_matches" : [
+            {
+              "context" : [
+                {
+                  "line" : 1,
+                  "text" : "struct Full {}"
+                }
+              ],
+              "line" : 1,
+              "path" : "Phase0Root/Sources/Full.swift",
+              "relative_path" : "Sources/Full.swift",
+              "root" : "Phase0Root",
+              "text" : "struct Full {}"
+            }
+          ],
+          "content_totals_complete" : true,
+          "count_only" : false,
+          "mode" : "content",
+          "omitted" : 0,
+          "omitted_is_lower_bound" : false,
+          "path_matches" : [
+
+          ],
+          "path_totals_complete" : true,
+          "pattern" : "struct Full",
+          "regex" : false,
+          "returned_matches" : 1,
+          "total_content_matches" : 1,
+          "total_matches" : 1,
+          "total_matches_is_lower_bound" : false,
+          "total_path_matches" : 0,
+          "totals_are_lower_bounds" : false,
+          "totals_complete" : true,
+          "whole_word" : false
+        }
+      },
+      "tool" : "file_search"
+    },
+    {
+      "failure" : {
+        "content" : [
+          {
+            "text" : "Unsupported prompt op 'phase0_invalid'. Supported ops: get, set, append, clear, export, list_presets.",
+            "type" : "text"
+          }
+        ],
+        "isError" : true
+      },
+      "success" : {
+        "content" : [
+          {
+            "text" : "## Prompt ✅\n\n```text\nphase zero headless prompt\nsecond line\n```",
+            "type" : "text"
+          }
+        ],
+        "isError" : false,
+        "structuredContent" : {
+          "op" : "get",
+          "prompt" : "phase zero headless prompt\nsecond line"
+        }
+      },
+      "tool" : "prompt"
+    }
+  ],
+  "runtime" : "headless-v1",
+  "tool_order" : [
+    "bind_context",
+    "manage_workspaces",
+    "manage_selection",
+    "workspace_context",
+    "get_file_tree",
+    "get_code_structure",
+    "read_file",
+    "file_search",
+    "prompt"
+  ]
+}

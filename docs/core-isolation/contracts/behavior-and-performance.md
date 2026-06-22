@@ -368,3 +368,32 @@ threshold. Signed packaged launch/smoke ticket
 `bff9ef43-1b52-4a08-989a-35a7ff6a6f12`, status
 `24de62db-d5b3-470f-8608-335cd9bd16d4`, and exact executable inspection found
 zero matching debug-app processes.
+
+## Phase 8 append — standalone direct-stdio behavior (2026-06-22)
+
+Phase 8 adds a distinct `repoprompt-headless` process without changing the app
+proxy baseline. Its direct NDJSON transport advertises exactly nine read-oriented
+tools, uses isolated v1 state and secret identities, and never connects to app
+sockets. Descriptor-relative root/catalog/state/export access and deterministic
+work budgets replace path-based traversal for the standalone process only.
+
+Three comparable staged debug direct-stdio smokes passed:
+
+| Ticket | Configuration | Result |
+| --- | --- | --- |
+| `58fc7d74-8337-46e6-bd9c-106cd4e079eb` | debug, freshly packaged | passed |
+| `a2858b8e-3caa-4f54-beba-4a0e01e2f7c4` | debug, staged artifact | passed |
+| `fe13046e-e0be-43af-9513-6f350f9e7d32` | debug, staged artifact | passed |
+
+The universal release staged-artifact smoke
+`479e1e86-3dcb-40a6-aaee-01b32386db70` also passed. These are bounded
+correctness samples, not arbitrary latency thresholds. Each sample covers exact
+tool order, framing and recovery, active-ID collision, cancellation, EOF drain,
+root/state/export confinement, bounded search, serialized mutation, private
+permissions, and clean shutdown.
+
+The app-proxy lane remained separate. Non-disruptive packaged smoke
+`cb4f57cc-4404-4158-9a6d-ccb767976901` passed the unchanged windows, workspace,
+tree, worktree, and role-discovery flow. Stop `c3e388fc-198e-4784-a9b9-6d4de09edd2b`
+removed PID 50364; status `7bd5a095-1452-4788-9397-51434b5bad50`, exact installed
+and worktree executable scans, and `kill -0` all proved absence.

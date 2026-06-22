@@ -78,6 +78,35 @@ for packaging inspection only; it is not notarized or suitable for public
 distribution. For runnable release-mode local testing, use the self-signed local
 production installer below.
 
+## Standalone headless artifacts
+
+`repoprompt-headless` has an independent distribution path and is never copied
+into `RepoPrompt.app`, the app universal-product directory, or the app updater
+archives. Its identity and contract are frozen in
+`docs/core-isolation/contracts/headless-v1.md`.
+
+```bash
+make dev-headless-package HEADLESS_CONFIGURATION=debug
+make dev-headless-provenance HEADLESS_CONFIGURATION=debug
+make dev-headless-smoke HEADLESS_CONFIGURATION=debug SKIP_PACKAGE=1
+
+make dev-headless-package HEADLESS_CONFIGURATION=release
+make dev-headless-provenance HEADLESS_CONFIGURATION=release
+```
+
+Debug stages a signed native-architecture binary; release builds isolated arm64
+and x86_64 products and joins them with `lipo`. Each configuration stores
+`repoprompt-headless` and owner-only `artifact-manifest.json` under
+`~/Library/Application Support/RepoPrompt CE/HeadlessTools/{Debug,Release}`.
+The manifest binds version/build from `version.env`, Git provenance, SHA-256,
+architectures, mode/owner, staged path, and `--version` output.
+
+Install/status/uninstall are separate conductor operations. Ordinary uninstall
+removes only managed headless links, binary, and manifest; private
+`Headless/v1` state is preserved unless `--delete-state` is explicit. None of
+these commands launches or stops the app, connects to app sockets, or changes
+`repoprompt-mcp`.
+
 ## KeyboardShortcuts resource lookup workaround
 
 RepoPrompt currently patches the pinned `KeyboardShortcuts` SwiftPM checkout

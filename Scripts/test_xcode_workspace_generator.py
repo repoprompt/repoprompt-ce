@@ -92,12 +92,13 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         copied = self.outputs[Path(generator.WORKSPACE_NAME) / "xcshareddata/swiftpm/Package.resolved"]
         self.assertEqual((generator.REPO_ROOT / "Package.resolved").read_bytes(), copied)
 
-    def test_generated_readme_documents_native_xcode_limitations(self) -> None:
+    def test_generated_readme_documents_active_headless_and_native_xcode_limitations(self) -> None:
         readme = self.outputs[Path("README.md")].decode()
         self.assertIn("not mutate `Vendor/`", readme)
         self.assertIn("RepoPromptMCP", readme)
         self.assertIn("repoprompt-headless", readme)
-        self.assertIn("no fourth convenience workflow", readme)
+        self.assertIn("standalone packaging, provenance, install", readme)
+        self.assertIn("RepoPromptHeadlessTests", readme)
 
     def test_project_has_exactly_three_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
@@ -106,7 +107,7 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertIn(generator.MCP_SCHEME, project)
         self.assertIn(generator.TEST_SCHEME, project)
 
-    def test_generation_metadata_includes_phase_one_scaffold_graph(self) -> None:
+    def test_generation_metadata_includes_active_isolated_graph(self) -> None:
         metadata = json.loads(self.outputs[Path("generation.json")])
         self.assertTrue(
             set(generator.REQUIRED_EXECUTABLE_PRODUCTS).issubset(

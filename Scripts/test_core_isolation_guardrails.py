@@ -35,6 +35,14 @@ def valid_package() -> dict[str, object]:
         }
         for name, expected in EXPECTED_DEPENDENCIES.items()
     ]
+    targets.append(
+        {
+            "name": "RepoPromptHeadlessTests",
+            "path": RESERVED_TEST_PATHS["RepoPromptHeadlessTests"],
+            "type": "test",
+            "dependencies": [dependency(("target", "RepoPromptHeadless", ""))],
+        }
+    )
     targets.extend(
         [
             {
@@ -346,6 +354,48 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             leaked = root / TARGET_PATHS["RepoPromptHeadless"] / "RuntimeLeak.swift"
             leaked.write_text("let registry = WorkspaceRuntimeLifecycleRegistry()\n")
             self.assertTrue(any("must not instantiate Phase 5 app session authority" in error for error in validate_sources(root)))
+
+    def test_phase_eight_headless_test_target_is_required(self) -> None:
+        package = copy.deepcopy(valid_package())
+        package["targets"] = [
+            target for target in package["targets"]
+            if target["name"] != "RepoPromptHeadlessTests"
+        ]
+        self.assertTrue(any("requires the RepoPromptHeadlessTests" in error for error in validate_package(package)))
+
+    def test_phase_eight_headless_stdout_bypass_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / TARGET_PATHS["RepoPromptHeadless"] / "StdoutLeak.swift"
+            leaked.write_text("let output = FileHandle.standardOutput\n")
+            self.assertTrue(any("writes stdout outside" in error for error in validate_sources(root)))
+
+    def test_phase_eight_headless_app_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / TARGET_PATHS["RepoPromptHeadless"] / "IdentityLeak.swift"
+            leaked.write_text('let identity = "repoprompt-ce-D-7.sock"\n')
+            self.assertTrue(any("leaks app/proxy identity" in error for error in validate_sources(root)))
+
+    def test_phase_eight_headless_tool_profile_drift_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            registry = root / TARGET_PATHS["RepoPromptHeadless"] / "MCP/HeadlessToolRegistry.swift"
+            registry.parent.mkdir(parents=True, exist_ok=True)
+            registry.write_text('Registration(name: "apply_edits", capability: .safeProfile)\n')
+            self.assertTrue(any("safe tool registry drifted" in error for error in validate_sources(root)))
+
+    def test_phase_eight_headless_packaging_cannot_reference_proxy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            script = root / "Scripts/package_headless.sh"
+            script.parent.mkdir(parents=True, exist_ok=True)
+            script.write_text("./Scripts/package_app.sh release\n")
+            self.assertTrue(any("must remain standalone" in error for error in validate_sources(root)))
 
     def _write_minimal_sources(self, root: Path) -> None:
         for relative in TARGET_PATHS.values():

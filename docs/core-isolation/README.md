@@ -1,10 +1,10 @@
 # Core Isolation Execution Packet
 
 **Created:** 2026-06-21
-**Current phase:** Phase 7 — runtime lifecycle identity and weak UI adapters; see [phase-7.md](phases/phase-7.md)
-**Disposition:** **GO through Phase 7**
+**Current phase:** Phase 8 — independently packaged standalone headless v1; see [phase-8.md](phases/phase-8.md)
+**Disposition:** **GO through Phase 8; Phase 9 remains unstarted**
 **Production behavior change:** one selected workspace authority with next-launch legacy rollback
-**Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, and `RepoPromptPOSIXSupportTests`
+**Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, `RepoPromptPOSIXSupportTests`, and `RepoPromptHeadlessTests`
 
 This directory is the compact execution record for
 [Core Isolation Reconstruction](../plans/core-isolation-reconstruction-2026-06-20.md).
@@ -58,6 +58,7 @@ contract. No later phase may depend on fetching those two objects.
 - [Phase 5 authority-cutover execution record](phases/phase-5.md)
 - [Phase 6 factual prompt execution record](phases/phase-6.md)
 - [Phase 7 runtime lifecycle execution record](phases/phase-7.md)
+- [Phase 8 standalone headless execution record](phases/phase-8.md)
 - [Deferred Phase 9+ work](deferred-work.md)
 
 ## Mutation policy
@@ -117,4 +118,12 @@ weak compatibility adapters and immutable routing snapshots. Exact runtime and
 mapping identity, exhaustive lifetime classification, drain-based teardown,
 all deterministic/package/style/ledger lanes, the bounded curated Oracle review,
 performance samples, packaged app-proxy smoke, and exact stopped-process proof
-are green. Standalone headless routing and Phase 8/9 work remain unstarted.
+are green. Phase 8 starts only from that frozen `5f0dab77` checkpoint; Phase 7 identity remains unchanged.
+
+Phase 8 is now **GO**. It activates the independently packaged direct-stdio
+runtime, exact nine-tool profile, isolated v1 state/secret namespace,
+descriptor-confined roots, and standalone distribution lanes. The full
+deterministic/security/build/Xcode/package/install/provenance/direct-stdio matrix,
+one curated Oracle review and its corrections, the separate unchanged app-proxy
+smoke, and exact stopped-process proof are green. Phase 9 convergence and
+compatibility cleanup remain unstarted.

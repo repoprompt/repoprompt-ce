@@ -187,3 +187,11 @@ package enum WorkspaceRuntimeDiagnosticsLog {
         }
     }
 #endif
+
+#if !DEBUG
+    /// Release builds keep the Phase 4 read instrumentation call sites source-compatible
+    /// without enabling debug history or app diagnostics.
+    package enum MCPToolWorkCountDiagnostics {
+        package static func recordReadFileDiskRead(bytes _: Int, decodeMicroseconds _: Int) {}
+    }
+#endif

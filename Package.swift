@@ -155,6 +155,12 @@ let package = Package(
             path: "Tests/RepoPromptPOSIXSupportTests"
         ),
         .testTarget(
+            name: "RepoPromptHeadlessTests",
+            dependencies: ["RepoPromptHeadless"],
+            path: "Tests/RepoPromptHeadlessTests",
+            resources: [.copy("Fixtures")]
+        ),
+        .testTarget(
             name: "RepoPromptTests",
             dependencies: ["RepoPrompt", "RepoPromptMCP", "RepoPromptShared"],
             path: "Tests/RepoPromptTests",
