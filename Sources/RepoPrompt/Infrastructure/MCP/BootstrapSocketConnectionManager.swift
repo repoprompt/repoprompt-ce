@@ -270,6 +270,7 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     func terminate(reason: TerminationReason, message: String?) async {
         guard !isClosing else { return }
         mcpConnectionLog("Terminating bootstrap connection \(connectionID) with reason: \(reason.rawValue)")
+        await sendTerminateNotification(reason: reason, message: message)
         isClosing = true
         healthMonitoringTask?.cancel()
         healthMonitoringTask = nil
@@ -283,6 +284,10 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
     func abortForExecutionWatchdog() async {
         if !isClosing {
             mcpConnectionLog("Force-disconnecting bootstrap connection \(connectionID) after unresponsive tool cancellation")
+            await sendTerminateNotification(
+                reason: .toolExecutionWatchdog,
+                message: "Unresponsive tool execution exceeded the watchdog deadline"
+            )
             isClosing = true
             healthMonitoringTask?.cancel()
             healthMonitoringTask = nil
@@ -319,6 +324,24 @@ actor BootstrapSocketConnectionManager: MCPServerConnection {
 
     private func updateState(_ newState: ConnectionStateSnapshot) {
         state = newState
+    }
+
+    private func sendTerminateNotification(reason: TerminationReason, message: String?) async {
+        guard handshakeComplete else { return }
+        let notification = RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+            reason: reason,
+            message: message
+        )
+        guard let data = notification.encodedJSONLine() else {
+            bootstrapLog.warning("Failed to encode terminate notification")
+            return
+        }
+
+        do {
+            try await transport.send(data)
+        } catch {
+            bootstrapLog.debug("Failed to send terminate notification: \(error)")
+        }
     }
 
     /// Sends a progress notification to the CLI.

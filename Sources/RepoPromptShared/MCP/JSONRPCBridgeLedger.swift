@@ -425,11 +425,13 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public let cancellationTombstoneCount: Int
     public let recentCompletionCount: Int
     public let pendingTransactionCount: Int
+    public let replayableClientRequestCount: Int
+    public let unreplayableActiveRequestCount: Int
     public let hasForwardedProtocolFrame: Bool
     public let terminalReason: String?
 
     public var canReconnect: Bool {
-        activeRequestCount == 0
+        unreplayableActiveRequestCount == 0
             && responseInDeliveryCount == 0
             && pendingTransactionCount == 0
             && terminalReason == nil
@@ -445,6 +447,8 @@ public struct JSONRPCBridgeLedgerSnapshot: Equatable, Sendable {
     public func socketDrainBlockerDescription(partialByteCount: Int) -> String {
         [
             "active_requests=\(activeRequestCount)",
+            "replayable_client_requests=\(replayableClientRequestCount)",
+            "unreplayable_active_requests=\(unreplayableActiveRequestCount)",
             "pending_transactions=\(pendingTransactionCount)",
             "partial_bytes=\(max(0, partialByteCount))",
             "response_in_delivery=\(responseInDeliveryCount)",
@@ -606,8 +610,10 @@ public actor JSONRPCBridgeLedger {
         guard terminalReason == nil else {
             throw JSONRPCBridgeLedgerError.terminal(terminalReason ?? "unknown")
         }
-        guard active.isEmpty, pendingTransactions.isEmpty else {
-            throw failTerminal("reconnection_attempted_with_outstanding_work")
+        guard pendingTransactions.isEmpty,
+              Self.unreplayableActiveRequestCount(in: active) == 0
+        else {
+            throw failTerminal("reconnection_attempted_with_unreplayable_work")
         }
         connectionGeneration &+= 1
         emit(phase: "connection_started", direction: nil, messages: [], prepared: nil, terminalReason: nil)
@@ -1020,19 +1026,39 @@ public actor JSONRPCBridgeLedger {
         return reason
     }
 
-    public func recordConnectionFailure(_ reason: String) -> Bool {
+    public func recordConnectionFailure(
+        _ reason: String,
+        now: TimeInterval = Date().timeIntervalSinceReferenceDate
+    ) -> Bool {
         if terminalReason != nil {
             emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: terminalReason)
             return true
         }
-        guard !active.isEmpty || !pendingTransactions.isEmpty else {
-            let phase = hasForwardedProtocolFrame ? "idle_connection_failure" : "startup_connection_failure"
-            emit(phase: phase, direction: nil, messages: [], prepared: nil, terminalReason: nil)
-            return false
+        if !pendingTransactions.isEmpty {
+            _ = failTerminal(reason)
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
+            return true
         }
-        _ = failTerminal(reason)
-        emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
-        return true
+
+        abandonServerOriginatedRequests(now: now)
+        if terminalReason != nil {
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: terminalReason)
+            return true
+        }
+
+        guard Self.unreplayableActiveRequestCount(in: active) == 0 else {
+            _ = failTerminal(reason)
+            emit(phase: "connection_terminal", direction: nil, messages: [], prepared: nil, terminalReason: reason)
+            return true
+        }
+
+        let phase: String = if !active.isEmpty {
+            "active_connection_failure"
+        } else {
+            hasForwardedProtocolFrame ? "idle_connection_failure" : "startup_connection_failure"
+        }
+        emit(phase: phase, direction: nil, messages: [], prepared: nil, terminalReason: nil)
+        return false
     }
 
     @discardableResult
@@ -1054,9 +1080,30 @@ public actor JSONRPCBridgeLedger {
             cancellationTombstoneCount: tombstones.count,
             recentCompletionCount: recentCompletions.count,
             pendingTransactionCount: pendingTransactions.count,
+            replayableClientRequestCount: Self.replayableClientRequestCount(in: active),
+            unreplayableActiveRequestCount: Self.unreplayableActiveRequestCount(in: active),
             hasForwardedProtocolFrame: hasForwardedProtocolFrame,
             terminalReason: terminalReason
         )
+    }
+
+    private func abandonServerOriginatedRequests(now: TimeInterval) {
+        guard !active.isEmpty else { return }
+        let abandoned = active.filter { key, _ in key.direction == .serverToClient }
+        for (key, state) in abandoned {
+            let metadata = state.metadata
+            guard tombstones.count < configuration.maximumCancellationTombstones else {
+                _ = failTerminal("cancellation_tombstone_capacity_exceeded")
+                return
+            }
+            tombstones[key] = Tombstone(
+                expiresAt: now + configuration.cancellationTombstoneTTL,
+                ordinal: metadata.ordinal,
+                method: metadata.method,
+                tool: metadata.tool
+            )
+            active.removeValue(forKey: key)
+        }
     }
 
     private func purgeExpiredTombstones(now: TimeInterval) {
@@ -1065,6 +1112,21 @@ public actor JSONRPCBridgeLedger {
 
     private static func activeRequestCount(in states: [RequestKey: RequestState]) -> Int {
         states.values.reduce(0) { $0 + $1.requestCount }
+    }
+
+    private static func replayableClientRequestCount(in states: [RequestKey: RequestState]) -> Int {
+        states.reduce(0) { partial, element in
+            guard element.key.direction == .clientToServer,
+                  case .forwarded = element.value
+            else {
+                return partial
+            }
+            return partial + 1
+        }
+    }
+
+    private static func unreplayableActiveRequestCount(in states: [RequestKey: RequestState]) -> Int {
+        activeRequestCount(in: states) - replayableClientRequestCount(in: states)
     }
 
     private static func appendCompletion(

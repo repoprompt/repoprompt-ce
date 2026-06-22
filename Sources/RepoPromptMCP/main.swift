@@ -351,6 +351,8 @@ enum CLIKillSignal {
             "Connection approval was denied"
         case .connectionReplaced:
             "Connection replaced by a newer connection"
+        case .toolExecutionWatchdog:
+            "Unresponsive tool execution exceeded the watchdog deadline"
         }
     }
 }
@@ -486,6 +488,95 @@ actor MCPInitializeReplayState {
     }
 }
 
+actor MCPOutstandingRequestReplayState {
+    private struct Entry {
+        let id: JSONRPCBridgeID
+        let ordinal: UInt64
+        var frame: Data
+    }
+
+    private var nextOrdinal: UInt64 = 0
+    private var entries: [JSONRPCBridgeID: Entry] = [:]
+
+    func recordForwardedClientFrame(_ frame: Data) {
+        for object in Self.jsonObjects(from: frame) {
+            guard let method = object["method"] as? String else {
+                if let id = MCPInitializeReplayState.jsonRPCID(from: object["id"]) {
+                    entries.removeValue(forKey: id)
+                }
+                continue
+            }
+
+            if method == "notifications/cancelled",
+               let params = object["params"] as? [String: Any],
+               let cancelledID = MCPInitializeReplayState.jsonRPCID(from: params["requestId"] ?? params["id"])
+            {
+                entries.removeValue(forKey: cancelledID)
+                continue
+            }
+
+            guard object["id"] != nil,
+                  method != "initialize",
+                  let id = MCPInitializeReplayState.jsonRPCID(from: object["id"]),
+                  id != .null,
+                  let frame = Self.lineFrame(for: object)
+            else {
+                continue
+            }
+
+            if let existing = entries[id] {
+                entries[id] = Entry(id: id, ordinal: existing.ordinal, frame: frame)
+            } else {
+                nextOrdinal &+= 1
+                entries[id] = Entry(id: id, ordinal: nextOrdinal, frame: frame)
+            }
+            debugLog("MCPOutstandingRequestReplayState: cached active client request id=\(id)")
+        }
+    }
+
+    func recordDeliveredServerFrame(_ frame: Data) {
+        for object in Self.jsonObjects(from: frame) where object["method"] == nil {
+            guard object["result"] != nil || object["error"] != nil,
+                  let id = MCPInitializeReplayState.jsonRPCID(from: object["id"])
+            else {
+                continue
+            }
+            entries.removeValue(forKey: id)
+            debugLog("MCPOutstandingRequestReplayState: completed active client request id=\(id)")
+        }
+    }
+
+    func replayFrames() -> [Data] {
+        entries.values
+            .sorted { $0.ordinal < $1.ordinal }
+            .map(\.frame)
+    }
+
+    private static func jsonObjects(from frame: Data) -> [[String: Any]] {
+        guard let value = try? JSONSerialization.jsonObject(with: frame) else {
+            return []
+        }
+        if let object = value as? [String: Any] {
+            return [object]
+        }
+        if let batch = value as? [[String: Any]] {
+            return batch
+        }
+        return []
+    }
+
+    private static func lineFrame(for object: [String: Any]) -> Data? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object)
+        else {
+            return nil
+        }
+        var frame = data
+        frame.append(UInt8(ascii: "\n"))
+        return frame
+    }
+}
+
 /// Socket proxy errors
 enum SocketProxyError: Swift.Error, LocalizedError {
     case socketCreationFailed(errno: Int32)
@@ -509,7 +600,7 @@ enum SocketProxyError: Swift.Error, LocalizedError {
     case cancelled
     case serverClosed
     case approvalDenied
-    case terminatedByServer(reason: String?)
+    case terminatedByServer(reason: TerminationReason?, message: String?)
     case handshakeFailed(reason: String)
     case handshakeRejected(errorCode: String?, reason: String?)
     case protocolVersionMismatch
@@ -566,8 +657,8 @@ enum SocketProxyError: Swift.Error, LocalizedError {
             return "Server closed connection"
         case .approvalDenied:
             return "Connection approval denied by user"
-        case let .terminatedByServer(reason):
-            return "Terminated by server: \(reason ?? "unknown reason")"
+        case let .terminatedByServer(reason, message):
+            return "Terminated by server: \(message ?? reason?.rawValue ?? "unknown reason")"
         case let .handshakeFailed(reason):
             return "Handshake failed: \(reason)"
         case let .handshakeRejected(errorCode, reason):
@@ -691,7 +782,7 @@ enum CLIProxyRuntimePolicy {
                 case .cancelled: return "transport_cancelled"
                 case .serverClosed: return "app_socket_closed"
                 case .approvalDenied: return "approval_denied"
-                case .terminatedByServer: return "terminated_by_server"
+                case let .terminatedByServer(reason, _): return reason?.rawValue ?? "terminated_by_server"
                 case .handshakeFailed: return "handshake_failed"
                 case .handshakeRejected: return "handshake_rejected"
                 case .protocolVersionMismatch: return "protocol_version_mismatch"
@@ -884,6 +975,7 @@ actor BootstrapSocketProxy {
     private let clientName: String?
     private let identityCache: ClientIdentityCache
     private let initializeReplayState: MCPInitializeReplayState
+    private let outstandingRequestReplayState: MCPOutstandingRequestReplayState
     private let replayInitializationOnStart: Bool
     private let bridgeLedger: JSONRPCBridgeLedger
     private let faultRule: JSONRPCBridgeFaultRule?
@@ -894,6 +986,7 @@ actor BootstrapSocketProxy {
         clientName: String?,
         identityCache: ClientIdentityCache,
         initializeReplayState: MCPInitializeReplayState,
+        outstandingRequestReplayState: MCPOutstandingRequestReplayState,
         replayInitializationOnStart: Bool,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?
@@ -903,6 +996,7 @@ actor BootstrapSocketProxy {
         self.clientName = clientName
         self.identityCache = identityCache
         self.initializeReplayState = initializeReplayState
+        self.outstandingRequestReplayState = outstandingRequestReplayState
         self.replayInitializationOnStart = replayInitializationOnStart
         self.bridgeLedger = bridgeLedger
         self.faultRule = faultRule
@@ -933,6 +1027,10 @@ actor BootstrapSocketProxy {
             if replayInitializationOnStart {
                 let plan = try await Self.requireReplayPlan(from: initializeReplayState)
                 try await Self.replayInitializedSession(plan, socketFD: socketFD)
+                try await Self.replayOutstandingClientRequests(
+                    outstandingRequestReplayState.replayFrames(),
+                    socketFD: socketFD
+                )
             }
 
         case "rejected":
@@ -956,12 +1054,14 @@ actor BootstrapSocketProxy {
         let fd = socketFD
         let cache = identityCache
         let replayState = initializeReplayState
+        let outstandingReplayState = outstandingRequestReplayState
         let ledger = bridgeLedger
         let faultRule = faultRule
         try await Self.runBridge(
             socketFD: fd,
             identityCache: cache,
             initializeReplayState: replayState,
+            outstandingRequestReplayState: outstandingReplayState,
             bridgeLedger: ledger,
             faultRule: faultRule
         )
@@ -1213,6 +1313,17 @@ extension BootstrapSocketProxy {
         debugLog("BootstrapSocketProxy: replayed MCP initialized notification after reconnect")
     }
 
+    private static func replayOutstandingClientRequests(
+        _ frames: [Data],
+        socketFD: Int32
+    ) throws {
+        guard !frames.isEmpty else { return }
+        debugLog("BootstrapSocketProxy: replaying \(frames.count) outstanding client request(s) after reconnect")
+        for frame in frames {
+            try writeToSocket(frame, socketFD: socketFD)
+        }
+    }
+
     private static func readReplayInitializeResponse(
         socketFD: Int32,
         expectedID: JSONRPCBridgeID,
@@ -1277,6 +1388,7 @@ extension BootstrapSocketProxy {
         stdoutFD: Int32 = STDOUT_FILENO,
         identityCache: ClientIdentityCache,
         initializeReplayState: MCPInitializeReplayState? = nil,
+        outstandingRequestReplayState: MCPOutstandingRequestReplayState? = nil,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
@@ -1294,6 +1406,7 @@ extension BootstrapSocketProxy {
                     stdinFD: stdinFD,
                     identityCache: identityCache,
                     initializeReplayState: initializeReplayState,
+                    outstandingRequestReplayState: outstandingRequestReplayState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule
                 )
@@ -1307,6 +1420,7 @@ extension BootstrapSocketProxy {
                     stdoutFD: stdoutFD,
                     drainState: drainState,
                     initializeReplayState: initializeReplayState,
+                    outstandingRequestReplayState: outstandingRequestReplayState,
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule,
                     socketPoller: socketPoller,
@@ -1344,6 +1458,67 @@ extension BootstrapSocketProxy {
         }
     }
 
+    private static func forwardClientFrameToSocket(
+        frame: Data,
+        socketFD: Int32,
+        ledger: JSONRPCBridgeLedger,
+        initializeReplayState: MCPInitializeReplayState?,
+        outstandingRequestReplayState: MCPOutstandingRequestReplayState?,
+        faultRule: JSONRPCBridgeFaultRule?
+    ) async throws -> JSONRPCBridgePreparedFrame {
+        let prepared = try await ledger.prepare(frame: frame, direction: .clientToServer)
+        guard let deliveryFrame = prepared.deliveryFrame else {
+            try await ledger.commit(prepared)
+            await initializeReplayState?.recordForwardedClientFrame(frame)
+            await outstandingRequestReplayState?.recordForwardedClientFrame(frame)
+            return prepared
+        }
+
+        if let faultRule, faultRule.matches(prepared) {
+            let selectedID = prepared.messages.first(where: { message in
+                faultRule.id == nil || message.id == faultRule.id
+            })?.id
+            let error = JSONRPCBridgeLedgerError.injectedFault(.clientToServer, selectedID)
+            await ledger.abort(prepared, reason: "fault_injected_\(faultRule.action.rawValue)")
+            throw error
+        }
+
+        do {
+            try writeToSocket(deliveryFrame, socketFD: socketFD)
+        } catch {
+            if isRecoverableAppWriteFailure(error) {
+                do {
+                    try await ledger.commit(prepared)
+                } catch {
+                    await ledger.abort(prepared, reason: "destination_write_uncertain")
+                    throw error
+                }
+                await initializeReplayState?.recordForwardedClientFrame(frame)
+                await outstandingRequestReplayState?.recordForwardedClientFrame(frame)
+                throw error
+            }
+            await ledger.abort(prepared, reason: "destination_write_uncertain")
+            throw error
+        }
+
+        try await ledger.commit(prepared)
+        await initializeReplayState?.recordForwardedClientFrame(frame)
+        await outstandingRequestReplayState?.recordForwardedClientFrame(frame)
+        return prepared
+    }
+
+    private static func isRecoverableAppWriteFailure(_ error: Swift.Error) -> Bool {
+        guard let socketError = error as? SocketProxyError else {
+            return false
+        }
+        switch socketError {
+        case .cancelled:
+            return false
+        default:
+            return true
+        }
+    }
+
     /// Pumps stdin to socket. Static to run outside actor isolation.
     /// Also parses MCP initialize requests to cache the client name for reconnects.
     private static func pumpStdinToSocket(
@@ -1351,6 +1526,7 @@ extension BootstrapSocketProxy {
         stdinFD: Int32 = STDIN_FILENO,
         identityCache: ClientIdentityCache,
         initializeReplayState: MCPInitializeReplayState?,
+        outstandingRequestReplayState: MCPOutstandingRequestReplayState?,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?
     ) async throws {
@@ -1429,21 +1605,20 @@ extension BootstrapSocketProxy {
                 var payload = Data(message)
                 payload.append(UInt8(ascii: "\n"))
                 debugLog("BootstrapSocketProxy: → socket bytes=\(payload.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(payload))")
-                let prepared = try await JSONRPCBridgeDelivery.forward(
+                let prepared = try await Self.forwardClientFrameToSocket(
                     frame: payload,
-                    direction: .clientToServer,
+                    socketFD: socketFD,
                     ledger: bridgeLedger,
+                    initializeReplayState: initializeReplayState,
+                    outstandingRequestReplayState: outstandingRequestReplayState,
                     faultRule: faultRule
-                ) { framed in
-                    try writeToSocket(framed, socketFD: socketFD)
-                }
+                )
                 if prepared.deliveryFrame != nil {
                     MCPResponseDeliveryTracer.emitPreparedFrame(
                         layer: "proxy_app_uds",
                         phase: "socket_write_completed",
                         prepared: prepared
                     )
-                    await initializeReplayState?.recordForwardedClientFrame(payload)
                 }
             }
 
@@ -1511,6 +1686,15 @@ extension BootstrapSocketProxy {
         return "\(tool): \(message)"
     }
 
+    private static func extractTerminateParams(from jsonLine: Data) -> RepoPromptTerminateParams? {
+        guard RepoPromptControlDetection.mightBeControlNotification(jsonLine),
+              RepoPromptControlDetection.extractNotificationMethod(from: jsonLine) == RepoPromptControlMethod.terminate
+        else {
+            return nil
+        }
+        return RepoPromptControlDetection.parseTerminateParams(from: jsonLine)
+    }
+
     #if DEBUG
         private static let stdoutWriteStallTimeout: TimeInterval = {
             guard let raw = ProcessInfo.processInfo.environment["RP_STDOUT_STALL_TIMEOUT"],
@@ -1543,6 +1727,7 @@ extension BootstrapSocketProxy {
         stdoutFD: Int32 = STDOUT_FILENO,
         drainState: BridgeDrainState,
         initializeReplayState: MCPInitializeReplayState?,
+        outstandingRequestReplayState: MCPOutstandingRequestReplayState?,
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
@@ -1604,10 +1789,13 @@ extension BootstrapSocketProxy {
             let sawHangup = revents & POLLHUP != 0
             if revents & POLLIN == 0 {
                 if sawHangup {
-                    try await requireCleanBridgeStop(
+                    try await handleAppSocketClosed(
                         ledger: bridgeLedger,
-                        direction: .serverToClient,
+                        drainState: drainState,
                         pendingByteCount: pending.count,
+                        drainDeadline: drainDeadline,
+                        visibilityInterval: drainVisibilityInterval,
+                        logDescriptor: drainLogDescriptor,
                         reason: "socket_hangup"
                     )
                     return
@@ -1624,10 +1812,13 @@ extension BootstrapSocketProxy {
                 throw SocketProxyError.readFailed(errno: errno)
             }
             if bytesRead == 0 {
-                try await requireCleanBridgeStop(
+                try await handleAppSocketClosed(
                     ledger: bridgeLedger,
-                    direction: .serverToClient,
+                    drainState: drainState,
                     pendingByteCount: pending.count,
+                    drainDeadline: drainDeadline,
+                    visibilityInterval: drainVisibilityInterval,
+                    logDescriptor: drainLogDescriptor,
                     reason: "socket_eof"
                 )
                 return
@@ -1640,6 +1831,11 @@ extension BootstrapSocketProxy {
                 let data = Data(pending[...newline])
                 pending = Data(pending[(newline + 1)...])
                 debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
+
+                if let termination = Self.extractTerminateParams(from: data) {
+                    let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
+                    throw JSONRPCBridgeLedgerError.terminal(terminalReason)
+                }
 
                 let prepared = try await JSONRPCBridgeDelivery.forward(
                     frame: data,
@@ -1684,14 +1880,18 @@ extension BootstrapSocketProxy {
                         terminalBarrier: false
                     )
                     await initializeReplayState?.recordDeliveredServerFrame(delivered)
+                    await outstandingRequestReplayState?.recordDeliveredServerFrame(delivered)
                 }
             }
 
             if sawHangup {
-                try await requireCleanBridgeStop(
+                try await handleAppSocketClosed(
                     ledger: bridgeLedger,
-                    direction: .serverToClient,
+                    drainState: drainState,
                     pendingByteCount: pending.count,
+                    drainDeadline: drainDeadline,
+                    visibilityInterval: drainVisibilityInterval,
+                    logDescriptor: drainLogDescriptor,
                     reason: "socket_hangup"
                 )
                 return
@@ -1741,6 +1941,41 @@ extension BootstrapSocketProxy {
             BestEffortStderrWriter.writeNonBlocking(Data(message.utf8), to: logDescriptor)
         }
         return false
+    }
+
+    private static func handleAppSocketClosed(
+        ledger: JSONRPCBridgeLedger,
+        drainState: BridgeDrainState,
+        pendingByteCount: Int,
+        drainDeadline: TimeInterval,
+        visibilityInterval: TimeInterval,
+        logDescriptor: Int32,
+        reason: String
+    ) async throws {
+        if pendingByteCount > 0 {
+            try await requireCleanBridgeStop(
+                ledger: ledger,
+                direction: .serverToClient,
+                pendingByteCount: pendingByteCount,
+                reason: reason
+            )
+            return
+        }
+
+        if await drainState.elapsedSinceStdinClosed() != nil,
+           try await shouldFinishSocketDrain(
+               drainState: drainState,
+               ledger: ledger,
+               pendingByteCount: pendingByteCount,
+               deadline: drainDeadline,
+               visibilityInterval: visibilityInterval,
+               logDescriptor: logDescriptor
+           )
+        {
+            return
+        }
+
+        throw SocketProxyError.serverClosed
     }
 
     private static func requireCleanBridgeStop(
@@ -1857,11 +2092,17 @@ actor MCPService: Service {
     private let identityCache = ClientIdentityCache()
 
     /// Helper-owned MCP initialize replay state for app-socket reconnects after
-    /// the host session is already initialized and idle.
+    /// the host session is already initialized.
     private let initializeReplayState = MCPInitializeReplayState()
 
+    /// Helper-owned cache of host-originated requests that were forwarded to an
+    /// app socket but have not yet produced a host-visible response. These are
+    /// replayed after an app restart so active host requests do not surface as a
+    /// transport close.
+    private let outstandingRequestReplayState = MCPOutstandingRequestReplayState()
+
     /// Process-lifetime correlation ledger. It deliberately survives reconnect attempts
-    /// so only idle, fully correlated bridge states can be resumed.
+    /// so fully correlated bridge states can be resumed and ambiguous states fail closed.
     private let bridgeLedger: JSONRPCBridgeLedger
 
     // Kill signal watcher state
@@ -2160,9 +2401,9 @@ actor MCPService: Service {
                 return
             } catch let err as CLIRuntimeError {
                 // Reconnection is legal while the bridge ledger can prove there is no
-                // active request, pending transaction, or response in delivery. If the
-                // session already initialized, the next socket loop replays initialize
-                // privately before normal host traffic resumes.
+                // pending transaction, response in delivery, or unreplayable active work.
+                // If the session already initialized, the next socket loop replays
+                // initialize privately, then replays outstanding host requests.
                 let protocolActiveFailure = await bridgeLedger.recordConnectionFailure(
                     transportFailureReason(for: err)
                 )
@@ -2242,6 +2483,7 @@ actor MCPService: Service {
             clientName: displayName,
             identityCache: identityCache,
             initializeReplayState: initializeReplayState,
+            outstandingRequestReplayState: outstandingRequestReplayState,
             replayInitializationOnStart: replayInitialization,
             bridgeLedger: bridgeLedger,
             faultRule: Self.responseDeliveryFaultRuleFromEnvironment()
@@ -2272,11 +2514,11 @@ actor MCPService: Service {
             case .connectionRefused:
                 // App not running or not accepting connections
                 throw CLIRuntimeError.connectionFailed(underlying: err)
-            case let .terminatedByServer(reason):
+            case let .terminatedByServer(reason, message):
                 // Server explicitly killed this connection - exit without retry
                 throw CLIRuntimeError.terminatedByServer(CLIServerTerminationProvenance(
-                    reason: nil,
-                    message: reason
+                    reason: reason,
+                    message: message
                 ))
             case let .handshakeFailed(reason):
                 log.error("Bootstrap handshake failed: \(reason)")
