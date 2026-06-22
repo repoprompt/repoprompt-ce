@@ -371,6 +371,11 @@ final class WindowStateCompositionReadinessTests: XCTestCase {
         }
         XCTAssertEqual(try Set(selectedPaths(from: getValue)), expectedSelection)
 
+        let visibleSelectionWithoutWorktreeMirror = fixture.composition.workspaceFilesViewModel.snapshotSelection()
+        XCTAssertTrue(
+            visibleSelectionWithoutWorktreeMirror.selectedPaths.isEmpty,
+            "worktree-bound MCP selection must remain canonical without active UI mirroring"
+        )
         let userSelectionPublished = expectation(
             description: "post-projection user selection published synchronously"
         )
@@ -414,6 +419,175 @@ final class WindowStateCompositionReadinessTests: XCTestCase {
                 codemapAutoEnabled: false
             )
         )
+    }
+
+    func testSelectionSliceFeedbackPreservesProgrammaticOriginAndPublishesLaterUserEdit() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("WindowStateCompositionReadinessTests-\(UUID().uuidString)")
+            .appendingPathComponent("SliceFeedbackRoot")
+        let worktreeRoot = root.deletingLastPathComponent()
+            .appendingPathComponent("SliceFeedbackWorktree")
+        let fileURL = root.appendingPathComponent("Sources/App.swift")
+        let worktreeFileURL = worktreeRoot.appendingPathComponent("Sources/App.swift")
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: worktreeFileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let source = "struct App {\n    let value = 1\n}\n"
+        try source.write(to: fileURL, atomically: true, encoding: .utf8)
+        try source.write(to: worktreeFileURL, atomically: true, encoding: .utf8)
+
+        let fixture = try await makeFixture(
+            repoPaths: [root.path],
+            useProductionAgentRestore: true,
+            agentWorktreeBindings: [makeWorktreeBinding(logicalRoot: root, worktreeRoot: worktreeRoot)]
+        )
+        addTeardownBlock { @MainActor in
+            fixture.composition.workspaceManager
+                .test_setAuthoritativeProjectionFeedbackEventHandler(nil)
+            await fixture.shutdown()
+            try? FileManager.default.removeItem(at: root.deletingLastPathComponent())
+            try? FileManager.default.removeItem(at: fixture.storageRoot)
+        }
+
+        try await fulfillment(of: [XCTUnwrap(fixture.readinessReached)], timeout: 3)
+        await fixture.readinessGate.release()
+        await fixture.indexGate.release()
+        await fixture.composition.workspaceSessionActivationTask?.value
+        _ = await fixture.composition.workspaceFileContextStore.awaitAppliedIngress(rootScope: .visibleWorkspace)
+        _ = try await fixture.composition.workspaceFileContextStore.loadRoot(
+            path: worktreeRoot.path,
+            kind: .sessionWorktree
+        )
+        let locatedFiles = await fixture.composition.workspaceFilesViewModel.findFiles(
+            atPaths: [fileURL.path],
+            profile: .mcpSelection
+        )
+        let file = try XCTUnwrap(locatedFiles[fileURL.path])
+        let selectedPath = file.standardizedFullPath
+
+        let promptFeedbackDrained = expectation(description: "preexisting prompt feedback drained")
+        fixture.composition.workspaceManager
+            .test_setAuthoritativeProjectionFeedbackEventHandler { source, _ in
+                guard source == .promptText else { return }
+                promptFeedbackDrained.fulfill()
+            }
+        fixture.composition.promptManager.promptText = "slice feedback readiness barrier"
+        await fulfillment(of: [promptFeedbackDrained], timeout: 3)
+        await fixture.composition.workspaceManager.test_flushUISnapshotCommands()
+        fixture.composition.workspaceManager
+            .test_setAuthoritativeProjectionFeedbackEventHandler(nil)
+
+        let connectionID = UUID()
+        try fixture.composition.mcpServer.bindTabForConnection(
+            connectionID: connectionID,
+            clientName: "restored-agent-slice-feedback",
+            tabID: fixture.tabID,
+            workspaceID: fixture.workspaceID,
+            windowID: fixture.windowID
+        )
+        let tools = await fixture.composition.mcpServer.windowMCPTools
+        let manageSelection = try XCTUnwrap(
+            tools.first { $0.name == MCPWindowToolName.manageSelection }
+        )
+
+        let programmaticSlice = LineRange(start: 1, end: 1)
+        _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+            try await manageSelection([
+                "op": .string("set"),
+                "mode": .string("slices"),
+                "slices": .array([
+                    .object([
+                        "path": .string(fileURL.path),
+                        "ranges": .array([
+                            .object([
+                                "start_line": .int(programmaticSlice.start),
+                                "end_line": .int(programmaticSlice.end)
+                            ])
+                        ])
+                    ])
+                ]),
+                "view": .string("files"),
+                "path_display": .string("full"),
+                "strict": .bool(true)
+            ])
+        }
+        let canonicalProgrammaticSelection = try XCTUnwrap(
+            fixture.composition.workspaceSessionCommandClient?.snapshot?.selection(
+                workspaceID: fixture.workspaceID,
+                tabID: fixture.tabID
+            )
+        )
+        XCTAssertEqual(canonicalProgrammaticSelection.selectedPaths, [selectedPath])
+        XCTAssertEqual(canonicalProgrammaticSelection.slices, [selectedPath: [programmaticSlice]])
+        XCTAssertTrue(
+            fixture.composition.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty,
+            "worktree-bound sliced selection must remain canonical without active UI mirroring"
+        )
+
+        let programmaticFeedback = expectation(
+            description: "programmatic slice feedback remains tagged after debounce"
+        )
+        var programmaticOrigin: Bool?
+        fixture.composition.workspaceManager
+            .test_setAuthoritativeProjectionFeedbackEventHandler { source, originatedDuringProgrammaticApply in
+                guard source == .selectionSlices, programmaticOrigin == nil else { return }
+                programmaticOrigin = originatedDuringProgrammaticApply
+                programmaticFeedback.fulfill()
+            }
+        await fixture.composition.selectionCoordinator.withApplyingSelectionMirror {
+            fixture.composition.workspaceFilesViewModel.seedSelectionSlicesForTesting(
+                [programmaticSlice],
+                for: file
+            )
+        }
+        await fulfillment(of: [programmaticFeedback], timeout: 3)
+        await fixture.composition.workspaceManager.test_flushUISnapshotCommands()
+        XCTAssertEqual(programmaticOrigin, true)
+        XCTAssertEqual(
+            try XCTUnwrap(
+                fixture.composition.workspaceSessionCommandClient?.snapshot?.selection(
+                    workspaceID: fixture.workspaceID,
+                    tabID: fixture.tabID
+                )
+            ),
+            canonicalProgrammaticSelection
+        )
+        XCTAssertTrue(
+            fixture.composition.workspaceFilesViewModel.snapshotSelection().selectedPaths.isEmpty,
+            "suppressed slice feedback must not synthesize an active UI mirror"
+        )
+
+        let userSlice = LineRange(start: 2, end: 2)
+        let userFeedback = expectation(description: "later user slice feedback publishes")
+        var userOrigin: Bool?
+        fixture.composition.workspaceManager
+            .test_setAuthoritativeProjectionFeedbackEventHandler { source, originatedDuringProgrammaticApply in
+                guard source == .selectionSlices, userOrigin == nil else { return }
+                userOrigin = originatedDuringProgrammaticApply
+                userFeedback.fulfill()
+            }
+        let userMutation = try await fixture.composition.workspaceFilesViewModel.setSelectionSlices(
+            entries: [.init(path: fileURL.path, ranges: [userSlice])],
+            mode: .setPaths,
+            persistWorkspace: false
+        )
+        XCTAssertTrue(userMutation.invalidPaths.isEmpty)
+        await fulfillment(of: [userFeedback], timeout: 3)
+        await fixture.composition.workspaceManager.test_flushUISnapshotCommands()
+        XCTAssertEqual(userOrigin, false)
+        let canonicalUserSelection = try XCTUnwrap(
+            fixture.composition.workspaceSessionCommandClient?.snapshot?.selection(
+                workspaceID: fixture.workspaceID,
+                tabID: fixture.tabID
+            )
+        )
+        XCTAssertEqual(canonicalUserSelection.selectedPaths, [selectedPath])
+        XCTAssertEqual(canonicalUserSelection.slices, [selectedPath: [userSlice]])
     }
 
     func testSetStatusWaitsForDelayedAuthoritativeBackgroundTitleProjection() async throws {
@@ -489,6 +663,201 @@ final class WindowStateCompositionReadinessTests: XCTestCase {
                 for: fixture.composition.promptManager.currentComposeTabs
             ).first(where: { $0.tabID == fixture.tabID })?.title,
             renamedTitle
+        )
+    }
+
+    func testCancelledSetStatusCompletesCommittedRenameWithoutPartialProjection() async throws {
+        let renamedTitle = "Cancelled committed title"
+        let delayed = try await makeDelayedSessionRenameFixture(renamedTitle: renamedTitle)
+        var renameReturned = false
+        let renameTask = Task { @MainActor in
+            defer { renameReturned = true }
+            return await delayed.fixture.composition.agentModeViewModel.renameSession(
+                tabID: delayed.fixture.tabID,
+                to: renamedTitle
+            )
+        }
+
+        await fulfillment(of: [delayed.projectionReached], timeout: 3)
+        renameTask.cancel()
+        await Task.yield()
+        XCTAssertFalse(renameReturned, "caller cancellation must not abandon committed projection")
+
+        await delayed.projectionGate.release()
+        let renameResult = await renameTask.value
+        XCTAssertNil(renameResult, "the cancelled caller may surface cancellation after convergence")
+        try await assertCommittedRenameConverged(delayed, renamedTitle: renamedTitle)
+    }
+
+    func testRunTransitionDuringCommittedSetStatusDoesNotRenameDecoyRow() async throws {
+        let renamedTitle = "Original session committed title"
+        let delayed = try await makeDelayedSessionRenameFixture(renamedTitle: renamedTitle)
+        let session = delayed.fixture.composition.agentModeViewModel.session(for: delayed.fixture.tabID)
+        let originalRunID = UUID()
+        session.runID = originalRunID
+        let originalRun = session.beginRunAttempt(source: "test.setStatus.originalRun")
+        let renameTask = Task { @MainActor in
+            await delayed.fixture.composition.agentModeViewModel.renameSession(
+                tabID: delayed.fixture.tabID,
+                to: renamedTitle
+            )
+        }
+
+        await fulfillment(of: [delayed.projectionReached], timeout: 3)
+        XCTAssertTrue(session.endRunAttempt(ifCurrent: originalRun, source: "test.setStatus.transition"))
+        let replacementRunID = UUID()
+        session.runID = replacementRunID
+        let replacementRun = session.beginRunAttempt(source: "test.setStatus.replacementRun")
+
+        await delayed.projectionGate.release()
+        let renameResult = await renameTask.value
+        XCTAssertEqual(renameResult, renamedTitle)
+        XCTAssertEqual(session.runID, replacementRunID)
+        XCTAssertEqual(session.activeRunAttemptID, replacementRun.attemptID)
+        try await assertCommittedRenameConverged(delayed, renamedTitle: renamedTitle)
+    }
+
+    private struct DelayedSessionRenameFixture {
+        let fixture: Fixture
+        let projectionGate: CompositionReadinessGate
+        let projectionReached: XCTestExpectation
+        let foregroundTab: ComposeTabState
+        let decoySessionID: UUID
+    }
+
+    private enum DelayedSessionRenameFixtureError: Error {
+        case decoyCreationFailed
+    }
+
+    private func makeDelayedSessionRenameFixture(
+        renamedTitle: String
+    ) async throws -> DelayedSessionRenameFixture {
+        let projectionReached = expectation(description: "committed rename reached observation bridge")
+        let projectionGate = CompositionReadinessGate()
+        let fixture = try await makeFixture(useProductionAgentRestore: true)
+        addTeardownBlock { @MainActor in
+            fixture.composition.workspaceSessionObservationBridge?.test_setBeforeApply(nil)
+            await projectionGate.release()
+            await fixture.shutdown()
+        }
+
+        try await fulfillment(of: [XCTUnwrap(fixture.readinessReached)], timeout: 3)
+        await fixture.readinessGate.release()
+        await fixture.indexGate.release()
+        await fixture.composition.workspaceSessionActivationTask?.value
+
+        let client = try XCTUnwrap(fixture.composition.workspaceSessionCommandClient)
+        let decoySessionID = UUID()
+        let foregroundTab = ComposeTabState(
+            name: "Foreground decoy",
+            activeAgentSessionID: decoySessionID
+        )
+        let createResult = await client.execute(
+            .composeTab(.create(
+                workspaceID: fixture.workspaceID,
+                tab: foregroundTab,
+                makeActive: true
+            )),
+            source: WorkspaceSessionCommandSource(kind: "test-delayed-set-status-decoy")
+        )
+        guard case .committed = createResult else {
+            XCTFail("Expected foreground decoy creation, got \(createResult)")
+            throw DelayedSessionRenameFixtureError.decoyCreationFailed
+        }
+
+        let viewModel = fixture.composition.agentModeViewModel
+        let owner = try XCTUnwrap(viewModel.test_sessionIndexOwner)
+        let workspace = try XCTUnwrap(fixture.composition.workspaceManager.workspace(withID: fixture.workspaceID))
+        var index = viewModel.test_ownerValidatedSessionIndex
+        index[decoySessionID] = makeSessionNamingIndexEntry(
+            id: decoySessionID,
+            tabID: foregroundTab.id,
+            name: foregroundTab.name
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            index,
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+
+        fixture.composition.workspaceSessionObservationBridge?.test_setBeforeApply { snapshot in
+            guard snapshot.workspaces.contains(where: { workspace in
+                workspace.id == fixture.workspaceID
+                    && workspace.composeTabs.contains(where: { tab in
+                        tab.id == fixture.tabID && tab.name == renamedTitle
+                    })
+            }) else { return }
+            projectionReached.fulfill()
+            await projectionGate.wait()
+        }
+        XCTAssertEqual(fixture.composition.promptManager.activeComposeTabID, foregroundTab.id)
+        return DelayedSessionRenameFixture(
+            fixture: fixture,
+            projectionGate: projectionGate,
+            projectionReached: projectionReached,
+            foregroundTab: foregroundTab,
+            decoySessionID: decoySessionID
+        )
+    }
+
+    private func assertCommittedRenameConverged(
+        _ delayed: DelayedSessionRenameFixture,
+        renamedTitle: String
+    ) async throws {
+        let fixture = delayed.fixture
+        XCTAssertEqual(fixture.composition.promptManager.activeComposeTabID, delayed.foregroundTab.id)
+        XCTAssertEqual(fixture.composition.workspaceManager.composeTabName(with: fixture.tabID), renamedTitle)
+        XCTAssertEqual(
+            fixture.composition.promptManager.currentComposeTabs.first(where: { $0.id == fixture.tabID })?.name,
+            renamedTitle
+        )
+        XCTAssertEqual(
+            fixture.composition.agentModeViewModel.test_ownerValidatedSessionIndex[fixture.agentSessionID]?.name,
+            renamedTitle
+        )
+        XCTAssertEqual(
+            fixture.composition.agentModeViewModel.test_ownerValidatedSessionIndex[delayed.decoySessionID]?.name,
+            delayed.foregroundTab.name
+        )
+        let rows = fixture.composition.agentModeViewModel.sidebarSessions(
+            for: fixture.composition.promptManager.currentComposeTabs
+        )
+        XCTAssertEqual(rows.first(where: { $0.tabID == fixture.tabID })?.title, renamedTitle)
+        XCTAssertEqual(
+            rows.first(where: { $0.tabID == delayed.foregroundTab.id })?.title,
+            delayed.foregroundTab.name
+        )
+        let workspace = try XCTUnwrap(fixture.composition.workspaceManager.workspace(withID: fixture.workspaceID))
+        let persisted = try await AgentSessionDataService.shared.loadAgentSession(
+            id: fixture.agentSessionID,
+            for: workspace
+        )
+        XCTAssertEqual(persisted?.name, renamedTitle)
+    }
+
+    private func makeSessionNamingIndexEntry(
+        id: UUID,
+        tabID: UUID,
+        name: String
+    ) -> AgentSessionIndexEntry {
+        AgentSessionIndexEntry(
+            id: id,
+            tabID: tabID,
+            name: name,
+            lastUserMessageAt: Date(),
+            savedAt: Date(),
+            lastRunStateRaw: AgentSessionRunState.idle.rawValue,
+            itemCount: 0,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: false,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
+            isMCPOriginated: false,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
         )
     }
 
@@ -668,7 +1037,7 @@ final class WindowStateCompositionReadinessTests: XCTestCase {
                       !activeSelection.selectedPaths.isEmpty
                 else { return }
 
-                projectionFeedbackRecorder.recordInjection()
+                guard projectionFeedbackRecorder.beginInjection() else { return }
                 files.test_emitEmptySelectionForAuthoritativeProjectionFeedback()
                 let visibleSelection = files.snapshotSelection()
                 XCTAssertTrue(
@@ -895,8 +1264,10 @@ private final class ProjectionFeedbackRecorder {
     private var manageSelectionReturned = false
     private var runtimeMetricsReadHandler: ((StoredSelection?) -> Void)?
 
-    func recordInjection() {
-        injectionCount += 1
+    func beginInjection() -> Bool {
+        guard injectionCount == 0 else { return false }
+        injectionCount = 1
+        return true
     }
 
     func beginRuntimeMetricsRead() -> Bool {

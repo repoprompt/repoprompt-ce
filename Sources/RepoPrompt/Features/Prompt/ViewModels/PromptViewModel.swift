@@ -2744,34 +2744,66 @@ class PromptViewModel: ObservableObject {
     }
 
     @MainActor
-    func renameComposeTabAuthoritatively(_ id: UUID, to newName: String) async -> String? {
+    struct AuthoritativeComposeTabRenameResult {
+        let canonicalName: String
+        let workspaceID: UUID
+        let tabID: UUID
+        let exactProjectionIsCurrent: Bool
+    }
+
+    @MainActor
+    func renameComposeTabAuthoritatively(
+        _ id: UUID,
+        workspaceID: UUID,
+        to newName: String,
+        preflight: @MainActor () -> Bool
+    ) async -> AuthoritativeComposeTabRenameResult? {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let manager = workspaceManager else { return nil }
 
         if manager.hasSelectedWorkspaceSession {
             guard let receipt = await manager.patchComposeTabTitle(
+                workspaceID: workspaceID,
                 tabID: id,
                 title: trimmed,
-                source: "prompt-rename-compose-tab"
+                source: "prompt-rename-compose-tab",
+                preflight: preflight
             ),
-                !Task.isCancelled,
+                receipt.workspaceID == workspaceID,
                 receipt.tabID == id,
-                receipt.title == trimmed,
-                manager.composeTab(for: WorkspaceSelectionIdentity(
+                receipt.title == trimmed
+            else { return nil }
+
+            let exactProjectionIsCurrent = manager.selectedWorkspaceSessionID == receipt.sessionID
+                && manager.selectedWorkspaceSessionActivationID == receipt.activationID
+                && manager.composeTab(for: WorkspaceSelectionIdentity(
                     workspaceID: receipt.workspaceID,
                     tabID: receipt.tabID
-                ))?.name == trimmed,
-                currentComposeTabs.first(where: { $0.id == id })?.name == trimmed
-            else { return nil }
+                ))?.name == trimmed
+                && currentComposeTabs.first(where: { $0.id == id })?.name == trimmed
+            if exactProjectionIsCurrent {
+                postComposeTabNameChanged(tabID: id, name: trimmed)
+            }
+            return AuthoritativeComposeTabRenameResult(
+                canonicalName: trimmed,
+                workspaceID: workspaceID,
+                tabID: id,
+                exactProjectionIsCurrent: exactProjectionIsCurrent
+            )
         } else {
-            guard applyLegacyComposeTabRename(id, to: trimmed),
+            guard preflight(),
+                  applyLegacyComposeTabRename(id, to: trimmed),
                   manager.composeTabName(with: id) == trimmed,
                   currentComposeTabs.first(where: { $0.id == id })?.name == trimmed
             else { return nil }
+            postComposeTabNameChanged(tabID: id, name: trimmed)
+            return AuthoritativeComposeTabRenameResult(
+                canonicalName: trimmed,
+                workspaceID: workspaceID,
+                tabID: id,
+                exactProjectionIsCurrent: true
+            )
         }
-
-        postComposeTabNameChanged(tabID: id, name: trimmed)
-        return trimmed
     }
 
     @MainActor
@@ -4109,7 +4141,7 @@ class PromptViewModel: ObservableObject {
 
     private func currentActiveComposeTabStoredSelectionForTokenCounting() -> StoredSelection? {
         if !isSwitchingComposeTab, let selectionCoordinator {
-            return selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true).selection
+            return selectionCoordinator.activeSelectionSnapshot(flushPendingUI: false).selection
         }
         guard let workspaceManager else { return nil }
         let activeTabID = activeComposeTabID
@@ -4132,7 +4164,7 @@ class PromptViewModel: ObservableObject {
 
     private func activeComposeTabStoredSelectionSnapshot() -> StoredSelection? {
         if let selectionCoordinator {
-            return selectionCoordinator.activeSelectionSnapshot(flushPendingUI: true).selection
+            return selectionCoordinator.activeSelectionSnapshot(flushPendingUI: false).selection
         }
         guard let workspaceManager else { return nil }
         let activeTabID = activeComposeTabID

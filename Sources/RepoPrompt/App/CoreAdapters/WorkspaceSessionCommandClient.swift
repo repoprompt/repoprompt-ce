@@ -64,7 +64,8 @@ final class WorkspaceSessionCommandClient {
             command,
             source: source,
             exactAdmissionToken: exactAdmissionToken,
-            expectedGeneration: expectedGeneration
+            expectedGeneration: expectedGeneration,
+            ownsCommittedProjectionCompletion: false
         )
     }
 
@@ -72,7 +73,8 @@ final class WorkspaceSessionCommandClient {
         _ command: WorkspaceSessionCommand,
         source: WorkspaceSessionCommandSource,
         exactAdmissionToken: WorkspaceSessionAdmissionToken?,
-        expectedGeneration: UInt64?
+        expectedGeneration: UInt64?,
+        ownsCommittedProjectionCompletion: Bool
     ) async -> WorkspaceSessionCommandResult {
         guard let snapshot, let token = exactAdmissionToken ?? admissionToken else {
             return .notReady(snapshot?.availability ?? .created)
@@ -91,9 +93,20 @@ final class WorkspaceSessionCommandClient {
             guard receipt.sessionID == sessionID,
                   receipt.activationID == token.activationID
             else { return .rejected(.expiredActivation) }
-            if let projectionWaiter,
-               await !projectionWaiter(receipt.snapshotSequence)
-            {
+            let projectionApplied: Bool
+            if let projectionWaiter {
+                if ownsCommittedProjectionCompletion {
+                    let completion = Task { @MainActor in
+                        await projectionWaiter(receipt.snapshotSequence)
+                    }
+                    projectionApplied = await completion.value
+                } else {
+                    projectionApplied = await projectionWaiter(receipt.snapshotSequence)
+                }
+            } else {
+                projectionApplied = true
+            }
+            if !projectionApplied, !ownsCommittedProjectionCompletion {
                 return .failed(WorkspaceSessionFailure("authoritative projection wait was cancelled"))
             }
         default:
@@ -103,23 +116,28 @@ final class WorkspaceSessionCommandClient {
     }
 
     func patchComposeTabTitle(
+        workspaceID: UUID,
         tabID: UUID,
         title: String,
         lastModified: Date,
-        source: WorkspaceSessionCommandSource
+        source: WorkspaceSessionCommandSource,
+        preflight: @MainActor () -> Bool
     ) async -> ComposeTabTitleProjectionReceipt? {
         await commandTail?.value
         guard !Task.isCancelled,
+              preflight(),
               let snapshot,
               snapshot.sessionID == sessionID,
               let admissionToken,
               admissionToken.sessionID == sessionID
         else { return nil }
 
-        let matches = snapshot.workspaces.compactMap { workspace in
-            workspace.composeTabs.contains(where: { $0.id == tabID }) ? workspace.id : nil
-        }
-        guard matches.count == 1, let workspaceID = matches.first else { return nil }
+        guard snapshot.workspaces.count(where: { workspace in
+            workspace.composeTabs.contains(where: { $0.id == tabID })
+        }) == 1,
+            snapshot.workspaces.first(where: { $0.id == workspaceID })?
+            .composeTabs.contains(where: { $0.id == tabID }) == true
+        else { return nil }
 
         let result = await executeNow(
             .composeTab(.patchTitle(
@@ -130,13 +148,9 @@ final class WorkspaceSessionCommandClient {
             )),
             source: source,
             exactAdmissionToken: admissionToken,
-            expectedGeneration: snapshot.stateGeneration
+            expectedGeneration: snapshot.stateGeneration,
+            ownsCommittedProjectionCompletion: true
         )
-        guard !Task.isCancelled,
-              self.admissionToken?.sessionID == sessionID,
-              self.admissionToken?.activationID == admissionToken.activationID
-        else { return nil }
-
         let receipt: WorkspaceSessionCommandReceipt
         switch result {
         case let .committed(commandReceipt), let .unchanged(commandReceipt):
@@ -145,12 +159,7 @@ final class WorkspaceSessionCommandClient {
             return nil
         }
         guard receipt.sessionID == sessionID,
-              receipt.activationID == admissionToken.activationID,
-              let projected = self.snapshot,
-              projected.sessionID == sessionID,
-              projected.snapshotSequence >= receipt.snapshotSequence,
-              projected.workspaces.first(where: { $0.id == workspaceID })?
-              .composeTabs.first(where: { $0.id == tabID })?.name == title
+              receipt.activationID == admissionToken.activationID
         else { return nil }
 
         return ComposeTabTitleProjectionReceipt(
@@ -204,7 +213,8 @@ final class WorkspaceSessionCommandClient {
                 command,
                 source: source,
                 exactAdmissionToken: nil,
-                expectedGeneration: nil
+                expectedGeneration: nil,
+                ownsCommittedProjectionCompletion: false
             )
             onResult(result)
             trackedTasks.removeValue(forKey: id)

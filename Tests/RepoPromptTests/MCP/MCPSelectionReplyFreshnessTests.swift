@@ -1245,6 +1245,11 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
         window.promptManager.loadComposeTabsFromWorkspace(workspace, syncPromptText: true)
         await window.workspaceManager.awaitInitialized()
+        if stopAutomaticTokenRecounts {
+            // Workspace switching restarts token counting; stop it again after setup so reply
+            // ingress assertions cannot observe an unrelated background provider flight.
+            await window.promptManager.stopTokenCountUpdateTimer()
+        }
         return (window, workspace.id)
     }
 

@@ -734,6 +734,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         store: LegacyWorkspaceRuntimeFactory.partitionStore()
     )
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
+    private(set) var explicitSelectionSliceMutationRevision: UInt64 = 0
     @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:] {
         didSet {
             guard selectionSlicesByFileID != oldValue else { return }
@@ -9869,6 +9870,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw SelectionSliceError.noWorkspaceLoaded
         }
 
+        explicitSelectionSliceMutationRevision &+= 1
         let scope = try currentPartitionScope()
 
         if entries.isEmpty {
@@ -10164,6 +10166,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw SelectionSliceError.noWorkspaceLoaded
         }
 
+        explicitSelectionSliceMutationRevision &+= 1
         let scope = try currentPartitionScope()
         let rootKey = file.standardizedRootFolderPath
         let relKey = file.standardizedRelativePath
@@ -11836,6 +11839,7 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func setFileAsFullContent(_ file: FileViewModel) {
+        explicitSelectionSliceMutationRevision &+= 1
         performSelectionBatch {
             if !file.isChecked {
                 file.setIsChecked(true)
@@ -11853,6 +11857,7 @@ extension WorkspaceFilesViewModel {
         // Only allow files with codemap support to be added as codemaps
         guard file.supportsCodeMap else { return }
 
+        explicitSelectionSliceMutationRevision &+= 1
         performSelectionBatch {
             if file.isChecked {
                 file.setIsChecked(false)

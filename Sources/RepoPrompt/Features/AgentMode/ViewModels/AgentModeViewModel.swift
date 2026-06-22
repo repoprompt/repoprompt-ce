@@ -15813,102 +15813,188 @@ final class AgentModeViewModel: ObservableObject {
     /// The compose-tab/workspace title is authoritative. Session-index, live-session,
     /// provider-thread, and sidebar state are derived projections updated only after
     /// that canonical title is visible.
+    private struct SessionRenameTarget {
+        let workspace: WorkspaceModel
+        let tabID: UUID
+        let workspaceSessionID: UUID?
+        let workspaceSessionActivationID: UUID?
+        let session: TabSession?
+        let sessionIdentity: ObjectIdentifier?
+        var persistentBinding: AgentPersistentSessionBindingIdentity?
+        var bindingTransitionGeneration: UInt64?
+        let runID: UUID?
+        let runAttemptID: UUID?
+        let sessionID: UUID?
+        let indexOwner: SessionIndexOwner?
+    }
+
     @discardableResult
     func renameSession(tabID: UUID, to newName: String) async -> String? {
         guard !newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         let validatedName = AgentSession.validatedName(newName)
         guard let promptManager,
-              promptManager.currentComposeTabs.contains(where: { $0.id == tabID })
+              let target = makeSessionRenameTarget(tabID: tabID)
         else { return nil }
-
-        let expectedSession = sessions[tabID]
-        let expectedSessionIdentity = expectedSession.map(ObjectIdentifier.init)
-        let expectedPersistentBinding = expectedSession?.persistentSessionBindingIdentity
-        let expectedBindingTransitionGeneration = expectedSession?.bindingTransitionGeneration
-        let expectedRunID = expectedSession?.runID
-        let expectedRunAttemptID = expectedSession?.activeRunAttemptID
-        let expectedSessionID = boundSessionID(for: tabID)
-        if let expectedSessionID,
+        if let expectedSessionID = target.sessionID,
            let indexed = ownerValidatedSessionIndex[expectedSessionID],
            indexed.tabID != tabID
         {
             return nil
         }
 
-        guard let canonicalName = await promptManager.renameComposeTabAuthoritatively(
+        guard let rename = await promptManager.renameComposeTabAuthoritatively(
             tabID,
-            to: validatedName
+            workspaceID: target.workspace.id,
+            to: validatedName,
+            preflight: { [weak self] in
+                self?.isSessionRenameTargetCurrent(target, requireRunIdentity: true) == true
+            }
         ),
-            !Task.isCancelled,
-            canonicalName == validatedName,
-            let workspaceName = workspaceManager?.composeTabName(with: tabID),
-            workspaceName == canonicalName,
-            let projectedName = promptManager.currentComposeTabs.first(where: { $0.id == tabID })?.name,
-            projectedName == workspaceName
+            rename.canonicalName == validatedName,
+            rename.workspaceID == target.workspace.id,
+            rename.tabID == tabID
         else {
             return nil
         }
 
-        let currentSession = sessions[tabID]
-        guard currentSession.map(ObjectIdentifier.init) == expectedSessionIdentity,
-              currentSession?.persistentSessionBindingIdentity == expectedPersistentBinding,
-              currentSession?.bindingTransitionGeneration == expectedBindingTransitionGeneration,
-              currentSession?.runID == expectedRunID,
-              currentSession?.activeRunAttemptID == expectedRunAttemptID,
-              boundSessionID(for: tabID) == expectedSessionID
+        let completion = Task { @MainActor in
+            await self.completeCommittedSessionRename(
+                target,
+                canonicalName: rename.canonicalName,
+                exactProjectionWasCurrent: rename.exactProjectionIsCurrent
+            )
+        }
+        let exactTargetConverged = await completion.value
+        return Task.isCancelled || !exactTargetConverged ? nil : rename.canonicalName
+    }
+
+    private func makeSessionRenameTarget(tabID: UUID) -> SessionRenameTarget? {
+        guard let workspaceManager,
+              let promptManager,
+              promptManager.currentComposeTabs.contains(where: { $0.id == tabID })
+        else { return nil }
+        let workspaces = workspaceManager.workspaces.filter { workspace in
+            workspace.composeTabs.contains(where: { $0.id == tabID })
+        }
+        guard workspaces.count == 1,
+              let workspace = workspaces.first,
+              let composeTab = workspace.composeTabs.first(where: { $0.id == tabID })
         else { return nil }
 
-        let sessionID = expectedSessionID
-        if let sessionID,
+        let session = sessions[tabID]
+        let sessionID = boundSessionID(for: tabID)
+        guard composeTab.activeAgentSessionID == nil || composeTab.activeAgentSessionID == sessionID,
+              session?.activeAgentSessionID == nil || session?.activeAgentSessionID == sessionID,
+              session?.bindingTransitionInProgress != true
+        else { return nil }
+        return SessionRenameTarget(
+            workspace: workspace,
+            tabID: tabID,
+            workspaceSessionID: workspaceManager.selectedWorkspaceSessionID?.rawValue,
+            workspaceSessionActivationID: workspaceManager.selectedWorkspaceSessionActivationID,
+            session: session,
+            sessionIdentity: session.map(ObjectIdentifier.init),
+            persistentBinding: session?.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session?.bindingTransitionGeneration,
+            runID: session?.runID,
+            runAttemptID: session?.activeRunAttemptID,
+            sessionID: sessionID,
+            indexOwner: sessionIndexOwner
+        )
+    }
+
+    private func isSessionRenameTargetCurrent(
+        _ target: SessionRenameTarget,
+        requireRunIdentity: Bool
+    ) -> Bool {
+        guard let workspaceManager,
+              workspaceManager.selectedWorkspaceSessionID?.rawValue == target.workspaceSessionID,
+              workspaceManager.selectedWorkspaceSessionActivationID == target.workspaceSessionActivationID
+        else { return false }
+        let workspaces = workspaceManager.workspaces.filter { workspace in
+            workspace.composeTabs.contains(where: { $0.id == target.tabID })
+        }
+        let composeTabSessionID = workspaces.first?
+            .composeTabs.first(where: { $0.id == target.tabID })?.activeAgentSessionID
+        guard workspaces.count == 1,
+              workspaces.first?.id == target.workspace.id,
+              composeTabSessionID == nil || composeTabSessionID == target.sessionID,
+              promptManager?.currentComposeTabs.contains(where: { $0.id == target.tabID }) == true,
+              sessions[target.tabID].map(ObjectIdentifier.init) == target.sessionIdentity,
+              sessions[target.tabID]?.persistentSessionBindingIdentity == target.persistentBinding,
+              sessions[target.tabID]?.bindingTransitionGeneration == target.bindingTransitionGeneration,
+              sessions[target.tabID]?.bindingTransitionInProgress != true,
+              boundSessionID(for: target.tabID) == target.sessionID
+        else { return false }
+        if requireRunIdentity {
+            guard sessions[target.tabID]?.runID == target.runID,
+                  sessions[target.tabID]?.activeRunAttemptID == target.runAttemptID
+            else { return false }
+        }
+        return true
+    }
+
+    private func completeCommittedSessionRename(
+        _ capturedTarget: SessionRenameTarget,
+        canonicalName: String,
+        exactProjectionWasCurrent: Bool
+    ) async -> Bool {
+        var target = capturedTarget
+        let exactSessionIsCurrent = isSessionRenameTargetCurrent(target, requireRunIdentity: false)
+        if exactSessionIsCurrent,
+           let session = target.session,
+           session.activeAgentSessionID == nil,
+           let sessionID = target.sessionID
+        {
+            _ = installPersistentSessionBinding(
+                sessionID: sessionID,
+                on: session,
+                updateWorkspaceMetadata: true,
+                invalidateAsyncWork: true
+            )
+            target.persistentBinding = session.persistentSessionBindingIdentity
+            target.bindingTransitionGeneration = session.bindingTransitionGeneration
+        }
+        if sessionIndexOwner == target.indexOwner,
+           let sessionID = target.sessionID,
            var entry = ownerValidatedSessionIndex[sessionID],
-           entry.tabID == tabID
+           entry.tabID == target.tabID
         {
             entry.name = canonicalName
             applyLocalSessionIndexUpsert(entry)
         }
 
-        if let session = sessions[tabID] {
-            if session.activeAgentSessionID == nil, let sessionID {
-                _ = installPersistentSessionBinding(
-                    sessionID: sessionID,
-                    on: session,
-                    updateWorkspaceMetadata: true,
-                    invalidateAsyncWork: true
-                )
-            }
+        if exactSessionIsCurrent, let session = target.session {
             session.isDirty = true
-            scheduleSave(for: tabID)
-            handleObservedMCPStateChange(for: session)
-            codexCoordinator.scheduleCodexThreadNameSyncIfPossible(
-                for: session,
-                name: canonicalName,
-                explicitThreadID: session.codexConversationID,
-                source: "renameSession"
-            )
-        } else if let sessionID,
-                  let workspaces = workspaceManager?.workspaces,
-                  workspaces.count(where: { workspace in
-                      workspace.composeTabs.contains(where: { $0.id == tabID })
-                  }) == 1,
-                  let workspace = workspaces.first(where: { workspace in
-                      workspace.composeTabs.contains(where: { $0.id == tabID })
-                  })
-        {
-            Task { [dataService] in
-                try? await dataService.renameAgentSession(
-                    id: sessionID,
-                    to: canonicalName,
-                    for: workspace
+            if isSessionRenameTargetCurrent(target, requireRunIdentity: true) {
+                handleObservedMCPStateChange(for: session)
+                codexCoordinator.scheduleCodexThreadNameSyncIfPossible(
+                    for: session,
+                    name: canonicalName,
+                    explicitThreadID: session.codexConversationID,
+                    source: "renameSession"
                 )
             }
         }
 
+        if let sessionID = target.sessionID {
+            try? await dataService.renameAgentSession(
+                id: sessionID,
+                to: canonicalName,
+                for: target.workspace
+            )
+        }
+
+        guard exactProjectionWasCurrent,
+              isSessionRenameTargetCurrent(target, requireRunIdentity: false),
+              let promptManager
+        else { return false }
         syncSidebarUIState(
             refresh: true,
             reason: .sessionName,
             sidebarTabs: promptManager.currentComposeTabs
         )
-        return canonicalName
+        return true
     }
 
     private func cleanupACPStateForDeletedSession(_ session: TabSession) async {

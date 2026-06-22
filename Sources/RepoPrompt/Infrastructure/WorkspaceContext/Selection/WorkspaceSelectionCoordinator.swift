@@ -2,6 +2,10 @@ import Combine
 import Foundation
 import RepoPromptCore
 
+enum WorkspaceSelectionApplicationContext {
+    @TaskLocal static var isProgrammatic = false
+}
+
 struct WorkspaceSelectionIdentity: Hashable {
     let workspaceID: UUID
     let tabID: UUID
@@ -785,9 +789,11 @@ final class WorkspaceSelectionCoordinator {
     }
 
     func withApplyingSelectionMirror<T>(_ operation: () async throws -> T) async rethrows -> T {
-        applyingSelectionMirrorDepth += 1
-        defer { applyingSelectionMirrorDepth = max(0, applyingSelectionMirrorDepth - 1) }
-        return try await operation()
+        try await WorkspaceSelectionApplicationContext.$isProgrammatic.withValue(true) {
+            applyingSelectionMirrorDepth += 1
+            defer { applyingSelectionMirrorDepth = max(0, applyingSelectionMirrorDepth - 1) }
+            return try await operation()
+        }
     }
 
     private func applySelectionMirror(_ operation: () async -> Void) async {

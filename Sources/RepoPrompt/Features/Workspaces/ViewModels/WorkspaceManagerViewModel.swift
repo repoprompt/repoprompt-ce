@@ -575,27 +575,26 @@ class WorkspaceManagerViewModel: ObservableObject {
     }
 
     func patchComposeTabTitle(
+        workspaceID: UUID,
         tabID: UUID,
         title: String,
-        source: String
+        source: String,
+        preflight: @MainActor () -> Bool
     ) async -> WorkspaceSessionCommandClient.ComposeTabTitleProjectionReceipt? {
         guard let workspaceSessionClient, !Task.isCancelled else { return nil }
         let expectedSessionID = workspaceSessionClient.sessionID
         guard let receipt = await workspaceSessionClient.patchComposeTabTitle(
+            workspaceID: workspaceID,
             tabID: tabID,
             title: title,
             lastModified: Date(),
-            source: WorkspaceSessionCommandSource(kind: source)
+            source: WorkspaceSessionCommandSource(kind: source),
+            preflight: preflight
         ),
-            !Task.isCancelled,
-            self.workspaceSessionClient === workspaceSessionClient,
             receipt.sessionID == expectedSessionID,
-            workspaceSessionClient.admissionToken?.activationID == receipt.activationID,
-            workspaceSessionClient.snapshot?.snapshotSequence ?? 0 >= receipt.snapshotSequence,
-            composeTab(for: WorkspaceSelectionIdentity(
-                workspaceID: receipt.workspaceID,
-                tabID: receipt.tabID
-            ))?.name == receipt.title
+            receipt.workspaceID == workspaceID,
+            receipt.tabID == tabID,
+            receipt.title == title
         else { return nil }
         return receipt
     }
@@ -919,6 +918,7 @@ class WorkspaceManagerViewModel: ObservableObject {
     )
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
     private var authoritativeProjectionApplyDepth = 0
+    private var pendingProgrammaticSliceFeedbackRevision: UInt64?
     private var uiSnapshotCommandTail: Task<Void, Never>?
     private var uiSnapshotCommandGeneration: UInt64 = 0
     #if DEBUG
@@ -1809,18 +1809,19 @@ class WorkspaceManagerViewModel: ObservableObject {
         fileManager.$selectionSlicesByFileID
             .removeDuplicates()
             .map { [weak self] _ in
-                self?.authoritativeProjectionApplyDepth ?? 0 > 0
+                self?.selectionSliceFeedbackOriginAtEmission()
+                    ?? WorkspaceSelectionApplicationContext.isProgrammatic
             }
             .debounce(for: .milliseconds(60), scheduler: DispatchQueue.main)
-            .sink { [weak self] originatedDuringAuthoritativeProjection in
+            .sink { [weak self] originatedDuringProgrammaticApply in
                 guard let self, !self.isSwitchingWorkspace else { return }
                 #if DEBUG
                     authoritativeProjectionFeedbackEventHandler?(
                         .selectionSlices,
-                        originatedDuringAuthoritativeProjection
+                        originatedDuringProgrammaticApply
                     )
                 #endif
-                guard !originatedDuringAuthoritativeProjection else {
+                guard !originatedDuringProgrammaticApply else {
                     return
                 }
                 bumpStateVersion(for: activeWorkspaceID)
@@ -4024,11 +4025,36 @@ class WorkspaceManagerViewModel: ObservableObject {
         apply()
     }
 
+    private var isApplyingProgrammaticSelectionState: Bool {
+        authoritativeProjectionApplyDepth > 0
+            || selectionCoordinator?.isApplyingSelectionMirror == true
+            || !applyingTabContextDepthByTabID.isEmpty
+    }
+
+    private func selectionSliceFeedbackOriginAtEmission() -> Bool {
+        let userMutationRevision = fileManager.explicitSelectionSliceMutationRevision
+        if WorkspaceSelectionApplicationContext.isProgrammatic
+            || isApplyingProgrammaticSelectionState
+        {
+            pendingProgrammaticSliceFeedbackRevision = userMutationRevision
+            return true
+        }
+        if pendingProgrammaticSliceFeedbackRevision == userMutationRevision {
+            return true
+        }
+        pendingProgrammaticSliceFeedbackRevision = nil
+        return false
+    }
+
     #if DEBUG
         func test_setAuthoritativeProjectionFeedbackEventHandler(
             _ handler: ((AuthoritativeProjectionFeedbackSource, Bool) -> Void)?
         ) {
             authoritativeProjectionFeedbackEventHandler = handler
+        }
+
+        func test_flushUISnapshotCommands() async {
+            await uiSnapshotCommandTail?.value
         }
     #endif
 
