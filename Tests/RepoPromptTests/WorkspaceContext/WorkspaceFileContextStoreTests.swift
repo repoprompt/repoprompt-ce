@@ -3,6 +3,24 @@ import CoreServices
 @testable import RepoPrompt
 import XCTest
 
+private enum CodemapInitializationResetBoundary: String, CaseIterable {
+    case cancelAll
+    case checkoutMutation
+    case cacheClear
+}
+
+private actor UUIDRecorder {
+    private var values: [UUID] = []
+
+    func append(_ value: UUID) {
+        values.append(value)
+    }
+
+    func snapshot() -> [UUID] {
+        values
+    }
+}
+
 final class WorkspaceFileContextStoreTests: XCTestCase {
     private var temporaryRoots: [URL] = []
 
@@ -6904,6 +6922,171 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             }
             XCTAssertEqual(reloadedCounters.trackedRootCount, 1)
             XCTAssertEqual(reloadedCounters.trackedFileIDCount, 1)
+        }
+
+        func testSessionWorktreeCodemapInitializationFinalReleaseCancelsWithoutLateSubmissionAndIsolatesReplacementLifetime() async throws {
+            let root = try makeTemporaryRoot(name: "SessionWorktreeCodemapLifetimeCancellation")
+            try write("struct OldLifetimeType {}\n", to: root.appendingPathComponent("A.swift"))
+            let store = WorkspaceFileContextStore()
+            let submitGate = AsyncGate()
+            let startedFileIDs = UUIDRecorder()
+            await store.setSessionWorktreeCodemapInitializationWillSubmitHandlerForTesting { _, _ in
+                await submitGate.markStartedAndWaitForRelease()
+            }
+            await store.setCodemapScanWillStartHandlerForTesting { fileID in
+                await startedFileIDs.append(fileID)
+            }
+            addTeardownBlock {
+                await submitGate.release()
+                await store.setSessionWorktreeCodemapInitializationWillSubmitHandlerForTesting(nil)
+                await store.setCodemapScanWillStartHandlerForTesting(nil)
+                await store.cancelAllCodemapScans()
+            }
+
+            let firstOwnerID = UUID()
+            let firstPreparation = try await store.prepareSessionWorktreeOwnership(
+                ownerID: firstOwnerID,
+                bindingFingerprint: "first-lifetime",
+                physicalRootPaths: [root.path]
+            )
+            let firstRoots = try await store.commitSessionWorktreeOwnership(firstPreparation)
+            let firstRootID = try XCTUnwrap(firstRoots.first?.rootID)
+            let firstLifetimeID = try await store.rootLifetimeIDForTesting(rootID: firstRootID)
+            let firstFile = await store.file(rootID: firstRootID, relativePath: "A.swift")
+            let firstFileID = try XCTUnwrap(firstFile?.id)
+            let firstInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [firstRootID])
+            XCTAssertEqual(firstInitialization, [firstRootID])
+            await submitGate.waitUntilStarted()
+            let beforeRelease = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+            XCTAssertEqual(beforeRelease.activeTaskCount, 1)
+            XCTAssertEqual(beforeRelease.initializingLifetimeCount, 1)
+
+            await store.releaseSessionWorktreeOwnership(ownerID: firstOwnerID)
+            let firstLifetimeCancelled = await waitForAsyncCondition {
+                let initialization = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                let roots = await store.roots()
+                return initialization.activeTaskCount == 0 && !roots.contains { $0.id == firstRootID }
+            }
+            XCTAssertTrue(firstLifetimeCancelled)
+            await submitGate.release()
+            let oldStartedFileIDs = await startedFileIDs.snapshot()
+            XCTAssertFalse(oldStartedFileIDs.contains(firstFileID))
+
+            try write("struct NewLifetimeType {}\n", to: root.appendingPathComponent("A.swift"))
+            await store.setSessionWorktreeCodemapInitializationWillSubmitHandlerForTesting(nil)
+            let secondOwnerID = UUID()
+            let secondPreparation = try await store.prepareSessionWorktreeOwnership(
+                ownerID: secondOwnerID,
+                bindingFingerprint: "second-lifetime",
+                physicalRootPaths: [root.path]
+            )
+            let secondRoots = try await store.commitSessionWorktreeOwnership(secondPreparation)
+            let secondRootID = try XCTUnwrap(secondRoots.first?.rootID)
+            let secondLifetimeID = try await store.rootLifetimeIDForTesting(rootID: secondRootID)
+            let secondFile = await store.file(rootID: secondRootID, relativePath: "A.swift")
+            let secondFileID = try XCTUnwrap(secondFile?.id)
+            XCTAssertNotEqual(secondRootID, firstRootID)
+            XCTAssertNotEqual(secondLifetimeID, firstLifetimeID)
+            XCTAssertNotEqual(secondFileID, firstFileID)
+            let secondInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [secondRootID])
+            XCTAssertEqual(secondInitialization, [secondRootID])
+            let replacementSubmitted = await waitForAsyncCondition {
+                await store.codemapSnapshot(rootID: secondRootID, relativePath: "A.swift") != nil
+            }
+            XCTAssertTrue(replacementSubmitted)
+            let allStartedFileIDs = await startedFileIDs.snapshot()
+            XCTAssertFalse(allStartedFileIDs.contains(firstFileID))
+            XCTAssertTrue(allStartedFileIDs.contains(secondFileID))
+
+            await store.releaseSessionWorktreeOwnership(ownerID: secondOwnerID)
+            let finalIdle = await waitForAsyncCondition {
+                let initialization = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                let roots = await store.roots()
+                return initialization.activeTaskCount == 0
+                    && initialization.initializingLifetimeCount == 0
+                    && initialization.initializedLifetimeCount == 0
+                    && roots.isEmpty
+            }
+            XCTAssertTrue(finalIdle)
+        }
+
+        func testSessionWorktreeCodemapInitializationCancelsAcrossResetBoundaries() async throws {
+            for boundary in CodemapInitializationResetBoundary.allCases {
+                let root = try makeTemporaryRoot(name: "SessionWorktreeCodemapReset-\(boundary.rawValue)")
+                try write("struct ResetBoundaryType {}\n", to: root.appendingPathComponent("A.swift"))
+                let store = WorkspaceFileContextStore()
+                let submitGate = AsyncGate()
+                let startedFileIDs = UUIDRecorder()
+                await store.setSessionWorktreeCodemapInitializationWillSubmitHandlerForTesting { _, _ in
+                    await submitGate.markStartedAndWaitForRelease()
+                }
+                await store.setCodemapScanWillStartHandlerForTesting { fileID in
+                    await startedFileIDs.append(fileID)
+                }
+
+                let ownerID = UUID()
+                let preparation = try await store.prepareSessionWorktreeOwnership(
+                    ownerID: ownerID,
+                    bindingFingerprint: boundary.rawValue,
+                    physicalRootPaths: [root.path]
+                )
+                let roots = try await store.commitSessionWorktreeOwnership(preparation)
+                let rootID = try XCTUnwrap(roots.first?.rootID, boundary.rawValue)
+                let file = await store.file(rootID: rootID, relativePath: "A.swift")
+                let fileID = try XCTUnwrap(file?.id, boundary.rawValue)
+                let initialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [rootID])
+                XCTAssertEqual(initialization, [rootID], boundary.rawValue)
+                await submitGate.waitUntilStarted()
+
+                switch boundary {
+                case .cancelAll:
+                    await store.cancelAllCodemapScans()
+                case .checkoutMutation:
+                    await store.cancelCodemapScansForCheckoutMutation(rootIDs: [rootID])
+                case .cacheClear:
+                    await store.clearAllCodemapCaches(rootFolders: [root.path])
+                }
+                let cancelled = await waitForAsyncCondition {
+                    let snapshot = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                    return snapshot.activeTaskCount == 0 && snapshot.initializingLifetimeCount == 0
+                }
+                XCTAssertTrue(cancelled, boundary.rawValue)
+
+                await store.setSessionWorktreeCodemapInitializationWillSubmitHandlerForTesting(nil)
+                let retry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [rootID])
+                XCTAssertEqual(retry, [rootID], boundary.rawValue)
+                let retrySubmitted = await waitForAsyncCondition {
+                    await store.codemapSnapshot(rootID: rootID, relativePath: "A.swift") != nil
+                }
+                XCTAssertTrue(retrySubmitted, boundary.rawValue)
+                let beforeOldCompletion = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                XCTAssertEqual(beforeOldCompletion.activeTaskCount, 0, boundary.rawValue)
+                XCTAssertEqual(beforeOldCompletion.initializedLifetimeCount, 1, boundary.rawValue)
+
+                await submitGate.release()
+                let staleCompletionFenced = await waitForAsyncCondition {
+                    let snapshot = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                    return snapshot.staleCompletionCount == beforeOldCompletion.staleCompletionCount + 1
+                        && snapshot.initializedLifetimeCount == 1
+                }
+                XCTAssertTrue(staleCompletionFenced, boundary.rawValue)
+                let started = await startedFileIDs.snapshot()
+                XCTAssertEqual(started.count(where: { $0 == fileID }), 1, boundary.rawValue)
+                let redundantRetry = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [rootID])
+                XCTAssertTrue(redundantRetry.isEmpty, boundary.rawValue)
+
+                await store.setCodemapScanWillStartHandlerForTesting(nil)
+                await store.releaseSessionWorktreeOwnership(ownerID: ownerID)
+                let idle = await waitForAsyncCondition {
+                    let snapshot = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+                    let loadedRoots = await store.roots()
+                    return snapshot.activeTaskCount == 0
+                        && snapshot.initializingLifetimeCount == 0
+                        && snapshot.initializedLifetimeCount == 0
+                        && loadedRoots.isEmpty
+                }
+                XCTAssertTrue(idle, boundary.rawValue)
+            }
         }
 
         func testDeferredInitialRootLoadFlushUsesStoreRootsInsteadOfMainActorUIGather() throws {

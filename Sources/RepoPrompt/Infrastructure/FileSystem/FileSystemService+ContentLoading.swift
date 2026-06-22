@@ -88,6 +88,19 @@ private enum BoundedDataReadResult {
     case tooLarge(observedByteCount: Int64)
 }
 
+enum ContentReadForegroundActivityKind: String, CaseIterable, Hashable {
+    case materialization
+    case rootLoad
+    case storeBackedSearch
+    case readResolution
+    case interactiveRead
+}
+
+struct ContentReadForegroundActivityToken: Hashable {
+    fileprivate let id: UUID
+    let kind: ContentReadForegroundActivityKind
+}
+
 actor ContentReadAsyncLimiter {
     #if DEBUG
         struct Snapshot: Equatable {
@@ -104,9 +117,15 @@ actor ContentReadAsyncLimiter {
             let bulkGrantCount: Int
             let backgroundPermitLimit: Int
             let activeBackgroundPermitCount: Int
+            let activeCodemapPermitCount: Int
+            let queuedCodemapWaiterCount: Int
+            let foregroundActivityCount: Int
+            let foregroundActivityCountsByKind: [ContentReadForegroundActivityKind: Int]
+            let codemapGrantWhileForegroundCount: Int
 
             var isIdle: Bool {
                 activePermitCount == 0 && queuedWaiterCount == 0 && ownerLaneCount == 0
+                    && foregroundActivityCount == 0
             }
         }
     #endif
@@ -119,6 +138,7 @@ actor ContentReadAsyncLimiter {
 
     private struct PermitAcquisition {
         let ownerID: UUID
+        let workloadClass: ContentReadWorkloadClass
         let priorityClass: PriorityClass
         let waited: Bool
         let queueDepth: Int
@@ -144,6 +164,8 @@ actor ContentReadAsyncLimiter {
     private let nowUptimeNanoseconds: @Sendable () -> UInt64
     private var availablePermits: Int
     private var activeBackgroundPermitCount = 0
+    private var activeCodemapPermitCount = 0
+    private var foregroundActivitiesByTokenID: [UUID: ContentReadForegroundActivityKind] = [:]
     private var waiterStates: [UUID: WaiterState] = [:]
     private var activePermitCountsByOwner: [UUID: Int] = [:]
     private var lastGrantOrdinalByOwner: [UUID: UInt64] = [:]
@@ -156,6 +178,7 @@ actor ContentReadAsyncLimiter {
     private var interactiveGrantCount = 0
     private var normalGrantCount = 0
     private var bulkGrantCount = 0
+    private var codemapGrantWhileForegroundCount = 0
 
     init(
         capacity: Int,
@@ -179,11 +202,50 @@ actor ContentReadAsyncLimiter {
         availablePermits = capacity
     }
 
+    func beginForegroundActivity(
+        kind: ContentReadForegroundActivityKind
+    ) -> ContentReadForegroundActivityToken {
+        let token = ContentReadForegroundActivityToken(id: UUID(), kind: kind)
+        foregroundActivitiesByTokenID[token.id] = kind
+        return token
+    }
+
+    func endForegroundActivity(_ token: ContentReadForegroundActivityToken) {
+        guard foregroundActivitiesByTokenID[token.id] == token.kind else {
+            assertionFailure("Content read foreground activity token mismatch or over-release")
+            return
+        }
+        foregroundActivitiesByTokenID.removeValue(forKey: token.id)
+        if foregroundActivitiesByTokenID.isEmpty {
+            scheduleAvailablePermits()
+        }
+    }
+
+    func withForegroundActivity<T>(
+        kind: ContentReadForegroundActivityKind,
+        _ body: @Sendable () async throws -> T
+    ) async rethrows -> T {
+        let token = beginForegroundActivity(kind: kind)
+        do {
+            let result = try await body()
+            endForegroundActivity(token)
+            return result
+        } catch {
+            endForegroundActivity(token)
+            throw error
+        }
+    }
+
     func withPermit<T>(
         workloadClass: ContentReadWorkloadClass,
         ownerID: UUID,
         _ body: @Sendable () async throws -> T
     ) async throws -> T {
+        #if DEBUG
+            let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
+            let schedulerRequestStart = WorkspaceFileSearchDebugTiming.now()
+            coldStartCollector?.recordSchedulerRequest(workload: workloadClass.rawValue)
+        #endif
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
         let permitWaitState = EditFlowPerf.begin(
             EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
@@ -200,6 +262,15 @@ actor ContentReadAsyncLimiter {
                 ownerID: ownerID,
                 lifecycleCorrelation: lifecycleCorrelation
             )
+            #if DEBUG
+                coldStartCollector?.recordSchedulerGrant(
+                    workload: workloadClass.rawValue,
+                    waitNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: schedulerRequestStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                )
+            #endif
             EditFlowPerf.end(
                 EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
                 permitWaitState,
@@ -223,9 +294,42 @@ actor ContentReadAsyncLimiter {
             )
             throw error
         }
-        defer { release(acquisition) }
-        try Task.checkCancellation()
-        return try await body()
+        #if DEBUG
+            let executionStart = WorkspaceFileSearchDebugTiming.now()
+            do {
+                try Task.checkCancellation()
+                let result = try await body()
+                let executionNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                    since: executionStart,
+                    through: WorkspaceFileSearchDebugTiming.now()
+                )
+                release(acquisition)
+                coldStartCollector?.recordSchedulerCompletion(
+                    workload: workloadClass.rawValue,
+                    executionNanoseconds: executionNanoseconds,
+                    cancelled: false,
+                    failed: false
+                )
+                return result
+            } catch {
+                let executionNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                    since: executionStart,
+                    through: WorkspaceFileSearchDebugTiming.now()
+                )
+                release(acquisition)
+                coldStartCollector?.recordSchedulerCompletion(
+                    workload: workloadClass.rawValue,
+                    executionNanoseconds: executionNanoseconds,
+                    cancelled: error is CancellationError,
+                    failed: !(error is CancellationError)
+                )
+                throw error
+            }
+        #else
+            defer { release(acquisition) }
+            try Task.checkCancellation()
+            return try await body()
+        #endif
     }
 
     private func acquire(
@@ -236,14 +340,15 @@ actor ContentReadAsyncLimiter {
         try Task.checkCancellation()
         scheduleAvailablePermits()
         let priorityClass = Self.priorityClass(for: workloadClass)
-        if waiterStates.isEmpty, canAllocatePermit(priorityClass: priorityClass) {
+        if waiterStates.isEmpty, canAllocatePermit(workloadClass: workloadClass) {
             return allocatePermit(
                 ownerID: ownerID,
+                workloadClass: workloadClass,
                 priorityClass: priorityClass,
                 waited: false
             )
         }
-        guard waiterStates.count < maxQueuedWaiterCount else {
+        guard canEnqueueWaiter(workloadClass: workloadClass) else {
             overloadCount &+= 1
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerOverloaded,
@@ -284,7 +389,7 @@ actor ContentReadAsyncLimiter {
             continuation.resume(throwing: CancellationError())
             return
         }
-        guard waiterStates.count < maxQueuedWaiterCount else {
+        guard canEnqueueWaiter(workloadClass: workloadClass) else {
             overloadCount &+= 1
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerOverloaded,
@@ -310,6 +415,11 @@ actor ContentReadAsyncLimiter {
             enqueueOrdinal: nextEnqueueOrdinal,
             enqueuedAtUptimeNanoseconds: nowUptimeNanoseconds()
         )
+        #if DEBUG
+            WorkspaceFileSearchDebugContext.coldStartCollector?.recordSchedulerEnqueue(
+                workload: workloadClass.rawValue
+            )
+        #endif
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan,
             correlation: lifecycleCorrelation,
@@ -346,6 +456,12 @@ actor ContentReadAsyncLimiter {
             #endif
             activeBackgroundPermitCount = max(0, activeBackgroundPermitCount - 1)
         }
+        if acquisition.workloadClass == .codemap {
+            #if DEBUG
+                assert(activeCodemapPermitCount > 0, "Content read limiter codemap over-release detected")
+            #endif
+            activeCodemapPermitCount = max(0, activeCodemapPermitCount - 1)
+        }
         if let activeCount = activePermitCountsByOwner[acquisition.ownerID] {
             if activeCount <= 1 {
                 activePermitCountsByOwner.removeValue(forKey: acquisition.ownerID)
@@ -366,6 +482,7 @@ actor ContentReadAsyncLimiter {
             guard let state = waiterStates.removeValue(forKey: waiterID) else { continue }
             let acquisition = allocatePermit(
                 ownerID: state.ownerID,
+                workloadClass: state.workloadClass,
                 priorityClass: state.priorityClass,
                 waited: true
             )
@@ -384,8 +501,12 @@ actor ContentReadAsyncLimiter {
 
     private func nextWaiterID() -> UUID? {
         let now = nowUptimeNanoseconds()
+        let hasQueuedForegroundWork = waiterStates.values.contains {
+            Self.isForegroundWorkload($0.workloadClass) && canAllocatePermit(workloadClass: $0.workloadClass)
+        }
         let eligibleWaiters = waiterStates.filter {
-            canAllocatePermit(priorityClass: $0.value.priorityClass)
+            canAllocatePermit(workloadClass: $0.value.workloadClass)
+                && !(hasQueuedForegroundWork && $0.value.workloadClass == .codemap)
         }
         if let aged = eligibleWaiters.min(by: { lhs, rhs in
             let lhsAged = elapsedNanoseconds(since: lhs.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds
@@ -397,13 +518,15 @@ actor ContentReadAsyncLimiter {
         }
 
         let hasInteractive = waiterStates.values.contains {
-            $0.priorityClass == .interactive && canAllocatePermit(priorityClass: $0.priorityClass)
+            $0.priorityClass == .interactive && canAllocatePermit(workloadClass: $0.workloadClass)
         }
         let hasNormal = waiterStates.values.contains {
-            $0.priorityClass == .normal && canAllocatePermit(priorityClass: $0.priorityClass)
+            $0.priorityClass == .normal && canAllocatePermit(workloadClass: $0.workloadClass)
         }
         let hasBulk = waiterStates.values.contains {
-            $0.priorityClass == .bulk && canAllocatePermit(priorityClass: $0.priorityClass)
+            $0.priorityClass == .bulk
+                && canAllocatePermit(workloadClass: $0.workloadClass)
+                && !(hasQueuedForegroundWork && $0.workloadClass == .codemap)
         }
         let selectedPriority: PriorityClass
         if hasInteractive,
@@ -419,13 +542,21 @@ actor ContentReadAsyncLimiter {
         } else {
             return nil
         }
-        return nextWaiterID(priorityClass: selectedPriority)
+        return nextWaiterID(
+            priorityClass: selectedPriority,
+            suppressCodemap: hasQueuedForegroundWork
+        )
     }
 
-    private func nextWaiterID(priorityClass: PriorityClass) -> UUID? {
+    private func nextWaiterID(
+        priorityClass: PriorityClass,
+        suppressCodemap: Bool
+    ) -> UUID? {
         var firstByOwner: [UUID: (id: UUID, state: WaiterState)] = [:]
         for (id, state) in waiterStates
-            where state.priorityClass == priorityClass && canAllocatePermit(priorityClass: state.priorityClass)
+            where state.priorityClass == priorityClass
+            && canAllocatePermit(workloadClass: state.workloadClass)
+            && !(suppressCodemap && state.workloadClass == .codemap)
         {
             if let existing = firstByOwner[state.ownerID], existing.state.enqueueOrdinal <= state.enqueueOrdinal {
                 continue
@@ -451,15 +582,22 @@ actor ContentReadAsyncLimiter {
 
     private func allocatePermit(
         ownerID: UUID,
+        workloadClass: ContentReadWorkloadClass,
         priorityClass: PriorityClass,
         waited: Bool
     ) -> PermitAcquisition {
         #if DEBUG
-            assert(canAllocatePermit(priorityClass: priorityClass), "Content read limiter allocation exceeded workload capacity")
+            assert(canAllocatePermit(workloadClass: workloadClass), "Content read limiter allocation exceeded workload capacity")
         #endif
         availablePermits -= 1
         if priorityClass == .bulk {
             activeBackgroundPermitCount += 1
+        }
+        if workloadClass == .codemap {
+            activeCodemapPermitCount += 1
+            if !foregroundActivitiesByTokenID.isEmpty {
+                codemapGrantWhileForegroundCount &+= 1
+            }
         }
         activePermitCountsByOwner[ownerID, default: 0] += 1
         nextGrantOrdinal &+= 1
@@ -478,6 +616,7 @@ actor ContentReadAsyncLimiter {
         }
         return PermitAcquisition(
             ownerID: ownerID,
+            workloadClass: workloadClass,
             priorityClass: priorityClass,
             waited: waited,
             queueDepth: waiterStates.count,
@@ -485,9 +624,21 @@ actor ContentReadAsyncLimiter {
         )
     }
 
-    private func canAllocatePermit(priorityClass: PriorityClass) -> Bool {
+    private func canAllocatePermit(workloadClass: ContentReadWorkloadClass) -> Bool {
         guard availablePermits > 0 else { return false }
+        if workloadClass == .codemap, !foregroundActivitiesByTokenID.isEmpty {
+            return false
+        }
+        let priorityClass = Self.priorityClass(for: workloadClass)
         return priorityClass != .bulk || activeBackgroundPermitCount < backgroundPermitLimit
+    }
+
+    private func canEnqueueWaiter(workloadClass: ContentReadWorkloadClass) -> Bool {
+        let foregroundQueueReserve = maxQueuedWaiterCount > 1 ? 1 : 0
+        let workloadQueueLimit = workloadClass == .codemap
+            ? maxQueuedWaiterCount - foregroundQueueReserve
+            : maxQueuedWaiterCount
+        return waiterStates.count < workloadQueueLimit
     }
 
     private func cleanupOwnerIfIdle(_ ownerID: UUID) {
@@ -512,6 +663,10 @@ actor ContentReadAsyncLimiter {
         }
     }
 
+    private static func isForegroundWorkload(_ workloadClass: ContentReadWorkloadClass) -> Bool {
+        workloadClass == .interactiveRead || workloadClass == .contentSearch
+    }
+
     #if DEBUG
         func snapshotForTesting() -> Snapshot {
             let queuedOwners = Set(waiterStates.values.map(\.ownerID))
@@ -529,7 +684,15 @@ actor ContentReadAsyncLimiter {
                 normalGrantCount: normalGrantCount,
                 bulkGrantCount: bulkGrantCount,
                 backgroundPermitLimit: backgroundPermitLimit,
-                activeBackgroundPermitCount: activeBackgroundPermitCount
+                activeBackgroundPermitCount: activeBackgroundPermitCount,
+                activeCodemapPermitCount: activeCodemapPermitCount,
+                queuedCodemapWaiterCount: waiterStates.values.count(where: { $0.workloadClass == .codemap }),
+                foregroundActivityCount: foregroundActivitiesByTokenID.count,
+                foregroundActivityCountsByKind: Dictionary(
+                    grouping: foregroundActivitiesByTokenID.values,
+                    by: { $0 }
+                ).mapValues(\.count),
+                codemapGrantWhileForegroundCount: codemapGrantWhileForegroundCount
             )
         }
     #endif
@@ -541,6 +704,13 @@ extension FileSystemService {
         capacity: contentReadWorkerLimit,
         maxQueuedWaiterCount: 512
     )
+
+    nonisolated static func withContentReadForegroundActivity<T>(
+        kind: ContentReadForegroundActivityKind,
+        _ body: @Sendable () async throws -> T
+    ) async rethrows -> T {
+        try await contentReadWorkerLimiter.withForegroundActivity(kind: kind, body)
+    }
 
     #if DEBUG
         nonisolated static var contentReadWorkerLimitForTesting: Int {

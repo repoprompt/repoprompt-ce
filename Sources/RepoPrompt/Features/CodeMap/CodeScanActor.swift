@@ -844,6 +844,7 @@ actor CodeScanActor {
         rootFolderPaths: [String] = [],
         purgeCachesOnEmptyInitialRequests: Bool = false
     ) async -> Set<UUID> {
+        guard !Task.isCancelled else { return [] }
         let ingestStart = CodeMapPerfRuntime.sharedPipelineStats.map { _ in CodeMapPerfRuntime.currentTime() }
         defer {
             if let ingestStart {
@@ -874,6 +875,7 @@ actor CodeScanActor {
                     startMS: cacheRebuildStartMS
                 )
             #endif
+            guard !Task.isCancelled else { return [] }
             guard rootGenerationsStillMatch(expectedRootGenerations) else { return [] }
         } else {
             initialRootLookupByRoot = [:]
@@ -1132,9 +1134,14 @@ actor CodeScanActor {
             let treeSitterParseLimiter = treeSitterParseLimiter
             #if DEBUG
                 let scanWillStartHandlerForTesting = scanWillStartHandlerForTesting
+                let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
             #endif
             let scanTask = Task<Void, Never> { [request, treeSitterParseLimiter] in
                 var fileAPI: FileAPI?
+                #if DEBUG
+                    let scanStart = WorkspaceFileSearchDebugTiming.now()
+                    coldStartCollector?.recordCodemapScanStarted()
+                #endif
                 do {
                     #if DEBUG
                         await scanWillStartHandlerForTesting?(request.fileID)
@@ -1179,7 +1186,20 @@ actor CodeScanActor {
                     fileAPI = nil
                     CodeMapPerfRuntime.sharedPipelineStats?.increment(\.nilAPIs)
                 }
+                #if DEBUG
+                    let scanNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                        since: scanStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                    let scanWasCancelled = Task.isCancelled
+                #endif
                 self.finishScan(uniqueID: uniqueTaskID, request: request, fileAPI: fileAPI)
+                #if DEBUG
+                    coldStartCollector?.recordCodemapScanFinished(
+                        nanoseconds: scanNanoseconds,
+                        cancelled: scanWasCancelled
+                    )
+                #endif
             }
             let record = ScanningTask(id: uniqueTaskID, request: request, task: scanTask)
             scanTasks.insert(record)

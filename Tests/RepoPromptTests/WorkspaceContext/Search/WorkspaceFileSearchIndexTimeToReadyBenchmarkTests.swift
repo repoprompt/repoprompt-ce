@@ -77,6 +77,7 @@ import XCTest
             defer { fixture.remove() }
             let environment = WorkspaceFileSearchIndexBenchmarkEnvironment.capture()
             let coldWorktree = try await runColdWorktreeScenario(fixture: fixture)
+            let productionEquivalent = try await runProductionEquivalentScenario()
             let incrementalRebuild = try await runIncrementalRebuildScenario(fixture: fixture)
             let sortDiagnostic: WorkspaceFileSearchIndexSortDiagnostic? = if metricsEnabled, sortDiagnosticsEnabled {
                 try await runSortAttributionProbe()
@@ -86,6 +87,7 @@ import XCTest
             let run = WorkspaceFileSearchIndexBenchmarkRun(
                 environment: environment,
                 coldWorktree: coldWorktree,
+                productionEquivalent: productionEquivalent,
                 incrementalRebuild: incrementalRebuild,
                 sortDiagnostic: sortDiagnostic
             )
@@ -210,8 +212,9 @@ import XCTest
                     "Cold path-index construction phase must be zero"
                 )
                 try require(
-                    counterVector(counters) == [1, 0, 1, 0, 1, 0, 0, 0, 1, 1],
-                    "Cold counter vector must match the records-only contract"
+                    coldCounterVectorIsValid(counters, pathIndexBuild: 0),
+                    "Cold counter vector must match the records-only contract with at most one watcher-applied generation",
+                    diagnostics: "actual=\(counterVector(counters))"
                 )
                 let fallbackDiagnostics = counters.fallbackDiagnosticDescription()
                 try require(
@@ -241,12 +244,224 @@ import XCTest
                     totalWallMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
                     preSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: materialized),
                     searchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: materialized, to: finished),
+                    cumulativeSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
+                    readMilliseconds: 0,
                     counters: counters,
-                    phases: phases
+                    phases: phases,
+                    coldStart: nil
                 )
             } catch {
                 await materializer.abort(preparation)
                 await materializer.release(sessionID: sessionID)
+                throw error
+            }
+        }
+
+        private func runProductionEquivalentScenario() async throws -> WorkspaceFileSearchIndexBenchmarkAggregate {
+            var warmup: WorkspaceFileSearchIndexBenchmarkSample?
+            var measured: [WorkspaceFileSearchIndexBenchmarkSample] = []
+            for sampleIndex in 0 ... 5 {
+                let isWarmup = sampleIndex == 0
+                let sample = try await runProductionEquivalentSample(
+                    ordinal: isWarmup ? 0 : sampleIndex,
+                    phase: isWarmup ? "warmup-excluded" : "measured"
+                )
+                if isWarmup {
+                    warmup = sample
+                } else {
+                    measured.append(sample)
+                }
+            }
+            return try WorkspaceFileSearchIndexBenchmarkAggregate(
+                scenario: "materialize-first-scoped-content-search-first-read",
+                warmup: XCTUnwrap(warmup),
+                measured: measured
+            )
+        }
+
+        private func runProductionEquivalentSample(
+            ordinal: Int,
+            phase: String
+        ) async throws -> WorkspaceFileSearchIndexBenchmarkSample {
+            let fixture = try WorkspaceFileSearchIndexBenchmarkFixture.make()
+            defer { fixture.remove() }
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            addTeardownBlock { await self.unloadAllRoots(in: store) }
+            let visibleRoot = try await store.loadRoot(path: fixture.visibleRootURL.path)
+            await store.stopWatchingRoot(id: visibleRoot.id)
+            let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+            let worktreePath = fixture.worktreeRootURL.standardizedFileURL.path
+            let rootsBefore = await store.roots()
+            try require(
+                !rootsBefore.contains { $0.standardizedFullPath == worktreePath },
+                "Production-equivalent sample must start with the worktree unloaded"
+            )
+            let ownershipBefore = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+            try require(ownershipBefore.installedOwnerCount == 0, "Sample must begin without installed ownership")
+            try require(ownershipBefore.provisionalOwnerCount == 0, "Sample must begin without provisional ownership")
+            try require(ownershipBefore.rootClaimCount == 0, "Sample must begin without worktree claims")
+
+            let sessionID = UUID()
+            let binding = AgentSessionWorktreeBinding(
+                id: "file-tools-benchmark-\(sessionID.uuidString)",
+                repositoryID: "file-tools-benchmark-repository",
+                repoKey: "file-tools-benchmark",
+                logicalRootPath: visibleRoot.standardizedFullPath,
+                logicalRootName: visibleRoot.name,
+                worktreeID: "file-tools-benchmark-\(ordinal)-\(sessionID.uuidString)",
+                worktreeRootPath: worktreePath,
+                worktreeName: fixture.worktreeRootURL.lastPathComponent,
+                source: "file_tools_benchmark"
+            )
+            let before = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(store: store)
+            let limiterBefore = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
+            let coldStartCollector = WorkspaceFileSearchColdStartCollector()
+            let searchPhaseCollector = WorkspaceFileSearchPhaseCollector()
+            let started = DispatchTime.now()
+
+            do {
+                let workload = try await WorkspaceFileSearchDebugContext.$coldStartCollector.withValue(coldStartCollector) {
+                    let maybeProjection = await materializer.materialize(sessionID: sessionID, bindings: [binding])
+                    let projection = try XCTUnwrap(maybeProjection)
+                    let materialized = DispatchTime.now()
+                    let searchResult = try await WorkspaceFileSearchDebugContext.$collector.withValue(searchPhaseCollector) {
+                        try await StoreBackedWorkspaceSearch.search(
+                            pattern: WorkspaceFileSearchIndexBenchmarkFixture.firstScopedContentNeedle,
+                            mode: .content,
+                            maxPaths: 1,
+                            rootScope: projection.lookupRootScope,
+                            store: store,
+                            workspaceManager: nil
+                        )
+                    }
+                    let searchFinished = DispatchTime.now()
+
+                    let logicalNeedlePath = fixture.visibleRootURL
+                        .appendingPathComponent(WorkspaceFileSearchIndexBenchmarkFixture.firstScopedNeedleRelativePath)
+                        .path
+                    let physicalReadPath = projection.translateInputPath(logicalNeedlePath)
+                    let readableService = WorkspaceReadableFileService(store: store)
+                    let roots = await store.rootRefs(scope: projection.lookupRootScope)
+                    try await readableService.awaitFreshnessForExplicitRequest(physicalReadPath, rootRefs: roots)
+                    let resolution = await readableService.resolveReadFileRequest(
+                        physicalReadPath,
+                        profile: .mcpRead,
+                        rootScope: projection.lookupRootScope,
+                        rootRefs: roots
+                    )
+                    guard case let .readable(.workspace(file)) = resolution else {
+                        throw BenchmarkInvariantError(message: "Production-equivalent read must resolve the scoped worktree file")
+                    }
+                    guard let readSnapshot = try await store.interactiveReadSnapshot(for: file) else {
+                        throw BenchmarkInvariantError(message: "Production-equivalent read content must be available")
+                    }
+                    let readFinished = DispatchTime.now()
+                    let coldStartAtReadCompletion = coldStartCollector.snapshot()
+                    return (
+                        projection: projection,
+                        materialized: materialized,
+                        searchResult: searchResult,
+                        searchFinished: searchFinished,
+                        readFile: file,
+                        readContent: readSnapshot.preparedContent.linesWithEndings.joined(),
+                        readFinished: readFinished,
+                        coldStart: coldStartAtReadCompletion
+                    )
+                }
+
+                let searchPhases = searchPhaseCollector.snapshot(
+                    readySearchNanoseconds: workload.searchFinished.uptimeNanoseconds - workload.materialized.uptimeNanoseconds
+                )
+                let physicalRootID = try XCTUnwrap(workload.projection.physicalRootRefs.first?.id)
+                let after = await WorkspaceFileSearchIndexBenchmarkCounterMark.capture(
+                    store: store,
+                    rootID: physicalRootID
+                )
+                let counters = after.delta(from: before)
+                let limiterAfter = await FileSystemService.contentReadWorkerLimiterSnapshotForTesting()
+                let catalogSnapshot = await store.searchCatalogSnapshot(
+                    rootScope: workload.projection.lookupRootScope,
+                    requirement: .recordsOnly
+                )
+
+                try require(workload.projection.isFullyMaterialized, "Production materializer must produce a fully materialized projection")
+                try require(
+                    limiterAfter.codemapGrantWhileForegroundCount == limiterBefore.codemapGrantWhileForegroundCount,
+                    "Production-equivalent foreground boundaries must not grant codemap permits"
+                )
+                try require(limiterAfter.foregroundActivityCount == 0, "Foreground activity tokens must be balanced at first-read completion")
+                try require(searchPhases.status == .completed, "Content-search phase collector must complete")
+                try require(
+                    workload.searchResult.matches?.map(\.filePath) == [fixture.firstScopedNeedleURL.path],
+                    "Scoped content search must return only the physical worktree needle"
+                )
+                try require(
+                    !(workload.searchResult.matches?.contains { $0.filePath.hasPrefix(fixture.visibleRootURL.path) } ?? false),
+                    "Scoped content search must not fall back to the canonical visible root"
+                )
+                try require(
+                    workload.projection.logicalDisplayPath(forPhysicalPath: workload.readFile.standardizedFullPath, display: .full)
+                        == fixture.visibleRootURL
+                        .appendingPathComponent(WorkspaceFileSearchIndexBenchmarkFixture.firstScopedNeedleRelativePath)
+                        .path,
+                    "Physical worktree reads must retain the logical display projection"
+                )
+                try require(
+                    workload.readContent == WorkspaceFileSearchIndexBenchmarkFixture.firstScopedNeedleContents,
+                    "First read must return the exact worktree-only content"
+                )
+                try require(catalogSnapshot.diagnostics.fileCount == WorkspaceFileSearchIndexBenchmarkFixture.seedFileCount, "Scoped catalog file count must match the fixture")
+                try require(counters.crawl == 1, "Production-equivalent sample must perform one crawl")
+                try require(counters.shardBuild == 1, "Production-equivalent sample must build one shard")
+                try require(counters.patch == 0, "Production-equivalent sample must not patch a shard")
+                try require(counters.authoritative == 1, "Production-equivalent sample must perform one authoritative shard build")
+                try require(counters.pathIndexBuild == 1, "Current content search must build one full path index")
+                try require(counters.overlayPathIndexBuild == 0, "Cold content search must not build an overlay")
+                try require(
+                    coldCounterVectorIsValid(counters, pathIndexBuild: 1),
+                    "Production-equivalent counter vector must match current content-search behavior with at most one watcher-applied generation"
+                )
+                try require(counters.fallback == 0, "Production-equivalent sample must not fall back", diagnostics: counters.fallbackDiagnosticDescription())
+
+                await materializer.release(sessionID: sessionID)
+                let rootsAfter = await store.roots()
+                try require(!rootsAfter.contains { $0.id == physicalRootID }, "Released production-equivalent worktree must unload")
+                let ownershipAfter = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
+                try require(ownershipAfter.installedOwnerCount == 0, "Released sample must clear installed ownership")
+                try require(ownershipAfter.provisionalOwnerCount == 0, "Released sample must clear provisional ownership")
+                try require(ownershipAfter.rootClaimCount == 0, "Released sample must clear worktree claims")
+                await unloadAllRoots(in: store)
+
+                let coldStart = workload.coldStart
+                try require(coldStart.rootCrawl.count == 1, "Cold-start attribution must contain exactly one root crawl")
+                try require(
+                    coldStart.rootCrawl.filesDiscovered == WorkspaceFileSearchIndexBenchmarkFixture.seedFileCount,
+                    "Cold-start crawl attribution must count every fixture file"
+                )
+                for workloadName in [ContentReadWorkloadClass.contentSearch.rawValue, ContentReadWorkloadClass.interactiveRead.rawValue] {
+                    let scheduler = try XCTUnwrap(coldStart.schedulerByWorkload[workloadName])
+                    try require(scheduler.requestCount > 0, "Foreground scheduler attribution must include \(workloadName)")
+                    try require(scheduler.requestCount == scheduler.grantCount, "Foreground scheduler grants must match requests for \(workloadName)")
+                    try require(scheduler.requestCount == scheduler.completionCount, "Foreground scheduler completions must match requests for \(workloadName)")
+                    try require(scheduler.cancellationCount == 0, "Foreground scheduler work must not be cancelled for \(workloadName)")
+                    try require(scheduler.failureCount == 0, "Foreground scheduler work must not fail for \(workloadName)")
+                }
+
+                return WorkspaceFileSearchIndexBenchmarkSample(
+                    ordinal: ordinal,
+                    phase: phase,
+                    totalWallMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: workload.readFinished),
+                    preSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: workload.materialized),
+                    searchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: workload.materialized, to: workload.searchFinished),
+                    cumulativeSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: workload.searchFinished),
+                    readMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: workload.searchFinished, to: workload.readFinished),
+                    counters: counters,
+                    phases: searchPhases,
+                    coldStart: coldStart
+                )
+            } catch {
+                await materializer.release(sessionID: sessionID)
+                await unloadAllRoots(in: store)
                 throw error
             }
         }
@@ -391,8 +606,11 @@ import XCTest
                 totalWallMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
                 preSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: published),
                 searchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: published, to: finished),
+                cumulativeSearchMilliseconds: workspaceFileSearchIndexElapsedMilliseconds(from: started, to: finished),
+                readMilliseconds: 0,
                 counters: counters,
-                phases: phases
+                phases: phases,
+                coldStart: nil
             )
         }
 
@@ -458,6 +676,15 @@ import XCTest
                 probe: probe,
                 storeStateUnchanged: storeStateUnchanged
             )
+        }
+
+        private func coldCounterVectorIsValid(
+            _ counters: WorkspaceFileSearchIndexBenchmarkCounters,
+            pathIndexBuild: Int
+        ) -> Bool {
+            let vector = counterVector(counters)
+            return vector == [1, 0, 1, 0, 1, pathIndexBuild, 0, 0, 1, 1]
+                || vector == [1, 1, 1, 0, 1, pathIndexBuild, 0, 0, 1, 1]
         }
 
         private func counterVector(_ counters: WorkspaceFileSearchIndexBenchmarkCounters) -> [Int] {

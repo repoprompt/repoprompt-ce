@@ -26,6 +26,8 @@
         static let seedFileCount = moduleCount * layerCount * filesPerLayer
         static let folderCount = 1 + moduleCount + moduleCount + moduleCount * layerCount
         static let firstScopedNeedleRelativePath = "Module-00/Sources/Layer-00/FirstScopedNeedle.swift"
+        static let firstScopedContentNeedle = "FirstScopedContentNeedle"
+        static let firstScopedNeedleContents = "// RepoPrompt CE file-search benchmark fixture\nlet FirstScopedContentNeedle = \"worktree-only\"\n"
 
         let containerURL: URL
         let visibleRootURL: URL
@@ -42,7 +44,9 @@
             let worktreeRootURL = containerURL.appendingPathComponent("SessionWorktree", isDirectory: true)
             try FileManager.default.createDirectory(at: visibleRootURL, withIntermediateDirectories: true)
             try FileManager.default.createDirectory(at: worktreeRootURL, withIntermediateDirectories: true)
-            try fixtureContents.write(
+            try Data(
+                "// Scope decoy\nlet FirstScopedContentNeedle = \"visible-root-decoy\"\n".utf8
+            ).write(
                 to: visibleRootURL.appendingPathComponent("VisibleNonMatching.swift"),
                 options: []
             )
@@ -60,7 +64,12 @@
                         } else {
                             String(format: "File-%02d.swift", fileIndex)
                         }
-                        try fixtureContents.write(to: layerURL.appendingPathComponent(fileName), options: [])
+                        let contents = if moduleIndex == 0, layerIndex == 0, fileIndex == 0 {
+                            Data(firstScopedNeedleContents.utf8)
+                        } else {
+                            fixtureContents
+                        }
+                        try contents.write(to: layerURL.appendingPathComponent(fileName), options: [])
                     }
                 }
             }
@@ -198,8 +207,11 @@
         let totalWallMilliseconds: Double
         let preSearchMilliseconds: Double
         let searchMilliseconds: Double
+        let cumulativeSearchMilliseconds: Double
+        let readMilliseconds: Double
         let counters: WorkspaceFileSearchIndexBenchmarkCounters
         let phases: WorkspaceFileSearchPhaseSnapshot
+        let coldStart: WorkspaceFileSearchColdStartSnapshot?
     }
 
     struct WorkspaceFileSearchIndexBenchmarkAggregate {
@@ -210,6 +222,14 @@
         let p95Milliseconds: Double
         let stabilityRatio: Double
         let isStable: Bool
+        let medianPreSearchMilliseconds: Double
+        let p95PreSearchMilliseconds: Double
+        let medianSearchMilliseconds: Double
+        let p95SearchMilliseconds: Double
+        let medianCumulativeSearchMilliseconds: Double
+        let p95CumulativeSearchMilliseconds: Double
+        let medianReadMilliseconds: Double
+        let p95ReadMilliseconds: Double
 
         init(
             scenario: String,
@@ -227,6 +247,14 @@
                 ? (p95Milliseconds - medianMilliseconds) / medianMilliseconds
                 : .infinity
             isStable = stabilityRatio <= 0.20
+            medianPreSearchMilliseconds = Self.median(measured.map(\.preSearchMilliseconds))
+            p95PreSearchMilliseconds = Self.nearestRankP95(measured.map(\.preSearchMilliseconds))
+            medianSearchMilliseconds = Self.median(measured.map(\.searchMilliseconds))
+            p95SearchMilliseconds = Self.nearestRankP95(measured.map(\.searchMilliseconds))
+            medianCumulativeSearchMilliseconds = Self.median(measured.map(\.cumulativeSearchMilliseconds))
+            p95CumulativeSearchMilliseconds = Self.nearestRankP95(measured.map(\.cumulativeSearchMilliseconds))
+            medianReadMilliseconds = Self.median(measured.map(\.readMilliseconds))
+            p95ReadMilliseconds = Self.nearestRankP95(measured.map(\.readMilliseconds))
         }
 
         var rawMilliseconds: [Double] {
@@ -310,6 +338,7 @@
     struct WorkspaceFileSearchIndexBenchmarkRun {
         let environment: WorkspaceFileSearchIndexBenchmarkEnvironment
         let coldWorktree: WorkspaceFileSearchIndexBenchmarkAggregate
+        let productionEquivalent: WorkspaceFileSearchIndexBenchmarkAggregate
         let incrementalRebuild: WorkspaceFileSearchIndexBenchmarkAggregate
         let sortDiagnostic: WorkspaceFileSearchIndexSortDiagnostic?
 
@@ -358,16 +387,25 @@
                 "| Scenario | Raw measured samples ms | Median ms | Nearest-rank p95 ms | Stability |",
                 "| --- | --- | ---: | ---: | --- |",
                 aggregateRow(coldWorktree),
+                aggregateRow(productionEquivalent),
                 aggregateRow(incrementalRebuild),
+                "",
+                "| Scenario | Materialize/publish median/p95 ms | Cumulative through search median/p95 ms | Search median/p95 ms | Read median/p95 ms |",
+                "| --- | ---: | ---: | ---: | ---: |",
+                phaseAggregateRow(coldWorktree),
+                phaseAggregateRow(productionEquivalent),
+                phaseAggregateRow(incrementalRebuild),
                 "",
                 "| Scenario | Crawl Δ | Applied generation Δ | Shard build Δ | Patch Δ | Authoritative Δ | Full path-index build Δ | Overlay build Δ | Fallback Δ | Catalog rebuild Δ | Catalog invalidation Δ |",
                 "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
                 counterRow(scenario: coldWorktree.scenario, counters: coldWorktree.measured.map(\.counters)),
+                counterRow(scenario: productionEquivalent.scenario, counters: productionEquivalent.measured.map(\.counters)),
                 counterRow(scenario: incrementalRebuild.scenario, counters: incrementalRebuild.measured.map(\.counters)),
                 "",
-                "| Scenario | Phase | Sample | Total ms | Materialize/publish ms | Ready search ms |",
-                "| --- | --- | ---: | ---: | ---: | ---: |",
+                "| Scenario | Phase | Sample | Total through read ms | Materialize/publish ms | Cumulative through search ms | Search ms | Read ms |",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
                 sampleRows(coldWorktree).joined(separator: "\n"),
+                sampleRows(productionEquivalent).joined(separator: "\n"),
                 sampleRows(incrementalRebuild).joined(separator: "\n")
             ]
             lines.append(contentsOf: [
@@ -375,11 +413,13 @@
                 "| Scenario | Phase | Sample | Ready ms | Readiness/freshness preamble ms | First catalog access ms | FileSearchActor ms | Orchestration residual ms | Reconciliation Δ ms |",
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
                 topLevelPhaseRows(coldWorktree).joined(separator: "\n"),
+                topLevelPhaseRows(productionEquivalent).joined(separator: "\n"),
                 topLevelPhaseRows(incrementalRebuild).joined(separator: "\n"),
                 "",
                 "| Scenario | Phase | Sample | Catalog total ms | Filter ms | Sort ms | File sort ms | Folder sort ms | Sort residual ms | Sort reconciliation Δ ms | Sort invocations | File inputs | Folder inputs | Entry materialization ms | Path-index key ms | Path-index construction ms | Composition/cache residual ms | Rebuilds | Files | Roots |",
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
                 catalogPhaseRows(coldWorktree).joined(separator: "\n"),
+                catalogPhaseRows(productionEquivalent).joined(separator: "\n"),
                 catalogPhaseRows(incrementalRebuild).joined(separator: "\n")
             ])
             lines.append(contentsOf: [
@@ -387,13 +427,16 @@
                 "| Scenario | Phase | Sample | Descriptor ms | Filter ms | Sort/input ms | Batch/enqueue ms | Drain-to-hit ms | Post-hit ms | Actor residual ms |",
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
                 actorPhaseRows(coldWorktree).joined(separator: "\n"),
+                actorPhaseRows(productionEquivalent).joined(separator: "\n"),
                 actorPhaseRows(incrementalRebuild).joined(separator: "\n"),
                 "",
                 "| Scenario | Phase | Sample | Source | Descriptors | Admitted | Sort input | Batches | Initially enqueued | Drained to hit | Entries examined | Returned hit ordinal | Returned prefix |",
                 "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
                 actorCountRows(coldWorktree).joined(separator: "\n"),
+                actorCountRows(productionEquivalent).joined(separator: "\n"),
                 actorCountRows(incrementalRebuild).joined(separator: "\n")
             ])
+            lines.append(contentsOf: coldStartRows(productionEquivalent))
             if let sortDiagnostic {
                 lines.append(contentsOf: sortDiagnosticMarkdown(sortDiagnostic))
             }
@@ -427,7 +470,11 @@
                     "buildConfiguration": environment.buildConfiguration,
                     "conductorState": environment.conductorState
                 ],
-                "scenarios": [aggregateDictionary(coldWorktree), aggregateDictionary(incrementalRebuild)],
+                "scenarios": [
+                    aggregateDictionary(coldWorktree),
+                    aggregateDictionary(productionEquivalent),
+                    aggregateDictionary(incrementalRebuild)
+                ],
                 "correctnessStatus": "passed"
             ]
             if let sortDiagnostic {
@@ -448,20 +495,84 @@
                 "nearestRankP95Milliseconds": aggregate.p95Milliseconds,
                 "stabilityRatio": aggregate.stabilityRatio,
                 "stable": aggregate.isStable,
+                "phaseMediansMilliseconds": [
+                    "materializeOrPublish": aggregate.medianPreSearchMilliseconds,
+                    "cumulativeThroughSearch": aggregate.medianCumulativeSearchMilliseconds,
+                    "search": aggregate.medianSearchMilliseconds,
+                    "read": aggregate.medianReadMilliseconds
+                ],
+                "phaseNearestRankP95Milliseconds": [
+                    "materializeOrPublish": aggregate.p95PreSearchMilliseconds,
+                    "cumulativeThroughSearch": aggregate.p95CumulativeSearchMilliseconds,
+                    "search": aggregate.p95SearchMilliseconds,
+                    "read": aggregate.p95ReadMilliseconds
+                ],
                 "warmup": sampleDictionary(aggregate.warmup),
                 "measured": aggregate.measured.map(sampleDictionary)
             ]
         }
 
         private func sampleDictionary(_ sample: WorkspaceFileSearchIndexBenchmarkSample) -> [String: Any] {
-            [
+            var dictionary: [String: Any] = [
                 "ordinal": sample.ordinal,
                 "phase": sample.phase,
                 "totalWallMilliseconds": sample.totalWallMilliseconds,
                 "materializeOrPublishMilliseconds": sample.preSearchMilliseconds,
                 "readySearchMilliseconds": sample.searchMilliseconds,
+                "cumulativeThroughSearchMilliseconds": sample.cumulativeSearchMilliseconds,
+                "readMilliseconds": sample.readMilliseconds,
                 "counters": counterDictionary(sample.counters),
                 "phaseAccounting": phaseDictionary(sample.phases)
+            ]
+            if let coldStart = sample.coldStart {
+                dictionary["coldStartAttribution"] = coldStartDictionary(coldStart)
+            }
+            return dictionary
+        }
+
+        private func coldStartDictionary(_ snapshot: WorkspaceFileSearchColdStartSnapshot) -> [String: Any] {
+            [
+                "materialization": [
+                    "totalMicroseconds": snapshot.materialization.totalMicroseconds,
+                    "prepareMicroseconds": snapshot.materialization.prepareMicroseconds,
+                    "commitMicroseconds": snapshot.materialization.commitMicroseconds,
+                    "codemapKickoffMicroseconds": snapshot.materialization.codemapKickoffMicroseconds
+                ],
+                "rootCrawl": [
+                    "count": snapshot.rootCrawl.count,
+                    "totalMicroseconds": snapshot.rootCrawl.totalMicroseconds,
+                    "maximumMicroseconds": snapshot.rootCrawl.maximumMicroseconds,
+                    "filesDiscovered": snapshot.rootCrawl.filesDiscovered,
+                    "foldersDiscovered": snapshot.rootCrawl.foldersDiscovered
+                ],
+                "schedulerByWorkload": snapshot.schedulerByWorkload.mapValues { workload in
+                    [
+                        "requestCount": workload.requestCount,
+                        "enqueueCount": workload.enqueueCount,
+                        "grantCount": workload.grantCount,
+                        "completionCount": workload.completionCount,
+                        "cancellationCount": workload.cancellationCount,
+                        "failureCount": workload.failureCount,
+                        "totalWaitMicroseconds": workload.totalWaitMicroseconds,
+                        "maximumWaitMicroseconds": workload.maximumWaitMicroseconds,
+                        "totalExecutionMicroseconds": workload.totalExecutionMicroseconds
+                    ]
+                },
+                "codemap": [
+                    "collectionPassCount": snapshot.codemap.collectionPassCount,
+                    "filesCollected": snapshot.codemap.filesCollected,
+                    "collectionMicroseconds": snapshot.codemap.collectionMicroseconds,
+                    "requestBuildPassCount": snapshot.codemap.requestBuildPassCount,
+                    "requestsBuilt": snapshot.codemap.requestsBuilt,
+                    "requestBuildMicroseconds": snapshot.codemap.requestBuildMicroseconds,
+                    "submissionPassCount": snapshot.codemap.submissionPassCount,
+                    "requestsSubmitted": snapshot.codemap.requestsSubmitted,
+                    "submissionMicroseconds": snapshot.codemap.submissionMicroseconds,
+                    "scansStarted": snapshot.codemap.scansStarted,
+                    "scansCompleted": snapshot.codemap.scansCompleted,
+                    "scansCancelled": snapshot.codemap.scansCancelled,
+                    "scanMicroseconds": snapshot.codemap.scanMicroseconds
+                ]
             ]
         }
 
@@ -632,9 +743,11 @@
             let folderStability = stabilityRatio(probe.samples.map(\.directFolderSortNanoseconds))
             let stableProbeSorts = fileStability <= 0.20 && folderStability <= 0.20
             let exactWorkCounters = coldSamples.allSatisfy {
-                counterVector($0.counters) == [1, 0, 1, 0, 1, 1, 0, 0, 1, 1]
+                let vector = counterVector($0.counters)
+                return vector == [1, 0, 1, 0, 1, 0, 0, 0, 1, 1]
+                    || vector == [1, 1, 1, 0, 1, 0, 0, 0, 1, 1]
             } && incrementalSamples.allSatisfy {
-                counterVector($0.counters) == [0, 1, 1, 1, 0, 0, 1, 0, 1, 1]
+                counterVector($0.counters) == [0, 1, 1, 1, 0, 0, 0, 0, 1, 1]
             }
             let overheadGuards = coldWorktree.p95Milliseconds <= 4223.831
                 && incrementalRebuild.p95Milliseconds <= 257.452
@@ -780,6 +893,10 @@
             return "| \(aggregate.scenario) | \(formatValues(aggregate.rawMilliseconds)) | \(formatMS(aggregate.medianMilliseconds)) | \(formatMS(aggregate.p95Milliseconds)) | \(stability) (\(formatPercent(aggregate.stabilityRatio))) |"
         }
 
+        private func phaseAggregateRow(_ aggregate: WorkspaceFileSearchIndexBenchmarkAggregate) -> String {
+            "| \(aggregate.scenario) | \(formatMS(aggregate.medianPreSearchMilliseconds))/\(formatMS(aggregate.p95PreSearchMilliseconds)) | \(formatMS(aggregate.medianCumulativeSearchMilliseconds))/\(formatMS(aggregate.p95CumulativeSearchMilliseconds)) | \(formatMS(aggregate.medianSearchMilliseconds))/\(formatMS(aggregate.p95SearchMilliseconds)) | \(formatMS(aggregate.medianReadMilliseconds))/\(formatMS(aggregate.p95ReadMilliseconds)) |"
+        }
+
         private func counterRow(
             scenario: String,
             counters: [WorkspaceFileSearchIndexBenchmarkCounters]
@@ -796,8 +913,33 @@
 
         private func sampleRows(_ aggregate: WorkspaceFileSearchIndexBenchmarkAggregate) -> [String] {
             ([aggregate.warmup] + aggregate.measured).map { sample in
-                "| \(aggregate.scenario) | \(sample.phase) | \(sample.ordinal) | \(formatMS(sample.totalWallMilliseconds)) | \(formatMS(sample.preSearchMilliseconds)) | \(formatMS(sample.searchMilliseconds)) |"
+                "| \(aggregate.scenario) | \(sample.phase) | \(sample.ordinal) | \(formatMS(sample.totalWallMilliseconds)) | \(formatMS(sample.preSearchMilliseconds)) | \(formatMS(sample.cumulativeSearchMilliseconds)) | \(formatMS(sample.searchMilliseconds)) | \(formatMS(sample.readMilliseconds)) |"
             }
+        }
+
+        private func coldStartRows(_ aggregate: WorkspaceFileSearchIndexBenchmarkAggregate) -> [String] {
+            var lines = [
+                "",
+                "| Scenario | Phase | Sample | Materialize ms | Crawl ms/count | Catalog/path-index ms | Content scheduler wait ms (requests/enqueued) | Interactive scheduler wait ms (requests/enqueued) | Codemap scheduler wait ms (requests/enqueued) | Codemap collect/build/submit ms | Codemap files/requests/submitted | Scans started/completed/cancelled |",
+                "| --- | --- | ---: | ---: | --- | ---: | --- | --- | --- | --- | --- | --- |"
+            ]
+            lines.append(contentsOf: allSamples(aggregate).compactMap { sample in
+                guard let snapshot = sample.coldStart else { return nil }
+                let content = snapshot.schedulerByWorkload[ContentReadWorkloadClass.contentSearch.rawValue]
+                let interactive = snapshot.schedulerByWorkload[ContentReadWorkloadClass.interactiveRead.rawValue]
+                let codemap = snapshot.schedulerByWorkload[ContentReadWorkloadClass.codemap.rawValue]
+                let codemapPhases = snapshot.codemap
+                let catalogAndPathIndex = sample.phases.catalog.totalMicroseconds
+                return "| \(aggregate.scenario) | \(sample.phase) | \(sample.ordinal) | \(formatMicroseconds(snapshot.materialization.totalMicroseconds)) | \(formatMicroseconds(snapshot.rootCrawl.totalMicroseconds))/\(snapshot.rootCrawl.count) | \(formatMicroseconds(catalogAndPathIndex)) | \(schedulerSummary(content)) | \(schedulerSummary(interactive)) | \(schedulerSummary(codemap)) | \(formatMicroseconds(codemapPhases.collectionMicroseconds))/\(formatMicroseconds(codemapPhases.requestBuildMicroseconds))/\(formatMicroseconds(codemapPhases.submissionMicroseconds)) | \(codemapPhases.filesCollected)/\(codemapPhases.requestsBuilt)/\(codemapPhases.requestsSubmitted) | \(codemapPhases.scansStarted)/\(codemapPhases.scansCompleted)/\(codemapPhases.scansCancelled) |"
+            })
+            return lines
+        }
+
+        private func schedulerSummary(
+            _ workload: WorkspaceFileSearchColdStartSnapshot.SchedulerWorkload?
+        ) -> String {
+            guard let workload else { return "0.000 (0/0)" }
+            return "\(formatMicroseconds(workload.totalWaitMicroseconds)) (\(workload.requestCount)/\(workload.enqueueCount))"
         }
 
         private func topLevelPhaseRows(_ aggregate: WorkspaceFileSearchIndexBenchmarkAggregate) -> [String] {

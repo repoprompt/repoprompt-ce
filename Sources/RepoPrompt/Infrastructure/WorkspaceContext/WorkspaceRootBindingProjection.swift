@@ -408,19 +408,83 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
+        await FileSystemService.withContentReadForegroundActivity(kind: .materialization) {
+            await materializeWithinForegroundActivity(
+                sessionID: sessionID,
+                bindings: bindings
+            )
+        }
+    }
+
+    private func materializeWithinForegroundActivity(
+        sessionID: UUID,
+        bindings: [AgentSessionWorktreeBinding]
+    ) async -> WorkspaceRootBindingProjection? {
+        #if DEBUG
+            let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
+            let materializationStart = WorkspaceFileSearchDebugTiming.now()
+            var prepareNanoseconds: UInt64 = 0
+            var commitNanoseconds: UInt64 = 0
+            var codemapKickoffNanoseconds: UInt64 = 0
+        #endif
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
         do {
+            #if DEBUG
+                let prepareStart = WorkspaceFileSearchDebugTiming.now()
+            #endif
             let preparation = try await prepare(
                 sessionID: sessionID,
                 bindings: bindings,
                 visibleRoots: visibleRoots
             )
+            #if DEBUG
+                prepareNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                    since: prepareStart,
+                    through: WorkspaceFileSearchDebugTiming.now()
+                )
+            #endif
             do {
+                #if DEBUG
+                    let commitStart = WorkspaceFileSearchDebugTiming.now()
+                #endif
                 let projection = try await commit(preparation)
+                #if DEBUG
+                    commitNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                        since: commitStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                    let codemapKickoffStart = WorkspaceFileSearchDebugTiming.now()
+                #endif
                 await initializeCodemaps(for: projection)
+                #if DEBUG
+                    codemapKickoffNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
+                        since: codemapKickoffStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    )
+                    coldStartCollector?.recordMaterialization(
+                        totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: materializationStart,
+                            through: WorkspaceFileSearchDebugTiming.now()
+                        ),
+                        prepareNanoseconds: prepareNanoseconds,
+                        commitNanoseconds: commitNanoseconds,
+                        codemapKickoffNanoseconds: codemapKickoffNanoseconds
+                    )
+                #endif
                 return projection
             } catch {
                 await abort(preparation)
+                #if DEBUG
+                    coldStartCollector?.recordMaterialization(
+                        totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                            since: materializationStart,
+                            through: WorkspaceFileSearchDebugTiming.now()
+                        ),
+                        prepareNanoseconds: prepareNanoseconds,
+                        commitNanoseconds: commitNanoseconds,
+                        codemapKickoffNanoseconds: codemapKickoffNanoseconds
+                    )
+                #endif
                 return failClosedProjection(
                     sessionID: sessionID,
                     bindings: bindings,
@@ -428,6 +492,17 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 )
             }
         } catch {
+            #if DEBUG
+                coldStartCollector?.recordMaterialization(
+                    totalNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: materializationStart,
+                        through: WorkspaceFileSearchDebugTiming.now()
+                    ),
+                    prepareNanoseconds: prepareNanoseconds,
+                    commitNanoseconds: commitNanoseconds,
+                    codemapKickoffNanoseconds: codemapKickoffNanoseconds
+                )
+            #endif
             return failClosedProjection(
                 sessionID: sessionID,
                 bindings: bindings,

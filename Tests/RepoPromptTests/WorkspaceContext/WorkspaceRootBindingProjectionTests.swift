@@ -318,12 +318,33 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
         let physicalRoot = WorkspaceRootRef(id: UUID(), name: logicalRoot.name, fullPath: physicalRootURL.path)
         let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "codemap")
+        let materializer = WorkspaceRootBindingProjectionMaterializer(store: store)
+        let parentSessionID = UUID()
+        let childSessionID = UUID()
 
-        let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
-            bindings: [binding]
-        )
-        let firstProjection = try XCTUnwrap(materializedProjection)
+        let firstProjection = try await FileSystemService.withContentReadForegroundActivity(kind: .storeBackedSearch) {
+            let maybeParentProjection = await materializer.materialize(
+                sessionID: parentSessionID,
+                bindings: [binding]
+            )
+            let parentProjection = try XCTUnwrap(maybeParentProjection)
+            let maybeChildProjection = await materializer.materialize(
+                sessionID: childSessionID,
+                bindings: [binding]
+            )
+            let childProjection = try XCTUnwrap(maybeChildProjection)
+            XCTAssertEqual(childProjection.physicalRootRefs, parentProjection.physicalRootRefs)
+            let pending = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+            XCTAssertEqual(pending.activeTaskCount, 1)
+            XCTAssertEqual(pending.initializingLifetimeCount, 1)
+
+            await materializer.release(sessionID: parentSessionID)
+            let rootsAfterNonFinalRelease = await store.roots()
+            XCTAssertTrue(rootsAfterNonFinalRelease.contains { $0.id == parentProjection.physicalRootRefs.first?.id })
+            let afterNonFinalRelease = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+            XCTAssertEqual(afterNonFinalRelease.activeTaskCount, 1)
+            return parentProjection
+        }
         let physicalRootID = try XCTUnwrap(firstProjection.physicalRootRefs.first?.id)
 
         let firstRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
@@ -334,13 +355,23 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             relativePath: "Sources/App.swift"
         )
         XCTAssertTrue(snapshot.fileAPI?.apiDescription.contains("WorktreeInitializedType") == true)
-
-        _ = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
-            bindings: [binding]
-        )
+        let completed = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+        XCTAssertEqual(completed.activeTaskCount, 0)
+        XCTAssertEqual(completed.initializingLifetimeCount, 0)
+        XCTAssertEqual(completed.initializedLifetimeCount, 1)
         let secondRedundantInitialization = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: [physicalRootID])
         XCTAssertTrue(secondRedundantInitialization.isEmpty)
+
+        await materializer.release(sessionID: childSessionID)
+        let cleanedUp = await waitForCondition {
+            let roots = await store.roots()
+            let initialization = await store.sessionWorktreeCodemapInitializationDebugSnapshotForTesting()
+            return !roots.contains { $0.id == physicalRootID }
+                && initialization.activeTaskCount == 0
+                && initialization.initializingLifetimeCount == 0
+                && initialization.initializedLifetimeCount == 0
+        }
+        XCTAssertTrue(cleanedUp)
     }
 
     func testMaterializerRetriesCodemapInitializationAfterZeroFileIngress() async throws {
@@ -425,6 +456,19 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         }
         XCTFail("Timed out waiting for codemap snapshot")
         throw NSError(domain: "WorkspaceRootBindingProjectionTests", code: 1)
+    }
+
+    private func waitForCondition(
+        timeout: Duration = .seconds(2),
+        _ predicate: () async -> Bool
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while clock.now < deadline {
+            if await predicate() { return true }
+            await Task.yield()
+        }
+        return await predicate()
     }
 
     private static func binding(

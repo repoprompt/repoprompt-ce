@@ -483,6 +483,53 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(idle.activePermitCount, 0)
             XCTAssertEqual(idle.queuedWaiterCount, 0)
             XCTAssertEqual(idle.ownerLaneCount, 0)
+
+            let reserveLimiter = ContentReadAsyncLimiter(
+                capacity: 1,
+                maxQueuedWaiterCount: 2,
+                retryAfterMilliseconds: 777
+            )
+            let reserveGate = AsyncGate()
+            let reserveRecorder = AsyncValueRecorder()
+            let reserveHeld = Task {
+                try await reserveLimiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                    await reserveGate.markStartedAndWaitForRelease()
+                }
+            }
+            await reserveGate.waitUntilStarted()
+            let foregroundToken = await reserveLimiter.beginForegroundActivity(kind: .storeBackedSearch)
+            let reservedCodemap = Task {
+                try await reserveLimiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                    await reserveRecorder.append(2)
+                }
+            }
+            _ = await waitForLimiterSnapshot(reserveLimiter) { $0.queuedCodemapWaiterCount == 1 }
+            do {
+                _ = try await reserveLimiter.withPermit(workloadClass: .codemap, ownerID: UUID()) { 0 }
+                XCTFail("Expected the codemap queue reserve to reject another background waiter")
+            } catch let error as ContentReadSchedulerError {
+                XCTAssertEqual(error, .queueFull(retryAfterMilliseconds: 777))
+            }
+            let reservedForeground = Task {
+                try await reserveLimiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                    await reserveRecorder.append(1)
+                }
+            }
+            let fullButForegroundAdmitted = await waitForLimiterSnapshot(reserveLimiter) {
+                $0.queuedWaiterCount == 2
+            }
+            XCTAssertEqual(fullButForegroundAdmitted.queuedCodemapWaiterCount, 1)
+
+            await reserveLimiter.endForegroundActivity(foregroundToken)
+            await reserveGate.release()
+            _ = try await reserveHeld.value
+            _ = try await reservedForeground.value
+            _ = try await reservedCodemap.value
+            let reservedValues = await reserveRecorder.values()
+            XCTAssertEqual(reservedValues, [1, 2])
+            let reserveIdle = await waitForLimiterSnapshot(reserveLimiter) { $0.isIdle }
+            XCTAssertTrue(reserveIdle.isIdle)
+            XCTAssertEqual(reserveIdle.overloadCount, 1)
         }
 
         func testContentReadSchedulerPrioritizesInteractiveWaitersOverBulk() async throws {
@@ -651,46 +698,150 @@ final class FileSystemContentLoadingConcurrencyTests: XCTestCase {
             XCTAssertEqual(idle.activeBackgroundPermitCount, 0)
         }
 
-        func testContentReadSchedulerPromotesAgedWaitersAheadOfNewInteractiveWork() async throws {
-            let clock = ContentReadTestClock()
-            let limiter = ContentReadAsyncLimiter(
-                capacity: 1,
-                maxQueuedWaiterCount: 4,
-                agePromotionNanoseconds: 10_000_000,
-                nowUptimeNanoseconds: { clock.now() }
-            )
-            let gate = AsyncGate()
+        func testContentReadSchedulerNeverPromotesAgedCodemapAheadOfForegroundWaiters() async throws {
+            for foregroundWorkload in [ContentReadWorkloadClass.interactiveRead, .contentSearch] {
+                let clock = ContentReadTestClock()
+                let limiter = ContentReadAsyncLimiter(
+                    capacity: 1,
+                    maxQueuedWaiterCount: 4,
+                    agePromotionNanoseconds: 10_000_000,
+                    nowUptimeNanoseconds: { clock.now() }
+                )
+                let gate = AsyncGate()
+                let recorder = AsyncValueRecorder()
+
+                let held = Task {
+                    try await limiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
+                        await gate.markStartedAndWaitForRelease()
+                    }
+                }
+                await gate.waitUntilStarted()
+                let agedCodemap = Task {
+                    try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
+                        await recorder.append(2)
+                    }
+                }
+                _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 1 }
+                clock.advance(by: 20_000_000)
+                let foreground = Task {
+                    try await limiter.withPermit(workloadClass: foregroundWorkload, ownerID: UUID()) {
+                        await recorder.append(1)
+                    }
+                }
+                _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 2 }
+
+                await gate.release()
+                _ = try await held.value
+                _ = try await foreground.value
+                _ = try await agedCodemap.value
+
+                let values = await recorder.values()
+                XCTAssertEqual(values, [1, 2], foregroundWorkload.rawValue)
+                let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+                XCTAssertTrue(idle.isIdle, foregroundWorkload.rawValue)
+            }
+        }
+
+        func testContentReadSchedulerForegroundTokensBlockCodemapReplacementUntilFinalEnd() async throws {
+            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 8)
+            let activeGate = AsyncGate()
             let recorder = AsyncValueRecorder()
-
-            let held = Task {
-                try await limiter.withPermit(workloadClass: .contentSearch, ownerID: UUID()) {
-                    await gate.markStartedAndWaitForRelease()
-                }
-            }
-            await gate.waitUntilStarted()
-            let agedBulk = Task {
+            let active = Task {
                 try await limiter.withPermit(workloadClass: .codemap, ownerID: UUID()) {
-                    await recorder.append(1)
+                    await activeGate.markStartedAndWaitForRelease()
                 }
             }
-            _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 1 }
-            clock.advance(by: 20_000_000)
-            let interactive = Task {
-                try await limiter.withPermit(workloadClass: .interactiveRead, ownerID: UUID()) {
-                    await recorder.append(2)
-                }
+            await activeGate.waitUntilStarted()
+
+            let materialization = await limiter.beginForegroundActivity(kind: .materialization)
+            let search = await limiter.beginForegroundActivity(kind: .storeBackedSearch)
+            let ownerA = UUID()
+            let ownerB = UUID()
+            var queued: [Task<Void, Error>] = []
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerA) { await recorder.append(1) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 1 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerA) { await recorder.append(2) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 2 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerB) { await recorder.append(3) } })
+            _ = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 3 }
+            queued.append(Task { try await limiter.withPermit(workloadClass: .codemap, ownerID: ownerB) { await recorder.append(4) } })
+            let blocked = await waitForLimiterSnapshot(limiter) { $0.queuedCodemapWaiterCount == 4 }
+            XCTAssertEqual(blocked.foregroundActivityCount, 2)
+            XCTAssertEqual(blocked.foregroundActivityCountsByKind, [.materialization: 1, .storeBackedSearch: 1])
+            XCTAssertEqual(blocked.activeCodemapPermitCount, 1)
+
+            await activeGate.release()
+            _ = try await active.value
+            let noReplacement = await waitForLimiterSnapshot(limiter) {
+                $0.activeCodemapPermitCount == 0 && $0.queuedCodemapWaiterCount == 4
             }
-            _ = await waitForLimiterSnapshot(limiter) { $0.queuedWaiterCount == 2 }
+            XCTAssertEqual(noReplacement.bulkGrantCount, 1)
+            XCTAssertEqual(noReplacement.codemapGrantWhileForegroundCount, 0)
 
-            await gate.release()
-            _ = try await held.value
-            _ = try await agedBulk.value
-            _ = try await interactive.value
+            await limiter.endForegroundActivity(materialization)
+            let oneToken = await limiter.snapshotForTesting()
+            XCTAssertEqual(oneToken.foregroundActivityCount, 1)
+            XCTAssertEqual(oneToken.activeCodemapPermitCount, 0)
+            XCTAssertEqual(oneToken.queuedCodemapWaiterCount, 4)
 
-            let values = await recorder.values()
-            XCTAssertEqual(values, [1, 2])
+            await limiter.endForegroundActivity(search)
+            for task in queued {
+                _ = try await task.value
+            }
+            let recordedValues = await recorder.values()
+            XCTAssertEqual(recordedValues, [1, 3, 2, 4])
             let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
             XCTAssertTrue(idle.isIdle)
+            XCTAssertEqual(idle.foregroundActivityCount, 0)
+            XCTAssertEqual(idle.activeCodemapPermitCount, 0)
+            XCTAssertEqual(idle.queuedCodemapWaiterCount, 0)
+            XCTAssertEqual(idle.codemapGrantWhileForegroundCount, 0)
+        }
+
+        func testForegroundActivityTokensCleanUpOnSuccessErrorAndCancellation() async throws {
+            let limiter = ContentReadAsyncLimiter(capacity: 1, maxQueuedWaiterCount: 2)
+
+            let value = await limiter.withForegroundActivity(kind: .rootLoad) {
+                let active = await limiter.snapshotForTesting()
+                XCTAssertEqual(active.foregroundActivityCountsByKind, [.rootLoad: 1])
+                return 42
+            }
+            XCTAssertEqual(value, 42)
+            let afterSuccess = await limiter.snapshotForTesting()
+            XCTAssertEqual(afterSuccess.foregroundActivityCount, 0)
+
+            do {
+                _ = try await limiter.withForegroundActivity(kind: .readResolution) {
+                    throw ForegroundActivityTestError.expected
+                }
+                XCTFail("Expected foreground body error")
+            } catch ForegroundActivityTestError.expected {
+                // Expected.
+            }
+            let afterError = await limiter.snapshotForTesting()
+            XCTAssertEqual(afterError.foregroundActivityCount, 0)
+
+            let started = AsyncSignal()
+            let cancelled = Task {
+                try await limiter.withForegroundActivity(kind: .interactiveRead) {
+                    await started.mark()
+                    try await Task.sleep(for: .seconds(60))
+                }
+            }
+            let didStart = await started.waitUntilMarked()
+            XCTAssertTrue(didStart)
+            cancelled.cancel()
+            do {
+                try await cancelled.value
+                XCTFail("Expected foreground body cancellation")
+            } catch is CancellationError {
+                // Expected.
+            }
+
+            let idle = await waitForLimiterSnapshot(limiter) { $0.isIdle }
+            XCTAssertTrue(idle.isIdle)
+            XCTAssertEqual(idle.foregroundActivityCount, 0)
+            XCTAssertTrue(idle.foregroundActivityCountsByKind.isEmpty)
         }
 
         func testContentReadSchedulerRoundRobinsOwnersWhilePreservingOwnerFIFO() async throws {
@@ -900,6 +1051,10 @@ private final class ContentReadTestClock: @unchecked Sendable {
         value &+= nanoseconds
         lock.unlock()
     }
+}
+
+private enum ForegroundActivityTestError: Error {
+    case expected
 }
 
 private actor AsyncGate {
