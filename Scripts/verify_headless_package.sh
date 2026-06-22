@@ -14,6 +14,8 @@ esac
 BINARY="$HEADLESS_TOOLS_ROOT/$LABEL/repoprompt-headless"
 MANIFEST="$HEADLESS_TOOLS_ROOT/$LABEL/artifact-manifest.json"
 /usr/bin/codesign --verify --strict --verbose=2 "$BINARY"
+python3 "$ROOT_DIR/Scripts/verify_tree_sitter_symbols.py" \
+    --binary "$BINARY" --expect exact --label "Staged RepoPrompt Headless"
 python3 "$ROOT_DIR/Scripts/headless_artifact_manifest.py" verify \
     --binary "$BINARY" --manifest "$MANIFEST" --source-root "$ROOT_DIR" \
     --configuration "$CONF" --version "$MARKETING_VERSION" --build "$BUILD_NUMBER" \

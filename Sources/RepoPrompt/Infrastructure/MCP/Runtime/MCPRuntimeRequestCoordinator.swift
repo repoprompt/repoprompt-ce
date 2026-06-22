@@ -1,11 +1,46 @@
 import Foundation
 import RepoPromptCore
 
+struct MCPRuntimeFileToolSnapshot: @unchecked Sendable {
+    let adapterTicket: MCPRuntimeAdapterTicket
+    let runtimeID: WorkspaceRuntimeID
+    let sessionID: WorkspaceSessionID
+    let lookupContext: WorkspaceLookupContext
+    let filePathDisplay: FilePathDisplay
+    let codeMapsEnabled: Bool
+
+    func context(admittedRuntime: WorkspaceAdmittedRuntimeSession) -> MCPRuntimeFileToolContext? {
+        guard admittedRuntime.runtimeID == runtimeID,
+              admittedRuntime.sessionID == sessionID
+        else { return nil }
+        return MCPRuntimeFileToolContext(
+            adapterTicket: adapterTicket,
+            runtimeID: runtimeID,
+            sessionID: sessionID,
+            query: admittedRuntime.query,
+            lookupContext: lookupContext,
+            filePathDisplay: filePathDisplay,
+            codeMapsEnabled: codeMapsEnabled
+        )
+    }
+}
+
+struct MCPRuntimeFileToolContext: @unchecked Sendable {
+    let adapterTicket: MCPRuntimeAdapterTicket
+    let runtimeID: WorkspaceRuntimeID
+    let sessionID: WorkspaceSessionID
+    let query: WorkspaceSessionQueryCapability
+    let lookupContext: WorkspaceLookupContext
+    let filePathDisplay: FilePathDisplay
+    let codeMapsEnabled: Bool
+}
+
 struct MCPRuntimeRequestContext: @unchecked Sendable {
     let lifetimeClass: MCPToolLifetimeClass
     let routingSnapshot: MCPRuntimeRoutingSnapshot
     let admittedRuntime: WorkspaceAdmittedRuntimeSession
     let adapterTicket: MCPRuntimeAdapterTicket?
+    let fileToolContext: MCPRuntimeFileToolContext?
 
     var runtimeID: WorkspaceRuntimeID {
         admittedRuntime.runtimeID
@@ -60,6 +95,19 @@ enum MCPRuntimeRequestCoordinator {
             guard adapterAvailable else { return .failure(.adapterUnavailable) }
         }
 
+        // Freeze every UI-derived value before Core admission. Once admission succeeds, runtime-
+        // capable work must not consult the weak app adapter again.
+        let fileToolSnapshot = await adapterRegistry.captureRuntimeFileToolSnapshot(
+            ticket: routingSnapshot.ticket
+        )
+        let mappingIsStillExact = await MainActor.run {
+            guard let current = adapterRegistry.routingSnapshot(windowID: routingSnapshot.windowID) else {
+                return false
+            }
+            return current.ticket == routingSnapshot.ticket
+        }
+        guard mappingIsStillExact else { return .failure(.mappingChanged) }
+
         let admission = await lifecycleRegistry.admit(runtimeID: routingSnapshot.runtimeID)
         guard case let .admitted(admittedRuntime) = admission else {
             if case let .unavailable(failure) = admission {
@@ -68,23 +116,14 @@ enum MCPRuntimeRequestCoordinator {
             return .failure(.routingUnavailable)
         }
 
-        let mappingIsStillExact = await MainActor.run {
-            guard let current = adapterRegistry.routingSnapshot(windowID: routingSnapshot.windowID) else {
-                return false
-            }
-            return current.ticket == routingSnapshot.ticket
-        }
-        guard mappingIsStillExact else {
-            _ = await lifecycleRegistry.release(admittedRuntime.admissionToken)
-            return .failure(.mappingChanged)
-        }
-
+        let fileToolContext = fileToolSnapshot?.context(admittedRuntime: admittedRuntime)
         return .success(MCPRuntimeRequestLease(
             context: MCPRuntimeRequestContext(
                 lifetimeClass: lifetimeClass,
                 routingSnapshot: routingSnapshot,
                 admittedRuntime: admittedRuntime,
-                adapterTicket: lifetimeClass.requiresUIAdapterAtStart ? routingSnapshot.ticket : nil
+                adapterTicket: lifetimeClass.requiresUIAdapterAtStart ? routingSnapshot.ticket : nil,
+                fileToolContext: fileToolContext
             ),
             registry: lifecycleRegistry
         ))

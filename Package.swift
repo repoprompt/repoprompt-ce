@@ -100,8 +100,7 @@ let package = Package(
         .executableTarget(
             name: "RepoPrompt",
             dependencies: [
-                "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS",
-                "RepoPromptPOSIXSupport", "RepoPromptSyntaxCBridge", "RepoPromptC", "Sparkle",
+                "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS", "Sparkle",
                 .product(name: "Logging", package: "swift-log"),
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
                 .product(name: "MarkdownUI", package: "swift-markdown-ui"),

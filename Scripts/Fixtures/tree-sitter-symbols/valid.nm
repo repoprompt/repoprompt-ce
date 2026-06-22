@@ -1,0 +1,16 @@
+0000000100001000 T _tree_sitter_c
+0000000100001010 T _tree_sitter_c_sharp
+0000000100001020 T _tree_sitter_cpp
+0000000100001030 T _tree_sitter_dart
+0000000100001040 T _tree_sitter_go
+0000000100001050 T _tree_sitter_java
+0000000100001060 T _tree_sitter_javascript
+0000000100001070 T _tree_sitter_php
+0000000100001080 T _tree_sitter_python
+0000000100001090 T _tree_sitter_ruby
+00000001000010a0 T _tree_sitter_rust
+00000001000010b0 T _tree_sitter_swift
+00000001000010c0 T _tree_sitter_tsx
+00000001000010d0 T _tree_sitter_typescript
+0000000100002000 T _unrelated_export
+                 U _tree_sitter_not_a_definition

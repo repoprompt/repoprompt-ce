@@ -1,14 +1,5 @@
 import Foundation
-
-enum SelectedGitDiffFolderPolicy {
-    case filesOnly
-    case expandFolders
-}
-
-struct WorkspaceSelectedGitPathResolution: Equatable {
-    let paths: [String]
-    let unresolvedCandidates: [String]
-}
+import RepoPromptCore
 
 enum WorkspaceGitDiffSelectionResolver {
     static func candidates(from selection: StoredSelection) -> [String] {

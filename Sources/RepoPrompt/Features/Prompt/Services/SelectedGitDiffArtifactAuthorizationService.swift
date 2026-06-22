@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 protocol PromptGitAuthorizationCatalogReading: Sendable {
     func exactRootRef(path: String, kind: WorkspaceRootKind) async -> WorkspaceRootRef?
@@ -14,6 +15,7 @@ protocol PromptGitAuthorizationCatalogReading: Sendable {
 }
 
 extension WorkspaceFileContextStore: PromptGitAuthorizationCatalogReading {}
+extension WorkspaceSessionQueryCapability: PromptGitAuthorizationCatalogReading {}
 
 struct SelectedGitArtifactAuthorizationRequest {
     let physicalSelection: StoredSelection
@@ -236,7 +238,9 @@ struct SelectedGitDiffArtifactAuthorizationService {
             capability.gitDataRoot.standardizedFullPath == expectedGitDataPath &&
             currentGitDataRoot == capability.gitDataRoot
 
-        for rawPath in selectedArtifactCandidates(from: request.physicalSelection) {
+        for rawPath in SelectedGitArtifactSelectionClassifier.selectionCandidatePaths(
+            from: request.physicalSelection
+        ) {
             guard let path = exactAbsolutePath(rawPath) else {
                 if rawPath.hasPrefix(capability.gitDataRoot.standardizedFullPath + "/") {
                     consumedPaths.insert(rawPath)
@@ -450,25 +454,6 @@ struct SelectedGitDiffArtifactAuthorizationService {
               !StandardizedPath.containsNUL(relativePath)
         else { return nil }
         return "_git_data/\(relativePath)"
-    }
-
-    private func selectedArtifactCandidates(from selection: StoredSelection) -> [String] {
-        var candidates: [String] = []
-        var seen = Set<String>()
-
-        func append(_ path: String) {
-            guard seen.insert(path).inserted else { return }
-            candidates.append(path)
-        }
-
-        selection.selectedPaths.forEach(append)
-        selection.slices
-            .filter { !$0.value.isEmpty }
-            .map(\.key)
-            .sorted()
-            .forEach(append)
-        selection.autoCodemapPaths.forEach(append)
-        return candidates
     }
 
     private func candidate(for path: String, gitDataRootPath: String) -> Candidate? {

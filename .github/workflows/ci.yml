@@ -64,6 +64,17 @@ jobs:
       - name: Build headless scaffold product
         run: swift build --product repoprompt-headless
 
+      - name: Verify linked Tree-sitter symbol ownership
+        run: |
+          set -euo pipefail
+          bin_dir="$(swift build --show-bin-path)"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/RepoPrompt" --expect exact --label "CI RepoPrompt app"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/repoprompt-headless" --expect exact --label "CI RepoPrompt Headless"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/repoprompt-mcp" --expect absent --label "CI repoprompt-mcp proxy"
+
       - name: Run Core tests
         run: swift test --filter RepoPromptCoreTests
 

@@ -3,6 +3,8 @@ import Foundation
 actor HeadlessMCPServer {
     typealias ToolCallOverride = (String, HeadlessJSONObject) async throws -> HeadlessJSONObject
 
+    static let toolsListConfigurationErrorMessage = "Headless configuration is unavailable; tools/list failed closed."
+
     private enum LifecycleState {
         case uninitialized
         case awaitingInitializedNotification
@@ -212,7 +214,17 @@ actor HeadlessMCPServer {
         case "ping":
             return .completed(requestResult(hasID: true, id: id, result: [:]))
         case "tools/list":
-            return .completed(requestResult(hasID: true, id: id, result: ["tools": registry.listDescriptors()]))
+            do {
+                let descriptors = try registry.listDescriptors()
+                return .completed(requestResult(hasID: true, id: id, result: ["tools": descriptors]))
+            } catch {
+                return .completed(requestError(
+                    hasID: true,
+                    id: id,
+                    code: -32603,
+                    message: Self.toolsListConfigurationErrorMessage
+                ))
+            }
         case "tools/call":
             guard let params = object["params"] as? [String: Any] else {
                 return .completed(requestError(hasID: true, id: id, code: -32602, message: "tools/call requires params."))

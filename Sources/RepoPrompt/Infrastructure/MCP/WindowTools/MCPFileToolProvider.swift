@@ -122,25 +122,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: []
             )
-        ) { [self] _, args in
+        ) { [self] toolContext, args in
             try Task.checkCancellation()
-            guard let promptVM = await dependencies.promptVM() else {
-                throw MCPError.internalError("The original window UI is no longer available for get_code_structure; the request was not retargeted.")
-            }
-            if await promptVM.codeMapsGloballyDisabled {
-                throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
-            }
             let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
             let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
-            let metadata = await dependencies.captureRequestMetadata()
-            try Task.checkCancellation()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            try Task.checkCancellation()
-            _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-            try Task.checkCancellation()
 
             switch scope {
             case "selected":
+                guard let promptVM = await dependencies.promptVM() else {
+                    throw MCPError.internalError("The original window UI is no longer available for get_code_structure; the request was not retargeted.")
+                }
+                if await promptVM.codeMapsGloballyDisabled {
+                    throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                }
+                let metadata = await dependencies.captureRequestMetadata()
+                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
                     throw CancellationError()
                 }
@@ -170,11 +167,61 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 guard !paths.isEmpty else {
                     throw MCPError.invalidParams("paths array cannot be empty")
                 }
+                if let runtimeRequest = toolContext.runtimeRequest {
+                    guard let runtimeContext = runtimeRequest.fileToolContext else {
+                        throw MCPError.internalError("The admitted runtime file context is unavailable for get_code_structure.")
+                    }
+                    guard runtimeContext.codeMapsEnabled else {
+                        throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                    }
+                    let lookupContext = runtimeContext.lookupContext
+                    let lookupRootScope = lookupContext.rootScope
+                    let resolvedPaths = lookupContext.translateInputPaths(paths)
+                    await runtimeContext.query.awaitAppliedIngress(rootScope: lookupRootScope)
+                    for path in resolvedPaths {
+                        try Task.checkCancellation()
+                        if let issue = await runtimeContext.query.exactPathResolutionIssue(
+                            for: path,
+                            kind: .either,
+                            rootScope: lookupRootScope
+                        ) {
+                            throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+                        }
+                    }
+                    try Task.checkCancellation()
+                    let resolvedFiles = try await MCPRuntimeFileToolServices.resolveCodeStructureFiles(
+                        paths: resolvedPaths,
+                        context: runtimeContext
+                    )
+                    try Task.checkCancellation()
+                    let reply = try await MCPRuntimeFileToolServices.buildCodeStructureDTO(
+                        files: resolvedFiles,
+                        maxResults: maxResults,
+                        includeUnmappedPaths: false,
+                        context: runtimeContext
+                    )
+                    try Task.checkCancellation()
+                    return try Value(reply)
+                }
+
+                guard let promptVM = await dependencies.promptVM() else {
+                    throw MCPError.internalError("The original window UI is no longer available for get_code_structure; the request was not retargeted.")
+                }
+                if await promptVM.codeMapsGloballyDisabled {
+                    throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                }
+                let metadata = await dependencies.captureRequestMetadata()
+                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 let lookupRootScope = lookupContext.rootScope
                 let resolvedPaths = lookupContext.translateInputPaths(paths)
                 for path in resolvedPaths {
                     try Task.checkCancellation()
-                    if let issue = await dependencies.workspaceFileContextStore.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
+                    if let issue = await dependencies.workspaceFileContextStore.exactPathResolutionIssue(
+                        for: path,
+                        kind: .either,
+                        rootScope: lookupRootScope
+                    ) {
                         throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
                     }
                 }
@@ -229,11 +276,37 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: []
             )
-        ) { [self] _, args in
+        ) { [self] toolContext, args in
+            let type = (args["type"]?.stringValue ?? "files").lowercased()
+            let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
+            let maxDepth: Int?
+            if let maxDepthArg = args["max_depth"] {
+                guard let intVal = maxDepthArg.intValue else {
+                    throw MCPError.invalidParams("max_depth must be an integer")
+                }
+                maxDepth = intVal
+            } else {
+                maxDepth = nil
+            }
+
+            if let runtimeRequest = toolContext.runtimeRequest,
+               type == "roots" || (type == "files" && mode != "selected")
+            {
+                guard let runtimeContext = runtimeRequest.fileToolContext else {
+                    throw MCPError.internalError("The admitted runtime file context is unavailable for get_file_tree.")
+                }
+                return try await Value(MCPRuntimeFileToolServices.fileTree(
+                    type: type,
+                    mode: type == "roots" ? "full" : mode,
+                    maxDepth: maxDepth,
+                    startPath: args["path"]?.stringValue,
+                    context: runtimeContext
+                ))
+            }
+
             guard let promptVM = await dependencies.promptVM() else {
                 throw MCPError.internalError("The original window UI is no longer available for get_file_tree; the request was not retargeted.")
             }
-            let type = args["type"]?.stringValue ?? "files"
             switch type {
             case "roots":
                 let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
@@ -255,14 +328,6 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 }
                 return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
             case "files":
-                let mode = args["mode"]?.stringValue ?? "auto"
-                let maxDepth: Int?
-                if let maxDepthArg = args["max_depth"] {
-                    guard let intVal = maxDepthArg.intValue else { throw MCPError.invalidParams("max_depth must be an integer") }
-                    maxDepth = intVal
-                } else {
-                    maxDepth = nil
-                }
                 let metadata = await dependencies.captureRequestMetadata()
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
                 _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)

@@ -750,6 +750,7 @@ package actor WorkspaceFileContextStore {
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
+        private var contextBuilderSelectionCandidateEligibilityDidResolveHandler: (@Sendable (UUID) async -> Void)?
         private var publishedGitArtifactIngressDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
         private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
@@ -822,6 +823,12 @@ package actor WorkspaceFileContextStore {
 
         package func setEnsureIndexedFilesEligibilityDidResolveHandler(_ handler: (@Sendable (UUID, String) async -> Void)?) {
             ensureIndexedFilesEligibilityDidResolveHandler = handler
+        }
+
+        package func setContextBuilderSelectionCandidateEligibilityDidResolveHandler(
+            _ handler: (@Sendable (UUID) async -> Void)?
+        ) {
+            contextBuilderSelectionCandidateEligibilityDidResolveHandler = handler
         }
 
         package func setPublishedGitArtifactIngressDidRegisterHandler(
@@ -2133,6 +2140,58 @@ package actor WorkspaceFileContextStore {
             let record = sessionWorktreeOwnershipRecordsByToken[token]
         else { return nil }
         return record.roots.compactMap { rootStatesByID[$0.rootID]?.root }
+    }
+
+    package func validateSessionRootAuthorization(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) -> WorkspaceSessionRootAuthorizationMismatch? {
+        sessionRootAuthorizationMismatch(authorization)
+    }
+
+    private func sessionRootAuthorizationMismatch(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) -> WorkspaceSessionRootAuthorizationMismatch? {
+        guard let token = installedSessionWorktreeOwnershipTokenByOwnerID[authorization.sessionID] else {
+            return .token
+        }
+        guard token.generation == authorization.ownershipGeneration else {
+            return .generation
+        }
+        guard let record = sessionWorktreeOwnershipRecordsByToken[token] else {
+            return .token
+        }
+        guard sessionWorktreeOwnershipRecordIsCurrent(record) else {
+            return .rootClaim
+        }
+        guard let ownedRoot = record.roots.first(where: { $0.rootID == authorization.root.id }) else {
+            return .rootID
+        }
+        guard ownedRoot.lifetimeID == authorization.lifetimeID else {
+            return .lifetime
+        }
+        guard ownedRoot.standardizedPhysicalPath == authorization.root.standardizedFullPath else {
+            return .path
+        }
+        guard let state = rootStatesByID[authorization.root.id] else {
+            return .rootID
+        }
+        guard state.lifetimeID == authorization.lifetimeID else {
+            return .lifetime
+        }
+        guard state.root.kind == .sessionWorktree else {
+            return .kind
+        }
+        guard state.root.standardizedFullPath == authorization.root.standardizedFullPath else {
+            return .path
+        }
+        let lifetimeKey = SessionWorktreeRootLifetimeKey(
+            rootID: authorization.root.id,
+            lifetimeID: authorization.lifetimeID
+        )
+        guard sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey]?.contains(token) == true else {
+            return .rootClaim
+        }
+        return nil
     }
 
     #if DEBUG
@@ -8264,6 +8323,170 @@ package actor WorkspaceFileContextStore {
             name: state.root.name,
             fullPath: state.root.standardizedFullPath
         )
+    }
+
+    /// Resolves one Context Builder selection candidate against an exact Agent-owned
+    /// session root. This route never consults another root, aliases, general lookup, or
+    /// raw filesystem fallback.
+    package func resolveContextBuilderSelectionCandidate(
+        path rawPath: String,
+        authorization: WorkspaceSessionRootAuthorization,
+        folderPolicy: SelectedGitDiffFolderPolicy
+    ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution {
+        try Task.checkCancellation()
+        if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+            return .staleAuthority(mismatch)
+        }
+
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed)
+        else {
+            return .blockedOrAmbiguous(.invalidPath)
+        }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            return .blockedOrAmbiguous(.invalidPath)
+        }
+        let standardizedPath = StandardizedPath.absolute(expanded)
+        let selectsAuthorizedRoot = standardizedPath == authorization.root.standardizedFullPath
+        guard selectsAuthorizedRoot
+            || StandardizedPath.isDescendant(
+                standardizedPath,
+                of: authorization.root.standardizedFullPath
+            )
+        else {
+            return .blockedOrAmbiguous(.outsideAuthorizedRoot)
+        }
+
+        if selectsAuthorizedRoot {
+            let expandsFolders = switch folderPolicy {
+            case .filesOnly: false
+            case .expandFolders: true
+            }
+            guard expandsFolders,
+                  let folder = rootFolderRecord(rootID: authorization.root.id)
+            else {
+                return .noCandidate
+            }
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            return .resolved(files: descendantFiles(in: folder.id), route: .catalogFolder)
+        }
+
+        let relativePath = relativePath(
+            for: standardizedPath,
+            rootPath: authorization.root.standardizedFullPath
+        )
+        guard !relativePath.isEmpty,
+              relativePath != "..",
+              !relativePath.hasPrefix("../")
+        else {
+            return .blockedOrAmbiguous(.outsideAuthorizedRoot)
+        }
+        guard let state = rootStatesByID[authorization.root.id] else {
+            return .staleAuthority(.rootID)
+        }
+
+        let eligibility = await state.service.catalogRegularFileEligibility(
+            relativePath: relativePath
+        )
+        #if DEBUG
+            if let contextBuilderSelectionCandidateEligibilityDidResolveHandler {
+                await contextBuilderSelectionCandidateEligibilityDidResolveHandler(authorization.root.id)
+            }
+        #endif
+        try Task.checkCancellation()
+        if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+            return .staleAuthority(mismatch)
+        }
+
+        switch eligibility {
+        case .eligible, .ineligible(.ignored):
+            if let record = file(rootID: authorization.root.id, relativePath: relativePath),
+               record.rootID == authorization.root.id,
+               record.standardizedFullPath == standardizedPath
+            {
+                return .resolved(files: [record], route: .catalogFile)
+            }
+
+            let registered = await state.service.registerExplicitlyManagedRegularFile(
+                relativePath: relativePath
+            )
+            try Task.checkCancellation()
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            let managedOnly: Bool
+            switch registered {
+            case .eligible:
+                managedOnly = false
+            case .ineligible(.ignored):
+                managedOnly = true
+            case .ineligible(.missingOrDirectory):
+                return .noCandidate
+            case let .ineligible(reason):
+                return .blockedOrAmbiguous(
+                    contextBuilderSelectionCandidateBlock(for: reason)
+                )
+            }
+            do {
+                let record = try materializeCatalogRegularFile(
+                    rootID: authorization.root.id,
+                    relativePath: relativePath,
+                    managedOnly: managedOnly
+                )
+                if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                    return .staleAuthority(mismatch)
+                }
+                return .resolved(files: [record], route: .materializedFile)
+            } catch {
+                return .blockedOrAmbiguous(.materializationFailed)
+            }
+
+        case .ineligible(.missingOrDirectory):
+            let expandsFolders = switch folderPolicy {
+            case .filesOnly: false
+            case .expandFolders: true
+            }
+            guard expandsFolders,
+                  let folder = folder(rootID: authorization.root.id, relativePath: relativePath),
+                  isDiscoverableFolderID(folder.id)
+            else {
+                return .noCandidate
+            }
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            return .resolved(files: descendantFiles(in: folder.id), route: .catalogFolder)
+
+        case let .ineligible(reason):
+            return .blockedOrAmbiguous(
+                contextBuilderSelectionCandidateBlock(for: reason)
+            )
+        }
+    }
+
+    private func contextBuilderSelectionCandidateBlock(
+        for reason: CatalogRegularFileIneligibilityReason
+    ) -> WorkspaceAuthorizedSelectionCandidateBlock {
+        switch reason {
+        case .invalidRelativePath:
+            .invalidPath
+        case .outsideRoot:
+            .outsideAuthorizedRoot
+        case .symbolicLink:
+            .symbolicLink
+        case .symlinkComponent:
+            .symlinkComponent
+        case .outsideCanonicalRoot:
+            .outsideCanonicalRoot
+        case .nonRegularFile:
+            .nonRegularFile
+        case .missingOrDirectory, .ignored:
+            .materializationFailed
+        }
     }
 
     /// Returns one exact catalog record under a previously frozen root identity.

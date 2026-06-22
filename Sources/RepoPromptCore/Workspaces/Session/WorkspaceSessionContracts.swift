@@ -93,6 +93,47 @@ package struct WorkspaceSessionQueryCapability: @unchecked Sendable {
         WorkspaceSearchCatalogAccessRequirement
     ) async -> WorkspaceSearchCatalogAccess
     private let lookupPathClosure: @Sendable (WorkspacePathLookupRequest) async -> WorkspacePathLookupResult?
+    private let exactRootRefClosure: @Sendable (String, WorkspaceRootKind) async -> WorkspaceRootRef?
+    private let validateSessionRootAuthorizationClosure: @Sendable (
+        WorkspaceSessionRootAuthorization
+    ) async -> WorkspaceSessionRootAuthorizationMismatch?
+    private let resolveContextBuilderSelectionCandidateClosure: @Sendable (
+        String,
+        WorkspaceSessionRootAuthorization,
+        SelectedGitDiffFolderPolicy
+    ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution
+    private let exactCatalogFileClosure: @Sendable (
+        String,
+        WorkspaceRootRef,
+        WorkspaceRootKind
+    ) async -> WorkspaceFileRecord?
+    private let readExactCatalogFileClosure: @Sendable (
+        WorkspaceFileRecord,
+        WorkspaceRootRef
+    ) async -> String?
+    private let rootRefsClosure: @Sendable (WorkspaceLookupRootScope) async -> [WorkspaceRootRef]
+    private let resolveSelectedGitDiffPathsClosure: @Sendable (
+        StoredSelection,
+        WorkspaceLookupRootScope,
+        SelectedGitDiffFolderPolicy,
+        PathLocateProfile,
+        Bool,
+        Set<String>
+    ) async -> WorkspaceSelectedGitPathResolution
+    private let awaitAppliedIngressClosure: @Sendable (WorkspaceLookupRootScope) async -> Void
+    private let exactPathResolutionIssueClosure: @Sendable (
+        String,
+        WorkspaceExactPathLookupKind,
+        WorkspaceLookupRootScope
+    ) async -> PathResolutionIssue?
+    private let codemapSnapshotBundleClosure: @Sendable (
+        WorkspaceLookupRootScope
+    ) async -> WorkspaceCodemapSnapshotBundle
+    private let fileTreeSnapshotClosure: @Sendable (
+        StoredSelection,
+        WorkspaceFileTreeSnapshotRequest,
+        PathLocateProfile
+    ) async -> FileTreeSelectionSnapshot
 
     package init(
         roots: @escaping @Sendable () async -> [WorkspaceRootRecord],
@@ -103,7 +144,52 @@ package struct WorkspaceSessionQueryCapability: @unchecked Sendable {
             WorkspaceLookupRootScope,
             WorkspaceSearchCatalogAccessRequirement
         ) async -> WorkspaceSearchCatalogAccess,
-        lookupPath: @escaping @Sendable (WorkspacePathLookupRequest) async -> WorkspacePathLookupResult?
+        lookupPath: @escaping @Sendable (WorkspacePathLookupRequest) async -> WorkspacePathLookupResult?,
+        exactRootRef: @escaping @Sendable (String, WorkspaceRootKind) async -> WorkspaceRootRef? = { _, _ in nil },
+        validateSessionRootAuthorization: @escaping @Sendable (
+            WorkspaceSessionRootAuthorization
+        ) async -> WorkspaceSessionRootAuthorizationMismatch? = { _ in .token },
+        resolveContextBuilderSelectionCandidate: @escaping @Sendable (
+            String,
+            WorkspaceSessionRootAuthorization,
+            SelectedGitDiffFolderPolicy
+        ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution = { _, _, _ in .staleAuthority(.token) },
+        exactCatalogFile: @escaping @Sendable (
+            String,
+            WorkspaceRootRef,
+            WorkspaceRootKind
+        ) async -> WorkspaceFileRecord? = { _, _, _ in nil },
+        readExactCatalogFile: @escaping @Sendable (
+            WorkspaceFileRecord,
+            WorkspaceRootRef
+        ) async -> String? = { _, _ in nil },
+        rootRefs: @escaping @Sendable (WorkspaceLookupRootScope) async -> [WorkspaceRootRef] = { _ in [] },
+        resolveSelectedGitDiffPaths: @escaping @Sendable (
+            StoredSelection,
+            WorkspaceLookupRootScope,
+            SelectedGitDiffFolderPolicy,
+            PathLocateProfile,
+            Bool,
+            Set<String>
+        ) async -> WorkspaceSelectedGitPathResolution = { _, _, _, _, _, _ in
+            WorkspaceSelectedGitPathResolution(paths: [], unresolvedCandidates: [])
+        },
+        awaitAppliedIngress: @escaping @Sendable (WorkspaceLookupRootScope) async -> Void = { _ in },
+        exactPathResolutionIssue: @escaping @Sendable (
+            String,
+            WorkspaceExactPathLookupKind,
+            WorkspaceLookupRootScope
+        ) async -> PathResolutionIssue? = { _, _, _ in nil },
+        codemapSnapshotBundle: @escaping @Sendable (
+            WorkspaceLookupRootScope
+        ) async -> WorkspaceCodemapSnapshotBundle = { _ in .empty },
+        fileTreeSnapshot: @escaping @Sendable (
+            StoredSelection,
+            WorkspaceFileTreeSnapshotRequest,
+            PathLocateProfile
+        ) async -> FileTreeSelectionSnapshot = { _, request, _ in
+            FileTreeSelectionSnapshot.empty(request: request)
+        }
     ) {
         rootsClosure = roots
         rootScopeAvailabilityClosure = rootScopeAvailability
@@ -111,6 +197,17 @@ package struct WorkspaceSessionQueryCapability: @unchecked Sendable {
         catalogDiagnosticsClosure = catalogDiagnostics
         searchCatalogAccessClosure = searchCatalogAccess
         lookupPathClosure = lookupPath
+        exactRootRefClosure = exactRootRef
+        validateSessionRootAuthorizationClosure = validateSessionRootAuthorization
+        resolveContextBuilderSelectionCandidateClosure = resolveContextBuilderSelectionCandidate
+        exactCatalogFileClosure = exactCatalogFile
+        readExactCatalogFileClosure = readExactCatalogFile
+        rootRefsClosure = rootRefs
+        resolveSelectedGitDiffPathsClosure = resolveSelectedGitDiffPaths
+        awaitAppliedIngressClosure = awaitAppliedIngress
+        exactPathResolutionIssueClosure = exactPathResolutionIssue
+        codemapSnapshotBundleClosure = codemapSnapshotBundle
+        fileTreeSnapshotClosure = fileTreeSnapshot
     }
 
     package func roots() async -> [WorkspaceRootRecord] {
@@ -138,6 +235,87 @@ package struct WorkspaceSessionQueryCapability: @unchecked Sendable {
 
     package func lookupPath(_ request: WorkspacePathLookupRequest) async -> WorkspacePathLookupResult? {
         await lookupPathClosure(request)
+    }
+
+    package func exactRootRef(path: String, kind: WorkspaceRootKind) async -> WorkspaceRootRef? {
+        await exactRootRefClosure(path, kind)
+    }
+
+    package func validateSessionRootAuthorization(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) async -> WorkspaceSessionRootAuthorizationMismatch? {
+        await validateSessionRootAuthorizationClosure(authorization)
+    }
+
+    package func resolveContextBuilderSelectionCandidate(
+        path: String,
+        authorization: WorkspaceSessionRootAuthorization,
+        folderPolicy: SelectedGitDiffFolderPolicy
+    ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution {
+        try await resolveContextBuilderSelectionCandidateClosure(path, authorization, folderPolicy)
+    }
+
+    package func exactCatalogFile(
+        absolutePath: String,
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) async -> WorkspaceFileRecord? {
+        await exactCatalogFileClosure(absolutePath, expectedRoot, expectedKind)
+    }
+
+    package func readExactCatalogFile(
+        _ file: WorkspaceFileRecord,
+        expectedRoot: WorkspaceRootRef
+    ) async -> String? {
+        await readExactCatalogFileClosure(file, expectedRoot)
+    }
+
+    package func rootRefs(scope: WorkspaceLookupRootScope) async -> [WorkspaceRootRef] {
+        await rootRefsClosure(scope)
+    }
+
+    package func resolveSelectedGitDiffPaths(
+        for selection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope,
+        folderPolicy: SelectedGitDiffFolderPolicy,
+        profile: PathLocateProfile,
+        allowFilesystemFallback: Bool,
+        excluding excludedPaths: Set<String>
+    ) async -> WorkspaceSelectedGitPathResolution {
+        await resolveSelectedGitDiffPathsClosure(
+            selection,
+            rootScope,
+            folderPolicy,
+            profile,
+            allowFilesystemFallback,
+            excludedPaths
+        )
+    }
+
+    package func awaitAppliedIngress(rootScope: WorkspaceLookupRootScope) async {
+        await awaitAppliedIngressClosure(rootScope)
+    }
+
+    package func exactPathResolutionIssue(
+        for path: String,
+        kind: WorkspaceExactPathLookupKind,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> PathResolutionIssue? {
+        await exactPathResolutionIssueClosure(path, kind, rootScope)
+    }
+
+    package func codemapSnapshotBundle(
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceCodemapSnapshotBundle {
+        await codemapSnapshotBundleClosure(rootScope)
+    }
+
+    package func makeFileTreeSelectionSnapshot(
+        selection: StoredSelection,
+        request: WorkspaceFileTreeSnapshotRequest,
+        profile: PathLocateProfile
+    ) async -> FileTreeSelectionSnapshot {
+        await fileTreeSnapshotClosure(selection, request, profile)
     }
 }
 
@@ -194,6 +372,55 @@ package actor WorkspaceSessionLifecycleOwner {
             },
             lookupPath: { [weak self] request in
                 await self?.queryLookupPath(request)
+            },
+            exactRootRef: { [weak self] path, kind in
+                await self?.queryExactRootRef(path: path, kind: kind)
+            },
+            validateSessionRootAuthorization: { [weak self] authorization in
+                await self?.queryValidateSessionRootAuthorization(authorization) ?? .token
+            },
+            resolveContextBuilderSelectionCandidate: { [weak self] path, authorization, folderPolicy in
+                guard let self else { return .staleAuthority(.token) }
+                return try await queryResolveContextBuilderSelectionCandidate(
+                    path: path,
+                    authorization: authorization,
+                    folderPolicy: folderPolicy
+                )
+            },
+            exactCatalogFile: { [weak self] path, root, kind in
+                await self?.queryExactCatalogFile(absolutePath: path, expectedRoot: root, expectedKind: kind)
+            },
+            readExactCatalogFile: { [weak self] file, root in
+                await self?.queryReadExactCatalogFile(file, expectedRoot: root)
+            },
+            rootRefs: { [weak self] scope in
+                await self?.queryRootRefs(scope: scope) ?? []
+            },
+            resolveSelectedGitDiffPaths: { [weak self] selection, scope, folderPolicy, profile, allowFallback, excluded in
+                guard let self else {
+                    return WorkspaceSelectedGitPathResolution(paths: [], unresolvedCandidates: [])
+                }
+                return await queryResolveSelectedGitDiffPaths(
+                    for: selection,
+                    rootScope: scope,
+                    folderPolicy: folderPolicy,
+                    profile: profile,
+                    allowFilesystemFallback: allowFallback,
+                    excluding: excluded
+                )
+            },
+            awaitAppliedIngress: { [weak self] scope in
+                await self?.queryAwaitAppliedIngress(rootScope: scope)
+            },
+            exactPathResolutionIssue: { [weak self] path, kind, scope in
+                await self?.queryExactPathResolutionIssue(for: path, kind: kind, rootScope: scope)
+            },
+            codemapSnapshotBundle: { [weak self] scope in
+                await self?.queryCodemapSnapshotBundle(rootScope: scope) ?? .empty
+            },
+            fileTreeSnapshot: { [weak self] selection, request, profile in
+                guard let self else { return FileTreeSelectionSnapshot.empty(request: request) }
+                return await queryFileTreeSnapshot(selection: selection, request: request, profile: profile)
             }
         )
     }
@@ -275,6 +502,112 @@ package actor WorkspaceSessionLifecycleOwner {
     ) async -> WorkspacePathLookupResult? {
         guard !isClosed else { return nil }
         return await underlyingQuery.lookupPath(request)
+    }
+
+    private func queryExactRootRef(path: String, kind: WorkspaceRootKind) async -> WorkspaceRootRef? {
+        guard !isClosed else { return nil }
+        return await underlyingQuery.exactRootRef(path: path, kind: kind)
+    }
+
+    private func queryValidateSessionRootAuthorization(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) async -> WorkspaceSessionRootAuthorizationMismatch? {
+        guard !isClosed else { return .token }
+        return await underlyingQuery.validateSessionRootAuthorization(authorization)
+    }
+
+    private func queryResolveContextBuilderSelectionCandidate(
+        path: String,
+        authorization: WorkspaceSessionRootAuthorization,
+        folderPolicy: SelectedGitDiffFolderPolicy
+    ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution {
+        guard !isClosed else { return .staleAuthority(.token) }
+        return try await underlyingQuery.resolveContextBuilderSelectionCandidate(
+            path: path,
+            authorization: authorization,
+            folderPolicy: folderPolicy
+        )
+    }
+
+    private func queryExactCatalogFile(
+        absolutePath: String,
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) async -> WorkspaceFileRecord? {
+        guard !isClosed else { return nil }
+        return await underlyingQuery.exactCatalogFile(
+            absolutePath: absolutePath,
+            expectedRoot: expectedRoot,
+            expectedKind: expectedKind
+        )
+    }
+
+    private func queryReadExactCatalogFile(
+        _ file: WorkspaceFileRecord,
+        expectedRoot: WorkspaceRootRef
+    ) async -> String? {
+        guard !isClosed else { return nil }
+        return await underlyingQuery.readExactCatalogFile(file, expectedRoot: expectedRoot)
+    }
+
+    private func queryRootRefs(scope: WorkspaceLookupRootScope) async -> [WorkspaceRootRef] {
+        guard !isClosed else { return [] }
+        return await underlyingQuery.rootRefs(scope: scope)
+    }
+
+    private func queryResolveSelectedGitDiffPaths(
+        for selection: StoredSelection,
+        rootScope: WorkspaceLookupRootScope,
+        folderPolicy: SelectedGitDiffFolderPolicy,
+        profile: PathLocateProfile,
+        allowFilesystemFallback: Bool,
+        excluding excludedPaths: Set<String>
+    ) async -> WorkspaceSelectedGitPathResolution {
+        guard !isClosed else {
+            return WorkspaceSelectedGitPathResolution(paths: [], unresolvedCandidates: [])
+        }
+        return await underlyingQuery.resolveSelectedGitDiffPaths(
+            for: selection,
+            rootScope: rootScope,
+            folderPolicy: folderPolicy,
+            profile: profile,
+            allowFilesystemFallback: allowFilesystemFallback,
+            excluding: excludedPaths
+        )
+    }
+
+    private func queryAwaitAppliedIngress(rootScope: WorkspaceLookupRootScope) async {
+        guard !isClosed else { return }
+        await underlyingQuery.awaitAppliedIngress(rootScope: rootScope)
+    }
+
+    private func queryExactPathResolutionIssue(
+        for path: String,
+        kind: WorkspaceExactPathLookupKind,
+        rootScope: WorkspaceLookupRootScope
+    ) async -> PathResolutionIssue? {
+        guard !isClosed else { return .emptyInput }
+        return await underlyingQuery.exactPathResolutionIssue(for: path, kind: kind, rootScope: rootScope)
+    }
+
+    private func queryCodemapSnapshotBundle(
+        rootScope: WorkspaceLookupRootScope
+    ) async -> WorkspaceCodemapSnapshotBundle {
+        guard !isClosed else { return .empty }
+        return await underlyingQuery.codemapSnapshotBundle(rootScope: rootScope)
+    }
+
+    private func queryFileTreeSnapshot(
+        selection: StoredSelection,
+        request: WorkspaceFileTreeSnapshotRequest,
+        profile: PathLocateProfile
+    ) async -> FileTreeSelectionSnapshot {
+        guard !isClosed else { return FileTreeSelectionSnapshot.empty(request: request) }
+        return await underlyingQuery.makeFileTreeSelectionSnapshot(
+            selection: selection,
+            request: request,
+            profile: profile
+        )
     }
 }
 

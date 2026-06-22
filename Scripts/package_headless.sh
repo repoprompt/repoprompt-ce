@@ -73,6 +73,10 @@ run /usr/bin/codesign --verify --strict --verbose=2 "$tmp_binary"
 run "$tmp_binary" --version
 run mv -f "$tmp_binary" "$TARGET_BINARY"
 tmp_binary=""
+run python3 "$CONTROL_PLANE_SCRIPTS_DIR/verify_tree_sitter_symbols.py" \
+	--binary "$TARGET_BINARY" \
+	--expect exact \
+	--label "Packaged RepoPrompt Headless"
 
 run python3 "$CONTROL_PLANE_SCRIPTS_DIR/headless_artifact_manifest.py" write \
 	--binary "$TARGET_BINARY" \

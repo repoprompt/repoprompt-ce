@@ -400,6 +400,25 @@ final class MCPAppRuntimeAdapterRegistry {
         return adapter
     }
 
+    func captureRuntimeFileToolSnapshot(
+        ticket: MCPRuntimeAdapterTicket
+    ) async -> MCPRuntimeFileToolSnapshot? {
+        guard let adapter = adapter(for: ticket),
+              let serverViewModel = adapter.serverViewModel
+        else { return nil }
+        let promptViewModel = adapter.windowState?.promptManager ?? serverViewModel.promptVM
+        let metadata = await serverViewModel.captureRequestMetadata()
+        let lookupContext = await serverViewModel.resolveFileToolLookupContext(from: metadata)
+        return MCPRuntimeFileToolSnapshot(
+            adapterTicket: ticket,
+            runtimeID: ticket.runtimeID,
+            sessionID: ticket.sessionID,
+            lookupContext: lookupContext,
+            filePathDisplay: promptViewModel.filePathDisplayOption,
+            codeMapsEnabled: !promptViewModel.codeMapsGloballyDisabled
+        )
+    }
+
     @discardableResult
     func beginClosing(runtimeID: WorkspaceRuntimeID) -> MCPRuntimeAdapterClosingResult {
         guard let entry = entriesByRuntimeID[runtimeID] else { return .notFound }

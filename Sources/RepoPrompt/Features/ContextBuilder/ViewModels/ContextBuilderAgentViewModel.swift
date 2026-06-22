@@ -3848,6 +3848,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
         reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         agentModeSessionID: UUID? = nil,
         agentModeRunID: UUID? = nil,
         chatName: String,
@@ -3892,7 +3893,8 @@ final class ContextBuilderAgentViewModel: ObservableObject {
                     promptText: prompt,
                     selection: selection,
                     lookupContext: lookupContext,
-                    reviewGitContext: reviewGitContext
+                    reviewGitContext: reviewGitContext,
+                    finalReviewAuthorization: finalReviewAuthorization
                 ),
                 model: model,
                 mode: mode,
@@ -4042,6 +4044,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
         reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
         gitScopeOverride: GitInclusion? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
         activityReporter: ContextBuilderMCPActivityReporter? = nil
@@ -4087,6 +4090,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             selection: selection,
             lookupContext: lookupContext,
             reviewGitContext: reviewGitContext,
+            finalReviewAuthorization: finalReviewAuthorization,
             agentModeSessionID: agentModeSessionID,
             agentModeRunID: agentModeRunID,
             chatName: chatNameForTab(tabID),

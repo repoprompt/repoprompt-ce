@@ -1,6 +1,5 @@
 import CryptoKit
 import Foundation
-import RepoPromptPOSIXSupport
 
 // MARK: - JJ Command Runner
 

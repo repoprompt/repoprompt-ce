@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
 
 /// Errors that can occur when publishing git diff artifacts
@@ -125,6 +126,7 @@ class PromptViewModel: ObservableObject {
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
     private(set) var promptFactualContextProvider: any PromptFactualContextProviding =
         UnavailablePromptFactualContextProvider()
+    private let workspaceSessionQuery: WorkspaceSessionQueryCapability
     @Published private(set) var factualContextUnavailableMessage: String?
 
     // MARK: - Compose Tabs
@@ -2031,7 +2033,8 @@ class PromptViewModel: ObservableObject {
         aiQueriesService: AIQueriesService? = nil,
         apiSettingsViewModel: APISettingsViewModel,
         windowID: Int,
-        settingsManager: SettingsManaging
+        settingsManager: SettingsManaging,
+        workspaceSessionQuery: WorkspaceSessionQueryCapability? = nil
     ) {
         self.fileManager = fileManager
         gitViewModel = GitViewModel(fileManager: fileManager)
@@ -2039,6 +2042,10 @@ class PromptViewModel: ObservableObject {
         self.apiSettingsViewModel = apiSettingsViewModel
         self.windowID = windowID
         self.settingsManager = settingsManager
+        self.workspaceSessionQuery = workspaceSessionQuery
+            ?? WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(
+                store: fileManager.workspaceFileContextStore
+            )
         codeMapsGloballyDisabled = GlobalSettingsStore.shared.globalCodeMapsDisabled()
 
         // Removed usage of workspaceManager to load an initial prompt
@@ -5607,6 +5614,7 @@ extension PromptViewModel {
                 cfg: cfg,
                 selection: selection,
                 store: workspaceFileContextStore,
+                authorizationCatalog: workspaceSessionQuery,
                 lookupContext: lookupContext,
                 factualProvider: promptFactualContextProvider,
                 filePathDisplay: filePathDisplayOption,
@@ -5616,6 +5624,59 @@ extension PromptViewModel {
                 selectedGitDiffLookupProfile: .uiAssisted,
                 includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
                 reviewGitContext: frozenReviewContext,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
+                },
+                completeGitDiffProvider: { [gitVM] in
+                    await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+                }
+            )
+        )
+    }
+
+    func preAssembleStrictPromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        sourceTabID: UUID,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> PromptContextPreAssemblyResult {
+        let effectiveBase: String? = switch reviewGitContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
+        let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(query: workspaceSessionQuery)
+        )
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return try await PromptContextPreAssemblyService.resolveStrict(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: selection,
+                store: workspaceFileContextStore,
+                authorizationCatalog: workspaceSessionQuery,
+                lookupContext: lookupContext,
+                factualProvider: promptFactualContextProvider,
+                filePathDisplay: filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .expandFolders,
+                selectedGitDiffLookupProfile: .uiAssisted,
+                reviewGitContext: reviewGitContext,
+                sourceTabID: sourceTabID,
+                finalReviewAuthorization: finalReviewAuthorization,
+                sessionQuery: workspaceSessionQuery,
                 selectedGitDiffProvider: { request in
                     #if DEBUG
                         if let automaticReviewGitDiffProviderOverrideForTesting {

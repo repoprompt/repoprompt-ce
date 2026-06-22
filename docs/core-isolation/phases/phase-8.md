@@ -1,11 +1,16 @@
 # Phase 8 — Independently packaged standalone headless v1
 
 **Implementation base:** `5f0dab77874a240b23cf3cc72d256c47c55c17b2`
+**Committed checkpoint:** `8046078ffe59f4130dc38dbecbb31b3485c9f735`
 **Execution date:** 2026-06-22
 **Frozen contract:** [`../contracts/headless-v1.md`](../contracts/headless-v1.md)
 **Identity decision:** [`../decisions/ADR-002-headless-version-and-transport-identity.md`](../decisions/ADR-002-headless-version-and-transport-identity.md)
 **Historical implementation seed:** reviewed `21b5603f5a333454aee899dd39ff38d860a5b716`; current contracts override its stale version and unversioned state path.
-**Disposition:** **GO — all Phase 8 close gates passed; changes remain uncommitted**
+**Disposition:** **GO — all Phase 8 close gates passed and were committed at `8046078f`**
+
+Post-close publication hardening is tracked separately in
+[`../publication-remediation-2026-06-22.md`](../publication-remediation-2026-06-22.md).
+It does not rewrite this phase's execution history or begin Phase 9 convergence.
 
 ## Scope and non-goals
 

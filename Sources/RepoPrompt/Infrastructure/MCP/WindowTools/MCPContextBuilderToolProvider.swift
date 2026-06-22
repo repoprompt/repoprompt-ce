@@ -218,9 +218,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         guard let initialResultTab = targetWindow.workspaceManager.composeTab(for: resolvedIdentity) else {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
-        try await workspaceContext?.validateReviewTargetAvailability(
-            store: dependencies.workspaceFileContextStore
-        )
+        try await workspaceContext?.validateReviewTargetAvailability()
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -389,11 +387,17 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             )
                         )
                     }
-                    guard let canonicalTab = canonicalState.0,
-                          canonicalState.1 >= committedTab.selectionRevision,
-                          canonicalState.1 != committedTab.selectionRevision ||
-                          canonicalTab.selection == committedTab.tab.selection
-                    else {
+                    let committedSnapshotIsCurrent: Bool = if responseType == .review {
+                        canonicalState.1 == committedTab.selectionRevision
+                            && canonicalState.0?.selection == committedTab.tab.selection
+                    } else {
+                        canonicalState.1 >= committedTab.selectionRevision
+                            && (
+                                canonicalState.1 != committedTab.selectionRevision
+                                    || canonicalState.0?.selection == committedTab.tab.selection
+                            )
+                    }
+                    guard committedSnapshotIsCurrent else {
                         throw MCPError.internalError(
                             "Context Builder committed tab snapshot is no longer valid"
                         )
@@ -447,6 +451,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     throw MCPError.internalError(message)
                 case let .generate(mode):
                     try Task.checkCancellation()
+                    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
                     if mode == .review, let workspaceContext {
                         guard case .completed = snapshot.terminalDisposition,
                               let committedTab = snapshot.committedTab
@@ -455,13 +460,35 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 "Context Builder review requires an exact completed selection snapshot"
                             )
                         }
-                        try await workspaceContext.validateFinalReviewSelection(
+
+                        await dependencies.beforeContextBuilderFinalReviewAuthorization()
+                        let preAuthorizationCanonical = await MainActor.run {
+                            () -> (ComposeTabState?, UInt64) in
+                            let manager = targetWindow.workspaceManager
+                            return (
+                                manager.composeTab(for: committedTab.identity),
+                                manager.selectionRevisionForMCP(
+                                    workspaceID: committedTab.identity.workspaceID,
+                                    tabID: committedTab.identity.tabID
+                                )
+                            )
+                        }
+                        guard preAuthorizationCanonical.1 == committedTab.selectionRevision,
+                              preAuthorizationCanonical.0?.selection == sel
+                        else {
+                            throw MCPError.invalidParams(
+                                "Context Builder review selection changed before final repository authorization."
+                            )
+                        }
+
+                        let authorization = try await workspaceContext.authorizeFinalReviewSelection(
                             sel,
                             workspaceID: committedTab.identity.workspaceID,
                             tabID: committedTab.identity.tabID,
-                            selectionRevision: committedTab.selectionRevision,
-                            store: dependencies.workspaceFileContextStore
+                            selectionRevision: committedTab.selectionRevision
                         )
+                        await dependencies.didFinalizeContextBuilderReview(authorization)
+
                         let finalCanonical = await MainActor.run { () -> (ComposeTabState?, UInt64) in
                             let manager = targetWindow.workspaceManager
                             return (
@@ -476,9 +503,18 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                               finalCanonical.0?.selection == sel
                         else {
                             throw MCPError.invalidParams(
-                                "Context Builder review selection changed after the frozen repository target was validated."
+                                "Context Builder review selection changed after final repository authorization."
                             )
                         }
+                        finalReviewAuthorization = authorization
+                    } else {
+                        finalReviewAuthorization = nil
+                    }
+
+                    if mode == .review, workspaceContext != nil, finalReviewAuthorization == nil {
+                        throw MCPError.internalError(
+                            "Context Builder review final authorization was not retained"
+                        )
                     }
 
                     let modeLabel = responseType?.generationLabel ?? "question"
@@ -507,6 +543,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                                 sel,
                                 lookupContext,
                                 tabResolution.reviewGitContext,
+                                finalReviewAuthorization,
                                 progressReporter,
                                 activityReporter
                             )

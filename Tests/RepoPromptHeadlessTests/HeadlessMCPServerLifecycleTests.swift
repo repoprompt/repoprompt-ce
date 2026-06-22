@@ -252,7 +252,7 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
         )
         await gate.release()
 
-        let response = try responseObject(await task.value)
+        let response = try await responseObject(task.value)
         XCTAssertNil(response["error"])
         let result = try XCTUnwrap(response["result"] as? [String: Any])
         XCTAssertEqual(result["committed"] as? Bool, true)
@@ -350,6 +350,78 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
         )
         let cancelled = await active.value
         XCTAssertEqual(try errorCode(cancelled), -32800)
+    }
+
+    func testToolsListCorruptConfigurationFailsClosedWithoutLeakingPath() async throws {
+        let fixture = try makeFixture()
+        try await makeReady(fixture.server)
+        try HeadlessStateFileSecurity.writePrivateFile(
+            Data("{".utf8),
+            to: fixture.store.paths.configFile,
+            stateRoot: fixture.store.paths.rootDirectory
+        )
+
+        try await assertToolsListConfigurationFailure(fixture)
+    }
+
+    func testToolsListUnsupportedSchemaFailsClosedWithoutLeakingDetails() async throws {
+        let fixture = try makeFixture()
+        _ = try fixture.store.loadOrCreate()
+        try await makeReady(fixture.server)
+
+        let data = try Data(contentsOf: fixture.store.paths.configFile)
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object["schema_version"] = HeadlessConfigurationDocument.currentSchemaVersion + 1
+        let unsupportedSchemaData = try JSONSerialization.data(withJSONObject: object)
+        try HeadlessStateFileSecurity.writePrivateFile(
+            unsupportedSchemaData,
+            to: fixture.store.paths.configFile,
+            stateRoot: fixture.store.paths.rootDirectory
+        )
+
+        try await assertToolsListConfigurationFailure(fixture)
+    }
+
+    func testToolsListInsecureConfigurationFileFailsClosedWithoutFollowingSymlink() async throws {
+        let fixture = try makeFixture()
+        try fixture.store.paths.ensureBaseDirectories()
+        try await makeReady(fixture.server)
+
+        let outside = fixture.store.paths.rootDirectory
+            .deletingLastPathComponent()
+            .appendingPathComponent("outside-config-\(UUID().uuidString).json")
+        let sentinel = Data("outside-secret-sentinel".utf8)
+        try sentinel.write(to: outside)
+        defer { try? FileManager.default.removeItem(at: outside) }
+        try? FileManager.default.removeItem(at: fixture.store.paths.configFile)
+        try FileManager.default.createSymbolicLink(
+            atPath: fixture.store.paths.configFile.path,
+            withDestinationPath: outside.path
+        )
+
+        try await assertToolsListConfigurationFailure(
+            fixture,
+            forbiddenResponseFragments: ["outside-secret-sentinel"]
+        )
+        XCTAssertEqual(try Data(contentsOf: outside), sentinel)
+    }
+
+    func testToolsListUnreadableConfigurationFileFailsClosedWithoutLeakingPath() async throws {
+        let fixture = try makeFixture()
+        _ = try fixture.store.loadOrCreate()
+        try await makeReady(fixture.server)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: fixture.store.paths.configFile.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: fixture.store.paths.configFile.path
+            )
+        }
+
+        try await assertToolsListConfigurationFailure(fixture)
     }
 
     func testUnexpectedRegistryFailureUsesJSONRPCInternalError() async throws {
@@ -466,6 +538,36 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
     private func errorCode(_ action: HeadlessRPCAction) throws -> Int {
         let error = try XCTUnwrap(try responseObject(action)["error"] as? [String: Any])
         return try XCTUnwrap(error["code"] as? Int)
+    }
+
+    private func assertToolsListConfigurationFailure(
+        _ fixture: Fixture,
+        forbiddenResponseFragments: [String] = [],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let action = try await fixture.server.handle(frame: request("tools/list", id: 91))
+        let response = try responseObject(action)
+        XCTAssertNil(response["result"], file: file, line: line)
+        let error = try XCTUnwrap(response["error"] as? [String: Any], file: file, line: line)
+        XCTAssertEqual(error["code"] as? Int, -32603, file: file, line: line)
+        XCTAssertEqual(
+            error["message"] as? String,
+            HeadlessMCPServer.toolsListConfigurationErrorMessage,
+            file: file,
+            line: line
+        )
+        let responseText = try XCTUnwrap(
+            action.responseData.flatMap { String(data: $0, encoding: .utf8) },
+            file: file,
+            line: line
+        )
+        for fragment in [
+            fixture.store.paths.rootDirectory.path,
+            fixture.store.paths.configFile.path
+        ] + forbiddenResponseFragments {
+            XCTAssertFalse(responseText.contains(fragment), file: file, line: line)
+        }
     }
 
     private func assertError(

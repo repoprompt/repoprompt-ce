@@ -89,6 +89,68 @@ private actor WorkspaceSessionStoreLifecycleStorage {
 }
 
 enum WorkspaceSessionStoreLifecycleFactory {
+    static func makeQueryCapability(store: WorkspaceFileContextStore) -> WorkspaceSessionQueryCapability {
+        WorkspaceSessionQueryCapability(
+            roots: { await store.roots() },
+            rootScopeAvailability: { scope in await store.rootScopeAvailability(scope) },
+            catalogGeneration: { scope in await store.catalogGeneration(rootScope: scope) },
+            catalogDiagnostics: { scope in await store.catalogDiagnostics(rootScope: scope) },
+            searchCatalogAccess: { scope, requirement in
+                await store.searchCatalogAccess(rootScope: scope, requirement: requirement)
+            },
+            lookupPath: { request in await store.lookupPath(request) },
+            exactRootRef: { path, kind in await store.exactRootRef(path: path, kind: kind) },
+            validateSessionRootAuthorization: { authorization in
+                await store.validateSessionRootAuthorization(authorization)
+            },
+            resolveContextBuilderSelectionCandidate: { path, authorization, folderPolicy in
+                try await store.resolveContextBuilderSelectionCandidate(
+                    path: path,
+                    authorization: authorization,
+                    folderPolicy: folderPolicy
+                )
+            },
+            exactCatalogFile: { path, root, kind in
+                await store.exactCatalogFile(
+                    absolutePath: path,
+                    expectedRoot: root,
+                    expectedKind: kind
+                )
+            },
+            readExactCatalogFile: { file, root in
+                await store.readExactCatalogFile(file, expectedRoot: root)
+            },
+            rootRefs: { scope in await store.rootRefs(scope: scope) },
+            resolveSelectedGitDiffPaths: { selection, scope, folderPolicy, profile, allowFallback, excluded in
+                await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
+                    for: selection,
+                    store: store,
+                    rootScope: scope,
+                    folderPolicy: folderPolicy,
+                    profile: profile,
+                    allowFilesystemFallback: allowFallback,
+                    excluding: excluded
+                )
+            },
+            awaitAppliedIngress: { scope in
+                _ = await store.awaitAppliedIngress(rootScope: scope)
+            },
+            exactPathResolutionIssue: { path, kind, scope in
+                await store.exactPathResolutionIssue(for: path, kind: kind, rootScope: scope)
+            },
+            codemapSnapshotBundle: { scope in
+                await store.codemapSnapshotBundle(rootScope: scope)
+            },
+            fileTreeSnapshot: { selection, request, profile in
+                await store.makeFileTreeSelectionSnapshot(
+                    selection: selection,
+                    request: request,
+                    profile: profile
+                )
+            }
+        )
+    }
+
     static func make(
         store: WorkspaceFileContextStore,
         configuration: @escaping @Sendable () async -> WorkspaceSessionRootLoadConfiguration = {
@@ -99,16 +161,7 @@ enum WorkspaceSessionStoreLifecycleFactory {
             store: store,
             configuration: configuration
         )
-        let query = WorkspaceSessionQueryCapability(
-            roots: { await store.roots() },
-            rootScopeAvailability: { scope in await store.rootScopeAvailability(scope) },
-            catalogGeneration: { scope in await store.catalogGeneration(rootScope: scope) },
-            catalogDiagnostics: { scope in await store.catalogDiagnostics(rootScope: scope) },
-            searchCatalogAccess: { scope, requirement in
-                await store.searchCatalogAccess(rootScope: scope, requirement: requirement)
-            },
-            lookupPath: { request in await store.lookupPath(request) }
-        )
+        let query = makeQueryCapability(store: store)
         return WorkspaceSessionLifecycleOwner(
             query: query,
             hydrate: { workspace, generation in

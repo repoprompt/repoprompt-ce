@@ -65,6 +65,7 @@ conductor-selftest:
 release-selftest:
 	python3 Scripts/test_release_promotion.py
 	python3 Scripts/test_release_tooling.py
+	python3 Scripts/test_tree_sitter_symbols.py
 
 release-sync-cli-version:
 	./Scripts/release.sh sync-cli-version

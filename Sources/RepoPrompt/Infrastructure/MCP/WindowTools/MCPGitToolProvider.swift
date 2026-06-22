@@ -461,7 +461,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 requestsArtifactPublication: requestsArtifactPublication,
                 operation: contextBuilderOperation,
                 allRepositories: allRepos,
-                store: dependencies.workspaceFileContextStore
+                query: dependencies.workspaceSessionQuery
             )
         } catch let error as MCPContextBuilderGitReviewPolicyError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -585,12 +585,15 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
             try Task.checkCancellation()
             if let publicationFence = contextBuilderAdmission.publicationFence {
+                guard let workspaceSessionQuery = dependencies.workspaceSessionQuery else {
+                    throw MCPError.invalidParams("Git artifact publication requires the active Core workspace session.")
+                }
                 do {
                     try await contextBuilderPolicy.validatePublishedOutcomes(
                         publishedOutcomes,
                         publishedArtifactSetCount: publishedSets.count,
                         fence: publicationFence,
-                        store: dependencies.workspaceFileContextStore
+                        query: workspaceSessionQuery
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = []

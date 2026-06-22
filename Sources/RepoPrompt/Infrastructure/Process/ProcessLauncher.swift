@@ -1,7 +1,6 @@
 import Foundation
 import RepoPromptCore
 import RepoPromptCoreMacOS
-import RepoPromptPOSIXSupport
 
 enum ProcessLauncherError: Error {
     case pipeCreationFailed(String)

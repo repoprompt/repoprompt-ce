@@ -1,7 +1,6 @@
 import Combine
 import Darwin
 import Foundation
-import RepoPromptPOSIXSupport
 import RepoPromptShared
 
 /// Monitors the MCP events directory for error events written by external CLI clients.

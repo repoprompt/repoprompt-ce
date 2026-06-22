@@ -118,17 +118,68 @@ final class MCPRuntimeLifecycleTests: XCTestCase {
         XCTAssertEqual(lifecycleSnapshot?.activeAdmissionCount, 0)
     }
 
+    func testRuntimeCapableAdmissionDoesNotConsultWeakAdapterAfterCoreAdmission() async throws {
+        let lifecycle = WorkspaceRuntimeLifecycleRegistry()
+        let adapters = MCPAppRuntimeAdapterRegistry()
+        let hook = RuntimeAdmissionHook()
+        let runtimeID = WorkspaceRuntimeID()
+        let sessionID = WorkspaceSessionID()
+        let activationID = UUID()
+        let handle = makeHandle(
+            sessionID: sessionID,
+            activationID: activationID,
+            shutdown: RuntimeShutdownProbe(),
+            onAdmit: { await hook.run() }
+        )
+        _ = await lifecycle.register(runtimeID: runtimeID, sessionHandle: handle)
+        _ = await lifecycle.activate(
+            runtimeID: runtimeID,
+            initialAdmission: Self.admission(sessionID: sessionID, activationID: activationID)
+        )
+
+        let adapter = MCPWindowRuntimeAdapter(windowState: nil, serverViewModel: nil)
+        guard case let .staged(ticket) = adapters.stage(
+            windowID: 12,
+            runtimeID: runtimeID,
+            sessionID: sessionID,
+            authoritativeSnapshot: snapshot(sessionID: sessionID),
+            adapter: adapter
+        ) else { return XCTFail("mapping did not stage") }
+        _ = adapters.activate(ticket: ticket)
+        let routing = try XCTUnwrap(adapters.routingSnapshot(windowID: 12))
+        await hook.install {
+            await MainActor.run {
+                _ = adapters.beginClosing(ticket: ticket)
+            }
+        }
+
+        guard case let .success(lease) = await MCPRuntimeRequestCoordinator.admit(
+            routingSnapshot: routing,
+            lifetimeClass: .runtimeCapable,
+            lifecycleRegistry: lifecycle,
+            adapterRegistry: adapters
+        ) else { return XCTFail("runtime admission reconsulted the closed adapter") }
+        let context = await lease.context
+        XCTAssertEqual(context.runtimeID, runtimeID)
+        XCTAssertNil(adapters.adapter(for: ticket))
+        _ = await lease.release()
+    }
+
     private func makeHandle(
         sessionID: WorkspaceSessionID,
         activationID: UUID,
         currentSnapshot: WorkspaceSessionSnapshot? = nil,
-        shutdown: RuntimeShutdownProbe
+        shutdown: RuntimeShutdownProbe,
+        onAdmit: @escaping @Sendable () async -> Void = {}
     ) -> WorkspaceRuntimeSessionHandle {
         WorkspaceRuntimeSessionHandle(
             sessionID: sessionID,
             query: Self.emptyQuery(),
             currentSnapshot: { currentSnapshot },
-            admit: { .admitted(Self.admission(sessionID: sessionID, activationID: activationID)) },
+            admit: {
+                await onAdmit()
+                return .admitted(Self.admission(sessionID: sessionID, activationID: activationID))
+            },
             execute: { _ in .notReady(.active) },
             shutdown: { await shutdown.increment() }
         )
@@ -200,6 +251,18 @@ private actor RuntimeShutdownProbe {
 
     func value() -> Int {
         count
+    }
+}
+
+private actor RuntimeAdmissionHook {
+    private var operation: (@Sendable () async -> Void)?
+
+    func install(_ operation: @escaping @Sendable () async -> Void) {
+        self.operation = operation
+    }
+
+    func run() async {
+        await operation?()
     }
 }
 

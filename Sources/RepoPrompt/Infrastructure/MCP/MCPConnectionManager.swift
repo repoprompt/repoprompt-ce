@@ -9,7 +9,6 @@ import MCP
 import Ontology
 import OSLog
 import RepoPromptCore
-import RepoPromptPOSIXSupport
 import RepoPromptShared
 import SwiftUI
 

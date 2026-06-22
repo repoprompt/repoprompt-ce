@@ -378,6 +378,10 @@ final class MCPServerViewModel: ObservableObject {
         var requestMetadataOverrideForTesting: RequestMetadata?
         var agentRunDispatchOverrideForTesting: AgentExternalMCPRunStarter.DispatchInstruction?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+        private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
+            MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
+        private var contextBuilderDidFinalizeReviewForTesting:
+            MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
         private var contextBuilderSelectionReplyObserverForTesting: ((
             StoredSelection,
             WorkspaceLookupContext?,
@@ -422,6 +426,14 @@ final class MCPServerViewModel: ObservableObject {
             _ override: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         ) {
             contextBuilderFollowUpOverrideForTesting = override
+        }
+
+        func setContextBuilderFinalReviewAuthorizationHooksForTesting(
+            before: MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?,
+            after: MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
+        ) {
+            contextBuilderBeforeFinalReviewAuthorizationForTesting = before
+            contextBuilderDidFinalizeReviewForTesting = after
         }
 
         func setContextBuilderSelectionReplyObserverForTesting(
@@ -987,6 +999,7 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private var runtimePublicationReady: Bool
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
 
     /// Controls whether the approval overlay is visible
     @Published var isApprovalOverlayVisible: Bool = false
@@ -1136,7 +1149,19 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, progressReporter, activityReporter in
+        beforeContextBuilderFinalReviewAuthorization: { [weak self] in
+            #if DEBUG
+                await self?.contextBuilderBeforeFinalReviewAuthorizationForTesting?()
+            #endif
+        },
+        didFinalizeContextBuilderReview: { [weak self] authorization in
+            #if DEBUG
+                await self?.contextBuilderDidFinalizeReviewForTesting?(authorization)
+            #else
+                _ = authorization
+            #endif
+        },
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -1150,6 +1175,7 @@ final class MCPServerViewModel: ObservableObject {
                         selection,
                         lookupContext,
                         reviewGitContext,
+                        finalReviewAuthorization,
                         progressReporter,
                         activityReporter
                     )
@@ -1165,6 +1191,7 @@ final class MCPServerViewModel: ObservableObject {
                 selection: selection,
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext,
+                finalReviewAuthorization: finalReviewAuthorization,
                 progressReporter: progressReporter,
                 activityReporter: activityReporter
             )
@@ -1174,6 +1201,7 @@ final class MCPServerViewModel: ObservableObject {
         workspaceManager: { [weak workspaceManager] in workspaceManager },
         selectionCoordinator: { [weak selectionCoordinator] in selectionCoordinator },
         workspaceFileContextStore: promptVM.workspaceFileContextStore,
+        workspaceSessionQuery: workspaceSessionQuery,
         applyEditsApprovalStore: applyEditsApprovalStore,
         captureRequestMetadata: { [weak self] in
             guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
@@ -2344,6 +2372,7 @@ final class MCPServerViewModel: ObservableObject {
         windowID: Int,
         runtimeID: WorkspaceRuntimeID = WorkspaceRuntimeID(),
         runtimePublicationInitiallyReady: Bool = true,
+        workspaceSessionQuery: WorkspaceSessionQueryCapability? = nil,
         workspaceSearch: @escaping WorkspaceSearchHandler,
         ensureGitDataRootLoaded: @escaping (
             WorkspaceModel,
@@ -2355,6 +2384,10 @@ final class MCPServerViewModel: ObservableObject {
         self.windowID = windowID
         self.runtimeID = runtimeID
         runtimePublicationReady = runtimePublicationInitiallyReady
+        self.workspaceSessionQuery = workspaceSessionQuery
+            ?? WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(
+                store: promptVM.workspaceFileContextStore
+            )
         self.promptVM = promptVM
         self.oracleVM = oracleVM
         self.workspaceManager = workspaceManager
@@ -3469,11 +3502,15 @@ final class MCPServerViewModel: ObservableObject {
                     throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
                 }
                 do {
+                    guard let sessionQuery = targetWindow.mcpServer.workspaceSessionQuery else {
+                        throw MCPError.invalidParams("context_builder requires the active Core workspace session.")
+                    }
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
                         workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
-                        store: targetWindow.promptManager.workspaceFileContextStore
+                        store: targetWindow.promptManager.workspaceFileContextStore,
+                        sessionQuery: sessionQuery
                     )
                 } catch {
                     throw MCPError.invalidParams(error.localizedDescription)

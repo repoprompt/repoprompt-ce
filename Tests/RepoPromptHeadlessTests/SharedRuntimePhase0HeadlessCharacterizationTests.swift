@@ -115,7 +115,7 @@ final class SharedRuntimePhase0HeadlessCharacterizationTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            registry.listDescriptors().compactMap { $0["name"] as? String },
+            try registry.listDescriptors().compactMap { $0["name"] as? String },
             Self.overlappingToolNames
         )
         for (toolName, capability) in HeadlessToolRegistry.blockedCapabilities {

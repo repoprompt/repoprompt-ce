@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct ContextBuilderWorkspaceContext {
     let parentAgentSessionID: UUID
@@ -8,6 +9,8 @@ struct ContextBuilderWorkspaceContext {
     let providerWorkspacePath: String
     let reviewGitContext: FrozenPromptGitReviewContext
     let reviewTargetResolution: ContextBuilderReviewTargetResolution
+    private let sessionQuery: WorkspaceSessionQueryCapability
+    private let reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink?
 
     var tabID: UUID {
         frozenTabContext.tabID
@@ -17,7 +20,9 @@ struct ContextBuilderWorkspaceContext {
         from snapshot: MCPServerViewModel.TabContextSnapshot,
         workspaceRepoPaths: [String],
         workspaceDirectoryPath: String,
-        store: WorkspaceFileContextStore
+        store: WorkspaceFileContextStore,
+        sessionQuery: WorkspaceSessionQueryCapability,
+        reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink? = nil
     ) async throws -> ContextBuilderWorkspaceContext {
         guard let parentAgentSessionID = snapshot.activeAgentSessionID else {
             throw ContextBuilderWorkspaceContextError.missingParentAgentSession
@@ -75,7 +80,9 @@ struct ContextBuilderWorkspaceContext {
             base: "HEAD",
             store: store
         )
-        let reviewTargetResolution = await ContextBuilderReviewTargetResolver().resolve(
+        let reviewTargetResolution = try await ContextBuilderReviewTargetResolver(
+            diagnosticSink: reviewDiagnosticSink
+        ).resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: snapshot.tabID,
@@ -84,7 +91,7 @@ struct ContextBuilderWorkspaceContext {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext
             ),
-            store: store
+            query: sessionQuery
         )
 
         let providerWorkspacePath: String
@@ -114,7 +121,9 @@ struct ContextBuilderWorkspaceContext {
             lookupContext: lookupContext,
             providerWorkspacePath: StandardizedPath.absolute(providerWorkspacePath),
             reviewGitContext: reviewGitContext,
-            reviewTargetResolution: reviewTargetResolution
+            reviewTargetResolution: reviewTargetResolution,
+            sessionQuery: sessionQuery,
+            reviewDiagnosticSink: reviewDiagnosticSink
         )
         try context.validateAvailability()
         return context
@@ -134,25 +143,22 @@ struct ContextBuilderWorkspaceContext {
         }
     }
 
-    func validateReviewTargetAvailability(store: WorkspaceFileContextStore) async throws {
+    func validateReviewTargetAvailability() async throws {
         guard case let .available(target) = reviewTargetResolution else { return }
-        if let reason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store) {
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(target, query: sessionQuery) {
             throw reason
         }
     }
 
-    func validateFinalReviewSelection(
+    func authorizeFinalReviewSelection(
         _ selection: StoredSelection,
         workspaceID: UUID,
         tabID: UUID,
-        selectionRevision: UInt64,
-        store: WorkspaceFileContextStore
-    ) async throws {
-        guard case let .available(target) = reviewTargetResolution else {
-            if case let .unavailable(reason) = reviewTargetResolution { throw reason }
-            throw ContextBuilderReviewTargetUnavailableReason.missingFrozenTarget
-        }
-        if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
+        selectionRevision: UInt64
+    ) async throws -> ContextBuilderFinalReviewAuthorization {
+        try await ContextBuilderReviewTargetResolver(
+            diagnosticSink: reviewDiagnosticSink
+        ).finalizeSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,
@@ -161,11 +167,9 @@ struct ContextBuilderWorkspaceContext {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext
             ),
-            frozenTarget: target,
-            store: store
-        ) {
-            throw reason
-        }
+            initialResolution: reviewTargetResolution,
+            query: sessionQuery
+        )
     }
 
     func nestedDiscoveryTabContext(runID: UUID) -> MCPServerViewModel.TabContextSnapshot {

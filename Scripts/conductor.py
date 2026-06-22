@@ -1191,7 +1191,7 @@ class OperationRegistry:
             config = str(args.get("configuration") or "debug")
             return [script("install_headless.sh"), "install", "--configuration", config], ["headlessArtifact"], cwd, env, effective_timeout
         if operation == "headless-status":
-            return [script("install_headless.sh"), "status"], [], cwd, env, effective_timeout
+            return [script("install_headless.sh"), "status"], ["headlessArtifact"], cwd, env, effective_timeout
         if operation == "headless-uninstall":
             config = str(args.get("configuration") or "debug")
             argv = [script("install_headless.sh"), "uninstall", "--configuration", config]
@@ -3569,6 +3569,38 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 def operation_swift_build_all(repo_root: Path) -> int:
     for product in SWIFT_BUILD_PRODUCTS:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+        if code != 0:
+            return code
+    code, stdout, _stderr = run_operation_command(
+        "swift build --show-bin-path",
+        ["swift", "build", "--show-bin-path"],
+        repo_root,
+    )
+    if code != 0:
+        return code
+    bin_dir = Path(stdout.strip())
+    verifier = repo_root / "Scripts" / "verify_tree_sitter_symbols.py"
+    validations = (
+        ("RepoPrompt", "exact", "Conductor RepoPrompt app"),
+        ("repoprompt-headless", "exact", "Conductor RepoPrompt Headless"),
+        ("repoprompt-mcp", "absent", "Conductor repoprompt-mcp proxy"),
+    )
+    for binary_name, expectation, label in validations:
+        argv = [
+            sys.executable,
+            str(verifier),
+            "--binary",
+            str(bin_dir / binary_name),
+            "--expect",
+            expectation,
+            "--label",
+            label,
+        ]
+        code, _stdout, _stderr = run_operation_command(
+            f"verify linked Tree-sitter symbols in {binary_name}",
+            argv,
+            repo_root,
+        )
         if code != 0:
             return code
     return 0

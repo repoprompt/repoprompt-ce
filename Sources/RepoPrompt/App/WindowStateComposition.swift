@@ -167,7 +167,8 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            workspaceSessionQuery: workspaceSessionQuery
         )
         promptManager.attachPromptFactualContextProvider(
             runtimeBootstrap?.factualProvider ?? UnavailablePromptFactualContextProvider()
@@ -245,6 +246,7 @@ enum WindowStateCompositionFactory {
             windowID: windowID,
             runtimeID: mcpCatalogRuntimeID,
             runtimePublicationInitiallyReady: workspaceRuntimeID == nil,
+            workspaceSessionQuery: workspaceSessionQuery,
             workspaceSearch: { [store = workspaceFileContextStore, weak workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
                 guard let workspaceManager else {
                     throw MCPError.internalError("The original window UI is no longer available for file_search; the request was not retargeted.")

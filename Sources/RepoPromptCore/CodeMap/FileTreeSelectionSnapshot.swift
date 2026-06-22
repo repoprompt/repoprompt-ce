@@ -31,6 +31,21 @@ package struct FileTreeSelectionSnapshot {
     }
 }
 
+package extension FileTreeSelectionSnapshot {
+    static func empty(request: WorkspaceFileTreeSnapshotRequest) -> FileTreeSelectionSnapshot {
+        FileTreeSelectionSnapshot(
+            roots: [],
+            selectedFileIDs: [],
+            mode: request.mode.rawValue,
+            showFullPaths: request.filePathDisplay == .full,
+            onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+            includeLegend: request.includeLegend,
+            showCodeMapMarkers: request.showCodeMapMarkers,
+            maxDepth: request.maxDepth
+        )
+    }
+}
+
 package struct FileTreeFolderSnapshot: Hashable {
     package let id: UUID
     package let name: String

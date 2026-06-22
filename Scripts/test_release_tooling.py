@@ -292,17 +292,30 @@ if [[ "$1" == "-archs" ]]; then
     cat "$2"
     exit 0
 fi
+input="${1:-}"
 output=""
 while (( $# )); do
     if [[ "$1" == "-output" ]]; then output="$2"; shift 2; else shift; fi
 done
+if [[ -n "$input" && "$input" != "-create" ]]; then
+    cp "$input" "$output"
+    exit 0
+fi
 printf 'arm64 x86_64\\n' > "$output"
 """,
             encoding="utf-8",
         )
+        nm = tools / "nm"
+        valid_nm = (SCRIPT_DIR / "Fixtures" / "tree-sitter-symbols" / "valid.nm").read_text(encoding="utf-8")
+        nm.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "[[ \"$*\" == *repoprompt-mcp* ]] && exit 0\n"
+            "cat <<'EOF'\n" + valid_nm + "EOF\n",
+            encoding="utf-8",
+        )
         ditto = tools / "ditto"
         ditto.write_text("#!/usr/bin/env bash\nset -euo pipefail\ncp -R \"$1\" \"$2\"\n", encoding="utf-8")
-        for tool in (wrapper, patch, comparator, lipo, ditto):
+        for tool in (wrapper, patch, comparator, lipo, nm, ditto):
             tool.chmod(0o755)
 
         env = os.environ.copy()
@@ -316,6 +329,7 @@ printf 'arm64 x86_64\\n' > "$output"
                 "REPOPROMPT_SWIFTPM_RESOURCE_COMPARATOR": str(comparator),
                 "PATCH_LOG": str(patch_log),
                 "LIPO": str(lipo),
+                "NM": str(nm),
             }
         )
         result = subprocess.run(
@@ -1055,6 +1069,7 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertLess(signed_smoke.index("shasum -a 256 -c"), signed_smoke.index("ditto -x -k"))
         self.assertIn("validate_embedded_mcp_helper_layout.sh", signed_smoke)
         self.assertIn("validate_app_architectures.sh", signed_smoke)
+        self.assertIn("verify_tree_sitter_symbols.py", signed_smoke)
         self.assertIn("write_app_artifact_manifest.py verify", signed_smoke)
         self.assertIn("smoke_packaged_mcp_roundtrip.sh", signed_smoke)
         self.assertIn('"extracted/RepoPrompt CE.app"', signed_smoke)
@@ -1070,6 +1085,7 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn("reviewed_checksums_sha256", reviewed_smoke)
         self.assertIn("validate_embedded_mcp_helper_layout.sh", reviewed_smoke)
         self.assertIn("validate_app_architectures.sh", reviewed_smoke)
+        self.assertIn("verify_tree_sitter_symbols.py", reviewed_smoke)
         self.assertIn("write_app_artifact_manifest.py verify", reviewed_smoke)
         self.assertIn("smoke_packaged_mcp_roundtrip.sh", reviewed_smoke)
         self.assertIn('"extracted/RepoPrompt CE.app"', reviewed_smoke)
@@ -1895,6 +1911,7 @@ extension Data {
             "validate_packaged_legal.sh",
             "validate_required_swiftpm_resource_bundles.sh",
             "validate_staged_release.sh",
+            "verify_tree_sitter_symbols.py",
         ):
             shutil.copy2(SCRIPT_DIR / name, scripts / name)
             scripts.joinpath(name).chmod(0o755)
@@ -1954,8 +1971,32 @@ SIGNING_TEAM_ID=648A27MST5
         )
         (staged / "RELEASE_COMMIT").write_text("fixture-release-commit\n", encoding="utf-8")
         fake_lipo = scripts / "fake-lipo"
-        fake_lipo.write_text("#!/usr/bin/env bash\nprintf 'arm64 x86_64\\n'\n", encoding="utf-8")
+        fake_lipo.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "-archs" ]]; then
+    printf 'arm64 x86_64\n'
+    exit 0
+fi
+input="$1"
+output=""
+while (( $# )); do
+    if [[ "$1" == "-output" ]]; then output="$2"; shift 2; else shift; fi
+done
+cp "$input" "$output"
+""",
+            encoding="utf-8",
+        )
         fake_lipo.chmod(0o755)
+        fake_nm = scripts / "fake-nm"
+        valid_nm = (SCRIPT_DIR / "Fixtures" / "tree-sitter-symbols" / "valid.nm").read_text(encoding="utf-8")
+        fake_nm.write_text(
+            "#!/usr/bin/env bash\nset -euo pipefail\n"
+            "[[ \"$*\" == *repoprompt-mcp* ]] && exit 0\n"
+            "cat <<'EOF'\n" + valid_nm + "EOF\n",
+            encoding="utf-8",
+        )
+        fake_nm.chmod(0o755)
         fake_codesign = scripts / "fake-codesign"
         fake_codesign.write_text(
             """#!/usr/bin/env bash
@@ -2007,6 +2048,7 @@ esac
                 "REPOPROMPT_APPROVED_SOURCE_ROOT": str(approved),
                 "REPOPROMPT_RELEASE_SOURCE_ROOT": str(staged),
                 "LIPO": str(scripts / "fake-lipo"),
+                "NM": str(scripts / "fake-nm"),
                 "CODESIGN": str(scripts / "fake-codesign"),
             }
         )

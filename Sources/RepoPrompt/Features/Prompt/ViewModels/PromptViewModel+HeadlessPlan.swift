@@ -29,18 +29,23 @@ struct HeadlessContextSnapshot {
     /// Frozen artifact authority, comparison intent, and logical checkout labels.
     let reviewGitContext: FrozenPromptGitReviewContext
 
+    /// Exact final review authorization. Nil for plan/chat and non-Context-Builder review.
+    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
+
     init(
         tabID: UUID,
         promptText: String,
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil,
-        reviewGitContext: FrozenPromptGitReviewContext
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) {
         self.tabID = tabID
         self.promptText = promptText
         self.selection = selection
         self.lookupContext = lookupContext
         self.reviewGitContext = reviewGitContext
+        self.finalReviewAuthorization = finalReviewAuthorization
     }
 }
 
@@ -74,16 +79,29 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
-        let outcome = await preAssemblePromptContext(
-            cfg: headlessConfig,
-            selection: snapshot.selection,
-            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
-            reviewGitContext: snapshot.reviewGitContext
-        )
-        let preAssembly: PromptContextPreAssemblyResult = switch outcome {
-        case let .ready(result): result
-        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
-        case .cancelled: throw PromptFactualPackagingError.cancelled
+        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
+        let preAssembly: PromptContextPreAssemblyResult
+        if let authorization = snapshot.finalReviewAuthorization {
+            preAssembly = try await preAssembleStrictPromptContext(
+                cfg: headlessConfig,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                sourceTabID: snapshot.tabID,
+                reviewGitContext: snapshot.reviewGitContext,
+                finalReviewAuthorization: authorization
+            )
+        } else {
+            let outcome = await preAssemblePromptContext(
+                cfg: headlessConfig,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: snapshot.reviewGitContext
+            )
+            preAssembly = switch outcome {
+            case let .ready(result): result
+            case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+            case .cancelled: throw PromptFactualPackagingError.cancelled
+            }
         }
 
         // Core already rendered the exact factual generation with logical paths.

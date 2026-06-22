@@ -63,8 +63,8 @@ final class HeadlessToolRegistry {
         self.configurationStore = configurationStore
     }
 
-    func listDescriptors() -> [HeadlessJSONObject] {
-        guard let permissions = try? configurationStore.loadOrCreate().permissions else { return [] }
+    func listDescriptors() throws -> [HeadlessJSONObject] {
+        let permissions = try configurationStore.loadOrCreate().permissions
         return Self.registrations
             .filter { $0.capability.isEnabled(by: permissions) }
             .map { descriptor(for: $0.name).json }

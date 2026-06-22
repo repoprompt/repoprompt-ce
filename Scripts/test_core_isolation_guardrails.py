@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,9 +54,6 @@ def valid_package() -> dict[str, object]:
                     dependency(("target", "RepoPromptShared", "")),
                     dependency(("target", "RepoPromptCore", "")),
                     dependency(("target", "RepoPromptCoreMacOS", "")),
-                    dependency(("target", "RepoPromptPOSIXSupport", "")),
-                    dependency(("target", "RepoPromptSyntaxCBridge", "")),
-                    dependency(("target", "RepoPromptC", "")),
                     dependency(("target", "Sparkle", "")),
                 ],
             },
@@ -139,6 +137,16 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             (root / TARGET_PATHS["RepoPromptCore"] / "Forbidden.swift").write_text("import SwiftUI\n")
             errors = validate_sources(root)
             self.assertTrue(any("imports forbidden module SwiftUI" in error for error in errors))
+
+    def test_direct_app_implementation_imports_are_rejected(self) -> None:
+        for module in ("RepoPromptC", "RepoPromptPOSIXSupport", "RepoPromptSyntaxCBridge"):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                self._write_minimal_sources(root)
+                leaked = root / "Sources/RepoPrompt/DirectImplementationLeak.swift"
+                leaked.write_text(f"import {module}\n")
+                errors = validate_sources(root)
+                self.assertTrue(any(module in error and "forbidden direct app imports" in error for error in errors))
 
     def test_attributed_forbidden_core_import_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -247,6 +255,55 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             leaked.parent.mkdir(parents=True, exist_ok=True)
             leaked.write_text("let service: VCSService\n")
             self.assertTrue(any("must not discover or carry Git authority" in error for error in validate_sources(root)))
+
+    def test_phase_six_factual_result_path_property_fixtures(self) -> None:
+        fixture_path = Path(__file__).parent / "Fixtures/core-isolation-guardrails/prompt_factual_path_properties.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        for declaration in fixture["declarations"]:
+            for token in fixture["forbidden_property_tokens"]:
+                with self.subTest(declaration=declaration, token=token):
+                    with tempfile.TemporaryDirectory() as temporary:
+                        root = Path(temporary)
+                        self._write_minimal_sources(root)
+                        models = root / "Sources/RepoPromptCore/WorkspaceContext/Prompt/PromptFactualContextModels.swift"
+                        models.parent.mkdir(parents=True, exist_ok=True)
+                        models.write_text(
+                            f"package struct {declaration} {{\n"
+                            f"    package let leaked{token}Value: String\n"
+                            "}\n",
+                            encoding="utf-8",
+                        )
+                        errors = validate_sources(root)
+                        self.assertIn(
+                            f"{declaration} must not expose physical path properties",
+                            errors,
+                        )
+
+    def test_phase_six_factual_result_logical_display_fixture_passes(self) -> None:
+        fixture_path = Path(__file__).parent / "Fixtures/core-isolation-guardrails/prompt_factual_path_properties.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            models = root / "Sources/RepoPromptCore/WorkspaceContext/Prompt/PromptFactualContextModels.swift"
+            models.parent.mkdir(parents=True, exist_ok=True)
+            models.write_text(
+                "\n".join(
+                    f"package struct {declaration} {{\n"
+                    + "\n".join(
+                        f"    package let {property_name}: String"
+                        for property_name in fixture["safe_property_names"]
+                    )
+                    + "\n}"
+                    for declaration in fixture["declarations"]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            errors = validate_sources(root)
+            self.assertFalse(any("must not expose physical path properties" in error for error in errors))
 
     def test_phase_six_headless_factual_provider_construction_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

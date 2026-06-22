@@ -6,6 +6,49 @@ extension MCPServerViewModel {
         case alreadyAwaited
     }
 
+    struct CanonicalSelectionReadSnapshot: Equatable {
+        let selection: StoredSelection
+        let selectionRevision: UInt64
+    }
+
+    enum StabilizedSelectionReadSnapshotError: LocalizedError, Equatable {
+        case canonicalTabUnavailable(workspaceID: UUID?, tabID: UUID)
+
+        var errorDescription: String? {
+            switch self {
+            case let .canonicalTabUnavailable(workspaceID, tabID):
+                let workspace = workspaceID?.uuidString ?? "unknown"
+                return "Canonical selection is unavailable for workspace \(workspace), tab \(tabID.uuidString). Rebind the tab context and retry."
+            }
+        }
+    }
+
+    @MainActor
+    private func canonicalSelectionReadSnapshot(
+        for context: TabScopedContext
+    ) -> CanonicalSelectionReadSnapshot? {
+        guard let manager = workspaceManager else { return nil }
+
+        let identity: WorkspaceSelectionIdentity
+        if let workspaceID = context.workspaceID {
+            identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        } else {
+            guard let workspace = manager.workspaces.first(where: { workspace in
+                workspace.composeTabs.contains(where: { $0.id == context.tabID })
+            }) else { return nil }
+            identity = WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: context.tabID)
+        }
+
+        guard let selection = manager.composeTab(for: identity)?.selection else { return nil }
+        return CanonicalSelectionReadSnapshot(
+            selection: selection,
+            selectionRevision: manager.selectionRevisionForMCP(
+                workspaceID: identity.workspaceID,
+                tabID: identity.tabID
+            )
+        )
+    }
+
     @MainActor
     func stabilizedVirtualSelection(for context: TabScopedContext) async -> StoredSelection {
         await stabilizedVirtualContext(for: context).selection
@@ -15,28 +58,28 @@ extension MCPServerViewModel {
     func stabilizedVirtualContext(for context: TabScopedContext) async -> TabScopedContext {
         // For any tab-bound virtual context (including runs), prefer latest stored tab selection.
         // This prevents resurrecting stale slices from the run snapshot after the user clears them.
-        guard let manager = workspaceManager else { return context }
+        guard let canonical = canonicalSelectionReadSnapshot(for: context) else { return context }
         var stabilized = context
-        if let workspaceID = context.workspaceID {
-            let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
-            guard let selection = manager.composeTab(for: identity)?.selection else { return context }
-            stabilized.selection = selection
-            stabilized.selectionRevision = manager.selectionRevisionForMCP(
-                workspaceID: workspaceID,
-                tabID: context.tabID
+        stabilized.selection = canonical.selection
+        stabilized.selectionRevision = canonical.selectionRevision
+        return stabilized
+    }
+
+    @MainActor
+    func stabilizedSelectionReadSnapshot(
+        _ resolved: ResolvedTabContextSnapshot
+    ) throws -> ResolvedTabContextSnapshot {
+        guard !resolved.usesActiveTabCompatibility else { return resolved }
+        guard let canonical = canonicalSelectionReadSnapshot(for: resolved.snapshot) else {
+            throw StabilizedSelectionReadSnapshotError.canonicalTabUnavailable(
+                workspaceID: resolved.snapshot.workspaceID,
+                tabID: resolved.snapshot.tabID
             )
-            return stabilized
         }
-        guard let workspace = manager.workspaces.first(where: { workspace in
-            workspace.composeTabs.contains(where: { $0.id == context.tabID })
-        }),
-            let selection = manager.composeTab(with: context.tabID)?.selection
-        else { return context }
-        stabilized.selection = selection
-        stabilized.selectionRevision = manager.selectionRevisionForMCP(
-            workspaceID: workspace.id,
-            tabID: context.tabID
-        )
+
+        var stabilized = resolved
+        stabilized.snapshot.selection = canonical.selection
+        stabilized.snapshot.selectionRevision = canonical.selectionRevision
         return stabilized
     }
 

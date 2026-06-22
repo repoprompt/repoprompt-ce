@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 enum MCPContextBuilderGitReviewOperation: String {
     case status, diff, log, show, blame
@@ -22,6 +23,7 @@ struct MCPContextBuilderGitPublishedOutcome {
 }
 
 enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
+    case targetDeferred
     case targetUnavailable(ContextBuilderReviewTargetUnavailableReason)
     case publicationOutsideFrozenTarget
     case implicitMultiRepositoryOperation
@@ -32,6 +34,8 @@ enum MCPContextBuilderGitReviewPolicyError: Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .targetDeferred:
+            "Context Builder review target election is deferred until discovery commits its final selection."
         case let .targetUnavailable(reason):
             reason.localizedDescription
         case .publicationOutsideFrozenTarget:
@@ -57,7 +61,7 @@ struct MCPContextBuilderGitReviewPolicy {
         requestsArtifactPublication: Bool,
         operation: MCPContextBuilderGitReviewOperation,
         allRepositories: [GitRepoDescriptor],
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability?
     ) async throws -> MCPContextBuilderGitReviewAdmission {
         guard let resolution else {
             return MCPContextBuilderGitReviewAdmission(
@@ -67,17 +71,30 @@ struct MCPContextBuilderGitReviewPolicy {
                 publicationFence: nil
             )
         }
+        guard let query else {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.staleWorkspaceRoot)
+        }
 
         let target: ContextBuilderReviewTarget
         switch resolution {
         case let .available(availableTarget):
             if let reason = await ContextBuilderReviewTargetResolver().revalidate(
                 availableTarget,
-                store: store
+                query: query
             ) {
                 throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
             }
             target = availableTarget
+        case .deferred:
+            guard hasExplicitSelector, !requestsArtifactPublication else {
+                throw MCPContextBuilderGitReviewPolicyError.targetDeferred
+            }
+            return MCPContextBuilderGitReviewAdmission(
+                target: nil,
+                implicitRepositories: nil,
+                preferredDefaultRepository: nil,
+                publicationFence: nil
+            )
         case let .unavailable(reason):
             guard hasExplicitSelector, !requestsArtifactPublication else {
                 throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
@@ -127,7 +144,7 @@ struct MCPContextBuilderGitReviewPolicy {
         _ outcomes: [MCPContextBuilderGitPublishedOutcome],
         publishedArtifactSetCount: Int,
         fence: MCPContextBuilderGitPublicationFence,
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async throws {
         var matchedTargets: [ContextBuilderReviewCheckoutTarget] = []
         for outcome in outcomes {
@@ -153,7 +170,7 @@ struct MCPContextBuilderGitReviewPolicy {
         guard Set(matchedTargets.map(\.identityKey)).count == matchedTargets.count else {
             throw MCPContextBuilderGitReviewPolicyError.publishedCheckoutMismatch
         }
-        if let reason = await ContextBuilderReviewTargetResolver().revalidate(fence.target, store: store) {
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(fence.target, query: query) {
             throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
         }
     }

@@ -1,6 +1,5 @@
 import RepoPromptCore
 import RepoPromptCoreMacOS
-import RepoPromptPOSIXSupport
 
 // Phase 2 temporary compatibility aliases.
 // Concrete implementations are owned by RepoPromptCore; these names preserve app call sites
@@ -10,10 +9,10 @@ import RepoPromptPOSIXSupport
 
 typealias FileContentFingerprint = RepoPromptCore.FileContentFingerprint
 typealias SpawnedProcess = RepoPromptCore.SpawnedProcess
-typealias POSIXDescriptorSupport = RepoPromptPOSIXSupport.POSIXDescriptorSupport
-typealias POSIXDescriptorConfigurationError = RepoPromptPOSIXSupport.POSIXDescriptorConfigurationError
-typealias FDWriteSupport = RepoPromptPOSIXSupport.FDWriteSupport
-typealias FDWriteError = RepoPromptPOSIXSupport.FDWriteError
+typealias POSIXDescriptorSupport = RepoPromptCoreMacOS.PlatformDescriptorPolicy
+typealias POSIXDescriptorConfigurationError = RepoPromptCoreMacOS.PlatformDescriptorConfigurationError
+typealias FDWriteSupport = RepoPromptCoreMacOS.PlatformFDWriter
+typealias FDWriteError = RepoPromptCoreMacOS.PlatformFDWriteError
 typealias FileSystemWatchEventID = RepoPromptCore.FileSystemWatchEventID
 typealias FileSystemWatchEventFlags = RepoPromptCore.FileSystemWatchEventFlags
 typealias FileSystemWatchEvent = RepoPromptCore.FileSystemWatchEvent

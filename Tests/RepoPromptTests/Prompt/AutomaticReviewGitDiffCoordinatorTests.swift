@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+import RepoPromptCore
 import XCTest
 
 final class AutomaticReviewGitDiffCoordinatorTests: XCTestCase {
@@ -391,6 +392,118 @@ final class AutomaticReviewGitDiffCoordinatorTests: XCTestCase {
         }
     }
 
+    func testFinalizedAuthorityBypassesOwnershipRediscoveryAndKeepsSameRelativePathsSeparate() async throws {
+        let rootA = URL(fileURLWithPath: "/tmp/review-finalized/alpha", isDirectory: true)
+        let rootB = URL(fileURLWithPath: "/tmp/review-finalized/beta", isDirectory: true)
+        let pathA = rootA.appendingPathComponent("Sources/App.swift").path
+        let pathB = rootB.appendingPathComponent("Sources/App.swift").path
+        let authorization = finalizedAuthorization(
+            rootsAndPaths: [(rootA, [pathA]), (rootB, [pathB])]
+        )
+        let recorder = ReviewGitCoordinatorRecorder()
+        let dependencies = AutomaticReviewGitDiffCoordinator.Dependencies(
+            resolveRepo: { _ in
+                XCTFail("Finalized requests must not rediscover selected-path ownership")
+                return nil
+            },
+            resolveLayout: { _ in
+                XCTFail("Finalized requests must not rediscover checkout layout through ownership")
+                return nil
+            },
+            resolveHead: { root in "head-\(root.lastPathComponent)" },
+            resolveRef: { _, _ in "unused" },
+            mergeBase: { _, _, _ in "unused" },
+            buildDiff: { _, paths, root in
+                await recorder.record("diff:\(root.lastPathComponent):\(paths.joined(separator: ","))")
+                return "diff \(root.lastPathComponent)"
+            },
+            revalidateFinalAuthorization: { _ in nil }
+        )
+
+        let result = try await AutomaticReviewGitDiffCoordinator(dependencies: dependencies)
+            .resolveStrict(finalizedRequest(authorization))
+
+        XCTAssertEqual(result.completeness, .complete)
+        XCTAssertEqual(result.outcomes.map(\.checkout.selectedPaths), [[pathA], [pathB]])
+        let snapshot = await recorder.snapshot()
+        XCTAssertEqual(
+            snapshot.events,
+            ["diff:alpha:\(pathA)", "diff:beta:\(pathB)"]
+        )
+    }
+
+    func testFinalizedAuthorityInvalidatedAfterBaseResolutionNeverRunsDiff() async {
+        let root = URL(fileURLWithPath: "/tmp/review-finalized/base-race", isDirectory: true)
+        let path = root.appendingPathComponent("Feature.swift").path
+        let authorization = finalizedAuthorization(rootsAndPaths: [(root, [path])])
+        let validity = FinalAuthorizationValidity()
+        let dependencies = AutomaticReviewGitDiffCoordinator.Dependencies(
+            resolveRepo: { _ in XCTFail("Ownership rediscovery is forbidden")
+                return nil
+            },
+            resolveLayout: { _ in XCTFail("Ownership rediscovery is forbidden")
+                return nil
+            },
+            resolveHead: { _ in
+                await validity.invalidate()
+                return "head"
+            },
+            resolveRef: { _, _ in "unused" },
+            mergeBase: { _, _, _ in "unused" },
+            buildDiff: { _, _, _ in XCTFail("Diff must not run after authority expires")
+                return "forbidden"
+            },
+            revalidateFinalAuthorization: { _ in
+                await validity.failure()
+            }
+        )
+
+        do {
+            _ = try await AutomaticReviewGitDiffCoordinator(dependencies: dependencies)
+                .resolveStrict(finalizedRequest(authorization))
+            XCTFail("Expected stale finalized authority")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .staleWorkspaceRoot)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
+    func testFinalizedAuthorityInvalidatedDuringDiffDiscardsReturnedPayload() async {
+        let root = URL(fileURLWithPath: "/tmp/review-finalized/diff-race", isDirectory: true)
+        let path = root.appendingPathComponent("Feature.swift").path
+        let authorization = finalizedAuthorization(rootsAndPaths: [(root, [path])])
+        let validity = FinalAuthorizationValidity()
+        let dependencies = AutomaticReviewGitDiffCoordinator.Dependencies(
+            resolveRepo: { _ in XCTFail("Ownership rediscovery is forbidden")
+                return nil
+            },
+            resolveLayout: { _ in XCTFail("Ownership rediscovery is forbidden")
+                return nil
+            },
+            resolveHead: { _ in "head" },
+            resolveRef: { _, _ in "unused" },
+            mergeBase: { _, _, _ in "unused" },
+            buildDiff: { _, _, _ in
+                await validity.invalidate()
+                return "late unauthorized payload"
+            },
+            revalidateFinalAuthorization: { _ in
+                await validity.failure()
+            }
+        )
+
+        do {
+            _ = try await AutomaticReviewGitDiffCoordinator(dependencies: dependencies)
+                .resolveStrict(finalizedRequest(authorization))
+            XCTFail("Expected stale finalized authority")
+        } catch let reason as ContextBuilderReviewTargetUnavailableReason {
+            XCTAssertEqual(reason, .staleWorkspaceRoot)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+    }
+
     private func request(
         paths: [String],
         unresolved: [String] = [],
@@ -412,6 +525,79 @@ final class AutomaticReviewGitDiffCoordinatorTests: XCTestCase {
             logicalRootPath: "/logical/\(name)",
             logicalRootName: name,
             physicalRootPath: physicalRoot.path
+        )
+    }
+
+    private func finalizedRequest(
+        _ authorization: ContextBuilderFinalReviewAuthorization
+    ) -> AutomaticReviewGitDiffRequest {
+        AutomaticReviewGitDiffRequest(
+            finalReviewAuthorization: authorization,
+            compareIntent: .uncommittedHEAD,
+            displayContext: authorization.target.displayContext
+        )
+    }
+
+    private func finalizedAuthorization(
+        rootsAndPaths: [(URL, [String])]
+    ) -> ContextBuilderFinalReviewAuthorization {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let revision: UInt64 = 7
+        let displayRoots = rootsAndPaths.enumerated().map { index, item in
+            displayRoot(name: "Checkout \(index + 1)", physicalRoot: item.0)
+        }
+        let checkouts = rootsAndPaths.enumerated().map { index, item in
+            ContextBuilderReviewCheckoutTarget(
+                logicalWorkspaceRoot: WorkspaceRootRef(
+                    id: UUID(),
+                    name: "Checkout \(index + 1)",
+                    fullPath: "/logical/checkout-\(index + 1)"
+                ),
+                physicalWorkspaceRoot: WorkspaceRootRef(
+                    id: UUID(),
+                    name: item.0.lastPathComponent,
+                    fullPath: item.0.path
+                ),
+                physicalWorkspaceRootKind: .primaryWorkspace,
+                checkoutRootPath: item.0.path,
+                repoKey: "repo-\(index)",
+                repositoryID: "repository-\(index)",
+                worktreeID: "worktree-\(index)",
+                kind: .canonical,
+                sessionRootAuthorization: nil
+            )
+        }
+        let target = ContextBuilderReviewTarget(
+            workspaceID: workspaceID,
+            tabID: tabID,
+            sourceSelectionRevision: revision,
+            initialOrdinarySelectionIdentities: rootsAndPaths.flatMap(\.1),
+            initialSelectedArtifactIdentities: [],
+            checkouts: checkouts,
+            primaryCheckout: checkouts[0],
+            artifactCapability: nil,
+            displayContext: ReviewGitDisplayContext(roots: displayRoots)
+        )
+        return ContextBuilderFinalReviewAuthorization(
+            electionOrigin: .initiallyAvailable,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            committedSelectionRevision: revision,
+            committedSelection: StoredSelection(
+                selectedPaths: rootsAndPaths.flatMap(\.1),
+                codemapAutoEnabled: false
+            ),
+            lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
+            reviewGitContext: .automaticOnly(),
+            target: target,
+            checkoutAuthorizations: zip(checkouts, rootsAndPaths).map { checkout, item in
+                ContextBuilderFinalReviewCheckoutAuthorization(
+                    checkout: checkout,
+                    ordinaryPhysicalPaths: item.1
+                )
+            },
+            selectedArtifactAuthorizations: []
         )
     }
 }
@@ -460,6 +646,18 @@ private actor ReviewGitNonCooperativeGate {
     func release() {
         releaseContinuation?.resume()
         releaseContinuation = nil
+    }
+}
+
+private actor FinalAuthorizationValidity {
+    private var isValid = true
+
+    func invalidate() {
+        isValid = false
+    }
+
+    func failure() -> ContextBuilderReviewTargetUnavailableReason? {
+        isValid ? nil : .staleWorkspaceRoot
     }
 }
 

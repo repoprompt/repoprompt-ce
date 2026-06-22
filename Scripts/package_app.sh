@@ -301,6 +301,14 @@ REPOPROMPT_RELEASE_SOURCE_ROOT="$ROOT_DIR" \
 run cp -R "$SPARKLE_FRAMEWORK" "$APP_BUNDLE/Contents/Frameworks/"
 run install_name_tool -add_rpath @executable_path/../Frameworks "$APP_BUNDLE/Contents/MacOS/$APP_NAME" 2>/dev/null || true
 run "$CONTROL_PLANE_SCRIPTS_DIR/validate_app_architectures.sh" "$APP_BUNDLE" "$ARCHITECTURE_POLICY" "Pre-sign packaged app"
+run python3 "$CONTROL_PLANE_SCRIPTS_DIR/verify_tree_sitter_symbols.py" \
+    --binary "$APP_BUNDLE/Contents/MacOS/$APP_NAME" \
+    --expect exact \
+    --label "Packaged RepoPrompt app"
+run python3 "$CONTROL_PLANE_SCRIPTS_DIR/verify_tree_sitter_symbols.py" \
+    --binary "$APP_BUNDLE/Contents/MacOS/repoprompt-mcp" \
+    --expect absent \
+    --label "Packaged repoprompt-mcp proxy"
 
 phase "Signing app bundle"
 sign_path(){

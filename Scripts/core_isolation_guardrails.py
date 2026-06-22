@@ -76,15 +76,11 @@ EXPECTED_DEPENDENCIES = {
 }
 
 EXPECTED_EXISTING_LOCAL_DEPENDENCIES = {
-    # Phase 3 uses explicit platform/POSIX/syntax modules. RepoPromptC remains
-    # until the Phase 4 engine move because app-owned ignore/search policy still calls it.
+    # C, POSIX, and syntax implementation edges terminate in Core/CoreMacOS.
     "RepoPrompt": {
         "RepoPromptShared",
         "RepoPromptCore",
         "RepoPromptCoreMacOS",
-        "RepoPromptPOSIXSupport",
-        "RepoPromptSyntaxCBridge",
-        "RepoPromptC",
         "Sparkle",
     },
     "RepoPromptMCP": {"RepoPromptShared", "RepoPromptPOSIXSupport"},
@@ -95,7 +91,7 @@ ALLOWED_IMPORTS = {
         "Foundation",
         "Dispatch",
         "CryptoKit",
-        "RepoPromptC",
+        "RepoPromptC", "RepoPromptPOSIXSupport", "RepoPromptSyntaxCBridge",
         "CSwiftPCRE2",
         "RepoPromptSyntaxCBridge",
         "SwiftTreeSitter",
@@ -611,7 +607,7 @@ def validate_sources(root: Path) -> list[str]:
     if factual_models.is_file():
         text = factual_models.read_text(encoding="utf-8")
         presentation_blocks = re.findall(
-            r"package struct (PromptFactualRenderedSections|PromptFactualEntrySummary|PromptFactualContextSnapshot)\\b.*?\\n}",
+            r"package struct (PromptFactualRenderedSections|PromptFactualEntrySummary|PromptFactualContextSnapshot)\b.*?\n}",
             text,
             re.DOTALL,
         )
@@ -622,7 +618,7 @@ def validate_sources(root: Path) -> list[str]:
             start = text.find(marker)
             end = text.find("\n}", start)
             declaration = text[start:end]
-            if re.search(r"package let \\w*(physical|absolute|worktree|fullPath)\\w*", declaration, re.IGNORECASE):
+            if re.search(r"package let \w*(physical|absolute|worktree|fullPath)\w*", declaration, re.IGNORECASE):
                 errors.append(f"{block} must not expose physical path properties")
 
     factual_provider_path = root / "Sources/RepoPrompt/App/CoreAdapters/PromptFactualContextProviding.swift"
@@ -748,7 +744,8 @@ def validate_sources(root: Path) -> list[str]:
         errors.append("Package.swift must not restore RepoPrompt bridging-header flags")
 
     forbidden_app_imports = {
-        "CoreServices", "Security", "Cuchardet", "UniversalCharsetDetection"
+        "CoreServices", "Security", "Cuchardet", "UniversalCharsetDetection",
+        "RepoPromptC", "RepoPromptPOSIXSupport", "RepoPromptSyntaxCBridge",
     }
     app_root = root / "Sources/RepoPrompt"
     for file in sorted(app_root.rglob("*.swift")):
@@ -756,7 +753,7 @@ def validate_sources(root: Path) -> list[str]:
         leaked = sorted(imported & forbidden_app_imports)
         if leaked:
             errors.append(
-                f"{file.relative_to(root)} retains Phase 3 platform imports {leaked}"
+                f"{file.relative_to(root)} retains forbidden direct app imports {leaked}"
             )
 
     if (root / "Sources/RepoPromptShared/MCP/POSIXDescriptorSupport.swift").exists():
@@ -812,6 +809,56 @@ def validate_sources(root: Path) -> list[str]:
     for symbol, locations in sorted(bridge_symbols.items()):
         if len(locations) != 1:
             errors.append(f"upstream symbol {symbol} must have one bridge declaration; found {locations}")
+
+    linked_symbol_verifier = root / "Scripts/verify_tree_sitter_symbols.py"
+    linked_symbol_test = root / "Scripts/test_tree_sitter_symbols.py"
+    linked_symbol_fixtures = root / "Scripts/Fixtures/tree-sitter-symbols"
+    if not linked_symbol_verifier.is_file():
+        errors.append("Scripts/verify_tree_sitter_symbols.py must continuously verify linked Tree-sitter ownership")
+    else:
+        verifier_text = linked_symbol_verifier.read_text(encoding="utf-8")
+        missing_verifier_symbols = sorted(
+            symbol for symbol in expected_tree_sitter_symbols if symbol not in verifier_text
+        )
+        if missing_verifier_symbols:
+            errors.append(
+                "linked Tree-sitter verifier is missing canonical symbols: "
+                f"{missing_verifier_symbols}"
+            )
+        for required_token in ("--expect", '"exact"', '"absent"', '"-gU"', '"-thin"'):
+            if required_token not in verifier_text:
+                errors.append(
+                    f"linked Tree-sitter verifier is missing required contract token {required_token}"
+                )
+    if not linked_symbol_test.is_file():
+        errors.append("linked Tree-sitter verifier must retain deterministic parser tests")
+    expected_linked_symbol_fixtures = {
+        "additional-scanner.nm", "duplicate.nm", "extra-parser.nm", "missing.nm", "proxy-empty.nm",
+        "undefined.nm", "valid.nm",
+    }
+    actual_linked_symbol_fixtures = {
+        path.name for path in linked_symbol_fixtures.glob("*.nm") if path.is_file()
+    }
+    if actual_linked_symbol_fixtures != expected_linked_symbol_fixtures:
+        errors.append(
+            "linked Tree-sitter parser fixtures drifted: expected "
+            f"{sorted(expected_linked_symbol_fixtures)}, got {sorted(actual_linked_symbol_fixtures)}"
+        )
+    linked_symbol_integrations = {
+        "Scripts/package_app.sh",
+        "Scripts/package_headless.sh",
+        "Scripts/verify_headless_package.sh",
+        "Scripts/build_swiftpm_release_products.sh",
+        "Scripts/validate_staged_release.sh",
+        "Scripts/conductor.py",
+        ".github/workflows/ci.yml",
+        ".github/workflows/release-promote.yml",
+        ".github/workflows/release.yml",
+    }
+    for relative in sorted(linked_symbol_integrations):
+        integration = root / relative
+        if not integration.is_file() or "verify_tree_sitter_symbols.py" not in integration.read_text(encoding="utf-8"):
+            errors.append(f"{relative} must run linked Tree-sitter symbol verification")
 
     package_script = root / "Scripts/package_app.sh"
     if package_script.is_file() and re.search(

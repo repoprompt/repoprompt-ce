@@ -29,7 +29,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             requestsArtifactPublication: false,
             operation: .diff,
             allRepositories: repositories,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertNil(generic.target)
         XCTAssertNil(generic.implicitRepositories)
@@ -49,7 +49,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             requestsArtifactPublication: true,
             operation: .diff,
             allRepositories: repositories,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertEqual(implicit.implicitRepositories?.map(\.rootPath), [ce.standardizedFileURL.path])
         XCTAssertEqual(implicit.preferredDefaultRepository?.rootPath, ce.standardizedFileURL.path)
@@ -68,7 +68,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             requestsArtifactPublication: false,
             operation: .show,
             allRepositories: repositories,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertNil(explicitInspection.implicitRepositories)
         XCTAssertNil(explicitInspection.publicationFence)
@@ -80,7 +80,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             requestsArtifactPublication: false,
             operation: .log,
             allRepositories: repositories,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertNil(unavailableInspection.target)
         await assertPolicyError(.targetUnavailable(.emptySelection)) {
@@ -90,7 +90,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 requestsArtifactPublication: false,
                 operation: .diff,
                 allRepositories: repositories,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.targetUnavailable(.emptySelection)) {
@@ -100,7 +100,43 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 requestsArtifactPublication: true,
                 operation: .diff,
                 allRepositories: repositories,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+            )
+        }
+
+        let deferred = try await resolveDeferred(
+            roots: [classic, ce],
+            workspaceDirectory: fixture.sandbox,
+            store: store
+        )
+        let deferredInspection = try await policy.admit(
+            resolution: deferred,
+            hasExplicitSelector: true,
+            requestsArtifactPublication: false,
+            operation: .show,
+            allRepositories: repositories,
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+        )
+        XCTAssertNil(deferredInspection.target)
+        XCTAssertNil(deferredInspection.publicationFence)
+        await assertPolicyError(.targetDeferred) {
+            _ = try await policy.admit(
+                resolution: deferred,
+                hasExplicitSelector: false,
+                requestsArtifactPublication: false,
+                operation: .diff,
+                allRepositories: repositories,
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+            )
+        }
+        await assertPolicyError(.targetDeferred) {
+            _ = try await policy.admit(
+                resolution: deferred,
+                hasExplicitSelector: true,
+                requestsArtifactPublication: true,
+                operation: .diff,
+                allRepositories: repositories,
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
 
@@ -117,7 +153,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 requestsArtifactPublication: false,
                 operation: operation,
                 allRepositories: repositories,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
             XCTAssertEqual(Set(admission.implicitRepositories?.map(\.rootPath) ?? []), Set(repositories.map(\.rootPath)))
         }
@@ -129,7 +165,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                     requestsArtifactPublication: false,
                     operation: operation,
                     allRepositories: repositories,
-                    store: store
+                    query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
                 )
             }
         }
@@ -143,7 +179,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 requestsArtifactPublication: false,
                 operation: .show,
                 allRepositories: repositories,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
     }
@@ -174,7 +210,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             requestsArtifactPublication: true,
             operation: .diff,
             allRepositories: [classicRepo, ceRepo],
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let fence = try XCTUnwrap(admission.publicationFence)
         let manifest = makeManifest(repo: ceRepo)
@@ -187,7 +223,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             [valid],
             publishedArtifactSetCount: 1,
             fence: fence,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
 
         await assertPolicyError(.incompletePublishedMetadata) {
@@ -199,7 +235,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.incompletePublishedMetadata) {
@@ -211,7 +247,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 0,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.publishedRepositoryMismatch) {
@@ -223,7 +259,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.publishedCheckoutMismatch) {
@@ -235,7 +271,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.publishedOutcomeMismatch) {
@@ -243,7 +279,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 [valid],
                 publishedArtifactSetCount: 2,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
         await assertPolicyError(.publishedCheckoutMismatch) {
@@ -251,7 +287,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 [valid, valid],
                 publishedArtifactSetCount: 2,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
 
@@ -262,7 +298,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 [valid],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
         }
     }
@@ -293,7 +329,7 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
             base: "HEAD",
             store: store
         )
-        let resolution = await ContextBuilderReviewTargetResolver().resolve(
+        let resolution = try await ContextBuilderReviewTargetResolver().resolve(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: tabID,
@@ -305,9 +341,52 @@ final class MCPContextBuilderGitReviewPolicyTests: XCTestCase {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewContext
             ),
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         _ = try XCTUnwrap(resolution.availableTarget)
+        return resolution
+    }
+
+    private func resolveDeferred(
+        roots: [URL],
+        workspaceDirectory: URL,
+        store: WorkspaceFileContextStore
+    ) async throws -> ContextBuilderReviewTargetResolution {
+        let workspaceID = UUID()
+        let tabID = UUID()
+        let rootPaths = roots.map(\.path)
+        let lookupContext = WorkspaceLookupContext(
+            rootScope: .sessionBoundWorkspace(
+                canonicalRootPaths: Set(rootPaths),
+                physicalRootPaths: []
+            ),
+            bindingProjection: nil
+        )
+        let reviewContext = await FrozenPromptGitReviewContext.make(
+            workspaceID: workspaceID,
+            workspaceDirectoryPath: workspaceDirectory.path,
+            workspaceRootPaths: rootPaths,
+            tabID: tabID,
+            sessionID: nil,
+            bindings: [],
+            base: "HEAD",
+            store: store
+        )
+        let resolution = try await ContextBuilderReviewTargetResolver().resolve(
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selectionRevision: 1,
+                selection: StoredSelection(codemapAutoEnabled: false),
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+        )
+        guard case .deferred = resolution else {
+            XCTFail("Expected empty review selection to defer")
+            return .unavailable(.emptySelection)
+        }
         return resolution
     }
 

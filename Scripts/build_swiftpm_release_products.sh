@@ -123,6 +123,14 @@ run "$LIPO" -create \
 run chmod +x "$staged_output/RepoPrompt" "$staged_output/repoprompt-mcp"
 require_exact_arch "$staged_output/RepoPrompt" "arm64,x86_64"
 require_exact_arch "$staged_output/repoprompt-mcp" "arm64,x86_64"
+run python3 "$SCRIPT_DIR/verify_tree_sitter_symbols.py" \
+    --binary "$staged_output/RepoPrompt" \
+    --expect exact \
+    --label "Universal release RepoPrompt"
+run python3 "$SCRIPT_DIR/verify_tree_sitter_symbols.py" \
+    --binary "$staged_output/repoprompt-mcp" \
+    --expect absent \
+    --label "Universal release repoprompt-mcp proxy"
 
 for resource in "$ARM64_BIN_DIR"/*.bundle "$ARM64_BIN_DIR/Sparkle.framework"; do
     [[ -e "$resource" ]] || continue

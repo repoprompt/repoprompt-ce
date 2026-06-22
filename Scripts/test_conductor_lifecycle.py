@@ -135,6 +135,10 @@ class LifecycleQueueTests(LifecycleTestCase):
             self.assertEqual(argv, [script("verify_headless_package.sh"), "debug"])
             self.assertEqual(lanes, ["headlessArtifact"])
 
+            argv, lanes, *_ = registry.prepare({"operation": "headless-status", "args": {}})
+            self.assertEqual(argv, [script("install_headless.sh"), "status"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
             argv, lanes, *_ = registry.prepare({"operation": "headless-smoke", "args": {"configuration": "debug", "skipPackage": True}})
             self.assertEqual(argv, [script("smoke_packaged_headless_roundtrip.sh"), "--configuration", "debug", "--skip-package"])
             self.assertEqual(lanes, ["headlessArtifact"])
@@ -143,8 +147,8 @@ class LifecycleQueueTests(LifecycleTestCase):
             self.assertEqual(argv, [script("install_headless.sh"), "uninstall", "--configuration", "debug", "--delete-state"])
             self.assertEqual(lanes, ["headlessArtifact"])
 
-    def test_swift_build_all_compiles_three_products_in_frozen_order(self) -> None:
-        completed = subprocess.CompletedProcess(["swift", "build"], 0, "", "")
+    def test_swift_build_all_compiles_three_products_then_verifies_linked_symbols(self) -> None:
+        completed = subprocess.CompletedProcess(["swift", "build"], 0, "/tmp/repoprompt-bin\n", "")
         with mock.patch.object(
             conductor.subprocess,
             "run",
@@ -153,12 +157,31 @@ class LifecycleQueueTests(LifecycleTestCase):
             self.assertEqual(conductor.operation_swift_build_all(Path.cwd()), 0)
 
         commands = [call.args[0] for call in run.call_args_list]
+        expected_commands = [
+            ["swift", "build", "--product", product]
+            for product in conductor.SWIFT_BUILD_PRODUCTS
+        ]
+        expected_commands.append(["swift", "build", "--show-bin-path"])
+        expected_commands.extend([
+            [
+                sys.executable,
+                str(Path.cwd() / "Scripts" / "verify_tree_sitter_symbols.py"),
+                "--binary",
+                f"/tmp/repoprompt-bin/{binary}",
+                "--expect",
+                expectation,
+                "--label",
+                label,
+            ]
+            for binary, expectation, label in (
+                ("RepoPrompt", "exact", "Conductor RepoPrompt app"),
+                ("repoprompt-headless", "exact", "Conductor RepoPrompt Headless"),
+                ("repoprompt-mcp", "absent", "Conductor repoprompt-mcp proxy"),
+            )
+        ])
         self.assertEqual(
             commands,
-            [
-                ["swift", "build", "--product", product]
-                for product in conductor.SWIFT_BUILD_PRODUCTS
-            ],
+            expected_commands,
         )
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:

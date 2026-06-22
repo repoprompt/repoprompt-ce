@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 
 extension MCPServerViewModel {
     nonisolated static let codeMapsGloballyDisabledMCPMessage = "Code Maps are globally disabled in Advanced Settings; codemap-only selection modes and get_code_structure are unavailable."
@@ -55,8 +56,12 @@ extension MCPServerViewModel {
     /// Returns selection-aware workspace records for the resolved tab context snapshot.
     @MainActor
     func selectedRecordsForCurrentTabContext() async throws -> [WorkspaceFileRecord] {
-        let collections = try await selectionCollectionsForCurrentTabContext()
-        return collections.selected.map(\.entry.file)
+        do {
+            let collections = try await selectionCollectionsForCurrentTabContext()
+            return collections.selected.map(\.entry.file)
+        } catch let error as StabilizedSelectionReadSnapshotError {
+            throw MCPError.invalidParams(error.localizedDescription)
+        }
     }
 
     /// Returns the identifiers of files selected in the resolved tab context snapshot.
@@ -103,7 +108,8 @@ extension MCPServerViewModel {
             toolName: "selection",
             policy: .allowLegacyImplicitRouting
         )
-        return await selectionCollections(for: resolved.snapshot)
+        let stabilized = try stabilizedSelectionReadSnapshot(resolved)
+        return await selectionCollections(for: stabilized.snapshot)
     }
 
     struct PathFormatter {

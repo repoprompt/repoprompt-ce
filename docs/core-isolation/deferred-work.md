@@ -80,3 +80,14 @@ not authorize Phase 9 work.
 - Converge remaining specialized selection/code-structure presentation adapters
   only after their external DTO contracts are characterized; do not reintroduce
   store-backed common prompt/export rendering.
+
+## Publication remediation confirmation (2026-06-22)
+
+- Phase 9 compatibility cleanup and headless/Core convergence remain deferred;
+  publication hardening is not authorization to begin either migration.
+- `RepoPrompt`, `repoprompt-mcp`, and `repoprompt-headless` retain distinct app,
+  compatibility-proxy, and direct-stdio identities, state, packaging, and smoke lanes.
+- Continuous linked Tree-sitter verification is a publication guard only. It does
+  not move grammar ownership, add bridge symbols, or broaden the target graph.
+- Any future convergence must begin from a new characterized plan and preserve
+  the Phase 0–8 checkpoints and this append-only deferral record.

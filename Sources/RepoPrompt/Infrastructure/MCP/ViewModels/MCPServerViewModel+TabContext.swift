@@ -2585,7 +2585,10 @@ extension MCPServerViewModel {
             compareIntent: .uncommittedHEAD,
             displayContext: target.displayContext
         )
-        if let reason = await ContextBuilderReviewTargetResolver().validateSelection(
+        guard let workspaceSessionQuery else {
+            throw ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot
+        }
+        _ = try await ContextBuilderReviewTargetResolver().finalizeSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
                 tabID: resolved.snapshot.tabID,
@@ -2594,11 +2597,9 @@ extension MCPServerViewModel {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewContext
             ),
-            frozenTarget: target,
-            store: promptVM.workspaceFileContextStore
-        ) {
-            throw reason
-        }
+            initialResolution: .available(target),
+            query: workspaceSessionQuery
+        )
     }
 
     /// Resolves and freezes the exact compose tab whose immutable review package will be

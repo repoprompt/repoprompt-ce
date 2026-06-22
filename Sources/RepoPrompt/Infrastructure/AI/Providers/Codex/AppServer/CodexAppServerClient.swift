@@ -1,7 +1,6 @@
 import Darwin
 import Darwin.POSIX.fcntl
 import Foundation
-import RepoPromptPOSIXSupport
 
 enum CodexJSONValue: Equatable {
     case string(String)

@@ -142,6 +142,180 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         XCTAssertGreaterThan(stabilized.selectionRevision, 0)
     }
 
+    func testSelectedRecordReadStabilizesCanonicalPairWithoutMutatingRunSnapshot() async throws {
+        let root = try makeTemporaryRoot(name: "SelectedRecordSnapshot")
+        defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+        let staleFile = root.appendingPathComponent("Stale.swift")
+        let fullFile = root.appendingPathComponent("FreshFull.swift")
+        let slicedFile = root.appendingPathComponent("FreshSlice.swift")
+        let codemapFile = root.appendingPathComponent("FreshCodemap.swift")
+        let laterFile = root.appendingPathComponent("Later.swift")
+        try write("struct Stale {}\n", to: staleFile)
+        try write("struct FreshFull {}\n", to: fullFile)
+        try write("struct FreshSlice {}\n", to: slicedFile)
+        try write("struct FreshCodemap {}\n", to: codemapFile)
+        try write("struct Later {}\n", to: laterFile)
+
+        let tabID = UUID()
+        let staleSelection = StoredSelection(
+            selectedPaths: [staleFile.path],
+            codemapAutoEnabled: false
+        )
+        let freshSelection = StoredSelection(
+            selectedPaths: [fullFile.path],
+            autoCodemapPaths: [codemapFile.path],
+            slices: [slicedFile.path: [LineRange(start: 1, end: 1)]],
+            codemapAutoEnabled: false
+        )
+        let laterSelection = StoredSelection(
+            selectedPaths: [laterFile.path],
+            codemapAutoEnabled: false
+        )
+        let (window, workspaceID) = await makeWindow(
+            root: root,
+            tabID: tabID,
+            selection: staleSelection
+        )
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+            in: window,
+            path: root.path
+        )
+
+        var staleContext = makeContext(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            selection: staleSelection
+        )
+        staleContext.selectionRevision = 0
+        let connectionID = UUID()
+        let clientName = "selection-read-snapshot"
+        window.mcpServer.tabContextByConnectionID[connectionID] = staleContext
+        window.mcpServer.windowIDByConnection[connectionID] = window.windowID
+        window.mcpServer.connectionIDToRunID[connectionID] = try XCTUnwrap(staleContext.runID)
+        window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+            connectionID: connectionID,
+            clientName: clientName,
+            windowID: window.windowID,
+            runPurpose: .agentModeRun
+        ))
+        defer { window.mcpServer.setRequestMetadataOverrideForTesting(nil) }
+
+        let selectionIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
+        _ = await window.selectionCoordinator.persistSelection(
+            freshSelection,
+            for: selectionIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+        let canonicalRevision = window.workspaceManager.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: tabID
+        )
+        XCTAssertGreaterThan(canonicalRevision, 0)
+
+        let collections = try await window.mcpServer.selectionCollectionsForCurrentTabContext()
+        XCTAssertEqual(
+            Set(collections.selected.map(\.entry.file.standardizedFullPath)),
+            Set([fullFile.standardizedFileURL.path, slicedFile.standardizedFileURL.path])
+        )
+        XCTAssertEqual(
+            collections.selected.first(where: {
+                $0.entry.file.standardizedFullPath == slicedFile.standardizedFileURL.path
+            })?.entry.lineRanges,
+            [LineRange(start: 1, end: 1)]
+        )
+        XCTAssertFalse(collections.selected.contains {
+            $0.entry.file.standardizedFullPath == codemapFile.standardizedFileURL.path
+        })
+        let selectedRecords = try await window.mcpServer.selectedRecordsForCurrentTabContext()
+        XCTAssertEqual(
+            Set(selectedRecords.map(\.standardizedFullPath)),
+            Set([fullFile.standardizedFileURL.path, slicedFile.standardizedFileURL.path])
+        )
+
+        let cachedContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+        XCTAssertEqual(cachedContext.selection, staleSelection)
+        XCTAssertEqual(cachedContext.selectionRevision, 0)
+        XCTAssertEqual(
+            window.workspaceManager.composeTab(with: tabID)?.selection,
+            freshSelection
+        )
+        XCTAssertEqual(
+            window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: tabID
+            ),
+            canonicalRevision
+        )
+
+        let captured = try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
+            snapshot: staleContext,
+            usesActiveTabCompatibility: false
+        ))
+        XCTAssertEqual(captured.snapshot.selection, freshSelection)
+        XCTAssertEqual(captured.snapshot.selectionRevision, canonicalRevision)
+        _ = await window.selectionCoordinator.persistSelection(
+            laterSelection,
+            for: selectionIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+
+        let capturedCollections = await window.mcpServer.selectionCollections(
+            for: captured.snapshot,
+            codeMapUsageOverride: .some(.none)
+        )
+        XCTAssertEqual(
+            Set(capturedCollections.selected.map(\.entry.file.standardizedFullPath)),
+            Set([fullFile.standardizedFileURL.path, slicedFile.standardizedFileURL.path])
+        )
+        XCTAssertFalse(capturedCollections.selected.contains {
+            $0.entry.file.standardizedFullPath == laterFile.standardizedFileURL.path
+        })
+
+        let compatibilitySnapshot = try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
+            snapshot: staleContext,
+            usesActiveTabCompatibility: true
+        ))
+        XCTAssertEqual(compatibilitySnapshot.snapshot.selection, staleSelection)
+        XCTAssertEqual(compatibilitySnapshot.snapshot.selectionRevision, 0)
+
+        let missingTabID = UUID()
+        var missingCanonicalContext = makeContext(
+            window: window,
+            workspaceID: workspaceID,
+            tabID: missingTabID,
+            selection: staleSelection
+        )
+        missingCanonicalContext.selectionRevision = 0
+        XCTAssertThrowsError(try window.mcpServer.stabilizedSelectionReadSnapshot(.init(
+            snapshot: missingCanonicalContext,
+            usesActiveTabCompatibility: false
+        ))) { error in
+            XCTAssertEqual(
+                error as? MCPServerViewModel.StabilizedSelectionReadSnapshotError,
+                .canonicalTabUnavailable(
+                    workspaceID: workspaceID,
+                    tabID: missingTabID
+                )
+            )
+        }
+        window.mcpServer.tabContextByConnectionID[connectionID] = missingCanonicalContext
+        window.mcpServer.connectionIDToRunID[connectionID] = try XCTUnwrap(missingCanonicalContext.runID)
+        do {
+            _ = try await window.mcpServer.selectedRecordsForCurrentTabContext()
+            XCTFail("Expected a missing canonical tab to fail closed")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("Invalid params"), String(describing: error))
+            XCTAssertTrue(
+                String(describing: error).contains("Canonical selection is unavailable"),
+                String(describing: error)
+            )
+        }
+    }
+
     func testAlreadyAwaitedRepliesKeepProviderResolvedLookupContext() async throws {
         let workspaceRoot = try makeTemporaryRoot(name: "Workspace")
         let worktreeRoot = try makeTemporaryRoot(name: "Worktree")
