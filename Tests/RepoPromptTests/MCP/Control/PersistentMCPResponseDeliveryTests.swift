@@ -248,6 +248,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         let initializeFrame = line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"resume-test","version":"1"}}}"#)
         let initializeResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"RepoPrompt CE","version":"test"}}}"#)
         let initializedFrame = line(#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
+        let coalescedBackendNotification = line(#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"resume-tail"}}"#)
 
         try Self.writeAll(initializeFrame, to: hostFD)
         XCTAssertEqual(try Self.readLine(from: firstAppFD, timeout: 2), initializeFrame)
@@ -294,7 +295,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
             )
         }
         XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializeFrame)
-        try Self.writeAll(initializeResponse, to: secondAppFD)
+        try Self.writeAll(initializeResponse + coalescedBackendNotification, to: secondAppFD)
         XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializedFrame)
         try await replayTask.value
 
@@ -315,6 +316,12 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
                 secondResult.store(.failure(error))
             }
         }
+
+        XCTAssertEqual(
+            try Self.readLine(from: hostFD, timeout: 2),
+            coalescedBackendNotification,
+            "Replay must not consume app frames coalesced after the initialize response"
+        )
 
         let toolRequest = line(#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#)
         let toolResponse = line(#"{"jsonrpc":"2.0","id":2,"result":{"tools":[]}}"#)

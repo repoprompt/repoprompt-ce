@@ -607,7 +607,7 @@ public actor JSONRPCBridgeLedger {
             throw JSONRPCBridgeLedgerError.terminal(terminalReason ?? "unknown")
         }
         guard active.isEmpty, pendingTransactions.isEmpty else {
-            throw failTerminal("reconnection_attempted_after_protocol_traffic")
+            throw failTerminal("reconnection_attempted_with_outstanding_work")
         }
         connectionGeneration &+= 1
         emit(phase: "connection_started", direction: nil, messages: [], prepared: nil, terminalReason: nil)

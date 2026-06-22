@@ -1219,7 +1219,6 @@ extension BootstrapSocketProxy {
         timeout: TimeInterval
     ) async throws {
         var buffer = Data()
-        var readBuffer = [UInt8](repeating: 0, count: 4096)
         let deadline = Date().addingTimeInterval(timeout)
 
         while Date() < deadline {
@@ -1241,8 +1240,9 @@ extension BootstrapSocketProxy {
                 throw SocketProxyError.connectionReset
             }
 
-            let bytesRead = readBuffer.withUnsafeMutableBufferPointer { ptr in
-                Darwin.read(socketFD, ptr.baseAddress!, ptr.count)
+            var byte: UInt8 = 0
+            let bytesRead = withUnsafeMutablePointer(to: &byte) { ptr in
+                Darwin.read(socketFD, ptr, 1)
             }
             if bytesRead < 0 {
                 if errno == EAGAIN || errno == EINTR { continue }
@@ -1252,9 +1252,9 @@ extension BootstrapSocketProxy {
                 throw SocketProxyError.serverClosed
             }
 
-            buffer.append(contentsOf: readBuffer[0 ..< bytesRead])
-            if let newline = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let frame = Data(buffer[...newline])
+            buffer.append(byte)
+            if byte == UInt8(ascii: "\n") {
+                let frame = buffer
                 guard let response = MCPInitializeReplayState.jsonObject(from: frame),
                       let responseID = MCPInitializeReplayState.jsonRPCID(from: response["id"]),
                       responseID == expectedID
