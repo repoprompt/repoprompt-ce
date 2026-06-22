@@ -22,6 +22,7 @@ final class AutoRecommendationEngine {
     // MARK: - Dependencies
 
     private let settingsStore: GlobalSettingsStore
+    private let profileSettingsManager: any SettingsManaging
     private(set) weak var apiSettingsViewModel: APISettingsViewModel?
 
     // MARK: - Constants
@@ -33,9 +34,11 @@ final class AutoRecommendationEngine {
 
     init(
         settingsStore: GlobalSettingsStore,
+        profileSettingsManager: any SettingsManaging,
         apiSettingsViewModel: APISettingsViewModel
     ) {
         self.settingsStore = settingsStore
+        self.profileSettingsManager = profileSettingsManager
         self.apiSettingsViewModel = apiSettingsViewModel
 
         // Ensure schema version is up to date on init
@@ -450,11 +453,13 @@ final class AutoRecommendationEngine {
     ) -> MCPAgentDefaultsRecommendation? {
         let availability = mcpAgentAvailabilityContext(from: actualStatus)
         let recommendedAvailability = mcpAgentAvailabilityContext(from: recommendedStatus)
+        let profileStore = AgentModelsProfileRoleDefaultsStore(
+            overrides: profile(for: scope).mcpAgentRoleOverrides
+        )
         let resolutions = MCPAgentRoleDefaultsService.resolutions(
             availability: availability,
             recommendedAvailability: recommendedAvailability,
-            workspaceID: scope.workspaceID,
-            settingsStore: settingsStore
+            settingsStore: profileStore
         )
         guard !resolutions.isEmpty else { return nil }
 
@@ -517,10 +522,12 @@ final class AutoRecommendationEngine {
         workspaceID _: UUID,
         scope: AgentModelsEditingScope = .global
     ) {
-        MCPAgentRoleDefaultsService.clearAllOverrides(
-            workspaceID: scope.workspaceID,
-            settingsStore: settingsStore
-        )
+        updateProfile(
+            scope: scope,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        ) { profile in
+            profile.mcpAgentRoleOverrides = nil
+        }
     }
 
     // MARK: - Apply Recommendations
@@ -619,7 +626,10 @@ final class AutoRecommendationEngine {
     ) {
         guard let trimmedModel = recommendedChatModelRaw(rec, backend: backend) else { return }
 
-        updateProfile(scope: scope) { profile in
+        updateProfile(
+            scope: scope,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        ) { profile in
             profile.planningModelRaw = trimmedModel
             profile.preferredComposeModelRaw = trimmedModel
         }
@@ -629,11 +639,15 @@ final class AutoRecommendationEngine {
     func applyContextBuilderRecommendation(
         _ rec: ContextBuilderRecommendation,
         workspaceID _: UUID,
-        scope: AgentModelsEditingScope = .global
+        scope: AgentModelsEditingScope = .global,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .userInitiated
     ) {
         let resolvedModelRaw = recommendedContextBuilderModelRaw(rec)
 
-        updateProfile(scope: scope) { profile in
+        updateProfile(
+            scope: scope,
+            contextBuilderWriteIntent: contextBuilderWriteIntent
+        ) { profile in
             profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
             profile = profile.replacingContextBuilderModel(resolvedModelRaw, for: rec.recommendedAgent.rawValue)
         }
@@ -691,24 +705,28 @@ final class AutoRecommendationEngine {
     private func profile(for scope: AgentModelsEditingScope) -> AgentModelsSettingsProfile {
         switch scope {
         case .global:
-            settingsStore.globalAgentModelsProfile()
+            profileSettingsManager.globalAgentModelsProfile()
         case let .workspace(workspaceID):
-            settingsStore.workspaceAgentModelsProfile(for: workspaceID)
-                ?? settingsStore.effectiveAgentModelsProfile(workspaceID: workspaceID)
+            profileSettingsManager.workspaceAgentModelsProfile(for: workspaceID)
+                ?? profileSettingsManager.effectiveAgentModelsProfile(workspaceID: workspaceID)
         }
     }
 
     private func updateProfile(
         scope: AgentModelsEditingScope,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
     ) {
         var profile = profile(for: scope)
         mutation(&profile)
         switch scope {
         case .global:
-            settingsStore.setGlobalAgentModelsProfile(profile)
+            profileSettingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
         case let .workspace(workspaceID):
-            settingsStore.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+            profileSettingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
         }
     }
 
@@ -750,7 +768,11 @@ final class AutoRecommendationEngine {
         if let cbRec = recs.contextBuilder,
            !cbRec.alreadySatisfied
         {
-            applyContextBuilderRecommendation(cbRec, workspaceID: workspaceID)
+            applyContextBuilderRecommendation(
+                cbRec,
+                workspaceID: workspaceID,
+                contextBuilderWriteIntent: .automaticSeed
+            )
             didApply = true
         }
 

@@ -9,10 +9,13 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         let recommended = AIModel.gpt54Pro.rawValue
         let nonRecommended = AIModel.claude4Sonnet.rawValue
 
-        fixture.store.setGlobalAgentModelsProfile(AgentModelsSettingsProfile(
-            planningModelRaw: recommended,
-            preferredComposeModelRaw: recommended
-        ))
+        fixture.store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: recommended,
+                preferredComposeModelRaw: recommended
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         fixture.store.setWorkspaceAgentModelsProfile(
             workspaceID: workspaceID,
             profile: AgentModelsSettingsProfile(
@@ -49,7 +52,10 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
                 AgentProviderKind.claudeCode.rawValue: AgentModel.claudeSonnet.rawValue
             ]
         )
-        fixture.store.setGlobalAgentModelsProfile(globalProfile)
+        fixture.store.setGlobalAgentModelsProfile(
+            globalProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         fixture.store.setWorkspaceAgentModelsProfile(
             workspaceID: workspaceID,
             profile: AgentModelsSettingsProfile(
@@ -84,7 +90,10 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
                 AgentProviderKind.codexExec.rawValue: AgentModel.gpt55CodexLow.rawValue
             ]
         )
-        fixture.store.setGlobalAgentModelsProfile(globalProfile)
+        fixture.store.setGlobalAgentModelsProfile(
+            globalProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         fixture.store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: AgentModelsSettingsProfile())
         let beforeWorkspaceChatSettings = fixture.store.chatSettings(for: workspaceID)
 
@@ -126,9 +135,12 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             agentRaw: AgentProviderKind.codexExec.rawValue,
             modelRaw: AgentModel.gpt55CodexMedium.rawValue
         ).rawValue
-        fixture.store.setGlobalAgentModelsProfile(AgentModelsSettingsProfile(
-            mcpAgentRoleOverrides: [AgentModelCatalog.TaskLabelKind.explore.rawValue: globalOverride]
-        ))
+        fixture.store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                mcpAgentRoleOverrides: [AgentModelCatalog.TaskLabelKind.explore.rawValue: globalOverride]
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         fixture.store.setWorkspaceAgentModelsProfile(
             workspaceID: workspaceID,
             profile: AgentModelsSettingsProfile(
@@ -152,6 +164,43 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
             [AgentModelCatalog.TaskLabelKind.explore.rawValue: globalOverride]
         )
         XCTAssertNil(fixture.store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides)
+    }
+
+    func testContextBuilderRecommendationWriteIntentDistinguishesAutomaticSeedFromExplicitApply() throws {
+        let fixture = try makeFixture()
+        let workspaceID = UUID()
+        let recommendation = ContextBuilderRecommendation(
+            recommendedAgent: .claudeCode,
+            recommendedModel: .claudeSonnet,
+            rationale: "test"
+        )
+
+        fixture.engine.applyContextBuilderRecommendation(
+            recommendation,
+            workspaceID: workspaceID,
+            contextBuilderWriteIntent: .automaticSeed
+        )
+
+        XCTAssertFalse(fixture.store.hasUserSetGlobalContextBuilderAgentDefaults)
+
+        fixture.engine.applyContextBuilderRecommendation(
+            recommendation,
+            workspaceID: workspaceID,
+            contextBuilderWriteIntent: .userInitiated
+        )
+
+        XCTAssertTrue(fixture.store.hasUserSetGlobalContextBuilderAgentDefaults)
+
+        fixture.engine.applyContextBuilderRecommendation(
+            recommendation,
+            workspaceID: workspaceID,
+            contextBuilderWriteIntent: .automaticSeed
+        )
+
+        XCTAssertTrue(
+            fixture.store.hasUserSetGlobalContextBuilderAgentDefaults,
+            "Automatic seeding must not demote an established user-owned selection."
+        )
     }
 
     private func makeFixture() throws -> (
@@ -189,6 +238,7 @@ final class AutoRecommendationEngineScopedSettingsTests: XCTestCase {
         apiSettings.isOpenAIKeyValid = true
         let engine = AutoRecommendationEngine(
             settingsStore: store,
+            profileSettingsManager: store,
             apiSettingsViewModel: apiSettings
         )
         return (store, engine, apiSettings)

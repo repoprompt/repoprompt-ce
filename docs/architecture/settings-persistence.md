@@ -1,6 +1,6 @@
 # Settings Persistence
 
-Current as of 2026-06-20. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
+Current as of 2026-06-21. This document is contributor-facing: use it when changing durable settings, workspace overrides, Agent Models settings, or MCP settings surfaces.
 
 ## Durable settings file
 
@@ -41,7 +41,9 @@ The global Agent Models profile is not a separate JSON blob. It is projected fro
 | `mcpAgentRoleOverrides` | `globalDefaults.mcpAgentRoleOverrides` |
 | `restrictMCPAgentDiscoveryToRoleLabels` | `scalarPreferences.agentMode.restrictMCPAgentDiscoveryToRoleLabels` |
 
-Use `GlobalSettingsStore.globalAgentModelsProfile()` and `setGlobalAgentModelsProfile(_:)` for whole-profile reads/writes. Legacy global Context Builder setters still exist for compatibility, but they must post `.agentModelsSettingsDidChange(scope: .global)` because they mutate fields used by the global Agent Models profile.
+Use `GlobalSettingsStore.globalAgentModelsProfile()` and `setGlobalAgentModelsProfile(_:contextBuilderWriteIntent:)` for whole-profile reads/writes. The write intent distinguishes user-owned Context Builder changes from automatic seeding while allowing unrelated model changes to preserve the existing ownership marker. User-driven Context Builder edits and workspace-to-global copies mark the selection as user-defined; automatic seeding stores an explicit unmarked state and never demotes an established user choice.
+
+Legacy global Context Builder setters and global backing-field writers for planning, Built-in Chat, sync, MCP role overrides, and role-label discovery filtering post `.agentModelsSettingsDidChange(scope: .global)` after an actual value change because they mutate fields used by the global Agent Models profile.
 
 ### Workspace profiles
 
@@ -59,6 +61,8 @@ Each entry is a `WorkspaceAgentModelsSettings` value:
 A workspace in `.useGlobalSettings` resolves to the global profile even if it has an inactive saved profile. Switching to `.useWorkspaceOverrides` materializes a complete workspace profile from the current global profile when none exists. This keeps override editing deterministic and avoids partial per-field fallback rules.
 
 `WindowSettingsManager` forwards scoped Agent Models reads/writes to `GlobalSettingsStore`; it does not create a window-local overlay for these settings.
+
+Durable Agent Models profile values use trim-only normalization: surrounding whitespace and empty strings are normalized, but unknown nonempty provider identifiers, model identifiers, and map keys are preserved for forward and rollback compatibility. Catalog validation and executable fallback belong at runtime; loading or saving the settings document must not replace unknown durable values with current defaults.
 
 ## Effective runtime resolution
 

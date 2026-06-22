@@ -28,6 +28,23 @@ extension GlobalSettingsStore: MCPAgentRoleDefaultsStoring {
     }
 }
 
+@MainActor
+final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
+    private var overrides: [String: String]?
+
+    init(overrides: [String: String]?) {
+        self.overrides = overrides
+    }
+
+    func mcpAgentRoleOverrides(workspaceID _: UUID?) -> [String: String]? {
+        overrides
+    }
+
+    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID _: UUID?, commit _: Bool) {
+        self.overrides = overrides
+    }
+}
+
 // MARK: - MCP Agent Role Defaults Service
 
 /// Centralized resolution and persistence for MCP agent role defaults.

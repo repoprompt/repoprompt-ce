@@ -41,19 +41,16 @@ protocol SettingsManaging {
     func setPlanningModelRaw(_ raw: String?, commit: Bool, reason: String?, honorSync: Bool)
     func syncChatModelWithOracle() -> Bool
     func globalAgentModelsProfile() -> AgentModelsSettingsProfile
-    func setGlobalAgentModelsProfile(_ profile: AgentModelsSettingsProfile)
+    func setGlobalAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
+    )
     func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings
     func setWorkspaceAgentModelsInheritanceMode(workspaceID: UUID, mode: AgentModelsInheritanceMode)
     func workspaceAgentModelsProfile(for workspaceID: UUID) -> AgentModelsSettingsProfile?
     func setWorkspaceAgentModelsProfile(workspaceID: UUID, profile: AgentModelsSettingsProfile)
     func effectiveAgentModelsProfile(workspaceID: UUID?) -> AgentModelsSettingsProfile
-    func setAgentModelsPlanningModelRaw(_ raw: String?, scope: AgentModelsEditingScope)
-    func setAgentModelsPreferredComposeModelRaw(_ raw: String?, scope: AgentModelsEditingScope)
-    func setAgentModelsSyncChatModelWithOracle(_ enabled: Bool, scope: AgentModelsEditingScope)
-    func setAgentModelsContextBuilderAgentRaw(_ raw: String?, scope: AgentModelsEditingScope)
-    func setAgentModelsContextBuilderModelRaw(_ raw: String?, forAgentRaw agentRaw: String?, scope: AgentModelsEditingScope)
     func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope)
-    func setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, scope: AgentModelsEditingScope)
     func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope)
     func maxBackgroundAgentComposeTabs() -> Int
     func commitWorkspace(_ workspaceID: UUID)
@@ -311,8 +308,14 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
         store.globalAgentModelsProfile()
     }
 
-    func setGlobalAgentModelsProfile(_ profile: AgentModelsSettingsProfile) {
-        store.setGlobalAgentModelsProfile(profile)
+    func setGlobalAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent
+    ) {
+        store.setGlobalAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: contextBuilderWriteIntent
+        )
     }
 
     func workspaceAgentModelsSettings(for workspaceID: UUID) -> WorkspaceAgentModelsSettings {
@@ -335,36 +338,8 @@ final class WindowSettingsManager: ObservableObject, SettingsManaging {
         store.effectiveAgentModelsProfile(workspaceID: workspaceID)
     }
 
-    func setAgentModelsPlanningModelRaw(_ raw: String?, scope: AgentModelsEditingScope) {
-        store.setAgentModelsPlanningModelRaw(raw, scope: scope)
-    }
-
-    func setAgentModelsPreferredComposeModelRaw(_ raw: String?, scope: AgentModelsEditingScope) {
-        store.setAgentModelsPreferredComposeModelRaw(raw, scope: scope)
-    }
-
-    func setAgentModelsSyncChatModelWithOracle(_ enabled: Bool, scope: AgentModelsEditingScope) {
-        store.setAgentModelsSyncChatModelWithOracle(enabled, scope: scope)
-    }
-
-    func setAgentModelsContextBuilderAgentRaw(_ raw: String?, scope: AgentModelsEditingScope) {
-        store.setAgentModelsContextBuilderAgentRaw(raw, scope: scope)
-    }
-
-    func setAgentModelsContextBuilderModelRaw(
-        _ raw: String?,
-        forAgentRaw agentRaw: String?,
-        scope: AgentModelsEditingScope
-    ) {
-        store.setAgentModelsContextBuilderModelRaw(raw, forAgentRaw: agentRaw, scope: scope)
-    }
-
     func setAgentModelsMCPAgentRoleOverrides(_ overrides: [String: String]?, scope: AgentModelsEditingScope) {
         store.setAgentModelsMCPAgentRoleOverrides(overrides, scope: scope)
-    }
-
-    func setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(_ enabled: Bool, scope: AgentModelsEditingScope) {
-        store.setAgentModelsRestrictMCPAgentDiscoveryToRoleLabels(enabled, scope: scope)
     }
 
     func copyAgentModelsProfile(from source: AgentModelsEditingScope, to destination: AgentModelsEditingScope) {

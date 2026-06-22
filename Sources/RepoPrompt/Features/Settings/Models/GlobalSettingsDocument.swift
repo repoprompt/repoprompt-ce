@@ -96,6 +96,12 @@ enum AgentModelsEditingScope: Equatable {
     case workspace(UUID)
 }
 
+enum ContextBuilderSettingsWriteIntent {
+    case preserveExistingOwnership
+    case userInitiated
+    case automaticSeed
+}
+
 struct AgentModelsSettingsProfile: Codable, Equatable {
     var planningModelRaw: String?
     var preferredComposeModelRaw: String?
@@ -123,13 +129,36 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
         self.restrictMCPAgentDiscoveryToRoleLabels = restrictMCPAgentDiscoveryToRoleLabels
     }
 
+    private enum CodingKeys: String, CodingKey {
+        case planningModelRaw
+        case preferredComposeModelRaw
+        case syncChatModelWithOracle
+        case contextBuilderAgentRaw
+        case contextBuilderModelsByAgent
+        case mcpAgentRoleOverrides
+        case restrictMCPAgentDiscoveryToRoleLabels
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            planningModelRaw: container.decodeIfPresent(String.self, forKey: .planningModelRaw),
+            preferredComposeModelRaw: container.decodeIfPresent(String.self, forKey: .preferredComposeModelRaw),
+            syncChatModelWithOracle: container.decodeIfPresent(Bool.self, forKey: .syncChatModelWithOracle) ?? false,
+            contextBuilderAgentRaw: container.decodeIfPresent(String.self, forKey: .contextBuilderAgentRaw),
+            contextBuilderModelsByAgent: container.decodeIfPresent([String: String].self, forKey: .contextBuilderModelsByAgent),
+            mcpAgentRoleOverrides: container.decodeIfPresent([String: String].self, forKey: .mcpAgentRoleOverrides),
+            restrictMCPAgentDiscoveryToRoleLabels: container.decodeIfPresent(Bool.self, forKey: .restrictMCPAgentDiscoveryToRoleLabels) ?? false
+        )
+    }
+
     func replacingContextBuilderModel(_ modelRaw: String?, for agentRaw: String?) -> AgentModelsSettingsProfile {
         let resolvedAgentRaw = Self.normalizedAgentRaw(agentRaw) ?? contextBuilderAgentRaw
         guard let resolvedAgentRaw else { return self }
 
         var next = self
         var modelsByAgent = contextBuilderModelsByAgent ?? [:]
-        if let normalizedModelRaw = Self.normalizedContextBuilderModelRaw(modelRaw, for: resolvedAgentRaw) {
+        if let normalizedModelRaw = Self.trimmedNonEmpty(modelRaw) {
             modelsByAgent[resolvedAgentRaw] = normalizedModelRaw
         } else {
             modelsByAgent[resolvedAgentRaw] = nil
@@ -139,40 +168,22 @@ struct AgentModelsSettingsProfile: Codable, Equatable {
     }
 
     private static func normalizedChatModelRaw(_ raw: String?) -> String? {
-        guard let trimmed = trimmedNonEmpty(raw) else { return nil }
-        return AIModel.fromModelName(trimmed)?.rawValue ?? trimmed
+        trimmedNonEmpty(raw)
     }
 
     private static func normalizedAgentRaw(_ raw: String?) -> String? {
-        guard let trimmed = trimmedNonEmpty(raw) else { return nil }
-        return AgentProviderKind(rawValue: trimmed)?.rawValue
+        trimmedNonEmpty(raw)
     }
 
     private static func normalizedContextBuilderModelsByAgent(_ values: [String: String]?) -> [String: String]? {
-        guard let values else { return nil }
-        let normalized = values.reduce(into: [String: String]()) { result, entry in
-            guard let agentRaw = normalizedAgentRaw(entry.key),
-                  let modelRaw = normalizedContextBuilderModelRaw(entry.value, for: agentRaw)
-            else {
-                return
-            }
-            result[agentRaw] = modelRaw
-        }
-        return normalized.isEmpty ? nil : normalized
-    }
-
-    private static func normalizedContextBuilderModelRaw(_ raw: String?, for agentRaw: String) -> String? {
-        guard let trimmed = trimmedNonEmpty(raw) else { return nil }
-        let normalized = AgentModelCatalog.normalizeSelection(agentRaw: agentRaw, modelRaw: trimmed)
-        guard normalized.agent.rawValue == agentRaw else { return nil }
-        return normalized.modelRaw
+        normalizedStringMap(values)
     }
 
     private static func normalizedStringMap(_ values: [String: String]?) -> [String: String]? {
         guard let values else { return nil }
-        let normalized = values.reduce(into: [String: String]()) { result, entry in
-            guard let key = trimmedNonEmpty(entry.key),
-                  let value = trimmedNonEmpty(entry.value)
+        let normalized = values.keys.sorted().reduce(into: [String: String]()) { result, rawKey in
+            guard let key = trimmedNonEmpty(rawKey),
+                  let value = trimmedNonEmpty(values[rawKey])
             else {
                 return
             }

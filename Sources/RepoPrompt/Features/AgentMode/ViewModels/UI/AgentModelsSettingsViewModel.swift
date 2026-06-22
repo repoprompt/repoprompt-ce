@@ -105,6 +105,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         self.notificationCenter = notificationCenter
         engine = AutoRecommendationEngine(
             settingsStore: settingsStore,
+            profileSettingsManager: settingsManager,
             apiSettingsViewModel: apiSettingsVM
         )
         syncChatWithOracle = initialProfile.syncChatModelWithOracle
@@ -171,8 +172,11 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var currentBuiltinChatModelName: String {
-        displayName(
-            forChatModelRaw: profileSnapshot.preferredComposeModelRaw ?? profileSnapshot.planningModelRaw,
+        let raw = profileSnapshot.syncChatModelWithOracle
+            ? profileSnapshot.planningModelRaw
+            : profileSnapshot.preferredComposeModelRaw
+        return displayName(
+            forChatModelRaw: raw,
             fallback: "Select a Built-in Chat model"
         )
     }
@@ -365,7 +369,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         guard let rec = recommendations.contextBuilder,
               workspaceID != nil else { return }
         let recommendedModelRaw = engine.recommendedContextBuilderModelRaw(rec)
-        updateSelectedProfile(reason: "agent_models.apply_context_builder_recommendation") { profile in
+        updateSelectedProfile(
+            reason: "agent_models.apply_context_builder_recommendation",
+            contextBuilderWriteIntent: .userInitiated
+        ) { profile in
             profile.contextBuilderAgentRaw = rec.recommendedAgent.rawValue
             profile = profile.replacingContextBuilderModel(recommendedModelRaw, for: rec.recommendedAgent.rawValue)
         }
@@ -424,7 +431,13 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             didMutateProfile = true
         }
         if didMutateProfile {
-            persistSelectedProfile(profile, reason: "agent_models.apply_all_recommendations")
+            persistSelectedProfile(
+                profile,
+                reason: "agent_models.apply_all_recommendations",
+                contextBuilderWriteIntent: recommendations.contextBuilder == nil
+                    ? .preserveExistingOwnership
+                    : .userInitiated
+            )
         }
         if includePresetExposure, let presetExposure = recommendations.mcpPresetExposure {
             engine.applyMCPPresetExposure(presetExposure)
@@ -560,17 +573,29 @@ final class AgentModelsSettingsViewModel: ObservableObject {
 
     private func updateSelectedProfile(
         reason: String,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership,
         _ mutation: (inout AgentModelsSettingsProfile) -> Void
     ) {
         var profile = profileSnapshot
         mutation(&profile)
-        persistSelectedProfile(profile, reason: reason)
+        persistSelectedProfile(
+            profile,
+            reason: reason,
+            contextBuilderWriteIntent: contextBuilderWriteIntent
+        )
     }
 
-    private func persistSelectedProfile(_ profile: AgentModelsSettingsProfile, reason: String) {
+    private func persistSelectedProfile(
+        _ profile: AgentModelsSettingsProfile,
+        reason: String,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
+    ) {
         switch editingScope {
         case .global:
-            settingsManager.setGlobalAgentModelsProfile(profile)
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
         case let .workspace(workspaceID):
             settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
         }
@@ -587,7 +612,10 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     private func setContextBuilderSelection(agent: AgentProviderKind, modelRaw: String) {
-        updateSelectedProfile(reason: "agent_models.context_builder") { profile in
+        updateSelectedProfile(
+            reason: "agent_models.context_builder",
+            contextBuilderWriteIntent: .userInitiated
+        ) { profile in
             profile.contextBuilderAgentRaw = agent.rawValue
             profile = profile.replacingContextBuilderModel(modelRaw, for: agent.rawValue)
         }
@@ -649,22 +677,5 @@ final class AgentModelsSettingsViewModel: ObservableObject {
             return fallback
         }
         return AIModel.fromModelName(raw)?.displayName ?? raw
-    }
-}
-
-@MainActor
-private final class AgentModelsProfileRoleDefaultsStore: MCPAgentRoleDefaultsStoring {
-    private var overrides: [String: String]?
-
-    init(overrides: [String: String]?) {
-        self.overrides = overrides
-    }
-
-    func mcpAgentRoleOverrides(workspaceID _: UUID?) -> [String: String]? {
-        overrides
-    }
-
-    func updateMCPAgentRoleOverrides(_ overrides: [String: String]?, workspaceID _: UUID?, commit _: Bool) {
-        self.overrides = overrides
     }
 }

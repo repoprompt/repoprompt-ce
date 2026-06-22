@@ -446,6 +446,164 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertFalse(saved.copySettings.isEmpty)
     }
 
+    func testAgentModelsProfilePreservesUnknownContextBuilderProviderAndModelRawValues() throws {
+        let temp = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: temp) }
+        let fileStore = GlobalSettingsFileStore(
+            fileURL: temp.appendingPathComponent("Settings/globalSettings.json")
+        )
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let workspaceID = UUID()
+        let unknownAgent = "future-agent"
+        let unknownModel = "future-model-v9"
+        let profile = AgentModelsSettingsProfile(
+            contextBuilderAgentRaw: "  \(unknownAgent)  ",
+            contextBuilderModelsByAgent: ["  \(unknownAgent)  ": "  \(unknownModel)  "]
+        )
+
+        store.setGlobalAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        store.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
+        store.setShowDatesInMessageTimestamps(true)
+
+        let reloaded = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        XCTAssertEqual(reloaded.globalAgentModelsProfile().contextBuilderAgentRaw, unknownAgent)
+        XCTAssertEqual(
+            reloaded.globalAgentModelsProfile().contextBuilderModelsByAgent?[unknownAgent],
+            unknownModel
+        )
+        XCTAssertEqual(
+            reloaded.workspaceAgentModelsProfile(for: workspaceID)?.contextBuilderAgentRaw,
+            unknownAgent
+        )
+        XCTAssertEqual(
+            reloaded.workspaceAgentModelsProfile(for: workspaceID)?.contextBuilderModelsByAgent?[unknownAgent],
+            unknownModel
+        )
+    }
+
+    func testLegacyGlobalAgentModelsBackingWritersPostGlobalNotifications() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.setPlanningModelRaw(AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(recorder.snapshot().count, 1)
+        store.setPreferredComposeModelRaw(AIModel.claude4Sonnet.rawValue)
+        XCTAssertEqual(recorder.snapshot().count, 2)
+        store.setSyncChatModelWithOracle(true)
+        XCTAssertEqual(recorder.snapshot().count, 3)
+        store.updateGlobalMCPAgentRoleOverrides(["plan": "codexExec:test-model"])
+        XCTAssertEqual(recorder.snapshot().count, 4)
+        store.setRestrictMCPAgentDiscoveryToRoleLabels(true)
+        XCTAssertEqual(recorder.snapshot().count, 5)
+
+        store.setPlanningModelRaw(AIModel.gpt54Pro.rawValue)
+        XCTAssertEqual(recorder.snapshot().count, 5)
+        store.setPreferredComposeModelRaw(AIModel.claude4Sonnet.rawValue)
+        XCTAssertEqual(recorder.snapshot().count, 5)
+        store.setSyncChatModelWithOracle(true)
+        XCTAssertEqual(recorder.snapshot().count, 5)
+        store.updateGlobalMCPAgentRoleOverrides(["plan": "codexExec:test-model"])
+        XCTAssertEqual(recorder.snapshot().count, 5)
+        store.setRestrictMCPAgentDiscoveryToRoleLabels(true)
+        XCTAssertEqual(recorder.snapshot().count, 5)
+
+        let notifications = recorder.snapshot()
+        XCTAssertEqual(notifications.count, 5)
+        XCTAssertTrue(notifications.allSatisfy {
+            $0.scope == AgentModelsSettingsNotification.Scope.global.rawValue
+                && $0.workspaceID == nil
+        })
+    }
+
+    func testPromptAgentModelsNotificationRefreshDoesNotWriteBack() async throws {
+        let workspaceID = UUID()
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            copySettings: [workspaceID: CopyGlobalSettings(workspaceID: workspaceID)],
+            chatSettings: [workspaceID: ChatGlobalSettings(workspaceID: workspaceID)],
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -303, store: store)
+        let fileManager = WorkspaceFilesViewModel()
+        fileManager.setCurrentWorkspaceID(workspaceID)
+        let prompt = PromptViewModel(
+            fileManager: fileManager,
+            apiSettingsViewModel: makeAPISettingsViewModel(),
+            windowID: -303,
+            settingsManager: manager
+        )
+        let originalCopyFileTreeOption = fileStore.document.copySettings[workspaceID]?.fileTreeOption
+        let originalChatFileTreeOption = fileStore.document.chatSettings[workspaceID]?.fileTreeOption
+        fileStore.saveCount = 0
+        let recorder = AgentModelsNotificationRecorder(observing: store)
+        defer { recorder.invalidate() }
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(planningModelRaw: AIModel.gpt54Pro.rawValue),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        await drainMainQueue()
+
+        XCTAssertEqual(fileStore.saveCount, 1)
+        XCTAssertEqual(recorder.snapshot().count, 1)
+        XCTAssertEqual(fileStore.document.copySettings.count, 1)
+        XCTAssertEqual(fileStore.document.chatSettings.count, 1)
+        XCTAssertEqual(
+            fileStore.document.copySettings[workspaceID]?.fileTreeOption,
+            originalCopyFileTreeOption
+        )
+        XCTAssertEqual(
+            fileStore.document.chatSettings[workspaceID]?.fileTreeOption,
+            originalChatFileTreeOption
+        )
+        XCTAssertEqual(prompt.planningModelName, AIModel.gpt54Pro.rawValue)
+    }
+
+    func testAgentModelsViewModelDoesNotFallbackUnsyncedBuiltinChatToOracle() async throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -404, store: store)
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: nil,
+                syncChatModelWithOracle: false
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        XCTAssertEqual(viewModel.currentBuiltinChatModelName, "Select a Built-in Chat model")
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: nil,
+                syncChatModelWithOracle: true
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        await drainMainQueue()
+
+        XCTAssertEqual(viewModel.currentBuiltinChatModelName, AIModel.gpt54Pro.displayName)
+    }
+
     func testAgentModelsGlobalProfileRoundTripsExistingFieldsWithOneSaveAndNotification() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
@@ -466,7 +624,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             restrictMCPAgentDiscoveryToRoleLabels: true
         )
 
-        store.setGlobalAgentModelsProfile(profile)
+        store.setGlobalAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
 
         let expected = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54Pro.rawValue,
@@ -554,7 +715,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             mcpAgentRoleOverrides: ["code": "claudeCode:sonnet"],
             restrictMCPAgentDiscoveryToRoleLabels: true
         )
-        store.setGlobalAgentModelsProfile(globalProfile)
+        store.setGlobalAgentModelsProfile(
+            globalProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         fileStore.saveCount = 0
         let recorder = AgentModelsNotificationRecorder(observing: store)
         defer { recorder.invalidate() }
@@ -597,7 +761,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             contextBuilderModelsByAgent: [codexAgent: AgentModelCatalog.defaultModelRaw(for: .codexExec)],
             mcpAgentRoleOverrides: ["old": "codexExec:old"],
             restrictMCPAgentDiscoveryToRoleLabels: false
-        ))
+        ), contextBuilderWriteIntent: .preserveExistingOwnership)
         let workspaceProfile = AgentModelsSettingsProfile(
             planningModelRaw: AIModel.gpt54Pro.rawValue,
             preferredComposeModelRaw: nil,
@@ -623,6 +787,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(fileStore.document.globalDefaults.discoverModelsByAgent, workspaceProfile.contextBuilderModelsByAgent)
         XCTAssertNil(fileStore.document.globalDefaults.discoverModelsByAgent?[codexAgent])
         XCTAssertEqual(fileStore.document.globalDefaults.mcpAgentRoleOverrides, workspaceProfile.mcpAgentRoleOverrides)
+        XCTAssertTrue(store.hasUserSetGlobalContextBuilderAgentDefaults)
     }
 
     func testAgentModelsWindowSettingsManagerBoundaryRoutesScopedWritesAndCopies() throws {
@@ -650,19 +815,15 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         let recorder = AgentModelsNotificationRecorder(observing: store)
         defer { recorder.invalidate() }
 
-        manager.setGlobalAgentModelsProfile(globalProfile)
+        manager.setGlobalAgentModelsProfile(
+            globalProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
-        manager.setAgentModelsPlanningModelRaw(AIModel.codexCliGpt55CodexHigh.rawValue, scope: .workspace(workspaceID))
 
         XCTAssertEqual(store.globalAgentModelsProfile(), globalProfile)
-        XCTAssertEqual(
-            manager.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
-            AIModel.codexCliGpt55CodexHigh.rawValue
-        )
-        XCTAssertEqual(
-            store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
-            AIModel.codexCliGpt55CodexHigh.rawValue
-        )
+        XCTAssertEqual(manager.workspaceAgentModelsProfile(for: workspaceID), workspaceProfile)
+        XCTAssertEqual(store.workspaceAgentModelsProfile(for: workspaceID), workspaceProfile)
 
         manager.copyAgentModelsProfile(from: .workspace(workspaceID), to: .global)
 
@@ -674,7 +835,7 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         })
     }
 
-    func testAgentModelsViewModelUsesInjectedSettingsManagerForScopedWritesCopiesAndNotifications() async throws {
+    func testAgentModelsViewModelUsesInjectedSettingsManagerForScopedReadsWritesCopiesAndNotifications() async throws {
         let managerFileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
             scalarPreferences: seededScalarPreferences()
@@ -703,9 +864,21 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
                 AgentProviderKind.claudeCode.rawValue: AgentModelCatalog.defaultModelRaw(for: .claudeCode)
             ]
         )
-        manager.setGlobalAgentModelsProfile(globalProfile)
+        manager.setGlobalAgentModelsProfile(
+            globalProfile,
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
         manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
         manager.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+        let engineWorkspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.gpt54Pro.rawValue,
+            preferredComposeModelRaw: AIModel.gpt54Pro.rawValue,
+            syncChatModelWithOracle: false
+        )
+        engineStore.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: engineWorkspaceProfile
+        )
 
         let apiSettings = makeAPISettingsViewModel()
         apiSettings.isOpenAIKeyValid = true
@@ -719,6 +892,10 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
 
         XCTAssertTrue(viewModel.isEditingWorkspaceSettings)
         XCTAssertEqual(viewModel.profileSnapshot.planningModelRaw, workspaceProfile.planningModelRaw)
+        XCTAssertFalse(
+            viewModel.isOracleRecommendationSatisfied,
+            "Recommendation satisfaction must read the injected manager profile, not the engine store."
+        )
 
         viewModel.setOracleModel(raw: AIModel.codexCliGpt55CodexHigh.rawValue)
 
@@ -726,8 +903,9 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
             AIModel.codexCliGpt55CodexHigh.rawValue
         )
-        XCTAssertNil(
+        XCTAssertEqual(
             engineStore.workspaceAgentModelsProfile(for: workspaceID),
+            engineWorkspaceProfile,
             "Scoped writes must route through the injected SettingsManaging boundary, not the engine/global store."
         )
         XCTAssertEqual(managerStore.globalAgentModelsProfile(), globalProfile)
@@ -738,8 +916,9 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
             managerStore.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
             AIModel.gpt54Pro.rawValue
         )
-        XCTAssertNil(
+        XCTAssertEqual(
             engineStore.workspaceAgentModelsProfile(for: workspaceID),
+            engineWorkspaceProfile,
             "Recommendation apply must also route scoped Agent Models writes through the injected SettingsManaging boundary."
         )
 

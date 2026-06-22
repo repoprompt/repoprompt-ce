@@ -666,10 +666,16 @@ class PromptViewModel: ObservableObject {
         settingsManager.effectiveAgentModelsProfile(workspaceID: currentWorkspaceID)
     }
 
-    private func persistCurrentAgentModelsProfile(_ profile: AgentModelsSettingsProfile) {
+    private func persistCurrentAgentModelsProfile(
+        _ profile: AgentModelsSettingsProfile,
+        contextBuilderWriteIntent: ContextBuilderSettingsWriteIntent = .preserveExistingOwnership
+    ) {
         switch currentAgentModelsEditingScope {
         case .global:
-            settingsManager.setGlobalAgentModelsProfile(profile)
+            settingsManager.setGlobalAgentModelsProfile(
+                profile,
+                contextBuilderWriteIntent: contextBuilderWriteIntent
+            )
         case let .workspace(workspaceID):
             settingsManager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: profile)
         }
@@ -680,7 +686,10 @@ class PromptViewModel: ObservableObject {
         let rawModel = modelRaw ?? contextBuilderAgentModelRaw
         profile.contextBuilderAgentRaw = contextBuilderAgent.rawValue
         profile = profile.replacingContextBuilderModel(rawModel, for: contextBuilderAgent.rawValue)
-        persistCurrentAgentModelsProfile(profile)
+        persistCurrentAgentModelsProfile(
+            profile,
+            contextBuilderWriteIntent: .userInitiated
+        )
     }
 
     private var isSyncingSettings = false
@@ -864,15 +873,25 @@ class PromptViewModel: ObservableObject {
         return persistedRaw
     }
 
+    private func syncAgentModelsSettingsFromSettingsManager() {
+        refreshAvailableAgentKinds()
+        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)")
+            }
+            contextBuilderAgent = normalizedContextBuilder.agent
+            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
+            if Self.debugLoggingEnabled {
+                print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)")
+            }
+        }
+        syncModelSelectionFromSettingsManager()
+    }
+
     func syncSettingsFromSettingsManager() {
         guard let workspaceID = currentWorkspaceID else {
             isSyncingSettings = true
-            refreshAvailableAgentKinds()
-            if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
-                contextBuilderAgent = normalizedContextBuilder.agent
-                contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-            }
-            syncModelSelectionFromSettingsManager()
+            syncAgentModelsSettingsFromSettingsManager()
             isSyncingSettings = false
             return
         }
@@ -933,17 +952,8 @@ class PromptViewModel: ObservableObject {
         }
         _contextBuilderModel = chatSettings.contextBuilderModelRaw ?? ""
 
-        // Sync Context Builder agent/model from the effective Agent Models profile.
-        refreshAvailableAgentKinds()
-        if let normalizedContextBuilder = resolvedPersistedContextBuilderSelection() {
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - normalized context builder agent: \(normalizedContextBuilder.agent.rawValue)") }
-            contextBuilderAgent = normalizedContextBuilder.agent
-            contextBuilderAgentModelRaw = normalizedContextBuilder.modelRaw
-            if Self.debugLoggingEnabled { print("[PromptVM] syncSettings - contextBuilderAgentModelRaw set to: \(contextBuilderAgentModelRaw)") }
-        }
-
-        // Sync model selection from the effective Agent Models profile (may have been set by recommendation engine).
-        syncModelSelectionFromSettingsManager()
+        // Sync model and Context Builder selection from the effective Agent Models profile.
+        syncAgentModelsSettingsFromSettingsManager()
 
         isSyncingSettings = false
 
@@ -2279,7 +2289,9 @@ class PromptViewModel: ObservableObject {
         {
             return
         }
-        syncSettingsFromSettingsManager()
+        isSyncingSettings = true
+        syncAgentModelsSettingsFromSettingsManager()
+        isSyncingSettings = false
     }
 
     fileprivate func invalidateChatPromptEntriesCache() {
