@@ -38,6 +38,40 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
     }
 }
 
+public enum JSONRPCBridgeReplayPolicy {
+    private static let replayableMethods: Set<String> = [
+        "ping",
+        "tools/list",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "prompts/list",
+        "prompts/get",
+        "completion/complete"
+    ]
+
+    private static let replayableToolCalls: Set<String> = [
+        "file_search",
+        "get_code_structure",
+        "get_file_tree",
+        "git",
+        "oracle_utils",
+        "read_file",
+        "workspace_context"
+    ]
+
+    public static func isReplayableClientRequest(method: String?, tool: String?) -> Bool {
+        guard let method else { return false }
+        if replayableMethods.contains(method) {
+            return true
+        }
+        guard method == "tools/call", let tool else {
+            return false
+        }
+        return replayableToolCalls.contains(tool)
+    }
+}
+
 public struct JSONRPCBridgeMessageMetadata: Equatable, Sendable {
     public enum Kind: String, Sendable {
         case request
@@ -516,6 +550,7 @@ public actor JSONRPCBridgeLedger {
         let method: String?
         let tool: String?
         let ordinal: UInt64
+        let isReplayable: Bool
     }
 
     private struct SuccessorRequest: Equatable {
@@ -642,6 +677,7 @@ public actor JSONRPCBridgeLedger {
         }
 
         let token = UUID()
+        let frameIsBatch = Self.frameIsBatch(frame)
         var simulatedActive = active
         var simulatedNextOrdinal = nextRequestOrdinal
         var operations: [Operation] = []
@@ -672,7 +708,14 @@ public actor JSONRPCBridgeLedger {
                     )
                 }
                 simulatedNextOrdinal &+= 1
-                let metadata = RequestMetadata(method: method, tool: tool, ordinal: simulatedNextOrdinal)
+                let metadata = RequestMetadata(
+                    method: method,
+                    tool: tool,
+                    ordinal: simulatedNextOrdinal,
+                    isReplayable: direction == .clientToServer
+                        && !frameIsBatch
+                        && JSONRPCBridgeReplayPolicy.isReplayableClientRequest(method: method, tool: tool)
+                )
                 if let existingState = simulatedActive[key] {
                     guard case let .responseInDelivery(
                         responseMetadata,
@@ -771,7 +814,12 @@ public actor JSONRPCBridgeLedger {
                         )
                     }
                     simulatedNextOrdinal &+= 1
-                    let metadata = RequestMetadata(method: nil, tool: nil, ordinal: simulatedNextOrdinal)
+                    let metadata = RequestMetadata(
+                        method: nil,
+                        tool: nil,
+                        ordinal: simulatedNextOrdinal,
+                        isReplayable: false
+                    )
                     if let existingState = simulatedActive[key] {
                         guard case let .responseInDelivery(
                             responseMetadata,
@@ -1117,7 +1165,8 @@ public actor JSONRPCBridgeLedger {
     private static func replayableClientRequestCount(in states: [RequestKey: RequestState]) -> Int {
         states.reduce(0) { partial, element in
             guard element.key.direction == .clientToServer,
-                  case .forwarded = element.value
+                  case let .forwarded(metadata) = element.value,
+                  metadata.isReplayable
             else {
                 return partial
             }
@@ -1269,6 +1318,18 @@ public actor JSONRPCBridgeLedger {
             }
         }
         return messages
+    }
+
+    private static func frameIsBatch(_ frame: Data) -> Bool {
+        for byte in frame {
+            switch byte {
+            case UInt8(ascii: " "), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\t"):
+                continue
+            default:
+                return byte == UInt8(ascii: "[")
+            }
+        }
+        return false
     }
 
     private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {

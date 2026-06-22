@@ -393,6 +393,7 @@ actor ClientIdentityCache {
 struct MCPInitializeReplayPlan: Equatable {
     let initializeFrame: Data
     let initializeRequestID: JSONRPCBridgeID
+    let initializeResultFingerprint: String
     let initializedFrame: Data
 }
 
@@ -409,6 +410,7 @@ enum MCPInitializeReplayUnavailableReason: String, Swift.Error, Equatable {
 actor MCPInitializeReplayState {
     private var initializeFrame: Data?
     private var initializeRequestID: JSONRPCBridgeID?
+    private var initializeResultFingerprint: String?
     private var initializedFrame: Data?
     private var initializeResponseDeliveredToHost = false
 
@@ -444,13 +446,15 @@ actor MCPInitializeReplayState {
               let object = Self.jsonObject(from: frame),
               let id = Self.jsonRPCID(from: object["id"]),
               id == initializeRequestID,
-              object["result"] != nil,
+              let result = object["result"],
+              let resultFingerprint = Self.initializeCompatibilityFingerprint(result),
               object["error"] == nil
         else {
             return
         }
 
         initializeResponseDeliveredToHost = true
+        initializeResultFingerprint = resultFingerprint
         debugLog("MCPInitializeReplayState: initialize response delivered to host id=\(id)")
     }
 
@@ -458,7 +462,7 @@ actor MCPInitializeReplayState {
         guard let initializeFrame, let initializeRequestID else {
             return .failure(.missingInitializeFrame)
         }
-        guard initializeResponseDeliveredToHost else {
+        guard initializeResponseDeliveredToHost, let initializeResultFingerprint else {
             return .failure(.initializeResponseNotDelivered)
         }
         guard let initializedFrame else {
@@ -468,6 +472,7 @@ actor MCPInitializeReplayState {
         return .success(MCPInitializeReplayPlan(
             initializeFrame: initializeFrame,
             initializeRequestID: initializeRequestID,
+            initializeResultFingerprint: initializeResultFingerprint,
             initializedFrame: initializedFrame
         ))
     }
@@ -486,6 +491,26 @@ actor MCPInitializeReplayState {
         }
         return nil
     }
+
+    static func canonicalJSONFingerprint(_ value: Any) -> String? {
+        guard JSONSerialization.isValidJSONObject(value),
+              let data = try? JSONSerialization.data(
+                  withJSONObject: value,
+                  options: [.sortedKeys, .withoutEscapingSlashes]
+              )
+        else {
+            return nil
+        }
+        return MCPResponseDeliveryTracer.sha256Hex(data)
+    }
+
+    static func initializeCompatibilityFingerprint(_ value: Any) -> String? {
+        guard let result = value as? [String: Any] else { return nil }
+        return canonicalJSONFingerprint([
+            "capabilities": result["capabilities"] ?? [String: Any](),
+            "protocolVersion": result["protocolVersion"] ?? NSNull()
+        ])
+    }
 }
 
 actor MCPOutstandingRequestReplayState {
@@ -499,6 +524,7 @@ actor MCPOutstandingRequestReplayState {
     private var entries: [JSONRPCBridgeID: Entry] = [:]
 
     func recordForwardedClientFrame(_ frame: Data) {
+        let isBatch = Self.frameIsBatch(frame)
         for object in Self.jsonObjects(from: frame) {
             guard let method = object["method"] as? String else {
                 if let id = MCPInitializeReplayState.jsonRPCID(from: object["id"]) {
@@ -519,16 +545,20 @@ actor MCPOutstandingRequestReplayState {
                   method != "initialize",
                   let id = MCPInitializeReplayState.jsonRPCID(from: object["id"]),
                   id != .null,
-                  let frame = Self.lineFrame(for: object)
+                  !isBatch,
+                  JSONRPCBridgeReplayPolicy.isReplayableClientRequest(
+                      method: method,
+                      tool: Self.toolName(from: object, method: method)
+                  )
             else {
                 continue
             }
 
             if let existing = entries[id] {
-                entries[id] = Entry(id: id, ordinal: existing.ordinal, frame: frame)
+                entries[id] = Entry(id: id, ordinal: existing.ordinal, frame: Self.lineFrame(frame))
             } else {
                 nextOrdinal &+= 1
-                entries[id] = Entry(id: id, ordinal: nextOrdinal, frame: frame)
+                entries[id] = Entry(id: id, ordinal: nextOrdinal, frame: Self.lineFrame(frame))
             }
             debugLog("MCPOutstandingRequestReplayState: cached active client request id=\(id)")
         }
@@ -565,15 +595,32 @@ actor MCPOutstandingRequestReplayState {
         return []
     }
 
-    private static func lineFrame(for object: [String: Any]) -> Data? {
-        guard JSONSerialization.isValidJSONObject(object),
-              let data = try? JSONSerialization.data(withJSONObject: object)
+    private static func frameIsBatch(_ frame: Data) -> Bool {
+        for byte in frame {
+            switch byte {
+            case UInt8(ascii: " "), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\t"):
+                continue
+            default:
+                return byte == UInt8(ascii: "[")
+            }
+        }
+        return false
+    }
+
+    private static func lineFrame(_ frame: Data) -> Data {
+        guard frame.last != UInt8(ascii: "\n") else { return frame }
+        var framed = frame
+        framed.append(UInt8(ascii: "\n"))
+        return framed
+    }
+
+    private static func toolName(from object: [String: Any], method: String) -> String? {
+        guard method == "tools/call",
+              let params = object["params"] as? [String: Any]
         else {
             return nil
         }
-        var frame = data
-        frame.append(UInt8(ascii: "\n"))
-        return frame
+        return params["name"] as? String
     }
 }
 
@@ -698,6 +745,11 @@ enum CLIProxyRuntimePolicy {
             return false
 
         case let .connectionFailed(underlying):
+            if let ledgerError = underlying as? JSONRPCBridgeLedgerError,
+               case .terminal = ledgerError
+            {
+                return false
+            }
             guard let socketError = underlying as? SocketProxyError else {
                 return true
             }
@@ -1307,6 +1359,7 @@ extension BootstrapSocketProxy {
         try await readReplayInitializeResponse(
             socketFD: socketFD,
             expectedID: plan.initializeRequestID,
+            expectedResultFingerprint: plan.initializeResultFingerprint,
             timeout: timeout
         )
         try writeToSocket(plan.initializedFrame, socketFD: socketFD)
@@ -1327,6 +1380,7 @@ extension BootstrapSocketProxy {
     private static func readReplayInitializeResponse(
         socketFD: Int32,
         expectedID: JSONRPCBridgeID,
+        expectedResultFingerprint: String,
         timeout: TimeInterval
     ) async throws {
         var buffer = Data()
@@ -1372,8 +1426,13 @@ extension BootstrapSocketProxy {
                 else {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_response_mismatch")
                 }
-                guard response["result"] != nil, response["error"] == nil else {
+                guard let result = response["result"],
+                      response["error"] == nil
+                else {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_rejected")
+                }
+                guard MCPInitializeReplayState.initializeCompatibilityFingerprint(result) == expectedResultFingerprint else {
+                    throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_result_mismatch")
                 }
                 return
             }
@@ -1834,7 +1893,10 @@ extension BootstrapSocketProxy {
 
                 if let termination = Self.extractTerminateParams(from: data) {
                     let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
-                    throw JSONRPCBridgeLedgerError.terminal(terminalReason)
+                    throw SocketProxyError.terminatedByServer(
+                        reason: TerminationReason(rawValue: terminalReason) ?? termination.reason,
+                        message: termination.message
+                    )
                 }
 
                 let prepared = try await JSONRPCBridgeDelivery.forward(

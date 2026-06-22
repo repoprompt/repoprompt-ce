@@ -48,6 +48,130 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         XCTAssertTrue(gate.snapshot().isTerminal)
     }
 
+    func testOutstandingReplayStateOnlyCachesReplayableSingleRequests() async {
+        let replayState = MCPOutstandingRequestReplayState()
+        let unsafeToolCall = line(#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"apply_edits","arguments":{"path":"README.md","search":"a","replace":"b"}}}"#)
+        let batchedSafeRequest = line(#"[{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]"#)
+        let safeToolCall = line(#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"README.md"}}}"#)
+        let safeMethodRequest = line(#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#)
+
+        await replayState.recordForwardedClientFrame(unsafeToolCall)
+        await replayState.recordForwardedClientFrame(batchedSafeRequest)
+        var frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+
+        await replayState.recordForwardedClientFrame(safeToolCall)
+        await replayState.recordForwardedClientFrame(safeMethodRequest)
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 2)
+        Self.assertJSONLineEqual(frames[0], safeToolCall)
+        Self.assertJSONLineEqual(frames[1], safeMethodRequest)
+
+        await replayState.recordForwardedClientFrame(line(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#))
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], safeMethodRequest)
+
+        await replayState.recordDeliveredServerFrame(line(#"{"jsonrpc":"2.0","id":4,"result":{"tools":[]}}"#))
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+    }
+
+    func testTerminateControlNotificationSurfacesAsServerTermination() async throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        var stdinPipe = [Int32](repeating: -1, count: 2)
+        var stdoutPipe = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        XCTAssertEqual(Darwin.pipe(&stdinPipe), 0)
+        XCTAssertEqual(Darwin.pipe(&stdoutPipe), 0)
+        defer {
+            (sockets + stdinPipe + stdoutPipe).forEach(Self.closeIfOpen)
+        }
+
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        let resultBox = BridgeTaskResultBox()
+        let bridgeTask = Task {
+            do {
+                try await BootstrapSocketProxy.runBridge(
+                    socketFD: sockets[0],
+                    stdinFD: stdinPipe[0],
+                    stdoutFD: stdoutPipe[1],
+                    identityCache: ClientIdentityCache(),
+                    bridgeLedger: ledger,
+                    faultRule: nil
+                )
+                resultBox.store(.success(()))
+            } catch {
+                resultBox.store(.failure(error))
+            }
+        }
+        defer { bridgeTask.cancel() }
+
+        let notification = try XCTUnwrap(
+            RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
+                reason: .toolExecutionWatchdog,
+                message: "watchdog fired"
+            ).encodedJSONLine()
+        )
+        try Self.writeAll(notification, to: sockets[1])
+
+        let completed = await resultBox.waitUntilStored(timeout: .seconds(2))
+        XCTAssertTrue(completed)
+        guard case let .failure(error) = resultBox.load(),
+              let socketError = error as? SocketProxyError,
+              case let .terminatedByServer(reason, message) = socketError
+        else {
+            XCTFail("Expected terminate control notification to surface as server termination")
+            return
+        }
+
+        XCTAssertEqual(reason, .toolExecutionWatchdog)
+        XCTAssertEqual(message, "watchdog fired")
+        let snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.terminalReason, TerminationReason.toolExecutionWatchdog.rawValue)
+        XCTAssertFalse(snapshot.canReconnect)
+    }
+
+    func testInitializeReplayResultMismatchFailsClosedWithoutRetry() async throws {
+        var sockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &sockets), 0)
+        defer { sockets.forEach(Self.closeIfOpen) }
+
+        let initializeFrame = line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"resume-test","version":"1"}}}"#)
+        let originalResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"RepoPrompt CE","version":"old"}}}"#)
+        let changedResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{},"resources":{}},"serverInfo":{"name":"RepoPrompt CE","version":"new"}}}"#)
+        let initializedFrame = line(#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
+        let originalResult = try XCTUnwrap(MCPInitializeReplayState.jsonObject(from: originalResponse)?["result"])
+        let originalFingerprint = try XCTUnwrap(MCPInitializeReplayState.initializeCompatibilityFingerprint(originalResult))
+        let plan = MCPInitializeReplayPlan(
+            initializeFrame: initializeFrame,
+            initializeRequestID: .number(1),
+            initializeResultFingerprint: originalFingerprint,
+            initializedFrame: initializedFrame
+        )
+
+        let replayTask = Task {
+            try await BootstrapSocketProxy.replayInitializedSession(
+                plan,
+                socketFD: sockets[0],
+                timeout: 2
+            )
+        }
+        XCTAssertEqual(try Self.readLine(from: sockets[1], timeout: 2), initializeFrame)
+        try Self.writeAll(changedResponse, to: sockets[1])
+
+        do {
+            try await replayTask.value
+            XCTFail("Expected initialize replay result mismatch to fail closed")
+        } catch let error as JSONRPCBridgeLedgerError {
+            XCTAssertEqual(error, .terminal("mcp_session_resume_initialize_replay_result_mismatch"))
+            XCTAssertFalse(CLIProxyRuntimePolicy.shouldRetry(after: .connectionFailed(underlying: error)))
+        } catch {
+            XCTFail("Unexpected replay error: \(error)")
+        }
+    }
+
     func testProxyHalfCloseDrainsResponseAfterFormerGraceCheckpoint() async throws {
         var sockets = [Int32](repeating: -1, count: 2)
         var stdinPipe = [Int32](repeating: -1, count: 2)
@@ -714,10 +838,32 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
                     try await clock.advanceNext(expected: MCPTimeoutPolicy.boundedToolCancellationCleanupGrace)
 
                     let bridgeResult = try await createdHarness.waitForBridgeResult(timeout: .seconds(10))
-                    guard case let .failure(rawBridgeError) = bridgeResult,
-                          let bridgeError = rawBridgeError as? JSONRPCBridgeLedgerError
-                    else {
-                        XCTFail("Expected execution watchdog to terminate the bridge with a ledger error")
+                    guard case let .failure(rawBridgeError) = bridgeResult else {
+                        XCTFail("Expected execution watchdog to terminate the bridge")
+                        throw WatchdogBridgeFixtureError.unexpectedBridgeResult
+                    }
+                    let bridgeTerminalReason: String
+                    let runtimeError: CLIRuntimeError
+                    switch rawBridgeError {
+                    case let bridgeError as JSONRPCBridgeLedgerError:
+                        guard case let .terminal(reason) = bridgeError else {
+                            XCTFail("Expected terminal ledger error, got \(bridgeError)")
+                            throw WatchdogBridgeFixtureError.unexpectedBridgeResult
+                        }
+                        bridgeTerminalReason = reason
+                        runtimeError = .connectionFailed(underlying: bridgeError)
+                    case let socketError as SocketProxyError:
+                        guard case let .terminatedByServer(reason, message) = socketError else {
+                            XCTFail("Expected server termination socket error, got \(socketError)")
+                            throw WatchdogBridgeFixtureError.unexpectedBridgeResult
+                        }
+                        bridgeTerminalReason = reason?.rawValue ?? "terminated_by_server"
+                        runtimeError = .terminatedByServer(CLIServerTerminationProvenance(
+                            reason: reason,
+                            message: message
+                        ))
+                    default:
+                        XCTFail("Unexpected bridge error: \(rawBridgeError)")
                         throw WatchdogBridgeFixtureError.unexpectedBridgeResult
                     }
 
@@ -740,7 +886,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
                         .contains(terminalReason),
                         terminalReason
                     )
-                    XCTAssertEqual(bridgeError, .terminal(terminalReason))
+                    XCTAssertEqual(bridgeTerminalReason, terminalReason)
                     XCTAssertEqual(terminalSnapshot.activeRequestCount, 1)
                     XCTAssertFalse(terminalSnapshot.canReconnect)
                     XCTAssertEqual(
@@ -766,11 +912,8 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
                     // handleRuntimeError would terminate the test runner. The production mapping
                     // reached after this real watchdog→transport→bridge failure is asserted here;
                     // the pending request's `.closed` result above covers observable stdio EOF.
-                    XCTAssertEqual(
-                        mcpCLIExitCode(for: .connectionFailed(underlying: bridgeError)),
-                        .connectionFailed
-                    )
-                    XCTAssertNotEqual(MCPCLIExitCode.connectionFailed.rawValue, MCPCLIExitCode.ok.rawValue)
+                    XCTAssertEqual(mcpCLIExitCode(for: runtimeError), .terminatedByServer)
+                    XCTAssertNotEqual(MCPCLIExitCode.terminatedByServer.rawValue, MCPCLIExitCode.ok.rawValue)
 
                     await operationGate.release()
                     MCPToolExecutionTracer.setTestSink(nil)

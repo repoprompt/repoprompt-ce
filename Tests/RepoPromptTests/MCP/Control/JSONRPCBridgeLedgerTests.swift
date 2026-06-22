@@ -340,7 +340,7 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertEqual(recentCompletionCount, 2)
     }
 
-    func testReconnectStateAllowsStartupIdleAndActiveClientFailures() async throws {
+    func testReconnectStateAllowsStartupIdleAndReplayableActiveClientFailures() async throws {
         let ledger = try await makeLedger()
         var reconnectSnapshot = await ledger.snapshot()
         XCTAssertTrue(reconnectSnapshot.canReconnect)
@@ -397,6 +397,34 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         try await forward(response(id: "2"), .serverToClient, activeLedger)
         let completedActiveSnapshot = await activeLedger.snapshot()
         XCTAssertEqual(completedActiveSnapshot.activeRequestCount, 0)
+
+        let unsafeActiveLedger = try await makeLedger()
+        try await forward(request(id: "3", method: "tools/call", tool: "apply_edits"), .clientToServer, unsafeActiveLedger)
+        let unsafeFailureWasTerminal = await unsafeActiveLedger.recordConnectionFailure(
+            "socket_reset_with_unsafe_active_request"
+        )
+        XCTAssertTrue(unsafeFailureWasTerminal)
+        let unsafeSnapshot = await unsafeActiveLedger.snapshot()
+        XCTAssertEqual(unsafeSnapshot.terminalReason, "socket_reset_with_unsafe_active_request")
+        XCTAssertEqual(unsafeSnapshot.replayableClientRequestCount, 0)
+        XCTAssertEqual(unsafeSnapshot.unreplayableActiveRequestCount, 1)
+        XCTAssertFalse(unsafeSnapshot.canReconnect)
+
+        let batchLedger = try await makeLedger()
+        try await forward(
+            line(#"[{"jsonrpc":"2.0","id":4,"method":"tools/list"}]"#),
+            .clientToServer,
+            batchLedger
+        )
+        let batchFailureWasTerminal = await batchLedger.recordConnectionFailure(
+            "socket_reset_with_batched_active_request"
+        )
+        XCTAssertTrue(batchFailureWasTerminal)
+        let batchSnapshot = await batchLedger.snapshot()
+        XCTAssertEqual(batchSnapshot.terminalReason, "socket_reset_with_batched_active_request")
+        XCTAssertEqual(batchSnapshot.replayableClientRequestCount, 0)
+        XCTAssertEqual(batchSnapshot.unreplayableActiveRequestCount, 1)
+        XCTAssertFalse(batchSnapshot.canReconnect)
     }
 
     func testAppOriginatedRequestsAreTombstonedAcrossReconnect() async throws {
