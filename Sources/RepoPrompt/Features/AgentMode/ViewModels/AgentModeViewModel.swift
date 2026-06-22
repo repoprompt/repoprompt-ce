@@ -466,7 +466,11 @@ final class AgentModeViewModel: ObservableObject {
         let tabID: UUID?
         var expectedBinding: AgentPersistentSessionBindingIdentity?
         private(set) var isComplete = false
-        private var waiters: [CheckedContinuation<Void, Never>] = []
+        private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+
+        var waiterCount: Int {
+            waiters.count
+        }
 
         init(
             owner: SessionIndexOwner,
@@ -479,18 +483,33 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         func wait() async {
-            guard !isComplete else { return }
-            await withCheckedContinuation { continuation in
-                waiters.append(continuation)
+            guard !isComplete, !Task.isCancelled else { return }
+            let waiterID = UUID()
+            await withTaskCancellationHandler {
+                await withCheckedContinuation { continuation in
+                    guard !isComplete, !Task.isCancelled else {
+                        continuation.resume()
+                        return
+                    }
+                    waiters[waiterID] = continuation
+                }
+            } onCancel: {
+                Task { @MainActor [weak self] in
+                    self?.cancelWaiter(waiterID)
+                }
             }
         }
 
         func complete() {
             guard !isComplete else { return }
             isComplete = true
-            let pending = waiters
+            let pending = Array(waiters.values)
             waiters.removeAll()
             pending.forEach { $0.resume() }
+        }
+
+        private func cancelWaiter(_ waiterID: UUID) {
+            waiters.removeValue(forKey: waiterID)?.resume()
         }
     }
 
@@ -895,6 +914,10 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_waitForInitialActiveSessionRestore() async {
             await awaitInitialActiveSessionRestore()
+        }
+
+        var test_initialActiveSessionRestoreWaiterCount: Int {
+            initialActiveSessionRestoreBarrier?.waiterCount ?? 0
         }
 
         func test_receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
@@ -2917,7 +2940,12 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
-        guard isAgentModeActive else {
+        let isInitialActiveSessionRestore = initialActiveSessionRestoreBarrier.map {
+            !$0.isComplete
+                && $0.owner == sessionIndexOwner
+                && $0.tabID == tabID
+        } ?? false
+        guard isAgentModeActive || isInitialActiveSessionRestore else {
             pendingTabIDForLoad = tabID
             return
         }
@@ -9766,8 +9794,9 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func awaitInitialActiveSessionRestore() async {
-        while let barrier = initialActiveSessionRestoreBarrier {
+        while !Task.isCancelled, let barrier = initialActiveSessionRestoreBarrier {
             await barrier.wait()
+            guard !Task.isCancelled else { return }
             guard initialActiveSessionRestoreBarrier === barrier else { continue }
             return
         }

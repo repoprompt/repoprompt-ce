@@ -55,6 +55,7 @@ struct WindowStateCompositionTestHooks {
         var configureAgentModeViewModel: ((AgentModeViewModel) -> Void)?
         var recordActivationEvent: ((WindowStateCompositionActivationEvent) -> Void)?
         var waitAfterInitialActiveSessionRestore: (@MainActor () async -> Void)?
+        var waitAfterRuntimePublicationReady: (@MainActor () async -> Void)?
     #endif
 }
 
@@ -433,6 +434,34 @@ enum WindowStateCompositionFactory {
             switch adapterRegistry.activate(ticket: ticket) {
             case let .activated(activeTicket), let .alreadyActive(activeTicket):
                 await mcpServer.markRuntimePublicationReady(ticket: activeTicket)
+                #if DEBUG
+                    await testHooks?.waitAfterRuntimePublicationReady?()
+                #endif
+                let lifecycleSnapshot = await lifecycle.snapshot()
+                let routingSnapshot = adapterRegistry.routingSnapshot(windowID: windowID)
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      lifecycleSnapshot?.runtimeID == runtimeID,
+                      lifecycleSnapshot?.sessionID == runtime.sessionID,
+                      lifecycleSnapshot?.state == .active,
+                      lifecycleSnapshot?.runtimeEpochID == readiness.admission.activationID,
+                      routingSnapshot?.runtimeID == runtimeID,
+                      routingSnapshot?.sessionID == runtime.sessionID,
+                      routingSnapshot?.adapterID == runtimeAdapter.adapterID,
+                      routingSnapshot?.mappingGeneration == activeTicket.mappingGeneration
+                else {
+                    mcpServer.beginRuntimeClose()
+                    _ = adapterRegistry.beginClosing(runtimeID: runtimeID)
+                    _ = await lifecycle.beginDraining()
+                    return .failed
+                }
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
+                #endif
+                workspaceManager.completeSelectedSessionInitialization()
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
+                #endif
                 return .published
             case .notFound, .staleTicket, .adapterUnavailable, .invalidState:
                 return .failed
@@ -522,13 +551,6 @@ enum WindowStateCompositionFactory {
                             appCoreContainer.releaseRuntime(windowID: windowID)
                             return
                         }
-                        #if DEBUG
-                            testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
-                        #endif
-                        workspaceManager.completeSelectedSessionInitialization()
-                        #if DEBUG
-                            testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
-                        #endif
                     case let .alreadyHydrated(snapshot):
                         guard let snapshot else {
                             await runtime.shutdown()
@@ -546,13 +568,6 @@ enum WindowStateCompositionFactory {
                             appCoreContainer.releaseRuntime(windowID: windowID)
                             return
                         }
-                        #if DEBUG
-                            testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
-                        #endif
-                        workspaceManager.completeSelectedSessionInitialization()
-                        #if DEBUG
-                            testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
-                        #endif
                     case .failed:
                         await runtime.shutdown()
                         appCoreContainer.releaseRuntime(windowID: windowID)
