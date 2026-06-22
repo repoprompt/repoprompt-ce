@@ -3186,29 +3186,12 @@ final class ContextBuilderAgentViewModel: ObservableObject {
         from selection: StoredSelection,
         lookupContext: WorkspaceLookupContext? = nil
     ) async -> String {
-        if let lookupContext {
-            return await AgentProviderContextBuilder.initialFileTree(
-                selection: selection,
-                store: promptManager.workspaceFileContextStore,
-                lookupContext: lookupContext
-            )
-        }
-
-        let snapshot = await promptManager.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
+        let effectiveLookupContext = lookupContext ?? promptManager.allLoadedWorkspaceLookupContext()
+        let tree = await AgentProviderContextBuilder.initialFileTree(
             selection: selection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: .auto,
-                filePathDisplay: .relative,
-                onlyIncludeRootsWithSelectedFiles: false,
-                includeLegend: true,
-                showCodeMapMarkers: true,
-                rootScope: .allLoaded
-            ),
-            profile: .uiAssisted
+            factualProvider: promptManager.promptFactualContextProvider,
+            lookupContext: effectiveLookupContext
         )
-        debugLog("Generating file tree for \(snapshot.roots.count) roots")
-        debugLog("Selected files count: \(snapshot.selectedFileIDs.count)")
-        let tree = CodeMapExtractor.generateFileTree(using: snapshot)
         debugLog("File tree length: \(tree.count) characters")
         return tree
     }
@@ -3903,7 +3886,7 @@ final class ContextBuilderAgentViewModel: ObservableObject {
             }
 
             await progressReporter?(.payloadPackaging)
-            let aiMessage = await promptManager.buildHeadlessAIMessage(
+            let aiMessage = try await promptManager.buildHeadlessAIMessage(
                 from: HeadlessContextSnapshot(
                     tabID: tabID,
                     promptText: prompt,

@@ -11,12 +11,14 @@ struct WorkspaceSessionRuntimeBundle: @unchecked Sendable {
     let commandIngress: any WorkspaceSessionCommandIngress
     let hydrate: @Sendable () async -> WorkspaceSessionHydrationResult
     let activateAfterApplyingFirstSnapshot: @Sendable (UInt64) async -> WorkspaceSessionActivationResult
+    let factualProvider: any PromptFactualContextProviding
     let shutdown: @Sendable () async -> Void
 }
 
 struct WorkspaceSessionRuntimeBootstrap: @unchecked Sendable {
     let sessionID: WorkspaceSessionID
     let commandIngress: DeferredWorkspaceSessionIngress
+    let factualProvider: DeferredPromptFactualContextProvider
     let runtimeTask: Task<WorkspaceSessionRuntimeBundle, Error>
 }
 
@@ -78,6 +80,7 @@ final class RepoPromptAppCoreContainer {
                             sequence: sequence
                         )
                     },
+                    factualProvider: CorePromptFactualContextProvider(handle: registration.handle),
                     shutdown: {
                         await coreHost.removeSession(registration.sessionID)
                     }
@@ -102,6 +105,7 @@ final class RepoPromptAppCoreContainer {
         precondition(claimedWindowIDs.insert(windowID).inserted, "window already claimed writable workspace authority")
         let sessionID = WorkspaceSessionID()
         let deferred = DeferredWorkspaceSessionIngress(sessionID: sessionID)
+        let deferredFactualProvider = DeferredPromptFactualContextProvider()
         let selectedBackend = selectedBackend
         let coreHost = coreHost
         let task = Task<WorkspaceSessionRuntimeBundle, Error> { @MainActor [weak self] in
@@ -124,12 +128,14 @@ final class RepoPromptAppCoreContainer {
                                 sequence: sequence
                             )
                         },
+                        factualProvider: CorePromptFactualContextProvider(handle: registration.handle),
                         shutdown: { await coreHost.removeSession(sessionID) }
                     )
                 case .legacy:
                     bundle = try await legacyFactory(sessionID)
                 }
                 await deferred.bind(bundle.commandIngress)
+                await deferredFactualProvider.bind(bundle.factualProvider)
                 return bundle
             } catch {
                 self?.claimedWindowIDs.remove(windowID)
@@ -139,6 +145,7 @@ final class RepoPromptAppCoreContainer {
         return WorkspaceSessionRuntimeBootstrap(
             sessionID: sessionID,
             commandIngress: deferred,
+            factualProvider: deferredFactualProvider,
             runtimeTask: task
         )
     }

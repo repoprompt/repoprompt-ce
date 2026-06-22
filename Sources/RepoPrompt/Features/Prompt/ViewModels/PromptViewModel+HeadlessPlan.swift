@@ -62,7 +62,7 @@ extension PromptViewModel {
         model: AIModel,
         mode: HeadlessMode = .plan,
         gitScopeOverride: GitInclusion? = nil
-    ) async -> AIMessage {
+    ) async throws -> AIMessage {
         let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
         let headlessConfig = PromptContextResolved(
             includeFiles: true,
@@ -74,34 +74,23 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
-        let preAssembly = await preAssemblePromptContext(
+        let outcome = await preAssemblePromptContext(
             cfg: headlessConfig,
             selection: snapshot.selection,
             lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
             reviewGitContext: snapshot.reviewGitContext
         )
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
-
-        // 2. Generate file contents. Preserve legacy formatting unless an authoritative
-        // Agent Mode lookup context requires physical paths to be projected logically.
-        let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
-            { entry in preAssembly.displayPath(for: entry) }
-        } else {
-            nil
+        let preAssembly: PromptContextPreAssemblyResult = switch outcome {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
         }
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: displayPathResolver
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
+
+        // Core already rendered the exact factual generation with logical paths.
+        let fileBlocks = preAssembly.rendered.contentBlocks
 
         // 3. Combine the frozen file tree with only the canonical codemap partition.
-        let fileTree = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
+        let fileTree = preAssembly.rendered.combinedFileMapContent ?? ""
 
         // 4. System prompt based on mode
         let systemPrompt: String = {

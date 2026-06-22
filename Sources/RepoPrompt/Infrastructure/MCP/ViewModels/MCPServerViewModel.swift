@@ -1486,8 +1486,8 @@ final class MCPServerViewModel: ObservableObject {
             return try await buildExportSelectedFileInfos(resolvedContext: resolvedContext, cfg: cfg, selectionOverride: selectionOverride, display: display)
         },
         buildTabClipboardContent: { [weak self] cfg, context in
-            guard let self else { return "" }
-            return await buildTabClipboardContent(cfg: cfg, context: context)
+            guard let self else { throw MCPError.internalError("Window deallocated while building prompt context") }
+            return try await buildTabClipboardContent(cfg: cfg, context: context)
         },
         writePromptExportFile: { [weak self] path, content in
             guard let self else { throw MCPError.internalError("Window deallocated while exporting prompt") }

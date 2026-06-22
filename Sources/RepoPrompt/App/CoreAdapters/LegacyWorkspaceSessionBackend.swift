@@ -197,6 +197,34 @@ actor LegacyWorkspaceSessionBackend: WorkspaceSessionCommandIngress {
         )
     }
 
+    func capturePromptFactualContext(
+        admission: WorkspaceSessionAdmissionToken,
+        request: PromptFactualCaptureRequest
+    ) async -> PromptFactualCaptureOutcome {
+        guard !isShuttingDown else { return .unavailable(.closedSession) }
+        guard validatesPromptAdmission(admission) else { return .unavailable(.staleGeneration) }
+        var outcome = await lifecycleOwner.capturePromptFactualContext(request)
+        if case .unavailable(.staleGeneration) = outcome,
+           validatesPromptAdmission(admission)
+        {
+            outcome = await lifecycleOwner.capturePromptFactualContext(request)
+        }
+        guard !Task.isCancelled else { return .cancelled }
+        guard validatesPromptAdmission(admission) else { return .unavailable(.staleGeneration) }
+        return outcome
+    }
+
+    private func validatesPromptAdmission(_ admission: WorkspaceSessionAdmissionToken) -> Bool {
+        guard let snapshot,
+              snapshot.availability == .active,
+              snapshot.readiness.isReady,
+              admission.sessionID == sessionID,
+              admission.activationID == activationID
+        else { return false }
+        return admission.admittedGeneration == snapshot.stateGeneration
+            && snapshot.snapshotSequence >= admission.snapshotSequence
+    }
+
     func execute(_ envelope: WorkspaceSessionCommandEnvelope) async -> WorkspaceSessionCommandResult {
         if let cached = cachedResults[envelope.commandID] { return cached }
         if let task = inFlightCommands[envelope.commandID] { return await task.value }

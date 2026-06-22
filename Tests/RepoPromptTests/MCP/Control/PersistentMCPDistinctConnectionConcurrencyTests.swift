@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -1364,6 +1365,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 WindowState()
             }
             let windowB = WindowState()
+            windowA.promptManager.attachPromptFactualContextProvider(
+                PersistentMCPTestFactualProvider(store: windowA.workspaceFileContextStore)
+            )
+            windowB.promptManager.attachPromptFactualContextProvider(
+                PersistentMCPTestFactualProvider(store: windowB.workspaceFileContextStore)
+            )
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -2168,5 +2175,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         case exactAbsoluteCatalogMiss
         case routingServiceUnavailable
         case toolReturnedError(String)
+    }
+
+    private struct PersistentMCPTestFactualProvider: PromptFactualContextProviding {
+        let store: WorkspaceFileContextStore
+
+        func capture(
+            _ request: PromptFactualCaptureRequest,
+            admission _: WorkspaceSessionAdmissionToken?
+        ) async -> PromptFactualCaptureOutcome {
+            for _ in 0 ..< 8 {
+                let outcome = await PromptFactualContextCaptureService.capture(request: request, store: store)
+                guard case .unavailable(.staleGeneration) = outcome else { return outcome }
+                await Task.yield()
+            }
+            return .unavailable(.staleGeneration)
+        }
     }
 #endif

@@ -55,3 +55,13 @@ wrap or instantiate the app's current mutable engine as a shortcut.
 - Converge headless onto the shared Core session graph only in Phase 9+.
 - Phase 7, not Phase 5, owns draining request counts, replacement routing, and
   weak runtime adapter registries.
+
+## Phase 6 append — factual compatibility retirement (2026-06-21)
+
+- Remove `LegacyPromptFactualContextProvider` with the Phase 5 legacy backend only
+  after Phase 8 rollback support expires.
+- Remove app aliases/DEBUG compatibility projections for Core prompt accounting,
+  token values, and legacy mixed-layer XCTest assertions in Phase 9.
+- Converge remaining specialized selection/code-structure presentation adapters
+  only after their external DTO contracts are characterized; do not reintroduce
+  store-backed common prompt/export rendering.

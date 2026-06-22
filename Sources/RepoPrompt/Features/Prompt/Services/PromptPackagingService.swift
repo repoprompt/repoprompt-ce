@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct MetaInstruction {
     let title: String
@@ -306,6 +307,79 @@ enum PromptPackagingService {
             .filter { !$0.isEmpty }
             .joined(separator: "\n\n")
         return combined.isEmpty ? nil : combined
+    }
+
+    /// Phase 6 common packaging path. All workspace facts are already rendered from one
+    /// admitted Core generation, and Git fallback has already been resolved by preassembly.
+    static func generateClipboardContent(
+        metaInstructions: [MetaInstruction],
+        userInstructions: String,
+        factualSections: PromptFactualRenderedSections,
+        gitDiff: String?,
+        includeSavedPrompts: Bool,
+        includeFiles: Bool,
+        includeUserPrompt: Bool,
+        includeDatetimeInUserInstructions: Bool = false,
+        promptSectionsOrder: [PromptSection],
+        disabledPromptSections: Set<PromptSection>,
+        duplicateUserInstructionsAtTop: Bool,
+        tabTitle: String? = nil
+    ) -> String {
+        var snippets: [PromptSection: String] = [:]
+
+        if let combinedMap = factualSections.combinedFileMapContent {
+            snippets[.fileMap] = """
+            <file_map>
+            \(combinedMap)
+            </file_map>
+
+            """
+        }
+        if includeFiles, !factualSections.contentBlocks.isEmpty {
+            snippets[.fileContents] = """
+            <file_contents>
+            \(factualSections.contentBlocks.joined(separator: "\n\n"))
+            </file_contents>
+
+            """
+        }
+        if includeSavedPrompts, let metaSnippet = buildMetaPromptsSnippet(metaInstructions) {
+            snippets[.metaPrompts] = metaSnippet
+        }
+        if let gitDiff, !gitDiff.isEmpty {
+            snippets[.gitDiff] = """
+            <git_diff>
+            \(gitDiff)
+            </git_diff>
+
+            """
+        }
+        if includeUserPrompt, !userInstructions.isEmpty {
+            if includeDatetimeInUserInstructions {
+                let formatter = DateFormatter()
+                formatter.dateFormat = "yyyy-MM-dd'T'HH:mm"
+                snippets[.userInstructions] = """
+                <user_instructions date="\(formatter.string(from: Date()))">
+                \(userInstructions)
+                </user_instructions>
+
+                """
+            } else {
+                snippets[.userInstructions] = """
+                <user_instructions>
+                \(userInstructions)
+                </user_instructions>
+
+                """
+            }
+        }
+        let content = PromptAssemblyBuilder.build(
+            order: promptSectionsOrder,
+            disabled: disabledPromptSections,
+            duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop,
+            snippets: snippets
+        )
+        return (titleSnippet(for: tabTitle) ?? "") + content
     }
 
     static func generatePartitionedFileBlocks(

@@ -189,6 +189,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
                     )
                 }
             )
+            composition.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: composition.workspaceFileContextStore)
+            )
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             await composition.workspaceManager.awaitInitialized()
 
@@ -279,6 +282,9 @@ final class ContextBuilderMCPProgressTimelineTests: XCTestCase {
             let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState { _, _, _ in provider }
+            window.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: window.workspaceFileContextStore)
+            )
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
             WindowStatesManager.shared.registerWindowState(window)
             defer { WindowStatesManager.shared.unregisterWindowState(window) }

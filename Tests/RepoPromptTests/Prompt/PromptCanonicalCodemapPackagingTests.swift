@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -56,7 +57,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         let config = makeAutoConfig()
         let conversation = [ConversationEntry(role: .user, content: "Inspect the canonical context.")]
 
-        let withoutCanonicalCodemap = await prompt.packagePrompt(
+        let withoutCanonicalCodemap = try await prompt.packagePrompt(
             conversation: conversation,
             overridePromptConfig: config,
             overrideMode: .chat,
@@ -70,7 +71,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         XCTAssertFalse(withoutCanonicalCodemap.fileTree.contains("targetCodemapSymbol"))
         XCTAssertFalse(withoutCanonicalCodemap.fileTree.contains("<Referenced APIs>"))
 
-        let canonicalMessage = await prompt.packagePrompt(
+        let canonicalMessage = try await prompt.packagePrompt(
             conversation: conversation,
             overridePromptConfig: config,
             overrideMode: .chat,
@@ -154,7 +155,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             emptyCanonicalSelection,
             forTabID: tabID
         )
-        let withoutCanonicalCodemap = await window.promptManager.buildClipboard(
+        let withoutCanonicalCodemap = try await window.promptManager.buildClipboard(
             for: makeAutoConfig(),
             promptTextOverride: ""
         )
@@ -183,8 +184,14 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             selection: capturedSelection,
             lookupContext: window.promptManager.allLoadedWorkspaceLookupContext()
         )
-        XCTAssertEqual(preAssembly.entries.filter(\.isCodemap).map(\.file.standardizedFullPath), [targetURL.standardizedFileURL.path])
-        let canonicalClipboard = await window.promptManager.buildClipboard(
+        guard case let .ready(resolvedPreAssembly) = preAssembly else {
+            return XCTFail("Expected factual preassembly")
+        }
+        XCTAssertEqual(
+            resolvedPreAssembly.factualSnapshot.entries.filter(\.isCodemap).map(\.fileName),
+            [targetURL.lastPathComponent]
+        )
+        let canonicalClipboard = try await window.promptManager.buildClipboard(
             for: makeAutoConfig(),
             promptTextOverride: ""
         )
@@ -275,7 +282,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             bindingProjection: projection
         )
         let prompt = makePrompt(store: store, windowID: -9802)
-        let message = await prompt.buildHeadlessAIMessage(
+        let message = try await prompt.buildHeadlessAIMessage(
             from: HeadlessContextSnapshot(
                 tabID: UUID(),
                 promptText: "Inspect the frozen worktree context.",
@@ -315,6 +322,9 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
+        window.promptManager.attachPromptFactualContextProvider(
+            PromptCanonicalTestFactualProvider(store: window.workspaceFileContextStore)
+        )
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 
@@ -343,12 +353,14 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             keyManager: keyManager,
             loadStoredDataOnInit: false
         )
-        return PromptViewModel(
+        let prompt = PromptViewModel(
             fileManager: WorkspaceFilesViewModel(workspaceFileContextStore: store),
             apiSettingsViewModel: apiSettings,
             windowID: windowID,
             settingsManager: WindowSettingsManager(windowID: windowID)
         )
+        prompt.attachPromptFactualContextProvider(PromptCanonicalTestFactualProvider(store: store))
+        return prompt
     }
 
     private func makeAutoConfig() -> PromptContextResolved {
@@ -392,5 +404,18 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
 
     private func occurrences(of needle: String, in text: String) -> Int {
         text.components(separatedBy: needle).count - 1
+    }
+}
+
+private struct PromptCanonicalTestFactualProvider: PromptFactualContextProviding {
+    let store: WorkspaceFileContextStore
+
+    func capture(
+        _ request: PromptFactualCaptureRequest,
+        admission _: WorkspaceSessionAdmissionToken?
+    ) async -> PromptFactualCaptureOutcome {
+        let first = await PromptFactualContextCaptureService.capture(request: request, store: store)
+        guard case .unavailable(.staleGeneration) = first else { return first }
+        return await PromptFactualContextCaptureService.capture(request: request, store: store)
     }
 }

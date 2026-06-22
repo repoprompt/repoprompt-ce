@@ -115,6 +115,7 @@ enum WindowStateCompositionFactory {
                     activateAfterApplyingFirstSnapshot: { sequence in
                         await backend.activate(appliedSnapshotSequence: sequence)
                     },
+                    factualProvider: LegacyPromptFactualContextProvider(backend: backend),
                     shutdown: { await backend.shutdown() }
                 )
             }
@@ -150,6 +151,9 @@ enum WindowStateCompositionFactory {
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
             settingsManager: settingsManager
+        )
+        promptManager.attachPromptFactualContextProvider(
+            runtimeBootstrap?.factualProvider ?? UnavailablePromptFactualContextProvider()
         )
 
         // 7) Create the workspace manager

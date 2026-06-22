@@ -19,6 +19,11 @@ enum GitArtifactPublishError: LocalizedError {
     }
 }
 
+enum PromptFactualPackagingError: Error, Equatable {
+    case unavailable(PromptFactualCaptureFailure)
+    case cancelled
+}
+
 @MainActor
 enum FilesTabSelection: Equatable {
     case followDefault
@@ -118,6 +123,9 @@ class PromptViewModel: ObservableObject {
     @Published private(set) var queryIdentifier = UUID()
     private weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
+    private(set) var promptFactualContextProvider: any PromptFactualContextProviding =
+        UnavailablePromptFactualContextProvider()
+    @Published private(set) var factualContextUnavailableMessage: String?
 
     // MARK: - Compose Tabs
 
@@ -2262,6 +2270,10 @@ class PromptViewModel: ObservableObject {
         selectionCoordinator = coordinator
     }
 
+    func attachPromptFactualContextProvider(_ provider: any PromptFactualContextProviding) {
+        promptFactualContextProvider = provider
+    }
+
     // MARK: - Tab Close Listener Management
 
     /// Registers a listener to be called before compose tabs are closed.
@@ -4013,6 +4025,15 @@ class PromptViewModel: ObservableObject {
             },
             getStoredSelection: { [weak self] in
                 self?.currentActiveComposeTabStoredSelectionForTokenCounting()
+            },
+            getFactualContext: { [weak self] in
+                guard let self else { return .unavailable(.closedSession) }
+                let cfg = applyingGlobalCodeMapOverride(resolvePromptContext())
+                return await preAssemblePromptContext(
+                    cfg: cfg,
+                    selection: activeComposeTabStoredSelectionForPromptPackaging(),
+                    lookupContext: allLoadedWorkspaceLookupContext()
+                )
             }
         )
     }
@@ -4162,25 +4183,28 @@ class PromptViewModel: ObservableObject {
         }()
 
         Task {
-            let preAssembly = await self.preAssemblePromptContext(
+            let outcome = await self.preAssemblePromptContext(
                 cfg: promptContext,
                 selection: selectionSnapshot,
                 lookupContext: self.allLoadedWorkspaceLookupContext()
             )
-            let includeFiles = includeFilesInClipboard && !preAssembly.entries.isEmpty
+            guard case let .ready(preAssembly) = outcome else {
+                await MainActor.run {
+                    self.factualContextUnavailableMessage = "Workspace context changed before it could be copied. Please try again."
+                }
+                return
+            }
+            let includeFiles = includeFilesInClipboard && !preAssembly.factualSnapshot.entries.isEmpty
 
             // Use captured values inside the Task
-            let clipboardContent = await PromptPackagingService.generateClipboardContent(
+            let clipboardContent = PromptPackagingService.generateClipboardContent(
                 metaInstructions: metaInstructions,
                 userInstructions: promptText,
-                files: preAssembly.entries,
-                fileTreeContent: preAssembly.fileTreeContent,
+                factualSections: preAssembly.rendered,
                 gitDiff: preAssembly.gitDiff,
                 includeSavedPrompts: includeSavedPrompts,
                 includeFiles: includeFiles,
                 includeUserPrompt: includeUserPrompt,
-                filePathDisplay: filePathDisplayOption,
-                codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
                 includeDatetimeInUserInstructions: includeDatetime,
                 promptSectionsOrder: promptSectionsOrder,
                 disabledPromptSections: disabledPromptSections,
@@ -4189,6 +4213,7 @@ class PromptViewModel: ObservableObject {
             )
 
             await MainActor.run {
+                self.factualContextUnavailableMessage = nil
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(clipboardContent, forType: .string)
             }
@@ -4928,7 +4953,7 @@ class PromptViewModel: ObservableObject {
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
         reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
-    ) async -> AIMessage {
+    ) async throws -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
         var resolvedConfig: PromptContextResolved = {
@@ -4969,13 +4994,17 @@ class PromptViewModel: ObservableObject {
         } else {
             await freezePromptGitReviewContext(base: gitBaseOverride ?? gitViewModel.selectedDiffBranch)
         }
-        let preAssembly = await preAssemblePromptContext(
+        let preAssemblyOutcome = await preAssemblePromptContext(
             cfg: activeConfig,
             selection: logicalSelection,
             lookupContext: lookupContext,
             reviewGitContext: frozenReviewGitContext
         )
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
+        let preAssembly: PromptContextPreAssemblyResult = switch preAssemblyOutcome {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
+        }
 
         // Identify a stored prompt to be used as SYSTEM prompt when configured
         let idsCandidate = activeConfig.storedPromptIds ?? preset.storedPromptIds
@@ -5010,19 +5039,8 @@ class PromptViewModel: ObservableObject {
         }
 
         // Render the canonical codemap partition with the file map and full/sliced content separately.
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplay,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: { entry in
-                preAssembly.displayPath(for: entry)
-            }
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
-        let fileTreeString = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
+        let fileBlocks = preAssembly.rendered.contentBlocks
+        let fileTreeString = preAssembly.rendered.combinedFileMapContent ?? ""
         let gitDiff = preAssembly.gitDiff
 
         // Meta prompts:
@@ -5567,7 +5585,7 @@ extension PromptViewModel {
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool = false,
         reviewGitContext: FrozenPromptGitReviewContext? = nil
-    ) async -> PromptContextPreAssemblyResult {
+    ) async -> PromptContextPreAssemblyOutcome {
         let frozenReviewContext = if let reviewGitContext {
             reviewGitContext
         } else {
@@ -5590,6 +5608,7 @@ extension PromptViewModel {
                 selection: selection,
                 store: workspaceFileContextStore,
                 lookupContext: lookupContext,
+                factualProvider: promptFactualContextProvider,
                 filePathDisplay: filePathDisplayOption,
                 onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
                 showCodeMapMarkers: !codeMapsGloballyDisabled,
@@ -5664,33 +5683,35 @@ extension PromptViewModel {
         promptTextOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         includeLocalDefinitionsInFileTree: Bool = false
-    ) async -> String {
+    ) async throws -> String {
         let cfg = applyingGlobalCodeMapOverride(inputConfig)
         let promptText = promptTextOverride ?? promptText
         let effectiveSelection = selectionOverride ?? activeComposeTabStoredSelectionForPromptPackaging()
-        let preAssembly = await preAssemblePromptContext(
+        let outcome = await preAssemblePromptContext(
             cfg: cfg,
             selection: effectiveSelection,
             lookupContext: allLoadedWorkspaceLookupContext(),
             includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree
         )
+        let preAssembly: PromptContextPreAssemblyResult = switch outcome {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
+        }
 
         // 2.5) Meta prompts assembly.
         let combinedMeta = metaInstructions(for: cfg)
         let includeMetaBlock = !combinedMeta.isEmpty
 
         // 3) Generate clipboard string via existing packaging service
-        return await PromptPackagingService.generateClipboardContent(
+        return PromptPackagingService.generateClipboardContent(
             metaInstructions: combinedMeta,
             userInstructions: cfg.includeUserPrompt ? promptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
+            factualSections: preAssembly.rendered,
             gitDiff: preAssembly.gitDiff,
             includeSavedPrompts: includeMetaBlock,
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
@@ -5707,7 +5728,9 @@ extension PromptViewModel {
     /// Estimates the token count for a specific Copy preset without mutating UI state.
     func calculateTokensForCopyContext(using preset: CopyPreset, promptTextOverride: String? = nil) async -> Int {
         let cfg = resolvePromptContext(preset, custom: workingCopyCustomizations)
-        let text = await buildClipboard(for: cfg, promptTextOverride: promptTextOverride)
+        guard let text = try? await buildClipboard(for: cfg, promptTextOverride: promptTextOverride) else {
+            return tokenCountingViewModel.latestTokenBreakdown().total
+        }
         return estimateTokens(for: text)
     }
 
@@ -5807,7 +5830,9 @@ extension PromptViewModel {
         // falling back to the current copy configuration only if unavailable.
         let cfg: PromptContextResolved = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
         guard cfg.gitInclusion == .none else {
-            let text = await buildClipboard(for: cfg)
+            guard let text = try? await buildClipboard(for: cfg) else {
+                return tokenCountingViewModel.latestTokenBreakdown().total
+            }
             return estimateTokens(for: text)
         }
         let cacheKey = chatContextTokenBaselineCacheKey(chatPreset: chatPreset, config: cfg)
@@ -5825,10 +5850,10 @@ extension PromptViewModel {
             }
         }
 
-        let text = await buildClipboard(
+        guard let text = try? await buildClipboard(
             for: cfg,
             promptTextOverride: promptTextSnapshot
-        )
+        ) else { return tokenCountingViewModel.latestTokenBreakdown().total }
         let tokenCount = estimateTokens(for: text)
 
         let currentChatPreset = currentChatPreset()
@@ -5851,7 +5876,11 @@ extension PromptViewModel {
     func performCopy(using preset: CopyPreset, promptTextOverride: String? = nil, openApplyXMLTab: Bool = true) {
         let cfg = resolvePromptContext(preset, custom: workingCopyCustomizations)
         Task {
-            let clipboard = await buildClipboard(for: cfg, promptTextOverride: promptTextOverride)
+            guard let clipboard = try? await buildClipboard(for: cfg, promptTextOverride: promptTextOverride) else {
+                factualContextUnavailableMessage = "Workspace context changed before it could be copied. Please try again."
+                return
+            }
+            factualContextUnavailableMessage = nil
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(clipboard, forType: .string)
         }

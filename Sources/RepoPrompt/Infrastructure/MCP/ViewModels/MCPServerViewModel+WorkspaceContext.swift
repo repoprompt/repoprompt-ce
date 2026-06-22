@@ -40,6 +40,59 @@ extension MCPServerViewModel {
         // Get effective copy usage from resolved config
         let copyUsage = effectiveMCPCodeMapUsage(resolvedCfg.codeMapUsage)
 
+        let needsFactualContext = include.contains("files")
+            || include.contains("tree")
+            || include.contains("tokens")
+        var factualContext: PromptContextPreAssemblyResult?
+        if needsFactualContext {
+            var factualCfg = resolvedCfg
+            factualCfg.includeFiles = include.contains("files") || include.contains("tokens")
+            factualCfg.codeMapUsage = effectiveMCPCodeMapUsage(.auto)
+            if include.contains("tree") {
+                factualCfg.includeFileTree = true
+                factualCfg.fileTreeMode = .selected
+            }
+            let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+                workspaceID: context.workspaceID,
+                tabID: context.tabID,
+                sessionID: context.activeAgentSessionID,
+                bindings: context.worktreeBindings
+            )
+            let coordinator = AutomaticReviewGitDiffCoordinator()
+            let outcome = await PromptContextPreAssemblyService.resolve(
+                PromptContextPreAssemblyRequest(
+                    cfg: factualCfg,
+                    selection: context.selection,
+                    store: promptVM.workspaceFileContextStore,
+                    lookupContext: lookupContext,
+                    factualProvider: promptVM.promptFactualContextProvider,
+                    admissionToken: ServerNetworkManager.currentAdmittedContextBinding?.admissionToken,
+                    filePathDisplay: display,
+                    onlyIncludeRootsWithSelectedFiles: false,
+                    showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
+                    codeMapUsage: factualCfg.codeMapUsage,
+                    selectedGitDiffFolderPolicy: .filesOnly,
+                    selectedGitDiffLookupProfile: .mcpSelection,
+                    selectedGitDiffArtifactPolicy: .respectGitInclusion,
+                    reviewGitContext: reviewGitContext,
+                    selectedGitDiffProvider: { request in
+                        await coordinator.resolve(request)
+                    },
+                    completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
+                        await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: false)
+                    }
+                )
+            )
+            switch outcome {
+            case let .ready(result):
+                factualContext = result
+            case let .unavailable(failure):
+                throw PromptFactualPackagingError.unavailable(failure)
+            case .cancelled:
+                throw PromptFactualPackagingError.cancelled
+            }
+        }
+
         // Include user preset state when copy mode differs from auto or a global override is active
         let userPresetState = (copyUsage != .auto || promptVM.codeMapsGloballyDisabled) ? buildUserPresetState() : nil
 
@@ -55,22 +108,62 @@ extension MCPServerViewModel {
                 from: source,
                 owner: self,
                 rootScope: lookupContext.rootScope,
-                contentPolicy: include.contains("files") ? .loadContent : .cachedOnly
+                contentPolicy: .cachedOnly
             )
-            let preparedAccounting = await prepareMCPTokenAccounting(
-                context: context,
-                effectiveSelection: effectiveSelection,
-                collections: gathered,
-                resolvedContext: resolvedCfg,
-                lookupContext: lookupContext,
-                activeTabCompatibility: activeTabCompatibility
+            let factualSnapshot = factualContext?.factualSnapshot
+            let entryPairs: [(UUID, PromptEntriesEvaluation.EntryResult)] = (factualSnapshot?.entries ?? []).compactMap { entry in
+                guard let info = factualSnapshot?.tokenResult.fileTokenInfo[entry.fileID] else { return nil }
+                let renderMode: PromptEntriesEvaluation.RenderMode = if entry.isCodemap {
+                    .codemap
+                } else if info.count != info.fullCount {
+                    .slice
+                } else {
+                    .full
+                }
+                return (
+                    entry.fileID,
+                    PromptEntriesEvaluation.EntryResult(
+                        fileID: entry.fileID,
+                        renderMode: renderMode,
+                        displayTokens: info.count,
+                        fullTokens: info.fullCount,
+                        codemapTokens: info.codemapCount
+                    )
+                )
+            }
+            let entryResults = Dictionary(uniqueKeysWithValues: entryPairs)
+            let selectedInstructionsText = promptVM.metaInstructions(
+                for: resolvedCfg,
+                selectedPromptIDsOverride: context.selectedMetaPromptIDs
+            )
+            .map(\.content)
+            .joined(separator: "\n\n")
+            let preparedAccounting = MCPPreparedTokenAccounting(
+                entryResultsByFileID: entryResults,
+                breakdown: TokenCalculationService.calculateComponentBreakdown(
+                    promptText: resolvedCfg.includeUserPrompt ? context.promptText : "",
+                    selectedInstructionsText: selectedInstructionsText,
+                    fileTreeText: factualContext?.fileTreeContent ?? "",
+                    gitDiffText: factualContext?.gitDiff,
+                    metadataText: nil,
+                    duplicateUserInstructionsAtTop: resolvedCfg.includeUserPrompt
+                        && promptVM.duplicateUserInstructionsAtTop
+                ),
+                tokenAccounting: .init(
+                    status: factualSnapshot == nil ? "incomplete" : "fresh",
+                    source: "construction_selected_factual_provider",
+                    refreshPending: factualSnapshot == nil,
+                    incompleteComponents: factualSnapshot == nil ? ["factual_context"] : nil
+                ),
+                activePublishedSnapshot: nil,
+                rendered: factualSnapshot?.rendered
             )
             let reply = await SelectionReplyAssembler.buildSelectedFilesReply(
                 collections: gathered,
                 formatter: formatter,
                 tokens: tokens,
                 userPresetState: userPresetState,
-                copyUsage: copyUsage != .auto ? copyUsage : nil,
+                copyUsage: nil,
                 projection: projectionConfig,
                 entryResultsByFileID: preparedAccounting.entryResultsByFileID
             )
@@ -83,15 +176,7 @@ extension MCPServerViewModel {
 
         var fileBlocks: [String]? = nil
         if include.contains("files") {
-            if let coll = collections {
-                fileBlocks = await SelectionReplyAssembler.generateBlocks(
-                    selected: coll.selected,
-                    display: display,
-                    projection: lookupContext.bindingProjection
-                )
-            } else {
-                fileBlocks = []
-            }
+            fileBlocks = factualContext?.rendered.contentBlocks ?? []
         }
 
         var codeStructDTO: ToolResultDTOs.SelectedCodeStructureDTO? = nil
@@ -102,25 +187,9 @@ extension MCPServerViewModel {
         }
 
         var fileTreeDTO: ToolResultDTOs.FileTreeDTO? = nil
-        var fileTreeTokens = 0
         if include.contains("tree") {
-            let treeSelection = activeTabCompatibility
-                ? storedSelection(for: context, includeCodemapPathsWhenSelectedUsage: true)
-                : effectiveSelection
-            let rawTreeSnapshot = await promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
-                selection: treeSelection,
-                request: WorkspaceFileTreeSnapshotRequest(
-                    mode: .selected,
-                    filePathDisplay: promptVM.filePathDisplayOption,
-                    onlyIncludeRootsWithSelectedFiles: false,
-                    includeLegend: true,
-                    showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
-                    rootScope: lookupContext.rootScope
-                ),
-                profile: .uiAssisted
-            )
-            let treeSnapshot = lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawTreeSnapshot) ?? rawTreeSnapshot
-            if treeSnapshot.roots.isEmpty {
+            let snapshot = factualContext?.factualSnapshot
+            if snapshot?.fileTreeRootCount == 0 {
                 let msg = activeTabCompatibility
                     ? await workspaceContextMessage(forOperation: MCPWindowToolName.getFileTree, path: nil)
                     : await tabWorkspaceContextMessage(forOperation: tabFileTreeToolName, path: nil)
@@ -131,29 +200,26 @@ extension MCPServerViewModel {
                     note: activeTabCompatibility ? "No workspace loaded" : nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: msg)
             } else {
-                let tree = await Task.detached(priority: .userInitiated) {
-                    CodeMapExtractor.generateFileTree(using: treeSnapshot)
-                }.value
+                let tree = snapshot?.rendered.fileTreeContent ?? ""
                 fileTreeDTO = .init(
-                    rootsCount: treeSnapshot.roots.count,
+                    rootsCount: snapshot?.fileTreeRootCount ?? 0,
                     usesLegend: true,
                     tree: tree,
                     note: nil,
                     worktreeScope: worktreeScope
                 )
-                fileTreeTokens = TokenCalculationService.estimateTokens(for: tree)
             }
         }
 
         var tokenStatsDTO: ToolResultDTOs.TokenStats? = nil
-        var userTokenStatsDTO: ToolResultDTOs.TokenStats? = nil
-        var tokenStatsNote: String? = nil
+        let userTokenStatsDTO: ToolResultDTOs.TokenStats? = nil
+        let tokenStatsNote: String? = nil
         if include.contains("tokens") {
-            let fileTokens = selectionReply?.totalTokens ?? 0
-            let filesContentTokens = (selectionReply?.summary?.fullTokens ?? 0) + (selectionReply?.summary?.sliceTokens ?? 0)
-            let codemapsTokens = selectionReply?.summary?.codemapTokens ?? 0
+            let factualTokens = factualContext?.factualSnapshot.tokenResult
+            let fileTokens = factualTokens?.totalTokenCountFilesOnly ?? 0
+            let codemapsTokens = factualTokens?.codeMapTokenCount ?? 0
+            let filesContentTokens = max(0, fileTokens - codemapsTokens)
 
             if let prepared = preparedTokenAccounting {
                 if let published = prepared.activePublishedSnapshot {
@@ -165,19 +231,6 @@ extension MCPServerViewModel {
                         codemapsTokens: codemapsTokens > 0 ? codemapsTokens : nil,
                         breakdown: prepared.breakdown
                     )
-                }
-
-                if let userFileTokens = selectionReply?.userCopyTokens, userFileTokens != fileTokens {
-                    let userContentTokens = selectionReply?.userCopyContentTokens ?? 0
-                    let userCodemapTokens = selectionReply?.userCopyCodemapTokens ?? 0
-                    userTokenStatsDTO = Self.makeTokenStats(
-                        filesTokens: userFileTokens,
-                        filesContentTokens: userContentTokens > 0 ? userContentTokens : nil,
-                        codemapsTokens: userCodemapTokens > 0 ? userCodemapTokens : nil,
-                        breakdown: prepared.breakdown
-                    )
-                    let codemapDelta = fileTokens - userFileTokens
-                    tokenStatsNote = "Difference: \(codemapDelta) codemap tokens (API signatures). Your preset excludes these, so exports use \(userFileTokens) file tokens, not \(fileTokens)."
                 }
             }
         }
@@ -275,7 +328,7 @@ extension MCPServerViewModel {
     func buildTabClipboardContent(
         cfg: PromptContextResolved,
         context: TabScopedContext
-    ) async -> String {
+    ) async throws -> String {
         // Use the resolved tab-scoped context directly.
         // Run-bound sessions and explicitly bound tabs should export from their bound tab
         // state, not from whichever compose tab happens to be active in the UI.
@@ -297,6 +350,8 @@ extension MCPServerViewModel {
                 selection: context.selection,
                 store: store,
                 lookupContext: lookupContext,
+                factualProvider: promptVM.promptFactualContextProvider,
+                admissionToken: ServerNetworkManager.currentAdmittedContextBinding?.admissionToken,
                 filePathDisplay: promptVM.filePathDisplayOption,
                 onlyIncludeRootsWithSelectedFiles: promptVM.onlyIncludeRootsWithSelectedFiles,
                 showCodeMapMarkers: !promptVM.codeMapsGloballyDisabled,
@@ -319,24 +374,23 @@ extension MCPServerViewModel {
         )
         let includeMetaBlock = !combinedMeta.isEmpty
 
-        return await PromptPackagingService.generateClipboardContent(
+        let resolved: PromptContextPreAssemblyResult = switch preAssembly {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
+        }
+        return PromptPackagingService.generateClipboardContent(
             metaInstructions: combinedMeta,
             userInstructions: cfg.includeUserPrompt ? effectivePromptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
-            gitDiff: preAssembly.gitDiff,
+            factualSections: resolved.rendered,
+            gitDiff: resolved.gitDiff,
             includeSavedPrompts: includeMetaBlock,
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: promptVM.filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: promptVM.includeDatetimeInUserInstructions,
             promptSectionsOrder: promptVM.promptSectionsOrder,
             disabledPromptSections: promptVM.disabledPromptSections,
-            duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop,
-            displayPathResolver: { entry in
-                preAssembly.displayPath(for: entry)
-            }
+            duplicateUserInstructionsAtTop: promptVM.duplicateUserInstructionsAtTop
         )
     }
 }

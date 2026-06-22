@@ -1,8 +1,8 @@
 # Core Isolation Execution Packet
 
 **Created:** 2026-06-21
-**Current phase:** Phase 5 — atomic workspace-authority cutover complete; see [phase-5.md](phases/phase-5.md)
-**Disposition:** **GO**
+**Current phase:** Phase 6 — factual prompt projection/accounting complete; see [phase-6.md](phases/phase-6.md)
+**Disposition:** **GO through Phase 6**
 **Production behavior change:** one selected workspace authority with next-launch legacy rollback
 **Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, and `RepoPromptPOSIXSupportTests`
 
@@ -55,6 +55,7 @@ contract. No later phase may depend on fetching those two objects.
 - [Phase 3 evidence and disposition](phases/phase-3.md)
 - [Phase 4 evidence, lifecycle continuation, and final GO disposition](phases/phase-4.md)
 - [Phase 5 authority-cutover execution record](phases/phase-5.md)
+- [Phase 6 factual prompt execution record](phases/phase-6.md)
 - [Deferred Phase 9+ work](deferred-work.md)
 
 ## Mutation policy
@@ -99,3 +100,11 @@ app, and confirmed no matching process remained. Phase 4 is **GO**. Phase 5 bega
 from clean checkpoint `e76b39f1` and is now **GO**: the atomic authority cutover,
 rollback parity, deterministic/package ladder, curated Oracle review, approved
 packaged live smokes, and exact stopped-process proof are all complete.
+
+
+Phase 6 began from clean checkpoint `33b32e47` and is now **GO**. Core owns one
+admitted immutable factual capture, logical projection, tree/codemap/content
+rendering, and accounting generation. The app retains Git authorization and
+capture, provider selection, fallback, envelopes, and presentation. Exact lists,
+all full deterministic/package lanes, the manually curated Oracle review, and the
+approved packaged live capture/stop proof are green. Phase 7+ remains unstarted.

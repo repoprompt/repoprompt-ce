@@ -506,10 +506,98 @@ def validate_sources(root: Path) -> list[str]:
         if "currentAdmittedContextBinding" not in mcp_connection_text:
             errors.append("MCP dispatch must propagate the exact admitted context binding")
 
+    # Phase 6: Core owns deterministic facts only. Git authority and provider closures remain
+    # app policy, and presentation results cannot carry physical filesystem identities.
+    core_prompt_root = root / "Sources/RepoPromptCore/WorkspaceContext/Prompt"
+    if core_prompt_root.is_dir():
+        forbidden_authority = (
+            "VCSService",
+            "GitDiffSnapshotStore",
+            "FrozenPromptGitReviewContext",
+            "SelectedGitArtifactCapability",
+            "AutomaticReviewGitDiffRequest",
+        )
+        for file in sorted(core_prompt_root.rglob("*.swift")):
+            text = file.read_text(encoding="utf-8")
+            for symbol in forbidden_authority:
+                if symbol in text:
+                    errors.append(
+                        f"{file.relative_to(root)} must not discover or carry Git authority; found {symbol}"
+                    )
+
+    factual_models = core_prompt_root / "PromptFactualContextModels.swift"
+    if factual_models.is_file():
+        text = factual_models.read_text(encoding="utf-8")
+        presentation_blocks = re.findall(
+            r"package struct (PromptFactualRenderedSections|PromptFactualEntrySummary|PromptFactualContextSnapshot)\\b.*?\\n}",
+            text,
+            re.DOTALL,
+        )
+        for block in presentation_blocks:
+            # The tuple above returns only the name under Python's findall; inspect each
+            # declaration slice explicitly below.
+            marker = f"package struct {block}"
+            start = text.find(marker)
+            end = text.find("\n}", start)
+            declaration = text[start:end]
+            if re.search(r"package let \\w*(physical|absolute|worktree|fullPath)\\w*", declaration, re.IGNORECASE):
+                errors.append(f"{block} must not expose physical path properties")
+
+    factual_provider_path = root / "Sources/RepoPrompt/App/CoreAdapters/PromptFactualContextProviding.swift"
+    if factual_provider_path.is_file():
+        provider_text = factual_provider_path.read_text(encoding="utf-8")
+        if "WorkspaceSessionAdmissionToken?" not in provider_text:
+            errors.append("Phase 6 factual providers must accept an exact request-scoped admission token")
+
+    packaging_path = root / "Sources/RepoPrompt/Features/Prompt/Services/PromptPackagingService.swift"
+    if packaging_path.is_file():
+        packaging_text = packaging_path.read_text(encoding="utf-8")
+        if "factualSections: PromptFactualRenderedSections" not in packaging_text:
+            errors.append("PromptPackagingService must package already-rendered Phase 6 factual sections")
+
+    preassembly_path = root / "Sources/RepoPrompt/Features/Prompt/Services/PromptContextPreAssemblyService.swift"
+    if preassembly_path.is_file():
+        preassembly_text = preassembly_path.read_text(encoding="utf-8")
+        release_text = re.sub(r"#if DEBUG.*?#endif", "", preassembly_text, flags=re.DOTALL)
+        if "authorizationCatalog: any PromptGitAuthorizationCatalogReading" not in release_text:
+            errors.append("Phase 6 app authorization must use the narrow exact-catalog reader")
+        for forbidden in ("authorizationStore: WorkspaceFileContextStore", "PromptContextAccountingService("):
+            if forbidden in release_text:
+                errors.append(f"PromptContextPreAssemblyService common path bypasses the factual provider; found {forbidden}")
+
+    common_factual_callers = {
+        "Sources/RepoPrompt/Features/AgentMode/Services/AgentProviderContextBuilder.swift": (
+            "factualProvider.capture", ("PromptContextAccountingService(", "makeFileTreeSelectionSnapshot(")
+        ),
+        "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+WorkspaceContext.swift": (
+            "PromptContextPreAssemblyService.resolve", ("makeFileTreeSelectionSnapshot(", "generatePartitionedFileBlocks(")
+        ),
+        "Sources/RepoPrompt/Infrastructure/MCP/ViewModels/MCPServerViewModel+TokenStats.swift": (
+            "PromptContextPreAssemblyService.resolve", ("PromptContextAccountingService(", "makeFileTreeSelectionSnapshot(")
+        ),
+        "Sources/RepoPrompt/Features/AgentMode/Services/AgentContextExportResolver.swift": (
+            "factualProvider:", ()
+        ),
+        "Sources/RepoPrompt/Features/Prompt/ViewModels/PromptViewModel+HeadlessPlan.swift": (
+            "preAssemblePromptContext(", ()
+        ),
+    }
+    for relative, (required, forbidden_symbols) in common_factual_callers.items():
+        caller = root / relative
+        if not caller.is_file():
+            continue
+        caller_text = caller.read_text(encoding="utf-8")
+        if required not in caller_text:
+            errors.append(f"{relative} must use the construction-selected Phase 6 factual provider")
+        for forbidden in forbidden_symbols:
+            if forbidden in caller_text:
+                errors.append(f"{relative} retains a direct common factual path; found {forbidden}")
+
     headless_root = root / "Sources/RepoPromptHeadless"
     if headless_root.is_dir():
         forbidden_headless = (
-            "WorkspaceSessionController(", "RepoPromptCoreSession(", "RepoPromptCoreHost("
+            "WorkspaceSessionController(", "RepoPromptCoreSession(", "RepoPromptCoreHost(",
+            "CorePromptFactualContextProvider(", "LegacyPromptFactualContextProvider("
         )
         for file in sorted(headless_root.rglob("*.swift")):
             text = file.read_text(encoding="utf-8")

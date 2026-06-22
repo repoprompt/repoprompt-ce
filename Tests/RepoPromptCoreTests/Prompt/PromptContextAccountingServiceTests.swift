@@ -1,4 +1,4 @@
-@testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class PromptContextAccountingServiceTests: XCTestCase {
@@ -59,59 +59,40 @@ final class PromptContextAccountingServiceTests: XCTestCase {
             name: logicalRootRecord.name,
             fullPath: worktreeRoot.path
         )
-        let projection = WorkspaceRootBindingProjection(
-            sessionID: UUID(),
-            boundRoots: [
-                .init(
-                    logicalRoot: logicalRootRef,
-                    physicalRoot: physicalRootRef,
-                    binding: AgentSessionWorktreeBinding(
-                        id: "accounting-binding",
-                        repositoryID: "accounting-repository",
-                        repoKey: "accounting-repo",
-                        logicalRootPath: logicalRoot.path,
-                        logicalRootName: logicalRootRecord.name,
-                        worktreeID: "accounting-worktree",
-                        worktreeRootPath: worktreeRoot.path,
-                        source: "test"
-                    )
-                )
-            ],
-            visibleLogicalRoots: [logicalRootRef]
+        let rootScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+            canonicalRootPaths: [],
+            physicalRootPaths: [worktreeRoot.path]
         )
-        let lookupContext = WorkspaceLookupContext(
-            // This test intentionally exercises a dynamic path selector that begins before
-            // the worktree root is loaded. Authoritative file-tool projections use the
-            // identity-pinned `projection.lookupRootScope` instead.
-            rootScope: .sessionBoundWorkspace(
-                canonicalRootPaths: [],
-                physicalRootPaths: [worktreeRoot.path]
-            ),
-            bindingProjection: projection
+        let projection = FrozenWorkspacePathProjection(
+            bindings: [
+                .init(logicalRoot: logicalRootRef, physicalRoot: physicalRootRef)
+            ],
+            visibleLogicalRoots: [logicalRootRef],
+            rootScope: rootScope
         )
         let logicalSelection = StoredSelection(
             selectedPaths: [logicalFile.path],
             codemapAutoEnabled: false
         )
-        let physicalSelection = lookupContext.physicalizeSelection(logicalSelection)
+        let physicalSelection = projection.physicalizeSelection(logicalSelection)
         XCTAssertEqual(physicalSelection.selectedPaths, [worktreeFile.path])
 
         let request = WorkspacePathLookupRequest(
             userPath: worktreeFile.path,
             profile: .uiAssisted,
-            rootScope: lookupContext.rootScope
+            rootScope: rootScope
         )
-        let generationBeforeWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        let generationBeforeWorktreeLoad = await store.catalogGeneration(rootScope: rootScope)
         let lookupBeforeWorktreeLoad = await store.lookupPaths([request])
         XCTAssertTrue(lookupBeforeWorktreeLoad.isEmpty)
 
         let worktreeRootRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
-        let generationAfterWorktreeLoad = await store.catalogGeneration(rootScope: lookupContext.rootScope)
+        let generationAfterWorktreeLoad = await store.catalogGeneration(rootScope: rootScope)
         XCTAssertNotEqual(generationAfterWorktreeLoad, generationBeforeWorktreeLoad)
         let resolution = await PromptContextAccountingService().resolveEntries(
             selection: physicalSelection,
             store: store,
-            rootScope: lookupContext.rootScope,
+            rootScope: rootScope,
             codeMapUsage: .none
         )
 
@@ -429,29 +410,18 @@ final class PromptContextAccountingServiceTests: XCTestCase {
                 codemapAutoEnabled: false
             )
 
-            EditFlowPerf.resetDebugCaptureForTesting()
-            defer { EditFlowPerf.resetDebugCaptureForTesting() }
-            switch EditFlowPerf.beginDebugCapture(label: "complete-codemap-batch", maxSamples: 200) {
-            case .started:
-                break
-            case .busy:
-                XCTFail("Performance capture should start")
-            }
+            let cacheCountBefore = await store.staticPathMatchSnapshotCacheCountForTesting()
 
             let resolution = await service.resolveEntries(
                 selection: selection,
                 store: store,
                 codeMapUsage: .complete
             )
-            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
-            let snapshotBuildCount = capture.stages
-                .filter { $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild) }
-                .reduce(0) { $0 + $1.sampleCount }
+            let cacheCountAfter = await store.staticPathMatchSnapshotCacheCountForTesting()
 
             XCTAssertEqual(resolution.entries.count, fileCount)
             XCTAssertTrue(resolution.entries.allSatisfy { $0.mode == .codemap })
-            XCTAssertEqual(snapshotBuildCount, 1)
-            XCTAssertEqual(capture.droppedSampleCount, 0)
+            XCTAssertLessThanOrEqual(cacheCountAfter - cacheCountBefore, 1)
         #endif
     }
 

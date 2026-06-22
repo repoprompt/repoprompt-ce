@@ -1,20 +1,35 @@
 import Foundation
 
+protocol PromptGitAuthorizationCatalogReading: Sendable {
+    func exactRootRef(path: String, kind: WorkspaceRootKind) async -> WorkspaceRootRef?
+    func exactCatalogFile(
+        absolutePath: String,
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) async -> WorkspaceFileRecord?
+    func readExactCatalogFile(
+        _ file: WorkspaceFileRecord,
+        expectedRoot: WorkspaceRootRef
+    ) async -> String?
+}
+
+extension WorkspaceFileContextStore: PromptGitAuthorizationCatalogReading {}
+
 struct SelectedGitArtifactAuthorizationRequest {
     let physicalSelection: StoredSelection
     let capability: SelectedGitArtifactCapability
-    let store: WorkspaceFileContextStore
+    let catalog: any PromptGitAuthorizationCatalogReading
     let delegationConsumer: SelectedGitArtifactDelegationConsumer?
 
     init(
         physicalSelection: StoredSelection,
         capability: SelectedGitArtifactCapability,
-        store: WorkspaceFileContextStore,
+        store: any PromptGitAuthorizationCatalogReading,
         delegationConsumer: SelectedGitArtifactDelegationConsumer? = nil
     ) {
         self.physicalSelection = physicalSelection
         self.capability = capability
-        self.store = store
+        catalog = store
         self.delegationConsumer = delegationConsumer
     }
 }
@@ -22,18 +37,18 @@ struct SelectedGitArtifactAuthorizationRequest {
 struct ExactSelectedGitArtifactAuthorizationRequest {
     let exactAbsolutePaths: [String]
     let capability: SelectedGitArtifactCapability
-    let store: WorkspaceFileContextStore
+    let catalog: any PromptGitAuthorizationCatalogReading
     let delegationConsumer: SelectedGitArtifactDelegationConsumer?
 
     init(
         exactAbsolutePaths: [String],
         capability: SelectedGitArtifactCapability,
-        store: WorkspaceFileContextStore,
+        store: any PromptGitAuthorizationCatalogReading,
         delegationConsumer: SelectedGitArtifactDelegationConsumer? = nil
     ) {
         self.exactAbsolutePaths = exactAbsolutePaths
         self.capability = capability
-        self.store = store
+        catalog = store
         self.delegationConsumer = delegationConsumer
     }
 }
@@ -70,8 +85,10 @@ struct SelectedGitArtifactAuthorizationResult {
     var rejectedDisplayDiagnostics: [String] {
         dispositions.compactMap { disposition in
             guard case let .rejected(path, reason) = disposition else { return nil }
-            let displayPath = displayAliasesByAbsolutePath[path] ?? path
-            return "\(displayPath): \(reason.diagnosticLabel)"
+            guard let displayAlias = displayAliasesByAbsolutePath[path],
+                  !displayAlias.hasPrefix("/")
+            else { return "selected artifact: \(reason.diagnosticLabel)" }
+            return "\(displayAlias): \(reason.diagnosticLabel)"
         }
     }
 
@@ -211,7 +228,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
             standardizedRoot: capability.workspaceDirectoryPath,
             standardizedRelativePath: "_git_data"
         )
-        let currentGitDataRoot = await request.store.exactRootRef(
+        let currentGitDataRoot = await request.catalog.exactRootRef(
             path: capability.gitDataRoot.standardizedFullPath,
             kind: .workspaceGitData
         )
@@ -259,7 +276,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 dispositions.append(.rejected(path: path, reason: .capabilityRootUnavailable))
                 continue
             }
-            guard let file = await request.store.exactCatalogFile(
+            guard let file = await request.catalog.exactCatalogFile(
                 absolutePath: path,
                 expectedRoot: capability.gitDataRoot,
                 expectedKind: .workspaceGitData
@@ -279,7 +296,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 standardizedRoot: capability.gitDataRoot.standardizedFullPath,
                 standardizedRelativePath: candidate.snapshotRef.snapshotDirRel + "/manifest.json"
             )
-            guard let manifestFile = await request.store.exactCatalogFile(
+            guard let manifestFile = await request.catalog.exactCatalogFile(
                 absolutePath: manifestPath,
                 expectedRoot: capability.gitDataRoot,
                 expectedKind: .workspaceGitData
@@ -287,7 +304,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 dispositions.append(.rejected(path: path, reason: .manifestNotCataloged))
                 continue
             }
-            guard let manifestContent = await request.store.readExactCatalogFile(
+            guard let manifestContent = await request.catalog.readExactCatalogFile(
                 manifestFile,
                 expectedRoot: capability.gitDataRoot
             ) else {
@@ -305,7 +322,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
             guard let checkoutAuthorization = await authorizeCheckout(
                 manifest: manifest,
                 capability: capability,
-                store: request.store
+                catalog: request.catalog
             ) else {
                 let reason: SelectedGitArtifactRejectionReason =
                     manifest.repoRoot == nil ? .repositoryProvenanceMissing : .checkoutProvenanceMismatch
@@ -341,7 +358,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
                 dispositions.append(.rejected(path: path, reason: reason))
                 continue
             }
-            guard let content = await request.store.readExactCatalogFile(
+            guard let content = await request.catalog.readExactCatalogFile(
                 file,
                 expectedRoot: capability.gitDataRoot
             ) else {
@@ -385,7 +402,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
             SelectedGitArtifactAuthorizationRequest(
                 physicalSelection: StoredSelection(selectedPaths: request.exactAbsolutePaths),
                 capability: request.capability,
-                store: request.store,
+                store: request.catalog,
                 delegationConsumer: request.delegationConsumer
             )
         )
@@ -503,7 +520,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
     private func authorizeCheckout(
         manifest: GitDiffSnapshotManifest,
         capability: SelectedGitArtifactCapability,
-        store: WorkspaceFileContextStore
+        catalog: any PromptGitAuthorizationCatalogReading
     ) async -> AuthorizedCheckout? {
         guard let manifestRepoRoot = normalizedRootPath(manifest.repoRoot) else { return nil }
         let boundCheckout = capability.boundCheckouts.first {
@@ -587,7 +604,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
                   visibleCheckout.mainWorktreeRootPath == liveMainWorktreeRoot,
                   visibleCheckout.repositoryID == repositoryIdentity.repositoryID,
                   visibleCheckout.worktreeID == worktreeID,
-                  await visibleCheckoutIsCurrent(visibleCheckout, store: store)
+                  await visibleCheckoutIsCurrent(visibleCheckout, catalog: catalog)
             else { return nil }
             return AuthorizedCheckout(authority: .visibleLinked, provenance: provenance)
         }
@@ -603,7 +620,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
 
         if let visibleCheckout,
            visibleCheckout.kind == .canonical,
-           await !visibleCheckoutIsCurrent(visibleCheckout, store: store)
+           await !visibleCheckoutIsCurrent(visibleCheckout, catalog: catalog)
         {
             return nil
         }
@@ -632,10 +649,10 @@ struct SelectedGitDiffArtifactAuthorizationService {
 
     func visibleRootCheckoutsAreCurrent(
         capability: SelectedGitArtifactCapability,
-        store: WorkspaceFileContextStore
+        store: any PromptGitAuthorizationCatalogReading
     ) async -> Bool {
         for checkout in capability.visibleRootCheckouts {
-            guard await visibleCheckoutIsCurrent(checkout, store: store) else { return false }
+            guard await visibleCheckoutIsCurrent(checkout, catalog: store) else { return false }
         }
         for checkout in capability.visibleRootCheckouts {
             guard await store.exactRootRef(
@@ -648,9 +665,9 @@ struct SelectedGitDiffArtifactAuthorizationService {
 
     private func visibleCheckoutIsCurrent(
         _ checkout: FrozenVisibleGitCheckoutIdentity,
-        store: WorkspaceFileContextStore
+        catalog: any PromptGitAuthorizationCatalogReading
     ) async -> Bool {
-        guard let currentRoot = await store.exactRootRef(
+        guard let currentRoot = await catalog.exactRootRef(
             path: checkout.workspaceRoot.standardizedFullPath,
             kind: .primaryWorkspace
         ),
@@ -689,7 +706,7 @@ struct SelectedGitDiffArtifactAuthorizationService {
         guard repositoryIdentity.repositoryID == checkout.repositoryID,
               worktreeID == checkout.worktreeID
         else { return false }
-        return await store.exactRootRef(
+        return await catalog.exactRootRef(
             path: checkout.workspaceRoot.standardizedFullPath,
             kind: .primaryWorkspace
         ) == checkout.workspaceRoot

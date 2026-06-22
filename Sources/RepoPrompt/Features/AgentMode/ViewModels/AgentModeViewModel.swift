@@ -15038,7 +15038,6 @@ final class AgentModeViewModel: ObservableObject {
         guard let promptManager else {
             return ("", nil)
         }
-        let store = promptManager.workspaceFileContextStore
         let isActiveTab = tabID == currentTabID
         if isActiveTab {
             workspaceManager?.publishActiveComposeTabSnapshot(commitToMemory: true)
@@ -15049,7 +15048,7 @@ final class AgentModeViewModel: ObservableObject {
         let lookupContext = await agentWorkspaceLookupContext(tabID: tabID, session: session)
         let fileTree = await AgentProviderContextBuilder.initialFileTree(
             selection: selection,
-            store: store,
+            factualProvider: promptManager.promptFactualContextProvider,
             lookupContext: lookupContext
         )
         return (fileTree, promptText)
@@ -16027,21 +16026,22 @@ final class AgentModeViewModel: ObservableObject {
         return await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: tokenCap,
-            store: promptManager.workspaceFileContextStore,
+            factualProvider: promptManager.promptFactualContextProvider,
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { [weak self] selection, lookupContext, codemapSnapshotBundle in
-                guard let self, let mcp = mcpServer else { return nil }
-                let reply = await mcp.buildTabSelectionReply(
-                    from: selection,
-                    includeBlocks: false,
-                    display: .relative,
-                    lookupContextOverride: lookupContext,
-                    codemapSnapshotBundle: codemapSnapshotBundle
-                )
-                let summary = ToolOutputFormatter.formatSelectionReplyToString(reply)
+            overTokenCapSummaryProvider: { snapshot in
+                let selectionTokens = snapshot.tokenResult.totalTokenCountFilesOnly
+                    + snapshot.tokenResult.codeMapTokenCount
+                let files = snapshot.entries.map { entry in
+                    entry.isCodemap
+                        ? "- \(entry.logicalDisplayPath) [codemap]"
+                        : "- \(entry.logicalDisplayPath)"
+                }
+                guard !files.isEmpty else { return nil }
                 return """
                 <selection_summary>
-                \(summary)
+                \(snapshot.entries.count) files, ~\(selectionTokens) tokens (contents omitted, exceeds \(tokenCap) token cap)
+
+                \(files.joined(separator: "\n"))
                 </selection_summary>
                 """
             }

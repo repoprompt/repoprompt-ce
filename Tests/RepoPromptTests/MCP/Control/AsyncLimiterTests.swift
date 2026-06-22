@@ -12,7 +12,7 @@ import XCTest
             let recorder = LimiterOrderRecorder()
             let snapshots = LimiterSnapshotSignal()
             await limiter.setDebugStateObserver { snapshot in
-                Task { await snapshots.record(snapshot) }
+                snapshots.record(snapshot)
             }
 
             let holder = Task {
@@ -84,7 +84,7 @@ import XCTest
             }
             let snapshots = LimiterSnapshotSignal()
             await limiter.setDebugStateObserver { snapshot in
-                Task { await snapshots.record(snapshot) }
+                snapshots.record(snapshot)
             }
             _ = await snapshots.waitUntil { $0.waiterCount == 1 }
 
@@ -124,7 +124,7 @@ import XCTest
             let removalCompleted = LimiterTestFlag()
             let snapshots = LimiterSnapshotSignal()
             await limiter.setDebugStateObserver { snapshot in
-                Task { await snapshots.record(snapshot) }
+                snapshots.record(snapshot)
             }
 
             let holder = Task {
@@ -4199,9 +4199,10 @@ import XCTest
         }
     }
 
-    private actor LimiterSnapshotSignal {
+    private final class LimiterSnapshotSignal: @unchecked Sendable {
         typealias Snapshot = AsyncLimiter.DebugSnapshot
 
+        private let lock = NSLock()
         private var latest: Snapshot?
         private var waiter: (
             predicate: @Sendable (Snapshot) -> Bool,
@@ -4209,20 +4210,36 @@ import XCTest
         )?
 
         func record(_ snapshot: Snapshot) {
+            let continuation: CheckedContinuation<Snapshot, Never>?
+            lock.lock()
             latest = snapshot
-            guard let waiter, waiter.predicate(snapshot) else { return }
-            self.waiter = nil
-            waiter.continuation.resume(returning: snapshot)
+            if let waiter, waiter.predicate(snapshot) {
+                self.waiter = nil
+                continuation = waiter.continuation
+            } else {
+                continuation = nil
+            }
+            lock.unlock()
+            continuation?.resume(returning: snapshot)
         }
 
         func waitUntil(
             _ predicate: @escaping @Sendable (Snapshot) -> Bool
         ) async -> Snapshot {
-            if let latest, predicate(latest) {
-                return latest
-            }
-            return await withCheckedContinuation { continuation in
-                waiter = (predicate, continuation)
+            await withCheckedContinuation { continuation in
+                let immediate: Snapshot?
+                lock.lock()
+                if let latest, predicate(latest) {
+                    immediate = latest
+                } else {
+                    precondition(waiter == nil, "limiter snapshot signal supports one waiter")
+                    waiter = (predicate, continuation)
+                    immediate = nil
+                }
+                lock.unlock()
+                if let immediate {
+                    continuation.resume(returning: immediate)
+                }
             }
         }
     }

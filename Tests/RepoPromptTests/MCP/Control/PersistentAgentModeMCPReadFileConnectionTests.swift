@@ -2687,6 +2687,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
+            window.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: window.workspaceFileContextStore)
+            )
+            routingGuardWindow.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: routingGuardWindow.workspaceFileContextStore)
+            )
             await window.workspaceManager.awaitInitialized()
             await routingGuardWindow.workspaceManager.awaitInitialized()
             if agentOwned {

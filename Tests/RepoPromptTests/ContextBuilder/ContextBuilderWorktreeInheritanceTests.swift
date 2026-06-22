@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 #if DEBUG
@@ -227,7 +228,7 @@ import XCTest
                             reviewGitContext.displayContext.roots.first?.physicalRootPath,
                             worktreeRoot.standardizedFileURL.path
                         )
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
@@ -579,6 +580,10 @@ import XCTest
                         ceRoot,
                         to: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
                     )
+                    _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: fixture.contextA.window,
+                        path: ceRoot.path
+                    )
                     let orderedRepoPaths = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.activeWorkspace
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
@@ -654,7 +659,7 @@ import XCTest
                         _, tabID, routedSessionID, routedRunID, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
                         XCTAssertEqual(routedSessionID, sessionID)
                         XCTAssertEqual(routedRunID, parentRunID)
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
@@ -910,7 +915,7 @@ import XCTest
                         }
                     fixture.contextA.window.mcpServer.setContextBuilderFollowUpOverrideForTesting {
                         _, tabID, _, _, mode, prompt, selection, lookupContext, reviewGitContext, _, _ in
-                        let message = await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
+                        let message = try await fixture.contextA.window.promptManager.buildHeadlessAIMessage(
                             from: HeadlessContextSnapshot(
                                 tabID: tabID,
                                 promptText: prompt,
@@ -1008,6 +1013,9 @@ import XCTest
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
+            context.window.promptManager.attachPromptFactualContextProvider(
+                ContextBuilderTestFactualProvider(store: context.window.workspaceFileContextStore)
+            )
             let workspace = try XCTUnwrap(
                 context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
             )
@@ -1481,6 +1489,19 @@ import XCTest
                 selection: selection,
                 lookupContext: lookupContext
             ))
+        }
+    }
+
+    private struct ContextBuilderTestFactualProvider: PromptFactualContextProviding {
+        let store: WorkspaceFileContextStore
+
+        func capture(
+            _ request: PromptFactualCaptureRequest,
+            admission _: WorkspaceSessionAdmissionToken?
+        ) async -> PromptFactualCaptureOutcome {
+            let first = await PromptFactualContextCaptureService.capture(request: request, store: store)
+            guard case .unavailable(.staleGeneration) = first else { return first }
+            return await PromptFactualContextCaptureService.capture(request: request, store: store)
         }
     }
 #endif

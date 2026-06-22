@@ -231,6 +231,33 @@ class CoreIsolationGuardrailTests(unittest.TestCase):
             manager.write_text("func reconcileWorkspaceProjectionMutation() {}\n")
             self.assertTrue(any("receipt-first" in error for error in validate_sources(root)))
 
+    def test_phase_six_core_git_authority_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / TARGET_PATHS["RepoPromptCore"] / "WorkspaceContext/Prompt/Leak.swift"
+            leaked.parent.mkdir(parents=True, exist_ok=True)
+            leaked.write_text("let service: VCSService\n")
+            self.assertTrue(any("must not discover or carry Git authority" in error for error in validate_sources(root)))
+
+    def test_phase_six_headless_factual_provider_construction_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / TARGET_PATHS["RepoPromptHeadless"] / "PromptProviderLeak.swift"
+            leaked.write_text("let provider = CorePromptFactualContextProvider(handle: handle)\n")
+            self.assertTrue(any("must not instantiate Phase 5 app session authority" in error for error in validate_sources(root)))
+
+    def test_phase_six_direct_common_factual_caller_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self._write_minimal_sources(root)
+            leaked = root / "Sources/RepoPrompt/Features/AgentMode/Services/AgentProviderContextBuilder.swift"
+            leaked.parent.mkdir(parents=True, exist_ok=True)
+            leaked.write_text("let accounting = PromptContextAccountingService()\n")
+            errors = validate_sources(root)
+            self.assertTrue(any("retains a direct common factual path" in error for error in errors))
+
     def test_phase_five_raw_store_runtime_exposure_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

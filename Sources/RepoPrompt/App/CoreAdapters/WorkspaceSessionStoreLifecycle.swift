@@ -115,7 +115,10 @@ enum WorkspaceSessionStoreLifecycleFactory {
                 try await storage.hydrate(workspace: workspace, generation: generation)
             },
             unload: { generation in await storage.unload(generation: generation) },
-            close: { await storage.close() }
+            close: { await storage.close() },
+            promptCapture: { request in
+                await PromptFactualContextCaptureService.capture(request: request, store: store)
+            }
         )
     }
 }

@@ -148,6 +148,7 @@ package actor WorkspaceSessionLifecycleOwner {
     private let hydrateClosure: @Sendable (WorkspaceModel?, UInt64) async throws -> WorkspaceSessionLifecycleReadiness
     private let unloadClosure: @Sendable (UInt64) async throws -> Void
     private let closeClosure: @Sendable () async -> Void
+    private let promptCaptureClosure: @Sendable (PromptFactualCaptureRequest) async -> PromptFactualCaptureOutcome
     private var unloadedGenerations: Set<UInt64> = []
     private var isClosed = false
 
@@ -155,12 +156,16 @@ package actor WorkspaceSessionLifecycleOwner {
         query: WorkspaceSessionQueryCapability,
         hydrate: @escaping @Sendable (WorkspaceModel?, UInt64) async throws -> WorkspaceSessionLifecycleReadiness,
         unload: @escaping @Sendable (UInt64) async throws -> Void,
-        close: @escaping @Sendable () async -> Void
+        close: @escaping @Sendable () async -> Void,
+        promptCapture: @escaping @Sendable (PromptFactualCaptureRequest) async -> PromptFactualCaptureOutcome = { _ in
+            .unavailable(.notReady)
+        }
     ) {
         underlyingQuery = query
         hydrateClosure = hydrate
         unloadClosure = unload
         closeClosure = close
+        promptCaptureClosure = promptCapture
     }
 
     package nonisolated func makeQueryCapability() -> WorkspaceSessionQueryCapability {
@@ -214,6 +219,13 @@ package actor WorkspaceSessionLifecycleOwner {
         guard !isClosed else { return }
         isClosed = true
         await closeClosure()
+    }
+
+    package func capturePromptFactualContext(
+        _ request: PromptFactualCaptureRequest
+    ) async -> PromptFactualCaptureOutcome {
+        guard !isClosed else { return .unavailable(.closedSession) }
+        return await promptCaptureClosure(request)
     }
 
     private func queryRoots() async -> [WorkspaceRootRecord] {

@@ -290,6 +290,7 @@ final class WorkspaceAuthorityCutoverTests: XCTestCase {
         let preRuntimeAdmission = await bootstrap.commandIngress.admit()
         XCTAssertEqual(preRuntimeAdmission, .notReady(.hydrating))
         let runtime = try await bootstrap.runtimeTask.value
+        XCTAssertTrue(runtime.factualProvider is CorePromptFactualContextProvider)
         let hydration = await runtime.hydrate()
         guard case let .awaitingFirstSnapshotApplication(first) = hydration else {
             return XCTFail("expected first authoritative snapshot")
@@ -349,12 +350,14 @@ final class WorkspaceAuthorityCutoverTests: XCTestCase {
                     activateAfterApplyingFirstSnapshot: { sequence in
                         await backend.activate(appliedSnapshotSequence: sequence)
                     },
+                    factualProvider: LegacyPromptFactualContextProvider(backend: backend),
                     shutdown: { await backend.shutdown() }
                 )
             }
         )
 
         let runtime = try await bootstrap.runtimeTask.value
+        XCTAssertTrue(runtime.factualProvider is LegacyPromptFactualContextProvider)
         guard case let .awaitingFirstSnapshotApplication(first) = await runtime.hydrate() else {
             return XCTFail("expected rollback snapshot")
         }

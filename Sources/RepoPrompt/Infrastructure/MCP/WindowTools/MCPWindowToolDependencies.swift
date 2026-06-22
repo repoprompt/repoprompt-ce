@@ -273,7 +273,7 @@ struct MCPWindowToolDependencies {
         _ selectionOverride: StoredSelection?,
         _ display: FilePathDisplay
     ) async throws -> [ToolResultDTOs.SelectedFileInfo]
-    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async -> String
+    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async throws -> String
     typealias WritePromptExportFile = @MainActor @Sendable (_ path: String, _ content: String) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 

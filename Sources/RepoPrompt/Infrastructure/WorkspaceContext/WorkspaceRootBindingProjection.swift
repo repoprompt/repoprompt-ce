@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct WorkspaceRootBindingProjection: Equatable {
     let sessionID: UUID
@@ -509,5 +510,20 @@ struct WorkspaceLookupContext: Equatable {
 
     func physicalizeSelection(_ selection: StoredSelection) -> StoredSelection {
         bindingProjection?.physicalizeSelection(selection) ?? selection
+    }
+}
+
+extension WorkspaceRootBindingProjection {
+    func frozenPromptProjection() -> FrozenWorkspacePathProjection {
+        FrozenWorkspacePathProjection(
+            bindings: boundRootsForMetadata.map {
+                FrozenWorkspacePathProjection.RootBinding(
+                    logicalRoot: $0.logicalRoot,
+                    physicalRoot: $0.physicalRoot
+                )
+            },
+            visibleLogicalRoots: visibleLogicalRootRefs,
+            rootScope: lookupRootScope
+        )
     }
 }

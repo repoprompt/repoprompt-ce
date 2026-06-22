@@ -302,3 +302,34 @@ The four comparable warm samples satisfy the required 3–5 series; median is
 the harness-accepted already-active response and continued. Coordinated stop
 ticket `5a7c4020-f8fc-45ed-9597-6220ba84a5ee` exited 0 and confirmed the app is
 stopped.
+
+## Phase 6 append — factual prompt parity and performance (2026-06-21)
+
+Phase 6 preserves the characterized ordering, slices, canonical codemap rendering,
+tree markers, selected-artifact precedence, map-as-context behavior, fallback
+policy, and token estimator. A capture now blocks on accepted/applied ingress and
+is discarded when catalog, codemap, validated worktree lifetime, session
+activation, or state generation changes before completion. This intentionally
+replaces the former plausible mixed-generation result with typed unavailability.
+
+Focused correctness evidence began with Core accounting `fdd66c45` (10 tests),
+Core factual capture/privacy `16f44f83` (3 tests), and root
+authorization/orchestration `245fdb01` (11 tests). After the curated Oracle
+corrections, Core factual capture `8abf30de` (4 tests), root preassembly
+`4f0dc11a` (10 tests), and canonical packaging `a1d62bc2` (3 tests) passed.
+
+Three comparable DEBUG SwiftPM samples of the authorized map/patch
+capture/render/accounting test were:
+
+| Ticket | XCTest seconds | Result |
+| --- | ---: | --- |
+| `3c1af909` | 0.006 | passed |
+| `c2c3b6a0` | 0.006 | passed |
+| `f2ae4eb4` | 0.007 | passed |
+
+Median 0.006 s; range 0.006–0.007 s. This is report-only evidence with no
+arbitrary threshold. The final live packaged `workspace_context` capture selected
+three Phase 6 files and returned 10,199 total tokens: 10,072 selected-file tokens
+plus 127 logical-tree tokens. It explicitly reported fresh accounting from the
+`construction_selected_factual_provider`. Earlier Phase 0 samples remain the
+fixed baseline.

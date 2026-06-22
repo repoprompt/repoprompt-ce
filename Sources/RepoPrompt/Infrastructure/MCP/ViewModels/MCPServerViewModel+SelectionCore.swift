@@ -645,12 +645,13 @@ extension MCPServerViewModel {
             tokens: TokenServices? = nil,
             tokenStatsOverride: ToolResultDTOs.TokenStats? = nil,
             tokenAccountingOverride: ToolResultDTOs.TokenAccountingDTO? = nil,
+            blocksOverride: [String]? = nil,
             pathProjection: WorkspaceRootBindingProjection? = nil,
             displayPathOverrides: [String: String] = [:]
         ) async -> ToolResultDTOs.SelectionReply {
             var blocks: [String]? = nil
             if includeBlocks {
-                let generated = generateBlocks(
+                blocks = blocksOverride ?? generateBlocks(
                     selected: collections.selected,
                     codemap: collections.codemap,
                     codemapSnapshotBundle: collections.codemapSnapshotBundle,
@@ -658,7 +659,6 @@ extension MCPServerViewModel {
                     projection: pathProjection,
                     displayPathOverrides: displayPathOverrides
                 )
-                blocks = generated
             }
 
             var invalid = collections.invalid

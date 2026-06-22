@@ -292,9 +292,9 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
         let effectivePreset = overridePreset ?? activePreset
         let cfg = await MainActor.run { dependencies.promptVM.resolvePromptContext(effectivePreset, custom: dependencies.promptVM.workingCopyCustomizations) }
         let text = if let tabContext {
-            await dependencies.buildTabClipboardContent(cfg, tabContext)
+            try await dependencies.buildTabClipboardContent(cfg, tabContext)
         } else {
-            await dependencies.promptVM.buildClipboard(for: cfg)
+            try await dependencies.promptVM.buildClipboard(for: cfg)
         }
         let pathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
         let rootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)

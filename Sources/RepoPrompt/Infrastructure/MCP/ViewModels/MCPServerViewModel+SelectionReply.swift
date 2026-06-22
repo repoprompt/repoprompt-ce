@@ -352,7 +352,7 @@ extension MCPServerViewModel {
             owner: self,
             rootScope: lookupContext.rootScope.excludingWorkspaceGitData,
             codemapSnapshotBundle: codemapSnapshotBundle,
-            contentPolicy: includeBlocks ? .loadContent : .cachedOnly
+            contentPolicy: .cachedOnly
         )
         let collections = overlaySelectedGitArtifacts(
             artifactAuthorization,
@@ -441,6 +441,7 @@ extension MCPServerViewModel {
             tokens: tokens,
             tokenStatsOverride: tokenStatsOverride,
             tokenAccountingOverride: preparedAccounting.tokenAccounting,
+            blocksOverride: preparedAccounting.rendered.map { $0.contentBlocks + $0.codemapBlocks } ?? [],
             pathProjection: lookupContext.bindingProjection,
             displayPathOverrides: artifactAuthorization.displayAliasesByAbsolutePath
         )

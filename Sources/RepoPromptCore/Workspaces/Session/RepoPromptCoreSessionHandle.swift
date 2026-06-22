@@ -8,6 +8,10 @@ package struct RepoPromptCoreSessionHandle: WorkspaceSessionCommandIngress {
     private let observationsClosure: @Sendable (UInt64?) async -> AsyncStream<WorkspaceSessionSnapshot>
     private let admitClosure: @Sendable () async -> WorkspaceSessionAdmissionResult
     private let executeClosure: @Sendable (WorkspaceSessionCommandEnvelope) async -> WorkspaceSessionCommandResult
+    private let capturePromptClosure: @Sendable (
+        WorkspaceSessionAdmissionToken,
+        PromptFactualCaptureRequest
+    ) async -> PromptFactualCaptureOutcome
     private let shutdownClosure: @Sendable () async -> Void
 
     package init(
@@ -18,6 +22,10 @@ package struct RepoPromptCoreSessionHandle: WorkspaceSessionCommandIngress {
         observations: @escaping @Sendable (UInt64?) async -> AsyncStream<WorkspaceSessionSnapshot>,
         admit: @escaping @Sendable () async -> WorkspaceSessionAdmissionResult,
         execute: @escaping @Sendable (WorkspaceSessionCommandEnvelope) async -> WorkspaceSessionCommandResult,
+        capturePrompt: @escaping @Sendable (
+            WorkspaceSessionAdmissionToken,
+            PromptFactualCaptureRequest
+        ) async -> PromptFactualCaptureOutcome,
         shutdown: @escaping @Sendable () async -> Void
     ) {
         self.sessionID = sessionID
@@ -26,6 +34,7 @@ package struct RepoPromptCoreSessionHandle: WorkspaceSessionCommandIngress {
         observationsClosure = observations
         admitClosure = admit
         executeClosure = execute
+        capturePromptClosure = capturePrompt
         shutdownClosure = shutdown
     }
 
@@ -43,6 +52,13 @@ package struct RepoPromptCoreSessionHandle: WorkspaceSessionCommandIngress {
 
     package func execute(_ command: WorkspaceSessionCommandEnvelope) async -> WorkspaceSessionCommandResult {
         await executeClosure(command)
+    }
+
+    package func capturePromptFactualContext(
+        admission: WorkspaceSessionAdmissionToken,
+        request: PromptFactualCaptureRequest
+    ) async -> PromptFactualCaptureOutcome {
+        await capturePromptClosure(admission, request)
     }
 
     package func shutdown() async {

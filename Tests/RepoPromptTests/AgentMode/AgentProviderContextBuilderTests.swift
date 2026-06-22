@@ -1,4 +1,5 @@
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 final class AgentProviderContextBuilderTests: XCTestCase {
@@ -18,7 +19,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
 
         let fileTree = await AgentProviderContextBuilder.initialFileTree(
             selection: StoredSelection(),
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: lookupContext
         )
 
@@ -34,7 +35,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let block = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: false),
             tokenCap: 10000,
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: lookupContext
         )
 
@@ -45,23 +46,33 @@ final class AgentProviderContextBuilderTests: XCTestCase {
     }
 
     func testForkFileContentsBlockIncludesCanonicalWorktreeCodemapExactlyOnce() async throws {
-        let fixture = try await makeBoundFixture()
-        let lookupContext = await makeLookupContext(fixture: fixture)
-        let logicalCodemapURL = fixture.logicalRoot.appendingPathComponent("Sources/BranchOnly.swift")
-        let worktreeCodemapURL = fixture.worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
+        let missingFixture = try await makeBoundFixture()
+        let missingLookupContext = await makeLookupContext(fixture: missingFixture)
+        let missingLogicalCodemapURL = missingFixture.logicalRoot
+            .appendingPathComponent("Sources/BranchOnly.rpfixture")
         let missingSnapshotBlock = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(
                 selectedPaths: [],
-                autoCodemapPaths: [logicalCodemapURL.path],
+                autoCodemapPaths: [missingLogicalCodemapURL.path],
                 codemapAutoEnabled: true
             ),
             tokenCap: 10000,
-            store: fixture.store,
-            lookupContext: lookupContext
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: missingFixture.store),
+            lookupContext: missingLookupContext
         )
         XCTAssertFalse(missingSnapshotBlock.contains("let branchOnly = true"), missingSnapshotBlock)
         XCTAssertFalse(missingSnapshotBlock.contains("<file_map>"), missingSnapshotBlock)
 
+        let fixture = try await makeBoundFixture()
+        let lookupContext = await makeLookupContext(fixture: fixture)
+        let logicalCodemapURL = fixture.logicalRoot.appendingPathComponent("Sources/BranchOnly.swift")
+        let worktreeCodemapURL = fixture.worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift")
+        await awaitCodemapSnapshot(
+            fixture.store,
+            scope: lookupContext.rootScope,
+            relativePath: "Sources/BranchOnly.swift"
+        )
+        await quiesceCodemapActivity(fixture.store, scope: lookupContext.rootScope)
         await fixture.store.applyObservedCodemapResults([
             WorkspaceObservedCodemapResult(
                 fullPath: worktreeCodemapURL.path,
@@ -69,6 +80,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
                 fileAPI: makeFileAPI(path: worktreeCodemapURL.path, symbolName: "branchOnlyCodemapSymbol")
             )
         ])
+        await awaitStableCatalog(fixture.store, scope: lookupContext.rootScope)
 
         let block = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(
@@ -77,10 +89,9 @@ final class AgentProviderContextBuilderTests: XCTestCase {
                 codemapAutoEnabled: true
             ),
             tokenCap: 10000,
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: lookupContext
         )
-
         XCTAssertTrue(block.contains("<file_map>"), block)
         XCTAssertEqual(block.components(separatedBy: "branchOnlyCodemapSymbol").count - 1, 1, block)
         XCTAssertTrue(block.contains("File: Sources/BranchOnly.swift"), block)
@@ -100,6 +111,12 @@ final class AgentProviderContextBuilderTests: XCTestCase {
             symbolName: "forkCapCodemapSentinel",
             imports: ["Foundation", "Combine"]
         )
+        await awaitCodemapSnapshot(
+            fixture.store,
+            scope: lookupContext.rootScope,
+            relativePath: "Sources/BranchOnly.swift"
+        )
+        await quiesceCodemapActivity(fixture.store, scope: lookupContext.rootScope)
         await fixture.store.applyObservedCodemapResults([
             WorkspaceObservedCodemapResult(
                 fullPath: worktreeURL.path,
@@ -107,6 +124,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
                 fileAPI: api
             )
         ])
+        await awaitStableCatalog(fixture.store, scope: lookupContext.rootScope)
         let selection = StoredSelection(
             autoCodemapPaths: [logicalURL.path],
             codemapAutoEnabled: true
@@ -117,7 +135,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let atCap = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: renderedTokens,
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: lookupContext
         )
         XCTAssertTrue(atCap.contains("forkCapCodemapSentinel"), atCap)
@@ -127,9 +145,9 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let overCap = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: selection,
             tokenCap: renderedTokens - 1,
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: lookupContext,
-            overTokenCapSummaryProvider: { _, _, frozenBundle in
+            overTokenCapSummaryProvider: { snapshot in
                 await fixture.store.applyObservedCodemapResults([
                     WorkspaceObservedCodemapResult(
                         fullPath: worktreeURL.path,
@@ -137,8 +155,8 @@ final class AgentProviderContextBuilderTests: XCTestCase {
                         fileAPI: nil
                     )
                 ])
-                let retainedOriginal = frozenBundle.orderedSnapshots.contains { snapshot in
-                    snapshot.fileAPI?.apiDescription.contains("forkCapCodemapSentinel") == true
+                let retainedOriginal = snapshot.rendered.codemapBlocks.contains {
+                    $0.contains("forkCapCodemapSentinel")
                 }
                 return retainedOriginal ? "<selection_summary>frozen bundle</selection_summary>" : nil
             }
@@ -153,7 +171,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         let block = await AgentProviderContextBuilder.forkFileContentsBlock(
             selection: StoredSelection(selectedPaths: ["Sources/App.swift"], codemapAutoEnabled: false),
             tokenCap: 10000,
-            store: fixture.store,
+            factualProvider: AgentProviderBuilderTestFactualProvider(store: fixture.store),
             lookupContext: .visibleWorkspace
         )
 
@@ -174,6 +192,7 @@ final class AgentProviderContextBuilderTests: XCTestCase {
         try write("let baseOnly = true\n", to: logicalRoot.appendingPathComponent("Sources/BaseOnly.swift"))
         try write("let origin = \"worktree\"\n", to: worktreeRoot.appendingPathComponent("Sources/App.swift"))
         try write("let branchOnly = true\n", to: worktreeRoot.appendingPathComponent("Sources/BranchOnly.swift"))
+        try write("let branchOnly = true\n", to: worktreeRoot.appendingPathComponent("Sources/BranchOnly.rpfixture"))
 
         let store = WorkspaceFileContextStore()
         _ = try await store.loadRoot(path: logicalRoot.path)
@@ -256,5 +275,67 @@ final class AgentProviderContextBuilderTests: XCTestCase {
             macros: [],
             referencedTypes: []
         )
+    }
+
+    private func awaitStableCatalog(
+        _ store: WorkspaceFileContextStore,
+        scope: WorkspaceLookupRootScope
+    ) async {
+        var previous: UInt64?
+        var stableSamples = 0
+        for _ in 0 ..< 200 {
+            _ = await store.awaitAppliedIngress(rootScope: scope)
+            let current = await store.catalogGeneration(rootScope: scope)
+            stableSamples = current == previous ? stableSamples + 1 : 0
+            if stableSamples >= 4 { return }
+            previous = current
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+    }
+
+    private func quiesceCodemapActivity(
+        _ store: WorkspaceFileContextStore,
+        scope: WorkspaceLookupRootScope
+    ) async {
+        for root in await store.rootRefs(scope: scope) {
+            if let service = await store.fileSystemServiceForTesting(rootID: root.id) {
+                await service.stopWatchingForChanges()
+            }
+        }
+        await store.cancelAllCodemapScans()
+    }
+
+    private func awaitCodemapSnapshot(
+        _ store: WorkspaceFileContextStore,
+        scope: WorkspaceLookupRootScope,
+        relativePath: String
+    ) async {
+        for _ in 0 ..< 200 {
+            let roots = await store.rootRefs(scope: scope)
+            for root in roots {
+                if await store.codemapSnapshot(rootID: root.id, relativePath: relativePath) != nil {
+                    return
+                }
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for worktree codemap snapshot at \(relativePath)")
+    }
+}
+
+private struct AgentProviderBuilderTestFactualProvider: PromptFactualContextProviding {
+    let store: WorkspaceFileContextStore
+
+    func capture(
+        _ request: PromptFactualCaptureRequest,
+        admission _: WorkspaceSessionAdmissionToken?
+    ) async -> PromptFactualCaptureOutcome {
+        var latest = await PromptFactualContextCaptureService.capture(request: request, store: store)
+        for _ in 0 ..< 20 {
+            guard case .unavailable(.staleGeneration) = latest else { return latest }
+            try? await Task.sleep(for: .milliseconds(25))
+            latest = await PromptFactualContextCaptureService.capture(request: request, store: store)
+        }
+        return latest
     }
 }

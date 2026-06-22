@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -21,6 +22,9 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         GlobalSettingsStore.shared.setCodeMapsGloballyDisabled(false, commit: false)
         let window = WindowState()
+        window.promptManager.attachPromptFactualContextProvider(
+            MCPSelectionContentTestFactualProvider(store: window.workspaceFileContextStore)
+        )
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
         defer {
@@ -196,5 +200,18 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
             macros: [],
             referencedTypes: []
         )
+    }
+}
+
+private struct MCPSelectionContentTestFactualProvider: PromptFactualContextProviding {
+    let store: WorkspaceFileContextStore
+
+    func capture(
+        _ request: PromptFactualCaptureRequest,
+        admission _: WorkspaceSessionAdmissionToken?
+    ) async -> PromptFactualCaptureOutcome {
+        let first = await PromptFactualContextCaptureService.capture(request: request, store: store)
+        guard case .unavailable(.staleGeneration) = first else { return first }
+        return await PromptFactualContextCaptureService.capture(request: request, store: store)
     }
 }

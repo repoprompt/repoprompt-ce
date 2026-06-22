@@ -536,9 +536,8 @@ import XCTest
                     let gitText = try toolResultText(gitResponse)
                     XCTAssertTrue(gitText.contains("auto-selected"), gitText)
 
-                    let publishedSelection = try XCTUnwrap(
-                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
-                    ).selection
+                    let awaitedPublishedSelection = await waitForPublishedArtifactSelection(fixture.contextA)
+                    let publishedSelection = try XCTUnwrap(awaitedPublishedSelection)
                     let mapPath = try XCTUnwrap(
                         publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
                     )
@@ -846,9 +845,8 @@ import XCTest
                         timeoutSeconds: 30
                     )
 
-                    let publishedSelection = try XCTUnwrap(
-                        fixture.contextA.window.workspaceManager.composeTab(with: fixture.contextA.tabID)
-                    ).selection
+                    let awaitedPublishedSelection = await waitForPublishedArtifactSelection(fixture.contextA)
+                    let publishedSelection = try XCTUnwrap(awaitedPublishedSelection)
                     let mapPath = try XCTUnwrap(
                         publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
                     )
@@ -1504,11 +1502,8 @@ import XCTest
                         timeoutSeconds: 30
                     )
 
-                    let publishedSelection = try XCTUnwrap(
-                        fixture.contextA.window.workspaceManager.composeTab(
-                            with: fixture.contextA.tabID
-                        )
-                    ).selection
+                    let awaitedPublishedSelection = await waitForPublishedArtifactSelection(fixture.contextA)
+                    let publishedSelection = try XCTUnwrap(awaitedPublishedSelection)
                     let mapPath = try XCTUnwrap(
                         publishedSelection.selectedPaths.first { $0.hasSuffix("/MAP.txt") }
                     )
@@ -2230,7 +2225,7 @@ import XCTest
                     gitInclusion: gitInclusion,
                     storedPromptIds: []
                 )
-                let message = await promptVM.packagePrompt(
+                let message = try await promptVM.packagePrompt(
                     conversation: [
                         ConversationEntry(
                             role: .user,
@@ -2432,6 +2427,19 @@ import XCTest
                 withIntermediateDirectories: true
             )
             try content.write(to: url, atomically: true, encoding: .utf8)
+        }
+
+        private func waitForPublishedArtifactSelection(
+            _ context: PersistentMCPTestContext
+        ) async -> StoredSelection? {
+            let published = await waitUntil(timeout: .seconds(5)) {
+                guard let selection = context.window.workspaceManager.composeTab(with: context.tabID)?.selection
+                else { return false }
+                return selection.selectedPaths.contains { $0.hasSuffix("/MAP.txt") }
+                    && selection.selectedPaths.contains { $0.hasSuffix("/diff/all.patch") }
+            }
+            guard published else { return nil }
+            return context.window.workspaceManager.composeTab(with: context.tabID)?.selection
         }
 
         private func waitUntil(

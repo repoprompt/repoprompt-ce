@@ -78,8 +78,37 @@ package actor RepoPromptCoreSession {
                 guard let self else { return .notReady(.closed) }
                 return await execute(command)
             },
+            capturePrompt: { [weak self] admission, request in
+                guard let self else { return .unavailable(.closedSession) }
+                return await capturePromptFactualContext(admission: admission, request: request)
+            },
             shutdown: { [weak self] in await self?.shutdown() }
         )
+    }
+
+    package func capturePromptFactualContext(
+        admission: WorkspaceSessionAdmissionToken,
+        request: PromptFactualCaptureRequest
+    ) async -> PromptFactualCaptureOutcome {
+        guard !isShuttingDown else { return .unavailable(.closedSession) }
+        guard await validatesPromptAdmission(admission) else { return .unavailable(.staleGeneration) }
+        var outcome = await dependencies.lifecycleOwner.capturePromptFactualContext(request)
+        if case .unavailable(.staleGeneration) = outcome,
+           await validatesPromptAdmission(admission)
+        {
+            outcome = await dependencies.lifecycleOwner.capturePromptFactualContext(request)
+        }
+        guard !Task.isCancelled else { return .cancelled }
+        guard await validatesPromptAdmission(admission) else { return .unavailable(.staleGeneration) }
+        return outcome
+    }
+
+    private func validatesPromptAdmission(_ admission: WorkspaceSessionAdmissionToken) async -> Bool {
+        guard case let .admitted(current) = await controller.admit() else { return false }
+        return current.sessionID == admission.sessionID
+            && current.activationID == admission.activationID
+            && current.admittedGeneration == admission.admittedGeneration
+            && current.snapshotSequence >= admission.snapshotSequence
     }
 
     package func hydrate() async -> WorkspaceSessionHydrationResult {
