@@ -11,6 +11,53 @@ private final class WorkspaceRuntimePublicationFence {
     }
 }
 
+private struct WorkspaceRuntimeReadinessProjection: Equatable {
+    let sessionID: WorkspaceSessionID
+    let activeWorkspaceID: UUID?
+    let activeComposeTabID: UUID?
+    let activeAgentSessionID: UUID?
+
+    init(_ snapshot: WorkspaceSessionSnapshot) {
+        sessionID = snapshot.sessionID
+        activeWorkspaceID = snapshot.activeWorkspaceID
+        let activeWorkspace = snapshot.workspaces.first { $0.id == snapshot.activeWorkspaceID }
+        activeComposeTabID = activeWorkspace?.activeComposeTabID
+        activeAgentSessionID = activeWorkspace?.composeTabs.first {
+            $0.id == activeWorkspace?.activeComposeTabID
+        }?.activeAgentSessionID
+    }
+}
+
+private struct AssembledAppReadiness {
+    let admission: WorkspaceSessionAdmissionToken
+    let projection: WorkspaceRuntimeReadinessProjection
+}
+
+private enum ActivatedRuntimePublicationResult {
+    case published
+    case projectionSuperseded
+    case failed
+}
+
+#if DEBUG
+    @MainActor
+    enum WindowStateCompositionActivationEvent: Equatable {
+        case firstAuthoritativeProjectionApplied
+        case initialActiveSessionRestoreSettled
+        case runtimeAdapterPublished
+        case selectedSessionInitializationCompleted
+    }
+#endif
+
+@MainActor
+struct WindowStateCompositionTestHooks {
+    #if DEBUG
+        var configureAgentModeViewModel: ((AgentModeViewModel) -> Void)?
+        var recordActivationEvent: ((WindowStateCompositionActivationEvent) -> Void)?
+        var waitAfterInitialActiveSessionRestore: (@MainActor () async -> Void)?
+    #endif
+}
+
 @MainActor
 struct WindowStateComposition {
     let workspaceSessionID: WorkspaceSessionID
@@ -60,7 +107,8 @@ enum WindowStateCompositionFactory {
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        testHooks: WindowStateCompositionTestHooks? = nil
     ) -> WindowStateComposition {
         let appCoreContainer = injectedAppCoreContainer ?? .shared
         let useSelectedSessionComposition = injectedAppCoreContainer != nil || !isRunningUnitTests
@@ -192,6 +240,11 @@ enum WindowStateCompositionFactory {
                 },
                 applySnapshot: { [weak workspaceManager] snapshot in
                     workspaceManager?.applyAuthoritativeSessionSnapshot(snapshot)
+                    if let activeWorkspace = snapshot.workspaces.first(where: {
+                        $0.id == snapshot.activeWorkspaceID
+                    }) {
+                        promptManager.loadComposeTabsFromWorkspace(activeWorkspace)
+                    }
                     if let runtimeID = runtimeBootstrap?.runtimeID,
                        let adapterRegistry = appCoreContainer.runtimeAdapterRegistry
                     {
@@ -309,6 +362,9 @@ enum WindowStateCompositionFactory {
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
         }
+        #if DEBUG
+            testHooks?.configureAgentModeViewModel?(agentModeViewModel)
+        #endif
 
         #if DEBUG
             let agentChatStressHarness: AgentChatStressHarness? = if let stressConfiguration = AppLaunchConfiguration.current.agentChatStress {
@@ -334,29 +390,32 @@ enum WindowStateCompositionFactory {
 
         let publishActivatedRuntime: @MainActor @Sendable (
             WorkspaceSessionRuntimeBundle,
-            WorkspaceSessionAdmissionToken,
+            AssembledAppReadiness,
             WorkspaceSessionSnapshot
-        ) async -> Bool = { runtime, initialAdmission, fallbackSnapshot in
-            guard !runtimePublicationFence.isClosing else { return false }
-            guard let runtimeID = runtime.runtimeID else { return true }
+        ) async -> ActivatedRuntimePublicationResult = { runtime, readiness, fallbackSnapshot in
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else { return .failed }
+            guard let runtimeID = runtime.runtimeID else { return .published }
             guard let lifecycle = runtime.runtimeLifecycle,
                   let adapterRegistry = appCoreContainer.runtimeAdapterRegistry,
                   let runtimeAdapter
-            else { return false }
-            switch await lifecycle.activate(initialAdmission: initialAdmission) {
+            else { return .failed }
+            switch await lifecycle.activate(initialAdmission: readiness.admission) {
             case .activated, .alreadyActive:
                 break
             case .runtimeNotFound, .sessionMismatch, .activationMismatch, .invalidState:
-                return false
+                return .failed
             }
-            guard !runtimePublicationFence.isClosing else {
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else {
                 _ = await lifecycle.beginDraining()
-                return false
+                return .failed
             }
             let routingSnapshot = await runtime.commandIngress.currentSnapshot() ?? fallbackSnapshot
-            guard !runtimePublicationFence.isClosing else {
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else {
                 _ = await lifecycle.beginDraining()
-                return false
+                return .failed
+            }
+            guard WorkspaceRuntimeReadinessProjection(routingSnapshot) == readiness.projection else {
+                return .projectionSuperseded
             }
             let ticket: MCPRuntimeAdapterTicket
             switch adapterRegistry.stage(
@@ -369,15 +428,69 @@ enum WindowStateCompositionFactory {
             case let .staged(stagedTicket):
                 ticket = stagedTicket
             case .duplicateRuntimeID, .windowOccupied, .predecessorNotDraining, .sessionMismatch:
-                return false
+                return .failed
             }
             switch adapterRegistry.activate(ticket: ticket) {
             case let .activated(activeTicket), let .alreadyActive(activeTicket):
                 await mcpServer.markRuntimePublicationReady(ticket: activeTicket)
-                return true
+                return .published
             case .notFound, .staleTicket, .adapterUnavailable, .invalidState:
-                return false
+                return .failed
             }
+        }
+
+        let awaitAssembledAppReadiness: @MainActor @Sendable () async -> AssembledAppReadiness? = {
+            while true {
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      let workspaceSessionCommandClient,
+                      workspaceSessionCommandClient.sessionID == workspaceSessionID,
+                      let snapshot = workspaceSessionCommandClient.snapshot,
+                      snapshot.sessionID == workspaceSessionID,
+                      case let .admitted(initialAdmission) = await workspaceSessionCommandClient.acquireAdmission()
+                else { return nil }
+                let projection = WorkspaceRuntimeReadinessProjection(snapshot)
+                guard !Task.isCancelled, !runtimePublicationFence.isClosing else { return nil }
+
+                await agentModeViewModel.awaitInitialActiveSessionRestore()
+
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      let currentSnapshot = workspaceSessionCommandClient.snapshot,
+                      currentSnapshot.sessionID == workspaceSessionID
+                else { return nil }
+                guard WorkspaceRuntimeReadinessProjection(currentSnapshot) == projection else { continue }
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.initialActiveSessionRestoreSettled)
+                    await testHooks?.waitAfterInitialActiveSessionRestore?()
+                    guard !Task.isCancelled,
+                          !runtimePublicationFence.isClosing,
+                          let finalSnapshot = workspaceSessionCommandClient.snapshot,
+                          WorkspaceRuntimeReadinessProjection(finalSnapshot) == projection
+                    else { continue }
+                #endif
+                return AssembledAppReadiness(
+                    admission: initialAdmission,
+                    projection: projection
+                )
+            }
+        }
+
+        let publishRuntimeWhenReady: @MainActor @Sendable (
+            WorkspaceSessionRuntimeBundle,
+            WorkspaceSessionSnapshot
+        ) async -> Bool = { runtime, fallbackSnapshot in
+            while let readiness = await awaitAssembledAppReadiness() {
+                switch await publishActivatedRuntime(runtime, readiness, fallbackSnapshot) {
+                case .published:
+                    return true
+                case .projectionSuperseded:
+                    continue
+                case .failed:
+                    return false
+                }
+            }
+            return false
         }
 
         let workspaceSessionActivationTask: Task<Void, Never>? = if let runtimeBootstrap,
@@ -390,6 +503,9 @@ enum WindowStateCompositionFactory {
                     switch await runtime.hydrate() {
                     case let .awaitingFirstSnapshotApplication(firstSnapshot):
                         await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(firstSnapshot)
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.firstAuthoritativeProjectionApplied)
+                        #endif
                         workspaceSessionObservationBridge.startObserving()
                         let activation = await runtime.activateAfterApplyingFirstSnapshot(
                             firstSnapshot.snapshotSequence
@@ -400,15 +516,19 @@ enum WindowStateCompositionFactory {
                             appCoreContainer.releaseRuntime(windowID: windowID)
                             return
                         }
-                        guard case let .admitted(initialAdmission) = await workspaceSessionCommandClient.acquireAdmission(),
-                              await publishActivatedRuntime(runtime, initialAdmission, firstSnapshot)
-                        else {
+                        guard await publishRuntimeWhenReady(runtime, firstSnapshot) else {
                             workspaceSessionObservationBridge.stop()
                             await runtime.shutdown()
                             appCoreContainer.releaseRuntime(windowID: windowID)
                             return
                         }
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
+                        #endif
                         workspaceManager.completeSelectedSessionInitialization()
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
+                        #endif
                     case let .alreadyHydrated(snapshot):
                         guard let snapshot else {
                             await runtime.shutdown()
@@ -416,16 +536,23 @@ enum WindowStateCompositionFactory {
                             return
                         }
                         await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(snapshot)
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.firstAuthoritativeProjectionApplied)
+                        #endif
                         workspaceSessionObservationBridge.startObserving()
-                        guard case let .admitted(initialAdmission) = await workspaceSessionCommandClient.acquireAdmission(),
-                              await publishActivatedRuntime(runtime, initialAdmission, snapshot)
-                        else {
+                        guard await publishRuntimeWhenReady(runtime, snapshot) else {
                             workspaceSessionObservationBridge.stop()
                             await runtime.shutdown()
                             appCoreContainer.releaseRuntime(windowID: windowID)
                             return
                         }
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
+                        #endif
                         workspaceManager.completeSelectedSessionInitialization()
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
+                        #endif
                     case .failed:
                         await runtime.shutdown()
                         appCoreContainer.releaseRuntime(windowID: windowID)
