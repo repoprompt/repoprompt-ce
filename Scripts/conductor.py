@@ -3303,13 +3303,9 @@ def resolve_debug_cli() -> Optional[str]:
     path_cli = shutil.which("rpce-cli-debug")
     if path_cli and os.access(path_cli, os.X_OK):
         return path_cli
-    fallbacks = (
-        Path.home() / "RepoPrompt" / "repoprompt_ce_cli_debug",
-        Path.home() / "Library" / "Application Support" / "RepoPrompt CE" / "repoprompt_ce_cli_debug",
-    )
-    for fallback in fallbacks:
-        if fallback.is_file() and os.access(fallback, os.X_OK):
-            return str(fallback)
+    fallback = Path.home() / "RepoPrompt" / "repoprompt_ce_cli_debug"
+    if fallback.is_file() and os.access(fallback, os.X_OK):
+        return str(fallback)
     bundled = debug_app_bundle_path() / "Contents" / "MacOS" / "repoprompt-mcp"
     if bundled.is_file() and os.access(bundled, os.X_OK):
         return str(bundled)

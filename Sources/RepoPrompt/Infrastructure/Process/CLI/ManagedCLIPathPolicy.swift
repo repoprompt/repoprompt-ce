@@ -76,15 +76,13 @@ enum ManagedCLIPathPolicy {
         fileManager: FileManager = .default
     ) -> Set<String> {
         let home = fileManager.homeDirectoryForCurrentUser
-        let legacyAppSupport = home.appendingPathComponent("Library/Application Support/RepoPrompt CE", isDirectory: true)
+        let appSupport = home.appendingPathComponent("Library/Application Support/RepoPrompt CE", isDirectory: true)
         var paths: Set<String> = [
             MCPFilesystemIdentity.repoPromptCE(.debug).userSpaceCLIURL(fileManager: fileManager).path,
             MCPFilesystemIdentity.repoPromptCE(.release).userSpaceCLIURL(fileManager: fileManager).path,
-            legacyAppSupport.appendingPathComponent("repoprompt_ce_cli_debug").path,
-            legacyAppSupport.appendingPathComponent("repoprompt_ce_cli").path,
-            legacyAppSupport.appendingPathComponent("repoprompt_cli_debug").path,
-            legacyAppSupport.appendingPathComponent("repoprompt_cli").path,
-            legacyAppSupport.appendingPathComponent("DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp").path,
+            appSupport.appendingPathComponent("repoprompt_cli_debug").path,
+            appSupport.appendingPathComponent("repoprompt_cli").path,
+            appSupport.appendingPathComponent("DebugApps/RepoPrompt.app/Contents/MacOS/repoprompt-mcp").path,
             "/Applications/RepoPrompt.app/Contents/MacOS/repoprompt-mcp",
             home.appendingPathComponent("Applications/RepoPrompt.app/Contents/MacOS/repoprompt-mcp").path
         ]

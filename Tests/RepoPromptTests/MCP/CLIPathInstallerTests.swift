@@ -1,6 +1,5 @@
 import Foundation
 @testable import RepoPrompt
-import RepoPromptShared
 import XCTest
 
 final class CLIPathInstallerTests: XCTestCase {
@@ -76,25 +75,6 @@ final class CLIPathInstallerTests: XCTestCase {
             ),
             .unmanaged
         )
-
-        try FileManager.default.removeItem(at: linkURL)
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let legacyRoot = home.appendingPathComponent("Library/Application Support/RepoPrompt CE", isDirectory: true)
-        let desiredDestination = MCPFilesystemIdentity.repoPromptCE(.debug).userSpaceCLIURL().path
-        let managedDestinations = ManagedCLIPathPolicy.managedDestinations(currentBundledCLIPath: bundledCLI.path)
-        for legacyName in ["repoprompt_ce_cli_debug", "repoprompt_ce_cli"] {
-            let legacyDestination = legacyRoot.appendingPathComponent(legacyName).path
-            try FileManager.default.createSymbolicLink(atPath: linkURL.path, withDestinationPath: legacyDestination)
-            XCTAssertEqual(
-                ManagedCLIPathPolicy.classifySymlink(
-                    at: linkURL.path,
-                    desiredDestination: desiredDestination,
-                    managedDestinations: managedDestinations
-                ),
-                .managedStale(destination: legacyDestination)
-            )
-            try FileManager.default.removeItem(at: linkURL)
-        }
     }
 
     func testUserSpaceManagerCreatesMissingLinkAndRefusesUnmanagedOccupants() throws {

@@ -69,31 +69,12 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
         XCTAssertTrue(result.output.contains("PATH command: unmanaged symlink"), result.output)
     }
 
-    func testInstallMigratesLegacyApplicationSupportPathLink() throws {
-        let fixture = try Fixture()
-        defer { fixture.cleanup() }
-        try FileManager.default.createSymbolicLink(
-            at: fixture.pathLink,
-            withDestinationURL: fixture.legacyUserLink
-        )
-
-        let result = try fixture.run("install")
-
-        XCTAssertEqual(result.status, 0, result.output)
-        XCTAssertEqual(
-            try FileManager.default.destinationOfSymbolicLink(atPath: fixture.pathLink.path),
-            fixture.userLink.path
-        )
-        XCTAssertFalse(fixture.userLink.path.contains(" "))
-    }
-
     private struct Fixture {
         let root: URL
         let home: URL
         let appBundle: URL
         let bundledCLI: URL
         let userLink: URL
-        let legacyUserLink: URL
         let pathLink: URL
         let script: URL
 
@@ -104,7 +85,6 @@ final class DebugCLIInstallerScriptTests: XCTestCase {
             appBundle = root.appendingPathComponent("RepoPrompt.app", isDirectory: true)
             bundledCLI = appBundle.appendingPathComponent("Contents/MacOS/repoprompt-mcp")
             userLink = home.appendingPathComponent("RepoPrompt/repoprompt_ce_cli_debug")
-            legacyUserLink = home.appendingPathComponent("Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug")
             pathLink = root.appendingPathComponent("bin/rpce-cli-debug")
             script = try RepoRoot.url().appendingPathComponent("Scripts/install_debug_cli.sh")
 

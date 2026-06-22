@@ -6,7 +6,6 @@ DEBUG_APP_ROOT="${REPOPROMPT_DEBUG_APP_ROOT:-$HOME/Library/Application Support/R
 APP_BUNDLE="${REPOPROMPT_DEBUG_APP_BUNDLE:-$DEBUG_APP_ROOT/RepoPrompt.app}"
 BUNDLED_CLI="$APP_BUNDLE/Contents/MacOS/repoprompt-mcp"
 USER_LINK="$HOME/RepoPrompt/repoprompt_ce_cli_debug"
-LEGACY_USER_LINK="$HOME/Library/Application Support/RepoPrompt CE/repoprompt_ce_cli_debug"
 PATH_LINK="${REPOPROMPT_DEBUG_CLI_INSTALL_PATH:-/usr/local/bin/rpce-cli-debug}"
 INSTALL_DIR="$(dirname "$PATH_LINK")"
 COMMAND_NAME="$(basename "$PATH_LINK")"
@@ -45,7 +44,7 @@ is_managed_path_link(){
 	local path="${1:-$PATH_LINK}" target
 	[[ -L "$path" ]] || return 1
 	target="$(readlink "$path" 2>/dev/null || true)"
-	[[ "$target" == "$USER_LINK" || "$target" == "$LEGACY_USER_LINK" || "$target" == "$BUNDLED_CLI" ]]
+	[[ "$target" == "$USER_LINK" || "$target" == "$BUNDLED_CLI" ]]
 }
 
 is_managed_user_link(){
