@@ -411,6 +411,8 @@ class OracleViewModel: ObservableObject {
     private let recentDisplayedSessionLimit = 2
     private var sessionSwitchGeneration: Int = 0
     private var workspaceChatSessionLoadGeneration: UInt64 = 0
+    private var pendingWorkspaceChatRestoreCount = 0
+    private var hasPendingActiveTabChangeDuringWorkspaceChatRestore = false
     private let workspaceSwitchChatStubLoadConcurrency = 4
 
     /// Session management
@@ -1088,8 +1090,11 @@ class OracleViewModel: ObservableObject {
         // New code using multi-listener approach:
         self.workspaceManager.addWorkspaceDidSwitchListener(label: "chat") { [weak self] newWS in
             guard let self else { return }
+            pendingWorkspaceChatRestoreCount += 1
             Task { [weak self] in
-                await self?.handleWorkspaceSwitched(to: newWS)
+                guard let self else { return }
+                defer { finishPendingWorkspaceChatRestore() }
+                await handleWorkspaceSwitched(to: newWS)
             }
         }
 
@@ -1554,6 +1559,12 @@ class OracleViewModel: ObservableObject {
 
     @MainActor
     private func handleActiveComposeTabChanged(tabID: UUID?) async {
+        guard pendingWorkspaceChatRestoreCount == 0 else {
+            if tabID != nil {
+                hasPendingActiveTabChangeDuringWorkspaceChatRestore = true
+            }
+            return
+        }
         refreshSessionLists()
         guard !isSwitchingTabsForSession else { return }
         guard tabID != nil else { return }
@@ -1872,6 +1883,20 @@ class OracleViewModel: ObservableObject {
                 ]
             )
         #endif
+    }
+
+    private func finishPendingWorkspaceChatRestore() {
+        pendingWorkspaceChatRestoreCount -= 1
+        guard pendingWorkspaceChatRestoreCount == 0,
+              hasPendingActiveTabChangeDuringWorkspaceChatRestore
+        else {
+            return
+        }
+        hasPendingActiveTabChangeDuringWorkspaceChatRestore = false
+        let tabID = promptViewModel.activeComposeTabID
+        Task { [weak self] in
+            await self?.handleActiveComposeTabChanged(tabID: tabID)
+        }
     }
 
     // MARK: - Session Management

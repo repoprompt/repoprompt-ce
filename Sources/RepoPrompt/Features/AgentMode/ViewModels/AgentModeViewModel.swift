@@ -466,6 +466,7 @@ final class AgentModeViewModel: ObservableObject {
         let tabID: UUID?
         var expectedBinding: AgentPersistentSessionBindingIdentity?
         private(set) var isComplete = false
+        private(set) var isRestoreAttemptPrepared = false
         private var waiters: [UUID: CheckedContinuation<Void, Never>] = [:]
 
         var waiterCount: Int {
@@ -482,7 +483,7 @@ final class AgentModeViewModel: ObservableObject {
             self.expectedBinding = expectedBinding
         }
 
-        func wait() async {
+        func wait(onRegistered: () -> Void) async {
             guard !isComplete, !Task.isCancelled else { return }
             let waiterID = UUID()
             await withTaskCancellationHandler {
@@ -492,12 +493,17 @@ final class AgentModeViewModel: ObservableObject {
                         return
                     }
                     waiters[waiterID] = continuation
+                    onRegistered()
                 }
             } onCancel: {
                 Task { @MainActor [weak self] in
                     self?.cancelWaiter(waiterID)
                 }
             }
+        }
+
+        func prepareRestoreAttempt() {
+            isRestoreAttemptPrepared = true
         }
 
         func complete() {
@@ -2940,12 +2946,13 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
 
-        let isInitialActiveSessionRestore = initialActiveSessionRestoreBarrier.map {
+        let hasRequestedInitialActiveSessionRestore = initialActiveSessionRestoreBarrier.map {
             !$0.isComplete
                 && $0.owner == sessionIndexOwner
                 && $0.tabID == tabID
+                && $0.waiterCount > 0
         } ?? false
-        guard isAgentModeActive || isInitialActiveSessionRestore else {
+        guard isAgentModeActive || hasRequestedInitialActiveSessionRestore else {
             pendingTabIDForLoad = tabID
             return
         }
@@ -3551,13 +3558,18 @@ final class AgentModeViewModel: ObservableObject {
         if let existing = session.activeAgentSessionID {
             return existing
         }
+        let wasLoaded = session.hasLoadedPersistedState
         let created = UUID()
-        return installPersistentSessionBinding(
+        let binding = installPersistentSessionBinding(
             sessionID: created,
             on: session,
             updateWorkspaceMetadata: true,
             invalidateAsyncWork: true
-        )?.sessionID
+        )
+        if wasLoaded, binding != nil {
+            session.hasLoadedPersistedState = true
+        }
+        return binding?.sessionID
     }
 
     private func persistentBindingResolution(for sessionID: UUID) -> PersistentBindingResolution {
@@ -9795,11 +9807,27 @@ final class AgentModeViewModel: ObservableObject {
 
     func awaitInitialActiveSessionRestore() async {
         while !Task.isCancelled, let barrier = initialActiveSessionRestoreBarrier {
-            await barrier.wait()
+            await barrier.wait { [weak self, weak barrier] in
+                guard let self, let barrier else { return }
+                resumeInitialActiveSessionRestoreIfNeeded(barrier)
+            }
             guard !Task.isCancelled else { return }
             guard initialActiveSessionRestoreBarrier === barrier else { continue }
             return
         }
+    }
+
+    private func resumeInitialActiveSessionRestoreIfNeeded(_ barrier: InitialActiveSessionRestoreBarrier) {
+        guard initialActiveSessionRestoreBarrier === barrier,
+              barrier.isRestoreAttemptPrepared,
+              barrier.waiterCount > 0,
+              let tabID = barrier.tabID,
+              lastProcessedTabID != tabID
+        else {
+            return
+        }
+        activeSessionLoadInProgressTabID = tabID
+        onTabChanged(tabID, allowDuringWorkspaceSwitch: true)
     }
 
     private func installInitialActiveSessionRestoreBarrier(
@@ -10291,6 +10319,9 @@ final class AgentModeViewModel: ObservableObject {
                 )
                 activeSession.hasLoadedPersistedState = false
             }
+        }
+        if initialActiveSessionRestoreBarrier?.owner == owner {
+            initialActiveSessionRestoreBarrier?.prepareRestoreAttempt()
         }
         if let resolvedActiveTabID {
             activeSessionLoadInProgressTabID = resolvedActiveTabID
