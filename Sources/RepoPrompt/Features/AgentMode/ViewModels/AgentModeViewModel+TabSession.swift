@@ -4,6 +4,24 @@ import Foundation
 extension AgentModeViewModel {
     // MARK: - Tab Session
 
+    struct PersistedSessionLoadKey: Equatable {
+        let tabID: UUID
+        let sessionIdentity: ObjectIdentifier
+        let binding: AgentPersistentSessionBindingIdentity?
+        let bindingTransitionGeneration: UInt64
+    }
+
+    enum PersistedSessionLoadOutcome: Equatable {
+        case current(PersistedSessionLoadKey)
+        case stale
+    }
+
+    struct PersistedSessionLoadFlight {
+        let id: UUID
+        let key: PersistedSessionLoadKey
+        let task: Task<PersistedSessionLoadOutcome, Never>
+    }
+
     /// Per-tab session state for agent mode
     @MainActor
     final class TabSession: ObservableObject {
@@ -537,7 +555,7 @@ extension AgentModeViewModel {
         var hasLoadedPersistedState: Bool = false
         private(set) var authoritativeHydratedBinding: AgentPersistentSessionBindingIdentity?
         private(set) var authoritativeHydratedBindingTransitionGeneration: UInt64?
-        var persistedLoadTask: Task<Void, Never>?
+        var persistedLoadFlight: PersistedSessionLoadFlight?
         var lastActivityAt: Date = .init()
         var lastUserMessageAt: Date?
         var lastCommandOutputSaveAt: Date?

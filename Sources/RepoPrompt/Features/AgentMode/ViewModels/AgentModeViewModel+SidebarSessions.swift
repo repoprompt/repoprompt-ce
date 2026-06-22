@@ -72,12 +72,15 @@ extension AgentModeViewModel {
 
     private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
         let frozenOrder = ownerValidatedSidebarRestoreFrozenOrderByTabID
-        guard !ownerValidatedSessionListCacheReady, !frozenOrder.isEmpty else { return false }
-        return tabs.allSatisfy { frozenOrder[$0.id] != nil }
+        return !tabs.isEmpty && !frozenOrder.isEmpty
     }
 
     private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        ownerValidatedSidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
+        let frozenOrder = ownerValidatedSidebarRestoreFrozenOrderByTabID
+        if let persistedIndex = frozenOrder[tabID] {
+            return persistedIndex
+        }
+        return (frozenOrder.values.max() ?? -1) + 1 + fallback
     }
 
     func preferredSidebarEntry(for tabID: UUID, tabName: String? = nil) -> AgentSessionIndexEntry? {
@@ -341,7 +344,6 @@ extension AgentModeViewModel {
             authoritativeSessionIDByTabID: authoritativeSessionIDByTabID,
             sessionIndex: currentIndex,
             sessionListSortDates: ownerValidatedSessionListSortDates,
-            sessionListCacheReady: ownerValidatedSessionListCacheReady,
             sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
             mcpControlledTabIDs: mcpControlledTabIDs
         ).build()
@@ -801,7 +803,7 @@ extension AgentModeViewModel {
             }
             return lhs.id.uuidString < rhs.id.uuidString
         }
-        return prefixedPinnedTabs(baseSortedTabs)
+        return useFrozenRestoreOrder ? baseSortedTabs : prefixedPinnedTabs(baseSortedTabs)
     }
 
     func computeLastUserMessageDate(in items: [AgentChatItem]) -> Date? {

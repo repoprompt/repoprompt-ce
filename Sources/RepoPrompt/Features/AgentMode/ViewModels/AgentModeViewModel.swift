@@ -452,6 +452,48 @@ final class AgentModeViewModel: ObservableObject {
         let activationEpoch: UInt64
     }
 
+    private struct SidebarRestoreOrderingGate {
+        let owner: SessionIndexOwner
+        let persistedOrderByTabID: [UUID: Int]
+        var indexGeneration: UInt64?
+        var indexTerminal = false
+        var activeRestoreTerminal = false
+    }
+
+    @MainActor
+    private final class InitialActiveSessionRestoreBarrier {
+        let owner: SessionIndexOwner
+        let tabID: UUID?
+        var expectedBinding: AgentPersistentSessionBindingIdentity?
+        private(set) var isComplete = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+
+        init(
+            owner: SessionIndexOwner,
+            tabID: UUID?,
+            expectedBinding: AgentPersistentSessionBindingIdentity?
+        ) {
+            self.owner = owner
+            self.tabID = tabID
+            self.expectedBinding = expectedBinding
+        }
+
+        func wait() async {
+            guard !isComplete else { return }
+            await withCheckedContinuation { continuation in
+                waiters.append(continuation)
+            }
+        }
+
+        func complete() {
+            guard !isComplete else { return }
+            isComplete = true
+            let pending = waiters
+            waiters.removeAll()
+            pending.forEach { $0.resume() }
+        }
+    }
+
     private struct SessionIndexRefreshToken: Equatable {
         let owner: SessionIndexOwner
         let generation: UInt64
@@ -464,6 +506,9 @@ final class AgentModeViewModel: ObservableObject {
         AgentSessionSidebarBuildRequest,
         Int
     ) async -> AsyncThrowingStream<AgentSessionSidebarBuildBatch, Error>
+    typealias PersistedHydrationPreparer = (
+        AgentSessionHydrationRequest
+    ) async throws -> AgentSessionHydrationPayload?
 
     @Published private(set) var sessions: [UUID: TabSession] = [:] {
         didSet {
@@ -547,6 +592,10 @@ final class AgentModeViewModel: ObservableObject {
     weak var workspaceManager: WorkspaceManagerViewModel?
     private weak var mcpServer: MCPServerViewModel?
     private let dataService = AgentSessionDataService.shared
+    private var persistedHydrationPreparer: PersistedHydrationPreparer = { request in
+        try await AgentSessionDataService.shared.preparePersistedHydration(request)
+    }
+
     private var sidebarPrioritizedIndexBuilder: SidebarPrioritizedIndexBuilder = { request in
         try await AgentSessionDataService.shared.buildPrioritizedSidebarIndex(request)
     }
@@ -607,7 +656,8 @@ final class AgentModeViewModel: ObservableObject {
     private var sessionIndexOwner: SessionIndexOwner?
     private var sessionListSortDatesOwner: SessionIndexOwner?
     private var sessionListCacheReadyOwner: SessionIndexOwner?
-    private var sidebarRestoreFrozenOrderOwner: SessionIndexOwner?
+    private var sidebarRestoreOrderingGate: SidebarRestoreOrderingGate?
+    private var initialActiveSessionRestoreBarrier: InitialActiveSessionRestoreBarrier?
     private var activeSessionIndexRefreshToken: SessionIndexRefreshToken?
     private var activeSessionIndexRefreshWorkspace: WorkspaceModel?
     private var activeSessionIndexRefreshValidTabIDs: Set<UUID> = []
@@ -631,7 +681,10 @@ final class AgentModeViewModel: ObservableObject {
     let sidebarAutoArchivePolicy = AgentModeSidebarAutoArchivePolicy()
     private var initialSystemWorkspaceSessionListRefreshDeferralReason: String?
     private var initialSystemWorkspaceSessionListRefreshDeferralFallbackTask: Task<Void, Never>?
-    var sidebarRestoreFrozenOrderByTabID: [UUID: Int] = [:]
+    var sidebarRestoreFrozenOrderByTabID: [UUID: Int] {
+        sidebarRestoreOrderingGate?.persistedOrderByTabID ?? [:]
+    }
+
     /// Last-published sidebar content fingerprint. Used by
     /// `syncSidebarUIState(refresh:reason:)` to skip duplicate forced refresh
     /// revisions when sidebar-visible content has not changed. Nil before the
@@ -652,6 +705,8 @@ final class AgentModeViewModel: ObservableObject {
             AgentRunEpochTransitionKind?,
             TabSession
         ) async -> AgentRunTerminalPublicationResult)?
+        private var test_beforeInitialActiveSessionPresentation: (@MainActor () async -> Void)?
+        private(set) var test_sidebarRestoreOrderingReleaseCount = 0
     #endif
     private var hasPreparedForWindowClose = false
     private static let uiRefreshCoalesceDelayNanos: UInt64 = 75_000_000
@@ -695,6 +750,10 @@ final class AgentModeViewModel: ObservableObject {
 
         func test_setCurrentTabIDOverride(_ tabID: UUID?) {
             test_currentTabIDOverride = tabID
+        }
+
+        var test_sessionActivationGeneration: Int {
+            sessionActivationGeneration
         }
 
         func test_setSidebarAutoArchiveDependencies(
@@ -758,12 +817,17 @@ final class AgentModeViewModel: ObservableObject {
             on session: TabSession,
             updateWorkspaceMetadata: Bool = false
         ) -> AgentPersistentSessionBindingIdentity? {
-            installPersistentSessionBinding(
+            let wasLoaded = session.hasLoadedPersistedState
+            let binding = installPersistentSessionBinding(
                 sessionID: sessionID,
                 on: session,
                 updateWorkspaceMetadata: updateWorkspaceMetadata,
                 invalidateAsyncWork: true
             )
+            if wasLoaded, binding != nil {
+                session.hasLoadedPersistedState = true
+            }
+            return binding
         }
 
         func test_ensureSessionBoundToTab(_ session: TabSession) -> UUID? {
@@ -815,6 +879,22 @@ final class AgentModeViewModel: ObservableObject {
         ) {
             sidebarPrioritizedIndexBuilder = prioritized
             sidebarIndexStreamBuilder = stream
+        }
+
+        func test_setPersistedHydrationPreparer(
+            _ preparer: @escaping PersistedHydrationPreparer
+        ) {
+            persistedHydrationPreparer = preparer
+        }
+
+        func test_setBeforeInitialActiveSessionPresentation(
+            _ hook: (@MainActor () async -> Void)?
+        ) {
+            test_beforeInitialActiveSessionPresentation = hook
+        }
+
+        func test_waitForInitialActiveSessionRestore() async {
+            await awaitInitialActiveSessionRestore()
         }
 
         func test_receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
@@ -2803,6 +2883,14 @@ final class AgentModeViewModel: ObservableObject {
         sessionActivationGeneration &+= 1
         let activationGeneration = sessionActivationGeneration
         let shouldDeferForWorkspaceSwitch = !allowDuringWorkspaceSwitch && workspaceManager?.isSwitchingWorkspace == true
+        if let barrier = initialActiveSessionRestoreBarrier,
+           !barrier.isComplete,
+           barrier.owner == sessionIndexOwner,
+           barrier.tabID != tabID
+        {
+            barrier.complete()
+            markSidebarRestoreActivePresentationTerminal(for: barrier.owner)
+        }
         // Opening a session is the canonical "I've seen it" interaction —
         // clear any unseen-run-state badge the sidebar had queued for it.
         // Runs for every tab activation path (click, keyboard shortcut,
@@ -2846,6 +2934,15 @@ final class AgentModeViewModel: ObservableObject {
                 publishLoadingTranscriptPresentation(tabID: tabID)
                 return
             }
+            if let barrier = initialActiveSessionRestoreBarrier,
+               !barrier.isComplete,
+               barrier.owner == sessionIndexOwner,
+               barrier.tabID == tabID
+            {
+                activeSessionLoadInProgressTabID = tabID
+                publishLoadingTranscriptPresentation(tabID: tabID)
+                return
+            }
             workspaceSwitchInFlight = false
             // No bound agent session for this tab yet.
             activeSessionLoadInProgressTabID = nil
@@ -2865,7 +2962,18 @@ final class AgentModeViewModel: ObservableObject {
         applySessionToBindings(session)
         Task { [weak self] in
             guard let self else { return }
-            await loadSessionFromDisk(for: session)
+            let outcome = await loadSessionFromDisk(for: session)
+            guard case let .current(loadKey) = outcome,
+                  persistedSessionLoadKeyIsCurrent(loadKey, for: session)
+            else {
+                return
+            }
+            #if DEBUG
+                if initialActiveSessionRestoreBarrier?.tabID == tabID {
+                    await test_beforeInitialActiveSessionPresentation?()
+                    guard persistedSessionLoadKeyIsCurrent(loadKey, for: session) else { return }
+                }
+            #endif
             guard sessionActivationGeneration == activationGeneration else { return }
             guard currentTabID == tabID else { return }
             guard sessions[tabID] === session else { return }
@@ -2955,9 +3063,6 @@ final class AgentModeViewModel: ObservableObject {
         let newSession = TabSession(tabID: tabID)
         newSession.onSourceItemsChanged = { [weak self] session, mutation in
             guard let self else { return }
-            if mutation.touchesUserItem {
-                invalidateSidebarRestoreOrdering()
-            }
             // Source items are the canonical mutable session data. Schedule
             // persistence from the source mutation itself so inactive presentation
             // deferral cannot make durability depend on derived UI refresh work.
@@ -3169,8 +3274,8 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func cancelPersistedLoad(for session: TabSession) {
-        session.persistedLoadTask?.cancel()
-        session.persistedLoadTask = nil
+        session.persistedLoadFlight?.task.cancel()
+        session.persistedLoadFlight = nil
     }
 
     func markSessionAsFreshlyCreated(_ session: TabSession) {
@@ -3316,7 +3421,10 @@ final class AgentModeViewModel: ObservableObject {
               workspace.id == token.owner.workspaceID,
               isSessionIndexOwnerCurrent(token.owner)
         else {
-            releaseSidebarRestoreFrozenOrder(for: token.owner)
+            markSidebarRestoreIndexTerminal(
+                token: token,
+                publishRevisionOnRelease: true
+            )
             return
         }
         refreshSessionListCache(for: workspace, owner: token.owner)
@@ -3374,10 +3482,18 @@ final class AgentModeViewModel: ObservableObject {
             removePendingUIRefresh(for: session.tabID)
         }
         _ = session.beginPersistentBindingTransition()
+        session.hasLoadedPersistedState = false
         let binding = sessionID.map {
             AgentPersistentSessionBindingIdentity(tabID: session.tabID, sessionID: $0)
         }
         session.installPersistentSessionBinding(binding)
+        if let barrier = initialActiveSessionRestoreBarrier,
+           !barrier.isComplete,
+           barrier.owner == sessionIndexOwner,
+           barrier.tabID == session.tabID
+        {
+            barrier.expectedBinding = binding
+        }
         handleSidebarRefreshBindingMutation(
             tabID: session.tabID,
             sessionID: sessionID
@@ -3664,7 +3780,40 @@ final class AgentModeViewModel: ObservableObject {
         return binding
     }
 
-    private func loadSessionFromDisk(for session: TabSession) async {
+    private func persistedSessionLoadKey(for session: TabSession) -> PersistedSessionLoadKey {
+        PersistedSessionLoadKey(
+            tabID: session.tabID,
+            sessionIdentity: ObjectIdentifier(session),
+            binding: session.persistentSessionBindingIdentity,
+            bindingTransitionGeneration: session.bindingTransitionGeneration
+        )
+    }
+
+    private func persistedSessionLoadKeyIsCurrent(
+        _ key: PersistedSessionLoadKey,
+        for session: TabSession
+    ) -> Bool {
+        sessions[key.tabID] === session
+            && ObjectIdentifier(session) == key.sessionIdentity
+            && session.persistentSessionBindingIdentity == key.binding
+            && session.bindingTransitionGeneration == key.bindingTransitionGeneration
+            && !session.bindingTransitionInProgress
+    }
+
+    private func currentPersistedSessionLoadOutcome(
+        for session: TabSession,
+        key: PersistedSessionLoadKey
+    ) -> PersistedSessionLoadOutcome {
+        guard persistedSessionLoadKeyIsCurrent(key, for: session),
+              session.hasLoadedPersistedState
+        else {
+            return .stale
+        }
+        return .current(key)
+    }
+
+    @discardableResult
+    private func loadSessionFromDisk(for session: TabSession) async -> PersistedSessionLoadOutcome {
         #if DEBUG
             let loadStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let debugTabID = session.tabID
@@ -3688,18 +3837,28 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG
                 logLoadTask(outcome: "alreadyLoaded")
             #endif
-            return
+            return currentPersistedSessionLoadOutcome(
+                for: session,
+                key: persistedSessionLoadKey(for: session)
+            )
         }
-        if let persistedLoadTask = session.persistedLoadTask {
+        let loadKey = persistedSessionLoadKey(for: session)
+        if let flight = session.persistedLoadFlight,
+           flight.key == loadKey
+        {
             Self.logCodexDebug("[AgentModeVM][PersistedLoad] join inflight tab=\(session.tabID)")
-            await persistedLoadTask.value
+            let outcome = await flight.task.value
             #if DEBUG
                 logLoadTask(outcome: "joinedExistingTask")
             #endif
-            return
+            return outcome
+        }
+        if let staleFlight = session.persistedLoadFlight {
+            staleFlight.task.cancel()
+            session.persistedLoadFlight = nil
         }
         let startRevision = session.sourceItemsRevision
-        let expectedBinding = session.persistentSessionBindingIdentity
+        let expectedBinding = loadKey.binding
         let expectedSessionID = expectedBinding?.sessionID
         let hydrationToken = expectedSessionID.map {
             PersistedHydrationCommitToken(
@@ -3707,25 +3866,32 @@ final class AgentModeViewModel: ObservableObject {
                 requestedSessionID: $0
             )
         }
+        let flightID = UUID()
         let persistedLoadTask = Task { [weak self] in
-            guard let self else { return }
-            await performPersistedSessionLoad(
+            guard let self else { return PersistedSessionLoadOutcome.stale }
+            return await performPersistedSessionLoad(
                 for: session,
+                loadKey: loadKey,
                 hydrationToken: hydrationToken,
                 startRevision: startRevision
             )
         }
-        session.persistedLoadTask = persistedLoadTask
-        defer {
-            session.persistedLoadTask = nil
-        }
+        session.persistedLoadFlight = PersistedSessionLoadFlight(
+            id: flightID,
+            key: loadKey,
+            task: persistedLoadTask
+        )
         Self.logCodexDebug(
             "[AgentModeVM][PersistedLoad] start tab=\(session.tabID) revision=\(startRevision) sessionID=\(expectedSessionID?.uuidString ?? "nil")"
         )
-        await persistedLoadTask.value
+        let outcome = await persistedLoadTask.value
+        if session.persistedLoadFlight?.id == flightID {
+            session.persistedLoadFlight = nil
+        }
         #if DEBUG
             logLoadTask(outcome: "createdTaskComplete")
         #endif
+        return outcome
     }
 
     private func isActivationTargetedPersistedHydration(for session: TabSession) -> Bool {
@@ -3751,9 +3917,10 @@ final class AgentModeViewModel: ObservableObject {
 
     private func performPersistedSessionLoad(
         for session: TabSession,
+        loadKey: PersistedSessionLoadKey,
         hydrationToken: PersistedHydrationCommitToken?,
         startRevision: Int
-    ) async {
+    ) async -> PersistedSessionLoadOutcome {
         let expectedSessionID = hydrationToken?.requestedSessionID
         #if DEBUG
             let performStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
@@ -3782,20 +3949,20 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG
                 logPerform(outcome: "suppressedPersistence")
             #endif
-            return
+            return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
         }
         guard let workspace = workspaceManager?.activeWorkspace ?? lastKnownWorkspaceSnapshot else {
             #if DEBUG
                 logPerform(outcome: "noWorkspace")
             #endif
-            return
+            return .stale
         }
         guard let sessionID = expectedSessionID, let hydrationToken else {
             session.hasLoadedPersistedState = true
             #if DEBUG
                 logPerform(outcome: "noExpectedSessionID")
             #endif
-            return
+            return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
         }
 
         let request = AgentSessionHydrationRequest(
@@ -3816,12 +3983,25 @@ final class AgentModeViewModel: ObservableObject {
             #if DEBUG
                 prepareStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
-            let preparedPayload = try await dataService.preparePersistedHydration(request)
+            let preparedPayload = try await persistedHydrationPreparer(request)
+            guard persistedSessionLoadKeyIsCurrent(loadKey, for: session) else {
+                #if DEBUG
+                    logPerform(outcome: "staleAfterPrepare")
+                #endif
+                return .stale
+            }
+            guard session.sourceItemsRevision == startRevision else {
+                session.hasLoadedPersistedState = true
+                #if DEBUG
+                    logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
+                #endif
+                return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
+            }
             guard persistentBindingTransitionIsCurrent(hydrationToken.transition) else {
                 #if DEBUG
                     logPerform(outcome: "staleAfterPrepare")
                 #endif
-                return
+                return .stale
             }
             guard let payload = preparedPayload else {
                 #if DEBUG
@@ -3833,7 +4013,7 @@ final class AgentModeViewModel: ObservableObject {
                 #if DEBUG
                     logPerform(outcome: "noPayload")
                 #endif
-                return
+                return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
             }
             #if DEBUG
                 if let prepareStartMS {
@@ -3845,21 +4025,21 @@ final class AgentModeViewModel: ObservableObject {
                 #if DEBUG
                     logPerform(outcome: "cancelledBeforeHydrate")
                 #endif
-                return
+                return .stale
             }
             guard sessions[session.tabID] === session else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] skip stale owner tab=\(session.tabID)")
                 #if DEBUG
                     logPerform(outcome: "staleOwner")
                 #endif
-                return
+                return .stale
             }
             guard !session.hasLoadedPersistedState else {
                 Self.logCodexDebug("[AgentModeVM][PersistedLoad] skip already loaded tab=\(session.tabID)")
                 #if DEBUG
                     logPerform(outcome: "alreadyLoaded")
                 #endif
-                return
+                return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
             }
             let currentSessionID = session.activeAgentSessionID
             guard currentSessionID == expectedSessionID,
@@ -3871,7 +4051,7 @@ final class AgentModeViewModel: ObservableObject {
                 #if DEBUG
                     logPerform(outcome: "sessionMismatch")
                 #endif
-                return
+                return .stale
             }
             guard session.sourceItemsRevision == startRevision else {
                 Self.logCodexDebug(
@@ -3881,7 +4061,7 @@ final class AgentModeViewModel: ObservableObject {
                 #if DEBUG
                     logPerform(outcome: "revisionSuperseded", currentRevision: session.sourceItemsRevision)
                 #endif
-                return
+                return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
             }
 
             #if DEBUG
@@ -3891,7 +4071,7 @@ final class AgentModeViewModel: ObservableObject {
                 #if DEBUG
                     logPerform(outcome: "staleBeforeApply")
                 #endif
-                return
+                return .stale
             }
             #if DEBUG
                 if let applyStartMS {
@@ -3899,18 +4079,25 @@ final class AgentModeViewModel: ObservableObject {
                 }
                 logPerform(outcome: "applied")
             #endif
+            return currentPersistedSessionLoadOutcome(for: session, key: loadKey)
         } catch {
             print("[AgentModeVM] Failed to load session: \(error)")
-            if persistentBindingTransitionIsCurrent(hydrationToken.transition) {
+            let wasCancelled = error is CancellationError || Task.isCancelled
+            if !wasCancelled,
+               persistedSessionLoadKeyIsCurrent(loadKey, for: session)
+            {
                 session.hasLoadedPersistedState = true
             }
             #if DEBUG
                 if let prepareStartMS, prepareDurationMS == nil {
                     prepareDurationMS = WorkspaceRestorePerfLog.elapsedMS(since: prepareStartMS)
                 }
-                let outcome = (error is CancellationError || Task.isCancelled) ? "cancelledDuringPrepare" : "error"
+                let outcome = wasCancelled ? "cancelledDuringPrepare" : "error"
                 logPerform(outcome: outcome, error: error)
             #endif
+            return wasCancelled
+                ? .stale
+                : currentPersistedSessionLoadOutcome(for: session, key: loadKey)
         }
     }
 
@@ -7378,6 +7565,26 @@ final class AgentModeViewModel: ObservableObject {
         refreshAutoEditPermissionGuidanceForActiveSession(syncUI: false)
         updateDynamicModelPolling()
         syncAllActiveUIState(tabID: session.tabID)
+        completeInitialActiveSessionRestoreIfPresented(session)
+    }
+
+    private func completeInitialActiveSessionRestoreIfPresented(_ session: TabSession) {
+        guard let barrier = initialActiveSessionRestoreBarrier,
+              !barrier.isComplete,
+              barrier.owner == sessionIndexOwner,
+              barrier.tabID == session.tabID,
+              barrier.expectedBinding == session.persistentSessionBindingIdentity,
+              session.hasLoadedPersistedState,
+              !session.bindingTransitionInProgress,
+              activeTranscriptPresentation.tabID == session.tabID,
+              activeTranscriptPresentation.bindingsHydrated,
+              activeTranscriptPresentation.hydratedPersistentBinding == session.persistentSessionBindingIdentity,
+              activeTranscriptPresentation.hydratedBindingTransitionGeneration == session.bindingTransitionGeneration
+        else {
+            return
+        }
+        barrier.complete()
+        markSidebarRestoreActivePresentationTerminal(for: barrier.owner)
     }
 
     func clearBindings() {
@@ -9478,6 +9685,7 @@ final class AgentModeViewModel: ObservableObject {
             activationEpoch: sessionIndexActivationEpoch
         )
         latestSessionIndexOwner = owner
+        installInitialActiveSessionRestoreBarrier(owner: owner, workspace: workspace)
         return owner
     }
 
@@ -9549,18 +9757,97 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     var ownerValidatedSidebarRestoreFrozenOrderByTabID: [UUID: Int] {
-        guard let owner = sidebarRestoreFrozenOrderOwner,
-              isSessionIndexOwnerCurrent(owner)
+        guard let gate = sidebarRestoreOrderingGate,
+              isSessionIndexOwnerCurrent(gate.owner)
         else {
             return [:]
         }
-        return sidebarRestoreFrozenOrderByTabID
+        return gate.persistedOrderByTabID
     }
 
-    private func releaseSidebarRestoreFrozenOrder(for owner: SessionIndexOwner) {
-        guard sidebarRestoreFrozenOrderOwner == owner else { return }
-        sidebarRestoreFrozenOrderByTabID.removeAll()
-        sidebarRestoreFrozenOrderOwner = nil
+    func awaitInitialActiveSessionRestore() async {
+        while let barrier = initialActiveSessionRestoreBarrier {
+            await barrier.wait()
+            guard initialActiveSessionRestoreBarrier === barrier else { continue }
+            return
+        }
+    }
+
+    private func installInitialActiveSessionRestoreBarrier(
+        owner: SessionIndexOwner,
+        workspace: WorkspaceModel?
+    ) {
+        if initialActiveSessionRestoreBarrier?.owner == owner {
+            return
+        }
+        initialActiveSessionRestoreBarrier?.complete()
+        let barrier = InitialActiveSessionRestoreBarrier(
+            owner: owner,
+            tabID: workspace?.activeComposeTabID,
+            expectedBinding: nil
+        )
+        initialActiveSessionRestoreBarrier = barrier
+        if workspace?.activeComposeTabID == nil {
+            barrier.complete()
+            markSidebarRestoreActivePresentationTerminal(for: owner)
+        }
+    }
+
+    private func markSidebarRestoreActivePresentationTerminal(for owner: SessionIndexOwner) {
+        guard var gate = sidebarRestoreOrderingGate,
+              gate.owner == owner,
+              !gate.activeRestoreTerminal
+        else {
+            return
+        }
+        gate.activeRestoreTerminal = true
+        sidebarRestoreOrderingGate = gate
+        tryReleaseSidebarRestoreOrdering(for: owner, publishRevision: true)
+    }
+
+    private func markSidebarRestoreIndexTerminal(
+        token: SessionIndexRefreshToken,
+        publishRevisionOnRelease: Bool
+    ) {
+        guard var gate = sidebarRestoreOrderingGate,
+              gate.owner == token.owner,
+              gate.indexGeneration == token.generation,
+              !gate.indexTerminal
+        else {
+            return
+        }
+        gate.indexTerminal = true
+        sidebarRestoreOrderingGate = gate
+        tryReleaseSidebarRestoreOrdering(
+            for: token.owner,
+            publishRevision: publishRevisionOnRelease
+        )
+    }
+
+    private func tryReleaseSidebarRestoreOrdering(
+        for owner: SessionIndexOwner,
+        publishRevision: Bool
+    ) {
+        guard let gate = sidebarRestoreOrderingGate,
+              gate.owner == owner,
+              gate.indexTerminal,
+              gate.activeRestoreTerminal
+        else {
+            return
+        }
+        sidebarRestoreOrderingGate = nil
+        #if DEBUG
+            test_sidebarRestoreOrderingReleaseCount += 1
+        #endif
+        if publishRevision {
+            syncSidebarUIState(refresh: true, reason: .sessionList)
+        }
+    }
+
+    private func retireSidebarRestoreOrdering(for owner: SessionIndexOwner) {
+        guard sidebarRestoreOrderingGate?.owner == owner else { return }
+        sidebarRestoreOrderingGate = nil
+        syncSidebarUIState(refresh: true, reason: .sessionList)
     }
 
     private func setSessionListCacheReady(_ ready: Bool, for owner: SessionIndexOwner) {
@@ -9573,7 +9860,10 @@ final class AgentModeViewModel: ObservableObject {
         releaseFrozenOrder: Bool,
         owner: SessionIndexOwner? = nil
     ) {
-        let refreshOwner = owner ?? activeSessionIndexRefreshToken?.owner
+        let refreshOwner = owner
+            ?? activeSessionIndexRefreshToken?.owner
+            ?? sidebarRestoreOrderingGate?.owner
+            ?? initialActiveSessionRestoreBarrier?.owner
         if let token = activeSessionIndexRefreshToken,
            isSessionIndexOwnerCurrent(token.owner)
         {
@@ -9590,7 +9880,10 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
         if releaseFrozenOrder, let refreshOwner {
-            releaseSidebarRestoreFrozenOrder(for: refreshOwner)
+            retireSidebarRestoreOrdering(for: refreshOwner)
+            if initialActiveSessionRestoreBarrier?.owner == refreshOwner {
+                initialActiveSessionRestoreBarrier?.complete()
+            }
         }
     }
 
@@ -9609,12 +9902,17 @@ final class AgentModeViewModel: ObservableObject {
         sessionListSortDates.removeAll()
         sessionListCacheReady = false
         if let workspace {
-            sidebarRestoreFrozenOrderByTabID = makeSidebarRestoreFrozenOrder(for: workspace)
-            sidebarRestoreFrozenOrderOwner = owner
+            var gate = SidebarRestoreOrderingGate(
+                owner: owner,
+                persistedOrderByTabID: makeSidebarRestoreFrozenOrder(for: workspace)
+            )
+            gate.activeRestoreTerminal = initialActiveSessionRestoreBarrier?.owner == owner
+                && initialActiveSessionRestoreBarrier?.isComplete == true
+            sidebarRestoreOrderingGate = gate
         } else {
-            sidebarRestoreFrozenOrderByTabID.removeAll()
-            sidebarRestoreFrozenOrderOwner = nil
+            sidebarRestoreOrderingGate = nil
         }
+        installInitialActiveSessionRestoreBarrier(owner: owner, workspace: workspace)
         lastSidebarContentFingerprint = nil
     }
 
@@ -9948,6 +10246,27 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return
         }
+        let resolvedActiveTabID = workspace.activeComposeTabID
+        if let resolvedActiveTabID,
+           let persistedSessionID = persistedSidebarTabs(for: workspace)
+           .first(where: { $0.id == resolvedActiveTabID })?
+           .activeAgentSessionID
+        {
+            let activeSession = session(for: resolvedActiveTabID)
+            if activeSession.activeAgentSessionID != persistedSessionID {
+                _ = installPersistentSessionBinding(
+                    sessionID: persistedSessionID,
+                    on: activeSession,
+                    updateWorkspaceMetadata: false,
+                    invalidateAsyncWork: true
+                )
+                activeSession.hasLoadedPersistedState = false
+            }
+        }
+        if let resolvedActiveTabID {
+            activeSessionLoadInProgressTabID = resolvedActiveTabID
+            onTabChanged(resolvedActiveTabID, allowDuringWorkspaceSwitch: true)
+        }
         refreshSessionListCache(for: workspace, owner: owner)
         #if DEBUG
             WorkspaceRestorePerfLog.event(
@@ -9960,10 +10279,7 @@ final class AgentModeViewModel: ObservableObject {
                 ]
             )
         #endif
-        let resolvedActiveTabID = workspace.activeComposeTabID
         if let resolvedActiveTabID {
-            activeSessionLoadInProgressTabID = resolvedActiveTabID
-            onTabChanged(resolvedActiveTabID, allowDuringWorkspaceSwitch: true)
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
                     "agentMode.workspaceSwitch.end",
@@ -10020,11 +10336,6 @@ final class AgentModeViewModel: ObservableObject {
             orderByTabID[tab.id] = index
         }
         return orderByTabID
-    }
-
-    private func invalidateSidebarRestoreOrdering() {
-        sidebarRestoreFrozenOrderByTabID.removeAll()
-        sidebarRestoreFrozenOrderOwner = nil
     }
 
     nonisolated static func shouldSkipSessionListCacheRefresh(
@@ -10101,6 +10412,13 @@ final class AgentModeViewModel: ObservableObject {
         sessionListCacheGeneration &+= 1
         let token = SessionIndexRefreshToken(owner: owner, generation: sessionListCacheGeneration)
         activeSessionIndexRefreshToken = token
+        if var gate = sidebarRestoreOrderingGate,
+           gate.owner == owner
+        {
+            gate.indexGeneration = token.generation
+            gate.indexTerminal = false
+            sidebarRestoreOrderingGate = gate
+        }
         activeSessionIndexRefreshWorkspace = workspace
         activeSessionIndexRefreshValidTabIDs = validTabIDs
         activeSessionIndexRefreshBoundSessionIDByTabID = boundSessionIDByTabID
@@ -10257,8 +10575,12 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshValidTabIDs.removeAll()
         activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
+        completeUnboundInitialActiveRestoreIfNeeded(for: token.owner)
+        markSidebarRestoreIndexTerminal(
+            token: token,
+            publishRevisionOnRelease: false
+        )
         setSessionListCacheReady(true, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
@@ -10347,7 +10669,12 @@ final class AgentModeViewModel: ObservableObject {
             provisional.merge(activeSessionIndexRefreshPrioritizedEntries) { _, new in new }
             publishSessionIndexReplacement(provisional, token: token)
         }
-        let resumeTriggered = resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: updatedTabIDs)
+        let resumeTriggered = resumePendingActiveSessionLoadIfNeeded(
+            batch: batch,
+            acceptedEntries: acceptedEntries,
+            updatedTabIDs: updatedTabIDs,
+            token: token
+        )
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "agentSessionIndex.applyBatch",
@@ -10368,21 +10695,62 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func resumePendingActiveSessionLoadIfNeeded(updatedTabIDs: Set<UUID>) -> Bool {
+    private func resumePendingActiveSessionLoadIfNeeded(
+        batch: AgentSessionSidebarBuildBatch,
+        acceptedEntries: [UUID: AgentSessionIndexEntry],
+        updatedTabIDs: Set<UUID>,
+        token: SessionIndexRefreshToken
+    ) -> Bool {
         guard let targetTabID = activeSessionLoadInProgressTabID,
               updatedTabIDs.contains(targetTabID)
         else {
             return false
         }
-        guard explicitActiveSessionID(for: targetTabID) != nil else {
+        guard let barrier = initialActiveSessionRestoreBarrier,
+              !barrier.isComplete,
+              barrier.owner == token.owner,
+              barrier.tabID == targetTabID,
+              barrier.expectedBinding == nil,
+              sessions[targetTabID]?.activeAgentSessionID == nil,
+              currentWorkspaceSnapshot(for: token.owner)?
+              .composeTabs.first(where: { $0.id == targetTabID })?
+              .activeAgentSessionID == nil,
+              let preferredSessionID = batch.preferredSessionIDByTabID[targetTabID],
+              let preferredEntry = acceptedEntries[preferredSessionID],
+              preferredEntry.tabID == targetTabID
+        else {
             return false
         }
-        guard workspaceManager?.isSwitchingWorkspace != true else {
+        activeSessionIndexRefreshBoundSessionIDByTabID[targetTabID] = preferredSessionID
+        let targetSession = session(for: targetTabID)
+        guard let binding = installPersistentSessionBinding(
+            sessionID: preferredSessionID,
+            on: targetSession,
+            updateWorkspaceMetadata: true,
+            invalidateAsyncWork: true
+        ) else {
             return false
         }
+        targetSession.hasLoadedPersistedState = false
+        barrier.expectedBinding = binding
         lastProcessedTabID = nil
         onTabChanged(targetTabID)
         return true
+    }
+
+    private func completeUnboundInitialActiveRestoreIfNeeded(for owner: SessionIndexOwner) {
+        guard let barrier = initialActiveSessionRestoreBarrier,
+              !barrier.isComplete,
+              barrier.owner == owner,
+              barrier.expectedBinding == nil,
+              barrier.tabID.map({ sessions[$0]?.activeAgentSessionID == nil }) ?? true
+        else {
+            return
+        }
+        barrier.complete()
+        activeSessionLoadInProgressTabID = nil
+        workspaceSwitchInFlight = false
+        markSidebarRestoreActivePresentationTerminal(for: owner)
     }
 
     private func prepareSidebarIndexStreamRetry(token: SessionIndexRefreshToken) -> Bool {
@@ -10416,8 +10784,12 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
+        completeUnboundInitialActiveRestoreIfNeeded(for: token.owner)
+        markSidebarRestoreIndexTerminal(
+            token: token,
+            publishRevisionOnRelease: false
+        )
         setSessionListCacheReady(true, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
         scheduleSidebarAutoArchive(reason: .sessionListReady)
     }
 
@@ -10437,8 +10809,12 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
+        completeUnboundInitialActiveRestoreIfNeeded(for: token.owner)
         setSessionListCacheReady(false, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
+        markSidebarRestoreIndexTerminal(
+            token: token,
+            publishRevisionOnRelease: true
+        )
     }
 
     private func notePrioritizedActiveSessionRestoreStatus(
@@ -10483,7 +10859,7 @@ final class AgentModeViewModel: ObservableObject {
             #endif
             return true
         }
-        guard sessions[prioritizedTabID]?.persistedLoadTask != nil else {
+        guard sessions[prioritizedTabID]?.persistedLoadFlight != nil else {
             let shouldContinue = activeSessionIndexRefreshToken == token
                 && isSessionIndexOwnerCurrent(token.owner)
             #if DEBUG
@@ -15323,7 +15699,6 @@ final class AgentModeViewModel: ObservableObject {
         session.lastActivityAt = Date()
         session.lastUserMessageAt = nil
         session.isDirty = true
-        invalidateSidebarRestoreOrdering()
         sessionListSortDates.removeValue(forKey: tabID)
 
         // Detach before clearing the provider session ID so async cleanup cannot
@@ -15732,7 +16107,6 @@ final class AgentModeViewModel: ObservableObject {
         guard let tabID = currentTabID else { return nil }
         let session = session(for: tabID)
         markSessionAsFreshlyCreated(session)
-        invalidateSidebarRestoreOrdering()
         updateBindingsFromSession(session)
         return tabID
     }

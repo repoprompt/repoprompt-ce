@@ -880,6 +880,221 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertTrue(fixture.manager.activeWorkspace?.stashedTabs.isEmpty == true)
     }
 
+    func testInitialActiveSessionHydratesBeforeFullIndexCompletes() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let sessionID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        viewModel.test_setSidebarAutoArchiveActive(true)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let hydration = PersistedHydrationHarness(payloads: [
+            sessionID: makeHydrationPayload(
+                sessionID: sessionID,
+                tabID: tabID,
+                texts: ["restored user", "restored assistant"]
+            )
+        ])
+        viewModel.test_setPersistedHydrationPreparer { request in
+            await hydration.prepare(request)
+        }
+        let indexGate = SidebarIndexStreamGate()
+        let indexHarness = SidebarIndexStreamHarness(plans: [
+            .init(batches: [makeBatch([makeIndexEntry(id: sessionID, tabID: tabID)])], gate: indexGate)
+        ])
+        installSidebarIndexHarness(indexHarness, on: viewModel)
+        let workspace = makeWorkspace(
+            name: "Immediate active restore",
+            tabs: [ComposeTabState(id: tabID, name: "Active", activeAgentSessionID: sessionID)],
+            activeTabID: tabID
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+        await hydration.waitForRequest(sessionID)
+        await indexHarness.waitForRequestCount(1)
+        await viewModel.test_waitForInitialActiveSessionRestore()
+
+        let session = try XCTUnwrap(viewModel.sessions[tabID])
+        let requestedBinding = await indexHarness.boundSessionID(requestIndex: 0, tabID: tabID)
+        XCTAssertEqual(session.activeAgentSessionID, sessionID)
+        XCTAssertEqual(requestedBinding, sessionID)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.tabID, tabID)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.map(\.text), ["restored user", "restored assistant"])
+        XCTAssertTrue(viewModel.activeTranscriptPresentation.bindingsHydrated)
+        XCTAssertFalse(viewModel.test_ownerValidatedSessionListCacheReady)
+
+        await indexGate.release()
+        await viewModel.test_waitForSessionListCacheRefresh()
+    }
+
+    func testStaleHydrationCannotReplaceCurrentBindingOrClearItsFlight() async throws {
+        let viewModel = makeViewModel()
+        let tabID = UUID()
+        let sessionAID = UUID()
+        let sessionBID = UUID()
+        viewModel.test_setCurrentTabIDOverride(tabID)
+        viewModel.test_setSidebarAutoArchiveActive(true)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let hydrationAGate = SidebarIndexStreamGate()
+        let hydrationBGate = SidebarIndexStreamGate()
+        let hydration = PersistedHydrationHarness(
+            payloads: [
+                sessionAID: makeHydrationPayload(sessionID: sessionAID, tabID: tabID, texts: ["A user", "A assistant"]),
+                sessionBID: makeHydrationPayload(sessionID: sessionBID, tabID: tabID, texts: ["B user", "B assistant"])
+            ],
+            gates: [sessionAID: hydrationAGate, sessionBID: hydrationBGate]
+        )
+        viewModel.test_setPersistedHydrationPreparer { request in
+            await hydration.prepare(request)
+        }
+        let firstIndexGate = SidebarIndexStreamGate()
+        let successorIndexGate = SidebarIndexStreamGate()
+        let indexHarness = SidebarIndexStreamHarness(plans: [
+            .init(batches: [], gate: firstIndexGate),
+            .init(batches: [], gate: successorIndexGate)
+        ])
+        installSidebarIndexHarness(indexHarness, on: viewModel)
+        let workspace = makeWorkspace(
+            name: "Stale hydration",
+            tabs: [ComposeTabState(id: tabID, name: "Active", activeAgentSessionID: sessionAID)],
+            activeTabID: tabID
+        )
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+        await hydration.waitForRequest(sessionAID)
+        let session = try XCTUnwrap(viewModel.sessions[tabID])
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionBID, on: session)
+        session.hasLoadedPersistedState = false
+        let loadBTask = Task { await viewModel.ensureSessionReady(tabID: tabID) }
+        await hydration.waitForRequest(sessionBID)
+
+        await hydrationAGate.release()
+        await Task.yield()
+        XCTAssertEqual(session.persistedLoadFlight?.key.binding?.sessionID, sessionBID)
+
+        await hydrationBGate.release()
+        _ = await loadBTask.value
+        await viewModel.test_waitForInitialActiveSessionRestore()
+        XCTAssertEqual(session.activeAgentSessionID, sessionBID)
+        XCTAssertEqual(session.items.map(\.text), ["B user", "B assistant"])
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.hydratedPersistentBinding?.sessionID, sessionBID)
+        XCTAssertEqual(viewModel.activeTranscriptPresentation.visibleRows.map(\.text), ["B user", "B assistant"])
+
+        await firstIndexGate.release()
+        await successorIndexGate.release()
+        await viewModel.test_waitForSessionListCacheRefresh()
+    }
+
+    func testRestoreOrderingGateIsBatchStableAndReleasesOnceWithoutChangingCurrentTab() async {
+        let viewModel = makeViewModel()
+        let firstTabID = UUID()
+        let secondTabID = UUID()
+        let thirdTabID = UUID()
+        let firstSessionID = UUID()
+        let secondSessionID = UUID()
+        let thirdSessionID = UUID()
+        viewModel.test_setCurrentTabIDOverride(firstTabID)
+        viewModel.test_setSidebarAutoArchiveActive(true)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let hydrationGate = SidebarIndexStreamGate()
+        let hydration = PersistedHydrationHarness(
+            payloads: [
+                firstSessionID: makeHydrationPayload(
+                    sessionID: firstSessionID,
+                    tabID: firstTabID,
+                    texts: ["active user", "active assistant"]
+                )
+            ],
+            gates: [firstSessionID: hydrationGate]
+        )
+        viewModel.test_setPersistedHydrationPreparer { request in
+            await hydration.prepare(request)
+        }
+        let presentationGate = SidebarIndexStreamGate()
+        viewModel.test_setBeforeInitialActiveSessionPresentation {
+            await presentationGate.wait()
+        }
+        defer { viewModel.test_setBeforeInitialActiveSessionPresentation(nil) }
+
+        let streamStartGate = SidebarIndexStreamGate()
+        let firstBatchGate = SidebarIndexStreamGate()
+        let finalBatchGate = SidebarIndexStreamGate()
+        let firstEntry = makeIndexEntry(
+            id: firstSessionID,
+            tabID: firstTabID,
+            lastUserMessageAt: Date(timeIntervalSince1970: 1)
+        )
+        let secondEntry = makeIndexEntry(
+            id: secondSessionID,
+            tabID: secondTabID,
+            parentSessionID: thirdSessionID,
+            lastUserMessageAt: Date(timeIntervalSince1970: 300)
+        )
+        let thirdEntry = makeIndexEntry(
+            id: thirdSessionID,
+            tabID: thirdTabID,
+            lastUserMessageAt: Date(timeIntervalSince1970: 200)
+        )
+        let indexHarness = SidebarIndexStreamHarness(plans: [
+            .init(
+                batches: [makeBatch([thirdEntry]), makeBatch([firstEntry, secondEntry])],
+                gate: streamStartGate,
+                gatesAfterEachBatch: [firstBatchGate, finalBatchGate]
+            )
+        ])
+        installSidebarIndexHarness(indexHarness, on: viewModel)
+        let tabs = [
+            ComposeTabState(id: firstTabID, name: "First", activeAgentSessionID: firstSessionID),
+            ComposeTabState(id: secondTabID, name: "Second", isPinned: true, activeAgentSessionID: secondSessionID),
+            ComposeTabState(id: thirdTabID, name: "Third", activeAgentSessionID: thirdSessionID)
+        ]
+        let workspace = makeWorkspace(name: "Stable ordering", tabs: tabs, activeTabID: firstTabID)
+        let owner = viewModel.test_receiveWorkspaceSwitchNotification(workspace)
+
+        await viewModel.test_handleWorkspaceSwitch(workspace, owner: owner)
+        await hydration.waitForRequest(firstSessionID)
+        await indexHarness.waitForRequestCount(1)
+        let activationGenerationBeforeBatches = viewModel.test_sessionActivationGeneration
+        XCTAssertEqual(viewModel.sidebarSessions(for: tabs).map(\.tabID), tabs.map(\.id))
+
+        await streamStartGate.release()
+        await firstBatchGate.waitForWaiter()
+        XCTAssertEqual(viewModel.sidebarSessions(for: tabs).map(\.tabID), tabs.map(\.id))
+        XCTAssertEqual(viewModel.test_sessionActivationGeneration, activationGenerationBeforeBatches)
+        await firstBatchGate.release()
+        await finalBatchGate.waitForWaiter()
+        XCTAssertEqual(viewModel.sidebarSessions(for: tabs).map(\.tabID), tabs.map(\.id))
+        XCTAssertEqual(viewModel.test_sessionActivationGeneration, activationGenerationBeforeBatches)
+        await finalBatchGate.release()
+        await viewModel.test_waitForSessionListCacheRefresh()
+
+        XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, tabs.count)
+        XCTAssertEqual(viewModel.test_sidebarRestoreOrderingReleaseCount, 0)
+        XCTAssertEqual(viewModel.sidebarSessions(for: tabs).map(\.tabID), tabs.map(\.id))
+
+        await hydrationGate.release()
+        await presentationGate.waitForWaiter()
+        let revisionBeforeRelease = viewModel.ui.sessionSidebar.snapshot.revision
+        let currentTabBeforeRelease = viewModel.currentTabID
+        await presentationGate.release()
+        await viewModel.test_waitForInitialActiveSessionRestore()
+
+        XCTAssertEqual(viewModel.test_sidebarRestoreOrderingReleaseCount, 1)
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionBeforeRelease + 1)
+        XCTAssertEqual(viewModel.currentTabID, currentTabBeforeRelease)
+        XCTAssertEqual(viewModel.currentTabID, firstTabID)
+        XCTAssertEqual(workspace.activeComposeTabID, firstTabID)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 0)
+        await Task.yield()
+        XCTAssertEqual(viewModel.test_sidebarRestoreOrderingReleaseCount, 1)
+        XCTAssertEqual(viewModel.ui.sessionSidebar.snapshot.revision, revisionBeforeRelease + 1)
+    }
+
     func testRestoredMatchingBindingPreservesRefreshAndRestoresIndexOnlyHierarchy() async throws {
         let viewModel = makeViewModel()
         let rootTabID = UUID()
@@ -919,7 +1134,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertNil(viewModel.test_activeSessionIndexRefreshGeneration)
         XCTAssertGreaterThan(generationWhileBindingIsInstalled, 0)
         XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
-        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 0)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, tabs.count)
         let matchingBindingRequestCount = await harness.currentRequestCount()
         XCTAssertEqual(matchingBindingRequestCount, 1)
         let rows = viewModel.sidebarSessions(for: tabs)
@@ -977,7 +1192,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(successorBinding, replacementSessionID)
         XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), [replacementSessionID])
         XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
-        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 0)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 1)
     }
 
     func testFullRefreshReplacesOmittedEntries() async throws {
@@ -1080,7 +1295,7 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         XCTAssertEqual(requestCount, 2)
         XCTAssertEqual(Set(viewModel.test_ownerValidatedSessionIndex.keys), [rootSessionID])
         XCTAssertTrue(viewModel.test_ownerValidatedSessionListCacheReady)
-        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 0)
+        XCTAssertEqual(viewModel.test_ownerValidatedSidebarRestoreFrozenOrderCount, 2)
     }
 
     func testLocalRemovalTombstoneWinsOverLaterFullBatch() async {
@@ -1403,6 +1618,67 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
         )
     }
 
+    private func makeHydrationPayload(
+        sessionID: UUID,
+        tabID: UUID,
+        texts: [String]
+    ) -> AgentSessionHydrationPayload {
+        let items = [
+            AgentChatItem.user(texts[0], sequenceIndex: 0),
+            AgentChatItem.assistant(texts[1], sequenceIndex: 1)
+        ]
+        let transcript = AgentTranscriptIO.buildTranscript(
+            from: items,
+            terminalState: .idle,
+            nextSequenceIndex: 2,
+            compact: false
+        )
+        let selection = AgentModelCatalog.normalizePersistedSelection(
+            agentRaw: nil,
+            modelRaw: nil
+        )
+        let savedAt = Date(timeIntervalSince1970: 100)
+        let persistedSession = AgentSession(
+            id: sessionID,
+            composeTabID: tabID,
+            name: "Restored",
+            savedAt: savedAt,
+            transcript: transcript,
+            itemCount: items.count,
+            lastUserMessageAt: items[0].timestamp,
+            agentKind: selection.agent.rawValue,
+            agentModel: selection.modelRaw,
+            lastRunState: AgentSessionRunState.idle.rawValue,
+            autoEditEnabled: false
+        )
+        return AgentSessionHydrationPayload(
+            sessionID: sessionID,
+            persistedSession: persistedSession,
+            canonicalLiveItems: items,
+            transcript: transcript,
+            builtPresentation: AgentSessionRestoreSupport.buildTranscriptPresentation(
+                from: transcript,
+                sourceItems: items,
+                selectedAgent: selection.agent,
+                previousPerformanceSnapshot: .empty,
+                projectionProtection: .none,
+                isCompressedHistoryRevealed: false,
+                isColdLoad: true
+            ),
+            normalizedRunState: .idle,
+            normalizedSelection: selection,
+            lastUserMessageAt: items[0].timestamp,
+            restoredIndexEntry: AgentSessionRestoreSupport.buildSidebarIndexEntry(
+                from: persistedSession,
+                tabID: tabID,
+                name: "Restored",
+                lastUserMessageAt: items[0].timestamp,
+                itemCount: items.count
+            ),
+            needsReloadMigrationSave: false
+        )
+    }
+
     private func makeWorkspace(
         name: String,
         tabs: [ComposeTabState],
@@ -1506,6 +1782,35 @@ final class AgentModeViewModelInactiveRefreshTests: XCTestCase {
     }
 }
 
+@MainActor
+private final class PersistedHydrationHarness {
+    private let payloads: [UUID: AgentSessionHydrationPayload]
+    private let gates: [UUID: SidebarIndexStreamGate]
+    private var requestedSessionIDs: Set<UUID> = []
+
+    init(
+        payloads: [UUID: AgentSessionHydrationPayload],
+        gates: [UUID: SidebarIndexStreamGate] = [:]
+    ) {
+        self.payloads = payloads
+        self.gates = gates
+    }
+
+    func prepare(_ request: AgentSessionHydrationRequest) async -> AgentSessionHydrationPayload? {
+        requestedSessionIDs.insert(request.sessionID)
+        if let gate = gates[request.sessionID] {
+            await gate.wait()
+        }
+        return payloads[request.sessionID]
+    }
+
+    func waitForRequest(_ sessionID: UUID) async {
+        while !requestedSessionIDs.contains(sessionID) {
+            await Task.yield()
+        }
+    }
+}
+
 private actor SidebarIndexStreamGate {
     private var released = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -1539,17 +1844,20 @@ private actor SidebarIndexStreamHarness {
     struct Plan: @unchecked Sendable {
         let batches: [AgentSessionSidebarBuildBatch]
         let gate: SidebarIndexStreamGate?
+        let gatesAfterEachBatch: [SidebarIndexStreamGate]
         let gateAfterBatches: SidebarIndexStreamGate?
         let failsAfterBatches: Bool
 
         init(
             batches: [AgentSessionSidebarBuildBatch],
             gate: SidebarIndexStreamGate? = nil,
+            gatesAfterEachBatch: [SidebarIndexStreamGate] = [],
             gateAfterBatches: SidebarIndexStreamGate? = nil,
             failsAfterBatches: Bool = false
         ) {
             self.batches = batches
             self.gate = gate
+            self.gatesAfterEachBatch = gatesAfterEachBatch
             self.gateAfterBatches = gateAfterBatches
             self.failsAfterBatches = failsAfterBatches
         }
@@ -1579,9 +1887,12 @@ private actor SidebarIndexStreamHarness {
                     continuation.finish()
                     return
                 }
-                for batch in plan.batches {
+                for (index, batch) in plan.batches.enumerated() {
                     guard !Task.isCancelled else { break }
                     continuation.yield(batch)
+                    if plan.gatesAfterEachBatch.indices.contains(index) {
+                        await plan.gatesAfterEachBatch[index].wait()
+                    }
                 }
                 if let gateAfterBatches = plan.gateAfterBatches {
                     await gateAfterBatches.wait()

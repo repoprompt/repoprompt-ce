@@ -120,6 +120,59 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
         XCTAssertEqual(fullyHydratedRows.map(\.depth), [0, 1, 1])
     }
 
+    func testRestoreOrderingGatePreservesExactPersistedOrderAcrossMetadataChanges() {
+        let firstTabID = id(13)
+        let secondTabID = id(14)
+        let thirdTabID = id(15)
+        let firstSessionID = id(113)
+        let secondSessionID = id(114)
+        let thirdSessionID = id(115)
+        let tabs = [
+            tab(firstTabID, sessionID: firstSessionID, lastModified: date(1)),
+            tab(secondTabID, sessionID: secondSessionID, isPinned: true, lastModified: date(2)),
+            tab(thirdTabID, sessionID: thirdSessionID, lastModified: date(3))
+        ]
+        let index = sessionIndex([
+            entry(firstSessionID, tabID: firstTabID, lastUserMessageAt: date(10)),
+            entry(
+                secondSessionID,
+                tabID: secondTabID,
+                parentSessionID: thirdSessionID,
+                lastUserMessageAt: date(200)
+            ),
+            entry(thirdSessionID, tabID: thirdTabID, lastUserMessageAt: date(100))
+        ])
+        let persistedOrder = [
+            firstTabID: 0,
+            secondTabID: 1,
+            thirdTabID: 2
+        ]
+
+        let restoredRows = build(
+            tabs: tabs,
+            sessionIndex: index,
+            restoreOrderByTabID: persistedOrder
+        )
+        let hydratedRows = build(
+            tabs: tabs,
+            sessions: [
+                secondTabID: liveSession(
+                    tabID: secondTabID,
+                    sessionID: secondSessionID,
+                    parentSessionID: thirdSessionID,
+                    lastUserMessageAt: date(500)
+                )
+            ],
+            sessionIndex: index,
+            restoreOrderByTabID: persistedOrder
+        )
+
+        XCTAssertEqual(restoredRows.map(\.tabID), [firstTabID, secondTabID, thirdTabID])
+        XCTAssertEqual(hydratedRows.map(\.tabID), [firstTabID, secondTabID, thirdTabID])
+        XCTAssertEqual(restoredRows.map(\.depth), [0, 0, 0])
+        XCTAssertNotEqual(build(tabs: tabs, sessionIndex: index).map(\.tabID), restoredRows.map(\.tabID))
+    }
+
     func testLiveContinuationWinsOverStalePersistedDates() throws {
         let parentTabID = id(20)
         let continuedChildTabID = id(21)
@@ -454,7 +507,8 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
     private func build(
         tabs: [ComposeTabState],
         sessions: [UUID: AgentModeViewModel.TabSession] = [:],
-        sessionIndex: [UUID: AgentSessionIndexEntry]
+        sessionIndex: [UUID: AgentSessionIndexEntry],
+        restoreOrderByTabID: [UUID: Int] = [:]
     ) -> [AgentModeViewModel.SidebarSession] {
         AgentModeSidebarSessionBuilder(
             allTabs: tabs,
@@ -467,8 +521,7 @@ final class AgentModeSidebarSessionBuilderTests: XCTestCase {
             ),
             sessionIndex: sessionIndex,
             sessionListSortDates: [:],
-            sessionListCacheReady: true,
-            sidebarRestoreFrozenOrderByTabID: [:],
+            sidebarRestoreFrozenOrderByTabID: restoreOrderByTabID,
             mcpControlledTabIDs: []
         ).build()
     }
