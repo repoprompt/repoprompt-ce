@@ -58,6 +58,50 @@ package enum PathResolutionIssue: Equatable {
 }
 
 package enum ClientPathFormatter {
+    package static func nonAbsoluteDisplayPath(
+        root: WorkspaceRootRef,
+        relativePath: String,
+        visibleRoots: [WorkspaceRootRef]
+    ) -> String {
+        let standardizedRelative = StandardizedPath.relative(relativePath)
+        let alias = nonAbsoluteRootAlias(root: root, visibleRoots: visibleRoots)
+        if visibleRoots.count <= 1 {
+            return standardizedRelative.isEmpty ? alias : standardizedRelative
+        }
+        return standardizedRelative.isEmpty ? alias : "\(alias)/\(standardizedRelative)"
+    }
+
+    package static func nonAbsoluteRootAlias(
+        root: WorkspaceRootRef,
+        visibleRoots: [WorkspaceRootRef]
+    ) -> String {
+        if visibleRoots.count <= 1 {
+            return root.name
+        }
+        let canonicalMatches = visibleRoots.filter { $0.name.caseInsensitiveCompare(root.name) == .orderedSame }
+        if canonicalMatches.count <= 1 {
+            return root.name
+        }
+
+        let rootComponents = pathComponents(for: root.standardizedFullPath)
+        for suffixLength in 2 ... max(2, rootComponents.count) {
+            let suffix = rootComponents.suffix(suffixLength).joined(separator: "/")
+            let matches = visibleRoots.filter {
+                pathComponents(for: $0.standardizedFullPath).suffix(suffixLength).joined(separator: "/").caseInsensitiveCompare(suffix) == .orderedSame
+            }
+            if matches.count == 1 {
+                return suffix
+            }
+        }
+        return root.name
+    }
+
+    private static func pathComponents(for standardizedPath: String) -> [String] {
+        standardizedPath
+            .split(separator: "/")
+            .map(String.init)
+    }
+
     package static func displayPath(
         root: WorkspaceRootRef,
         relativePath: String,
@@ -123,6 +167,16 @@ package enum WorkspaceAliasResolver {
         guard let alias = components.first, !alias.isEmpty else { return .notAliasPrefixed }
         guard !roots.isEmpty else { return .notAliasPrefixed }
 
+        let generatedAliasResolution = resolveNonAbsoluteGeneratedAlias(
+            components: components,
+            roots: roots,
+            options: options,
+            minimumComponentCount: 2
+        )
+        if generatedAliasResolution != .notAliasPrefixed {
+            return generatedAliasResolution
+        }
+
         let canonicalMatches = roots.filter { $0.name.caseInsensitiveCompare(alias) == .orderedSame }
         if canonicalMatches.count > 1 {
             return .ambiguous(alias: alias, matchingRoots: canonicalMatches)
@@ -143,16 +197,52 @@ package enum WorkspaceAliasResolver {
             resolvedRoot = nil
         }
 
-        guard let root = resolvedRoot else { return .notAliasPrefixed }
-        if options.disambiguateRealSubpath, rootHasRealSubpath?(root, alias) == true {
-            return .notAliasPrefixed
+        if let root = resolvedRoot {
+            if options.disambiguateRealSubpath, rootHasRealSubpath?(root, alias) == true {
+                return .notAliasPrefixed
+            }
+
+            let remainder = components.dropFirst().joined(separator: "/")
+            if remainder.isEmpty {
+                return .bareRoot(root: root, alias: alias)
+            }
+            return .prefixed(root: root, alias: alias, remainder: remainder)
         }
 
-        let remainder = components.dropFirst().joined(separator: "/")
-        if remainder.isEmpty {
-            return .bareRoot(root: root, alias: alias)
+        return resolveNonAbsoluteGeneratedAlias(
+            components: components,
+            roots: roots,
+            options: options,
+            minimumComponentCount: 1
+        )
+    }
+
+    private static func resolveNonAbsoluteGeneratedAlias(
+        components: [String],
+        roots: [WorkspaceRootRef],
+        options: RootAliasOptions,
+        minimumComponentCount: Int
+    ) -> RootAliasResolution {
+        let aliasByRoot = Dictionary(grouping: roots) { root in
+            ClientPathFormatter.nonAbsoluteRootAlias(root: root, visibleRoots: roots).lowercased()
         }
-        return .prefixed(root: root, alias: alias, remainder: remainder)
+        let lowerBound = max(1, minimumComponentCount)
+        guard components.count >= lowerBound else { return .notAliasPrefixed }
+        for aliasLength in stride(from: components.count, through: lowerBound, by: -1) {
+            let alias = components.prefix(aliasLength).joined(separator: "/")
+            let remainder = components.dropFirst(aliasLength).joined(separator: "/")
+            if options.requireRemainder, remainder.isEmpty { continue }
+            guard let matches = aliasByRoot[alias.lowercased()] else { continue }
+            if matches.count > 1 {
+                return .ambiguous(alias: alias, matchingRoots: matches)
+            }
+            guard let root = matches.first else { continue }
+            if remainder.isEmpty {
+                return .bareRoot(root: root, alias: alias)
+            }
+            return .prefixed(root: root, alias: alias, remainder: remainder)
+        }
+        return .notAliasPrefixed
     }
 }
 

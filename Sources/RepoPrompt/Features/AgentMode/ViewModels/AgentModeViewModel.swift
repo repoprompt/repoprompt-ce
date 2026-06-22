@@ -12776,7 +12776,9 @@ final class AgentModeViewModel: ObservableObject {
         workspaceEntries.reserveCapacity(min(taggedPaths.count, maxFiles))
         var seenFileIDs = Set<UUID>()
         var seenExternalPaths = Set<String>()
-        let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: lookupContext.rootScope).map { ($0.id, $0) })
+        let scopedRootRefs = await store.rootRefs(scope: lookupContext.rootScope)
+        let rootsByID = Dictionary(uniqueKeysWithValues: scopedRootRefs.map { ($0.id, $0) })
+        let displayRootRefs = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? scopedRootRefs
 
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
@@ -12814,9 +12816,22 @@ final class AgentModeViewModel: ObservableObject {
             filePathDisplay: .relative,
             codemapSnapshotBundle: .empty,
             displayPathResolver: { entry in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-                    forPhysicalPath: entry.file.standardizedFullPath,
-                    display: .relative
+                if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+                    forPhysicalPath: entry.file.standardizedFullPath
+                ) {
+                    return ClientPathFormatter.nonAbsoluteDisplayPath(
+                        root: projected.root,
+                        relativePath: projected.relativePath,
+                        visibleRoots: displayRootRefs
+                    )
+                }
+                guard let root = rootsByID[entry.file.rootID] else {
+                    return entry.file.standardizedRelativePath
+                }
+                return ClientPathFormatter.nonAbsoluteDisplayPath(
+                    root: root,
+                    relativePath: entry.file.standardizedRelativePath,
+                    visibleRoots: displayRootRefs
                 )
             }
         )

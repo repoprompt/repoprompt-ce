@@ -179,6 +179,16 @@ struct WorkspaceRootBindingProjection: Equatable {
         return (boundRoot.logicalRoot.standardizedFullPath, StandardizedPath.relative(relative))
     }
 
+    func projectedLogicalPathComponents(forPhysicalPath rawPath: String) -> (root: WorkspaceRootRef, relativePath: String)? {
+        let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
+        guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
+            return nil
+        }
+        let relative = String(standardized.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return (boundRoot.logicalRoot, StandardizedPath.relative(relative))
+    }
+
     func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {
         let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
         guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {

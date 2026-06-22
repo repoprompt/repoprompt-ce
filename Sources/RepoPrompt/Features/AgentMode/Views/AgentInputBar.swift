@@ -184,21 +184,11 @@ struct AgentInputBar: View {
 
 enum AgentFileMentionText {
     static func attachmentDisplayName(for suggestion: MentionSuggestion) -> String {
-        if let commitDisplayText = suggestion.commitDisplayText?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-            !commitDisplayText.isEmpty
-        {
-            return commitDisplayText
+        let trimmedPath = suggestion.relativePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPath.isEmpty {
+            return trimmedPath
         }
-
-        let normalizedPath = suggestion.relativePath.replacingOccurrences(of: "\\", with: "/")
-        if let fileName = normalizedPath.split(separator: "/").last {
-            let value = String(fileName).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !value.isEmpty {
-                return value
-            }
-        }
-        return suggestion.displayName
+        return suggestion.displayName.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func removingTaggedMention(

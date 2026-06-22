@@ -30,6 +30,7 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let suggestion = try XCTUnwrap(suggestions.first { $0.relativePath == "Sources/BranchOnly.swift" })
 
         XCTAssertEqual(suggestion.subtitle, "Sources")
+        XCTAssertEqual(suggestion.commitDisplayText, suggestion.relativePath)
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(".worktrees") }, String(describing: suggestions))
         XCTAssertFalse(suggestions.contains { $0.relativePath.contains(fixture.worktreeRoot.path) }, String(describing: suggestions))
     }
@@ -123,8 +124,8 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         XCTAssertTrue(suggestions.count > 64)
         XCTAssertTrue(suggestions.allSatisfy { $0.kind == .file })
         XCTAssertEqual(Set(suggestions.compactMap(\.subtitle)), ["Sources"])
-        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasPrefix("Match") == true })
-        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.contains("Sources/") == false })
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText == $0.relativePath })
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasPrefix("Sources/Match") == true })
     }
 
     @MainActor
@@ -152,7 +153,142 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
             Set(suggestions.compactMap(\.subtitle)),
             [firstRoot.lastPathComponent, secondRoot.lastPathComponent]
         )
+        XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText == $0.relativePath })
         XCTAssertTrue(suggestions.allSatisfy { $0.commitDisplayText?.hasSuffix("Sources/Shared.swift") == true })
+        XCTAssertFalse(suggestions.contains { $0.commitDisplayText?.hasPrefix("/") == true })
+        XCTAssertFalse(suggestions.contains { $0.commitDisplayText?.contains(firstRoot.path) == true })
+        XCTAssertFalse(suggestions.contains { $0.commitDisplayText?.contains(secondRoot.path) == true })
+    }
+
+    @MainActor
+    func testSameNamedVisibleRootsUseNonAbsoluteResolvableFileTagPaths() async throws {
+        let fixture = try makeSameNamedRootFixture()
+        let selectedFile = fixture.secondRoot.appendingPathComponent("Sources/Target.swift")
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: fixture.firstRoot.path)
+        _ = try await store.loadRoot(path: fixture.secondRoot.path)
+        let host = FileTagSelectionHost(selection: StoredSelection(selectedPaths: [selectedFile.path]))
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: host, store: store)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: coordinator,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: 5
+        )
+
+        let searchSuggestions = await service.suggestions(for: "Target")
+        let searchTokenPaths = Set(searchSuggestions.map(\.relativePath))
+        let fallbackSuggestions = await service.suggestions(for: "")
+        let fallbackSuggestion = try XCTUnwrap(fallbackSuggestions.first)
+        let expectedSecondToken = "B/SharedRoot/Sources/Target.swift"
+
+        XCTAssertEqual(
+            searchTokenPaths,
+            ["A/SharedRoot/Sources/Target.swift", expectedSecondToken],
+            String(describing: searchSuggestions)
+        )
+        XCTAssertEqual(fallbackSuggestion.relativePath, expectedSecondToken)
+        XCTAssertEqual(fallbackSuggestion.commitDisplayText, expectedSecondToken)
+        XCTAssertEqual(
+            FileTagMentionHelper.committedReplacementText(for: fallbackSuggestion),
+            "@B/SharedRoot/Sources/Target.swift "
+        )
+        XCTAssertEqual(AgentFileMentionText.attachmentDisplayName(for: fallbackSuggestion), expectedSecondToken)
+
+        let allTokenText = searchSuggestions.flatMap { [$0.relativePath, $0.commitDisplayText ?? ""] } + [fallbackSuggestion.relativePath, fallbackSuggestion.commitDisplayText ?? ""]
+        XCTAssertFalse(allTokenText.contains { $0.hasPrefix("/") }, allTokenText.joined(separator: "\n"))
+        XCTAssertFalse(allTokenText.contains { $0.contains(fixture.base.path) }, allTokenText.joined(separator: "\n"))
+
+        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+            [expectedSecondToken],
+            tokenBudget: 10000,
+            maxFiles: 10,
+            store: store
+        )
+        let xml = try XCTUnwrap(resolvedXML)
+
+        XCTAssertTrue(xml.contains("File: \(expectedSecondToken)"), xml)
+        XCTAssertTrue(xml.contains("let target = \"b\""), xml)
+        XCTAssertFalse(xml.contains(fixture.base.path), xml)
+    }
+
+    func testSameNamedRootGeneratedAliasTakesPrecedenceOverShadowingRootAlias() async throws {
+        let fixture = try makeSameNamedRootFixture()
+        let shadowRoot = fixture.base.appendingPathComponent("Shadow/B", isDirectory: true)
+        try write("let target = \"shadow\"\n", to: shadowRoot.appendingPathComponent("SharedRoot/Sources/Target.swift"))
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: fixture.firstRoot.path)
+        _ = try await store.loadRoot(path: fixture.secondRoot.path)
+        _ = try await store.loadRoot(path: shadowRoot.path)
+        let generatedToken = "B/SharedRoot/Sources/Target.swift"
+
+        let resolvedXML = await AgentModeViewModel.taggedFileContentsXMLForTaggedPaths(
+            [generatedToken],
+            tokenBudget: 10000,
+            maxFiles: 10,
+            store: store
+        )
+        let xml = try XCTUnwrap(resolvedXML)
+
+        XCTAssertTrue(xml.contains("File: \(generatedToken)"), xml)
+        XCTAssertTrue(xml.contains("let target = \"b\""), xml)
+        XCTAssertFalse(xml.contains("let target = \"shadow\""), xml)
+        XCTAssertFalse(xml.contains(fixture.base.path), xml)
+    }
+
+    @MainActor
+    func testSelectedFileFallbackCommitsPathfulSameBasenameFile() async throws {
+        let root = try makeTemporaryRoot(name: "AgentFileTagSelectedFallback")
+        try write("# first\n", to: root.appendingPathComponent("skills/writing/SKILL.md"))
+        let selectedFile = root.appendingPathComponent("skills/engineering/tidy-first/SKILL.md")
+        try write("# selected\n", to: selectedFile)
+        let store = WorkspaceFileContextStore()
+        _ = try await store.loadRoot(path: root.path)
+        let host = FileTagSelectionHost(selection: StoredSelection(selectedPaths: [selectedFile.path]))
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: host, store: store)
+        let service = AgentFileTagSuggestionService(
+            store: store,
+            searchService: nil,
+            selectionCoordinator: coordinator,
+            lookupContextProvider: { .visibleWorkspace },
+            maxResults: 5
+        )
+
+        let suggestions = await service.suggestions(for: "")
+        let suggestion = try XCTUnwrap(suggestions.first)
+
+        XCTAssertEqual(suggestions.count, 1, String(describing: suggestions))
+        XCTAssertEqual(suggestion.displayName, "SKILL.md")
+        XCTAssertEqual(suggestion.relativePath, "skills/engineering/tidy-first/SKILL.md")
+        XCTAssertEqual(suggestion.commitDisplayText, suggestion.relativePath)
+    }
+
+    func testAgentFileMentionDisplayNamePrefersRelativePathOverBasenameDisplay() {
+        let suggestion = MentionSuggestion(
+            displayName: "SKILL.md",
+            relativePath: "aAtila/skills/engineering/tidy-first/SKILL.md",
+            kind: .file,
+            commitDisplayText: "SKILL.md"
+        )
+
+        XCTAssertEqual(
+            AgentFileMentionText.attachmentDisplayName(for: suggestion),
+            "aAtila/skills/engineering/tidy-first/SKILL.md"
+        )
+    }
+
+    func testAgentFileMentionRemovalRemovesPathfulInlineMention() {
+        let path = "aAtila/skills/engineering/tidy-first/SKILL.md"
+        let text = "Review @\(path) before continuing"
+
+        let reduced = AgentFileMentionText.removingTaggedMention(
+            displayName: path,
+            relativePath: path,
+            from: text
+        )
+
+        XCTAssertEqual(reduced, "Review before continuing")
     }
 
     @MainActor
@@ -174,8 +310,10 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         let suggestion = try XCTUnwrap(suggestions.first { $0.relativePath.contains("Other.swift") })
         let logicalRootQualifiedSuggestions = await service.suggestions(for: "\(fixture.logicalRoot.lastPathComponent)/Sources/App")
 
+        XCTAssertEqual(suggestion.commitDisplayText, suggestion.relativePath)
         XCTAssertFalse(suggestion.relativePath.hasPrefix("/"), String(describing: suggestions))
         XCTAssertFalse(suggestion.relativePath.contains(unboundRoot.path), String(describing: suggestions))
+        XCTAssertFalse(suggestion.commitDisplayText?.contains(unboundRoot.path) == true, String(describing: suggestions))
         XCTAssertTrue(
             logicalRootQualifiedSuggestions.contains { $0.relativePath.contains("Sources/App.swift") },
             String(describing: logicalRootQualifiedSuggestions)
@@ -300,8 +438,58 @@ final class AgentFileTagWorktreeResolutionTests: XCTestCase {
         return url
     }
 
+    private func makeSameNamedRootFixture() throws -> (base: URL, firstRoot: URL, secondRoot: URL) {
+        let base = try makeTemporaryRoot(name: "AgentFileTagSameNamedRoots")
+        let firstRoot = base.appendingPathComponent("A/SharedRoot", isDirectory: true)
+        let secondRoot = base.appendingPathComponent("B/SharedRoot", isDirectory: true)
+        try write("let target = \"a\"\n", to: firstRoot.appendingPathComponent("Sources/Target.swift"))
+        try write("let target = \"b\"\n", to: secondRoot.appendingPathComponent("Sources/Target.swift"))
+        return (base, firstRoot, secondRoot)
+    }
+
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
     }
+}
+
+@MainActor
+private final class FileTagSelectionHost: WorkspaceSelectionHost {
+    var activeWorkspace: WorkspaceModel?
+    var selectionMirrorContextRevision: UInt64 = 0
+
+    init(selection: StoredSelection) {
+        let tabID = UUID()
+        let tab = ComposeTabState(id: tabID, name: "Agent", selection: selection)
+        activeWorkspace = WorkspaceModel(
+            id: UUID(),
+            name: "Agent File Tags",
+            repoPaths: [],
+            composeTabs: [tab],
+            activeComposeTabID: tabID
+        )
+    }
+
+    func composeTab(with id: UUID) -> ComposeTabState? {
+        activeWorkspace?.composeTabs.first { $0.id == id }
+    }
+
+    func composeTab(for identity: WorkspaceSelectionIdentity) -> ComposeTabState? {
+        guard activeWorkspace?.id == identity.workspaceID else { return nil }
+        return activeWorkspace?.composeTabs.first { $0.id == identity.tabID }
+    }
+
+    func publishActiveComposeTabSnapshot(commitToMemory _: Bool, touchModified _: Bool) {}
+
+    @discardableResult
+    func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool {
+        guard var workspace = activeWorkspace, workspace.id == workspaceID,
+              let index = workspace.composeTabs.firstIndex(where: { $0.id == tab.id })
+        else { return false }
+        workspace.composeTabs[index] = tab
+        activeWorkspace = workspace
+        return true
+    }
+
+    func applySelectionMirrorAttempt(_: StoredSelection, forTabID _: UUID, workspaceID _: UUID) async {}
 }
