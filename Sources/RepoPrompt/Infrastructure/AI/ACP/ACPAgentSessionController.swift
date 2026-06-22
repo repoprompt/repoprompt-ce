@@ -327,10 +327,14 @@ actor ACPAgentSessionController {
         state == .sessionOpen && process != nil && sessionID != nil
     }
 
-    func isCompatibleWith(request: ACPRunRequest) -> Bool {
+    func isCompatibleWith(
+        request: ACPRunRequest,
+        ignoringWorkspacePath: Bool = false
+    ) -> Bool {
         guard let providerID = request.agentKind.acpProviderID,
               provider.providerID == providerID,
-              normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
+              ignoringWorkspacePath
+              || normalizedWorkspacePath(runRequest.workspacePath) == normalizedWorkspacePath(request.workspacePath)
         else {
             return false
         }

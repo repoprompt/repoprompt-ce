@@ -184,6 +184,44 @@ extension AgentModeRunServiceLifecycleTests {
         ], in: recorder)
     }
 
+    func testLiveWorktreeSwitchRetainsClaudeControllerAcrossWorkspaceOnlyMismatch() async {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(
+            recorder: recorder,
+            label: "retained-workspace"
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            claudeControllerFactory: { _, _, _, _ in
+                recorder.record("factory:unexpected-live-switch-recycle")
+                return LifecycleFakeNativeController(recorder: recorder, label: "unexpected-replacement")
+            }
+        )
+        let session = makeRunningClaudeSession(controller: controller)
+        let runtime = resolvedClaudeLaunchPolicy(profile: .mcpSafeDefaults, harness: harness)
+        session.permissionProfile = .mcpSafeDefaults
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            workspacePath: "/retained/provider/cwd",
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+        session.retainAttachedRuntimeForLiveWorktreeSwitch(session.attachedProviderRuntimeIdentity)
+
+        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+
+        XCTAssertTrue(session.claudeController === controller)
+        XCTAssertTrue(session.retainsClaudeControllerForLiveWorktreeSwitch(controller))
+        XCTAssertFalse(recorder.contains("retained-workspace:shutdown"))
+        XCTAssertFalse(recorder.contains("factory:unexpected-live-switch-recycle"))
+        XCTAssertEqual(
+            harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session)?.workspacePath,
+            "/retained/provider/cwd"
+        )
+    }
+
     func testQueuedClaudeSteeringRecycleDoesNotClearReplacementControllerAfterAwait() async {
         let recorder = LifecycleRecorder()
         let currentSessionRefGate = LifecycleAsyncGate()

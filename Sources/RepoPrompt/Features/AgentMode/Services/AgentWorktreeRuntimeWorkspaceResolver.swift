@@ -1,6 +1,19 @@
 import Foundation
 
 enum AgentWorktreeRuntimeWorkspaceResolver {
+    static func primaryLogicalRoot(
+        in visibleRoots: [WorkspaceRootRef],
+        fallbackWorkspacePath: String?
+    ) -> WorkspaceRootRef? {
+        guard let primaryWorkspacePath = standardizedWorkspacePath(fallbackWorkspacePath) else {
+            return nil
+        }
+        let matches = visibleRoots.filter { root in
+            standardizedWorkspacePath(root.standardizedFullPath) == primaryWorkspacePath
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
     static func primaryExecutionBinding(
         in bindings: [AgentSessionWorktreeBinding],
         fallbackWorkspacePath: String?

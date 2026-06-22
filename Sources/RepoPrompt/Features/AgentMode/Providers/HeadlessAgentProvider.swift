@@ -1,7 +1,7 @@
 import Foundation
 
 /// Protocol for headless CLI-based agents that operate via MCP tools only.
-protocol HeadlessAgentProvider {
+protocol HeadlessAgentProvider: AnyObject {
     /// Stream agent execution results.
     /// - Parameters:
     ///   - message: The agent message to process (system prompt + user message)

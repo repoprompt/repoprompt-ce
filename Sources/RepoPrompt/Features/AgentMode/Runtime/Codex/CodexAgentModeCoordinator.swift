@@ -3658,7 +3658,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             )
         }
         if let existingController = session.codexController,
-           session.codexControllerWorkspacePath != runtimeWorkspacePath
+           session.codexControllerWorkspacePath != runtimeWorkspacePath,
+           !session.retainsCodexControllerForLiveWorktreeSwitch(existingController)
         {
             _ = invalidateCodexControllerForReconnect(
                 session: session,

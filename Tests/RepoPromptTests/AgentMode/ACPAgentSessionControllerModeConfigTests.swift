@@ -13,6 +13,39 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         super.tearDown()
     }
 
+    func testLiveSwitchCompatibilityCanIgnoreOnlyWorkspacePath() async throws {
+        let fixture = try makeFixture(shape: "modern")
+        let switchedRequest = ACPRunRequest(
+            agentKind: .openCode,
+            modelString: nil,
+            workspacePath: "/tmp/live-switch-new-workspace",
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let exactWorkspaceCompatibility = await fixture.controller.isCompatibleWith(request: switchedRequest)
+        let retainedWorkspaceCompatibility = await fixture.controller.isCompatibleWith(
+            request: switchedRequest,
+            ignoringWorkspacePath: true
+        )
+        XCTAssertFalse(exactWorkspaceCompatibility)
+        XCTAssertTrue(retainedWorkspaceCompatibility)
+
+        let wrongProviderRequest = ACPRunRequest(
+            agentKind: .cursor,
+            modelString: nil,
+            workspacePath: "/tmp/live-switch-new-workspace",
+            resumeSessionID: nil,
+            attachments: [],
+            taskLabelKind: nil
+        )
+        let wrongProviderCompatibility = await fixture.controller.isCompatibleWith(
+            request: wrongProviderRequest,
+            ignoringWorkspacePath: true
+        )
+        XCTAssertFalse(wrongProviderCompatibility)
+    }
+
     func testSessionOpenRoutesInjectMCPAndUseModernModeConfiguration() async throws {
         let cases = [
             SessionOpenRouteCase(

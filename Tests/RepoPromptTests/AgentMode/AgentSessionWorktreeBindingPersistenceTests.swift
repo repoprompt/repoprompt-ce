@@ -42,6 +42,52 @@ final class AgentSessionWorktreeBindingPersistenceTests: XCTestCase {
         XCTAssertEqual(decoded.worktreeBindings, [binding])
     }
 
+    @MainActor
+    func testPersistedLiveSwitchBindingDrivesFutureRuntimeWorkspaceWithoutTransientRetention() throws {
+        let parent = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AgentSessionLiveSwitchPersistence-\(UUID().uuidString)", isDirectory: true)
+        let logicalRoot = parent.appendingPathComponent("logical", isDirectory: true)
+        let switchedWorktree = parent.appendingPathComponent("switched", isDirectory: true)
+        try FileManager.default.createDirectory(at: logicalRoot, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: switchedWorktree, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: parent) }
+        let binding = AgentSessionWorktreeBinding(
+            id: "bind-live-switch",
+            repositoryID: "gitrepo_live",
+            repoKey: "repo",
+            logicalRootPath: logicalRoot.path,
+            logicalRootName: "logical",
+            worktreeID: "wt_live",
+            worktreeRootPath: switchedWorktree.path,
+            worktreeName: "switched",
+            branch: "feature/live-switch",
+            source: "test_live_switch"
+        )
+        let session = AgentSession(
+            id: UUID(),
+            name: "Live switched session",
+            savedAt: Date(),
+            autoEditEnabled: true,
+            worktreeBindings: [binding]
+        )
+
+        let encoded = try JSONEncoder().encode(session)
+        let decoded = try JSONDecoder().decode(AgentSession.self, from: encoded)
+
+        XCTAssertEqual(decoded.serializationVersion, 6)
+        XCTAssertEqual(decoded.worktreeBindings, [binding])
+        XCTAssertEqual(
+            try AgentWorktreeRuntimeWorkspaceResolver.effectiveWorkspacePath(
+                bindings: decoded.worktreeBindings,
+                fallbackWorkspacePath: logicalRoot.path
+            ),
+            switchedWorktree.path
+        )
+        let hydratedTabSession = AgentModeViewModel.TabSession(tabID: UUID())
+        hydratedTabSession.worktreeBindings = decoded.worktreeBindings
+        XCTAssertNil(hydratedTabSession.liveWorktreeSwitchRuntimeRetention)
+    }
+
     func testDataServiceStubAndMetadataExposeWorktreeBindingSummaries() async throws {
         let service = AgentSessionDataService.shared
         let workspace = makeTemporaryWorkspace()

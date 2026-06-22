@@ -2,6 +2,20 @@ import Combine
 import Foundation
 
 extension AgentModeViewModel {
+    struct LiveWorktreeSwitchRuntimeRetention: Equatable {
+        var providerIdentity: ObjectIdentifier?
+        var codexControllerGeneration: UUID?
+        var claudeControllerIdentity: ObjectIdentifier?
+        var acpControllerIdentity: ObjectIdentifier?
+
+        var hasAttachedRuntime: Bool {
+            providerIdentity != nil
+                || codexControllerGeneration != nil
+                || claudeControllerIdentity != nil
+                || acpControllerIdentity != nil
+        }
+    }
+
     // MARK: - Tab Session
 
     /// Per-tab session state for agent mode
@@ -416,7 +430,13 @@ extension AgentModeViewModel {
             runLifecycleTracker.liveness
         }
 
-        var provider: HeadlessAgentProvider?
+        var provider: HeadlessAgentProvider? {
+            didSet {
+                guard oldValue.map(ObjectIdentifier.init) != provider.map(ObjectIdentifier.init) else { return }
+                liveWorktreeSwitchRuntimeRetention?.providerIdentity = nil
+            }
+        }
+
         var agentTask: Task<Void, Never>?
 
         // Settings (per-tab)
@@ -471,6 +491,7 @@ extension AgentModeViewModel {
                 let newIdentity = codexController.map { ObjectIdentifier($0) }
                 guard oldIdentity != newIdentity else { return }
                 codexControllerGeneration = UUID()
+                liveWorktreeSwitchRuntimeRetention?.codexControllerGeneration = nil
                 codexAuthoritativeActiveTurn = nil
                 codexAnonymousActiveTurn = nil
                 codexRoutingObservedTurnID = nil
@@ -494,8 +515,68 @@ extension AgentModeViewModel {
             pendingCodexComputerUseActivation != nil
         }
 
-        var claudeController: (any NativeAgentRuntimeControlling)?
-        var acpController: ACPAgentSessionController?
+        var claudeController: (any NativeAgentRuntimeControlling)? {
+            didSet {
+                guard oldValue.map(ObjectIdentifier.init) != claudeController.map(ObjectIdentifier.init) else { return }
+                liveWorktreeSwitchRuntimeRetention?.claudeControllerIdentity = nil
+            }
+        }
+
+        var acpController: ACPAgentSessionController? {
+            didSet {
+                guard oldValue.map(ObjectIdentifier.init) != acpController.map(ObjectIdentifier.init) else { return }
+                liveWorktreeSwitchRuntimeRetention?.acpControllerIdentity = nil
+            }
+        }
+
+        private(set) var liveWorktreeSwitchRuntimeRetention: LiveWorktreeSwitchRuntimeRetention?
+
+        var attachedProviderRuntimeIdentity: LiveWorktreeSwitchRuntimeRetention {
+            LiveWorktreeSwitchRuntimeRetention(
+                providerIdentity: provider.map(ObjectIdentifier.init),
+                codexControllerGeneration: codexController == nil ? nil : codexControllerGeneration,
+                claudeControllerIdentity: claudeController.map(ObjectIdentifier.init),
+                acpControllerIdentity: acpController.map(ObjectIdentifier.init)
+            )
+        }
+
+        var hasAttachedProviderRuntime: Bool {
+            attachedProviderRuntimeIdentity.hasAttachedRuntime
+        }
+
+        func retainAttachedRuntimeForLiveWorktreeSwitch(
+            _ identity: LiveWorktreeSwitchRuntimeRetention
+        ) {
+            liveWorktreeSwitchRuntimeRetention = identity.hasAttachedRuntime ? identity : nil
+        }
+
+        func retainsCodexControllerForLiveWorktreeSwitch(
+            _ controller: any CodexSessionControlling
+        ) -> Bool {
+            guard let activeController = codexController,
+                  ObjectIdentifier(activeController) == ObjectIdentifier(controller)
+            else { return false }
+            return liveWorktreeSwitchRuntimeRetention?.codexControllerGeneration == codexControllerGeneration
+        }
+
+        func retainsClaudeControllerForLiveWorktreeSwitch(
+            _ controller: any NativeAgentRuntimeControlling
+        ) -> Bool {
+            guard let activeController = claudeController,
+                  ObjectIdentifier(activeController) == ObjectIdentifier(controller)
+            else { return false }
+            return liveWorktreeSwitchRuntimeRetention?.claudeControllerIdentity == ObjectIdentifier(controller)
+        }
+
+        func retainsACPControllerForLiveWorktreeSwitch(_ controller: ACPAgentSessionController) -> Bool {
+            guard acpController === controller else { return false }
+            return liveWorktreeSwitchRuntimeRetention?.acpControllerIdentity == ObjectIdentifier(controller)
+        }
+
+        func clearLiveWorktreeSwitchRuntimeRetention() {
+            liveWorktreeSwitchRuntimeRetention = nil
+        }
+
         var codexEventTask: Task<Void, Never>?
         var codexEventTaskRunID: UUID?
         var codexLastEventAt: Date?

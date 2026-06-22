@@ -302,7 +302,11 @@ final class ACPIntegratedAgentModeRunner {
             log("active prompt preflight rejected selected=\(session.selectedAgent.rawValue) request=\(runRequest.agentKind.rawValue) state=\(session.runState.rawValue) runID=\(String(describing: session.runID)) targetRunID=\(String(describing: targetRunID)) attempt=\(String(describing: session.activeRunAttemptID)) targetAttempt=\(String(describing: targetRunAttemptID)) hasController=\(session.acpController != nil) controllerMatches=\(session.acpController === targetController)", runID: diagnosticRunID)
             return false
         }
-        guard await controller.isCompatibleWith(request: runRequest) else {
+        let retainsControllerAtLiveSwitchCWD = session.retainsACPControllerForLiveWorktreeSwitch(controller)
+        guard await controller.isCompatibleWith(
+            request: runRequest,
+            ignoringWorkspacePath: retainsControllerAtLiveSwitchCWD
+        ) else {
             log("active prompt preflight rejected incompatible ACP request model=\(runRequest.modelString ?? "default") workspace=\(runRequest.workspacePath ?? "nil")", runID: runID)
             return false
         }

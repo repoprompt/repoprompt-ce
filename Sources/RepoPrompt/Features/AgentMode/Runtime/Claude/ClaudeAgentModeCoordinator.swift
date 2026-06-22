@@ -296,7 +296,8 @@ final class ClaudeAgentModeCoordinator {
         }
 
         if let existingController = session.claudeController,
-           controllerLaunchSettingsByTabID[session.tabID]?.workspacePath != runtimeWorkspacePath
+           controllerLaunchSettingsByTabID[session.tabID]?.workspacePath != runtimeWorkspacePath,
+           !session.retainsClaudeControllerForLiveWorktreeSwitch(existingController)
         {
             guard let detached = detachClaudeController(
                 existingController,
@@ -365,7 +366,7 @@ final class ClaudeAgentModeCoordinator {
     private func hasEffectiveClaudeControllerLaunchSettingsMismatch(
         for session: AgentModeViewModel.TabSession
     ) -> Bool {
-        guard session.claudeController != nil else { return false }
+        guard let controller = session.claudeController else { return false }
         let runtimeVariant = session.selectedAgent.claudeRuntimeVariant ?? .standard
         let runtimeWorkspacePath: String?
         do {
@@ -379,9 +380,12 @@ final class ClaudeAgentModeCoordinator {
             selectedModelRaw: session.selectedModelRaw,
             runtimePermission: runtimePermission
         ).effectiveMode
+        let expectedWorkspacePath = session.retainsClaudeControllerForLiveWorktreeSwitch(controller)
+            ? controllerLaunchSettingsByTabID[session.tabID]?.workspacePath
+            : runtimeWorkspacePath
         let expected = ControllerLaunchSettings(
             runtimeVariant: runtimeVariant,
-            workspacePath: runtimeWorkspacePath,
+            workspacePath: expectedWorkspacePath,
             permissionMode: effectivePermissionMode,
             allowNativeBashTool: runtimePermission.allowNativeBashTool,
             mcpStrictMode: runtimePermission.mcpStrictMode

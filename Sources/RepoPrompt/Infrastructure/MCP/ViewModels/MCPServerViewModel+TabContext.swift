@@ -476,6 +476,23 @@ extension MCPServerViewModel {
             return removed
         }
 
+        mutating func replaceMatching(
+            _ predicate: (TabScopedContext) -> Bool,
+            transform: (TabScopedContext) -> TabScopedContext
+        ) {
+            for clientName in Array(storage.keys) {
+                guard var windowMap = storage[clientName] else { continue }
+                for windowID in Array(windowMap.keys) {
+                    guard var runMap = windowMap[windowID] else { continue }
+                    for (runID, context) in runMap where predicate(context) {
+                        runMap[runID] = transform(context)
+                    }
+                    windowMap[windowID] = runMap
+                }
+                storage[clientName] = windowMap
+            }
+        }
+
         mutating func purge(tabID: UUID) -> [TabScopedContext] {
             var removed: [TabScopedContext] = []
             let clientNames = Array(storage.keys)
@@ -1668,6 +1685,78 @@ extension MCPServerViewModel {
         lookupContext: WorkspaceLookupContext
     ) -> StoredSelection {
         lookupContext.logicalizeSelection(selection)
+    }
+
+    @MainActor
+    func publishLiveWorktreeBindingSwitch(
+        sessionID: UUID,
+        tabID: UUID,
+        previousBindings _: [AgentSessionWorktreeBinding],
+        currentBindings: [AgentSessionWorktreeBinding]
+    ) {
+        nextReadFileAutoSelectionBindingGeneration &+= 1
+        let publicationGeneration = nextReadFileAutoSelectionBindingGeneration
+
+        func updatedContext(
+            _ context: TabScopedContext,
+            oldLookupContext: WorkspaceLookupContext?
+        ) -> TabScopedContext? {
+            guard context.windowID == windowID,
+                  context.tabID == tabID,
+                  context.activeAgentSessionID == sessionID
+            else { return nil }
+
+            var updated = context
+            if let oldLookupContext {
+                updated.selection = Self.logicalizeSelectionForPersistence(
+                    updated.selection,
+                    lookupContext: oldLookupContext
+                )
+            }
+            updated.worktreeBindingState = .hydrated(currentBindings)
+            updated.frozenLookupContext = nil
+            updated.readFileAutoSelectionGeneration = publicationGeneration
+            return updated
+        }
+
+        for (connectionID, context) in Array(tabContextByConnectionID) {
+            let oldLookupContext = context.frozenLookupContext
+                ?? fileToolLookupContextCacheByConnectionID[connectionID]?.context
+            guard let updated = updatedContext(context, oldLookupContext: oldLookupContext) else { continue }
+            readFileAutoSelectionHandoverLineageByConnectionID.removeValue(forKey: connectionID)
+            invalidateReadFileAutoSelection(connectionID: connectionID, context: context)
+            pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
+            fileToolLookupContextCacheByConnectionID.removeValue(forKey: connectionID)
+            tabContextByConnectionID[connectionID] = updated
+        }
+
+        pendingRunScopedTabContexts.replaceMatching { context in
+            context.windowID == windowID
+                && context.tabID == tabID
+                && context.activeAgentSessionID == sessionID
+        } transform: { context in
+            updatedContext(context, oldLookupContext: context.frozenLookupContext) ?? context
+        }
+
+        for (clientName, perWindow) in Array(lastContextByClientAndWindow) {
+            guard let context = perWindow[windowID],
+                  let updated = updatedContext(context, oldLookupContext: context.frozenLookupContext)
+            else { continue }
+            var updatedPerWindow = perWindow
+            updatedPerWindow[windowID] = updated
+            lastContextByClientAndWindow[clientName] = updatedPerWindow
+        }
+
+        for (runID, detached) in Array(detachedContextBuilderTabContextByRunID) {
+            guard let updated = updatedContext(
+                detached.context,
+                oldLookupContext: detached.context.frozenLookupContext
+            ) else { continue }
+            detachedContextBuilderTabContextByRunID[runID] = DetachedContextBuilderTabContext(
+                connectionID: detached.connectionID,
+                context: updated
+            )
+        }
     }
 
     @MainActor

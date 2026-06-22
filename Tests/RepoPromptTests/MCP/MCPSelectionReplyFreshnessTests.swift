@@ -789,6 +789,239 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             )
         }
 
+        func testLiveWorktreeSwitchPublishesRunScopedLookupSelectionAndFencesPendingResolution() async throws {
+            let workspaceRoot = try makeTemporaryRoot(name: "LiveSwitchWorkspace")
+            let worktreeA = try makeTemporaryRoot(name: "LiveSwitchWorktreeA")
+            let worktreeB = try makeTemporaryRoot(name: "LiveSwitchWorktreeB")
+            let secondaryLogical = try makeTemporaryRoot(name: "LiveSwitchSecondaryLogical")
+            let secondaryWorktreeA = try makeTemporaryRoot(name: "LiveSwitchSecondaryWorktreeA")
+            let secondaryWorktreeB = try makeTemporaryRoot(name: "LiveSwitchSecondaryWorktreeB")
+            defer {
+                try? FileManager.default.removeItem(at: workspaceRoot.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeA.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: worktreeB.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: secondaryLogical.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: secondaryWorktreeA.deletingLastPathComponent())
+                try? FileManager.default.removeItem(at: secondaryWorktreeB.deletingLastPathComponent())
+            }
+            let logicalFile = workspaceRoot.appendingPathComponent("Shared.swift")
+            let physicalFileA = worktreeA.appendingPathComponent("Shared.swift")
+            let physicalFileB = worktreeB.appendingPathComponent("Shared.swift")
+            try write("struct Canonical {}\n", to: logicalFile)
+            try write("struct WorktreeA {}\n", to: physicalFileA)
+            try write("struct WorktreeB {}\n", to: physicalFileB)
+            try write("struct SecondaryLogical {}\n", to: secondaryLogical.appendingPathComponent("Secondary.swift"))
+            try write("struct SecondaryA {}\n", to: secondaryWorktreeA.appendingPathComponent("Secondary.swift"))
+            try write("struct SecondaryB {}\n", to: secondaryWorktreeB.appendingPathComponent("Secondary.swift"))
+
+            let tabID = UUID()
+            let sessionID = UUID()
+            let connectionID = UUID()
+            let runID = UUID()
+            let (window, workspaceID) = await makeWindow(
+                root: workspaceRoot,
+                tabID: tabID,
+                selection: StoredSelection(selectedPaths: [logicalFile.path])
+            )
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let logicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: workspaceRoot.path
+            )
+            let physicalRootA = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeA.path,
+                kind: .sessionWorktree
+            )
+            let physicalRootB = try await window.workspaceFileContextStore.loadRoot(
+                path: worktreeB.path,
+                kind: .sessionWorktree
+            )
+            let secondaryLogicalRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: secondaryLogical.path
+            )
+            let secondaryPhysicalRootA = try await window.workspaceFileContextStore.loadRoot(
+                path: secondaryWorktreeA.path,
+                kind: .sessionWorktree
+            )
+            let secondaryPhysicalRootB = try await window.workspaceFileContextStore.loadRoot(
+                path: secondaryWorktreeB.path,
+                kind: .sessionWorktree
+            )
+            let logicalRootRef = WorkspaceRootRef(
+                id: logicalRoot.id,
+                name: logicalRoot.name,
+                fullPath: logicalRoot.standardizedFullPath
+            )
+            let bindingA = makeBinding(
+                logicalRoot: logicalRootRef,
+                physicalRoot: WorkspaceRootRef(
+                    id: physicalRootA.id,
+                    name: physicalRootA.name,
+                    fullPath: physicalRootA.standardizedFullPath
+                )
+            )
+            let bindingB = makeBinding(
+                logicalRoot: logicalRootRef,
+                physicalRoot: WorkspaceRootRef(
+                    id: physicalRootB.id,
+                    name: physicalRootB.name,
+                    fullPath: physicalRootB.standardizedFullPath
+                )
+            )
+            let secondaryBindingA = makeBinding(
+                logicalRoot: WorkspaceRootRef(
+                    id: secondaryLogicalRoot.id,
+                    name: secondaryLogicalRoot.name,
+                    fullPath: secondaryLogicalRoot.standardizedFullPath
+                ),
+                physicalRoot: WorkspaceRootRef(
+                    id: secondaryPhysicalRootA.id,
+                    name: secondaryPhysicalRootA.name,
+                    fullPath: secondaryPhysicalRootA.standardizedFullPath
+                )
+            )
+            let secondaryBindingB = makeBinding(
+                logicalRoot: WorkspaceRootRef(
+                    id: secondaryLogicalRoot.id,
+                    name: secondaryLogicalRoot.name,
+                    fullPath: secondaryLogicalRoot.standardizedFullPath
+                ),
+                physicalRoot: WorkspaceRootRef(
+                    id: secondaryPhysicalRootB.id,
+                    name: secondaryPhysicalRootB.name,
+                    fullPath: secondaryPhysicalRootB.standardizedFullPath
+                )
+            )
+            var currentBindings = [bindingA, secondaryBindingA]
+
+            var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
+            liveTab.activeAgentSessionID = sessionID
+            XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
+            let registerBindingProvider = {
+                window.mcpServer.registerAgentWorktreeBindingsProvider { requestedSessionID, requestedTabID in
+                    guard requestedSessionID == sessionID, requestedTabID == tabID else { return .unavailable }
+                    return .hydrated(currentBindings)
+                }
+            }
+            registerBindingProvider()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "live-switch-lookup-test",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID,
+                runID: runID
+            )
+            await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: connectionID)
+            defer {
+                Task { await ServerNetworkManager.shared.setRunPurpose(.unknown, for: connectionID) }
+            }
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "live-switch-lookup-test",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun
+            )
+
+            let initial = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(initial.translateInputPath(logicalFile.path), physicalFileA.path)
+
+            let windowTools = await window.mcpServer.windowMCPTools
+            let manageSelection = try XCTUnwrap(
+                windowTools.first { $0.name == MCPWindowToolName.manageSelection }
+            )
+            _ = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await manageSelection([
+                    "op": .string("set"),
+                    "paths": .array([.string("Shared.swift")]),
+                    "mode": .string("full"),
+                    "strict": .bool(true)
+                ])
+            }
+            XCTAssertEqual(
+                window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths,
+                [logicalFile.path]
+            )
+
+            var oldPhysicalSnapshot = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
+            oldPhysicalSnapshot.selection = StoredSelection(selectedPaths: [physicalFileA.path])
+            oldPhysicalSnapshot.worktreeBindingState = .hydrated([bindingA, secondaryBindingB])
+            window.mcpServer.tabContextByConnectionID[connectionID] = oldPhysicalSnapshot
+
+            currentBindings = [bindingB, secondaryBindingB]
+            window.mcpServer.publishLiveWorktreeBindingSwitch(
+                sessionID: sessionID,
+                tabID: tabID,
+                previousBindings: [bindingA, secondaryBindingA],
+                currentBindings: currentBindings
+            )
+            let switchedSnapshot = try window.mcpServer.resolveTabContextSnapshot(
+                from: metadata,
+                toolName: "live-switch-test",
+                policy: .allowLegacyImplicitRouting
+            ).snapshot
+            XCTAssertEqual(switchedSnapshot.worktreeBindings, currentBindings)
+            XCTAssertNil(switchedSnapshot.frozenLookupContext)
+            XCTAssertEqual(switchedSnapshot.selection.selectedPaths, [logicalFile.path])
+            XCTAssertEqual(
+                window.workspaceManager.composeTab(with: tabID)?.selection.selectedPaths,
+                [logicalFile.path]
+            )
+            let publicationGeneration = switchedSnapshot.readFileAutoSelectionGeneration
+
+            window.mcpServer.publishLiveWorktreeBindingSwitch(
+                sessionID: sessionID,
+                tabID: tabID,
+                previousBindings: [bindingA, secondaryBindingA],
+                currentBindings: currentBindings
+            )
+            let duplicateSnapshot = try window.mcpServer.resolveTabContextSnapshot(
+                from: metadata,
+                toolName: "live-switch-idempotence-test",
+                policy: .allowLegacyImplicitRouting
+            ).snapshot
+            XCTAssertGreaterThan(duplicateSnapshot.readFileAutoSelectionGeneration, publicationGeneration)
+
+            let switched = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(switched.translateInputPath(logicalFile.path), physicalFileB.path)
+            XCTAssertEqual(
+                switched.physicalizeSelection(duplicateSnapshot.selection).selectedPaths,
+                [physicalFileB.path]
+            )
+
+            registerBindingProvider()
+            let resolutionGate = TokenAccountingGate()
+            window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting {
+                await resolutionGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await MainActor.run {
+                    window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting(nil)
+                }
+                await resolutionGate.release()
+            }
+            let staleLookup = Task { @MainActor in
+                await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            }
+            await resolutionGate.waitUntilStarted()
+
+            currentBindings = [bindingA, secondaryBindingB]
+            window.mcpServer.publishLiveWorktreeBindingSwitch(
+                sessionID: sessionID,
+                tabID: tabID,
+                previousBindings: [bindingB, secondaryBindingB],
+                currentBindings: currentBindings
+            )
+            await resolutionGate.release()
+            let staleResult = await staleLookup.value
+            XCTAssertEqual(staleResult, AgentWorkspaceLookupContextResolver.failClosedLookupContext)
+            window.mcpServer.setBeforeFileToolLookupContextResolutionForTesting(nil)
+
+            let final = await window.mcpServer.resolveFileToolLookupContext(from: metadata)
+            XCTAssertEqual(final.translateInputPath(logicalFile.path), physicalFileA.path)
+        }
+
         func testFileToolLookupCacheInvalidatesWithoutLeakingStaleRoots() async throws {
             let workspaceRoot = try makeTemporaryRoot(name: "LookupCacheWorkspace")
             let replacementWorkspaceRoot = try makeTemporaryRoot(name: "LookupCacheReplacementWorkspace")

@@ -58,7 +58,30 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertEqual(previous["visual_color_hex"]?.stringValue, "#7C3AED")
     }
 
-    private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
+    func testManageWorktreeSwitchReplySupportsReplacementAndCanonicalMainWithoutBinding() throws {
+        let replacement = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "switch",
+            worktree: Self.worktreeDTO(),
+            binding: Self.bindingDTO(id: "stable", worktreeID: "wt_new"),
+            previousBinding: Self.bindingDTO(id: "stable", worktreeID: "wt_old")
+        )
+        let replacementObject = try XCTUnwrap(Self.value(replacement).objectValue)
+        XCTAssertEqual(replacementObject["op"]?.stringValue, "switch")
+        XCTAssertEqual(replacementObject["binding"]?.objectValue?["worktree_id"]?.stringValue, "wt_new")
+        XCTAssertEqual(replacementObject["previous_binding"]?.objectValue?["worktree_id"]?.stringValue, "wt_old")
+
+        let canonicalMain = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "switch",
+            worktree: Self.worktreeDTO(isMain: true),
+            previousBinding: Self.bindingDTO(id: "stable", worktreeID: "wt_old")
+        )
+        let canonicalObject = try XCTUnwrap(Self.value(canonicalMain).objectValue)
+        XCTAssertNil(canonicalObject["binding"])
+        XCTAssertEqual(canonicalObject["worktree"]?.objectValue?["is_main"]?.boolValue, true)
+        XCTAssertEqual(canonicalObject["previous_binding"]?.objectValue?["worktree_id"]?.stringValue, "wt_old")
+    }
+
+    private static func worktreeDTO(isMain: Bool = false) -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
         .init(
             worktreeID: "wt_123",
             specifier: "@id:wt_123",
@@ -67,7 +90,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             name: "repo-wt",
             branch: "feature/demo",
             head: "abcdef0",
-            isMain: false,
+            isMain: isMain,
             isCurrent: true,
             isDetached: false,
             isLocked: false,

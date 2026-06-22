@@ -100,6 +100,38 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         XCTAssertFalse(text.contains("<session_id>"), "A completed bind should not suggest rebinding with a placeholder session id.")
     }
 
+    func testSwitchOutputExplainsLiveRoutingAndSupportsCanonicalMain() throws {
+        let replacement = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "switch",
+            worktree: Self.worktreeDTO(),
+            binding: Self.bindingDTO(id: "stable", worktreeID: "wt_new"),
+            previousBinding: Self.bindingDTO(id: "stable", worktreeID: "wt_previous")
+        )
+        let replacementText = try Self.onlyText(
+            ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(replacement))
+        )
+        XCTAssertTrue(replacementText.contains("### Binding"), replacementText)
+        XCTAssertTrue(replacementText.contains("wt_new"), replacementText)
+        XCTAssertTrue(replacementText.contains("### Previous Binding"), replacementText)
+        XCTAssertTrue(replacementText.contains("wt_previous"), replacementText)
+        XCTAssertTrue(replacementText.contains("original launch cwd"), replacementText)
+        XCTAssertTrue(replacementText.contains("MCP tools now target the selected checkout"), replacementText)
+        XCTAssertTrue(replacementText.contains("future provider start or resume"), replacementText)
+
+        let canonicalMain = ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "switch",
+            worktree: Self.worktreeDTO(isMain: true),
+            previousBinding: Self.bindingDTO(id: "stable", worktreeID: "wt_previous")
+        )
+        let canonicalText = try Self.onlyText(
+            ToolOutputFormatter.formatManageWorktree(args: [:], value: Self.value(canonicalMain))
+        )
+        XCTAssertTrue(canonicalText.contains("Kind**: main"), canonicalText)
+        XCTAssertFalse(canonicalText.contains("### Binding\n"), canonicalText)
+        XCTAssertTrue(canonicalText.contains("### Previous Binding"), canonicalText)
+        XCTAssertTrue(canonicalText.contains("### Live Routing"), canonicalText)
+    }
+
     func testListOutputShowsVisualIdentityAndBoundedGraph() throws {
         let dto = ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",
@@ -453,7 +485,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         )
     }
 
-    private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
+    private static func worktreeDTO(isMain: Bool = false) -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
         .init(
             worktreeID: "wt_feature",
             specifier: "@id:wt_feature",
@@ -462,7 +494,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
             name: "repo-feature",
             branch: "feature/demo",
             head: "abcdef0",
-            isMain: false,
+            isMain: isMain,
             isCurrent: true,
             isDetached: false,
             isLocked: false,
