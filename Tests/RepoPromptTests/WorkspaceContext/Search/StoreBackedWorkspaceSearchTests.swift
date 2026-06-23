@@ -942,15 +942,19 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             await sinkGate.waitUntilStarted()
             let statsBeforeBurst = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
 
-            // The production lane admits the entire burst concurrently, so every member
-            // captures the same watermark cut and shares the single blocked barrier flight.
+            // The production lane admits the entire burst concurrently. Depending on
+            // task scheduling, late burst members can either join the active barrier or
+            // enqueue the sole pending successor if their captured cut advances.
             let burst = (0 ..< burstSize).map { index in
                 Task { try await self.searchContent(pattern: "burstNeedle\(index)", store: store) }
             }
             await assertAsyncTrue(freshnessCaptureCount.waitUntilValue(atLeast: burstSize))
             let heldStats = await store.scopedIngressBarrierStatsForTesting(rootID: record.id)
+            let joinDelta = heldStats.joinCount - statsBeforeBurst.joinCount
+            let successorDelta = heldStats.successorCount - statsBeforeBurst.successorCount
             XCTAssertEqual(heldStats.launchCount - statsBeforeBurst.launchCount, 1)
-            XCTAssertEqual(heldStats.joinCount - statsBeforeBurst.joinCount, burstSize - 1)
+            XCTAssertEqual(joinDelta + successorDelta, burstSize - 1)
+            XCTAssertLessThanOrEqual(successorDelta, 1)
             let heldLane = await store.searchLaneSnapshotForTesting()
             XCTAssertEqual(heldLane.activePermitCount, burstSize)
             XCTAssertEqual(heldLane.waiterCount, 0)
