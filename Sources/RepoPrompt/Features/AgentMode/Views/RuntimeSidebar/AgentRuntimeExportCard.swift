@@ -72,7 +72,7 @@ struct AgentExportCard: View {
                 Button {
                     let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
                     Task {
-                        let clipboard = await buildAgentClipboard(for: cfg)
+                        guard let clipboard = try? await buildAgentClipboard(for: cfg) else { return }
                         await MainActor.run {
                             NSPasteboard.general.clearContents()
                             NSPasteboard.general.setString(clipboard, forType: .string)
@@ -241,7 +241,7 @@ struct AgentExportCard: View {
         )
     }
 
-    private func buildAgentClipboard(for cfg: PromptContextResolved) async -> String {
+    private func buildAgentClipboard(for cfg: PromptContextResolved) async throws -> String {
         let source = await MainActor.run { makeExportSource() }
         let lookupContext = await AgentContextExportResolver.lookupContext(
             source: source,
@@ -261,6 +261,7 @@ struct AgentExportCard: View {
                 source: source,
                 store: promptManager.workspaceFileContextStore,
                 lookupContext: lookupContext,
+                factualProvider: promptManager.promptFactualContextProvider,
                 filePathDisplay: promptManager.filePathDisplayOption,
                 onlyIncludeRootsWithSelectedFiles: promptManager.onlyIncludeRootsWithSelectedFiles,
                 showCodeMapMarkers: !promptManager.codeMapsGloballyDisabled,
@@ -275,7 +276,7 @@ struct AgentExportCard: View {
                 }
             )
         }
-        return await AgentContextExportResolver.buildClipboardContent(request)
+        return try await AgentContextExportResolver.buildClipboardContent(request)
     }
 
     private func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {

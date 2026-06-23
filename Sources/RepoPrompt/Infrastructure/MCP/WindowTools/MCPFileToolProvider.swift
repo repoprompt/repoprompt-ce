@@ -122,22 +122,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: []
             )
-        ) { [self] _, args in
+        ) { [self] toolContext, args in
             try Task.checkCancellation()
-            if await dependencies.promptVM.codeMapsGloballyDisabled {
-                throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
-            }
             let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
             let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
-            let metadata = await dependencies.captureRequestMetadata()
-            try Task.checkCancellation()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            try Task.checkCancellation()
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-            try Task.checkCancellation()
 
             switch scope {
             case "selected":
+                guard let promptVM = await dependencies.promptVM() else {
+                    throw MCPError.internalError("The original window UI is no longer available for get_code_structure; the request was not retargeted.")
+                }
+                if await promptVM.codeMapsGloballyDisabled {
+                    throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                }
+                let metadata = await dependencies.captureRequestMetadata()
+                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
                     throw CancellationError()
                 }
@@ -167,11 +167,48 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 guard !paths.isEmpty else {
                     throw MCPError.invalidParams("paths array cannot be empty")
                 }
+                if let runtimeRequest = toolContext.runtimeRequest {
+                    guard let runtimeContext = runtimeRequest.fileToolContext else {
+                        throw MCPError.internalError("The admitted runtime file context is unavailable for get_code_structure.")
+                    }
+                    guard runtimeContext.codeMapsEnabled else {
+                        throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                    }
+                    let resolvedPaths = runtimeContext.lookupContext.translateInputPaths(paths)
+                    try Task.checkCancellation()
+                    let resolvedFiles = try await MCPRuntimeFileToolServices.resolveCodeStructureFiles(
+                        paths: resolvedPaths,
+                        context: runtimeContext
+                    )
+                    try Task.checkCancellation()
+                    let reply = try await MCPRuntimeFileToolServices.buildCodeStructureDTO(
+                        files: resolvedFiles,
+                        maxResults: maxResults,
+                        includeUnmappedPaths: false,
+                        context: runtimeContext
+                    )
+                    try Task.checkCancellation()
+                    return try Value(reply)
+                }
+
+                guard let promptVM = await dependencies.promptVM() else {
+                    throw MCPError.internalError("The original window UI is no longer available for get_code_structure; the request was not retargeted.")
+                }
+                if await promptVM.codeMapsGloballyDisabled {
+                    throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+                }
+                let metadata = await dependencies.captureRequestMetadata()
+                let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 let lookupRootScope = lookupContext.rootScope
                 let resolvedPaths = lookupContext.translateInputPaths(paths)
                 for path in resolvedPaths {
                     try Task.checkCancellation()
-                    if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
+                    if let issue = await dependencies.workspaceFileContextStore.exactPathResolutionIssue(
+                        for: path,
+                        kind: .either,
+                        rootScope: lookupRootScope
+                    ) {
                         throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
                     }
                 }
@@ -226,16 +263,45 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: []
             )
-        ) { [self] _, args in
-            let type = args["type"]?.stringValue ?? "files"
+        ) { [self] toolContext, args in
+            let type = (args["type"]?.stringValue ?? "files").lowercased()
+            let mode = (args["mode"]?.stringValue ?? "auto").lowercased()
+            let maxDepth: Int?
+            if let maxDepthArg = args["max_depth"] {
+                guard let intVal = maxDepthArg.intValue else {
+                    throw MCPError.invalidParams("max_depth must be an integer")
+                }
+                maxDepth = intVal
+            } else {
+                maxDepth = nil
+            }
+
+            if let runtimeRequest = toolContext.runtimeRequest,
+               type == "roots" || (type == "files" && mode != "selected")
+            {
+                guard let runtimeContext = runtimeRequest.fileToolContext else {
+                    throw MCPError.internalError("The admitted runtime file context is unavailable for get_file_tree.")
+                }
+                return try await Value(MCPRuntimeFileToolServices.fileTree(
+                    type: type,
+                    mode: type == "roots" ? "full" : mode,
+                    maxDepth: maxDepth,
+                    startPath: args["path"]?.stringValue,
+                    context: runtimeContext
+                ))
+            }
+
+            guard let promptVM = await dependencies.promptVM() else {
+                throw MCPError.internalError("The original window UI is no longer available for get_file_tree; the request was not retargeted.")
+            }
             switch type {
             case "roots":
-                let filePathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
+                let filePathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
                 let metadata = await dependencies.captureRequestMetadata()
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
-                let snapshot = await dependencies.promptVM.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
+                let snapshot = await dependencies.workspaceFileContextStore.makeFileTreeSelectionSnapshot(
                     selection: StoredSelection(),
                     request: WorkspaceFileTreeSnapshotRequest(mode: .full, filePathDisplay: filePathDisplay, onlyIncludeRootsWithSelectedFiles: false, includeLegend: false, showCodeMapMarkers: false, rootScope: lookupContext.rootScope),
                     profile: .mcpRead
@@ -249,17 +315,9 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 }
                 return try Value(ToolResultDTOs.FileTreeDTO(rootsCount: snapshot.roots.count, usesLegend: false, tree: rootLines.joined(separator: "\n"), note: nil, wasTruncated: false, worktreeScope: worktreeScope))
             case "files":
-                let mode = args["mode"]?.stringValue ?? "auto"
-                let maxDepth: Int?
-                if let maxDepthArg = args["max_depth"] {
-                    guard let intVal = maxDepthArg.intValue else { throw MCPError.invalidParams("max_depth must be an integer") }
-                    maxDepth = intVal
-                } else {
-                    maxDepth = nil
-                }
                 let metadata = await dependencies.captureRequestMetadata()
                 let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
                 if mode.lowercased() == "selected" {
                     guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
                         throw CancellationError()
@@ -315,12 +373,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: ["path"]
             )
-        ) { [self] _, args in
-            try await executeReadFile(args: args)
+        ) { [self] toolContext, args in
+            try await executeReadFile(toolContext: toolContext, args: args)
         }
     }
 
-    private func executeReadFile(args: [String: Value]) async throws -> Value {
+    private func executeReadFile(
+        toolContext: MCPWindowToolContext,
+        args: [String: Value]
+    ) async throws -> Value {
         try Task.checkCancellation()
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
@@ -336,6 +397,104 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             let limit = args["limit"]?.intValue ?? args["limit"]?.stringValue.flatMap(Int.init)
             return (path, startLine1Based, limit)
         }
+        return try await MCPRuntimeFileToolServices.executeRuntimeOrLegacy(
+            runtimeRequest: toolContext.runtimeRequest,
+            toolName: MCPWindowToolName.readFile,
+            runtimeOperation: { [self] runtimeContext in
+                try await executeRuntimeReadFile(
+                    path: path,
+                    startLine1Based: startLine1Based,
+                    limit: limit,
+                    context: runtimeContext
+                )
+            },
+            legacyOperation: { [self] in
+                try await executeLegacyReadFile(
+                    path: path,
+                    startLine1Based: startLine1Based,
+                    limit: limit
+                )
+            }
+        )
+    }
+
+    private func executeRuntimeReadFile(
+        path: String,
+        startLine1Based: Int?,
+        limit: Int?,
+        context: MCPRuntimeFileToolContext
+    ) async throws -> Value {
+        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
+            await dependencies.captureRequestMetadata()
+        }
+        try Task.checkCancellation()
+        let resolvedPath = context.lookupContext.translateInputPath(path)
+        let authorizedArtifact = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
+            try await dependencies.readSelectedAuthorizedGitArtifact(
+                path,
+                resolvedPath,
+                startLine1Based,
+                limit,
+                metadata,
+                context.lookupContext
+            )
+        }
+        if let artifact = authorizedArtifact {
+            let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(
+                from: context.lookupContext.bindingProjection
+            )
+            let reply = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReplyProjection) {
+                try await MCPReadFileToolProjection.projectReply(
+                    artifact.reply,
+                    displayPath: artifact.reply.displayPath,
+                    worktreeScope: worktreeScope
+                )
+            }
+            try Task.checkCancellation()
+            let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
+                try await MCPProviderProjectionWorker.encode(
+                    reply,
+                    toolName: MCPWindowToolName.readFile
+                )
+            }
+            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
+            return value
+        }
+        try Task.checkCancellation()
+        let runtimeResult = try await MCPRuntimeFileToolServices.readFile(
+            path: path,
+            startLine1Based: startLine1Based,
+            lineCount: limit,
+            context: context
+        )
+        try Task.checkCancellation()
+        let value = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerValueEncoding) {
+            try await MCPProviderProjectionWorker.encode(
+                runtimeResult.reply,
+                toolName: MCPWindowToolName.readFile
+            )
+        }
+        try Task.checkCancellation()
+        await EditFlowPerf.measure(
+            EditFlowPerf.Stage.ReadFile.providerAutoSelect,
+            EditFlowPerf.Dimensions(outcome: "attempted")
+        ) {
+            await dependencies.enqueueReadFileAutoSelection(
+                runtimeResult.reply,
+                path,
+                runtimeResult.resolvedPhysicalPath,
+                metadata
+            )
+        }
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerResultReady)
+        return value
+    }
+
+    private func executeLegacyReadFile(
+        path: String,
+        startLine1Based: Int?,
+        limit: Int?
+    ) async throws -> Value {
         let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerRequestMetadata) {
             await dependencies.captureRequestMetadata()
         }
@@ -461,11 +620,11 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 ],
                 required: ["pattern"]
             )
-        ) { [self] _, args in
+        ) { [self] toolContext, args in
             EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
             let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-            let reply = try await executeFileSearch(args: args)
+            let reply = try await executeFileSearch(toolContext: toolContext, args: args)
             try Task.checkCancellation()
             let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
                 try Value(reply)
@@ -475,7 +634,10 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
     }
 
-    private func executeFileSearch(args: [String: Value]) async throws -> ToolResultDTOs.SearchResultDTO {
+    private func executeFileSearch(
+        toolContext: MCPWindowToolContext,
+        args: [String: Value]
+    ) async throws -> ToolResultDTOs.SearchResultDTO {
         try Task.checkCancellation()
         let rawPattern = args["pattern"]?.stringValue ?? ""
         let pattern = rawPattern.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -505,39 +667,94 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
 
         let mode = SearchMode(rawValue: modeRaw) ?? .auto
-        let metadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
-            await dependencies.captureRequestMetadata()
+        let runtimeContext: MCPRuntimeFileToolContext?
+        if let runtimeRequest = toolContext.runtimeRequest {
+            guard let admittedFileContext = runtimeRequest.fileToolContext else {
+                throw MCPError.internalError("The admitted runtime file context is unavailable for file_search.")
+            }
+            runtimeContext = admittedFileContext
+        } else {
+            runtimeContext = nil
         }
-        try Task.checkCancellation()
-        let lookupContext = await EditFlowPerf.measure(
-            EditFlowPerf.Stage.Search.providerLookupContextResolution,
-            EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
-        ) {
-            await dependencies.resolveFileToolLookupContext(metadata)
+
+        let metadata: MCPServerViewModel.RequestMetadata?
+        let lookupContext: WorkspaceLookupContext
+        if let runtimeContext {
+            metadata = nil
+            lookupContext = runtimeContext.lookupContext
+        } else {
+            let capturedMetadata = await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+                await dependencies.captureRequestMetadata()
+            }
+            metadata = capturedMetadata
+            try Task.checkCancellation()
+            lookupContext = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.providerLookupContextResolution,
+                EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+            ) {
+                await dependencies.resolveFileToolLookupContext(capturedMetadata)
+            }
         }
         try Task.checkCancellation()
         let usesWorktreeProjection = lookupContext.bindingProjection != nil
         let worktreeScope = ToolResultDTOs.WorktreeScopeDTO.sessionBound(from: lookupContext.bindingProjection)
         let lookupRootScope = lookupContext.rootScope
-        if let current = limiters, !current.isEmpty {
+        if runtimeContext == nil, let current = limiters, !current.isEmpty {
             limiters = lookupContext.translateInputPaths(current)
         }
         let results: SearchResults
+        var runtimeRootRefs: [WorkspaceRootRef]?
         do {
             try Task.checkCancellation()
-            results = try await EditFlowPerf.measure(
-                EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
-                EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
-            ) {
-                try await dependencies.workspaceSearch(
-                    pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
-                )
-            }
+            results = try await MCPRuntimeFileToolServices.executeRuntimeOrLegacy(
+                runtimeRequest: toolContext.runtimeRequest,
+                toolName: MCPWindowToolName.search,
+                runtimeOperation: { context in
+                    let runtimeResult = try await MCPRuntimeFileToolServices.fileSearch(
+                        request: MCPRuntimeFileSearchRequest(
+                            pattern: pattern,
+                            mode: mode,
+                            isRegex: regex,
+                            maxResults: maxResults,
+                            pathLimiters: limiters,
+                            includeExtensions: includeExts,
+                            excludePatterns: excludePatterns,
+                            contextLines: contextLines,
+                            wholeWord: wholeWord,
+                            countOnly: countOnly,
+                            fuzzySpaceMatching: pattern.contains(" ")
+                        ),
+                        context: context
+                    )
+                    runtimeRootRefs = runtimeResult.rootRefs
+                    return runtimeResult.results
+                },
+                legacyOperation: { [self] in
+                    try await EditFlowPerf.measure(
+                        EditFlowPerf.Stage.Search.providerWorkspaceSearchAwait,
+                        EditFlowPerf.Dimensions(searchMode: mode.rawValue, countOnly: countOnly)
+                    ) {
+                        try await dependencies.workspaceSearch(
+                            pattern, mode, regex, true, maxResults, maxResults, limiters, includeExts, excludePatterns, contextLines, wholeWord, countOnly, pattern.contains(" "), lookupRootScope
+                        )
+                    }
+                }
+            )
             try Task.checkCancellation()
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.Search.providerWorkspaceSearchReturned,
                 EditFlowPerf.Dimensions(outcome: "completed", searchMode: mode.rawValue, countOnly: countOnly)
             )
+        } catch let error as MCPRuntimeFileToolServiceError {
+            if let retryableError = error.retryableSearchError {
+                let reply = Self.searchRetryableFailureDTO(for: retryableError, worktreeScope: worktreeScope)
+                EditFlowPerf.lifecycleEvent(
+                    EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned,
+                    EditFlowPerf.Dimensions(outcome: "skippedRetryableFailure")
+                )
+                return reply
+            }
+            throw MCPError.invalidParams(error.localizedDescription)
         } catch let error as StoreBackedWorkspaceSearchError {
             let outcome = switch error {
             case .worktreeScopeUnavailable:
@@ -614,15 +831,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         defer { endDTOBuildIfNeeded() }
 
         try Task.checkCancellation()
-        let displayRootRefsSnapshot = await EditFlowPerf.measure(
-            EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
-            dtoBuildDimensions()
-        ) {
-            await dependencies.promptVM.workspaceFileContextStore.displayRootRefsSnapshot()
+        let visibleRootRefs: [WorkspaceRootRef]
+        let allRootRefs: [WorkspaceRootRef]
+        if let runtimeRootRefs {
+            visibleRootRefs = runtimeRootRefs
+            allRootRefs = runtimeRootRefs
+        } else {
+            let displayRootRefsSnapshot = await EditFlowPerf.measure(
+                EditFlowPerf.Stage.Search.dtoRootRefSnapshotLookup,
+                dtoBuildDimensions()
+            ) {
+                await dependencies.workspaceFileContextStore.displayRootRefsSnapshot()
+            }
+            visibleRootRefs = displayRootRefsSnapshot.visibleRoots
+            allRootRefs = displayRootRefsSnapshot.allRoots
         }
         try Task.checkCancellation()
-        let visibleRootRefs = displayRootRefsSnapshot.visibleRoots
-        let allRootRefs = displayRootRefsSnapshot.allRoots
         let (displayPath, pathFilterSuggestion): ((String) -> String, String?) = EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.dtoDisplayResolverPreparation,
             dtoBuildDimensions()
@@ -820,6 +1044,14 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
             )
         )
         try Task.checkCancellation()
+        let autoSelectionMetadata: MCPServerViewModel.RequestMetadata = if let metadata {
+            metadata
+        } else {
+            await EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerRequestMetadata) {
+                await dependencies.captureRequestMetadata()
+            }
+        }
+        try Task.checkCancellation()
         await EditFlowPerf.measure(
             EditFlowPerf.Stage.Search.providerAutoSelection,
             EditFlowPerf.Dimensions(searchMode: mode.rawValue, contextLines: contextLines)
@@ -829,7 +1061,7 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 contextLines,
                 reply,
                 autoSelectionResolvedPhysicalPaths,
-                metadata
+                autoSelectionMetadata
             )
         }
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerAutoSelectionReturned)

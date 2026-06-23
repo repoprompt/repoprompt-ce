@@ -26,14 +26,32 @@ required_dirs=(
   "Sources/RepoPrompt/Features"
   "Sources/RepoPrompt/Infrastructure"
   "Sources/RepoPrompt/Infrastructure/SyntaxParsing"
-  "Sources/RepoPromptShared/MCP"
-  "Tests/RepoPromptTests"
+  "Sources/RepoPromptCore"
+  "Sources/RepoPromptCoreMacOS"
+  "Sources/RepoPromptPOSIXSupport"
+  "Sources/RepoPromptSyntaxCBridge"
+  "Sources/RepoPromptHeadless"
+    "Sources/RepoPromptShared/MCP"
+    "Tests/RepoPromptHeadlessTests"
+    "Tests/RepoPromptTests"
 )
 for dir in "${required_dirs[@]}"; do
   if [[ ! -d "$dir" ]]; then
     fail "required source layout directory missing: $dir"
   fi
 done
+
+# Phase 1 target/dependency/import/declaration/C-symbol/package separation is
+# executable policy. Its deterministic negative tests must pass before checking
+# the live tree so reverse edges and forbidden imports cannot silently weaken it.
+if ! core_isolation_guard_test_output="$(python3 Scripts/test_core_isolation_guardrails.py --quiet 2>&1)"; then
+  fail "Core isolation guardrail negative tests failed"
+  printf '%s\n' "$core_isolation_guard_test_output" >&2
+fi
+if ! core_isolation_guard_output="$(python3 Scripts/core_isolation_guardrails.py 2>&1)"; then
+  fail "Core isolation target/source/symbol/package guardrails failed"
+  printf '%s\n' "$core_isolation_guard_output" >&2
+fi
 
 shared_mcp_required_files=(
   "Sources/RepoPromptShared/MCP/MCPControlMessages.swift"
@@ -111,11 +129,11 @@ resolved = json.loads(Path("Package.resolved").read_text())
 resolved_pins = {pin["identity"]: pin for pin in resolved["pins"]}
 package = json.loads(subprocess.check_output(["swift", "package", "dump-package"], text=True))
 targets = {target["name"]: target for target in package["targets"]}
-repo_prompt = targets.get("RepoPrompt", {})
-repo_prompt_dependencies = repo_prompt.get("dependencies", [])
-repo_prompt_products = {
+syntax_bridge = targets.get("RepoPromptSyntaxCBridge", {})
+syntax_bridge_dependencies = syntax_bridge.get("dependencies", [])
+syntax_bridge_products = {
     (dependency["product"][0], dependency["product"][1])
-    for dependency in repo_prompt_dependencies
+    for dependency in syntax_bridge_dependencies
     if "product" in dependency
 }
 
@@ -128,8 +146,8 @@ for identity, (url, revision, product) in expected_packages.items():
         errors.append(f"Package.resolved missing pin: {identity}")
     elif pin.get("location") != url or pin.get("state", {}).get("revision") != revision:
         errors.append(f"Package.resolved pin drift: {identity}")
-    if (product, identity) not in repo_prompt_products:
-        errors.append(f"RepoPrompt missing upstream grammar product dependency: {product} ({identity})")
+    if (product, identity) not in syntax_bridge_products:
+        errors.append(f"RepoPromptSyntaxCBridge missing upstream grammar product dependency: {product} ({identity})")
 
 support = targets.get("TreeSitterScannerSupport")
 if support is None:
@@ -140,8 +158,8 @@ else:
     expected_sources = ["src/javascript/scanner.c", "src/python/scanner.c"]
     if sorted(support.get("sources", [])) != expected_sources:
         errors.append("TreeSitterScannerSupport sources must remain exactly JavaScript/Python scanner.c")
-if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in repo_prompt_dependencies):
-    errors.append("RepoPrompt must directly depend on TreeSitterScannerSupport")
+if not any(dependency.get("byName", [None])[0] == "TreeSitterScannerSupport" for dependency in syntax_bridge_dependencies):
+    errors.append("RepoPromptSyntaxCBridge must directly depend on TreeSitterScannerSupport")
 
 if errors:
     raise SystemExit("\n".join(errors))
@@ -292,13 +310,34 @@ allowed_tracked_docs=(
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
   "docs/architecture/xcode-workspace.md"
+  "docs/core-isolation/README.md"
+  "docs/core-isolation/contracts/behavior-and-performance.md"
+  "docs/core-isolation/contracts/headless-v1.md"
+  "docs/core-isolation/contracts/persistence-schema.md"
+  "docs/core-isolation/decisions/ADR-001-target-graph-and-c-symbol-namespace.md"
+  "docs/core-isolation/decisions/ADR-002-headless-version-and-transport-identity.md"
+  "docs/core-isolation/decisions/ADR-003-runtime-and-ui-identity.md"
+  "docs/core-isolation/deferred-work.md"
+  "docs/core-isolation/migration-ledger.tsv"
+  "docs/core-isolation/phases/phase-0.md"
+  "docs/core-isolation/phases/phase-1.md"
+  "docs/core-isolation/phases/phase-2.md"
+  "docs/core-isolation/phases/phase-3.md"
+  "docs/core-isolation/phases/phase-4.md"
+  "docs/core-isolation/phases/phase-5.md"
+  "docs/core-isolation/phases/phase-6.md"
+  "docs/core-isolation/phases/phase-7.md"
+  "docs/core-isolation/phases/phase-8.md"
+  "docs/core-isolation/publication-remediation-2026-06-22.md"
+  "docs/investigations/core-isolation-reconstruction-2026-06-20.md"
+  "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
+  "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
   "docs/open-source-readiness.md"
+  "docs/plans/core-isolation-reconstruction-2026-06-20.md"
+  "docs/plans/test-coverage-value-audit-2026-05-29.md"
   "docs/releasing.md"
   "docs/testing.md"
   "docs/worktrees.md"
-  "docs/investigations/mcp-tool-throughput-wi3-baseline-2026-06-11.md"
-  "docs/investigations/test-coverage-value-audit-ledger-2026-05-29.md"
-  "docs/plans/test-coverage-value-audit-2026-05-29.md"
 )
 unexpected_tracked_docs="$(comm -23 \
   <(git ls-files docs | sort) \

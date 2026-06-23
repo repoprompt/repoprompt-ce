@@ -436,7 +436,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         var replacement = active
         replacement.repoPaths = [rootB.path]
         let replacementIndex = try XCTUnwrap(manager.workspaces.firstIndex(where: { $0.id == active.id }))
-        manager.workspaces[replacementIndex] = replacement
+        manager.mutateWorkspacesForTesting { $0[replacementIndex] = replacement }
 
         let unloadGate = WorkspaceSwitchRecoveryGate()
         await store.setRootUnloadDidDetachHandler { paths in
@@ -600,7 +600,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         var replacement = active
         replacement.repoPaths = [rootB.path]
         let replacementIndex = try XCTUnwrap(manager.workspaces.firstIndex(where: { $0.id == active.id }))
-        manager.workspaces[replacementIndex] = replacement
+        manager.mutateWorkspacesForTesting { $0[replacementIndex] = replacement }
 
         let result = await manager.reactivateWorkspaceAfterReplacement(replacement)
         XCTAssertEqual(result, .switched)
@@ -637,7 +637,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let composition = makeComposition()
         let manager = composition.workspaceManager
         await manager.awaitInitialized()
-        manager.workspaces.append(fixture.workspace)
+        manager.mutateWorkspacesForTesting { $0.append(fixture.workspace) }
 
         let initialResult = await manager.switchWorkspace(to: fixture.workspace, saveState: false)
         XCTAssertTrue(initialResult.didSwitch)
@@ -744,7 +744,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let composition = makeComposition()
         let manager = composition.workspaceManager
         await manager.awaitInitialized()
-        manager.workspaces.append(workspace)
+        manager.mutateWorkspacesForTesting { $0.append(workspace) }
 
         var injectedBlankSnapshot = false
         manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting { phase in
@@ -825,7 +825,7 @@ final class WorkspaceSwitchRecoveryTests: XCTestCase {
         let composition = makeComposition()
         let manager = composition.workspaceManager
         await manager.awaitInitialized()
-        manager.workspaces.append(workspace)
+        manager.mutateWorkspacesForTesting { $0.append(workspace) }
 
         var updatedCanonicalSelection = false
         manager.setWorkspaceSwitchPhaseDidChangeHandlerForTesting { phase in

@@ -6,6 +6,31 @@ import XCTest
 
 @MainActor
 final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
+    func testPersistentAgentRuntimeReadAuthorizesOnlyExactTabSelectedGitArtifactAliases() async throws {
+        #if DEBUG
+            try await withFixture(agentOwned: true) { fixture in
+                let gitFixture = try ReviewGitRepositoryFixture(name: "PersistentRuntimeGitArtifactRead")
+                _ = try gitFixture.runGit(["init"], at: fixture.rootURL)
+                _ = try gitFixture.runGit(["config", "user.name", "RepoPrompt Test"], at: fixture.rootURL)
+                _ = try gitFixture.runGit(
+                    ["config", "user.email", "repoprompt@example.test"],
+                    at: fixture.rootURL
+                )
+                _ = try gitFixture.runGit(["config", "commit.gpgSign", "false"], at: fixture.rootURL)
+                _ = try gitFixture.runGit(["add", "."], at: fixture.rootURL)
+                _ = try gitFixture.runGit(["commit", "-m", "Initial commit"], at: fixture.rootURL)
+                try "let persistent_runtime_git_artifact_marker = true\n".write(
+                    to: fixture.fileURL,
+                    atomically: true,
+                    encoding: .utf8
+                )
+                try await runCheckpoint(fixture: fixture, scenario: .selectedGitArtifactAliases)
+            }
+        #else
+            throw XCTSkip("Persistent Agent Mode MCP socketpair integration requires DEBUG inspection helpers.")
+        #endif
+    }
+
     func testWorktreeReadCoverageCertificateHitsExactFullAndSliceRepeatsButNotExpansion() async throws {
         #if DEBUG
             try await withFixture(agentOwned: true) { fixture in
@@ -225,13 +250,15 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             case worktreeCoverageCertificateFailClosed
             case worktreeSearchPhysicalCoverage
             case hiddenWorktreeReadSliceRebase
+            case selectedGitArtifactAliases
 
             var requiresSerialReadPrelude: Bool {
                 switch self {
                 case .agentOwnedNoRangeNonEmptyWorktreeFile, .agentOwnedSequentialReadUnion,
                      .manageSelectionGetCanonicalHandover, .worktreeCoverageCertificateRepeats,
                      .worktreeCoverageCertificatePersistenceBoundary, .worktreeCoverageCertificateFailClosed,
-                     .worktreeSearchPhysicalCoverage, .hiddenWorktreeReadSliceRebase:
+                     .worktreeSearchPhysicalCoverage, .hiddenWorktreeReadSliceRebase,
+                     .selectedGitArtifactAliases:
                     false
                 default:
                     true
@@ -424,7 +451,191 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 try await assertWorktreeSearchPhysicalCoverage(fixture: fixture)
             case .hiddenWorktreeReadSliceRebase:
                 try await assertHiddenWorktreeReadSliceRebase(fixture: fixture)
+            case .selectedGitArtifactAliases:
+                try await assertSelectedGitArtifactAliases(fixture: fixture)
             }
+        }
+
+        func assertSelectedGitArtifactAliases(fixture: Fixture) async throws {
+            let selectSource = try await fixture.socketClient.request(
+                id: 3,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "set",
+                        "paths": [fixture.fileURL.path],
+                        "mode": "full",
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(selectSource, id: 3)
+            let publish = try await fixture.socketClient.request(
+                id: 4,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.git,
+                    "arguments": [
+                        "op": "diff",
+                        "repo_root": fixture.rootURL.path,
+                        "scope": "selected",
+                        "detail": "patches",
+                        "artifacts": true,
+                        "mode": "deep"
+                    ]
+                ]
+            )
+            let publishText = try Self.readFileText(from: publish, id: 4)
+            XCTAssertTrue(publishText.contains("MAP.txt"), publishText)
+            XCTAssertTrue(publishText.contains("diff/all.patch"), publishText)
+
+            let published = await waitForSelection(fixture: fixture) { selection in
+                selection.selectedPaths.contains { $0.hasSuffix("/MAP.txt") }
+                    && selection.selectedPaths.contains { $0.hasSuffix("/diff/all.patch") }
+            }
+            let mapPath = try XCTUnwrap(published?.selectedPaths.first { $0.hasSuffix("/MAP.txt") })
+            let patchPath = try XCTUnwrap(
+                published?.selectedPaths.first { $0.hasSuffix("/diff/all.patch") }
+            )
+            let mapAlias = try Self.gitDataAlias(for: mapPath)
+            let patchAlias = try Self.gitDataAlias(for: patchPath)
+
+            let selectedRead = try await fixture.socketClient.request(
+                id: 5,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": patchAlias]
+                ]
+            )
+            let selectedText = try Self.readFileText(from: selectedRead, id: 5)
+            XCTAssertTrue(selectedText.contains("persistent_runtime_git_artifact_marker"), selectedText)
+            XCTAssertTrue(selectedText.contains(patchAlias), selectedText)
+
+            let removeMap = try await fixture.socketClient.request(
+                id: 6,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": [
+                        "op": "remove",
+                        "paths": [mapAlias],
+                        "strict": true
+                    ]
+                ]
+            )
+            try Self.assertSuccessfulResponse(removeMap, id: 6)
+            let unselectedRead = try await fixture.socketClient.request(
+                id: 7,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": mapAlias]
+                ]
+            )
+            let unselectedError = try Self.toolErrorText(from: unselectedRead, id: 7)
+            XCTAssertTrue(unselectedError.contains("already be selected and authorized"), unselectedError)
+
+            let snapshotDirectoryAlias = String(
+                patchAlias.dropLast("diff/all.patch".count)
+            ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            let diffDirectoryAlias = String(
+                patchAlias.dropLast("all.patch".count)
+            ).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            for (requestID, directoryAlias) in zip(
+                8 ... 10,
+                ["_git_data", snapshotDirectoryAlias, diffDirectoryAlias]
+            ) {
+                let directoryRead = try await fixture.socketClient.request(
+                    id: requestID,
+                    method: "tools/call",
+                    params: [
+                        "name": MCPWindowToolName.readFile,
+                        "arguments": ["path": directoryAlias]
+                    ]
+                )
+                let directoryError = try Self.toolErrorText(from: directoryRead, id: requestID)
+                XCTAssertTrue(
+                    directoryError.contains("already be selected and authorized"),
+                    directoryError
+                )
+            }
+
+            let decoyTabID = UUID()
+            guard let workspaceIndex = fixture.window.workspaceManager.workspaces.firstIndex(where: {
+                $0.id == fixture.workspaceID
+            }) else {
+                return XCTFail("Expected persistent fixture workspace")
+            }
+            fixture.window.workspaceManager.mutateWorkspacesForTesting {
+                $0[workspaceIndex].composeTabs.append(
+                    ComposeTabState(
+                        id: decoyTabID,
+                        name: "Git artifact decoy",
+                        selection: StoredSelection(selectedPaths: [patchPath], codemapAutoEnabled: false)
+                    )
+                )
+            }
+            _ = await fixture.window.selectionCoordinator.persistSelection(
+                StoredSelection(selectedPaths: [patchPath], codemapAutoEnabled: false),
+                for: WorkspaceSelectionIdentity(
+                    workspaceID: fixture.workspaceID,
+                    tabID: decoyTabID
+                ),
+                source: .mcpTabContext,
+                mirrorToUIIfActive: false
+            )
+            let clearOwner = try await fixture.socketClient.request(
+                id: 11,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.manageSelection,
+                    "arguments": ["op": "clear"]
+                ]
+            )
+            try Self.assertSuccessfulResponse(clearOwner, id: 11)
+            let wrongContextRead = try await fixture.socketClient.request(
+                id: 12,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": patchAlias]
+                ]
+            )
+            let wrongContextError = try Self.toolErrorText(from: wrongContextRead, id: 12)
+            XCTAssertTrue(wrongContextError.contains("already be selected and authorized"), wrongContextError)
+            XCTAssertTrue(
+                try XCTUnwrap(fixture.window.workspaceManager.composeTab(with: decoyTabID))
+                    .selection.selectedPaths.contains(patchPath)
+            )
+
+            let ownerIdentity = WorkspaceSelectionIdentity(
+                workspaceID: fixture.workspaceID,
+                tabID: Fixture.tabID
+            )
+            _ = await fixture.window.selectionCoordinator.persistSelection(
+                StoredSelection(selectedPaths: [patchPath], codemapAutoEnabled: false),
+                for: ownerIdentity,
+                source: .mcpTabContext,
+                mirrorToUIIfActive: true
+            )
+            fixture.window.mcpServer.gitArtifactAdvertisementRegistry.invalidate(
+                identity: ownerIdentity
+            )
+            let unadvertisedRead = try await fixture.socketClient.request(
+                id: 13,
+                method: "tools/call",
+                params: [
+                    "name": MCPWindowToolName.readFile,
+                    "arguments": ["path": patchAlias]
+                ]
+            )
+            let unadvertisedError = try Self.toolErrorText(from: unadvertisedRead, id: 13)
+            XCTAssertTrue(
+                unadvertisedError.contains("already be selected and authorized"),
+                unadvertisedError
+            )
         }
 
         func assertHiddenWorktreeReadSliceRebase(fixture: Fixture) async throws {
@@ -483,11 +694,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_001
                 )]
             )
@@ -551,11 +758,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_002
                 )]
             )
@@ -677,9 +880,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_101
                 )]
             )
@@ -746,11 +947,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 rootID: fixture.installedWorktreeRootID,
                 events: [(
                     absolutePath: physicalURL.path,
-                    flags: FSEventStreamEventFlags(
-                        kFSEventStreamEventFlagItemRenamed
-                            | kFSEventStreamEventFlagItemCreated
-                            | kFSEventStreamEventFlagItemIsFile
-                    ),
+                    flags: [.itemRenamed, .itemCreated, .itemIsFile],
                     eventId: 8_900_000_000_000_000_102
                 )]
             )
@@ -2236,7 +2433,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             if workspaceWithoutTab.activeComposeTabID == Fixture.tabID {
                 workspaceWithoutTab.activeComposeTabID = workspaceWithoutTab.composeTabs.first?.id
             }
-            manager.workspaces[workspaceIndex] = workspaceWithoutTab
+            manager.mutateWorkspacesForTesting { $0[workspaceIndex] = workspaceWithoutTab }
 
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
@@ -2245,7 +2442,7 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertEqual(boundSelection?.selectedPaths, [])
             XCTAssertEqual(boundSelection?.slices, [:])
 
-            manager.workspaces[workspaceIndex] = originalWorkspace
+            manager.mutateWorkspacesForTesting { $0[workspaceIndex] = originalWorkspace }
         }
 
         func assertWorkspaceReorderDuringAutoSelectionPersistence(fixture: Fixture) async throws {
@@ -2271,8 +2468,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             )
             decoy.composeTabs = []
             let decoyID = decoy.id
-            manager.workspaces.insert(decoy, at: originalIndex)
-            defer { manager.workspaces.removeAll { $0.id == decoyID } }
+            manager.mutateWorkspacesForTesting { $0.insert(decoy, at: originalIndex) }
+            defer { manager.mutateWorkspacesForTesting { $0.removeAll { $0.id == decoyID } } }
 
             await gate.release()
             let settled = await waitForCanonicalWorkerToSettle(fixture: fixture)
@@ -2290,9 +2487,11 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             let manager = fixture.window.workspaceManager
             let workspaceIndex = try XCTUnwrap(manager.workspaces.firstIndex { $0.id == fixture.workspaceID })
             let replacementTabID = UUID()
-            manager.workspaces[workspaceIndex].composeTabs.append(
-                ComposeTabState(id: replacementTabID, name: "Replacement Auto-Selection Owner")
-            )
+            manager.mutateWorkspacesForTesting {
+                $0[workspaceIndex].composeTabs.append(
+                    ComposeTabState(id: replacementTabID, name: "Replacement Auto-Selection Owner")
+                )
+            }
 
             let gate = PersistentAsyncGate()
             fixture.window.mcpServer.setReadFileAutoSelectionPersistenceGateForTesting {
@@ -2414,6 +2613,26 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             return await signal.isMarked()
         }
 
+        func waitForSelection(
+            fixture: Fixture,
+            timeout: Duration = .seconds(5),
+            condition: (StoredSelection) -> Bool
+        ) async -> StoredSelection? {
+            let deadline = ContinuousClock.now + timeout
+            while ContinuousClock.now < deadline {
+                if let selection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection,
+                   condition(selection)
+                {
+                    return selection
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            guard let selection = fixture.window.workspaceManager.composeTab(with: Fixture.tabID)?.selection,
+                  condition(selection)
+            else { return nil }
+            return selection
+        }
+
         static func assertStableAgentModeSnapshot(_ snapshot: RetainedConnectionSnapshot, fixture: Fixture) {
             XCTAssertEqual(snapshot.connectionID, Fixture.connectionID)
             XCTAssertEqual(snapshot.capabilityToken, Fixture.sessionToken)
@@ -2484,6 +2703,19 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             XCTAssertNotEqual(result["isError"] as? Bool, true)
             let content = try XCTUnwrap(result["content"] as? [[String: Any]])
             return content.compactMap { $0["text"] as? String }.joined()
+        }
+
+        static func toolErrorText(from rawJSON: String, id: Int) throws -> String {
+            let object = try responseObject(from: rawJSON, id: id)
+            let result = try XCTUnwrap(object["result"] as? [String: Any])
+            XCTAssertEqual(result["isError"] as? Bool, true)
+            let content = try XCTUnwrap(result["content"] as? [[String: Any]])
+            return content.compactMap { $0["text"] as? String }.joined()
+        }
+
+        static func gitDataAlias(for absolutePath: String) throws -> String {
+            let marker = try XCTUnwrap(absolutePath.range(of: "/_git_data/"))
+            return "_git_data/" + absolutePath[marker.upperBound...]
         }
 
         static func diagnosticsPayload(_ result: CallTool.Result) throws -> [String: Any] {
@@ -2699,6 +2931,12 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
             GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
             let window = WindowState()
             let routingGuardWindow = WindowState()
+            window.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: window.workspaceFileContextStore)
+            )
+            routingGuardWindow.promptManager.attachPromptFactualContextProvider(
+                TestPromptFactualContextProvider(store: routingGuardWindow.workspaceFileContextStore)
+            )
             await window.workspaceManager.awaitInitialized()
             await routingGuardWindow.workspaceManager.awaitInitialized()
             if agentOwned {
@@ -2741,8 +2979,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                         at: 0
                     )
                 }
-                window.workspaceManager.workspaces[workspaceIndex].composeTabs = composeTabs
-                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = inactiveAgentTab ? activeTabID : tabID
+                window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].composeTabs = composeTabs }
+                window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = inactiveAgentTab ? activeTabID : tabID }
                 let configuredWorkspace = window.workspaceManager.workspaces[workspaceIndex]
                 await window.workspaceManager.switchWorkspace(
                     to: configuredWorkspace,
@@ -3225,8 +3463,8 @@ final class PersistentAgentModeMCPReadFileConnectionTests: XCTestCase {
                 ],
                 activeComposeTabID: Self.tabID
             )
-            routingGuardWindow.workspaceManager.workspaces.append(unrelatedWorkspace)
-            routingGuardWindow.workspaceManager.workspaces.append(peerWorkspace)
+            routingGuardWindow.workspaceManager.mutateWorkspacesForTesting { $0.append(unrelatedWorkspace) }
+            routingGuardWindow.workspaceManager.mutateWorkspacesForTesting { $0.append(peerWorkspace) }
             await routingGuardWindow.workspaceManager.switchWorkspace(
                 to: peerWorkspace,
                 saveState: false,

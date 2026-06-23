@@ -35,6 +35,7 @@ docs/designs/
 docs/references/
 docs/reviews/
 docs/plans/*
+!docs/plans/core-isolation-reconstruction-2026-06-20.md
 !docs/plans/test-coverage-value-audit-2026-05-29.md
 
 # Python cache artifacts

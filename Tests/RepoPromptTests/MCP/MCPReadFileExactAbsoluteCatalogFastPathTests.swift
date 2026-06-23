@@ -48,15 +48,34 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
         }
 
         do {
-            let caseLabel = "testProviderTranslationPrecedesScopedReadDependencyCall"
+            let caseLabel = "testRuntimeAndLegacyProviderAuthorizeSelectedGitArtifactsBeforeOrdinaryRead"
             let providerSource = try source("Sources/RepoPrompt/Infrastructure/MCP/WindowTools/MCPFileToolProvider.swift")
-            let translation = try XCTUnwrap(providerSource.range(of: "let resolvedPath = lookupContext.translateInputPath(path)"), caseLabel)
-            let authorizedRead = try XCTUnwrap(
-                providerSource.range(of: "dependencies.readSelectedAuthorizedGitArtifact("),
+            let runtimeRead = try XCTUnwrap(providerSource.slice(
+                from: "    private func executeRuntimeReadFile(\n",
+                to: "    private func executeLegacyReadFile(\n"
+            ), caseLabel)
+            try assertOrdered([
+                "await dependencies.captureRequestMetadata()",
+                "let resolvedPath = context.lookupContext.translateInputPath(path)",
+                "dependencies.readSelectedAuthorizedGitArtifact(",
+                "MCPRuntimeFileToolServices.readFile("
+            ], in: runtimeRead, label: caseLabel)
+            XCTAssertFalse(runtimeRead.contains("executeLegacyReadFile("), caseLabel)
+
+            let legacyRead = try XCTUnwrap(providerSource.slice(
+                from: "    private func executeLegacyReadFile(\n",
+                to: "    private func fileSearchTool() -> Tool {\n"
+            ), caseLabel)
+            let translation = try XCTUnwrap(
+                legacyRead.range(of: "let resolvedPath = lookupContext.translateInputPath(path)"),
                 caseLabel
             )
             let scopedRead = try XCTUnwrap(
-                providerSource.range(of: "dependencies.readFile("),
+                legacyRead.range(of: "dependencies.readFile("),
+                caseLabel
+            )
+            let authorizedRead = try XCTUnwrap(
+                legacyRead.range(of: "dependencies.readSelectedAuthorizedGitArtifact("),
                 caseLabel
             )
             XCTAssertLessThan(translation.lowerBound, authorizedRead.lowerBound, caseLabel)

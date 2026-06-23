@@ -1,12 +1,17 @@
 import Foundation
 import MCP
+import RepoPromptCore
 
 struct MCPContextBindingMatch {
     let windowID: Int
+    let runtimeID: WorkspaceRuntimeID
+    let mappingGeneration: UInt64
     let tabID: UUID
     let workspaceID: UUID
     let workspaceName: String
     let repoPaths: [String]
+    let sessionID: WorkspaceSessionID
+    let sessionAvailability: WorkspaceSessionAvailability
 }
 
 struct MCPLogicalContextResolution {
@@ -20,6 +25,82 @@ struct MCPLogicalContextResolution {
 struct MCPLogicalContextBindingResolution {
     let logicalContext: MCPLogicalContextResolution
     let windowID: Int
+    let runtimeID: WorkspaceRuntimeID
+    let mappingGeneration: UInt64
+    let sessionID: WorkspaceSessionID
+    let sessionAvailability: WorkspaceSessionAvailability
+}
+
+/// Exact workspace-session capability admitted for one MCP request.
+///
+/// Session identity and activation token are intentionally inseparable so downstream
+/// routing cannot accidentally combine a resolved window with a token reacquired from a
+/// replacement session.
+struct MCPAdmittedContextBinding: Equatable, @unchecked Sendable {
+    let windowID: Int
+    let tabID: UUID?
+    let workspaceID: UUID?
+    let sessionID: WorkspaceSessionID
+    let admissionToken: WorkspaceSessionAdmissionToken
+
+    init?(
+        windowID: Int,
+        tabID: UUID?,
+        workspaceID: UUID?,
+        sessionID: WorkspaceSessionID,
+        admissionToken: WorkspaceSessionAdmissionToken
+    ) {
+        guard admissionToken.sessionID == sessionID else { return nil }
+        self.windowID = windowID
+        self.tabID = tabID
+        self.workspaceID = workspaceID
+        self.sessionID = sessionID
+        self.admissionToken = admissionToken
+    }
+
+    @MainActor
+    func isCurrent(in windowState: WindowState) -> Bool {
+        guard windowState.windowID == windowID,
+              windowState.workspaceSessionID == sessionID,
+              let client = windowState.workspaceSessionCommandClient,
+              let snapshot = client.snapshot,
+              isCurrent(
+                  clientSessionID: client.sessionID,
+                  snapshot: snapshot,
+                  currentAdmissionToken: client.admissionToken
+              )
+        else { return false }
+        return true
+    }
+
+    func isCurrent(
+        clientSessionID: WorkspaceSessionID,
+        snapshot: WorkspaceSessionSnapshot,
+        currentAdmissionToken: WorkspaceSessionAdmissionToken?
+    ) -> Bool {
+        clientSessionID == sessionID
+            && snapshot.sessionID == sessionID
+            && (snapshot.availability == .active || snapshot.availability == .switching)
+            && currentAdmissionToken?.activationID == admissionToken.activationID
+    }
+
+    @MainActor
+    func execute(
+        _ command: WorkspaceSessionCommand,
+        source: String,
+        in windowState: WindowState
+    ) async -> WorkspaceSessionCommandResult? {
+        guard isCurrent(in: windowState),
+              let client = windowState.workspaceSessionCommandClient,
+              let snapshot = client.snapshot
+        else { return nil }
+        return await client.execute(
+            command,
+            source: WorkspaceSessionCommandSource(kind: source),
+            exactAdmissionToken: admissionToken,
+            expectedGeneration: snapshot.stateGeneration
+        )
+    }
 }
 
 struct MCPBindingResolver {
@@ -81,7 +162,17 @@ struct MCPBindingResolver {
             connectionID: connectionID,
             requestedWindowID: requestedWindowID
         )
-        return MCPLogicalContextBindingResolution(logicalContext: logicalContext, windowID: windowID)
+        guard let selectedMatch = matches.first(where: { $0.windowID == windowID }) else {
+            throw MCPError.invalidParams("The resolved RepoPrompt window no longer hosts the requested context.")
+        }
+        return MCPLogicalContextBindingResolution(
+            logicalContext: logicalContext,
+            windowID: windowID,
+            runtimeID: selectedMatch.runtimeID,
+            mappingGeneration: selectedMatch.mappingGeneration,
+            sessionID: selectedMatch.sessionID,
+            sessionAvailability: selectedMatch.sessionAvailability
+        )
     }
 
     private func collapseLogicalContextMatches(

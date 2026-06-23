@@ -70,7 +70,7 @@ final class WindowStateDisplayedTitleTests: XCTestCase {
             )
             let activeTabID = try XCTUnwrap(window.promptManager.activeComposeTabID)
 
-            window.agentModeViewModel.renameSession(tabID: activeTabID, to: "Renamed Agent Session")
+            await window.agentModeViewModel.renameSession(tabID: activeTabID, to: "Renamed Agent Session")
 
             try await waitForDisplayedTitle(
                 window,

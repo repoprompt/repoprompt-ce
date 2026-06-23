@@ -6,6 +6,7 @@
 //
 
 import Cocoa
+import Darwin
 import Foundation
 import MachO
 import os.lock

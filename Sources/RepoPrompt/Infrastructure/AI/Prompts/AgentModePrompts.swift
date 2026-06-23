@@ -374,25 +374,31 @@ enum AgentModePrompts {
         /// Tool-list item for session naming (provider-aware).
         static func setStatusToolListItem(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\n- `set_status` - RepoPrompt MCP tool call for setting or renaming the session title (call once at session start)"
+                return "\n- `set_status` - RepoPrompt MCP tool call for setting or renaming the session title; call it at session start and whenever the user explicitly asks to name, rename, or retitle this session. Do not claim success unless the tool succeeds."
             }
-            return "\n- `set_status` - Set or rename the session title (call once at session start)"
+            return "\n- `set_status` - Set or rename the session title; call it at session start and whenever the user explicitly asks to name, rename, or retitle this session. Do not claim success unless the tool succeeds."
         }
 
         /// Session-start instruction for role prompts that use inline numbered steps.
         static func setStatusStartSentence(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "Call `set_status` with `session_name` as a RepoPrompt MCP tool call to name this session at the start."
+                return "Call `set_status` with `session_name` as a RepoPrompt MCP tool call to name this session at the start. Call it again whenever the user explicitly asks to name, rename, or retitle the session, and do not claim success unless the tool succeeds."
             }
-            return "Call `set_status` to name this session at the start."
+            return "Call `set_status` to name this session at the start. Call it again whenever the user explicitly asks to name, rename, or retitle the session, and do not claim success unless the tool succeeds."
         }
 
         /// Session-start bullet for standard workflow guidance.
         static func setStatusStartupBullet(agentKind: AgentProviderKind?) -> String {
             if agentKind == .codexExec {
-                return "\t- Immediately call `set_status` with `session_name` as a RepoPrompt MCP tool call to name the current chat/session"
+                return """
+                \t- Immediately call `set_status` with `session_name` as a RepoPrompt MCP tool call to name the current session
+                \t- Call `set_status` whenever the user explicitly asks to name, rename, or retitle the session; do not claim success unless the tool succeeds
+                """
             }
-            return "\t- Immediately call `set_status` with `session_name` to name the current chat/session"
+            return """
+            \t- Immediately call `set_status` with `session_name` to name the current session
+            \t- Call `set_status` whenever the user explicitly asks to name, rename, or retitle the session; do not claim success unless the tool succeeds
+            """
         }
 
         /// Keep set_status title-only wording aligned with provider-specific tool naming.

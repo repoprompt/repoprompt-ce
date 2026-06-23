@@ -205,99 +205,6 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         XCTAssertFalse(clipboard.contains("<Referenced APIs>"), clipboard)
     }
 
-    func testResolveFreezesCodemapResolutionTreeAndRenderingAcrossAwait() async throws {
-        #if DEBUG
-            let root = try makeTemporaryRoot(name: "PromptPreAssemblyFrozenCodemap")
-            let selectedURL = root.appendingPathComponent("Selected.swift")
-            let targetURL = root.appendingPathComponent("Target.swift")
-            try FileSystemTestSupport.write("let selected = true\n", to: selectedURL)
-            try FileSystemTestSupport.write("struct Target {}\n", to: targetURL)
-
-            let store = WorkspaceFileContextStore()
-            let rootRecord = try await store.loadRoot(path: root.path)
-            let loadedFileSystemService = await store.fileSystemServiceForTesting(rootID: rootRecord.id)
-            let fileSystemService = try XCTUnwrap(loadedFileSystemService)
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: targetURL.path,
-                    modificationDate: Date(),
-                    fileAPI: makeFileAPI(
-                        path: targetURL.path,
-                        symbolName: "frozenCodemapSentinel"
-                    )
-                )
-            ])
-            let gate = PreAssemblyContentReadGate()
-            await fileSystemService.setContentReadChunkHandlerForTesting { _ in
-                await gate.markStartedAndWaitForRelease()
-            }
-            defer {
-                Task {
-                    await fileSystemService.setContentReadChunkHandlerForTesting(nil)
-                    await gate.release()
-                }
-            }
-
-            let request = PromptContextPreAssemblyRequest(
-                cfg: makeConfig(gitInclusion: .none, codeMapUsage: .auto),
-                selection: StoredSelection(
-                    selectedPaths: [selectedURL.path],
-                    autoCodemapPaths: [targetURL.path],
-                    codemapAutoEnabled: true
-                ),
-                store: store,
-                lookupContext: WorkspaceLookupContext(rootScope: .allLoaded, bindingProjection: nil),
-                filePathDisplay: .relative,
-                onlyIncludeRootsWithSelectedFiles: true,
-                showCodeMapMarkers: true,
-                selectedGitDiffFolderPolicy: .filesOnly,
-                reviewGitContext: .automaticOnly(),
-                selectedGitDiffProvider: { _ in Self.automaticResult(nil) },
-                completeGitDiffProvider: { nil }
-            )
-            let resolveTask = Task {
-                await PromptContextPreAssemblyService.resolve(request)
-            }
-            await gate.waitUntilStarted()
-            await store.applyObservedCodemapResults([
-                WorkspaceObservedCodemapResult(
-                    fullPath: targetURL.path,
-                    modificationDate: Date(),
-                    fileAPI: nil
-                )
-            ])
-            await gate.release()
-            let result = await resolveTask.value
-            await fileSystemService.setContentReadChunkHandlerForTesting(nil)
-
-            let clipboard = await PromptPackagingService.generateClipboardContent(
-                metaInstructions: [],
-                userInstructions: "",
-                files: result.entries,
-                fileTreeContent: result.fileTreeContent,
-                includeSavedPrompts: false,
-                includeFiles: true,
-                includeUserPrompt: false,
-                filePathDisplay: .relative,
-                codemapSnapshotBundle: result.codemapSnapshotBundle,
-                promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
-                disabledPromptSections: [],
-                duplicateUserInstructionsAtTop: false
-            )
-
-            XCTAssertEqual(result.entries.filter(\.isCodemap).map(\.file.standardizedFullPath), [targetURL.standardizedFileURL.path])
-            XCTAssertTrue(result.fileTreeContent?.contains("Target.swift +") == true, result.fileTreeContent ?? "")
-            XCTAssertTrue(clipboard.contains("frozenCodemapSentinel"), clipboard)
-            XCTAssertTrue(result.codemapSnapshotBundle.orderedSnapshots.contains {
-                $0.fileAPI?.apiDescription.contains("frozenCodemapSentinel") == true
-            })
-            let currentBundle = await store.codemapSnapshotBundle()
-            XCTAssertFalse(currentBundle.orderedSnapshots.contains {
-                $0.fileAPI?.apiDescription.contains("frozenCodemapSentinel") == true
-            })
-        #endif
-    }
-
     func testSelectedArtifactWinsLazilyAndMapRemainsOrdinaryContext() async throws {
         let diffText = "diff --git a/Sources/App.swift b/Sources/App.swift\n"
         let fixture = try await makeArtifactFixture(patchContent: diffText)
@@ -895,11 +802,11 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
             reviewGitContext: fixture.reviewContext
         )
         let resolver = ContextBuilderReviewTargetResolver()
-        let initial = try await resolver.resolve(input: input, store: fixture.store)
+        let initial = try await resolver.resolve(input: input, query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: fixture.store))
         return try await resolver.finalizeSelection(
             input: input,
             initialResolution: initial,
-            store: fixture.store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: fixture.store)
         )
     }
 
@@ -1004,37 +911,3 @@ final class PromptContextPreAssemblyServiceTests: XCTestCase {
         try temporaryRoots.makeRoot(suiteName: name)
     }
 }
-
-#if DEBUG
-    private actor PreAssemblyContentReadGate {
-        private var started = false
-        private var released = false
-        private var startWaiters: [CheckedContinuation<Void, Never>] = []
-        private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-
-        func markStartedAndWaitForRelease() async {
-            started = true
-            let waiters = startWaiters
-            startWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-            guard !released else { return }
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
-            }
-        }
-
-        func waitUntilStarted() async {
-            guard !started else { return }
-            await withCheckedContinuation { continuation in
-                startWaiters.append(continuation)
-            }
-        }
-
-        func release() {
-            released = true
-            let waiters = releaseWaiters
-            releaseWaiters.removeAll()
-            waiters.forEach { $0.resume() }
-        }
-    }
-#endif

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct ContextBuilderWorkspaceContext {
     let parentAgentSessionID: UUID
@@ -8,6 +9,7 @@ struct ContextBuilderWorkspaceContext {
     let providerWorkspacePath: String
     let reviewGitContext: FrozenPromptGitReviewContext
     let reviewTargetResolution: ContextBuilderReviewTargetResolution
+    private let sessionQuery: WorkspaceSessionQueryCapability
     private let reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink?
 
     var tabID: UUID {
@@ -19,6 +21,7 @@ struct ContextBuilderWorkspaceContext {
         workspaceRepoPaths: [String],
         workspaceDirectoryPath: String,
         store: WorkspaceFileContextStore,
+        sessionQuery: WorkspaceSessionQueryCapability,
         reviewDiagnosticSink: ContextBuilderReviewDiagnosticSink? = nil
     ) async throws -> ContextBuilderWorkspaceContext {
         guard let parentAgentSessionID = snapshot.activeAgentSessionID else {
@@ -88,7 +91,7 @@ struct ContextBuilderWorkspaceContext {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewGitContext
             ),
-            store: store
+            query: sessionQuery
         )
 
         let providerWorkspacePath: String
@@ -119,6 +122,7 @@ struct ContextBuilderWorkspaceContext {
             providerWorkspacePath: StandardizedPath.absolute(providerWorkspacePath),
             reviewGitContext: reviewGitContext,
             reviewTargetResolution: reviewTargetResolution,
+            sessionQuery: sessionQuery,
             reviewDiagnosticSink: reviewDiagnosticSink
         )
         try context.validateAvailability()
@@ -139,9 +143,9 @@ struct ContextBuilderWorkspaceContext {
         }
     }
 
-    func validateReviewTargetAvailability(store: WorkspaceFileContextStore) async throws {
+    func validateReviewTargetAvailability() async throws {
         guard case let .available(target) = reviewTargetResolution else { return }
-        if let reason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store) {
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(target, query: sessionQuery) {
             throw reason
         }
     }
@@ -150,8 +154,7 @@ struct ContextBuilderWorkspaceContext {
         _ selection: StoredSelection,
         workspaceID: UUID,
         tabID: UUID,
-        selectionRevision: UInt64,
-        store: WorkspaceFileContextStore
+        selectionRevision: UInt64
     ) async throws -> ContextBuilderFinalReviewAuthorization {
         try await ContextBuilderReviewTargetResolver(
             diagnosticSink: reviewDiagnosticSink
@@ -165,7 +168,7 @@ struct ContextBuilderWorkspaceContext {
                 reviewGitContext: reviewGitContext
             ),
             initialResolution: reviewTargetResolution,
-            store: store
+            query: sessionQuery
         )
     }
 

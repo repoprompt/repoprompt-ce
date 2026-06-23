@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import RepoPromptCore
 import SwiftUI
 
 enum WindowKind: String, Codable {
@@ -110,6 +111,15 @@ class WindowState: ObservableObject {
 
     private(set) static var windowCounter = 0
     let windowID: Int
+    let workspaceSessionID: WorkspaceSessionID
+    let workspaceRuntimeID: WorkspaceRuntimeID?
+    private let runtimeAdapter: MCPWindowRuntimeAdapter?
+    private let workspaceRuntimeBeginClose: @MainActor () -> Void
+    let workspaceSessionCommandClient: WorkspaceSessionCommandClient?
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
+    let workspaceSessionObservationBridge: WorkspaceSessionObservationBridge?
+    private let workspaceSessionActivationTask: Task<Void, Never>?
+    private let workspaceSessionShutdown: @Sendable () async -> Void
 
     @Published var kind: WindowKind = .standard
 
@@ -277,6 +287,7 @@ class WindowState: ObservableObject {
     func beginClose() {
         guard !isClosing else { return }
         isClosing = true
+        workspaceRuntimeBeginClose()
 
         let manager = windowStatesManager ?? WindowStatesManager.shared
         if !manager.isTerminating {
@@ -333,12 +344,22 @@ class WindowState: ObservableObject {
             )
         }
 
+        convenience init(appCoreContainer: RepoPromptAppCoreContainer) {
+            self.init(
+                contextBuilderProviderFactory: nil,
+                loadStoredAPISettingsDataOnInit: true,
+                codexModelPollingService: .shared,
+                appCoreContainer: appCoreContainer
+            )
+        }
+
     #endif
 
     private init(
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory?,
         loadStoredAPISettingsDataOnInit: Bool,
-        codexModelPollingService: CodexModelPollingService
+        codexModelPollingService: CodexModelPollingService,
+        appCoreContainer: RepoPromptAppCoreContainer? = nil
     ) {
         // Assign a unique window ID
         WindowState.windowCounter += 1
@@ -357,12 +378,22 @@ class WindowState: ObservableObject {
             windowID: windowID,
             deferredInitialAgentSystemWorkspaceRefresh: deferredInitialAgentSystemWorkspaceRefresh,
             sharedMCPService: Self.sharedMCPService,
+            appCoreContainer: appCoreContainer,
             contextBuilderProviderFactory: contextBuilderProviderFactory,
             loadStoredAPISettingsDataOnInit: loadStoredAPISettingsDataOnInit,
             codexModelPollingService: codexModelPollingService
         )
 
         workspaceFileContextStore = composition.workspaceFileContextStore
+        workspaceSessionID = composition.workspaceSessionID
+        workspaceRuntimeID = composition.workspaceRuntimeID
+        runtimeAdapter = composition.runtimeAdapter
+        workspaceRuntimeBeginClose = composition.workspaceRuntimeBeginClose
+        workspaceSessionCommandClient = composition.workspaceSessionCommandClient
+        workspaceSessionQuery = composition.workspaceSessionQuery
+        workspaceSessionObservationBridge = composition.workspaceSessionObservationBridge
+        workspaceSessionActivationTask = composition.workspaceSessionActivationTask
+        workspaceSessionShutdown = composition.workspaceSessionShutdown
         workspaceSearchService = composition.workspaceSearchService
         selectionCoordinator = composition.selectionCoordinator
         workspaceFilesViewModel = composition.workspaceFilesViewModel
@@ -381,6 +412,7 @@ class WindowState: ObservableObject {
         aiQueriesService = composition.aiQueriesService
         chatDataService = composition.chatDataService
         workspaceManager = composition.workspaceManager
+        runtimeAdapter?.attach(windowState: self)
 
         // Set up additional actions
         setupSendPromptAction()
@@ -1194,7 +1226,7 @@ class WindowState: ObservableObject {
                 // If ephemeral == true, mark existing workspace ephemeral (edge case)
                 if shouldBeEphemeral {
                     if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existingWorkspace.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
+                        workspaceManager.setWorkspaceEphemeral(workspaceManager.workspaces[index].id, true)
                     }
                 }
 
@@ -1234,7 +1266,7 @@ class WindowState: ObservableObject {
                 // If ephemeral == true, mark that workspace ephemeral
                 if shouldBeEphemeral {
                     if let index = workspaceManager.workspaces.firstIndex(where: { $0.id == existing.id }) {
-                        workspaceManager.workspaces[index].isEphemeral = true
+                        workspaceManager.setWorkspaceEphemeral(workspaceManager.workspaces[index].id, true)
                     }
                 }
 
@@ -1302,6 +1334,9 @@ class WindowState: ObservableObject {
     func tearDown() async {
         beginClose()
         await promptManager.gitViewModel.shutdownForWindowClose()
+        workspaceSessionObservationBridge?.stop()
+        workspaceSessionActivationTask?.cancel()
+        await workspaceSessionShutdown()
 
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG

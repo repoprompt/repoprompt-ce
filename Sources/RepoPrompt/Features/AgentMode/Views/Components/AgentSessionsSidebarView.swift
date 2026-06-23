@@ -428,7 +428,9 @@ struct AgentModeSessionsListView: View {
                                     Task { await promptManager.closeComposeTab(session.tabID) }
                                 },
                                 onRename: { newName in
-                                    agentModeVM.renameSession(tabID: session.tabID, to: newName)
+                                    Task {
+                                        await agentModeVM.renameSession(tabID: session.tabID, to: newName)
+                                    }
                                 },
                                 onDismissAttention: {
                                     agentModeVM.dismissSidebarRunAttention(tabID: session.tabID)

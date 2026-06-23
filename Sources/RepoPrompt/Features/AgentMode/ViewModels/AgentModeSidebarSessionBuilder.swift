@@ -11,7 +11,6 @@ struct AgentModeSidebarSessionBuilder {
     let authoritativeSessionIDByTabID: [UUID: UUID]
     let sessionIndex: [UUID: AgentSessionIndexEntry]
     let sessionListSortDates: [UUID: Date]
-    let sessionListCacheReady: Bool
     let sidebarRestoreFrozenOrderByTabID: [UUID: Int]
     let mcpControlledTabIDs: Set<UUID>
 
@@ -154,12 +153,14 @@ struct AgentModeSidebarSessionBuilder {
     }
 
     private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
-        guard !sessionListCacheReady, !sidebarRestoreFrozenOrderByTabID.isEmpty else { return false }
-        return tabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
+        !tabs.isEmpty && !sidebarRestoreFrozenOrderByTabID.isEmpty
     }
 
     private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        sidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
+        if let persistedIndex = sidebarRestoreFrozenOrderByTabID[tabID] {
+            return persistedIndex
+        }
+        return (sidebarRestoreFrozenOrderByTabID.values.max() ?? -1) + 1 + fallback
     }
 
     private func sidebarEntryMap(
@@ -443,9 +444,7 @@ struct AgentModeSidebarSessionBuilder {
         context: BuildContext
     ) -> [SidebarSession] {
         if context.useFrozenRestoreOrder {
-            return sidebarSessionsPreservingFlatOrder(
-                prefixedPinnedSidebarSessions(baseSortedSessions)
-            )
+            return sidebarSessionsPreservingFlatOrder(baseSortedSessions)
         }
         if baseSortedSessions.contains(where: { $0.parentSessionID != nil }) {
             return threadedSidebarSessions(

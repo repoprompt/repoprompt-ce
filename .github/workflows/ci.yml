@@ -48,6 +48,45 @@ jobs:
       - name: Build MCP product
         run: swift build --product repoprompt-mcp
 
+      - name: Build isolated scaffold targets
+        run: |
+          set -euo pipefail
+          for target in \
+            RepoPromptCore \
+            RepoPromptCoreMacOS \
+            RepoPromptPOSIXSupport \
+            RepoPromptSyntaxCBridge \
+            RepoPromptHeadless
+          do
+            swift build --target "$target"
+          done
+
+      - name: Build headless scaffold product
+        run: swift build --product repoprompt-headless
+
+      - name: Verify linked Tree-sitter symbol ownership
+        run: |
+          set -euo pipefail
+          bin_dir="$(swift build --show-bin-path)"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/RepoPrompt" --expect exact --label "CI RepoPrompt app"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/repoprompt-headless" --expect exact --label "CI RepoPrompt Headless"
+          python3 Scripts/verify_tree_sitter_symbols.py \
+            --binary "$bin_dir/repoprompt-mcp" --expect absent --label "CI repoprompt-mcp proxy"
+
+      - name: Run Core tests
+        run: swift test --filter RepoPromptCoreTests
+
+      - name: Run Core macOS adapter tests
+        run: swift test --filter RepoPromptCoreMacOSTests
+
+      - name: Run POSIX support tests
+        run: swift test --filter RepoPromptPOSIXSupportTests
+
+      - name: Run Headless tests
+        run: swift test --filter RepoPromptHeadlessTests
+
       - name: Run app tests
         shell: bash
         run: |
@@ -74,7 +113,7 @@ jobs:
           suites = sorted({
               line.split("/", 1)[0]
               for line in listed.stdout.splitlines()
-              if "/" in line
+              if "/" in line and line.startswith("RepoPromptTests.")
           })
 
           def descendant_process_groups(root_pid):

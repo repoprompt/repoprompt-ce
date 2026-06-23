@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 enum AutomaticReviewGitDiffSource: Equatable {
     case discover(WorkspaceSelectedGitPathResolution)
@@ -118,7 +119,7 @@ struct AutomaticReviewGitDiffCoordinator {
             vcsService: VCSService = .shared,
             gitService: GitService = GitService(),
             diffEngine: GitDiffEngine? = nil,
-            store: WorkspaceFileContextStore? = nil
+            query: WorkspaceSessionQueryCapability? = nil
         ) -> Dependencies {
             let engine = diffEngine ?? GitDiffEngine(vcsService: vcsService, gitService: gitService)
             return Dependencies(
@@ -151,9 +152,9 @@ struct AutomaticReviewGitDiffCoordinator {
                     return result.diffText
                 },
                 revalidateFinalAuthorization: { authorization in
-                    guard let store else { return .staleWorkspaceRoot }
+                    guard let query else { return .staleWorkspaceRoot }
                     return await ContextBuilderReviewTargetResolver(vcsService: vcsService)
-                        .revalidate(authorization.target, store: store)
+                        .revalidate(authorization.target, query: query)
                 }
             )
         }

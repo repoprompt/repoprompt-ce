@@ -29,7 +29,7 @@ struct HeadlessContextSnapshot {
     /// Frozen artifact authority, comparison intent, and logical checkout labels.
     let reviewGitContext: FrozenPromptGitReviewContext
 
-    /// Exact final Context Builder review authority. Nil for every general prompt route.
+    /// Exact final review authorization. Nil for plan/chat and non-Context-Builder review.
     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
 
     init(
@@ -80,8 +80,9 @@ extension PromptViewModel {
             storedPromptIds: []
         )
         let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
-        let preAssembly = if let authorization = snapshot.finalReviewAuthorization {
-            try await preAssembleStrictPromptContext(
+        let preAssembly: PromptContextPreAssemblyResult
+        if let authorization = snapshot.finalReviewAuthorization {
+            preAssembly = try await preAssembleStrictPromptContext(
                 cfg: headlessConfig,
                 selection: snapshot.selection,
                 lookupContext: lookupContext,
@@ -90,35 +91,24 @@ extension PromptViewModel {
                 finalReviewAuthorization: authorization
             )
         } else {
-            await preAssemblePromptContext(
+            let outcome = await preAssemblePromptContext(
                 cfg: headlessConfig,
                 selection: snapshot.selection,
                 lookupContext: lookupContext,
                 reviewGitContext: snapshot.reviewGitContext
             )
+            preAssembly = switch outcome {
+            case let .ready(result): result
+            case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+            case .cancelled: throw PromptFactualPackagingError.cancelled
+            }
         }
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
-        // 2. Generate file contents. Preserve legacy formatting unless an authoritative
-        // Agent Mode lookup context requires physical paths to be projected logically.
-        let displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = if snapshot.lookupContext != nil {
-            { entry in preAssembly.displayPath(for: entry) }
-        } else {
-            nil
-        }
-        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
-            codeEntries,
-            filePathDisplay: filePathDisplayOption,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
-            displayPathResolver: displayPathResolver
-        )
-        let fileBlocks = partitionedBlocks.contentBlocks
+        // Core already rendered the exact factual generation with logical paths.
+        let fileBlocks = preAssembly.rendered.contentBlocks
 
         // 3. Combine the frozen file tree with only the canonical codemap partition.
-        let fileTree = PromptPackagingService.combinedFileMapContent(
-            fileTreeContent: preAssembly.fileTreeContent,
-            codemapBlocks: partitionedBlocks.codemapBlocks
-        ) ?? ""
+        let fileTree = preAssembly.rendered.combinedFileMapContent ?? ""
 
         // 4. System prompt based on mode
         let systemPrompt: String = {

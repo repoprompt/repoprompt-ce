@@ -119,7 +119,7 @@ final class WorkspaceGitDataRootLoadingTests: XCTestCase {
             promptViewModel: prompt,
             performInitialWorkspaceActivation: false
         )
-        manager.workspaces = [workspace]
+        manager.setWorkspacesForTesting([workspace])
         return (store, files, manager)
     }
 }

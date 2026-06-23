@@ -23,6 +23,7 @@ class TokenCountingViewModel: ObservableObject {
     @Published private(set) var scannedLanguages: Set<LanguageType> = []
     @Published private(set) var copyContextTotalTokens: Int = 0
     @Published private(set) var copyContextTokenCountString: String = "0.00k"
+    @Published private(set) var factualContextUnavailable = false
 
     /// Combined property preserving legacy behaviour
     var combinedTreeAndCodeMapContent: String {
@@ -101,6 +102,7 @@ class TokenCountingViewModel: ObservableObject {
     private var getSettings: (() -> TokenCalculationSettings)?
     private var getCopyContext: (() -> CopyContextSnapshot)?
     private var getStoredSelection: (@MainActor () -> StoredSelection?)?
+    private var getFactualContext: (@MainActor () async -> PromptContextPreAssemblyOutcome)?
 
     // MARK: - Settings Structure
 
@@ -151,7 +153,8 @@ class TokenCountingViewModel: ObservableObject {
         getSelectedInstructionsText: @escaping () -> String,
         getSettings: @escaping () -> TokenCalculationSettings,
         getCopyContext: @escaping () -> CopyContextSnapshot,
-        getStoredSelection: @escaping @MainActor () -> StoredSelection?
+        getStoredSelection: @escaping @MainActor () -> StoredSelection?,
+        getFactualContext: @escaping @MainActor () async -> PromptContextPreAssemblyOutcome
     ) {
         self.fileManager = fileManager
         self.gitViewModel = gitViewModel
@@ -160,6 +163,7 @@ class TokenCountingViewModel: ObservableObject {
         self.getSettings = getSettings
         self.getCopyContext = getCopyContext
         self.getStoredSelection = getStoredSelection
+        self.getFactualContext = getFactualContext
 
         setupObservers()
         startTokenCountUpdateTimer()
@@ -536,6 +540,10 @@ class TokenCountingViewModel: ObservableObject {
             let calculateStartMS = PromptTokenRecountDiagnostics.start()
             PromptTokenRecountDiagnostics.event("tokenRecount.calculate.begin", fields: debugTokenRecountStateFields())
         #endif
+        if let getFactualContext {
+            await performSelectedProviderTokenCount(getFactualContext)
+            return
+        }
         guard let fileManager,
               let promptSource = getPromptText?(),
               let instructionsSource = getSelectedInstructionsText?(),
@@ -871,6 +879,53 @@ class TokenCountingViewModel: ObservableObject {
         #endif
     }
 
+    private func performSelectedProviderTokenCount(
+        _ capture: @MainActor () async -> PromptContextPreAssemblyOutcome
+    ) async {
+        let outcome = await capture()
+        guard !Task.isCancelled else { return }
+        guard case let .ready(preAssembly) = outcome else {
+            factualContextUnavailable = true
+            return
+        }
+
+        let result = preAssembly.factualSnapshot.tokenResult
+        let promptText = getPromptText?() ?? ""
+        let instructions = getSelectedInstructionsText?() ?? ""
+        let settings = getSettings?()
+        let duplicatePrompt = settings?.duplicateUserInstructionsAtTop == true
+        let promptTokens = TokenCalculationService.estimateTokens(for: promptText)
+        let instructionTokens = TokenCalculationService.estimateTokens(for: instructions)
+        let duplicateTokens = duplicatePrompt ? promptTokens : 0
+        let gitTokens = preAssembly.gitDiff.map(TokenCalculationService.estimateTokens(for:)) ?? 0
+        let total = result.totalTokenCount + promptTokens + duplicateTokens + instructionTokens + gitTokens
+
+        factualContextUnavailable = false
+        tokenCount = String(format: "%.2fk", Double(total) / 1000.0)
+        tokenCountFilesOnly = result.tokenCountFilesOnlyString
+        totalTokenCount = total
+        totalTokenCountFilesOnly = result.totalTokenCountFilesOnly
+        charCount = result.charCount + promptText.count + (duplicatePrompt ? promptText.count : 0) + instructions.count
+        fileTokenInfo = result.fileTokenInfo
+        folderTokenInfo = result.folderTokenInfo
+        fileTreeContent = result.fileTreeContent
+        codeMapContent = result.codeMapContent
+        codeMapFileCount = result.codeMapFileCount
+        codeMapTokenCount = result.codeMapTokenCount
+        gitDiffTokenCount = gitTokens
+        gitDiffTokenCountString = String(format: "%.2fk", Double(gitTokens) / 1000.0)
+        copyContextTotalTokens = total
+        copyContextTokenCountString = tokenCount
+        lastPromptTokens = promptTokens
+        lastDuplicatePromptTokens = duplicateTokens
+        lastInstructionsTokens = instructionTokens
+        lastGitDiffTokens = gitTokens
+        lastFileTreeTokens = result.fileTreeTokenCountRaw
+        lastBaseWithoutUserText = max(0, total - promptTokens - duplicateTokens - instructionTokens)
+        didComputeBaseline = true
+        tokenCalculationCompletedPublisher.send()
+    }
+
     private func remapStoreFileTokenInfo(
         _ storeFileTokenInfo: [UUID: TokenInfo],
         resolvedEntries: [ResolvedPromptFileEntry],
@@ -888,6 +943,12 @@ class TokenCountingViewModel: ObservableObject {
 
     /// Light path (prompt text and/or meta instructions and/or git diff only).
     private func recalculateLight(kinds: DirtyKind) async {
+        // Git/artifact membership is factual state. Re-enter the construction-selected
+        // provider instead of mixing a fresh app-side diff decision with an older Core capture.
+        if kinds.contains(.gitDiff) {
+            await performTokenCountOffMainThread()
+            return
+        }
         guard didComputeBaseline,
               let promptSource = getPromptText?(),
               let instructionsSource = getSelectedInstructionsText?()
@@ -907,58 +968,7 @@ class TokenCountingViewModel: ObservableObject {
         let duplicatePromptTokens = duplicatePrompt ? promptTokens : 0
         let instructionsTokens = TokenCalculationService.estimateTokens(for: selectedInstructionsText)
 
-        var gitDiffTokens = gitDiffTokenCount
-        if kinds.contains(.gitDiff) {
-            if let fileManager {
-                // Check if artifact files are selected - if so, they're already counted as normal files.
-                let hasSelectedArtifacts: Bool
-                if copySnapshot.includeFiles {
-                    let store = fileManager.workspaceFileContextStore
-                    let selection = currentStoredSelection(includeFiles: true)
-                    let resolution = await promptContextAccountingService.resolveEntries(
-                        selection: selection,
-                        store: store,
-                        rootScope: .allLoaded,
-                        profile: .uiAssisted,
-                        codeMapUsage: copySnapshot.includeFiles ? copySnapshot.codeMapUsage : .none
-                    )
-                    let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(resolution.entries)
-                    hasSelectedArtifacts = !diffEntries.isEmpty
-                } else {
-                    hasSelectedArtifacts = false
-                }
-
-                if hasSelectedArtifacts {
-                    // Artifact files are selected - they're counted as normal files, not as gitDiffTokens
-                    gitDiffTokens = 0
-                } else if let gitViewModel {
-                    // No artifact files - use GitViewModel to generate diff if git inclusion is enabled
-                    switch copySnapshot.gitInclusion {
-                    case .none:
-                        gitDiffTokens = 0
-                    case .selected:
-                        if let diff = await gitViewModel.getDiffUsing(inclusionMode: .selectedFiles) {
-                            gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                        } else {
-                            gitDiffTokens = 0
-                        }
-                    case .complete:
-                        if let diff = await gitViewModel.getDiffUsing(inclusionMode: .all) {
-                            gitDiffTokens = TokenCalculationService.estimateTokens(for: diff)
-                        } else {
-                            gitDiffTokens = 0
-                        }
-                    }
-                } else {
-                    gitDiffTokens = 0
-                }
-            } else {
-                gitDiffTokens = 0
-            }
-            gitDiffTokenCount = gitDiffTokens
-            gitDiffTokenCountString = String(format: "%.2fk", Double(gitDiffTokens) / 1000.0)
-            lastGitDiffTokens = gitDiffTokens
-        }
+        let gitDiffTokens = gitDiffTokenCount
 
         let mainTotal = lastBaseWithoutUserText + promptTokens + duplicatePromptTokens + instructionsTokens
         let totalWithGit = mainTotal + gitDiffTokens

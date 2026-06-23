@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import MCP
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 @MainActor
@@ -1364,6 +1365,12 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 WindowState()
             }
             let windowB = WindowState()
+            windowA.promptManager.attachPromptFactualContextProvider(
+                PersistentMCPTestFactualProvider(store: windowA.workspaceFileContextStore)
+            )
+            windowB.promptManager.attachPromptFactualContextProvider(
+                PersistentMCPTestFactualProvider(store: windowB.workspaceFileContextStore)
+            )
             WindowStatesManager.shared.registerWindowState(windowA)
             WindowStatesManager.shared.registerWindowState(windowB)
             GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
@@ -1528,8 +1535,8 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
             await contextA.window.workspaceFilesViewModel.cancelAllScans()
             await contextB.window.workspaceFileContextStore.unloadRoot(id: contextB.rootID)
             await contextA.window.workspaceFileContextStore.unloadRoot(id: contextA.rootID)
-            contextB.window.workspaceManager.workspaces.removeAll { $0.id == contextB.workspaceID }
-            contextA.window.workspaceManager.workspaces.removeAll { $0.id == contextA.workspaceID }
+            contextB.window.workspaceManager.mutateWorkspacesForTesting { $0.removeAll { $0.id == contextB.workspaceID } }
+            contextA.window.workspaceManager.mutateWorkspacesForTesting { $0.removeAll { $0.id == contextA.workspaceID } }
             WindowStatesManager.shared.unregisterWindowState(contextB.window)
             WindowStatesManager.shared.unregisterWindowState(contextA.window)
             if let ownedRoutingService { ServiceRegistry.unregister(ownedRoutingService) }
@@ -1598,7 +1605,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
                 ComposeTabState(id: tabID, name: "Distinct MCP Connection \(label)")
             ]
             configuredWorkspace.activeComposeTabID = tabID
-            window.workspaceManager.workspaces.append(configuredWorkspace)
+            window.workspaceManager.mutateWorkspacesForTesting { $0.append(configuredWorkspace) }
             let rootRecord = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
                 in: window,
                 path: rootURL.path
@@ -1643,7 +1650,7 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         private static func cleanupContext(_ context: PersistentMCPTestContext) async {
             ServiceRegistry.unregister(context.catalogService)
             await context.window.workspaceFileContextStore.unloadRoot(id: context.rootID)
-            context.window.workspaceManager.workspaces.removeAll { $0.id == context.workspaceID }
+            context.window.workspaceManager.mutateWorkspacesForTesting { $0.removeAll { $0.id == context.workspaceID } }
             try? FileManager.default.removeItem(at: context.rootURL)
         }
     }
@@ -2168,5 +2175,21 @@ final class PersistentMCPDistinctConnectionConcurrencyTests: XCTestCase {
         case exactAbsoluteCatalogMiss
         case routingServiceUnavailable
         case toolReturnedError(String)
+    }
+
+    private struct PersistentMCPTestFactualProvider: PromptFactualContextProviding {
+        let store: WorkspaceFileContextStore
+
+        func capture(
+            _ request: PromptFactualCaptureRequest,
+            admission _: WorkspaceSessionAdmissionToken?
+        ) async -> PromptFactualCaptureOutcome {
+            for _ in 0 ..< 8 {
+                let outcome = await PromptFactualContextCaptureService.capture(request: request, store: store)
+                guard case .unavailable(.staleGeneration) = outcome else { return outcome }
+                await Task.yield()
+            }
+            return .unavailable(.staleGeneration)
+        }
     }
 #endif

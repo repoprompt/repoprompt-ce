@@ -93,7 +93,7 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
             }
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
             if includeArr.contains("files") {
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+                _ = await dependencies.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
             }
             let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
             let dto = try await dependencies.buildTabWorkspaceContext(
@@ -152,6 +152,9 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func executePrompt(args: [String: Value]) async throws -> Value {
+        guard let promptVM = await dependencies.promptVM() else {
+            throw MCPError.internalError("The original window UI is no longer available for prompt; the request was not retargeted.")
+        }
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         if op == "list_presets" {
             return try Value(ToolResultDTOs.PromptToolEnvelope.forPresetsList(dependencies.buildCopyPresetsListDTO()))
@@ -171,21 +174,21 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
             return try await activePromptReply(op: op)
         case "set":
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for set") }
-            await MainActor.run { dependencies.promptVM.promptText = text }
+            await MainActor.run { promptVM.promptText = text }
             return try Value(simplePromptReply(text, op: op))
         case "append":
             guard let text = args["text"]?.stringValue else { throw MCPError.invalidParams("text required for append") }
-            let combined = await dependencies.promptVM.promptText + text
-            await MainActor.run { dependencies.promptVM.promptText = combined }
+            let combined = await promptVM.promptText + text
+            await MainActor.run { promptVM.promptText = combined }
             return try Value(simplePromptReply(combined, op: op))
         case "clear":
-            await MainActor.run { dependencies.promptVM.promptText = "" }
+            await MainActor.run { promptVM.promptText = "" }
             return try Value(simplePromptReply("", op: op))
         case "export":
             return try await exportPrompt(args: args, resolvedContext: resolvedContext, tabContext: nil)
         case "select_preset":
             let preset = try await resolveRequiredPreset(args["preset"])
-            await MainActor.run { dependencies.promptVM.selectCopyPreset(preset.id) }
+            await MainActor.run { promptVM.selectCopyPreset(preset.id) }
             return try Value(ToolResultDTOs.PromptToolEnvelope.forSelectPreset(dependencies.copyPresetDescriptorDTO(preset)))
         default:
             throw MCPError.invalidParams("invalid op: \(op)")
@@ -193,6 +196,9 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func executeTabScopedPrompt(op: String, args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot) async throws -> Value {
+        guard let promptVM = await dependencies.promptVM() else {
+            throw MCPError.internalError("The original window UI is no longer available for prompt; the request was not retargeted.")
+        }
         let tabContext = resolvedContext.snapshot
         switch op {
         case "get":
@@ -220,7 +226,7 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
                 throw MCPError.invalidParams("select_preset requires an explicitly bound tab (bind_context or _tabID). It is disabled for run-based bindings; use copy_preset override in workspace_context or export instead.")
             }
             let preset = try await resolveRequiredPreset(args["preset"])
-            await MainActor.run { dependencies.promptVM.selectCopyPreset(preset.id) }
+            await MainActor.run { promptVM.selectCopyPreset(preset.id) }
             return try Value(ToolResultDTOs.PromptToolEnvelope.forSelectPreset(dependencies.copyPresetDescriptorDTO(preset)))
         default:
             throw MCPError.invalidParams("Unsupported op '\(op)' for prompt when tab context is active")
@@ -233,23 +239,26 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func activePromptReply(op: String) async throws -> Value {
-        let prompt = await dependencies.promptVM.promptText
+        guard let promptVM = await dependencies.promptVM() else {
+            throw MCPError.internalError("The original window UI is no longer available for prompt; the request was not retargeted.")
+        }
+        let prompt = await promptVM.promptText
         let lines = prompt.isEmpty ? 0 : prompt.components(separatedBy: "\n").count
-        let copyPreset = await dependencies.promptVM.currentCopyPreset()
-        let chatPreset = await dependencies.promptVM.currentChatPreset()
-        let resolved = await dependencies.promptVM.resolvePromptContext()
-        let effectiveTokens = await dependencies.promptVM.calculateTokensForChatContext()
-        let fullFilesTokens = await dependencies.promptVM.tokenCountingViewModel.totalTokenCountFilesOnly
+        let copyPreset = await promptVM.currentCopyPreset()
+        let chatPreset = await promptVM.currentChatPreset()
+        let resolved = await promptVM.resolvePromptContext()
+        let effectiveTokens = await promptVM.calculateTokensForChatContext()
+        let fullFilesTokens = await promptVM.tokenCountingViewModel.totalTokenCountFilesOnly
         let includesCodemaps = resolved.codeMapUsage != .none
         let includesGitDiff = resolved.gitInclusion != .none
         let hasStoredPrompts = resolved.storedPromptIds?.isEmpty == false
-        let codeMapFileCount = includesCodemaps ? await dependencies.promptVM.codeMapFileCount : nil
-        let codeMapTokens = includesCodemaps ? await dependencies.promptVM.codeMapTokenCount : nil
+        let codeMapFileCount = includesCodemaps ? await promptVM.codeMapFileCount : nil
+        let codeMapTokens = includesCodemaps ? await promptVM.codeMapTokenCount : nil
         let codeMapFiles: [String]? = try await {
             guard includesCodemaps else { return nil }
             let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
-            let roots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
-            let display = dependencies.promptVM.filePathDisplayOption
+            let roots = await dependencies.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+            let display = promptVM.filePathDisplayOption
             return collections.codemap.map { entry in
                 if display == .full {
                     return entry.file.fullPath
@@ -284,24 +293,27 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func exportPrompt(args: [String: Value], resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot, tabContext: MCPServerViewModel.TabScopedContext?) async throws -> Value {
+        guard let promptVM = await dependencies.promptVM() else {
+            throw MCPError.internalError("The original window UI is no longer available for prompt export; the request was not retargeted.")
+        }
         guard let rawPath = args["path"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines), !rawPath.isEmpty else {
             throw MCPError.invalidParams("path required for export")
         }
         let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
-        let activePreset = await MainActor.run { dependencies.promptVM.currentCopyPreset() }
+        let activePreset = await MainActor.run { promptVM.currentCopyPreset() }
         let effectivePreset = overridePreset ?? activePreset
-        let cfg = await MainActor.run { dependencies.promptVM.resolvePromptContext(effectivePreset, custom: dependencies.promptVM.workingCopyCustomizations) }
+        let cfg = await MainActor.run { promptVM.resolvePromptContext(effectivePreset, custom: promptVM.workingCopyCustomizations) }
         let text = if let tabContext {
-            await dependencies.buildTabClipboardContent(cfg, tabContext)
+            try await dependencies.buildTabClipboardContent(cfg, tabContext)
         } else {
-            await dependencies.promptVM.buildClipboard(for: cfg)
+            try await promptVM.buildClipboard(for: cfg)
         }
-        let pathDisplay = await MainActor.run { dependencies.promptVM.filePathDisplayOption }
-        let rootRefs = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .allLoaded)
+        let pathDisplay = await MainActor.run { promptVM.filePathDisplayOption }
+        let rootRefs = await dependencies.workspaceFileContextStore.rootRefs(scope: .allLoaded)
         let effectiveContext = tabContext.map { MCPServerViewModel.ResolvedTabContextSnapshot(snapshot: $0, usesActiveTabCompatibility: false) } ?? resolvedContext
         let files = try await dependencies.buildExportSelectedFileInfos(effectiveContext, cfg, tabContext?.selection, pathDisplay)
         let resolvedPath = try await dependencies.writePromptExportFile(rawPath, text)
-        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+        _ = await dependencies.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
             userPath: resolvedPath,
             fallbackScope: .allLoaded
         )

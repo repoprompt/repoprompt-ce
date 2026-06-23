@@ -418,7 +418,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: status, diff, log, show, blame")
         }
 
-        guard let workspaceManager = dependencies.workspaceManager else {
+        guard let workspaceManager = await dependencies.workspaceManager() else {
             throw MCPError.invalidParams("Workspace manager unavailable for git tool.")
         }
         guard let workspace = workspaceManager.activeWorkspace else {
@@ -432,7 +432,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
         // runs instead use the immutable selected-repository target carried by their tab snapshot.
         let metadata = await dependencies.captureRequestMetadata()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = await dependencies.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let requestContext = MCPGitRequestContext(rootRefs: visibleRoots, vcsService: vcsService)
         let allRepos = await requestContext.allRepos()
         let explicitTokens = parseExplicitRepoRoots(from: args).map { tokens in
@@ -461,7 +461,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
                 requestsArtifactPublication: requestsArtifactPublication,
                 operation: contextBuilderOperation,
                 allRepositories: allRepos,
-                store: dependencies.promptVM.workspaceFileContextStore
+                query: dependencies.workspaceSessionQuery
             )
         } catch let error as MCPContextBuilderGitReviewPolicyError {
             throw MCPError.invalidParams(error.localizedDescription)
@@ -585,12 +585,15 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
 
             try Task.checkCancellation()
             if let publicationFence = contextBuilderAdmission.publicationFence {
+                guard let workspaceSessionQuery = dependencies.workspaceSessionQuery else {
+                    throw MCPError.invalidParams("Git artifact publication requires the active Core workspace session.")
+                }
                 do {
                     try await contextBuilderPolicy.validatePublishedOutcomes(
                         publishedOutcomes,
                         publishedArtifactSetCount: publishedSets.count,
                         fence: publicationFence,
-                        store: dependencies.promptVM.workspaceFileContextStore
+                        query: workspaceSessionQuery
                     )
                 } catch let error as MCPContextBuilderGitReviewPolicyError {
                     stagedAdvertisementsByInvocation[advertisementInvocationID] = []
@@ -599,7 +602,7 @@ final class MCPGitToolProvider: MCPWindowToolProviding {
             }
 
             try Task.checkCancellation()
-            let ingress = await dependencies.promptVM.workspaceFileContextStore.ingressPublishedGitArtifacts(
+            let ingress = await dependencies.workspaceFileContextStore.ingressPublishedGitArtifacts(
                 WorkspacePublishedGitArtifactIngressRequest(
                     root: root,
                     artifacts: publishedSets.flatMap(\.orderedArtifacts)

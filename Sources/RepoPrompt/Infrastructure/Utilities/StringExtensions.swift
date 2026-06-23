@@ -5,8 +5,8 @@
 //  Created by Eric Provencher on 2024-07-25.
 //
 
-import Darwin
 import Foundation
+import RepoPromptCore
 
 public extension String {
     internal static func truncateModelName(_ text: String, maxLength: Int = 40) -> String {
@@ -33,11 +33,7 @@ public extension String {
     /// - For strings ≤ 64 chars: optimized Levenshtein with single row
     /// - For longer strings: Dice coefficient (linear time, allocation-free)
     internal func similarityFast(to other: String) -> Double {
-        withCString { aPtr in
-            other.withCString { bPtr in
-                repo_similarity_score(aPtr, bPtr)
-            }
-        }
+        StringRuntimeUtilities.similarityScore(self, other)
     }
 
     internal func isSimilar(to other: String, threshold: Double) -> Bool {
@@ -63,15 +59,7 @@ public extension String {
     }
 
     internal func longestCommonSubsequence(with other: String) -> String {
-        withCString { aPtr in
-            other.withCString { bPtr in
-                guard let cRes = repo_longest_common_subsequence(aPtr, bPtr) else {
-                    return ""
-                }
-                defer { free(cRes) }
-                return String(cString: cRes)
-            }
-        }
+        StringRuntimeUtilities.longestCommonSubsequence(self, other)
     }
 
     /*
@@ -84,21 +72,17 @@ public extension String {
     /// Public, full-distance call (preserves previous API surface).
     /// Falls back to the optimized core without a cap.
     internal func levenshteinDistance(to other: String) -> Int {
-        withCString { aPtr in
-            other.withCString { bPtr in
-                Int(repo_levenshtein_distance(aPtr, bPtr, -1))
-            }
-        }
+        StringRuntimeUtilities.levenshteinDistance(self, other)
     }
 
     /// Public capped-distance overload. Returns `maxAllowedDistance + 1` when the true
     /// edit distance is guaranteed to exceed the supplied cap (useful for fast threshold checks).
     internal func levenshteinDistance(to other: String, maxAllowedDistance: Int) -> Int {
-        withCString { aPtr in
-            other.withCString { bPtr in
-                Int(repo_levenshtein_distance(aPtr, bPtr, Int32(maxAllowedDistance)))
-            }
-        }
+        StringRuntimeUtilities.levenshteinDistance(
+            self,
+            other,
+            maxAllowedDistance: maxAllowedDistance
+        )
     }
 
     internal func splitIntoLines(usesSpaces: Bool, indentSize: Int) -> [String] {
@@ -110,27 +94,7 @@ public extension String {
     }
 
     static func splitContentPreservingLineEndings(_ content: String) -> ([String], String) {
-        content.withCString { contentPtr in
-            guard let result = repo_split_content_preserving_endings(contentPtr) else {
-                return ([], "\n")
-            }
-            defer { repo_free_split_result(result) }
-
-            // Convert C string array to Swift array
-            var lines: [String] = []
-            for i in 0 ..< result.pointee.line_count {
-                if let linePtr = result.pointee.lines.advanced(by: Int(i)).pointee {
-                    lines.append(String(cString: linePtr))
-                }
-            }
-
-            // Get detected ending
-            let detectedEnding = result.pointee.detected_ending != nil
-                ? String(cString: result.pointee.detected_ending)
-                : "\n"
-
-            return (lines, detectedEnding)
-        }
+        StringRuntimeUtilities.splitPreservingLineEndings(content)
     }
 
     static func encodeIndentationAsTabs(_ line: String) -> String {
@@ -267,26 +231,13 @@ public extension String {
     }
 
     static func encodeIndentationAsSpaces(_ line: String) -> String {
-        // Split leading whitespace and remainder
-        line.withCString { cLine in
-            guard let raw = repo_encode_indentation(cLine, CChar(115)) else {
-                return line
-            }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.encodeIndentationAsSpaces(line)
     }
 
     static func decodeIndentation(_ encodedLine: String) -> String {
         let parts = encodedLine.split(separator: ">", maxSplits: 1) // anchor placeholder
         _ = parts // silence unused-var warning
-        return encodedLine.withCString { cLine in
-            guard let raw = repo_decode_indentation(cLine) else {
-                return encodedLine
-            }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        return StringRuntimeUtilities.decodeIndentation(encodedLine)
     }
 
     static func decodeIndentationPreservingAllLineEndings(_ content: String) -> String {
@@ -299,13 +250,7 @@ public extension String {
     }
 
     static func trimCommonLeadingWhitespacePreservingLineEndings(_ content: String) -> String {
-        content.withCString { ptr in
-            guard let raw = repo_trim_common_leading_whitespace_preserving_endings(ptr) else {
-                return content
-            }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.trimCommonLeadingWhitespacePreservingLineEndings(content)
     }
 
     /// Extracts the indentation type and count from an encoded indentation string.
@@ -342,46 +287,7 @@ public extension String {
     }
 
     static func splitContentPreservingAllLineEndings(_ content: String) -> [(line: String, ending: String)] {
-        guard !content.isEmpty else { return [] }
-
-        var result: [(String, String)] = []
-        result.reserveCapacity(32)
-
-        let scalars = content.unicodeScalars
-        var lineStart = scalars.startIndex
-        var index = scalars.startIndex
-
-        while index < scalars.endIndex {
-            let scalar = scalars[index]
-
-            if scalar == "\r" {
-                let line = String(scalars[lineStart ..< index])
-                let next = scalars.index(after: index)
-                if next < scalars.endIndex, scalars[next] == "\n" {
-                    result.append((line, "\r\n"))
-                    index = scalars.index(after: next)
-                    lineStart = index
-                } else {
-                    result.append((line, "\r"))
-                    index = next
-                    lineStart = index
-                }
-            } else if scalar == "\n" {
-                let line = String(scalars[lineStart ..< index])
-                result.append((line, "\n"))
-                index = scalars.index(after: index)
-                lineStart = index
-            } else {
-                index = scalars.index(after: index)
-            }
-        }
-
-        if lineStart < scalars.endIndex {
-            let remainder = String(scalars[lineStart ..< scalars.endIndex])
-            result.append((remainder, ""))
-        }
-
-        return result
+        StringLineUtilities.splitPreservingAllLineEndings(content)
     }
 
     static func removeIndentationTag(_ encodedLine: String) -> String {
@@ -461,19 +367,11 @@ public extension String {
     }
 
     internal func escapedString() -> String {
-        withCString { ptr in
-            guard let raw = repo_escape_string(ptr) else { return self }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.escape(self)
     }
 
     internal func unescaped() -> String {
-        withCString { ptr in
-            guard let raw = repo_unescape_string(ptr) else { return self }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.unescape(self)
     }
 
     /// Static regex for indentation level extraction
@@ -823,11 +721,7 @@ public extension String {
 
     /// Decodes common HTML entities like <, >, &, etc.
     internal func decodingHTMLEntities() -> String {
-        withCString { ptr in
-            guard let raw = repo_decode_html_entities(ptr) else { return self }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.decodeHTMLEntities(self)
     }
 
     internal func oldDecodingHTMLEntities() -> String {
@@ -894,11 +788,7 @@ public extension String {
 
     @inline(__always)
     internal func diceCoefficientFast(_ a: String, _ b: String) -> Double {
-        a.withCString { aPtr in
-            b.withCString { bPtr in
-                repo_dice_coefficient(aPtr, bPtr)
-            }
-        }
+        StringRuntimeUtilities.diceCoefficient(a, b)
     }
 
     /// Returns a copy where every *run* of space / tab / line-break / NBSP
@@ -908,63 +798,39 @@ public extension String {
     /// `NSRegularExpression` – it's a straightforward linear scan.
     @inline(__always)
     internal func condensingWhitespace() -> String {
-        withCString { ptr in
-            guard let raw = repo_condense_whitespace(ptr) else { return self }
-            defer { free(raw) }
-            return String(cString: raw)
-        }
+        StringRuntimeUtilities.condenseWhitespace(self)
     }
 
     /// 64‑bit FNV‑1a (mirrors the helper in DiffGenerationUtility)
     @inline(__always)
     internal func fnv1a64() -> UInt64 {
-        withCString { ptr in
-            repo_fnv1a64(ptr)
-        }
+        StringRuntimeUtilities.fnv1a64(self)
     }
 
     /// Fuzzy space matching - spaces in pattern match any amount of whitespace in text
     @inline(__always)
     internal func fuzzySpaceMatch(_ text: String, caseInsensitive: Bool = false) -> Bool {
-        withCString { patternPtr in
-            text.withCString { textPtr in
-                repo_fuzzy_space_match(patternPtr, textPtr, caseInsensitive ? 1 : 0) != 0
-            }
-        }
+        StringRuntimeUtilities.fuzzySpaceMatch(
+            pattern: self,
+            text: text,
+            caseInsensitive: caseInsensitive
+        )
     }
 
     /// Generates a canonical key for string comparison
     @inline(__always)
     internal static func canonicalKey(_ raw: String) -> String? {
-        raw.withCString { ptr in
-            guard let result = repo_canonical_key(ptr) else { return nil }
-            defer { free(result) }
-            return String(cString: result)
-        }
+        StringRuntimeUtilities.canonicalKey(raw)
     }
 
     /// Finds the best dice coefficient match among candidates
     @inline(__always)
     internal static func bulkDiceBestMatch(pattern: String, candidates: [String], threshold: Double) -> (index: Int, score: Double)? {
-        guard !candidates.isEmpty else { return nil }
-
-        // For now, use a simple approach that keeps strings alive
-        var bestIdx = -1
-        var bestScore = 0.0
-
-        pattern.withCString { patternPtr in
-            for (idx, candidate) in candidates.enumerated() {
-                candidate.withCString { candidatePtr in
-                    let score = repo_dice_coefficient(patternPtr, candidatePtr)
-                    if score >= threshold, score > bestScore {
-                        bestScore = score
-                        bestIdx = idx
-                    }
-                }
-            }
-        }
-
-        return bestIdx >= 0 ? (bestIdx, bestScore) : nil
+        StringRuntimeUtilities.bulkDiceBestMatch(
+            pattern: pattern,
+            candidates: candidates,
+            threshold: threshold
+        )
     }
 
     // MARK: - Encoded indentation sanitizer

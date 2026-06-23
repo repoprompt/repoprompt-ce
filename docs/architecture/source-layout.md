@@ -1,13 +1,18 @@
 # Source Layout Ownership Map
 
-Current as of 2026-05-30 after the source-layout refactor, Context Builder discovery cleanup, provider extraction, post-native-tree cleanup guardrail pass, provider-neutral workflow prompt catalog cleanup, and upstream Tree-sitter grammar migration. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong.
+Current as of 2026-06-21 after Core-isolation Phase 3. This document is contributor-facing: use it to decide where new source, tests, fixtures, diagnostics, shared protocol code, and guardrail checks belong. Phases 2–3 established neutral Core contracts and concrete platform adapters while deliberately retaining product orchestration in `RepoPrompt` until its owning later phase.
 
 ## Current source tree shape
 
 ```text
 Sources/
+  RepoPromptCore/                 # neutral Core models, contracts, and Phase 2–3 behavior
+  RepoPromptCoreMacOS/            # macOS watcher, filesystem, content, process, security, and signing adapters
+  RepoPromptPOSIXSupport/          # narrow descriptor/socket/POSIX helpers shared by app and CLI targets
+  RepoPromptSyntaxCBridge/         # canonical Tree-sitter declaration/link boundary; no upstream implementation
+  RepoPromptHeadless/              # standalone direct-stdio v1 runtime; no app/proxy authority
   RepoPrompt/
-    Support/                     # Obj-C bridging header / bridging-header-sensitive support path used by Package.swift
+    Support/                     # bridging-header-free app support that must remain source-layout sensitive
     App/                         # lifecycle, launch/configuration, commands, composition wiring, app notifications, root app views/view models
       Notifications/
       Sparkle/
@@ -50,7 +55,12 @@ Sources/
   CSwiftPCRE2/                   # C PCRE2 target
   TreeSitterScannerSupport/      # narrow exact-snapshot JavaScript/Python scanner ABI fallback
 Tests/
-  RepoPromptTests/               # XCTest tests, support, and fixtures
+  RepoPromptTests/               # app/root integration XCTest tests, support, and fixtures
+  RepoPromptCoreTests/           # neutral Core contract tests and authoritative Core list lane
+  RepoPromptCoreMacOSTests/      # direct macOS adapter contract tests and authoritative CoreMacOS list lane
+  RepoPromptPOSIXSupportTests/   # direct POSIX helper contract tests and authoritative POSIX list lane
+  RepoPromptSyntaxCBridgeTests/  # reserved; declare only with the first meaningful syntax-bridge contract test
+  RepoPromptHeadlessTests/       # active standalone transport/security/tool/package contracts
 ```
 
 The legacy top-level layer buckets under `Sources/RepoPrompt` have been pruned and must not be recreated:
@@ -75,9 +85,14 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 
 ## Placement rules for new files
 
+- `Sources/RepoPromptCore` accepts only neutral declarations and behavior owned by an explicit Core-isolation migration phase. It must not import app, UI, Security, Darwin, CoreServices, OSLog, or `os` modules.
+- `Sources/RepoPromptCoreMacOS` owns concrete macOS filesystem/watcher/content-decoding/process/security/signing adapters. App path selection, UserDefaults, approvals, product policy, root lifetime, event ingress/coalescing, Combine publication, and diagnostics presentation stay in `RepoPrompt` until their explicit later phase.
+- `Sources/RepoPromptPOSIXSupport` is limited to narrowly prefixed descriptor/socket/system helpers. Every new CE-defined externally visible C symbol uses the reserved `rpce_` prefix.
+- `Sources/RepoPromptSyntaxCBridge` owns Tree-sitter declarations/linkage without reimplementing or renaming upstream `tree_sitter_*` symbols.
+- `Sources/RepoPromptHeadless` owns the Phase 8 standalone direct-NDJSON runtime, isolated v1 state/root/secret policy, and exact safe tool profile. It must not import or instantiate app/`RepoPromptMCP`, window routing, Phase 5/7 runtime authority, app sockets/state/defaults, or app packaging.
 - New product-flow code goes under `Sources/RepoPrompt/Features/<FeatureName>`.
 - New app lifecycle, launch/configuration, command, root view/view-model, notification-name, and composition-root wiring goes under `Sources/RepoPrompt/App`.
-- Keep bridging-header-sensitive support under `Sources/RepoPrompt/Support` unless `Package.swift` is updated in the same change.
+- Keep app support that is sensitive to target layout under `Sources/RepoPrompt/Support`. The retired `RepoPrompt-Bridging-Header.h` and `-import-objc-header` package flags must not be restored; import `RepoPromptSyntaxCBridge`, `RepoPromptPOSIXSupport`, or `RepoPromptC` explicitly.
 - New cross-cutting service/platform code goes under `Sources/RepoPrompt/Infrastructure/<Area>`.
 - Provider-neutral workflow prompt catalog metadata and renderers go under `Sources/RepoPrompt/Infrastructure/AI/Prompts/Workflows/`; do not add new workflow prompts under provider-specific command names or bundled `AppResources/Services/AI/Prompts` mirrors.
 - New reusable SwiftUI components, text/markdown helpers, and UI services should prefer a narrow feature owner first; otherwise use `Sources/RepoPrompt/Infrastructure/UI/<Area>`.
@@ -86,8 +101,8 @@ The old IDE-era Prompt selected-files panel is also removed. Do not add back `Pr
 - New app/CLI protocol definitions shared by both executables go under `Sources/RepoPromptShared`.
 - MCP filesystem/product/build-flavor identity and external-client event wire DTOs are single-sourced under `Sources/RepoPromptShared/MCP`; app/helper targets may keep only local compile-flavor selection and app-only presentation behavior.
 - New app-local MCP/socket/routing helpers go under `Sources/RepoPrompt/Infrastructure/MCP`, not `Sources/RepoPrompt/Shared`.
-- New CLI-only implementation code goes under `Sources/RepoPromptMCP`.
-- New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under `Tests/RepoPromptTests`, not the app target.
+- App-proxy CLI implementation remains under `Sources/RepoPromptMCP`; headless-only implementation belongs under `Sources/RepoPromptHeadless`. The two executables keep separate transport and packaging identities.
+- New test doubles, fixtures, parser inputs, sample projects, benchmark-only fixture data, and XCTest-only helpers go under the owning declared test target. App/root integration support remains under `Tests/RepoPromptTests`, not the app target. Dedicated isolated test roots and list lanes are declared only with a meaningful executable contract test.
 - Do not create directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Do not put parser fixtures or sample parser inputs under `Sources/RepoPrompt/Infrastructure/SyntaxParsing`; keep only production parser/query code there.
 - Keep `App/WindowState.swift` in `App` until there is a separate composition-root refactor; physical moves must preserve initialization order.
@@ -117,7 +132,7 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 ### Tree-sitter scanner linker compatibility target
 
 - `Sources/TreeSitterScannerSupport` is an internal C linker compatibility target, not a restored local grammar target. It contains byte-for-byte exact-snapshot copies of the upstream JavaScript and Python `scanner.c` implementations plus their required `tree_sitter` helper headers. It does not contain parser copies, grammar definitions, queries, or CE-authored scanner code.
-- Clean coordinated SwiftPM root graphs compile the exact-pinned upstream JavaScript and Python parser objects but omit their scanner objects, leaving unresolved external-scanner ABI symbols. `TreeSitterScannerSupport` supplies only those missing symbols while CE continues linking the upstream package products.
+- Clean coordinated SwiftPM root graphs compile the exact-pinned upstream JavaScript and Python parser objects but omit their scanner objects, leaving unresolved external-scanner ABI symbols. `TreeSitterScannerSupport` supplies only those missing symbols while `RepoPromptSyntaxCBridge` links the upstream package products and owns their declarations.
 - The tracked checksum manifest at [`ThirdPartyLicenses/tree-sitter/scanner-support.sha256`](../../ThirdPartyLicenses/tree-sitter/scanner-support.sha256) protects the copied snapshots from drift. Do not expand this target, restore the seven retired local grammar directories, or replace the target with transient `.build/checkouts` mutation. Remove the target, guardrails, checksums, and this exception together only after validated upstream revisions or SwiftPM behavior compile the scanners directly from the dependency products in a clean graph.
 
 No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide notification-name extensions now live under `Sources/RepoPrompt/App/Notifications`.
@@ -142,6 +157,8 @@ make guardrails
 
 The guardrail script verifies:
 
+- the phased target graph follows its allowed dependency direction, neutral Core has no forbidden platform imports, the syntax bridge is the single declaration owner without duplicate upstream definitions, new CE C symbols use `rpce_`, and app/headless source and packaging identities remain separate;
+- migrated Phase 2–3 declarations have one canonical owner while deferred app orchestration remains in place;
 - old top-level layer buckets are absent or contain no files;
 - no `Tests`, `TestSupport`, or `Fixtures` directories exist under `Sources/RepoPrompt`;
 - `MCPControlMessages.swift` and `MCPFilesystemIdentity.swift` exist only under `Sources/RepoPromptShared/MCP`, and the `MCPExternalClientEvent` wire DTO is declared only there;
@@ -173,9 +190,24 @@ Run the smallest focused validation that covers your change, then broaden as nee
 ```bash
 make dev-swift-build PRODUCT=RepoPrompt
 make dev-swift-build PRODUCT=repoprompt-mcp
+make dev-swift-build PRODUCT=repoprompt-headless
+make dev-swift-build TARGET=RepoPromptCore
+make dev-swift-build TARGET=RepoPromptCoreMacOS
+make dev-swift-build TARGET=RepoPromptPOSIXSupport
+make dev-swift-build TARGET=RepoPromptSyntaxCBridge
+make dev-swift-build TARGET=RepoPromptHeadless
+make dev-core-test
+make dev-core-test-list
+make dev-core-macos-test
+make dev-core-macos-test-list
+make dev-posix-test
+make dev-posix-test-list
+make dev-headless-test
+make dev-headless-test-list
+make dev-headless-package HEADLESS_CONFIGURATION=debug
+make dev-headless-smoke HEADLESS_CONFIGURATION=debug SKIP_PACKAGE=1
 make dev-test FILTER=CodexIntegrationConfigurationTests
 make dev-test FILTER=WorkspaceFileContextStoreTests
-make dev-test
 make guardrails
 make doctor
 make dev-build

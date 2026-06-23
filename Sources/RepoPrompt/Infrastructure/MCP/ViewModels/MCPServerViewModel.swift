@@ -12,6 +12,7 @@ import JSONSchema
 import Logging
 import MCP
 import Ontology
+import RepoPromptCore
 import RepoPromptShared
 
 enum ReadFileAutoSelectionCoverageCertificateMissReason: String, CaseIterable, Hashable {
@@ -368,6 +369,7 @@ final class MCPServerViewModel: ObservableObject {
 
     // ---------------------------------------------------------------------
     let windowID: Int
+    let runtimeID: WorkspaceRuntimeID
     private(set) var service: MCPService
     private let logger = Logger(label: "com.repoprompt.mcp")
 
@@ -402,6 +404,10 @@ final class MCPServerViewModel: ObservableObject {
 
         func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
             try await agentRunToolService.execute(args: args)
+        }
+
+        func executeAgentManageForTesting(args: [String: Value]) async throws -> Value {
+            try await agentManageToolService.execute(args: args)
         }
 
         func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
@@ -996,6 +1002,9 @@ final class MCPServerViewModel: ObservableObject {
         }
     }
 
+    private var runtimePublicationReady: Bool
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
+
     /// Controls whether the approval overlay is visible
     @Published var isApprovalOverlayVisible: Bool = false
 
@@ -1008,7 +1017,14 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else {
                 throw MCPError.internalError("Window deallocated during \(name)")
             }
-            return try await implementation(MCPWindowToolContext(toolName: name, windowID: windowID), args)
+            return try await implementation(
+                MCPWindowToolContext(
+                    toolName: name,
+                    windowID: windowID,
+                    runtimeRequest: ServerNetworkManager.currentRuntimeRequestContext
+                ),
+                args
+            )
         }
     }
 
@@ -1185,9 +1201,11 @@ final class MCPServerViewModel: ObservableObject {
             )
         },
         windowID: windowID,
-        promptVM: promptVM,
-        workspaceManager: workspaceManager,
-        selectionCoordinator: selectionCoordinator,
+        promptVM: { [weak promptVM] in promptVM },
+        workspaceManager: { [weak workspaceManager] in workspaceManager },
+        selectionCoordinator: { [weak selectionCoordinator] in selectionCoordinator },
+        workspaceFileContextStore: promptVM.workspaceFileContextStore,
+        workspaceSessionQuery: workspaceSessionQuery,
         applyEditsApprovalStore: applyEditsApprovalStore,
         captureRequestMetadata: { [weak self] in
             guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
@@ -1396,9 +1414,14 @@ final class MCPServerViewModel: ObservableObject {
             }
             return await computeSelectionSlicesVirtual(base: base, entries: entries, mode: mode, lookupRootScope: lookupRootScope)
         },
-        persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated in
+        persistResolvedTabContextSnapshot: { [weak self] resolvedContext, metadata, mutated, expectedCurrentSelection in
             guard let self else { return nil }
-            return await persistResolvedTabContextSnapshot(resolvedContext, metadata: metadata, mutated: mutated)
+            return await persistResolvedTabContextSnapshot(
+                resolvedContext,
+                metadata: metadata,
+                mutated: mutated,
+                expectedCurrentSelection: expectedCurrentSelection
+            )
         },
         makeSelectionHintError: { [weak self] paths, operation, lookupContext in
             guard let self else { return "Window deallocated while resolving selection inputs." }
@@ -1512,8 +1535,8 @@ final class MCPServerViewModel: ObservableObject {
             return try await buildExportSelectedFileInfos(resolvedContext: resolvedContext, cfg: cfg, selectionOverride: selectionOverride, display: display)
         },
         buildTabClipboardContent: { [weak self] cfg, context in
-            guard let self else { return "" }
-            return await buildTabClipboardContent(cfg: cfg, context: context)
+            guard let self else { throw MCPError.internalError("Window deallocated while building prompt context") }
+            return try await buildTabClipboardContent(cfg: cfg, context: context)
         },
         writePromptExportFile: { [weak self] path, content in
             guard let self else { throw MCPError.internalError("Window deallocated while exporting prompt") }
@@ -1529,6 +1552,7 @@ final class MCPServerViewModel: ObservableObject {
     @MainActor
     private lazy var windowToolCatalogService = MCPWindowToolCatalogService(
         windowID: windowID,
+        runtimeID: runtimeID,
         providers: [
             MCPSelectionToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
             MCPFileToolProvider(runtime: windowToolRuntime, dependencies: windowToolDependencies),
@@ -1625,6 +1649,10 @@ final class MCPServerViewModel: ObservableObject {
     var windowIDByConnection: [UUID: Int] = [:]
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
+    #if DEBUG
+        @MainActor
+        var tabContextMirrorSnapshotHandledForTesting: ((UUID) -> Void)?
+    #endif
     @MainActor
     var lastContextByClientAndWindow: [String: [Int: TabScopedContext]] = [:]
     /// Temporary legacy routing switch. Diagnostics/tests can disable active-tab
@@ -1695,6 +1723,7 @@ final class MCPServerViewModel: ObservableObject {
         let runID: UUID?
         let connectionID: UUID?
         let toolName: String
+        let lifetimeClass: MCPToolLifetimeClass
         let lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let startedAt: Date
         let cancel: () -> Void
@@ -1838,6 +1867,7 @@ final class MCPServerViewModel: ObservableObject {
         runID: UUID?,
         connectionID: UUID?,
         toolName: String,
+        lifetimeClass: MCPToolLifetimeClass = .uiRequired,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = nil,
         cancel: @escaping () -> Void
     ) {
@@ -1846,6 +1876,7 @@ final class MCPServerViewModel: ObservableObject {
             runID: runID,
             connectionID: connectionID,
             toolName: toolName,
+            lifetimeClass: lifetimeClass,
             lifecycleCorrelation: lifecycleCorrelation,
             startedAt: Date(),
             cancel: cancel
@@ -2352,6 +2383,9 @@ final class MCPServerViewModel: ObservableObject {
         workspaceManager: WorkspaceManagerViewModel,
         selectionCoordinator: WorkspaceSelectionCoordinator? = nil,
         windowID: Int,
+        runtimeID: WorkspaceRuntimeID = WorkspaceRuntimeID(),
+        runtimePublicationInitiallyReady: Bool = true,
+        workspaceSessionQuery: WorkspaceSessionQueryCapability? = nil,
         workspaceSearch: @escaping WorkspaceSearchHandler,
         ensureGitDataRootLoaded: @escaping (
             WorkspaceModel,
@@ -2361,6 +2395,12 @@ final class MCPServerViewModel: ObservableObject {
     ) {
         self.service = service
         self.windowID = windowID
+        self.runtimeID = runtimeID
+        runtimePublicationReady = runtimePublicationInitiallyReady
+        self.workspaceSessionQuery = workspaceSessionQuery
+            ?? WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(
+                store: promptVM.workspaceFileContextStore
+            )
         self.promptVM = promptVM
         self.oracleVM = oracleVM
         self.workspaceManager = workspaceManager
@@ -2584,7 +2624,7 @@ final class MCPServerViewModel: ObservableObject {
             #endif
         }
 
-        if windowToolsEnabled {
+        if windowToolsEnabled, runtimePublicationReady {
             ServiceRegistry.register(windowToolCatalogService) // idempotent
             do {
                 try await service.join(windowID: windowID)
@@ -2596,6 +2636,23 @@ final class MCPServerViewModel: ObservableObject {
             ServiceRegistry.unregister(windowToolCatalogService)
             await service.leave(windowID: windowID)
             await service.refreshState()
+        }
+    }
+
+    @MainActor
+    func markRuntimePublicationReady(ticket: MCPRuntimeAdapterTicket) async {
+        guard ticket.windowID == windowID, ticket.runtimeID == runtimeID else { return }
+        windowToolCatalogService.publish(mappingGeneration: ticket.mappingGeneration)
+        runtimePublicationReady = true
+        await updateToolRegistration(invalidateCatalogBeforeUpdate: false)
+    }
+
+    @MainActor
+    func beginRuntimeClose() {
+        runtimePublicationReady = false
+        ServiceRegistry.unregister(windowToolCatalogService)
+        for execution in activeToolExecutionsByID.values where execution.lifetimeClass == .uiRequired {
+            execution.cancel()
         }
     }
 
@@ -2929,10 +2986,15 @@ final class MCPServerViewModel: ObservableObject {
         let capturedConnectionID = metadata.connectionID
         let serverViewModelIdentity = ObjectIdentifier(self)
         let dispatchAuthorization = ServerNetworkManager.currentToolDispatchAuthorization
-        if let dispatchAuthorization {
+        let runtimeLifetimeClass = ServerNetworkManager.currentRuntimeRequestContext?.lifetimeClass
+            ?? .uiRequired
+        let requiresLiveUIIdentity = ServerNetworkManager.currentRuntimeRequestContext?
+            .lifetimeClass != .runtimeCapable
+        if requiresLiveUIIdentity, let dispatchAuthorization {
             guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
                 dispatchAuthorization,
                 expectedWindowID: windowID,
+                expectedRuntimeID: runtimeID,
                 expectedServerViewModelIdentity: serverViewModelIdentity
             ) else {
                 throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
@@ -2969,10 +3031,11 @@ final class MCPServerViewModel: ObservableObject {
         let task = Task {
             await startGate.wait()
             try Task.checkCancellation()
-            if let dispatchAuthorization {
+            if requiresLiveUIIdentity, let dispatchAuthorization {
                 guard await ServerNetworkManager.shared.validateToolDispatchAuthorization(
                     dispatchAuthorization,
                     expectedWindowID: windowID,
+                    expectedRuntimeID: runtimeID,
                     expectedServerViewModelIdentity: serverViewModelIdentity
                 ) else {
                     throw ServerNetworkManager.ToolDispatchAdmissionError.windowTerminal
@@ -3027,15 +3090,18 @@ final class MCPServerViewModel: ObservableObject {
                 runID: indexedRunID,
                 connectionID: capturedConnectionID,
                 toolName: name,
+                lifetimeClass: runtimeLifetimeClass,
                 lifecycleCorrelation: lifecycleCorrelation,
                 cancel: { task.cancel() }
             )
         }
 
-        if let dispatchAuthorization,
+        if requiresLiveUIIdentity,
+           let dispatchAuthorization,
            await !(ServerNetworkManager.shared.validateToolDispatchAuthorization(
                dispatchAuthorization,
                expectedWindowID: windowID,
+               expectedRuntimeID: runtimeID,
                expectedServerViewModelIdentity: serverViewModelIdentity
            ))
         {
@@ -3449,11 +3515,15 @@ final class MCPServerViewModel: ObservableObject {
                     throw MCPError.invalidParams("context_builder could not resolve the invoking Agent Mode workspace.")
                 }
                 do {
+                    guard let sessionQuery = targetWindow.mcpServer.workspaceSessionQuery else {
+                        throw MCPError.invalidParams("context_builder requires the active Core workspace session.")
+                    }
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
                         workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
-                        store: targetWindow.promptManager.workspaceFileContextStore
+                        store: targetWindow.promptManager.workspaceFileContextStore,
+                        sessionQuery: sessionQuery
                     )
                 } catch {
                     throw MCPError.invalidParams(error.localizedDescription)
@@ -5127,7 +5197,31 @@ final class MCPServerViewModel: ObservableObject {
             return nil
         }
 
+        let identity = WorkspaceSelectionIdentity(
+            workspaceID: capability.workspaceID,
+            tabID: context.tabID
+        )
+        let grantSnapshot: MCPGitArtifactAdvertisementSnapshot
+        switch gitArtifactAdvertisementRegistry.lookup(
+            exactAlias: displayPath,
+            identity: identity,
+            capability: capability
+        ) {
+        case let .granted(artifact, snapshot)
+            where artifact.absolutePath == entry.file.standardizedFullPath:
+            grantSnapshot = snapshot
+        case .granted, .rejected:
+            throw MCPError.invalidParams(
+                "Cannot read '\(requestedPath)'. Git-data artifacts must already be selected and authorized."
+            )
+        }
+
         let preparedContent = await WorkspaceInteractiveReadProcessor.prepareOffActor(content)
+        guard gitArtifactAdvertisementRegistry.isCurrent(grantSnapshot) else {
+            throw MCPError.invalidParams(
+                "Cannot read '\(requestedPath)'. Git-data artifacts must already be selected and authorized."
+            )
+        }
         do {
             let preparedReply = try await MCPReadFileToolProjection.makeBaseReply(
                 preparedContent: preparedContent,

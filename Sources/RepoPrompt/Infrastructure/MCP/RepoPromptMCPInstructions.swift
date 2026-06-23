@@ -43,6 +43,8 @@ enum RepoPromptMCPInstructions {
 
         \(alsoAvailable)
 
+        SESSION NAMING: Use set_status whenever the user explicitly asks to name, rename, or retitle the current Agent Mode session. Do not claim that the title changed unless set_status returns success.
+
         CONTEXT BUILDING: context_builder is a heavy sub-agent that autonomously explores the codebase to build deep, curated context for a task. Ideal for going from task description to full implementation plan (response_type="plan"), code review ("review"), or deep Q&A ("question"). Its context is stateful — optionally continue with oracle calls using the returned chat_id.
 
         CONTEXT WORKFLOW: manage_selection curates the file context used by oracle and workspace_context tools — update it before oracle calls. Use add/remove for incremental changes; use set mode=full only for complete replacement; set mode=slices only replaces slices for specified files. Continue chats by passing the returned chat_id to ask_oracle.

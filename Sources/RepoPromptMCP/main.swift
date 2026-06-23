@@ -2,6 +2,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 import ServiceLifecycle
 import SystemPackage
@@ -2132,8 +2133,8 @@ private func parseToolTimeoutSeconds(_ raw: String) -> Double? {
 }
 
 /// Parses command line arguments to determine CLI mode
-func parseCLIMode() -> CLIMode {
-    let args = CommandLine.arguments.dropFirst() // Skip executable name
+func parseCLIMode(arguments: [String] = Array(CommandLine.arguments.dropFirst())) -> CLIMode {
+    let args = arguments
     let hasUserArgs = !args.isEmpty
     var interactiveOptions = InteractiveOptions()
     var execOptions = ExecOptions()
@@ -2344,12 +2345,14 @@ func parseCLIMode() -> CLIMode {
         case "--tab", "-t":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.initialTabID = args[i]
                 execOptions.tabID = args[i]
             }
 
         case "--context-id":
             i = args.index(after: i)
             if i < args.endIndex {
+                interactiveOptions.initialContextID = args[i]
                 execOptions.contextID = args[i]
             }
 

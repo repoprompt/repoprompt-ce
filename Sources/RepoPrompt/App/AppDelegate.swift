@@ -159,10 +159,14 @@ class AppDelegate: NSObject, ObservableObject, NSApplicationDelegate {
             }
 
             // 3) Shut down agent processes and MCP tools on the main actor WITHOUT blocking.
+            for window in WindowStatesManager.shared.allWindows {
+                window.beginClose()
+            }
             // Kill Claude CLI and Codex app-server processes BEFORE stopping MCP servers,
             // so child processes are terminated and reaped rather than orphaned on quit.
             await WindowStatesManager.shared.shutdownAllAgentSessions()
             await WindowStatesManager.shared.stopAllServers()
+            await RepoPromptAppCoreContainer.shared.shutdownForAppTermination()
             sender.reply(toApplicationShouldTerminate: true)
         }
 

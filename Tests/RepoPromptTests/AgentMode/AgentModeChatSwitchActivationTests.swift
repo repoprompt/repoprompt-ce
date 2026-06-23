@@ -194,8 +194,8 @@ final class AgentModeChatSwitchActivationTests: XCTestCase {
             let workspaceIndex = try XCTUnwrap(
                 window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id })
             )
-            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [tabA, tabB]
-            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabAID
+            window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].composeTabs = [tabA, tabB] }
+            window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = tabAID }
             window.promptManager.loadComposeTabsFromWorkspace(
                 window.workspaceManager.workspaces[workspaceIndex],
                 syncPromptText: true

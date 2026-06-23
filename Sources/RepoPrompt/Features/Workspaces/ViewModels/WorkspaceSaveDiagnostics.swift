@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 struct WorkspaceSaveSource: Equatable, Hashable, ExpressibleByStringLiteral, CustomStringConvertible {
     let rawValue: String
@@ -59,10 +60,7 @@ struct WorkspaceSaveOwner: Equatable, Hashable {
     static let none = WorkspaceSaveOwner(windowID: nil, managerID: nil)
 }
 
-struct WorkspaceTabSelectionKey: Hashable {
-    let workspaceID: UUID
-    let tabID: UUID
-}
+typealias WorkspaceTabSelectionKey = RepoPromptCore.WorkspaceTabSelectionKey
 
 struct WorkspaceSaveSelectionSummary: Equatable {
     let tabID: UUID?

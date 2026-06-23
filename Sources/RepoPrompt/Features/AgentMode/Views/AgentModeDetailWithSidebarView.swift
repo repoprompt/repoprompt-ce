@@ -1,5 +1,19 @@
 import SwiftUI
 
+@MainActor
+enum AgentModeRuntimeMetricsSelectionResolver {
+    static func selection(
+        for tabID: UUID?,
+        selectionCoordinator: WorkspaceSelectionCoordinator
+    ) -> StoredSelection? {
+        guard let tabID else { return nil }
+        return selectionCoordinator.selectionSnapshot(
+            for: tabID,
+            flushPendingUIIfActive: false
+        )?.selection
+    }
+}
+
 struct AgentModeDetailWithSidebarView: View {
     let agentModeVM: AgentModeViewModel
     let runtimeVM: AgentRuntimeSidebarViewModel
@@ -242,13 +256,14 @@ struct AgentModeDetailWithSidebarView: View {
     }
 
     private func syncRuntimeMetricsSelectionCount() {
-        guard let targetTabID = runtimeMetricsTargetTabID,
-              let snapshot = selectionCoordinator.selectionSnapshot(for: targetTabID, flushPendingUIIfActive: true)
-        else {
+        guard let selection = AgentModeRuntimeMetricsSelectionResolver.selection(
+            for: runtimeMetricsTargetTabID,
+            selectionCoordinator: selectionCoordinator
+        ) else {
             agentModeVM.syncRuntimeMetricsUIState(liveSelectedFileCount: nil)
             return
         }
-        syncRuntimeMetricsSelectionCount(selection: snapshot.selection)
+        syncRuntimeMetricsSelectionCount(selection: selection)
     }
 
     private func syncRuntimeMetricsSelectionCountFromActiveUIIfCurrent() {

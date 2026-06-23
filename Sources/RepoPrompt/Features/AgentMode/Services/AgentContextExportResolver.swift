@@ -149,6 +149,7 @@ struct AgentContextClipboardRequest {
     let source: AgentContextExportSource
     let store: WorkspaceFileContextStore
     let lookupContext: WorkspaceLookupContext
+    let factualProvider: (any PromptFactualContextProviding)?
     let filePathDisplay: FilePathDisplay
     let onlyIncludeRootsWithSelectedFiles: Bool
     let showCodeMapMarkers: Bool
@@ -235,7 +236,7 @@ enum AgentContextExportResolver {
         )
     }
 
-    static func buildClipboardContent(_ request: AgentContextClipboardRequest) async -> String {
+    static func buildClipboardContent(_ request: AgentContextClipboardRequest) async throws -> String {
         let cfg = request.cfg
         let coordinator = AutomaticReviewGitDiffCoordinator()
         let preAssembly = await PromptContextPreAssemblyService.resolve(
@@ -244,6 +245,7 @@ enum AgentContextExportResolver {
                 selection: request.source.selection,
                 store: request.store,
                 lookupContext: request.lookupContext,
+                factualProvider: request.factualProvider,
                 filePathDisplay: request.filePathDisplay,
                 onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
                 showCodeMapMarkers: request.showCodeMapMarkers,
@@ -260,24 +262,23 @@ enum AgentContextExportResolver {
             )
         )
 
-        return await PromptPackagingService.generateClipboardContent(
+        let resolved: PromptContextPreAssemblyResult = switch preAssembly {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
+        }
+        return PromptPackagingService.generateClipboardContent(
             metaInstructions: request.metaInstructions,
             userInstructions: cfg.includeUserPrompt ? request.source.promptText : "",
-            files: preAssembly.entries,
-            fileTreeContent: preAssembly.fileTreeContent,
-            gitDiff: preAssembly.gitDiff,
+            factualSections: resolved.rendered,
+            gitDiff: resolved.gitDiff,
             includeSavedPrompts: !request.metaInstructions.isEmpty,
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
-            filePathDisplay: request.filePathDisplay,
-            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
             promptSectionsOrder: request.promptSectionsOrder,
             disabledPromptSections: request.disabledPromptSections,
-            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop,
-            displayPathResolver: { entry in
-                preAssembly.displayPath(for: entry)
-            }
+            duplicateUserInstructionsAtTop: request.duplicateUserInstructionsAtTop
         )
     }
 

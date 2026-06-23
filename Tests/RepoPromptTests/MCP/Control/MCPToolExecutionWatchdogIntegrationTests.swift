@@ -2,6 +2,7 @@ import Foundation
 import JSONSchema
 import MCP
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import RepoPromptShared
 import XCTest
 
@@ -1901,6 +1902,8 @@ import XCTest
 
     private final class MCPWindowIDEffectiveArgumentsService: WindowScopedService {
         let windowID: Int
+        let runtimeID = WorkspaceRuntimeID()
+        let mappingGeneration: UInt64 = 1
 
         init(windowID: Int) {
             self.windowID = windowID

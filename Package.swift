@@ -1,15 +1,13 @@
 // swift-tools-version: 6.2
-import Foundation
 import PackageDescription
-
-let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
 let package = Package(
     name: "RepoPromptCE",
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "RepoPrompt", targets: ["RepoPrompt"]),
-        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"])
+        .executable(name: "repoprompt-mcp", targets: ["RepoPromptMCP"]),
+        .executable(name: "repoprompt-headless", targets: ["RepoPromptHeadless"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-log.git", exact: "1.6.3"),
@@ -43,19 +41,10 @@ let package = Package(
         .package(path: "Packages/RepoPromptAgentProviders")
     ],
     targets: [
-        .executableTarget(
-            name: "RepoPrompt",
+        .target(
+            name: "RepoPromptSyntaxCBridge",
             dependencies: [
-                "RepoPromptShared",
-                "RepoPromptC", "CSwiftPCRE2", "TreeSitterScannerSupport",
-                "Sparkle",
-                .product(name: "Logging", package: "swift-log"),
-                .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
-                .product(name: "MarkdownUI", package: "swift-markdown-ui"),
-                .product(name: "Markdown", package: "swift-markdown"),
-                .product(name: "SwiftyJSON", package: "SwiftyJSON"),
-                .product(name: "MCP", package: "swift-sdk"),
-                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
+                "TreeSitterScannerSupport",
                 .product(name: "TreeSitterC", package: "tree-sitter-c"),
                 .product(name: "TreeSitterDart", package: "tree-sitter-dart"),
                 .product(name: "TreeSitterGo", package: "tree-sitter-go"),
@@ -68,12 +57,60 @@ let package = Package(
                 .product(name: "TreeSitterSwift", package: "tree-sitter-swift"),
                 .product(name: "TreeSitterCSharp", package: "tree-sitter-c-sharp"),
                 .product(name: "TreeSitterCPP", package: "tree-sitter-cpp"),
-                .product(name: "TreeSitterPHP", package: "tree-sitter-php"),
+                .product(name: "TreeSitterPHP", package: "tree-sitter-php")
+            ],
+            path: "Sources/RepoPromptSyntaxCBridge",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "RepoPromptCore",
+            dependencies: [
+                "RepoPromptC",
+                "CSwiftPCRE2",
+                "RepoPromptSyntaxCBridge",
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter")
+            ],
+            path: "Sources/RepoPromptCore"
+        ),
+        .target(
+            name: "RepoPromptPOSIXSupport",
+            path: "Sources/RepoPromptPOSIXSupport"
+        ),
+        .target(
+            name: "RepoPromptCoreMacOS",
+            dependencies: [
+                "RepoPromptCore",
+                "RepoPromptPOSIXSupport",
+                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
+                .product(name: "Cuchardet", package: "UniversalCharsetDetection")
+            ],
+            path: "Sources/RepoPromptCoreMacOS"
+        ),
+        .executableTarget(
+            name: "RepoPromptHeadless",
+            dependencies: [
+                "RepoPromptShared",
+                "RepoPromptCore",
+                "RepoPromptCoreMacOS",
+                "RepoPromptPOSIXSupport",
+                .product(name: "Logging", package: "swift-log")
+            ],
+            path: "Sources/RepoPromptHeadless"
+        ),
+        .executableTarget(
+            name: "RepoPrompt",
+            dependencies: [
+                "RepoPromptShared", "RepoPromptCore", "RepoPromptCoreMacOS", "Sparkle",
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts"),
+                .product(name: "MarkdownUI", package: "swift-markdown-ui"),
+                .product(name: "Markdown", package: "swift-markdown"),
+                .product(name: "SwiftyJSON", package: "SwiftyJSON"),
+                .product(name: "MCP", package: "swift-sdk"),
+                .product(name: "SwiftTreeSitter", package: "SwiftTreeSitter"),
                 .product(name: "SwiftAnthropic", package: "SwiftAnthropic"),
                 .product(name: "SwiftOpenAI", package: "SwiftOpenAI"),
                 .product(name: "Neon", package: "Neon"),
-                .product(name: "UniversalCharsetDetection", package: "UniversalCharsetDetection"),
-                .product(name: "Cuchardet", package: "UniversalCharsetDetection"),
                 .product(name: "JSONSchema", package: "JSONSchema"),
                 .product(name: "Ontology", package: "ontology"),
                 .product(name: "RepoPromptClaudeCompatibleProvider", package: "RepoPromptAgentProviders")
@@ -81,16 +118,12 @@ let package = Package(
             path: "Sources/RepoPrompt",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug)),
-                .enableUpcomingFeature("BareSlashRegexLiterals"),
-                .unsafeFlags([
-                    "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
-                    "-disable-bridging-pch"
-                ])
+                .enableUpcomingFeature("BareSlashRegexLiterals")
             ]
         ),
         .executableTarget(
             name: "RepoPromptMCP",
-            dependencies: ["RepoPromptShared", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
+            dependencies: ["RepoPromptShared", "RepoPromptPOSIXSupport", .product(name: "Logging", package: "swift-log"), .product(name: "MCP", package: "swift-sdk"), .product(name: "ServiceLifecycle", package: "swift-service-lifecycle"), .product(name: "SystemPackage", package: "swift-system")],
             path: "Sources/RepoPromptMCP",
             swiftSettings: [.define("DEBUG", .when(configuration: .debug))]
         ),
@@ -105,6 +138,27 @@ let package = Package(
         // See docs/architecture/source-layout.md and ThirdPartyLicenses/tree-sitter/README.md.
         .target(name: "TreeSitterScannerSupport", path: "Sources/TreeSitterScannerSupport", sources: ["src/javascript/scanner.c", "src/python/scanner.c"], publicHeadersPath: "include"),
         .binaryTarget(name: "Sparkle", path: "Vendor/Sparkle/Sparkle.xcframework"),
+        .testTarget(
+            name: "RepoPromptCoreTests",
+            dependencies: ["RepoPromptCore"],
+            path: "Tests/RepoPromptCoreTests"
+        ),
+        .testTarget(
+            name: "RepoPromptCoreMacOSTests",
+            dependencies: ["RepoPromptCoreMacOS"],
+            path: "Tests/RepoPromptCoreMacOSTests"
+        ),
+        .testTarget(
+            name: "RepoPromptPOSIXSupportTests",
+            dependencies: ["RepoPromptPOSIXSupport"],
+            path: "Tests/RepoPromptPOSIXSupportTests"
+        ),
+        .testTarget(
+            name: "RepoPromptHeadlessTests",
+            dependencies: ["RepoPromptHeadless"],
+            path: "Tests/RepoPromptHeadlessTests",
+            resources: [.copy("Fixtures")]
+        ),
         .testTarget(
             name: "RepoPromptTests",
             dependencies: ["RepoPrompt", "RepoPromptMCP", "RepoPromptShared"],

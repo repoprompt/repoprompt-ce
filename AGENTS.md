@@ -71,7 +71,8 @@ make xcode-generator-test   # deterministic generator contract tests
 make xcode-clean            # remove generated workspace metadata
 ```
 
-Xcode 26.3 exposes the native `RepoPrompt` and `repoprompt-mcp` product schemes.
+Xcode 26.3 exposes the native `RepoPrompt`, `repoprompt-mcp`, and
+`repoprompt-headless` product schemes.
 Use `RepoPrompt CE App` and `RepoPrompt CE MCP` for conductor-coordinated debug
 products. `RepoPrompt CE Tests` delegates to conductor because `RepoPromptMCP`
 is executable-only and cannot back a native Xcode unit-test dependency. Do not
@@ -148,12 +149,16 @@ Happy path — daemon aliases:
 ```bash
 make dev-status
 make dev-build
-make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|all, default all)
+make dev-swift-build PRODUCT=repoprompt-mcp         # focused product build (PRODUCT=RepoPrompt|repoprompt-mcp|repoprompt-headless|all, default all)
+make dev-swift-build TARGET=RepoPromptCore          # focused internal target build (the five Core-isolation production targets)
 make dev-run
 make dev-test                                       # full coordinated test suite
-make dev-test FILTER=WorkspaceFileContextStoreTests # focused coordinated test run
-make dev-test-list                                  # coordinated authoritative root XCTest method list
-make dev-provider-test                              # RepoPromptAgentProviders package tests (FILTER= also supported)
+make dev-test FILTER=WorkspaceFileContextStoreTests   # focused coordinated test run
+make dev-core-test FILTER=RepoPromptCoreTests.WorkspaceRootSyncTests
+```
+make dev-core-test                                   # isolated RepoPromptCore tests (FILTER= also supported)
+make dev-core-test-list                              # coordinated authoritative Core XCTest method list
+make dev-provider-test
 make dev-provider-test-list                         # coordinated authoritative provider XCTest method list
 make dev-smoke          # non-disruptive: requires an already-running CE debug app and installed debug CLI
 make dev-smoke-launch   # builds/launches the debug app, then runs the smoke flow
@@ -212,8 +217,8 @@ See `docs/architecture/source-layout.md` for the full ownership map and document
 - Bridging-header-sensitive support stays under `Sources/RepoPrompt/Support` unless `Package.swift` is updated in the same change.
 - Reusable UI, diffing, regex, networking, process, security, and utility substrate should use the narrowest `Sources/RepoPrompt/Infrastructure/<Area>` owner.
 - App-integrated diagnostics belong under `Sources/RepoPrompt/Features/Diagnostics` and need a documented entry point/purpose.
-- App/CLI protocol code shared by both products belongs under `Sources/RepoPromptShared`.
-- Test doubles, fixtures, parser inputs, sample projects, and XCTest-only helpers belong under `Tests/RepoPromptTests`, not `Sources/RepoPrompt`.
+- App/proxy/headless protocol code shared across products belongs under `Sources/RepoPromptShared`.
+- Test doubles, fixtures, parser inputs, sample projects, and XCTest-only helpers belong under the owning declared test root. Current app/root integration support remains under `Tests/RepoPromptTests`, not `Sources/RepoPrompt`; reserved isolated roots are declared only with their first meaningful test.
 - Do not recreate legacy top-level `Views`, `ViewModels`, `Services`, `Models`, `Utils`, or `Shared` buckets.
 - Do not put directories named `Tests`, `TestSupport`, or `Fixtures` under `Sources/RepoPrompt`.
 - Keep `MCPControlMessages.swift` single-sourced in `Sources/RepoPromptShared/MCP`.

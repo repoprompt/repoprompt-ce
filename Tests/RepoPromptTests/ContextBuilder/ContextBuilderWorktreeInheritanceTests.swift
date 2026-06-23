@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 @testable import RepoPrompt
+@testable import RepoPromptCore
 import XCTest
 
 #if DEBUG
@@ -886,6 +887,10 @@ import XCTest
                         ceRoot,
                         to: XCTUnwrap(fixture.contextA.window.workspaceManager.activeWorkspace)
                     )
+                    _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                        in: fixture.contextA.window,
+                        path: ceRoot.path
+                    )
                     let orderedRepoPaths = try XCTUnwrap(
                         fixture.contextA.window.workspaceManager.activeWorkspace
                     ).repoPaths.map { ($0 as NSString).standardizingPath }
@@ -1317,6 +1322,9 @@ import XCTest
         }
 
         private func activateWorkspace(_ context: PersistentMCPTestContext) async throws {
+            context.window.promptManager.attachPromptFactualContextProvider(
+                ContextBuilderTestFactualProvider(store: context.window.workspaceFileContextStore)
+            )
             let workspace = try XCTUnwrap(
                 context.window.workspaceManager.workspaces.first { $0.id == context.workspaceID }
             )
@@ -1793,6 +1801,19 @@ import XCTest
                 selection: selection,
                 lookupContext: lookupContext
             ))
+        }
+    }
+
+    private struct ContextBuilderTestFactualProvider: PromptFactualContextProviding {
+        let store: WorkspaceFileContextStore
+
+        func capture(
+            _ request: PromptFactualCaptureRequest,
+            admission _: WorkspaceSessionAdmissionToken?
+        ) async -> PromptFactualCaptureOutcome {
+            let first = await PromptFactualContextCaptureService.capture(request: request, store: store)
+            guard case .unavailable(.staleGeneration) = first else { return first }
+            return await PromptFactualContextCaptureService.capture(request: request, store: store)
         }
     }
 #endif

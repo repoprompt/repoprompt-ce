@@ -35,9 +35,9 @@ from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from debug_app_process import ProcessIdentityError, matching_processes, terminate_matching_processes
 
-PROTOCOL_VERSION = 9
+PROTOCOL_VERSION = 11
 TERMINAL_STATES = {"completed", "failed", "canceled"}
-LANE_NAMES = {"build", "debugArtifact", "liveApp", "release", "style"}
+LANE_NAMES = {"build", "debugArtifact", "headlessArtifact", "liveApp", "release", "style"}
 LOG_TAIL_LINES = 30
 SUMMARY_VERSION = 1
 SUMMARY_SUCCESS_MAX_LINES = 25
@@ -73,6 +73,15 @@ MEDIUM_TIMEOUT_SECONDS = 60 * 60
 RELEASE_TIMEOUT_SECONDS = 2 * 60 * 60
 SMOKE_AGENT_WAIT_SECONDS = 120.0
 
+SWIFT_BUILD_PRODUCTS = ("RepoPrompt", "repoprompt-mcp", "repoprompt-headless")
+SWIFT_BUILD_TARGETS = (
+    "RepoPromptCore",
+    "RepoPromptCoreMacOS",
+    "RepoPromptPOSIXSupport",
+    "RepoPromptSyntaxCBridge",
+    "RepoPromptHeadless",
+)
+
 IMPLEMENTED_OPERATIONS = {
     "doctor",
     "guardrails",
@@ -86,6 +95,17 @@ IMPLEMENTED_OPERATIONS = {
     "build",
     "package",
     "test",
+    "core-test",
+    "core-macos-test",
+    "posix-test",
+    "headless-build",
+    "headless-test",
+    "headless-package",
+    "headless-provenance",
+    "headless-install",
+    "headless-status",
+    "headless-uninstall",
+    "headless-smoke",
     "provider-test",
     "install-debug-cli",
     "debug-cli-status",
@@ -126,10 +146,22 @@ Operation commands:
   ./conductor format-tools-status    # inspect SwiftFormat/SwiftLint availability
   ./conductor check-format-tools     # fail if style tools are missing
   ./conductor install-format-tools   # explicit Homebrew install of missing style tools
-  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|all
+  ./conductor swift-build --product RepoPrompt|repoprompt-mcp|repoprompt-headless|all
+  ./conductor swift-build --target RepoPromptCore|RepoPromptCoreMacOS|RepoPromptPOSIXSupport|RepoPromptSyntaxCBridge|RepoPromptHeadless
   ./conductor build
   ./conductor package debug|release
   ./conductor test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor core-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor core-macos-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor posix-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor headless-build
+  ./conductor headless-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
+  ./conductor headless-package [--configuration debug|release]
+  ./conductor headless-provenance [--configuration debug|release]
+  ./conductor headless-install [--configuration debug|release]
+  ./conductor headless-status
+  ./conductor headless-uninstall [--configuration debug|release] [--delete-state]
+  ./conductor headless-smoke [--configuration debug|release] [--skip-package]
   ./conductor provider-test [--list | --filter <filter>] [--xctest-stall-seconds <seconds>] [--xctest-stall-wake-probe]
   ./conductor install-debug-cli
   ./conductor debug-cli-status
@@ -145,7 +177,7 @@ Operation commands:
 Foundation validation operation:
   ./conductor sleep <seconds> [--lane <lane>]... [--message <text>] [--exit-code <n>]
   ./conductor fake-sleep <seconds> [same options]
-  valid lanes: build, debugArtifact, liveApp, release, style
+  valid lanes: build, debugArtifact, headlessArtifact, liveApp, release, style
 
 Global operation flags:
   --async              enqueue and return a ticket immediately
@@ -1018,6 +1050,14 @@ class OperationRegistry:
         "LC_ALL",
         "LC_CTYPE",
     ]
+    HEADLESS_ENV_KEYS = [
+        "REPOPROMPT_HEADLESS_TOOLS_ROOT",
+        "REPOPROMPT_HEADLESS_STATE_DIR",
+        "REPOPROMPT_HEADLESS_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH",
+        "REPOPROMPT_HEADLESS_BINARY",
+        "REPOPROMPT_HEADLESS_SMOKE_TMPDIR",
+    ]
     STYLE_ENV_KEYS = [
         "GITHUB_ACTIONS",
         "CI",
@@ -1025,7 +1065,7 @@ class OperationRegistry:
         "HOMEBREW_NO_INSTALL_CLEANUP",
         "HOMEBREW_CACHE",
     ]
-    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
+    PASSTHROUGH_ENV_KEYS = sorted(set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + HEADLESS_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS))
 
     def __init__(self, repo_root: Path) -> None:
         self.repo_root = repo_root
@@ -1068,7 +1108,7 @@ class OperationRegistry:
         if operation not in IMPLEMENTED_OPERATIONS:
             raise ConductorError(f"operation '{operation}' is not implemented")
 
-        if operation in {"test", "provider-test"}:
+        if operation in {"test", "core-test", "core-macos-test", "posix-test", "headless-test", "provider-test"}:
             self._validate_xctest_stall_options(args)
 
         env = self._base_env(verbose, request)
@@ -1098,10 +1138,15 @@ class OperationRegistry:
             return [script("install_format_tools.sh"), "install"], ["style"], cwd, env, effective_timeout
         if operation == "swift-build":
             product = args.get("product")
+            target = args.get("target")
             lanes = ["build"]
             if product == "all":
                 return self._internal_argv("swift_build_all", {}), lanes, cwd, env, effective_timeout
-            return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            if product:
+                return ["swift", "build", "--product", str(product)], lanes, cwd, env, effective_timeout
+            if target:
+                return ["swift", "build", "--target", str(target)], lanes, cwd, env, effective_timeout
+            raise ConductorError("swift-build requires a product or target")
         if operation == "build":
             return [script("package_app.sh"), "debug"], ["build", "debugArtifact"], cwd, env, effective_timeout
         if operation == "package":
@@ -1109,12 +1154,59 @@ class OperationRegistry:
             lanes = ["build", "debugArtifact"] + (["release"] if config == "release" else [])
             return [script("package_app.sh"), config], lanes, cwd, env, effective_timeout
         if operation == "test":
-            argv = ["swift", "test"]
             if args.get("list"):
-                argv.append("list")
-            elif args.get("filter"):
-                argv.extend(["--filter", str(args["filter"])])
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptTests")]
             return argv, ["build"], cwd, env, effective_timeout
+        if operation == "core-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptCoreTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptCoreTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "core-macos-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptCoreMacOSTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptCoreMacOSTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "posix-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptPOSIXSupportTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptPOSIXSupportTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "headless-build":
+            return ["swift", "build", "--product", "repoprompt-headless"], ["build"], cwd, env, effective_timeout
+        if operation == "headless-test":
+            if args.get("list"):
+                return [sys.executable, script("list_swift_tests.py"), "RepoPromptHeadlessTests"], ["build"], cwd, env, effective_timeout
+            argv = ["swift", "test", "--filter", self._scoped_test_filter(args, "RepoPromptHeadlessTests")]
+            return argv, ["build"], cwd, env, effective_timeout
+        if operation == "headless-package":
+            config = str(args.get("configuration") or "debug")
+            lanes = ["build", "headlessArtifact"] + (["release"] if config == "release" else [])
+            return [script("package_headless.sh"), config], lanes, cwd, env, effective_timeout
+        if operation == "headless-provenance":
+            config = str(args.get("configuration") or "debug")
+            return [script("verify_headless_package.sh"), config], ["headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-install":
+            config = str(args.get("configuration") or "debug")
+            return [script("install_headless.sh"), "install", "--configuration", config], ["headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-status":
+            return [script("install_headless.sh"), "status"], ["headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-uninstall":
+            config = str(args.get("configuration") or "debug")
+            argv = [script("install_headless.sh"), "uninstall", "--configuration", config]
+            if args.get("deleteState"):
+                argv.append("--delete-state")
+            return argv, ["headlessArtifact"], cwd, env, effective_timeout
+        if operation == "headless-smoke":
+            config = str(args.get("configuration") or "debug")
+            argv = [script("smoke_packaged_headless_roundtrip.sh"), "--configuration", config]
+            lanes = ["headlessArtifact"]
+            if args.get("skipPackage"):
+                argv.append("--skip-package")
+            else:
+                lanes.insert(0, "build")
+            return argv, lanes, cwd, env, effective_timeout
         if operation == "provider-test":
             argv = ["swift", "test"]
             if args.get("list"):
@@ -1165,6 +1257,20 @@ class OperationRegistry:
                 return self._internal_argv("release_preflight_missing", {}), ["release"], cwd, env, effective_timeout
 
         raise ConductorError(f"invalid arguments for operation '{operation}'")
+
+    @staticmethod
+    def _scoped_test_filter(args: Dict[str, Any], module: str) -> str:
+        requested = str(args.get("filter") or "").strip()
+        if not requested:
+            return module
+        qualifier = requested.split(".", 1)[0]
+        if qualifier.endswith("Tests") and qualifier != module:
+            raise ConductorError(
+                f"filter for {module} cannot target test module {qualifier}"
+            )
+        if qualifier == module:
+            return requested
+        return f"{module}.{requested}"
 
     @staticmethod
     def _validate_xctest_stall_options(args: Dict[str, Any]) -> None:
@@ -1227,11 +1333,11 @@ class OperationRegistry:
         return [sys.executable, "-u", str(self.script_path), "__operation_runner", json_dumps(payload)]
 
     def _default_timeout(self, operation: Any, args: Dict[str, Any]) -> float:
-        if operation in {"doctor", "guardrails", "debug-cli-status", "format-tools-status", "check-format-tools"}:
+        if operation in {"doctor", "guardrails", "debug-cli-status", "headless-status", "headless-provenance", "format-tools-status", "check-format-tools"}:
             return SHORT_TIMEOUT_SECONDS
         if operation == "app" and args.get("subcommand") in {"status", "stop"}:
             return SHORT_TIMEOUT_SECONDS
-        if operation in {"package", "release"} and (args.get("config") == "release" or args.get("subcommand") in {"artifact", "package", "local-install"}):
+        if operation in {"package", "headless-package", "release"} and (args.get("config") == "release" or args.get("configuration") == "release" or args.get("subcommand") in {"artifact", "package", "local-install"}):
             return RELEASE_TIMEOUT_SECONDS
         if operation == "smoke" and args.get("agentRun"):
             return MEDIUM_TIMEOUT_SECONDS
@@ -1880,7 +1986,7 @@ class DaemonState:
 
     def _xctest_watchdog_enabled(self, job: Job) -> bool:
         return (
-            job.operation in {"test", "provider-test"}
+            job.operation in {"test", "core-test", "core-macos-test", "posix-test", "headless-test", "provider-test"}
             and not bool(job.args.get("list"))
             and job.args.get("xctestStallSeconds") is not None
         )
@@ -3461,8 +3567,40 @@ def operation_app_stop(repo_root: Path, args: Dict[str, Any]) -> int:
 
 
 def operation_swift_build_all(repo_root: Path) -> int:
-    for product in ["RepoPrompt", "repoprompt-mcp"]:
+    for product in SWIFT_BUILD_PRODUCTS:
         code, _stdout, _stderr = run_operation_command(f"swift build --product {product}", ["swift", "build", "--product", product], repo_root)
+        if code != 0:
+            return code
+    code, stdout, _stderr = run_operation_command(
+        "swift build --show-bin-path",
+        ["swift", "build", "--show-bin-path"],
+        repo_root,
+    )
+    if code != 0:
+        return code
+    bin_dir = Path(stdout.strip())
+    verifier = repo_root / "Scripts" / "verify_tree_sitter_symbols.py"
+    validations = (
+        ("RepoPrompt", "exact", "Conductor RepoPrompt app"),
+        ("repoprompt-headless", "exact", "Conductor RepoPrompt Headless"),
+        ("repoprompt-mcp", "absent", "Conductor repoprompt-mcp proxy"),
+    )
+    for binary_name, expectation, label in validations:
+        argv = [
+            sys.executable,
+            str(verifier),
+            "--binary",
+            str(bin_dir / binary_name),
+            "--expect",
+            expectation,
+            "--label",
+            label,
+        ]
+        code, _stdout, _stderr = run_operation_command(
+            f"verify linked Tree-sitter symbols in {binary_name}",
+            argv,
+            repo_root,
+        )
         if code != 0:
             return code
     return 0
@@ -3694,6 +3832,8 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         "doctor",
         "guardrails",
         "build",
+        "headless-build",
+        "headless-status",
         "install-debug-cli",
         "debug-cli-status",
         "format",
@@ -3706,15 +3846,33 @@ def handle_real_operation(paths: Paths, operation: str, argv: List[str]) -> int:
         parse_no_args(f"conductor {operation}", rest)
     elif operation == "swift-build":
         parser = argparse.ArgumentParser(prog="conductor swift-build")
-        parser.add_argument("--product", required=True, choices=["RepoPrompt", "repoprompt-mcp", "all"])
+        selector = parser.add_mutually_exclusive_group(required=True)
+        selector.add_argument("--product", choices=[*SWIFT_BUILD_PRODUCTS, "all"])
+        selector.add_argument("--target", choices=SWIFT_BUILD_TARGETS)
         ns = parser.parse_args(rest)
-        args["product"] = ns.product
+        if ns.product:
+            args["product"] = ns.product
+        if ns.target:
+            args["target"] = ns.target
     elif operation == "package":
         parser = argparse.ArgumentParser(prog="conductor package")
         parser.add_argument("config", choices=["debug", "release"])
         ns = parser.parse_args(rest)
         args["config"] = ns.config
-    elif operation in {"test", "provider-test"}:
+    elif operation in {"headless-package", "headless-provenance", "headless-install", "headless-uninstall", "headless-smoke"}:
+        parser = argparse.ArgumentParser(prog=f"conductor {operation}")
+        parser.add_argument("--configuration", choices=["debug", "release"], default="debug")
+        if operation == "headless-uninstall":
+            parser.add_argument("--delete-state", action="store_true")
+        if operation == "headless-smoke":
+            parser.add_argument("--skip-package", action="store_true")
+        ns = parser.parse_args(rest)
+        args["configuration"] = ns.configuration
+        if operation == "headless-uninstall" and ns.delete_state:
+            args["deleteState"] = True
+        if operation == "headless-smoke" and ns.skip_package:
+            args["skipPackage"] = True
+    elif operation in {"test", "core-test", "core-macos-test", "posix-test", "headless-test", "provider-test"}:
         parser = argparse.ArgumentParser(prog=f"conductor {operation}")
         mode = parser.add_mutually_exclusive_group()
         mode.add_argument("--list", action="store_true")

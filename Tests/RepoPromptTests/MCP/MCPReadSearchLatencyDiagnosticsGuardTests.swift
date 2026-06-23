@@ -1,8 +1,8 @@
 #if DEBUG
     import Combine
-    import CoreServices
     import MCP
     @testable import RepoPrompt
+    @testable import RepoPromptCore
     import RepoPromptShared
     import XCTest
 
@@ -212,11 +212,17 @@
             )
             let insertedBoundedApplyProbe = await applyRegistry.insert(boundedEntry)
             XCTAssertTrue(insertedBoundedApplyProbe)
-            MCPApplyEditsRebaseProbeRecorder.recordServicePublication(
-                rootToken: boundedState.rootToken,
-                source: .syntheticMutation,
-                deltas: [.fileModified("fixture.swift", nil)]
-            )
+            LegacyWorkspaceRuntimeDiagnosticsSink().record(RuntimeDiagnosticEvent(
+                subsystem: "workspace-engine",
+                name: "applyEdits.servicePublication",
+                kind: .lifecycle,
+                fields: [
+                    "rootID": boundedState.rootToken.uuidString,
+                    "source": FileSystemDeltaPublicationSource.syntheticMutation.rawValue,
+                    "deltaCount": "1",
+                    "modifiedPaths": "fixture.swift"
+                ]
+            ))
             for index in 0 ..< 70 {
                 boundedState.increment("test_events", event: "unsafe / payload \(index)")
             }
@@ -1192,9 +1198,7 @@
 
             do {
                 await flushGate.waitUntilStarted()
-                let createdFileFlags = FSEventStreamEventFlags(
-                    kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-                )
+                let createdFileFlags: FileSystemWatchEventFlags = [.itemCreated, .itemIsFile]
                 let firstAccepted = try await store.acceptWatcherPayloadForTesting(
                     rootID: record.id,
                     events: [(absolutePath: firstURL.path, flags: createdFileFlags, eventId: 500)],
@@ -1860,9 +1864,9 @@
             let childTaskCompleted = expectation(description: "sink child task captured publication correlation")
             let observations = LockedCorrelationIDs()
             let cancellable = publisher.sink { _ in
-                observations.recordSink(EditFlowPerf.currentFileSystemPublicationCorrelation?.id)
+                observations.recordSink(RepoFileReplayPerf.currentFileSystemPublicationCorrelation?.id)
                 Task {
-                    observations.recordChildTask(EditFlowPerf.currentFileSystemPublicationCorrelation?.id)
+                    observations.recordChildTask(RepoFileReplayPerf.currentFileSystemPublicationCorrelation?.id)
                     childTaskCompleted.fulfill()
                 }
             }
@@ -1885,7 +1889,7 @@
         }
 
         private func scenarioReadSearchBarrierDiagnosticsExposeBoundedPendingSuccessorState() throws {
-            let store = try source("Sources/RepoPrompt/Infrastructure/WorkspaceContext/WorkspaceFileContextStore.swift")
+            let store = try source("Sources/RepoPromptCore/WorkspaceContext/WorkspaceFileContextStore.swift")
             for hook in [
                 "ScopedIngressBarrierRootFlightState",
                 "ScopedIngressBarrierPendingFlight",

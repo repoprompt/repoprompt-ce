@@ -53,6 +53,10 @@ final class MCPWindowToolRuntime {
     }
 
     func context(for toolName: String) -> MCPWindowToolContext {
-        MCPWindowToolContext(toolName: toolName, windowID: windowID)
+        MCPWindowToolContext(
+            toolName: toolName,
+            windowID: windowID,
+            runtimeRequest: ServerNetworkManager.currentRuntimeRequestContext
+        )
     }
 }

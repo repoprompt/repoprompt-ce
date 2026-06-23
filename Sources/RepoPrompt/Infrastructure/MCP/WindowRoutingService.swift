@@ -2,7 +2,17 @@ import Foundation
 import JSONSchema
 import MCP
 import Ontology
+import RepoPromptCore
 import SwiftUI
+
+private extension WorkspaceSessionCommandResult {
+    var isSuccessfulWorkspaceMutation: Bool {
+        switch self {
+        case .committed, .unchanged: true
+        case .stale, .notReady, .rejected, .failed: false
+        }
+    }
+}
 
 #if DEBUG
     private func routingLog(_ message: @autoclosure () -> String) {
@@ -329,6 +339,203 @@ final class WindowRoutingService: Service {
     // NotificationCenter observer tokens for cleanup
     private var userDefaultsObserver: NSObjectProtocol?
     private var windowCountObserver: NSObjectProtocol?
+
+    // ---------------------------------------------------------------------
+    // MARK: Exact workspace-session admission
+
+    private func admittedBinding(
+        for window: WindowState,
+        allowFreshAdmission: Bool = false
+    ) async throws -> MCPAdmittedContextBinding {
+        if let binding = ServerNetworkManager.currentAdmittedContextBinding {
+            if binding.windowID == window.windowID {
+                guard binding.isCurrent(in: window) else {
+                    throw MCPError.invalidRequest(
+                        "The admitted workspace session changed before routing completed; the request was not retargeted."
+                    )
+                }
+                return binding
+            }
+            guard allowFreshAdmission else {
+                throw MCPError.invalidRequest(
+                    "The routed window does not match the request workspace-session admission."
+                )
+            }
+        }
+
+        guard allowFreshAdmission,
+              case let .admitted(token) = await window.workspaceManager.admitSelectedWorkspaceSession(),
+              let binding = MCPAdmittedContextBinding(
+                  windowID: window.windowID,
+                  tabID: nil,
+                  workspaceID: window.workspaceManager.activeWorkspace?.id,
+                  sessionID: window.workspaceSessionID,
+                  admissionToken: token
+              ),
+              binding.isCurrent(in: window)
+        else {
+            throw MCPError.invalidRequest(
+                "No exact workspace-session admission is available for the routed window."
+            )
+        }
+        return binding
+    }
+
+    private func performAdmittedWorkspaceSwitch(
+        in window: WindowState,
+        to workspace: WorkspaceModel,
+        saveState: Bool,
+        allowFreshAdmission: Bool = false
+    ) async throws -> WorkspaceSwitchResult {
+        let binding = try await admittedBinding(for: window, allowFreshAdmission: allowFreshAdmission)
+        guard let commandResult = await binding.execute(
+            .switchWorkspace(
+                WorkspaceSwitchCommand(
+                    targetWorkspaceID: workspace.id,
+                    shouldSaveCurrentState: saveState,
+                    reason: .other("mcp")
+                )
+            ),
+            source: "mcp-workspace-switch",
+            in: window
+        ), binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session changed during workspace switch; the result was not retargeted."
+            )
+        }
+        switch commandResult {
+        case .committed, .unchanged: return .switched
+        case .stale: return .cancelled("Workspace state advanced before the switch committed.")
+        case let .failed(failure): return .blocked(failure.message)
+        case let .notReady(availability): return .blocked("Workspace session is not ready (\(availability)).")
+        case let .rejected(rejection): return .blocked("Workspace switch was rejected (\(rejection)).")
+        }
+    }
+
+    private func performAdmittedWorkspaceCreate(
+        in window: WindowState,
+        name: String,
+        repoPaths: [String],
+        allowFreshAdmission: Bool = false
+    ) async throws -> WorkspaceModel {
+        let binding = try await admittedBinding(for: window, allowFreshAdmission: allowFreshAdmission)
+        let workspace = WorkspaceModel(name: name, repoPaths: repoPaths)
+        guard let result = await binding.execute(
+            .workspace(.create(workspace, makeActive: false)),
+            source: "mcp-workspace-create",
+            in: window
+        ), case .committed = result, binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session rejected workspace creation; the request was not retargeted."
+            )
+        }
+        _ = await binding.execute(
+            .persistence(.saveWorkspace(workspaceID: workspace.id)),
+            source: "mcp-workspace-create-save",
+            in: window
+        )
+        _ = await binding.execute(.persistence(.saveIndex), source: "mcp-workspace-create-index", in: window)
+        return workspace
+    }
+
+    private func performAdmittedWorkspaceDelete(
+        in window: WindowState,
+        workspace: WorkspaceModel
+    ) async throws {
+        let binding = try await admittedBinding(for: window)
+        guard let result = await binding.execute(
+            .workspace(.delete(workspaceID: workspace.id)),
+            source: "mcp-workspace-delete",
+            in: window
+        ), case .committed = result, binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session rejected workspace deletion; the request was not retargeted."
+            )
+        }
+        _ = await binding.execute(.persistence(.saveIndex), source: "mcp-workspace-delete-index", in: window)
+    }
+
+    private func performAdmittedWorkspaceHiddenMutation(
+        in window: WindowState,
+        workspaceID: UUID,
+        hidden: Bool
+    ) async throws -> WorkspaceModel {
+        let binding = try await admittedBinding(for: window)
+        guard var updatedWorkspace = window.workspaceManager.workspace(withID: workspaceID) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session does not contain the requested workspace; the request was not retargeted."
+            )
+        }
+        updatedWorkspace.isHiddenInMenus = hidden
+        updatedWorkspace.dateModified = Date()
+        guard let mutationResult = await binding.execute(
+            .workspace(.replace(updatedWorkspace)),
+            source: "mcp-workspace-hidden-state",
+            in: window
+        ), mutationResult.isSuccessfulWorkspaceMutation, binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session rejected the hidden-state mutation; the request was not retargeted."
+            )
+        }
+        guard let saveResult = await binding.execute(
+            .persistence(.saveWorkspace(workspaceID: workspaceID)),
+            source: "mcp-workspace-hidden-state-save",
+            in: window
+        ), saveResult.isSuccessfulWorkspaceMutation,
+        let indexResult = await binding.execute(
+            .persistence(.saveIndex),
+            source: "mcp-workspace-hidden-state-index",
+            in: window
+        ), indexResult.isSuccessfulWorkspaceMutation,
+        binding.isCurrent(in: window)
+        else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session could not persist the hidden-state mutation."
+            )
+        }
+        return window.workspaceManager.workspace(withID: workspaceID) ?? updatedWorkspace
+    }
+
+    private func performAdmittedAddFolder(
+        _ folderURL: URL,
+        to workspace: WorkspaceModel,
+        in window: WindowState
+    ) async throws {
+        let binding = try await admittedBinding(for: window)
+        let path = (folderURL.path as NSString).standardizingPath
+        var roots = workspace.repoPaths
+        if !roots.contains(where: { ($0 as NSString).standardizingPath.caseInsensitiveCompare(path) == .orderedSame }) {
+            roots.append(path)
+        }
+        guard let result = await binding.execute(
+            .workspace(.replaceOrderedRoots(workspaceID: workspace.id, roots: roots)),
+            source: "mcp-workspace-root-add",
+            in: window
+        ), result.isSuccessfulWorkspaceMutation, binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session rejected the folder addition; the request was not retargeted."
+            )
+        }
+    }
+
+    private func performAdmittedRemoveFolder(
+        _ path: String,
+        from workspace: WorkspaceModel,
+        in window: WindowState
+    ) async throws {
+        let binding = try await admittedBinding(for: window)
+        let standardized = (path as NSString).standardizingPath
+        let roots = workspace.repoPaths.filter { ($0 as NSString).standardizingPath != standardized }
+        guard let result = await binding.execute(
+            .workspace(.replaceOrderedRoots(workspaceID: workspace.id, roots: roots)),
+            source: "mcp-workspace-root-remove",
+            in: window
+        ), result.isSuccessfulWorkspaceMutation, binding.isCurrent(in: window) else {
+            throw MCPError.invalidRequest(
+                "The admitted workspace session rejected the folder removal; the request was not retargeted."
+            )
+        }
+    }
 
     // ---------------------------------------------------------------------
     // MARK: Init & registration
@@ -1370,7 +1577,12 @@ final class WindowRoutingService: Service {
         let newWindow = try await openRoutingWindow(deferringInitialAgentSystemWorkspaceRefresh: true)
         defer { newWindow.agentModeViewModel.finishInitialSystemWorkspaceSessionListRefreshDeferral() }
         await newWindow.workspaceManager.awaitInitialized()
-        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: workspace, saveState: true)
+        let switchResult = try await performAdmittedWorkspaceSwitch(
+            in: newWindow,
+            to: workspace,
+            saveState: true,
+            allowFreshAdmission: true
+        )
         if !switchResult.didSwitch {
             throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
         }
@@ -1414,9 +1626,17 @@ final class WindowRoutingService: Service {
         repoPaths: [String],
         switchToCreated: Bool
     ) async throws -> WorkspaceModel {
-        let newWorkspace = window.workspaceManager.createWorkspace(name: name, repoPaths: repoPaths)
+        let newWorkspace = try await performAdmittedWorkspaceCreate(
+            in: window,
+            name: name,
+            repoPaths: repoPaths
+        )
         if switchToCreated {
-            let switchResult = await window.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
+            let switchResult = try await performAdmittedWorkspaceSwitch(
+                in: window,
+                to: newWorkspace,
+                saveState: true
+            )
             if !switchResult.didSwitch {
                 throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
             }
@@ -1548,7 +1768,11 @@ final class WindowRoutingService: Service {
 
             if let targetWindow = windowStates.allWindows.first(where: { $0.windowID == preferredWindowID }) {
                 if targetWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
+                    let switchResult = try await performAdmittedWorkspaceSwitch(
+                        in: targetWindow,
+                        to: match.workspace,
+                        saveState: true
+                    )
                     if !switchResult.didSwitch {
                         throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                     }
@@ -1597,7 +1821,11 @@ final class WindowRoutingService: Service {
                 )
             }
             if requestedWindow.workspaceManager.activeWorkspace?.id != match.workspace.id {
-                let switchResult = await requestedWindow.workspaceManager.requestWorkspaceSwitch(to: match.workspace, saveState: true)
+                let switchResult = try await performAdmittedWorkspaceSwitch(
+                    in: requestedWindow,
+                    to: match.workspace,
+                    saveState: true
+                )
                 if !switchResult.didSwitch {
                     throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                 }
@@ -2297,7 +2525,12 @@ final class WindowRoutingService: Service {
                         await newWindow.workspaceManager.awaitInitialized()
 
                         // Switch the new window to the target workspace
-                        let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: targetWorkspace, saveState: true)
+                        let switchResult = try await performAdmittedWorkspaceSwitch(
+                            in: newWindow,
+                            to: targetWorkspace,
+                            saveState: true,
+                            allowFreshAdmission: true
+                        )
                         if !switchResult.didSwitch {
                             throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                         }
@@ -2345,7 +2578,11 @@ final class WindowRoutingService: Service {
                     let targetModel = try await resolveWorkspaceForSwitch(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
                     // Perform the switch on the target window
-                    let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: targetModel, saveState: true)
+                    let switchResult = try await performAdmittedWorkspaceSwitch(
+                        in: targetWindow,
+                        to: targetModel,
+                        saveState: true
+                    )
                     if !switchResult.didSwitch {
                         throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                     }
@@ -2450,11 +2687,19 @@ final class WindowRoutingService: Service {
                         await newWindow.workspaceManager.awaitInitialized()
 
                         // Create the workspace in the new window
-                        let newWorkspace = await MainActor.run {
-                            newWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths)
-                        }
+                        let newWorkspace = try await performAdmittedWorkspaceCreate(
+                            in: newWindow,
+                            name: workspaceName,
+                            repoPaths: initialRepoPaths,
+                            allowFreshAdmission: true
+                        )
                         if switchToCreated {
-                            let switchResult = await newWindow.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
+                            let switchResult = try await performAdmittedWorkspaceSwitch(
+                                in: newWindow,
+                                to: newWorkspace,
+                                saveState: true,
+                                allowFreshAdmission: true
+                            )
                             if !switchResult.didSwitch {
                                 throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                             }
@@ -2479,12 +2724,18 @@ final class WindowRoutingService: Service {
                     }
 
                     // Create the workspace in the target window
-                    let newWorkspace = await MainActor.run {
-                        approvalWindow.workspaceManager.createWorkspace(name: workspaceName, repoPaths: initialRepoPaths)
-                    }
+                    let newWorkspace = try await performAdmittedWorkspaceCreate(
+                        in: approvalWindow,
+                        name: workspaceName,
+                        repoPaths: initialRepoPaths
+                    )
 
                     if switchToCreated {
-                        let switchResult = await approvalWindow.workspaceManager.requestWorkspaceSwitch(to: newWorkspace, saveState: true)
+                        let switchResult = try await performAdmittedWorkspaceSwitch(
+                            in: approvalWindow,
+                            to: newWorkspace,
+                            saveState: true
+                        )
                         if !switchResult.didSwitch {
                             throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                         }
@@ -2511,21 +2762,42 @@ final class WindowRoutingService: Service {
                     guard !resolvedWorkspace.isSystemWorkspace else {
                         throw MCPError.invalidParams("Cannot \(action) system workspace '\(resolvedWorkspace.name)'.")
                     }
-                    let mutationManagers = await MainActor.run {
-                        self.windowStates.allWindows.map(\.workspaceManager)
-                    }
-                    guard let writerManager = mutationManagers.first else {
+                    let mutationWindows = await MainActor.run { self.windowStates.allWindows }
+                    guard let writerWindow = mutationWindows.first else {
                         throw MCPError.invalidParams("No windows available to update workspace hidden state. Open at least one window first.")
                     }
 
-                    let updatedWorkspace = try await writerManager.setWorkspaceHiddenFromSnapshot(resolvedWorkspace, hidden: shouldHide)
-                    await MainActor.run {
-                        for manager in mutationManagers {
-                            manager.applyWorkspaceHiddenStateInMemory(
-                                workspaceID: updatedWorkspace.id,
-                                hidden: updatedWorkspace.isHiddenInMenus,
-                                dateModified: updatedWorkspace.dateModified
+                    let updatedWorkspace: WorkspaceModel
+                    if let admitted = ServerNetworkManager.currentAdmittedContextBinding {
+                        guard let admittedWindow = mutationWindows.first(where: { $0.windowID == admitted.windowID }) else {
+                            throw MCPError.invalidRequest("The admitted workspace-session window is no longer available.")
+                        }
+                        updatedWorkspace = try await performAdmittedWorkspaceHiddenMutation(
+                            in: admittedWindow,
+                            workspaceID: resolvedWorkspace.id,
+                            hidden: shouldHide
+                        )
+                    } else {
+                        guard await MainActor.run(body: {
+                            writerWindow.workspaceManager.selectedWorkspaceSessionID == nil
+                        }) else {
+                            throw MCPError.invalidRequest(
+                                "No exact workspace-session admission is available for the hidden-state mutation."
                             )
+                        }
+                        let mutationManagers = mutationWindows.map(\.workspaceManager)
+                        updatedWorkspace = try await writerWindow.workspaceManager.setWorkspaceHiddenFromSnapshot(
+                            resolvedWorkspace,
+                            hidden: shouldHide
+                        )
+                        await MainActor.run {
+                            for manager in mutationManagers {
+                                manager.applyWorkspaceHiddenStateInMemory(
+                                    workspaceID: updatedWorkspace.id,
+                                    hidden: updatedWorkspace.isHiddenInMenus,
+                                    dateModified: updatedWorkspace.dateModified
+                                )
+                            }
                         }
                     }
 
@@ -2578,8 +2850,10 @@ final class WindowRoutingService: Service {
 
                     let workspace = try await resolveWorkspaceForDelete(rawWorkspaceParam: rawWorkspaceParam, includeHidden: includeHidden)
 
-                    await MainActor.run {
-                        targetWindow.workspaceManager.reloadWorkspacesFromDisk()
+                    if await MainActor.run(body: { targetWindow.workspaceManager.selectedWorkspaceSessionID == nil }) {
+                        await MainActor.run {
+                            targetWindow.workspaceManager.reloadWorkspacesFromDisk()
+                        }
                     }
 
                     let showingWindowIDs = await MainActor.run { () -> [Int] in
@@ -2625,18 +2899,25 @@ final class WindowRoutingService: Service {
 
                     if closeWindow {
                         let fallback = await MainActor.run {
-                            targetWindow.workspaceManager.getOrCreateSystemWorkspace()
+                            targetWindow.workspaceManager.workspaces.first(where: {
+                                $0.id != workspace.id && $0.isSystemWorkspace
+                            }) ?? targetWindow.workspaceManager.workspaces.first(where: { $0.id != workspace.id })
                         }
-                        let switchResult = await targetWindow.workspaceManager.requestWorkspaceSwitch(to: fallback, saveState: false)
+                        guard let fallback else {
+                            throw MCPError.invalidRequest("No fallback workspace is available before closing the target window.")
+                        }
+                        let switchResult = try await performAdmittedWorkspaceSwitch(
+                            in: targetWindow,
+                            to: fallback,
+                            saveState: false
+                        )
                         if !switchResult.didSwitch {
                             throw MCPError.invalidRequest(switchResult.message ?? "Workspace switch was cancelled.")
                         }
                     }
 
                     // Delete the workspace
-                    await MainActor.run {
-                        targetWindow.workspaceManager.deleteWorkspace(workspace)
-                    }
+                    try await performAdmittedWorkspaceDelete(in: targetWindow, workspace: workspace)
 
                     if closeWindow {
                         let authorization = Self.workspaceDeleteCloseAuthorization()
@@ -2742,7 +3023,7 @@ final class WindowRoutingService: Service {
 
                     // Add the folder to the workspace
                     do {
-                        try await targetWindow.workspaceManager.addFolder(folderURL, to: workspace)
+                        try await performAdmittedAddFolder(folderURL, to: workspace, in: targetWindow)
                     } catch {
                         if let addError = error as? WorkspaceManagerViewModel.AddFolderError {
                             throw MCPError.invalidParams(addError.agentMessage)
@@ -2855,7 +3136,7 @@ final class WindowRoutingService: Service {
                     }
 
                     // Remove the folder from the workspace
-                    await targetWindow.workspaceManager.removeFolder(folderPath, from: workspace)
+                    try await performAdmittedRemoveFolder(folderPath, from: workspace, in: targetWindow)
 
                     // Return updated workspace info
                     let updatedWorkspace = await MainActor.run {

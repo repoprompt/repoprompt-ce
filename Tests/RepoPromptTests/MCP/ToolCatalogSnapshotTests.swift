@@ -485,7 +485,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "18|agent_run|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=52ef9e56d0aa35f1523bb6700ce9ced3512749401b4ea409d0de8cf3d007855b|schema=e2b5bce34fa512aca293fffec7eaa46a9639feb4e840546c12d3554b8a2d514b",
         "19|agent_manage|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=03e16bee789cb9343f6b1b16cb4d472aedd3d811a43f6f95ad8ea5e8f69dc28d|schema=f5bc6b05cf0683ef3acb7a82ee4a14b75fadf26f32c56b0314be1424688a2ba5",
         "20|share_thoughts|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=b1ac755b39a4ac2d8a621e78801a258c5d95ec2ff4e063f600081fa27891a852|schema=a5dea0c92fd4da06a15f991e1e8a287235ca681ae381cef1b594bc7c07e538d7",
-        "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=19bbfd6fc47639e02295de4e9289ea77f25c6a91ad150998726768b84c266783|schema=0854d727c81f1eb8fa0a14edb9d6ab8bb58974d919cc53150bd72473f1ae0196",
+        "21|set_status|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=eac4ae29c6cb67c42e9205865443acdae2bfacc441867cdff19ee66c9252b873|schema=dea5e25e17794032562c0257c3c1ba4bdc57a1faee3ad8e4f835dc08e68b455f",
         "22|wait_for_next_user_instruction|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=3a59a13a0026414ae04dd21d730a7144b91c67146dce77340fe730c865bea3d7|schema=15335c3bbadf042948d0a1ba52f0fcb01125428dda4952dbda418051904d82ef"
     ]
 

@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 @MainActor
 protocol MCPWindowToolProviding {
@@ -9,17 +10,31 @@ protocol MCPWindowToolProviding {
 @MainActor
 final class MCPWindowToolCatalogService: WindowScopedService {
     let windowID: Int
+    let runtimeID: WorkspaceRuntimeID
+    private(set) var mappingGeneration: UInt64
 
     private let providers: [any MCPWindowToolProviding]
     private var toolsCache: [Tool]?
 
-    init(windowID: Int, providers: [any MCPWindowToolProviding]) {
+    init(
+        windowID: Int,
+        runtimeID: WorkspaceRuntimeID,
+        mappingGeneration: UInt64 = 0,
+        providers: [any MCPWindowToolProviding]
+    ) {
         #if DEBUG || EDIT_FLOW_PERF
             let constructionState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.construction)
             defer { EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.construction, constructionState) }
         #endif
         self.windowID = windowID
+        self.runtimeID = runtimeID
+        self.mappingGeneration = mappingGeneration
         self.providers = providers
+    }
+
+    func publish(mappingGeneration: UInt64) {
+        precondition(mappingGeneration > 0, "active runtime catalog requires a mapping generation")
+        self.mappingGeneration = mappingGeneration
     }
 
     var tools: [Tool] {

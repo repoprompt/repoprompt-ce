@@ -49,7 +49,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             from: snapshot,
             workspaceRepoPaths: [logicalRoot.path],
             workspaceDirectoryPath: logicalRoot.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
 
         XCTAssertEqual(context.parentAgentSessionID, sessionID)
@@ -123,6 +124,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             workspaceRepoPaths: [canonical.path],
             workspaceDirectoryPath: fixture.sandbox.path,
             store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store),
             reviewDiagnosticSink: recorder.append
         )
         let target = try XCTUnwrap(context.reviewTargetResolution.availableTarget)
@@ -154,8 +156,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 ),
                 workspaceID: target.workspaceID,
                 tabID: target.tabID,
-                selectionRevision: 12,
-                store: store
+                selectionRevision: 12
             )
             XCTFail("Expected released worktree authority to reject canonical same-path rescue")
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
@@ -209,6 +210,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             workspaceRepoPaths: [canonical.path],
             workspaceDirectoryPath: fixture.sandbox.path,
             store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store),
             reviewDiagnosticSink: recorder.append
         )
         guard case .deferred = context.reviewTargetResolution else {
@@ -223,8 +225,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             finalSelection,
             workspaceID: XCTUnwrap(snapshot.workspaceID),
             tabID: snapshot.tabID,
-            selectionRevision: 51,
-            store: store
+            selectionRevision: 51
         )
 
         XCTAssertEqual(authorization.electionOrigin, .deferred)
@@ -250,8 +251,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 StoredSelection(codemapAutoEnabled: false),
                 workspaceID: authorization.workspaceID,
                 tabID: authorization.tabID,
-                selectionRevision: 52,
-                store: store
+                selectionRevision: 52
             )
             XCTFail("Expected empty final selection to remain terminal")
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
@@ -266,8 +266,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 ),
                 workspaceID: authorization.workspaceID,
                 tabID: authorization.tabID,
-                selectionRevision: 53,
-                store: store
+                selectionRevision: 53
             )
             XCTFail("Expected deferred final artifact selection to remain terminal")
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
@@ -305,7 +304,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             )),
             workspaceRepoPaths: [root.path],
             workspaceDirectoryPath: root.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertEqual(
             unresolvedContext.reviewTargetResolution,
@@ -319,7 +319,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             )),
             workspaceRepoPaths: [root.path],
             workspaceDirectoryPath: root.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         XCTAssertEqual(
             artifactContext.reviewTargetResolution,
@@ -362,7 +363,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             from: snapshot,
             workspaceRepoPaths: [first.path, second.path],
             workspaceDirectoryPath: fixture.sandbox.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         guard case .deferred = context.reviewTargetResolution else {
             return XCTFail("Expected empty multi-root selection to defer")
@@ -376,8 +378,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             selection,
             workspaceID: XCTUnwrap(snapshot.workspaceID),
             tabID: snapshot.tabID,
-            selectionRevision: 71,
-            store: store
+            selectionRevision: 71
         )
         XCTAssertEqual(authorization.electionOrigin, .deferred)
         XCTAssertEqual(authorization.target.checkouts.count, 2)
@@ -417,7 +418,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             from: snapshot,
             workspaceRepoPaths: [logicalRoot.path],
             workspaceDirectoryPath: logicalRoot.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
 
         XCTAssertEqual(context.providerWorkspacePath, logicalRoot.standardizedFileURL.path)
@@ -483,7 +485,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             from: snapshot,
             workspaceRepoPaths: [classic.path, selected.path],
             workspaceDirectoryPath: fixture.sandbox.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
 
         let target = try XCTUnwrap(context.reviewTargetResolution.availableTarget)
@@ -502,8 +505,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
             workspaceID: target.workspaceID,
             tabID: target.tabID,
-            selectionRevision: 38,
-            store: store
+            selectionRevision: 38
         )
 
         do {
@@ -511,8 +513,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 StoredSelection(selectedPaths: [selectedFile.path], codemapAutoEnabled: false),
                 workspaceID: UUID(),
                 tabID: target.tabID,
-                selectionRevision: 39,
-                store: store
+                selectionRevision: 39
             )
             XCTFail("Expected final selection workspace provenance mismatch to fail")
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
@@ -524,8 +525,7 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 StoredSelection(selectedPaths: [classicFile.path], codemapAutoEnabled: false),
                 workspaceID: target.workspaceID,
                 tabID: target.tabID,
-                selectionRevision: 40,
-                store: store
+                selectionRevision: 40
             )
             XCTFail("Expected final selection ownership outside the frozen CE target to fail")
         } catch let reason as ContextBuilderReviewTargetUnavailableReason {
@@ -533,7 +533,10 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
         }
 
         await store.unloadRoot(id: target.primaryCheckout.physicalWorkspaceRoot.id)
-        let staleReason = await ContextBuilderReviewTargetResolver().revalidate(target, store: store)
+        let staleReason = await ContextBuilderReviewTargetResolver().revalidate(
+            target,
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+        )
         XCTAssertEqual(staleReason, .staleWorkspaceRoot)
     }
 
@@ -575,7 +578,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
             from: snapshot,
             workspaceRepoPaths: [linked.path],
             workspaceDirectoryPath: workspaceDirectory.path,
-            store: store
+            store: store,
+            sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
 
         let capability = try XCTUnwrap(context.reviewGitContext.artifactCapability)
@@ -614,7 +618,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 from: snapshot,
                 workspaceRepoPaths: [logicalRoot.path],
                 workspaceDirectoryPath: logicalRoot.path,
-                store: store
+                store: store,
+                sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
             XCTFail("Expected unhydrated binding state to fail closed")
         } catch let error as ContextBuilderWorkspaceContextError {
@@ -670,7 +675,8 @@ final class ContextBuilderWorkspaceContextTests: XCTestCase {
                 from: snapshot,
                 workspaceRepoPaths: [logicalRoot.path],
                 workspaceDirectoryPath: logicalRoot.path,
-                store: store
+                store: store,
+                sessionQuery: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
             XCTFail("Expected unavailable inherited worktree to fail closed")
         } catch let error as ContextBuilderWorkspaceContextError {

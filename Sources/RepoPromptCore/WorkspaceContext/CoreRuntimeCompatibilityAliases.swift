@@ -1,0 +1,3 @@
+package typealias FSEventCallbackEntry = FileSystemWatchEvent
+package typealias FSEventCallbackPayload = FileSystemWatchEventPayload
+package typealias LookupRootScope = WorkspaceLookupRootScope

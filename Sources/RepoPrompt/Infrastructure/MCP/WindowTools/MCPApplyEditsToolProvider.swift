@@ -86,11 +86,11 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
             let effectivePath = lookupContext.translateInputPath(request.path)
             let displayPath = lookupContext.bindingProjection?.projectedLogicalDisplayPath(forPhysicalPath: effectivePath, display: .relative) ?? request.path
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+            _ = await dependencies.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                 userPath: effectivePath,
                 fallbackScope: lookupContext.rootScope
             )
-            if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
+            if let issue = await dependencies.workspaceFileContextStore.exactPathResolutionIssue(for: effectivePath, kind: .file, rootScope: lookupContext.rootScope) {
                 throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
             }
             let resolvedContext = try dependencies.resolveTabContextSnapshot(
@@ -98,10 +98,10 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 MCPWindowToolName.applyEdits,
                 MCPServerViewModel.TabContextResolutionPolicy.allowLegacyImplicitRouting
             )
-            let store = await MainActor.run { dependencies.promptVM.workspaceFileContextStore }
-            let host = WorkspaceFileEditHost(
+            let store = await MainActor.run { dependencies.workspaceFileContextStore }
+            let host = await WorkspaceFileEditHost(
                 store: store,
-                selectionCoordinator: dependencies.selectionCoordinator,
+                selectionCoordinator: dependencies.selectionCoordinator(),
                 lookupRootScope: lookupContext.rootScope,
                 createPathResolutionPolicy: .canonicalAliasFirst,
                 selectCreatedFiles: true
@@ -115,7 +115,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             }
             let virtualTabID: UUID? = resolvedContext.usesActiveTabCompatibility ? nil : resolvedContext.snapshot.tabID
             let availableTabIDs = await MainActor.run {
-                Set(dependencies.workspaceManager?.activeWorkspace?.composeTabs.map(\.id) ?? [])
+                Set(dependencies.workspaceManager()?.activeWorkspace?.composeTabs.map(\.id) ?? [])
             }
             let tabID = try Self.resolveApplyEditsAgentModeTabID(
                 runPurpose: runPurpose,
@@ -184,7 +184,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         )
                     }
                     await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                        _ = await dependencies.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                             userPath: effectivePath,
                             fallbackScope: lookupContext.rootScope
                         )
@@ -243,7 +243,7 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
             let result = try await service.run(effectiveRequest)
             if result.editsApplied > 0 {
                 await EditFlowPerf.measure(EditFlowPerf.Stage.ApplyEdits.flushDeltas) {
-                    _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
+                    _ = await dependencies.workspaceFileContextStore.awaitAppliedIngressForExplicitRequest(
                         userPath: effectivePath,
                         fallbackScope: lookupContext.rootScope
                     )

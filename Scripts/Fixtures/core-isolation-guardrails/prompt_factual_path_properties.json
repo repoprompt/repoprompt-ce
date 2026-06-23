@@ -1,0 +1,16 @@
+{
+  "declarations": [
+    "PromptFactualRenderedSections",
+    "PromptFactualEntrySummary",
+    "PromptFactualContextSnapshot"
+  ],
+  "forbidden_property_tokens": [
+    "physical",
+    "absolute",
+    "worktree",
+    "fullPath"
+  ],
+  "safe_property_names": [
+    "logicalDisplayPath"
+  ]
+}

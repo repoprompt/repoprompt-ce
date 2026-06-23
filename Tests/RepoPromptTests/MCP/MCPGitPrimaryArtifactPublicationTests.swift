@@ -193,7 +193,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewContext
             ),
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let policy = MCPContextBuilderGitReviewPolicy()
         let linkedRepo = GitRepoDescriptor(rootURL: linked)
@@ -203,7 +203,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             requestsArtifactPublication: true,
             operation: .diff,
             allRepositories: [GitRepoDescriptor(rootURL: canonical), linkedRepo],
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let fence = try XCTUnwrap(admission.publicationFence)
         let linkedManifest = try XCTUnwrap(try GitDiffSnapshotStore().readManifest(
@@ -219,7 +219,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             )],
             publishedArtifactSetCount: 1,
             fence: fence,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         do {
             try await policy.validatePublishedOutcomes(
@@ -230,7 +230,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
             XCTFail("Expected incomplete Context Builder publication metadata to fail")
         } catch {
@@ -248,7 +248,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
                 )],
                 publishedArtifactSetCount: 1,
                 fence: fence,
-                store: store
+                query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
             )
             XCTFail("Expected mismatched Context Builder publication repository to fail")
         } catch {
@@ -321,7 +321,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
                 lookupContext: lookupContext,
                 reviewGitContext: reviewContext
             ),
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let firstRepo = GitRepoDescriptor(rootURL: firstRoot)
         let secondRepo = GitRepoDescriptor(rootURL: secondRoot)
@@ -332,7 +332,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             requestsArtifactPublication: true,
             operation: .diff,
             allRepositories: [firstRepo, secondRepo],
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let fence = try XCTUnwrap(admission.publicationFence)
         XCTAssertEqual(
@@ -377,7 +377,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             ],
             publishedArtifactSetCount: 2,
             fence: fence,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let completeIngress = await store.ingressPublishedGitArtifacts(
             WorkspacePublishedGitArtifactIngressRequest(
@@ -423,7 +423,7 @@ final class MCPGitPrimaryArtifactPublicationTests: XCTestCase {
             ],
             publishedArtifactSetCount: 1,
             fence: fence,
-            store: store
+            query: WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
         )
         let partialIngress = await store.ingressPublishedGitArtifacts(
             WorkspacePublishedGitArtifactIngressRequest(

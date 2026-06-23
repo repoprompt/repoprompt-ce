@@ -273,6 +273,12 @@ import RepoPromptShared
             return statesByProbeID.count
         }
 
+        static var isActive: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return !statesByProbeID.isEmpty
+        }
+
         static func latestApplyEditsRequestIdentity(
             connectionID: UUID?,
             events: [MCPResponseDeliveryTraceEvent] = MCPResponseDeliveryTracer.debugEventSnapshot()

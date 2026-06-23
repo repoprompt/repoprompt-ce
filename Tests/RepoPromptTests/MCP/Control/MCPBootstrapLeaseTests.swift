@@ -406,10 +406,12 @@ final class MCPBootstrapLeaseTests: XCTestCase {
                 let workspaceIndex = try XCTUnwrap(
                     window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
                 )
-                window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                    ComposeTabState(id: tabID, name: "Cursor Deferred Routing")
-                ]
-                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = tabID
+                window.workspaceManager.mutateWorkspacesForTesting {
+                    $0[workspaceIndex].composeTabs = [
+                        ComposeTabState(id: tabID, name: "Cursor Deferred Routing")
+                    ]
+                }
+                window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = tabID }
                 await window.workspaceManager.switchWorkspace(
                     to: window.workspaceManager.workspaces[workspaceIndex],
                     saveState: false,

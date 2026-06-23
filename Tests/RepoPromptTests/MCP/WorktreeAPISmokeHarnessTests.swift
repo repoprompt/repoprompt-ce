@@ -1,4 +1,3 @@
-import CoreServices
 import Foundation
 import MCP
 @testable import RepoPrompt
@@ -174,9 +173,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             rootID: physicalRootID,
             events: [(
                 absolutePath: searchCreatedFile.path,
-                flags: FSEventStreamEventFlags(
-                    kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
-                ),
+                flags: [.itemCreated, .itemIsFile],
                 eventId: 9_000_000_000_000_000_000
             )]
         )

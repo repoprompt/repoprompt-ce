@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import MCP
+import RepoPromptCore
 
 #if DEBUG
     private func tabContextLog(_ message: @autoclosure () -> String) {
@@ -287,6 +288,19 @@ extension MCPServerViewModel {
         let tabID: UUID
         let workspaceID: UUID?
         let windowID: Int?
+        let admittedBinding: MCPAdmittedContextBinding?
+
+        init(
+            tabID: UUID,
+            workspaceID: UUID?,
+            windowID: Int?,
+            admittedBinding: MCPAdmittedContextBinding? = nil
+        ) {
+            self.tabID = tabID
+            self.workspaceID = workspaceID
+            self.windowID = windowID
+            self.admittedBinding = admittedBinding
+        }
     }
 
     enum TabContextResolutionPolicy: Equatable {
@@ -716,39 +730,18 @@ extension MCPServerViewModel {
                         return
                     }
 
-                    // 3) Merge snapshot into bound context, but preserve manual codemap mode once set.
+                    // 3) Keep connection-owned selection snapshots frozen. Selection reads
+                    // stabilize a local copy from canonical state, and selection mutations
+                    // update only their owning connection after persistence succeeds.
                     guard var bound = self.tabContextByConnectionID[connectionID] else { return }
-                    var incomingSelection = snapshot.selection
 
-                    // Preserve manual=false stickiness
-                    let wasManual = (bound.selection.codemapAutoEnabled == false)
-                    if wasManual && incomingSelection.codemapAutoEnabled == true {
-                        incomingSelection = StoredSelection(
-                            selectedPaths: incomingSelection.selectedPaths,
-                            autoCodemapPaths: incomingSelection.autoCodemapPaths,
-                            slices: incomingSelection.slices,
-                            codemapAutoEnabled: false
-                        )
-                        // DON'T call commitTabContext here - it creates an infinite loop!
-                        // The bound context correction is enough; next operation will sync to UI.
-                        tabContextLog("preserved manual mode on snapshot connectionID=\(connectionID) tab=\(context.tabID)")
-                    }
-
-                    // 4) Apply if changed
-                    let selectionChanged = bound.selection != incomingSelection
+                    // 4) Apply non-selection presentation changes if needed.
                     let promptChanged = bound.promptText != snapshot.promptText
                     let metaChanged = bound.selectedMetaPromptIDs != snapshot.selectedMetaPromptIDs
                     let nameChanged = bound.tabName != snapshot.name
                     let sessionChanged = bound.runID == nil
                         && bound.activeAgentSessionID != snapshot.activeAgentSessionID
-                    if selectionChanged || promptChanged || metaChanged || nameChanged || sessionChanged {
-                        bound.selection = incomingSelection
-                        if let workspaceID = bound.workspaceID {
-                            bound.selectionRevision = manager.selectionRevisionForMCP(
-                                workspaceID: workspaceID,
-                                tabID: bound.tabID
-                            )
-                        }
+                    if promptChanged || metaChanged || nameChanged || sessionChanged {
                         bound.promptText = snapshot.promptText
                         bound.selectedMetaPromptIDs = snapshot.selectedMetaPromptIDs
                         bound.tabName = snapshot.name
@@ -761,8 +754,11 @@ extension MCPServerViewModel {
                             self.pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
                         }
                         self.tabContextByConnectionID[connectionID] = bound
-                        tabContextLog("applied snapshot connectionID=\(connectionID) tab=\(context.tabID) selCount=\(incomingSelection.selectedPaths.count) promptChars=\(snapshot.promptText.count)")
+                        tabContextLog("applied snapshot connectionID=\(connectionID) tab=\(context.tabID) promptChars=\(snapshot.promptText.count)")
                     }
+                    #if DEBUG
+                        self.tabContextMirrorSnapshotHandledForTesting?(connectionID)
+                    #endif
                 }
             }
             .store(in: &bag)
@@ -1424,6 +1420,9 @@ extension MCPServerViewModel {
         /// This is not a sticky connection binding; resolvers validate it against any
         /// existing binding and otherwise use it for this call only.
         let tabContextHint: TabContextHint?
+        /// Exact request-scoped workspace-session admission. Unlike a window hint, this
+        /// capability cannot be reacquired or retargeted by downstream tool code.
+        let admittedBinding: MCPAdmittedContextBinding?
         /// Dispatcher-validated provenance for a one-shot hidden `_windowID`.
         /// This is distinct from effective or persisted connection affinity.
         let explicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
@@ -1434,6 +1433,7 @@ extension MCPServerViewModel {
             windowID: Int?,
             runPurpose: MCPRunPurpose? = nil,
             tabContextHint: TabContextHint? = nil,
+            admittedBinding: MCPAdmittedContextBinding? = nil,
             explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil
         ) {
             self.connectionID = connectionID
@@ -1441,6 +1441,7 @@ extension MCPServerViewModel {
             self.windowID = windowID
             self.runPurpose = runPurpose
             self.tabContextHint = tabContextHint
+            self.admittedBinding = admittedBinding
             self.explicitWindowRoutingHint = explicitWindowRoutingHint
         }
     }
@@ -1464,6 +1465,7 @@ extension MCPServerViewModel {
             windowID: service.currentRequestWindowID(),
             runPurpose: runPurpose,
             tabContextHint: ServerNetworkManager.currentTabContextHint,
+            admittedBinding: ServerNetworkManager.currentAdmittedContextBinding,
             explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint()
         )
     }
@@ -1475,11 +1477,29 @@ extension MCPServerViewModel {
         toolName: String = "unknown",
         policy: TabContextResolutionPolicy
     ) throws -> TabContextResolution {
-        try resolveTabContext(
+        let resolvedHint = explicitHint ?? metadata.tabContextHint
+        if let hintedBinding = resolvedHint?.admittedBinding,
+           let requestBinding = metadata.admittedBinding,
+           hintedBinding != requestBinding
+        {
+            throw MCPError.invalidParams(
+                "The tab-context admission does not match the request workspace session."
+            )
+        }
+        if let admittedBinding = resolvedHint?.admittedBinding ?? metadata.admittedBinding {
+            guard let admittedWindow = WindowStatesManager.shared.window(withID: admittedBinding.windowID),
+                  admittedBinding.isCurrent(in: admittedWindow)
+            else {
+                throw MCPError.invalidParams(
+                    "The admitted workspace session changed before \(toolName) executed; the request was not retargeted."
+                )
+            }
+        }
+        return try resolveTabContext(
             connectionID: metadata.connectionID,
             clientName: metadata.clientName,
             providedWindowID: metadata.windowID,
-            explicitHint: explicitHint ?? metadata.tabContextHint,
+            explicitHint: resolvedHint,
             toolName: toolName,
             policy: policy,
             runPurpose: metadata.runPurpose
@@ -1638,6 +1658,24 @@ extension MCPServerViewModel {
         case persisted
         case unchanged
         case unavailable
+        case notCommitted(WorkspaceSelectionMutationDisposition)
+
+        var committed: Bool {
+            self == .persisted || self == .unchanged
+        }
+
+        var diagnosticDescription: String {
+            switch self {
+            case .persisted:
+                "persisted"
+            case .unchanged:
+                "unchanged"
+            case .unavailable:
+                "unavailable"
+            case let .notCommitted(disposition):
+                "not committed (\(disposition))"
+            }
+        }
     }
 
     struct PrimaryGitArtifactCommitResult: Equatable {
@@ -1659,7 +1697,7 @@ extension MCPServerViewModel {
         let canonicalSelection: StoredSelection?
 
         var isVerified: Bool {
-            canonicalSelection == expectedSelection
+            outcome.committed && canonicalSelection == expectedSelection
         }
     }
 
@@ -1682,19 +1720,26 @@ extension MCPServerViewModel {
     ) async -> MCPSelectionCoordinatorPersistenceResult {
         guard let workspaceID, let selectionCoordinator else { return .unavailable }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID)
-        guard let current = selectionCoordinator.selectionSnapshot(
+        guard selectionCoordinator.selectionSnapshot(
             for: identity,
             flushPendingUIIfActive: false
-        ) else { return .unavailable }
-        let outcome: MCPSelectionCoordinatorPersistenceResult = current.selection == selection ? .unchanged : .persisted
-        _ = await selectionCoordinator.persistSelection(
+        ) != nil else { return .unavailable }
+        let mutationOutcome = await selectionCoordinator.persistSelectionOutcome(
             selection,
             for: identity,
             source: .mcpTabContext,
             mirrorToUIIfActive: mirrorToUIIfActive,
-            expectedCurrentSelection: expectedCurrentSelection
+            expectedCurrentSelection: expectedCurrentSelection,
+            retryGenerationStaleOnce: true
         )
-        return outcome
+        switch mutationOutcome.disposition {
+        case .committed:
+            return .persisted
+        case .unchanged:
+            return .unchanged
+        default:
+            return .notCommitted(mutationOutcome.disposition)
+        }
     }
 
     @MainActor
@@ -1746,8 +1791,10 @@ extension MCPServerViewModel {
     }
 
     @MainActor
-    private func persistenceSafeTabContext(_ context: TabContextSnapshot) async -> TabContextSnapshot {
-        let lookupContext = await lookupContext(for: context)
+    private func persistenceSafeTabContext(
+        _ context: TabContextSnapshot,
+        lookupContext: WorkspaceLookupContext
+    ) -> TabContextSnapshot {
         var persisted = context
         persisted.selection = Self.logicalizeSelectionForPersistence(context.selection, lookupContext: lookupContext)
         return persisted
@@ -1758,10 +1805,15 @@ extension MCPServerViewModel {
     func persistResolvedTabContextSnapshot(
         _ resolved: ResolvedTabContextSnapshot,
         metadata: RequestMetadata,
-        mutated: Bool
+        mutated: Bool,
+        expectedCurrentSelection: StoredSelection? = nil
     ) async -> MCPSelectionPersistenceVerification? {
         guard mutated else { return nil }
-        let context = await persistenceSafeTabContext(resolved.snapshot)
+        let lookupContext = await lookupContext(for: resolved.snapshot)
+        let context = persistenceSafeTabContext(resolved.snapshot, lookupContext: lookupContext)
+        let expectedSelection = expectedCurrentSelection.map {
+            Self.logicalizeSelectionForPersistence($0, lookupContext: lookupContext)
+        }
         // The visible file-tree UI is backed by logical workspace roots. Mirroring a
         // worktree-only selection through it would drop paths that exist only in the bound root.
         var verification = await Self.persistMCPSelectionAndVerifyThroughCoordinator(
@@ -1769,23 +1821,30 @@ extension MCPServerViewModel {
             for: context.tabID,
             workspaceID: context.workspaceID,
             selectionCoordinator: selectionCoordinator,
-            mirrorToUIIfActive: context.worktreeBindings.isEmpty
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty,
+            expectedCurrentSelection: expectedSelection
         )
         if verification.outcome == .unavailable {
-            await commitTabContext(selectionOnlyCommitContext(from: context))
+            var fallbackCommitted = false
+            if workspaceManager?.selectedWorkspaceSessionID == nil {
+                fallbackCommitted = await commitTabContext(
+                    selectionOnlyCommitContext(from: context)
+                ) != nil
+            }
+            let canonicalSelection = canonicalPersistedSelection(
+                for: context.tabID,
+                workspaceID: context.workspaceID
+            )
             verification = MCPSelectionPersistenceVerification(
-                outcome: .unavailable,
+                outcome: fallbackCommitted && canonicalSelection == context.selection ? .persisted : .unavailable,
                 expectedSelection: context.selection,
-                canonicalSelection: canonicalPersistedSelection(
-                    for: context.tabID,
-                    workspaceID: context.workspaceID
-                )
+                canonicalSelection: canonicalSelection
             )
         }
 
         if !resolved.usesActiveTabCompatibility,
+           verification.isVerified,
            let canonicalSelection = verification.canonicalSelection,
-           canonicalSelection == verification.expectedSelection,
            let connectionID = metadata.connectionID,
            let latest = tabContextByConnectionID[connectionID],
            latest.tabID == context.tabID,
@@ -1891,18 +1950,21 @@ extension MCPServerViewModel {
             }
             guard let refreshedTarget = currentReadFileAutoSelectionTab(for: contextKey) else { return nil }
             if verification.outcome == .unavailable {
+                // Selected-session composition must fail closed; it never falls back to a
+                // direct manager write after an expected-revision command was unavailable.
+                guard refreshedTarget.manager.selectedWorkspaceSessionID == nil else { return nil }
                 guard refreshedTarget.tab.selection == expectedBaseSelection else { return nil }
                 var updatedTab = refreshedTarget.tab
                 updatedTab.selection = persistedSelection
                 updatedTab.lastModified = Date()
-                await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
-                    _ = refreshedTarget.manager.updateComposeTabStoredOnly(
+                let fallbackCommitted = await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalStoredCommit) {
+                    refreshedTarget.manager.updateComposeTabStoredOnly(
                         updatedTab,
                         inWorkspaceID: refreshedTarget.identity.workspaceID
                     )
                 }
                 verification = MCPSelectionPersistenceVerification(
-                    outcome: .unavailable,
+                    outcome: fallbackCommitted ? .persisted : .unavailable,
                     expectedSelection: persistedSelection,
                     canonicalSelection: currentReadFileAutoSelectionTab(for: contextKey)?.tab.selection
                 )
@@ -2544,6 +2606,9 @@ extension MCPServerViewModel {
             compareIntent: .uncommittedHEAD,
             displayContext: target.displayContext
         )
+        guard let workspaceSessionQuery else {
+            throw ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot
+        }
         _ = try await ContextBuilderReviewTargetResolver().finalizeSelection(
             input: ContextBuilderReviewTargetInput(
                 workspaceID: workspaceID,
@@ -2554,7 +2619,7 @@ extension MCPServerViewModel {
                 reviewGitContext: reviewContext
             ),
             initialResolution: .available(target),
-            store: promptVM.workspaceFileContextStore
+            query: workspaceSessionQuery
         )
     }
 
@@ -2586,13 +2651,19 @@ extension MCPServerViewModel {
 
         let hasValidatedExplicitWindowRoute: Bool
         if let explicitWindowRoutingHint {
+            let exactAdapterRouteMatches: Bool = if let ticket = explicitWindowRoutingHint.runtimeAdapterTicket {
+                ticket.runtimeID == targetWindow.workspaceRuntimeID
+                    && RepoPromptAppCoreContainer.shared.runtimeAdapterRegistry?.adapter(for: ticket) != nil
+            } else {
+                explicitWindowRoutingHint.windowStateIdentity == ObjectIdentifier(targetWindow)
+                    && explicitWindowRoutingHint.serverViewModelIdentity == ObjectIdentifier(targetWindow.mcpServer)
+            }
             guard explicitWindowRoutingHint.connectionID == metadata.connectionID,
                   explicitWindowRoutingHint.toolName == "agent_run",
                   explicitWindowRoutingHint.provenance == .hiddenWindowArgument,
                   explicitWindowRoutingHint.windowID == metadata.windowID,
                   explicitWindowRoutingHint.windowID == targetWindow.windowID,
-                  explicitWindowRoutingHint.windowStateIdentity == ObjectIdentifier(targetWindow),
-                  explicitWindowRoutingHint.serverViewModelIdentity == ObjectIdentifier(targetWindow.mcpServer)
+                  exactAdapterRouteMatches
             else {
                 throw MCPError.invalidParams(
                     "agent_run.start received an explicit window route that does not match its authorized connection, tool, effective window, or target window."
@@ -2969,7 +3040,8 @@ extension MCPServerViewModel {
             connectionID: connectionID,
             clientName: service.currentRequestClientName(),
             windowID: service.currentRequestWindowID(),
-            tabContextHint: ServerNetworkManager.currentTabContextHint
+            tabContextHint: ServerNetworkManager.currentTabContextHint,
+            admittedBinding: ServerNetworkManager.currentAdmittedContextBinding
         )
         let purpose = await ServerNetworkManager.shared.runPurpose(for: connectionID)
 
@@ -4267,10 +4339,45 @@ extension MCPServerViewModel {
             updatedTab.activeSubView = promptVM.storedActiveSubView
         }
 
-        // 1) Persist to backing store without publishing UI snapshots (prevents tool echo)
+        // 1) Persist through the selected command ingress without publishing UI snapshots.
         guard isStillCurrent(), !Task.isCancelled else { return nil }
-        guard manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID) else { return nil }
         let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        if manager.selectedWorkspaceSessionID != nil {
+            guard let admittedBinding = ServerNetworkManager.currentAdmittedContextBinding,
+                  admittedBinding.windowID == context.windowID,
+                  admittedBinding.tabID == nil || admittedBinding.tabID == context.tabID,
+                  let admittedWindow = WindowStatesManager.shared.window(withID: context.windowID),
+                  admittedBinding.isCurrent(in: admittedWindow)
+            else { return nil }
+            let expectedRevision = manager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: context.tabID
+            )
+            let command = WorkspaceSessionCommand.selectionAndPatch(
+                WorkspaceSelectionAndTabPatchCommand(
+                    selection: WorkspaceSelectionCommand(
+                        workspaceID: workspaceID,
+                        tabID: context.tabID,
+                        expectedRevision: expectedRevision,
+                        selection: updatedTab.selection
+                    ),
+                    patch: ComposeTabNonSelectionPatch(tab: updatedTab)
+                )
+            )
+            guard let result = await admittedBinding.execute(
+                command,
+                source: "mcp-commit-tab-context",
+                in: admittedWindow
+            ) else { return nil }
+            switch result {
+            case .committed, .unchanged:
+                break
+            case .stale, .notReady, .rejected, .failed:
+                return nil
+            }
+        } else {
+            guard manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID) else { return nil }
+        }
         guard let storedTab = manager.composeTab(for: identity),
               storedTab.selection == updatedTab.selection
         else { return nil }

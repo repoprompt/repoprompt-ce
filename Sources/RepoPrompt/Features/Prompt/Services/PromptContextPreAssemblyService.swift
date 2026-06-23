@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 enum SelectedGitDiffArtifactPolicy {
     case includeBeforeGitInclusion
@@ -8,8 +9,15 @@ enum SelectedGitDiffArtifactPolicy {
 struct PromptContextPreAssemblyRequest {
     let cfg: PromptContextResolved
     let selection: StoredSelection
-    let store: WorkspaceFileContextStore
+    /// App-owned artifact authorization receives only exact frozen-root catalog operations.
+    let authorizationCatalog: any PromptGitAuthorizationCatalogReading
+    #if DEBUG
+        /// XCTest-only compatibility for legacy callers that intentionally omit a provider.
+        let debugAuthorizationStore: WorkspaceFileContextStore
+    #endif
     let lookupContext: WorkspaceLookupContext
+    let factualProvider: (any PromptFactualContextProviding)?
+    let admissionToken: WorkspaceSessionAdmissionToken?
     let filePathDisplay: FilePathDisplay
     let onlyIncludeRootsWithSelectedFiles: Bool
     let includeFileTreeLegend: Bool
@@ -18,13 +26,13 @@ struct PromptContextPreAssemblyRequest {
     let entryResolutionProfile: PathLocateProfile
     let selectedGitDiffFolderPolicy: SelectedGitDiffFolderPolicy
     let selectedGitDiffLookupProfile: PathLocateProfile
-    /// Compatibility input retained for callers that previously requested hidden local-definition discovery.
-    /// Canonical codemap inclusion is now controlled exclusively by `selection.autoCodemapPaths`.
+    let factualIngressPolicy: PromptFactualIngressPolicy
     let includeLocalDefinitionsInFileTree: Bool
     let selectedGitDiffArtifactPolicy: SelectedGitDiffArtifactPolicy
     let reviewGitContext: FrozenPromptGitReviewContext
     let sourceTabID: UUID?
     let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
+    let sessionQuery: WorkspaceSessionQueryCapability?
     let selectedGitDiffProvider: (AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult
     let completeGitDiffProvider: () async -> String?
 
@@ -32,7 +40,10 @@ struct PromptContextPreAssemblyRequest {
         cfg: PromptContextResolved,
         selection: StoredSelection,
         store: WorkspaceFileContextStore,
+        authorizationCatalog: (any PromptGitAuthorizationCatalogReading)? = nil,
         lookupContext: WorkspaceLookupContext,
+        factualProvider: (any PromptFactualContextProviding)? = nil,
+        admissionToken: WorkspaceSessionAdmissionToken? = nil,
         filePathDisplay: FilePathDisplay,
         onlyIncludeRootsWithSelectedFiles: Bool,
         includeFileTreeLegend: Bool = true,
@@ -41,18 +52,31 @@ struct PromptContextPreAssemblyRequest {
         entryResolutionProfile: PathLocateProfile = .uiAssisted,
         selectedGitDiffFolderPolicy: SelectedGitDiffFolderPolicy,
         selectedGitDiffLookupProfile: PathLocateProfile? = nil,
+        factualIngressPolicy: PromptFactualIngressPolicy = .awaitPending,
         includeLocalDefinitionsInFileTree: Bool = false,
         selectedGitDiffArtifactPolicy: SelectedGitDiffArtifactPolicy = .includeBeforeGitInclusion,
         reviewGitContext: FrozenPromptGitReviewContext,
         sourceTabID: UUID? = nil,
         finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil,
+        sessionQuery: WorkspaceSessionQueryCapability? = nil,
         selectedGitDiffProvider: @escaping (AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult,
         completeGitDiffProvider: @escaping () async -> String?
     ) {
         self.cfg = cfg
         self.selection = selection
-        self.store = store
+        #if DEBUG
+            debugAuthorizationStore = store
+            let effectiveSessionQuery = sessionQuery
+                ?? WorkspaceSessionStoreLifecycleFactory.makeQueryCapability(store: store)
+            self.sessionQuery = effectiveSessionQuery
+            self.authorizationCatalog = authorizationCatalog ?? effectiveSessionQuery
+        #else
+            self.sessionQuery = sessionQuery
+            self.authorizationCatalog = authorizationCatalog ?? store
+        #endif
         self.lookupContext = lookupContext
+        self.factualProvider = factualProvider
+        self.admissionToken = admissionToken
         self.filePathDisplay = filePathDisplay
         self.onlyIncludeRootsWithSelectedFiles = onlyIncludeRootsWithSelectedFiles
         self.includeFileTreeLegend = includeFileTreeLegend
@@ -61,6 +85,7 @@ struct PromptContextPreAssemblyRequest {
         self.entryResolutionProfile = entryResolutionProfile
         self.selectedGitDiffFolderPolicy = selectedGitDiffFolderPolicy
         self.selectedGitDiffLookupProfile = selectedGitDiffLookupProfile ?? entryResolutionProfile
+        self.factualIngressPolicy = factualIngressPolicy
         self.includeLocalDefinitionsInFileTree = includeLocalDefinitionsInFileTree
         self.selectedGitDiffArtifactPolicy = selectedGitDiffArtifactPolicy
         self.reviewGitContext = reviewGitContext
@@ -79,38 +104,111 @@ enum PromptGitDiffResolution: Equatable {
 
     var text: String? {
         switch self {
-        case .none:
-            nil
-        case let .selectedArtifact(text):
-            text
-        case let .automatic(result):
-            result.text
-        case let .complete(text):
-            text
+        case .none: nil
+        case let .selectedArtifact(text): text
+        case let .automatic(result): result.text
+        case let .complete(text): text
         }
     }
 }
 
 struct PromptContextPreAssemblyResult {
-    let physicalSelection: StoredSelection
-    let entries: [ResolvedPromptFileEntry]
-    let missingPaths: [String]
-    let invalidPaths: [String]
-    let codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
-    let fileTreeContent: String?
-    let gitDiff: String?
+    let factualSnapshot: PromptFactualContextSnapshot
     let gitDiffResolution: PromptGitDiffResolution
     let selectedGitArtifactDispositions: [SelectedGitArtifactDisposition]
-    let lookupContext: WorkspaceLookupContext
-    let filePathDisplay: FilePathDisplay
+    #if DEBUG
+        let debugPhysicalSelection: StoredSelection
+        let debugEntries: [ResolvedPromptFileEntry]
+        let debugCodemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
+        let debugLookupContext: WorkspaceLookupContext
+        let debugFilePathDisplay: FilePathDisplay
+    #endif
 
-    func displayPath(for entry: ResolvedPromptFileEntry) -> String? {
-        lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-            forPhysicalPath: entry.file.standardizedFullPath,
-            display: filePathDisplay
-        )
+    var rendered: PromptFactualRenderedSections {
+        factualSnapshot.rendered
+    }
+
+    var fileTreeContent: String? {
+        factualSnapshot.rendered.fileTreeContent
+    }
+
+    var gitDiff: String? {
+        gitDiffResolution.text
     }
 }
+
+#if DEBUG
+    extension PromptContextPreAssemblyResult {
+        var physicalSelection: StoredSelection {
+            debugPhysicalSelection
+        }
+
+        var entries: [ResolvedPromptFileEntry] {
+            debugEntries
+        }
+
+        var codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle {
+            debugCodemapSnapshotBundle
+        }
+
+        func displayPath(for entry: ResolvedPromptFileEntry) -> String? {
+            debugLookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: entry.file.standardizedFullPath,
+                display: debugFilePathDisplay
+            )
+        }
+    }
+#endif
+
+enum PromptContextPreAssemblyOutcome {
+    case ready(PromptContextPreAssemblyResult)
+    case unavailable(PromptFactualCaptureFailure)
+    case cancelled
+}
+
+#if DEBUG
+    extension PromptContextPreAssemblyOutcome {
+        private var debugReady: PromptContextPreAssemblyResult? {
+            guard case let .ready(result) = self else { return nil }
+            return result
+        }
+
+        var physicalSelection: StoredSelection {
+            debugReady?.debugPhysicalSelection ?? StoredSelection()
+        }
+
+        var entries: [ResolvedPromptFileEntry] {
+            debugReady?.debugEntries ?? []
+        }
+
+        var codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle {
+            debugReady?.debugCodemapSnapshotBundle ?? .empty
+        }
+
+        var fileTreeContent: String? {
+            debugReady?.fileTreeContent
+        }
+
+        var gitDiff: String? {
+            debugReady?.gitDiff
+        }
+
+        var gitDiffResolution: PromptGitDiffResolution {
+            debugReady?.gitDiffResolution ?? .none
+        }
+
+        var selectedGitArtifactDispositions: [SelectedGitArtifactDisposition] {
+            debugReady?.selectedGitArtifactDispositions ?? []
+        }
+
+        func displayPath(for entry: ResolvedPromptFileEntry) -> String? {
+            debugReady?.debugLookupContext.bindingProjection?.projectedLogicalDisplayPath(
+                forPhysicalPath: entry.file.standardizedFullPath,
+                display: debugReady?.debugFilePathDisplay ?? .relative
+            )
+        }
+    }
+#endif
 
 enum PromptContextPreAssemblyService {
     private struct ArtifactSnapshotEntry: Equatable {
@@ -118,13 +216,15 @@ enum PromptContextPreAssemblyService {
         let content: String?
     }
 
-    static func resolve(_ request: PromptContextPreAssemblyRequest) async -> PromptContextPreAssemblyResult {
+    static func resolve(
+        _ request: PromptContextPreAssemblyRequest
+    ) async -> PromptContextPreAssemblyOutcome {
         precondition(
             request.finalReviewAuthorization == nil,
             "Strict Context Builder review packaging must use resolveStrict"
         )
         let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
-        let artifactAuthorization = await authorizeSelectedGitArtifacts(
+        let authorization = await authorizeSelectedGitArtifacts(
             request: request,
             physicalSelection: physicalSelection
         )
@@ -132,93 +232,143 @@ enum PromptContextPreAssemblyService {
             return try await resolveCore(
                 request,
                 physicalSelection: physicalSelection,
-                artifactAuthorization: artifactAuthorization
+                authorization: authorization
             )
         } catch {
-            preconditionFailure("Non-strict prompt preassembly unexpectedly failed: \(error)")
+            return .unavailable(.invalidFrozenInput)
         }
     }
 
     static func resolveStrict(
         _ request: PromptContextPreAssemblyRequest
     ) async throws -> PromptContextPreAssemblyResult {
-        guard let authorization = request.finalReviewAuthorization else {
-            return await resolve(request)
+        guard let finalAuthorization = request.finalReviewAuthorization else {
+            return try await unwrap(resolve(request))
         }
         let physicalSelection = request.lookupContext.physicalizeSelection(request.selection)
-        let artifactAuthorization = try await validateStrictAuthorization(
+        let initialAuthorization = try await validateStrictAuthorization(
             request: request,
             physicalSelection: physicalSelection,
-            authorization: authorization
+            authorization: finalAuthorization
         )
-        let result = try await resolveCore(
+        let result = try await unwrap(resolveCore(
             request,
             physicalSelection: physicalSelection,
-            artifactAuthorization: artifactAuthorization
-        )
+            authorization: initialAuthorization
+        ))
         let finalArtifactAuthorization = try await validateStrictAuthorization(
             request: request,
             physicalSelection: physicalSelection,
-            authorization: authorization
+            authorization: finalAuthorization
         )
-        guard artifactSnapshot(finalArtifactAuthorization) == artifactSnapshot(artifactAuthorization) else {
+        guard artifactSnapshot(finalArtifactAuthorization) == artifactSnapshot(initialAuthorization) else {
             throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
-                count: authorization.selectedArtifactAuthorizations.count
+                count: finalAuthorization.selectedArtifactAuthorizations.count
             )
         }
         return result
     }
 
+    private static func unwrap(
+        _ outcome: PromptContextPreAssemblyOutcome
+    ) throws -> PromptContextPreAssemblyResult {
+        switch outcome {
+        case let .ready(result): result
+        case let .unavailable(failure): throw PromptFactualPackagingError.unavailable(failure)
+        case .cancelled: throw PromptFactualPackagingError.cancelled
+        }
+    }
+
     private static func resolveCore(
         _ request: PromptContextPreAssemblyRequest,
         physicalSelection: StoredSelection,
-        artifactAuthorization: SelectedGitArtifactAuthorizationResult
-    ) async throws -> PromptContextPreAssemblyResult {
-        let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
-        let ordinarySelection = selection(
-            physicalSelection,
-            excluding: artifactAuthorization.consumedSelectionPaths
-        )
-        let codemapSnapshotBundle = await request.store.codemapSnapshotBundle(
-            rootScope: ordinaryRootScope
-        )
-        let accountingService = PromptContextAccountingService()
-        let resolution = await accountingService.resolveEntries(
-            selection: ordinarySelection,
-            store: request.store,
-            rootScope: ordinaryRootScope,
-            profile: request.entryResolutionProfile,
-            codeMapUsage: request.codeMapUsage,
-            codemapSnapshotBundle: codemapSnapshotBundle
-        )
-        let fileTreeContent = await resolveFileTreeContent(
-            request: request,
-            physicalSelection: ordinarySelection,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            rootScope: ordinaryRootScope
-        )
-        let allEntries = artifactAuthorization.entries + resolution.entries
-        let gitDiffResolution = try await resolveGitDiff(
-            request: request,
-            physicalSelection: ordinarySelection,
-            entries: allEntries,
-            rootScope: ordinaryRootScope
-        )
-        let packagingEntries = entriesForPackaging(request: request, entries: allEntries)
+        authorization: SelectedGitArtifactAuthorizationResult
+    ) async throws -> PromptContextPreAssemblyOutcome {
+        let frozenArtifacts: PromptAuthorizedArtifactBatch
+        do {
+            frozenArtifacts = try FrozenAuthorizedGitArtifactAdapter.freeze(authorization)
+        } catch {
+            return .unavailable(.invalidFrozenInput)
+        }
 
-        return PromptContextPreAssemblyResult(
-            physicalSelection: physicalSelection,
-            entries: packagingEntries,
-            missingPaths: resolution.missingPaths,
-            invalidPaths: resolution.invalidPaths,
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            fileTreeContent: fileTreeContent,
-            gitDiff: gitDiffResolution.text,
-            gitDiffResolution: gitDiffResolution,
-            selectedGitArtifactDispositions: artifactAuthorization.dispositions,
-            lookupContext: request.lookupContext,
-            filePathDisplay: request.filePathDisplay
+        let projection = request.lookupContext.bindingProjection?.frozenPromptProjection()
+        let ordinaryRootScope = request.lookupContext.rootScope.excludingWorkspaceGitData
+        let factualRequest = PromptFactualCaptureRequest(
+            selection: request.selection,
+            rootScope: ordinaryRootScope,
+            projection: projection,
+            filePathDisplay: request.filePathDisplay,
+            codeMapUsage: request.codeMapUsage,
+            entryResolutionProfile: request.entryResolutionProfile,
+            rendersFileTree: request.cfg.rendersFileTree,
+            fileTreeMode: WorkspaceFileTreeSnapshotMode(fileTreeOption: request.cfg.effectiveFileTreeMode),
+            onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
+            includeFileTreeLegend: request.includeFileTreeLegend,
+            showCodeMapMarkers: request.showCodeMapMarkers,
+            authorizedArtifactBatch: frozenArtifacts,
+            selectedDiffFolderPolicy: request.selectedGitDiffFolderPolicy == .filesOnly ? .filesOnly : .expandFolders,
+            selectedDiffLookupProfile: request.selectedGitDiffLookupProfile,
+            ingressPolicy: request.factualIngressPolicy
         )
+
+        let factualOutcome: PromptFactualCaptureOutcome
+        if let provider = request.factualProvider {
+            factualOutcome = await provider.capture(factualRequest, admission: request.admissionToken)
+        } else {
+            #if DEBUG
+                // XCTest-only compatibility seam. Every production caller supplies the
+                // construction-selected provider; release builds fail closed here.
+                let first = await PromptFactualContextCaptureService.capture(
+                    request: factualRequest,
+                    store: request.debugAuthorizationStore
+                )
+                if case .unavailable(.staleGeneration) = first {
+                    factualOutcome = await PromptFactualContextCaptureService.capture(
+                        request: factualRequest,
+                        store: request.debugAuthorizationStore
+                    )
+                } else {
+                    factualOutcome = first
+                }
+            #else
+                factualOutcome = .unavailable(.notReady)
+            #endif
+        }
+
+        switch factualOutcome {
+        case .cancelled:
+            return .cancelled
+        case let .unavailable(failure):
+            return .unavailable(failure)
+        case let .ready(snapshot):
+            let resolution = try await resolveGitDiff(request: request, snapshot: snapshot)
+            #if DEBUG
+                let debugCompatibility = await debugCompatibilityCapture(
+                    request: request,
+                    physicalSelection: physicalSelection,
+                    authorization: authorization
+                )
+            #endif
+            #if DEBUG
+                let result = PromptContextPreAssemblyResult(
+                    factualSnapshot: snapshot,
+                    gitDiffResolution: resolution,
+                    selectedGitArtifactDispositions: authorization.dispositions,
+                    debugPhysicalSelection: physicalSelection,
+                    debugEntries: debugCompatibility.entries,
+                    debugCodemapSnapshotBundle: debugCompatibility.codemaps,
+                    debugLookupContext: request.lookupContext,
+                    debugFilePathDisplay: request.filePathDisplay
+                )
+            #else
+                let result = PromptContextPreAssemblyResult(
+                    factualSnapshot: snapshot,
+                    gitDiffResolution: resolution,
+                    selectedGitArtifactDispositions: authorization.dispositions
+                )
+            #endif
+            return .ready(result)
+        }
     }
 
     private static func validateStrictAuthorization(
@@ -226,6 +376,9 @@ enum PromptContextPreAssemblyService {
         physicalSelection: StoredSelection,
         authorization: ContextBuilderFinalReviewAuthorization
     ) async throws -> SelectedGitArtifactAuthorizationResult {
+        guard let sessionQuery = request.sessionQuery else {
+            throw ContextBuilderReviewTargetUnavailableReason.staleWorkspaceRoot
+        }
         guard request.sourceTabID == authorization.tabID,
               request.selection == authorization.committedSelection,
               request.lookupContext == authorization.lookupContext,
@@ -248,7 +401,7 @@ enum PromptContextPreAssemblyService {
 
         if let reason = await ContextBuilderReviewTargetResolver().revalidate(
             authorization.target,
-            store: request.store
+            query: sessionQuery
         ) {
             throw reason
         }
@@ -266,9 +419,7 @@ enum PromptContextPreAssemblyService {
             }
             return StandardizedPath.absolute(trimmed)
         })
-        let expectedIdentities = Set(
-            authorization.selectedArtifactAuthorizations.map(\.absolutePath)
-        )
+        let expectedIdentities = Set(authorization.selectedArtifactAuthorizations.map(\.absolutePath))
         guard candidateIdentities == expectedIdentities else {
             throw ContextBuilderReviewTargetUnavailableReason.unauthorizedSelectedArtifact(
                 count: max(candidateIdentities.count, expectedIdentities.count)
@@ -281,7 +432,7 @@ enum PromptContextPreAssemblyService {
                 SelectedGitArtifactAuthorizationRequest(
                     physicalSelection: physicalSelection,
                     capability: capability,
-                    store: request.store,
+                    store: request.authorizationCatalog,
                     delegationConsumer: request.reviewGitContext.artifactDelegationConsumer
                 )
             )
@@ -323,10 +474,9 @@ enum PromptContextPreAssemblyService {
                 count: max(actualAuthorizations.count, expectedAuthorizations.count)
             )
         }
-
         if let reason = await ContextBuilderReviewTargetResolver().revalidate(
             authorization.target,
-            store: request.store
+            query: sessionQuery
         ) {
             throw reason
         }
@@ -337,12 +487,7 @@ enum PromptContextPreAssemblyService {
         _ authorization: SelectedGitArtifactAuthorizationResult
     ) -> [ArtifactSnapshotEntry] {
         authorization.entries
-            .map {
-                ArtifactSnapshotEntry(
-                    path: $0.file.standardizedFullPath,
-                    content: $0.loadedContent
-                )
-            }
+            .map { ArtifactSnapshotEntry(path: $0.file.standardizedFullPath, content: $0.loadedContent) }
             .sorted { $0.path < $1.path }
     }
 
@@ -361,82 +506,69 @@ enum PromptContextPreAssemblyService {
             SelectedGitArtifactAuthorizationRequest(
                 physicalSelection: physicalSelection,
                 capability: capability,
-                store: request.store,
+                store: request.authorizationCatalog,
                 delegationConsumer: request.reviewGitContext.artifactDelegationConsumer
             )
         )
     }
 
-    private static func selection(
-        _ selection: StoredSelection,
-        excluding consumedPaths: Set<String>
-    ) -> StoredSelection {
-        guard !consumedPaths.isEmpty else { return selection }
-        let normalizedConsumed = Set(consumedPaths.compactMap(StoredSelectionPathNormalization.standardizedPath))
-        func isConsumed(_ path: String) -> Bool {
-            consumedPaths.contains(path)
-                || StoredSelectionPathNormalization.standardizedPath(path).map(normalizedConsumed.contains) == true
+    #if DEBUG
+        private static func debugCompatibilityCapture(
+            request: PromptContextPreAssemblyRequest,
+            physicalSelection: StoredSelection,
+            authorization: SelectedGitArtifactAuthorizationResult
+        ) async -> (entries: [ResolvedPromptFileEntry], codemaps: WorkspaceCodemapSnapshotBundle) {
+            // Only legacy XCTest call sites omit the selected provider. Production debug builds
+            // never perform this second query.
+            guard request.factualProvider == nil else { return ([], .empty) }
+            let normalizedConsumed = Set(
+                authorization.consumedSelectionPaths.compactMap(StoredSelectionPathNormalization.standardizedPath)
+            )
+            func retained(_ path: String) -> Bool {
+                !authorization.consumedSelectionPaths.contains(path)
+                    && StoredSelectionPathNormalization.standardizedPath(path).map {
+                        !normalizedConsumed.contains($0)
+                    } != false
+            }
+            let ordinary = StoredSelection(
+                selectedPaths: physicalSelection.selectedPaths.filter(retained),
+                autoCodemapPaths: physicalSelection.autoCodemapPaths.filter(retained),
+                slices: physicalSelection.slices.filter { retained($0.key) },
+                codemapAutoEnabled: physicalSelection.codemapAutoEnabled
+            )
+            let scope = request.lookupContext.rootScope.excludingWorkspaceGitData
+            let codemaps = await request.debugAuthorizationStore.codemapSnapshotBundle(rootScope: scope)
+            let resolved = await PromptContextAccountingService().resolveEntries(
+                selection: ordinary,
+                store: request.debugAuthorizationStore,
+                rootScope: scope,
+                profile: request.entryResolutionProfile,
+                codeMapUsage: request.codeMapUsage,
+                codemapSnapshotBundle: codemaps
+            )
+            let all = authorization.entries + resolved.entries
+            if request.selectedGitDiffArtifactPolicy == .respectGitInclusion,
+               request.cfg.gitInclusion == .none
+            {
+                return (all.filter { $0.role != .authorizedGitDiffArtifact }, codemaps)
+            }
+            return (all, codemaps)
         }
-        return StoredSelection(
-            selectedPaths: selection.selectedPaths.filter { !isConsumed($0) },
-            autoCodemapPaths: selection.autoCodemapPaths.filter { !isConsumed($0) },
-            slices: selection.slices.filter { !isConsumed($0.key) },
-            codemapAutoEnabled: selection.codemapAutoEnabled
-        )
-    }
-
-    private static func resolveFileTreeContent(
-        request: PromptContextPreAssemblyRequest,
-        physicalSelection: StoredSelection,
-        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
-        rootScope: WorkspaceLookupRootScope
-    ) async -> String? {
-        guard request.cfg.rendersFileTree else { return nil }
-
-        let rawFileTreeSnapshot = await request.store.makeFileTreeSelectionSnapshot(
-            selection: physicalSelection,
-            request: WorkspaceFileTreeSnapshotRequest(
-                mode: WorkspaceFileTreeSnapshotMode(fileTreeOption: request.cfg.effectiveFileTreeMode),
-                filePathDisplay: request.filePathDisplay,
-                onlyIncludeRootsWithSelectedFiles: request.onlyIncludeRootsWithSelectedFiles,
-                includeLegend: request.includeFileTreeLegend,
-                showCodeMapMarkers: request.showCodeMapMarkers,
-                rootScope: rootScope
-            ),
-            codemapSnapshotBundle: codemapSnapshotBundle,
-            profile: request.entryResolutionProfile
-        )
-        let fileTreeSnapshot = request.lookupContext.bindingProjection?.logicalizeFileTreeSnapshot(rawFileTreeSnapshot) ?? rawFileTreeSnapshot
-        let tree = CodeMapExtractor.generateFileTree(using: fileTreeSnapshot)
-        return tree.isEmpty ? nil : tree
-    }
-
-    private static func entriesForPackaging(
-        request: PromptContextPreAssemblyRequest,
-        entries: [ResolvedPromptFileEntry]
-    ) -> [ResolvedPromptFileEntry] {
-        guard request.selectedGitDiffArtifactPolicy == .respectGitInclusion,
-              request.cfg.gitInclusion == .none
-        else { return entries }
-        let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(entries)
-        return codeEntries
-    }
+    #endif
 
     private static func resolveGitDiff(
         request: PromptContextPreAssemblyRequest,
-        physicalSelection: StoredSelection,
-        entries: [ResolvedPromptFileEntry],
-        rootScope: WorkspaceLookupRootScope
+        snapshot: PromptFactualContextSnapshot
     ) async throws -> PromptGitDiffResolution {
-        let (diffEntries, _) = PromptPackagingService.partitionPromptEntriesForGitDiff(entries)
         if request.selectedGitDiffArtifactPolicy == .respectGitInclusion,
            request.cfg.gitInclusion == .none
         {
             return .none
         }
-
-        if let selected = PromptPackagingService.selectedGitDiffText(fromDiffEntries: diffEntries) {
-            return .selectedArtifact(selected)
+        if let selectedPatch = snapshot.rendered.selectedPatchText,
+           !selectedPatch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            return .selectedArtifact(selectedPatch)
         }
 
         switch request.cfg.gitInclusion {
@@ -456,18 +588,13 @@ enum PromptContextPreAssemblyService {
                 }
                 return .automatic(result)
             }
-            let pathResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
-                for: physicalSelection,
-                store: request.store,
-                rootScope: rootScope,
-                folderPolicy: request.selectedGitDiffFolderPolicy,
-                profile: request.selectedGitDiffLookupProfile,
-                allowFilesystemFallback: rootScope.allowsSelectedGitDiffFilesystemFallback,
-                excluding: []
-            )
+            let frozen = snapshot.selectedDiffPathResolution
             let result = await request.selectedGitDiffProvider(
                 AutomaticReviewGitDiffRequest(
-                    pathResolution: pathResolution,
+                    pathResolution: WorkspaceSelectedGitPathResolution(
+                        paths: frozen.paths,
+                        unresolvedCandidates: frozen.unresolvedLogicalCandidates
+                    ),
                     compareIntent: request.reviewGitContext.compareIntent,
                     displayContext: request.reviewGitContext.displayContext
                 )

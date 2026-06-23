@@ -1,0 +1,347 @@
+import RepoPromptCore
+import RepoPromptCoreMacOS
+
+// Phase 2 temporary compatibility aliases.
+// Concrete implementations are owned by RepoPromptCore; these names preserve app call sites
+// until Phase 9 compatibility cleanup.
+
+// MARK: - Phase 3 platform boundaries
+
+typealias FileContentFingerprint = RepoPromptCore.FileContentFingerprint
+typealias SpawnedProcess = RepoPromptCore.SpawnedProcess
+typealias POSIXDescriptorSupport = RepoPromptCoreMacOS.PlatformDescriptorPolicy
+typealias POSIXDescriptorConfigurationError = RepoPromptCoreMacOS.PlatformDescriptorConfigurationError
+typealias FDWriteSupport = RepoPromptCoreMacOS.PlatformFDWriter
+typealias FDWriteError = RepoPromptCoreMacOS.PlatformFDWriteError
+typealias FileSystemWatchEventID = RepoPromptCore.FileSystemWatchEventID
+typealias FileSystemWatchEventFlags = RepoPromptCore.FileSystemWatchEventFlags
+typealias FileSystemWatchEvent = RepoPromptCore.FileSystemWatchEvent
+typealias FileSystemWatchEventPayload = RepoPromptCore.FileSystemWatchEventPayload
+typealias FSEventCallbackEntry = RepoPromptCore.FileSystemWatchEvent
+typealias FSEventCallbackPayload = RepoPromptCore.FileSystemWatchEventPayload
+typealias SecureStorageAccessMode = RepoPromptCore.SecureStorageAccessMode
+typealias SecureStorageAccessReason = RepoPromptCore.SecureStorageAccessReason
+typealias SecureStorageError = RepoPromptCore.SecureStorageError
+typealias KeychainAccessMode = RepoPromptCore.SecureStorageAccessMode
+typealias KeychainAccessReason = RepoPromptCore.SecureStorageAccessReason
+typealias SecureKeyValueStorageBackend = RepoPromptCore.SecureKeyValueStorageBackend
+typealias RuntimeCodeSigningDomain = RepoPromptCore.RuntimeCodeSigningDomain
+typealias RuntimeCodeSigningFailureCategory = RepoPromptCore.RuntimeCodeSigningFailureCategory
+typealias RuntimeCodeSigningValidationResult = RepoPromptCore.RuntimeCodeSigningValidationResult
+typealias RuntimeCodeSigningInfo = RepoPromptCore.RuntimeCodeSigningInfo
+typealias RuntimeValidatedLocalSigningIdentity = RepoPromptCore.RuntimeValidatedLocalSigningIdentity
+typealias RuntimeLocalSigningExpectation = RepoPromptCore.RuntimeLocalSigningExpectation
+typealias RuntimeCodeSigningRequirements = RepoPromptCore.RuntimeCodeSigningRequirements
+typealias KeychainService = RepoPromptCoreMacOS.KeychainService
+typealias SecItemClient = RepoPromptCoreMacOS.SecItemClient
+typealias SystemSecItemClient = RepoPromptCoreMacOS.SystemSecItemClient
+
+// MARK: - Utilities and slices
+
+typealias StandardizedPath = RepoPromptCore.StandardizedPath
+typealias RelativePath = RepoPromptCore.RelativePath
+typealias CheckoutPathIdentity = RepoPromptCore.CheckoutPathIdentity
+typealias LineRange = RepoPromptCore.LineRange
+typealias SliceRangeMath = RepoPromptCore.SliceRangeMath
+typealias PathCharPolicy = RepoPromptCore.PathCharPolicy
+
+// MARK: - Workspace persistence
+
+typealias WorkspacePreset = RepoPromptCore.WorkspacePreset
+typealias StoredSelection = RepoPromptCore.StoredSelection
+typealias ContextBuilderOverrides = RepoPromptCore.ContextBuilderOverrides
+typealias ContextBuilderTabConfig = RepoPromptCore.ContextBuilderTabConfig
+typealias StashedTab = RepoPromptCore.StashedTab
+typealias ComposeTabState = RepoPromptCore.ComposeTabState
+typealias WorkspaceModel = RepoPromptCore.WorkspaceModel
+typealias CopyCustomizations = RepoPromptCore.CopyCustomizations
+typealias FileTreeOption = RepoPromptCore.FileTreeOption
+typealias CodeMapUsage = RepoPromptCore.CodeMapUsage
+typealias GitInclusion = RepoPromptCore.GitInclusion
+typealias FilesTab = RepoPromptCore.FilesTab
+
+// MARK: - Path matching and resolution
+
+typealias FileRecord = RepoPromptCore.FileRecord
+typealias FolderRecord = RepoPromptCore.FolderRecord
+typealias FileHierarchyReadable = RepoPromptCore.FileHierarchyReadable
+typealias FrozenFileRecord = RepoPromptCore.FrozenFileRecord
+typealias FrozenFolderRecord = RepoPromptCore.FrozenFolderRecord
+typealias PathMatchLocation = RepoPromptCore.PathMatchLocation
+typealias PathMatchCacheIdentity = RepoPromptCore.PathMatchCacheIdentity
+typealias PathLocateProfile = RepoPromptCore.PathLocateProfile
+typealias PathLocateOptions = RepoPromptCore.PathLocateOptions
+typealias FileCreationResult = RepoPromptCore.FileCreationResult
+typealias CreationResolutionMode = RepoPromptCore.CreationResolutionMode
+typealias FileCreationResolution = RepoPromptCore.FileCreationResolution
+typealias AnyItem = RepoPromptCore.AnyItem
+typealias WorkspaceRootRef = RepoPromptCore.WorkspaceRootRef
+typealias RootAliasOptions = RepoPromptCore.RootAliasOptions
+typealias RootAliasResolution = RepoPromptCore.RootAliasResolution
+typealias PathResolutionIssue = RepoPromptCore.PathResolutionIssue
+typealias ClientPathFormatter = RepoPromptCore.ClientPathFormatter
+
+// MARK: - Workspace context values
+
+typealias WorkspaceLookupRootScope = RepoPromptCore.WorkspaceLookupRootScope
+typealias LookupRootScope = RepoPromptCore.WorkspaceLookupRootScope
+typealias WorkspaceLookupRootScopeAvailability = RepoPromptCore.WorkspaceLookupRootScopeAvailability
+typealias WorkspaceRootKind = RepoPromptCore.WorkspaceRootKind
+typealias WorkspaceRootLoadFailure = RepoPromptCore.WorkspaceRootLoadFailure
+typealias WorkspaceSearchReadinessTicket = RepoPromptCore.WorkspaceSearchReadinessTicket
+typealias WorkspaceSearchReadinessWaitError = RepoPromptCore.WorkspaceSearchReadinessWaitError
+typealias WorkspaceSearchReadinessState = RepoPromptCore.WorkspaceSearchReadinessState
+typealias WorkspaceCatalogDiagnostics = RepoPromptCore.WorkspaceCatalogDiagnostics
+typealias WorkspaceSearchCatalogEntry = RepoPromptCore.WorkspaceSearchCatalogEntry
+typealias WorkspaceSearchCatalogAccessRequirement = RepoPromptCore.WorkspaceSearchCatalogAccessRequirement
+typealias WorkspaceSearchQueryResult = RepoPromptCore.WorkspaceSearchQueryResult
+typealias WorkspaceResolvedCandidates = RepoPromptCore.WorkspaceResolvedCandidates
+typealias WorkspaceCodemapOnlyCandidates = RepoPromptCore.WorkspaceCodemapOnlyCandidates
+typealias WorkspaceRootRecord = RepoPromptCore.WorkspaceRootRecord
+typealias WorkspaceFolderRecord = RepoPromptCore.WorkspaceFolderRecord
+typealias WorkspaceFileRecord = RepoPromptCore.WorkspaceFileRecord
+typealias ResolvedWorkspaceSelection = RepoPromptCore.ResolvedWorkspaceSelection
+typealias ResolvedPromptFileEntry = RepoPromptCore.ResolvedPromptFileEntry
+typealias ResolvedPromptFileEntryRole = RepoPromptCore.ResolvedPromptFileEntryRole
+typealias ResolvedPromptFileBlockRecord = RepoPromptCore.ResolvedPromptFileBlockRecord
+typealias ResolvedPromptFileEntryID = RepoPromptCore.ResolvedPromptFileEntryID
+typealias PromptFileEntryMode = RepoPromptCore.PromptFileEntryMode
+typealias WorkspaceCodemapSnapshot = RepoPromptCore.WorkspaceCodemapSnapshot
+typealias WorkspaceCodemapSnapshotBundle = RepoPromptCore.WorkspaceCodemapSnapshotBundle
+typealias WorkspaceCodemapRepairResult = RepoPromptCore.WorkspaceCodemapRepairResult
+typealias WorkspaceCodemapUpdateEvent = RepoPromptCore.WorkspaceCodemapUpdateEvent
+typealias WorkspacePathLookupRequest = RepoPromptCore.WorkspacePathLookupRequest
+typealias WorkspacePathLocation = RepoPromptCore.WorkspacePathLocation
+typealias WorkspacePathLookupResult = RepoPromptCore.WorkspacePathLookupResult
+
+// MARK: - Search
+
+typealias RepoSearchQuery = RepoPromptCore.RepoSearchQuery
+typealias RepoSearchQueryFactory = RepoPromptCore.RepoSearchQueryFactory
+typealias PathSearchIndex = RepoPromptCore.PathSearchIndex
+
+// MARK: - Prompt and codemap values
+
+typealias PromptFileEntrySnapshot = RepoPromptCore.PromptFileEntrySnapshot
+typealias TokenCalculationFileTreeInput = RepoPromptCore.TokenCalculationFileTreeInput
+typealias TokenCalculationSnapshot = RepoPromptCore.TokenCalculationSnapshot
+typealias TokenEstimator = RepoPromptCore.TokenEstimator
+typealias PromptFactualCaptureFailure = RepoPromptCore.PromptFactualCaptureFailure
+typealias PromptFactualCaptureRequest = RepoPromptCore.PromptFactualCaptureRequest
+typealias PromptFactualCaptureOutcome = RepoPromptCore.PromptFactualCaptureOutcome
+typealias PromptFactualContextSnapshot = RepoPromptCore.PromptFactualContextSnapshot
+typealias PromptFactualRenderedSections = RepoPromptCore.PromptFactualRenderedSections
+typealias PromptAuthorizedArtifactPayload = RepoPromptCore.PromptAuthorizedArtifactPayload
+typealias PromptFactualContextCaptureService = RepoPromptCore.PromptFactualContextCaptureService
+typealias FileTreeSelectionSnapshot = RepoPromptCore.FileTreeSelectionSnapshot
+typealias FileTreeFolderSnapshot = RepoPromptCore.FileTreeFolderSnapshot
+typealias FileTreeFileSnapshot = RepoPromptCore.FileTreeFileSnapshot
+typealias FileTreeNodeSnapshot = RepoPromptCore.FileTreeNodeSnapshot
+typealias InterfaceInfo = RepoPromptCore.InterfaceInfo
+typealias TypeAliasInfo = RepoPromptCore.TypeAliasInfo
+typealias ClassInfo = RepoPromptCore.ClassInfo
+typealias FunctionInfo = RepoPromptCore.FunctionInfo
+typealias ParameterInfo = RepoPromptCore.ParameterInfo
+typealias PropertyInfo = RepoPromptCore.PropertyInfo
+typealias VariableInfo = RepoPromptCore.VariableInfo
+typealias EnumInfo = RepoPromptCore.EnumInfo
+typealias FileAPI = RepoPromptCore.FileAPI
+
+// MARK: - Regex
+
+typealias RepoPromptRegexRuntime = RepoPromptCore.RepoPromptRegexRuntime
+typealias RepoPromptPCRE2MatchPolicy = RepoPromptCore.RepoPromptPCRE2MatchPolicy
+typealias RepoPromptPCRE2CompileResult = RepoPromptCore.RepoPromptPCRE2CompileResult
+typealias RepoPromptPCRE2CompileRequest = RepoPromptCore.RepoPromptPCRE2CompileRequest
+typealias RepoPromptPCRE2Adapter = RepoPromptCore.RepoPromptPCRE2Adapter
+typealias RegexPatternFailure = RepoPromptCore.RegexPatternFailure
+typealias RegexToolkit = RepoPromptCore.RegexToolkit
+typealias SearchPatternErrorFormatter = RepoPromptCore.SearchPatternErrorFormatter
+typealias SearchPatternError = RepoPromptCore.SearchPatternError
+typealias SearchPatternTooComplexError = RepoPromptCore.SearchPatternTooComplexError
+typealias PCRE2LimitKind = RepoPromptCore.PCRE2LimitKind
+typealias PCRE2Error = RepoPromptCore.PCRE2Error
+typealias PCRE2BuildConfiguration = RepoPromptCore.PCRE2BuildConfiguration
+typealias PCRE2JITStatus = RepoPromptCore.PCRE2JITStatus
+typealias PCRE2Literal = RepoPromptCore.PCRE2Literal
+typealias PCRE2Match = RepoPromptCore.PCRE2Match
+typealias PCRE2CompileOptions = RepoPromptCore.PCRE2CompileOptions
+typealias PCRE2MatchOptions = RepoPromptCore.PCRE2MatchOptions
+typealias PCRE2MatchLimits = RepoPromptCore.PCRE2MatchLimits
+typealias PCRE2JITMode = RepoPromptCore.PCRE2JITMode
+typealias PCRE2Regex = RepoPromptCore.PCRE2Regex
+typealias PCRE2LinePrefilter = RepoPromptCore.PCRE2LinePrefilter
+typealias PCRE2LineScanOptions = RepoPromptCore.PCRE2LineScanOptions
+typealias PCRE2LineScanResult = RepoPromptCore.PCRE2LineScanResult
+typealias PCRE2LineRangeHit = RepoPromptCore.PCRE2LineRangeHit
+typealias PCRE2LineRangeScanResult = RepoPromptCore.PCRE2LineRangeScanResult
+typealias PCRE2LineMode = RepoPromptCore.PCRE2LineMode
+typealias PCRE2ASCIIMarkerLinePattern = RepoPromptCore.PCRE2ASCIIMarkerLinePattern
+typealias PCRE2ASCIIWholeWordLiteral = RepoPromptCore.PCRE2ASCIIWholeWordLiteral
+typealias PCRE2AnchoredDeclarationLinePattern = RepoPromptCore.PCRE2AnchoredDeclarationLinePattern
+typealias PCRE2PathSuffixPattern = RepoPromptCore.PCRE2PathSuffixPattern
+
+// MARK: - Phase 4 workspace runtime compatibility
+
+typealias LanguageType = RepoPromptCore.LanguageType
+typealias SyntaxManager = RepoPromptCore.SyntaxManager
+typealias CodeMapGenerator = RepoPromptCore.CodeMapGenerator
+typealias CodeMapPerfOptions = RepoPromptCore.CodeMapPerfOptions
+typealias CodeMapSyntaxStartupPerfStats = RepoPromptCore.CodeMapSyntaxStartupPerfStats
+typealias CodeMapSyntaxPerfStats = RepoPromptCore.CodeMapSyntaxPerfStats
+typealias CodeMapPipelinePerfSnapshot = RepoPromptCore.CodeMapPipelinePerfSnapshot
+typealias CodeMapPipelinePerfStats = RepoPromptCore.CodeMapPipelinePerfStats
+typealias CodeMapPerfRuntime = RepoPromptCore.CodeMapPerfRuntime
+typealias CodeMapPerfStats = RepoPromptCore.CodeMapPerfStats
+typealias CodeScanActor = RepoPromptCore.CodeScanActor
+
+typealias FilePathDisplay = RepoPromptCore.FilePathDisplay
+typealias FileSystemItem = RepoPromptCore.FileSystemItem
+typealias File = RepoPromptCore.File
+typealias Folder = RepoPromptCore.Folder
+typealias FileSystemProviding = RepoPromptCore.FileSystemProviding
+typealias FileManagerError = RepoPromptCore.FileManagerError
+typealias FileSystemError = RepoPromptCore.FileSystemError
+typealias FileSystemDelta = RepoPromptCore.FileSystemDelta
+typealias FileSystemDeltaPublicationSource = RepoPromptCore.FileSystemDeltaPublicationSource
+typealias FileSystemService = RepoPromptCore.FileSystemService
+typealias FileSystemWatcherActivationError = RepoPromptCore.FileSystemWatcherActivationError
+typealias ContentReadAsyncLimiter = RepoPromptCore.ContentReadAsyncLimiter
+typealias IgnoreSettingsDefaults = RepoPromptCore.IgnoreSettingsDefaults
+typealias GitignoreCompiler = RepoPromptCore.GitignoreCompiler
+
+typealias TaskSemaphore = RepoPromptCore.TaskSemaphore
+typealias DiffEdit = RepoPromptCore.DiffEdit
+typealias DiffEditCreator = RepoPromptCore.DiffEditCreator
+
+typealias WorkspaceSliceSegment = RepoPromptCore.WorkspaceSliceSegment
+typealias WorkspaceSliceAssembly = RepoPromptCore.WorkspaceSliceAssembly
+typealias SliceAssemblyBuilder = RepoPromptCore.SliceAssemblyBuilder
+typealias PartitionScope = RepoPromptCore.PartitionScope
+typealias PartitionStore = RepoPromptCore.PartitionStore
+typealias SelectionSliceCoordinator = RepoPromptCore.SelectionSliceCoordinator
+typealias StoredSelectionSliceMutation = RepoPromptCore.StoredSelectionSliceMutation
+typealias SliceAnchor = RepoPromptCore.SliceAnchor
+typealias SliceMutationMode = RepoPromptCore.SliceMutationMode
+typealias SliceRebaseEngine = RepoPromptCore.SliceRebaseEngine
+typealias WorkspaceSliceRebaseFence = RepoPromptCore.WorkspaceSliceRebaseFence
+typealias WorkspaceSliceRebasePathState = RepoPromptCore.WorkspaceSliceRebasePathState
+
+typealias WorkspaceFileContextStore = RepoPromptCore.WorkspaceFileContextStore
+typealias WorkspaceAppliedIndexBatchEvent = RepoPromptCore.WorkspaceAppliedIndexBatchEvent
+typealias WorkspaceExternalReadableFile = RepoPromptCore.WorkspaceExternalReadableFile
+typealias WorkspaceFileCatalogMaterializationResult = RepoPromptCore.WorkspaceFileCatalogMaterializationResult
+typealias WorkspaceFileSystemDeltaEvent = RepoPromptCore.WorkspaceFileSystemDeltaEvent
+typealias WorkspaceFileTreeSnapshotMode = RepoPromptCore.WorkspaceFileTreeSnapshotMode
+typealias WorkspaceFileTreeSnapshotRequest = RepoPromptCore.WorkspaceFileTreeSnapshotRequest
+typealias WorkspaceIngressBarrierSample = RepoPromptCore.WorkspaceIngressBarrierSample
+typealias WorkspaceSearchCatalogSnapshot = RepoPromptCore.WorkspaceSearchCatalogSnapshot
+typealias WorkspaceCodemapFileAPIAggregate = RepoPromptCore.WorkspaceCodemapFileAPIAggregate
+typealias WorkspaceInteractiveReadRangeError = RepoPromptCore.WorkspaceInteractiveReadRangeError
+typealias WorkspaceInteractiveReadProcessor = RepoPromptCore.WorkspaceInteractiveReadProcessor
+typealias WorkspaceInteractiveReadPreparedContent = RepoPromptCore.WorkspaceInteractiveReadPreparedContent
+typealias WorkspaceReadableFileHandle = RepoPromptCore.WorkspaceReadableFileHandle
+typealias WorkspaceSessionRootLifetimeSnapshot = RepoPromptCore.WorkspaceSessionRootLifetimeSnapshot
+typealias WorkspaceSessionWorktreeOwnershipPreparation = RepoPromptCore.WorkspaceSessionWorktreeOwnershipPreparation
+typealias WorkspaceSessionWorktreeOwnershipError = RepoPromptCore.WorkspaceSessionWorktreeOwnershipError
+typealias WorkspaceAliasResolver = RepoPromptCore.WorkspaceAliasResolver
+typealias PathResolutionIssueRenderer = RepoPromptCore.PathResolutionIssueRenderer
+
+typealias DeferredReplayBufferDiagnostics = RepoPromptCore.DeferredReplayBufferDiagnostics
+typealias DeferredReplayIngressResult = RepoPromptCore.DeferredReplayIngressResult
+typealias DeltaReplayPreparationActor = RepoPromptCore.DeltaReplayPreparationActor
+typealias FileSystemDeltaPreparation = RepoPromptCore.FileSystemDeltaPreparation
+typealias PreparedFileSystemDelta = RepoPromptCore.PreparedFileSystemDelta
+typealias PreparedFileSystemReplayBatch = RepoPromptCore.PreparedFileSystemReplayBatch
+typealias PreparedFileSystemReplayChunk = RepoPromptCore.PreparedFileSystemReplayChunk
+typealias WorkspaceFileSystemIngressCoordinator = RepoPromptCore.WorkspaceFileSystemIngressCoordinator
+
+typealias WorkspaceSearchService = RepoPromptCore.WorkspaceSearchService
+typealias WorkspaceSearchReadinessSource = RepoPromptCore.WorkspaceSearchReadinessSource
+typealias FileContentFreshnessPolicy = RepoPromptCore.FileContentFreshnessPolicy
+typealias FileSearchContentSnapshot = RepoPromptCore.FileSearchContentSnapshot
+typealias SearchFileDescriptor = RepoPromptCore.SearchFileDescriptor
+typealias SearchMatch = RepoPromptCore.SearchMatch
+typealias SearchMode = RepoPromptCore.SearchMode
+typealias SearchOptions = RepoPromptCore.SearchOptions
+typealias PatternErrorInfo = RepoPromptCore.PatternErrorInfo
+typealias PerFileError = RepoPromptCore.PerFileError
+typealias SearchResults = RepoPromptCore.SearchResults
+typealias FileSearchActor = RepoPromptCore.FileSearchActor
+typealias SearchPathClause = RepoPromptCore.SearchPathClause
+typealias SearchPathFilterSpec = RepoPromptCore.SearchPathFilterSpec
+typealias RepoSearchBatchScorer = RepoPromptCore.RepoSearchBatchScorer
+typealias StoreBackedWorkspaceSearch = RepoPromptCore.StoreBackedWorkspaceSearch
+typealias StoreBackedWorkspaceSearchError = RepoPromptCore.StoreBackedWorkspaceSearchError
+typealias StoreBackedWorkspaceSearchAdmissionError = RepoPromptCore.StoreBackedWorkspaceSearchAdmissionError
+typealias StoreBackedWorkspaceSearchLane = RepoPromptCore.StoreBackedWorkspaceSearchLane
+typealias SearchFolderSuffixIndex<T> = RepoPromptCore.SearchFolderSuffixIndex<T>
+
+typealias GitDiffArtifactPathPolicy = RepoPromptCore.GitDiffArtifactPathPolicy
+typealias GitDiffPublishedArtifact = RepoPromptCore.GitDiffPublishedArtifact
+typealias GitDiffPublishedArtifactKind = RepoPromptCore.GitDiffPublishedArtifactKind
+typealias GitDiffPublishedArtifactSelectionDisposition = RepoPromptCore.GitDiffPublishedArtifactSelectionDisposition
+typealias WorkspacePublishedGitArtifactIngressRequest = RepoPromptCore.WorkspacePublishedGitArtifactIngressRequest
+typealias WorkspacePublishedGitArtifactIngressOutcomeStatus = RepoPromptCore.WorkspacePublishedGitArtifactIngressOutcomeStatus
+typealias WorkspacePublishedGitArtifactIngressResult = RepoPromptCore.WorkspacePublishedGitArtifactIngressResult
+
+typealias RepoFileReplayPerf = RepoPromptCore.WorkspaceRuntimePerf
+
+func buildFolderSuffixIndex<T>(
+    in foldersByFullPath: [String: T],
+    relativePath: (T) -> String,
+    caseInsensitive: Bool = true
+) -> SearchFolderSuffixIndex<T> {
+    RepoPromptCore.buildFolderSuffixIndex(
+        in: foldersByFullPath,
+        relativePath: relativePath,
+        caseInsensitive: caseInsensitive
+    )
+}
+
+func resolveFoldersBySuffixFragment<T>(
+    _ fragment: String,
+    using suffixIndex: SearchFolderSuffixIndex<T>,
+    caseInsensitive: Bool = true
+) -> [T] {
+    RepoPromptCore.resolveFoldersBySuffixFragment(
+        fragment,
+        using: suffixIndex,
+        caseInsensitive: caseInsensitive
+    )
+}
+
+typealias CatalogRegularFileIneligibilityReason = RepoPromptCore.CatalogRegularFileIneligibilityReason
+
+// MARK: - Phase 4 integration-test compatibility
+
+typealias DeferredReplayBufferActor = RepoPromptCore.DeferredReplayBufferActor
+typealias FileContentValidationError = RepoPromptCore.FileContentValidationError
+typealias FileSystemDeltaPublication = RepoPromptCore.FileSystemDeltaPublication
+typealias IgnoreRules = RepoPromptCore.IgnoreRules
+typealias OrderedSearchBatchWindow = RepoPromptCore.OrderedSearchBatchWindow
+typealias PathMatcher = RepoPromptCore.PathMatcher
+typealias ValidatedFileContentSnapshot = RepoPromptCore.ValidatedFileContentSnapshot
+typealias WorkspaceFileSearchDebugContext = RepoPromptCore.WorkspaceFileSearchDebugContext
+typealias WorkspaceFileSearchPhaseCollector = RepoPromptCore.WorkspaceFileSearchPhaseCollector
+typealias WorkspaceInteractiveReadCache = RepoPromptCore.WorkspaceInteractiveReadCache
+typealias WorkspaceInteractiveReadCacheKey = RepoPromptCore.WorkspaceInteractiveReadCacheKey
+typealias WorkspaceObservedCodemapResult = RepoPromptCore.WorkspaceObservedCodemapResult
+typealias WorkspaceRootUnloadBoundedWait = RepoPromptCore.WorkspaceRootUnloadBoundedWait
+typealias WorkspaceRootUnloadCompletionLatch = RepoPromptCore.WorkspaceRootUnloadCompletionLatch
+typealias WorkspaceRootUnloadTerminationPolicy = RepoPromptCore.WorkspaceRootUnloadTerminationPolicy
+typealias WorkspaceSearchContentCacheKey = RepoPromptCore.WorkspaceSearchContentCacheKey
+typealias WorkspaceSearchContentInvalidationBatch = RepoPromptCore.WorkspaceSearchContentInvalidationBatch
+typealias WorkspaceSearchDecodedContentCache = RepoPromptCore.WorkspaceSearchDecodedContentCache
+typealias ContentReadSchedulerError = RepoPromptCore.ContentReadSchedulerError
+typealias ContentReadWorkloadClass = RepoPromptCore.ContentReadWorkloadClass
+typealias FileSystemUncancellableMutation = RepoPromptCore.FileSystemUncancellableMutation
+typealias FileSystemWatcherIngressMailbox = RepoPromptCore.FileSystemWatcherIngressMailbox
+typealias PathMatchSnapshot = RepoPromptCore.PathMatchSnapshot
+typealias PreparedImmediateReplay = RepoPromptCore.PreparedImmediateReplay
+typealias WorkspaceCatalogSortAttributionProbe = RepoPromptCore.WorkspaceCatalogSortAttributionProbe
+typealias WorkspaceFileContextStoreError = RepoPromptCore.WorkspaceFileContextStoreError
+typealias WorkspaceFileSearchPhaseSnapshot = RepoPromptCore.WorkspaceFileSearchPhaseSnapshot
+typealias WorkspaceInteractiveReadSlice = RepoPromptCore.WorkspaceInteractiveReadSlice
+typealias WorkspaceRootUnloadTerminationDiagnostics = RepoPromptCore.WorkspaceRootUnloadTerminationDiagnostics
+typealias StoredSelectionPathNormalization = RepoPromptCore.StoredSelectionPathNormalization

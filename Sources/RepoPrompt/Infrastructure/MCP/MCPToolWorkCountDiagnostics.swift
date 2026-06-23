@@ -284,6 +284,14 @@ enum MCPToolWorkCountDiagnostics {
         #endif
     }
 
+    static var isReadFileInvocationActive: Bool {
+        #if DEBUG
+            currentReadFileCapture != nil
+        #else
+            false
+        #endif
+    }
+
     static func readFileExternalRecorder() -> @Sendable (_ bytes: Int, _ decodeMicroseconds: Int) -> Void {
         #if DEBUG
             let capture = currentReadFileCapture

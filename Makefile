@@ -1,6 +1,8 @@
-.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-test dev-test-list dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
+.PHONY: help doctor setup install-format-tools format-tools-status format format-check lint install-debug-cli uninstall-debug-cli debug-cli-status resolve build run test guardrails conductor-selftest release-selftest release-sync-cli-version release-preflight release-artifact install-local-production xcode xcode-open xcode-generate xcode-check xcode-validate xcode-generator-test xcode-clean dev-status dev-build dev-swift-build dev-run dev-test dev-test-list dev-core-test dev-core-test-list dev-core-macos-test dev-core-macos-test-list dev-posix-test dev-posix-test-list dev-headless-build dev-headless-test dev-headless-test-list dev-headless-package dev-headless-provenance dev-headless-install dev-headless-status dev-headless-uninstall dev-headless-smoke dev-provider-test dev-provider-test-list dev-smoke dev-smoke-launch dev-format dev-format-check dev-lint dev-format-tools-status dev-check-format-tools dev-install-format-tools dev-release-preflight dev-release-artifact dev-install-local-production dev-stop-app dev-daemon-stop clean
 
 PRODUCT ?= all
+TARGET ?=
+HEADLESS_CONFIGURATION ?= debug
 
 help:
 	@printf '%s\n' 'Usage: make <target>'
@@ -15,16 +17,32 @@ help:
 	@printf '\n%s\n' 'Coordinated developer daemon targets:'
 	@printf '  %-30s %s\n' 'dev-status' 'Show conductor daemon status'
 	@printf '  %-30s %s\n' 'dev-build' 'Coordinated debug app package build'
-	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name'
+	@printf '  %-30s %s\n' 'dev-swift-build' 'Coordinated Swift build; override with PRODUCT=name or TARGET=name'
 	@printf '  %-30s %s\n' 'dev-run' 'Coordinated debug app build and launch'
 	@printf '  %-30s %s\n' 'dev-test' 'Coordinated test run; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-test-list' 'List XCTest methods through conductor'
+	@printf '  %-30s %s\n' 'dev-core-test' 'Run isolated RepoPromptCore tests; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-core-test-list' 'List isolated RepoPromptCore XCTest methods'
+	@printf '  %-30s %s\n' 'dev-core-macos-test' 'Run RepoPromptCoreMacOS tests; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-core-macos-test-list' 'List RepoPromptCoreMacOS XCTest methods'
+	@printf '  %-30s %s\n' 'dev-posix-test' 'Run RepoPromptPOSIXSupport tests; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-posix-test-list' 'List RepoPromptPOSIXSupport XCTest methods'
 	@printf '  %-30s %s\n' 'dev-provider-test' 'Run provider package tests; override with FILTER=name'
 	@printf '  %-30s %s\n' 'dev-provider-test-list' 'List provider package tests'
 	@printf '  %-30s %s\n' 'dev-smoke' 'Run non-disruptive live debug app smoke checks'
 	@printf '  %-30s %s\n' 'dev-smoke-launch' 'Launch debug app, then run smoke checks'
 	@printf '  %-30s %s\n' 'dev-stop-app' 'Stop the coordinated debug app'
 	@printf '  %-30s %s\n' 'dev-daemon-stop' 'Stop the conductor daemon'
+	@printf '\n%s\n' 'Headless targets:'
+	@printf '  %-30s %s\n' 'dev-headless-build' 'Build the headless product'
+	@printf '  %-30s %s\n' 'dev-headless-test' 'Run headless tests; override with FILTER=name'
+	@printf '  %-30s %s\n' 'dev-headless-test-list' 'List headless XCTest methods'
+	@printf '  %-30s %s\n' 'dev-headless-package' 'Package headless; override with HEADLESS_CONFIGURATION=name'
+	@printf '  %-30s %s\n' 'dev-headless-provenance' 'Show headless package provenance'
+	@printf '  %-30s %s\n' 'dev-headless-install' 'Install the headless package'
+	@printf '  %-30s %s\n' 'dev-headless-status' 'Show headless installation status'
+	@printf '  %-30s %s\n' 'dev-headless-uninstall' 'Uninstall headless; set DELETE_STATE=1 to remove state'
+	@printf '  %-30s %s\n' 'dev-headless-smoke' 'Run headless smoke checks; set SKIP_PACKAGE=1 to reuse package'
 	@printf '\n%s\n' 'Style targets:'
 	@printf '  %-30s %s\n' 'format' 'Format Swift files directly'
 	@printf '  %-30s %s\n' 'format-check' 'Check Swift formatting directly'
@@ -122,6 +140,8 @@ conductor-selftest:
 release-selftest:
 	python3 Scripts/test_release_promotion.py
 	python3 Scripts/test_release_tooling.py
+	python3 Scripts/test_package_headless_transaction.py
+	python3 Scripts/test_tree_sitter_symbols.py
 
 release-sync-cli-version:
 	./Scripts/release.sh sync-cli-version
@@ -162,7 +182,7 @@ dev-build:
 	./conductor build
 
 dev-swift-build:
-	./conductor swift-build --product $(PRODUCT)
+	./conductor swift-build $(if $(TARGET),--target $(TARGET),--product $(PRODUCT))
 
 dev-run:
 	./conductor run
@@ -172,6 +192,51 @@ dev-test:
 
 dev-test-list:
 	./conductor test --list
+
+dev-core-test:
+	./conductor core-test$(if $(FILTER), --filter $(FILTER))
+
+dev-core-test-list:
+	./conductor core-test --list
+
+dev-core-macos-test:
+	./conductor core-macos-test$(if $(FILTER), --filter $(FILTER))
+
+dev-core-macos-test-list:
+	./conductor core-macos-test --list
+
+dev-posix-test:
+	./conductor posix-test$(if $(FILTER), --filter $(FILTER))
+
+dev-posix-test-list:
+	./conductor posix-test --list
+
+dev-headless-build:
+	./conductor headless-build
+
+dev-headless-test:
+	./conductor headless-test$(if $(FILTER), --filter $(FILTER))
+
+dev-headless-test-list:
+	./conductor headless-test --list
+
+dev-headless-package:
+	./conductor headless-package --configuration $(HEADLESS_CONFIGURATION)
+
+dev-headless-provenance:
+	./conductor headless-provenance --configuration $(HEADLESS_CONFIGURATION)
+
+dev-headless-install:
+	./conductor headless-install --configuration $(HEADLESS_CONFIGURATION)
+
+dev-headless-status:
+	./conductor headless-status
+
+dev-headless-uninstall:
+	./conductor headless-uninstall --configuration $(HEADLESS_CONFIGURATION)$(if $(DELETE_STATE), --delete-state)
+
+dev-headless-smoke:
+	./conductor headless-smoke --configuration $(HEADLESS_CONFIGURATION)$(if $(SKIP_PACKAGE), --skip-package)
 
 dev-provider-test:
 	./conductor provider-test$(if $(FILTER), --filter $(FILTER))

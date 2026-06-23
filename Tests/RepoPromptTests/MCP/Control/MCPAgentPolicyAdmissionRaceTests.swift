@@ -388,17 +388,19 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let workspaceIndex = try XCTUnwrap(
                 window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
             )
-            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                ComposeTabState(
-                    id: seedTabID,
-                    name: "Seed",
-                    selection: seedSelection,
-                    promptText: "seed prompt"
-                ),
-                ComposeTabState(id: blankTabIDs[0], name: "Agent 1"),
-                ComposeTabState(id: blankTabIDs[1], name: "Agent 2")
-            ]
-            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = seedTabID
+            window.workspaceManager.mutateWorkspacesForTesting {
+                $0[workspaceIndex].composeTabs = [
+                    ComposeTabState(
+                        id: seedTabID,
+                        name: "Seed",
+                        selection: seedSelection,
+                        promptText: "seed prompt"
+                    ),
+                    ComposeTabState(id: blankTabIDs[0], name: "Agent 1"),
+                    ComposeTabState(id: blankTabIDs[1], name: "Agent 2")
+                ]
+            }
+            window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = seedTabID }
             let reloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
                 window.workspaceManager.workspaces[workspaceIndex],
                 reason: "policyBlankStateTabs"
@@ -422,7 +424,7 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
                 let currentWorkspaceIndex = try XCTUnwrap(
                     window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
                 )
-                window.workspaceManager.workspaces[currentWorkspaceIndex].activeComposeTabID = blankTabID
+                window.workspaceManager.mutateWorkspacesForTesting { $0[currentWorkspaceIndex].activeComposeTabID = blankTabID }
                 window.promptManager.loadComposeTabsFromWorkspace(
                     window.workspaceManager.workspaces[currentWorkspaceIndex]
                 )
@@ -510,11 +512,13 @@ final class MCPAgentPolicyAdmissionRaceTests: XCTestCase {
             let workspaceIndex = try XCTUnwrap(
                 window.workspaceManager.workspaces.firstIndex { $0.id == workspace.id }
             )
-            window.workspaceManager.workspaces[workspaceIndex].composeTabs = [
-                ComposeTabState(id: firstTabID, name: "First", selection: firstSelection),
-                ComposeTabState(id: secondTabID, name: "Second", selection: secondSelection)
-            ]
-            window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = firstTabID
+            window.workspaceManager.mutateWorkspacesForTesting {
+                $0[workspaceIndex].composeTabs = [
+                    ComposeTabState(id: firstTabID, name: "First", selection: firstSelection),
+                    ComposeTabState(id: secondTabID, name: "Second", selection: secondSelection)
+                ]
+            }
+            window.workspaceManager.mutateWorkspacesForTesting { $0[workspaceIndex].activeComposeTabID = firstTabID }
             let tabReloadResult = await window.workspaceManager.reactivateWorkspaceAfterReplacement(
                 window.workspaceManager.workspaces[workspaceIndex],
                 reason: "retainedConnectionSelectionIsolationTabs"

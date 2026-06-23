@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 enum MCPContextBuilderGitReviewOperation: String {
     case status, diff, log, show, blame
@@ -60,7 +61,7 @@ struct MCPContextBuilderGitReviewPolicy {
         requestsArtifactPublication: Bool,
         operation: MCPContextBuilderGitReviewOperation,
         allRepositories: [GitRepoDescriptor],
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability?
     ) async throws -> MCPContextBuilderGitReviewAdmission {
         guard let resolution else {
             return MCPContextBuilderGitReviewAdmission(
@@ -70,13 +71,16 @@ struct MCPContextBuilderGitReviewPolicy {
                 publicationFence: nil
             )
         }
+        guard let query else {
+            throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(.staleWorkspaceRoot)
+        }
 
         let target: ContextBuilderReviewTarget
         switch resolution {
         case let .available(availableTarget):
             if let reason = await ContextBuilderReviewTargetResolver().revalidate(
                 availableTarget,
-                store: store
+                query: query
             ) {
                 throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
             }
@@ -140,7 +144,7 @@ struct MCPContextBuilderGitReviewPolicy {
         _ outcomes: [MCPContextBuilderGitPublishedOutcome],
         publishedArtifactSetCount: Int,
         fence: MCPContextBuilderGitPublicationFence,
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async throws {
         var matchedTargets: [ContextBuilderReviewCheckoutTarget] = []
         for outcome in outcomes {
@@ -166,7 +170,7 @@ struct MCPContextBuilderGitReviewPolicy {
         guard Set(matchedTargets.map(\.identityKey)).count == matchedTargets.count else {
             throw MCPContextBuilderGitReviewPolicyError.publishedCheckoutMismatch
         }
-        if let reason = await ContextBuilderReviewTargetResolver().revalidate(fence.target, store: store) {
+        if let reason = await ContextBuilderReviewTargetResolver().revalidate(fence.target, query: query) {
             throw MCPContextBuilderGitReviewPolicyError.targetUnavailable(reason)
         }
     }

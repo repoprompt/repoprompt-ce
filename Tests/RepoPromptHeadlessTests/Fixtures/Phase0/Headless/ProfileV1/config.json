@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "allowed_roots": [{
+    "id": "11111111-1111-1111-1111-111111111111",
+    "name": "Phase0Root",
+    "path": "__FIXTURE_ROOT_PATH__",
+    "resolved_path": "__FIXTURE_ROOT_RESOLVED_PATH__",
+    "added_at": "2026-01-02T03:04:05Z"
+  }],
+  "active_workspace_id": "22222222-2222-2222-2222-222222222222",
+  "permissions": {
+    "write_files": false,
+    "vcs_write": false,
+    "launch_agents": false,
+    "export_outside_state_directory": false
+  },
+  "created_at": "2026-01-02T03:04:05Z",
+  "updated_at": "2026-01-02T03:04:06Z"
+}

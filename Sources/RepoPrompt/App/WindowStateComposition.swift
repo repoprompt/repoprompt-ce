@@ -1,7 +1,80 @@
 import Foundation
+import MCP
+import RepoPromptCore
+
+@MainActor
+private final class WorkspaceRuntimePublicationFence {
+    private(set) var isClosing = false
+
+    func beginClosing() {
+        isClosing = true
+    }
+}
+
+private struct WorkspaceRuntimeReadinessProjection: Equatable {
+    let sessionID: WorkspaceSessionID
+    let activeWorkspaceID: UUID?
+    let activeComposeTabID: UUID?
+    let activeAgentSessionID: UUID?
+
+    init(_ snapshot: WorkspaceSessionSnapshot) {
+        sessionID = snapshot.sessionID
+        activeWorkspaceID = snapshot.activeWorkspaceID
+        let activeWorkspace = snapshot.workspaces.first { $0.id == snapshot.activeWorkspaceID }
+        activeComposeTabID = activeWorkspace?.activeComposeTabID
+        activeAgentSessionID = activeWorkspace?.composeTabs.first {
+            $0.id == activeWorkspace?.activeComposeTabID
+        }?.activeAgentSessionID
+    }
+}
+
+private struct AssembledAppReadiness {
+    let admission: WorkspaceSessionAdmissionToken
+    let projection: WorkspaceRuntimeReadinessProjection
+}
+
+private enum ActivatedRuntimePublicationResult {
+    case published
+    case projectionSuperseded
+    case failed
+}
+
+#if DEBUG
+    @MainActor
+    enum WindowStateCompositionActivationEvent: Equatable {
+        case firstAuthoritativeProjectionApplied
+        case initialActiveSessionRestoreSettled
+        case runtimeAdapterPublished
+        case selectedSessionInitializationCompleted
+    }
+#endif
+
+@MainActor
+struct WindowStateCompositionTestHooks {
+    #if DEBUG
+        var configureAgentModeViewModel: ((AgentModeViewModel) -> Void)?
+        var recordActivationEvent: ((WindowStateCompositionActivationEvent) -> Void)?
+        var waitAfterInitialActiveSessionRestore: (@MainActor () async -> Void)?
+        var waitAfterRuntimePublicationReady: (@MainActor () async -> Void)?
+        var afterAuthoritativeWorkspaceProjection: (@MainActor (
+            WorkspaceManagerViewModel,
+            WorkspaceFilesViewModel,
+            WorkspaceSessionSnapshot
+        ) -> Void)?
+    #endif
+}
 
 @MainActor
 struct WindowStateComposition {
+    let workspaceSessionID: WorkspaceSessionID
+    let workspaceRuntimeID: WorkspaceRuntimeID?
+    let runtimeAdapter: MCPWindowRuntimeAdapter?
+    let workspaceRuntimeBeginClose: @MainActor () -> Void
+    let workspaceSessionCommandClient: WorkspaceSessionCommandClient?
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
+    let workspaceSessionObservationBridge: WorkspaceSessionObservationBridge?
+    let workspaceSessionActivationTask: Task<Void, Never>?
+    let workspaceSessionShutdown: @Sendable () async -> Void
     let workspaceFileContextStore: WorkspaceFileContextStore
     let workspaceSearchService: WorkspaceSearchService
     let selectionCoordinator: WorkspaceSelectionCoordinator
@@ -25,26 +98,104 @@ struct WindowStateComposition {
 
 @MainActor
 enum WindowStateCompositionFactory {
+    private static var isRunningUnitTests: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || NSClassFromString("XCTestCase") != nil
+    }
+
     static func make(
         windowID: Int,
         deferredInitialAgentSystemWorkspaceRefresh: Bool,
         sharedMCPService: MCPService,
+        appCoreContainer injectedAppCoreContainer: RepoPromptAppCoreContainer? = nil,
         contextBuilderProviderFactory: ContextBuilderAgentViewModel.ProviderFactory? = nil,
         aiQueriesServiceFactory: ((_ keyManager: KeyManager) -> AIQueriesService)? = nil,
         workspaceFileContextStore injectedWorkspaceFileContextStore: WorkspaceFileContextStore? = nil,
         workspaceSwitchTimingPolicy: WorkspaceSwitchTimingPolicy = .production,
         loadStoredAPISettingsDataOnInit: Bool = true,
-        codexModelPollingService: CodexModelPollingService = .shared
+        codexModelPollingService: CodexModelPollingService = .shared,
+        testHooks: WindowStateCompositionTestHooks? = nil
     ) -> WindowStateComposition {
+        let appCoreContainer = injectedAppCoreContainer ?? .shared
+        let useSelectedSessionComposition = injectedAppCoreContainer != nil || !isRunningUnitTests
         // 1) Workspace file context store + visible file-tree UI adapter
-        #if DEBUG
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore(
-                enableCatalogShardShadowValidation: false
+        LegacyWorkspaceGlobalIgnoreDefaults.shared.update(GlobalSettingsStore.shared.globalIgnoreDefaults())
+        let storageRoot = resolvedWorkspaceStorageRoot()
+        let workspaceFileContextStore: WorkspaceFileContextStore = if let injectedWorkspaceFileContextStore {
+            injectedWorkspaceFileContextStore
+        } else {
+            #if DEBUG
+                WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            #else
+                WorkspaceFileContextStore()
+            #endif
+        }
+        let workspaceSessionLifecycleOwner = useSelectedSessionComposition
+            ? WorkspaceSessionStoreLifecycleFactory.make(
+                store: workspaceFileContextStore,
+                configuration: {
+                    let settings = await MainActor.run {
+                        GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
+                    }
+                    return WorkspaceSessionRootLoadConfiguration(
+                        respectGitignore: settings.respectGitignore,
+                        respectRepoIgnore: settings.respectRepoIgnore,
+                        respectCursorignore: settings.respectCursorignore,
+                        skipSymlinks: settings.skipSymlinks,
+                        enableHierarchicalIgnores: settings.enableHierarchicalIgnores
+                    )
+                }
             )
-        #else
-            let defaultWorkspaceFileContextStore = WorkspaceFileContextStore()
-        #endif
-        let workspaceFileContextStore = injectedWorkspaceFileContextStore ?? defaultWorkspaceFileContextStore
+            : nil
+        let runtimeBootstrap = useSelectedSessionComposition ? appCoreContainer.beginRuntime(
+            windowID: windowID,
+            coreDependencies: {
+                RepoPromptCoreSessionDependencies(
+                    load: { try loadWorkspaceHydrationInput(storageRoot: storageRoot) },
+                    lifecycleOwner: workspaceSessionLifecycleOwner!,
+                    workspaceURL: { workspace in
+                        workspace.customStoragePath?.appendingPathComponent("workspace.json")
+                            ?? storageRoot
+                            .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)")
+                            .appendingPathComponent("workspace.json")
+                    },
+                    indexURL: { storageRoot.appendingPathComponent("workspacesIndex.json") }
+                )
+            },
+            legacyFactory: { sessionID in
+                let backend = LegacyWorkspaceSessionBackend(
+                    sessionID: sessionID,
+                    load: { try loadWorkspaceHydrationInput(storageRoot: storageRoot) },
+                    lifecycleOwner: workspaceSessionLifecycleOwner!,
+                    workspaceURL: { workspace in
+                        workspace.customStoragePath?.appendingPathComponent("workspace.json")
+                            ?? storageRoot
+                            .appendingPathComponent("Workspace-\(workspace.name)-\(workspace.id.uuidString)")
+                            .appendingPathComponent("workspace.json")
+                    },
+                    indexURL: { storageRoot.appendingPathComponent("workspacesIndex.json") }
+                )
+                return WorkspaceSessionRuntimeBundle(
+                    sessionID: sessionID,
+                    commandIngress: backend,
+                    runtimeQuery: workspaceSessionLifecycleOwner!.makeQueryCapability(),
+                    hydrate: { await backend.hydrate() },
+                    activateAfterApplyingFirstSnapshot: { sequence in
+                        await backend.activate(appliedSnapshotSequence: sequence)
+                    },
+                    factualProvider: LegacyPromptFactualContextProvider(backend: backend),
+                    shutdown: { await backend.shutdown() }
+                )
+            }
+        ) : nil
+        let workspaceSessionID = runtimeBootstrap?.sessionID ?? WorkspaceSessionID()
+        let workspaceRuntimeID = runtimeBootstrap?.runtimeID
+        let mcpCatalogRuntimeID = workspaceRuntimeID
+            ?? WorkspaceRuntimeID(rawValue: workspaceSessionID.rawValue)
+        let workspaceSessionCommandClient = runtimeBootstrap.map {
+            WorkspaceSessionCommandClient(sessionID: $0.sessionID, ingress: $0.commandIngress)
+        }
+        let workspaceSessionQuery = workspaceSessionLifecycleOwner?.makeQueryCapability()
         let workspaceSearchService = WorkspaceSearchService()
         let workspaceFilesViewModel = WorkspaceFilesViewModel(workspaceFileContextStore: workspaceFileContextStore)
 
@@ -70,7 +221,11 @@ enum WindowStateCompositionFactory {
             aiQueriesService: aiQueriesService,
             apiSettingsViewModel: apiSettingsViewModel,
             windowID: windowID,
-            settingsManager: settingsManager
+            settingsManager: settingsManager,
+            workspaceSessionQuery: workspaceSessionQuery
+        )
+        promptManager.attachPromptFactualContextProvider(
+            runtimeBootstrap?.factualProvider ?? UnavailablePromptFactualContextProvider()
         )
 
         // 7) Create the workspace manager
@@ -78,8 +233,61 @@ enum WindowStateCompositionFactory {
             fileManager: workspaceFilesViewModel,
             promptViewModel: promptManager,
             workspaceSearchService: workspaceSearchService,
-            switchTimingPolicy: workspaceSwitchTimingPolicy
+            switchTimingPolicy: workspaceSwitchTimingPolicy,
+            performInitialWorkspaceActivation: runtimeBootstrap == nil,
+            workspaceSessionClient: workspaceSessionCommandClient,
+            deferSelectedSessionInitialization: runtimeBootstrap != nil
         )
+        let workspaceSessionObservationBridge = runtimeBootstrap.map { bootstrap in
+            WorkspaceSessionObservationBridge(
+                snapshotProvider: { await bootstrap.commandIngress.currentSnapshot() },
+                observationProvider: { sequence in
+                    await bootstrap.commandIngress.observations(after: sequence)
+                },
+                applySnapshot: { [weak workspaceManager] snapshot in
+                    workspaceManager?.withAuthoritativeProjection {
+                        workspaceManager?.applyAuthoritativeSessionSnapshot(snapshot)
+                        if let activeWorkspace = snapshot.workspaces.first(where: {
+                            $0.id == snapshot.activeWorkspaceID
+                        }) {
+                            promptManager.loadComposeTabsFromWorkspace(activeWorkspace)
+                        }
+                        #if DEBUG
+                            if let workspaceManager {
+                                testHooks?.afterAuthoritativeWorkspaceProjection?(
+                                    workspaceManager,
+                                    workspaceFilesViewModel,
+                                    snapshot
+                                )
+                            }
+                        #endif
+                    }
+                    if let runtimeID = runtimeBootstrap?.runtimeID,
+                       let adapterRegistry = appCoreContainer.runtimeAdapterRegistry
+                    {
+                        _ = adapterRegistry.updateSnapshot(
+                            runtimeID: runtimeID,
+                            sessionID: snapshot.sessionID,
+                            authoritativeSnapshot: snapshot
+                        )
+                    }
+                    guard let workspaceManager else { return }
+                    let roots = await workspaceSessionQuery?.roots() ?? []
+                    await workspaceFilesViewModel.applySessionRootProjection(
+                        roots,
+                        workspaceID: snapshot.activeWorkspaceID,
+                        orderedPrimaryPaths: snapshot.workspaces.first(where: {
+                            $0.id == snapshot.activeWorkspaceID
+                        })?.repoPaths ?? []
+                    )
+                }
+            )
+        }
+        if let workspaceSessionCommandClient, let workspaceSessionObservationBridge {
+            workspaceSessionCommandClient.bindProjectionWaiter { sequence in
+                await workspaceSessionObservationBridge.waitUntilApplied(sequence: sequence)
+            }
+        }
         let selectionCoordinator = WorkspaceSelectionCoordinator(
             workspaceManager: workspaceManager,
             store: workspaceFileContextStore
@@ -106,8 +314,14 @@ enum WindowStateCompositionFactory {
             workspaceManager: workspaceManager,
             selectionCoordinator: selectionCoordinator,
             windowID: windowID,
-            workspaceSearch: { [store = workspaceFileContextStore, workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
-                try await StoreBackedWorkspaceSearch.search(
+            runtimeID: mcpCatalogRuntimeID,
+            runtimePublicationInitiallyReady: workspaceRuntimeID == nil,
+            workspaceSessionQuery: workspaceSessionQuery,
+            workspaceSearch: { [store = workspaceFileContextStore, weak workspaceManager] pattern, mode, isRegex, caseInsensitive, maxPaths, maxMatches, paths, includeExtensions, excludePatterns, contextLines, wholeWord, countOnly, fuzzySpaceMatching, rootScope in
+                guard let workspaceManager else {
+                    throw MCPError.internalError("The original window UI is no longer available for file_search; the request was not retargeted.")
+                }
+                return try await StoreBackedWorkspaceSearch.search(
                     pattern: pattern,
                     mode: mode,
                     isRegex: isRegex,
@@ -134,6 +348,10 @@ enum WindowStateCompositionFactory {
             },
             applyEditsApprovalStore: applyEditsApprovalStore
         )
+        let runtimeAdapter = workspaceRuntimeID.map { _ in
+            MCPWindowRuntimeAdapter(windowState: nil, serverViewModel: mcpServer)
+        }
+        let runtimePublicationFence = WorkspaceRuntimePublicationFence()
         let closeCoordinator = WindowCloseCoordinator()
 
         // 12) Context Builder agent (needs mcpServer reference)
@@ -161,6 +379,9 @@ enum WindowStateCompositionFactory {
         if deferredInitialAgentSystemWorkspaceRefresh {
             agentModeViewModel.deferInitialSystemWorkspaceSessionListRefresh(reason: "programmaticNewWindowWorkspaceSwitch")
         }
+        #if DEBUG
+            testHooks?.configureAgentModeViewModel?(agentModeViewModel)
+        #endif
 
         #if DEBUG
             let agentChatStressHarness: AgentChatStressHarness? = if let stressConfiguration = AppLaunchConfiguration.current.agentChatStress {
@@ -183,6 +404,199 @@ enum WindowStateCompositionFactory {
                 oracleViewModel: oracleViewModel
             )
         )
+
+        let publishActivatedRuntime: @MainActor @Sendable (
+            WorkspaceSessionRuntimeBundle,
+            AssembledAppReadiness,
+            WorkspaceSessionSnapshot
+        ) async -> ActivatedRuntimePublicationResult = { runtime, readiness, fallbackSnapshot in
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else { return .failed }
+            guard let runtimeID = runtime.runtimeID else { return .published }
+            guard let lifecycle = runtime.runtimeLifecycle,
+                  let adapterRegistry = appCoreContainer.runtimeAdapterRegistry,
+                  let runtimeAdapter
+            else { return .failed }
+            switch await lifecycle.activate(initialAdmission: readiness.admission) {
+            case .activated, .alreadyActive:
+                break
+            case .runtimeNotFound, .sessionMismatch, .activationMismatch, .invalidState:
+                return .failed
+            }
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else {
+                _ = await lifecycle.beginDraining()
+                return .failed
+            }
+            let routingSnapshot = await runtime.commandIngress.currentSnapshot() ?? fallbackSnapshot
+            guard !Task.isCancelled, !runtimePublicationFence.isClosing else {
+                _ = await lifecycle.beginDraining()
+                return .failed
+            }
+            guard WorkspaceRuntimeReadinessProjection(routingSnapshot) == readiness.projection else {
+                return .projectionSuperseded
+            }
+            let ticket: MCPRuntimeAdapterTicket
+            switch adapterRegistry.stage(
+                windowID: windowID,
+                runtimeID: runtimeID,
+                sessionID: runtime.sessionID,
+                authoritativeSnapshot: routingSnapshot,
+                adapter: runtimeAdapter
+            ) {
+            case let .staged(stagedTicket):
+                ticket = stagedTicket
+            case .duplicateRuntimeID, .windowOccupied, .predecessorNotDraining, .sessionMismatch:
+                return .failed
+            }
+            switch adapterRegistry.activate(ticket: ticket) {
+            case let .activated(activeTicket), let .alreadyActive(activeTicket):
+                await mcpServer.markRuntimePublicationReady(ticket: activeTicket)
+                #if DEBUG
+                    await testHooks?.waitAfterRuntimePublicationReady?()
+                #endif
+                let lifecycleSnapshot = await lifecycle.snapshot()
+                let routingSnapshot = adapterRegistry.routingSnapshot(windowID: windowID)
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      lifecycleSnapshot?.runtimeID == runtimeID,
+                      lifecycleSnapshot?.sessionID == runtime.sessionID,
+                      lifecycleSnapshot?.state == .active,
+                      lifecycleSnapshot?.runtimeEpochID == readiness.admission.activationID,
+                      routingSnapshot?.runtimeID == runtimeID,
+                      routingSnapshot?.sessionID == runtime.sessionID,
+                      routingSnapshot?.adapterID == runtimeAdapter.adapterID,
+                      routingSnapshot?.mappingGeneration == activeTicket.mappingGeneration
+                else {
+                    mcpServer.beginRuntimeClose()
+                    _ = adapterRegistry.beginClosing(runtimeID: runtimeID)
+                    _ = await lifecycle.beginDraining()
+                    return .failed
+                }
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.runtimeAdapterPublished)
+                #endif
+                workspaceManager.completeSelectedSessionInitialization()
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.selectedSessionInitializationCompleted)
+                #endif
+                return .published
+            case .notFound, .staleTicket, .adapterUnavailable, .invalidState:
+                return .failed
+            }
+        }
+
+        let awaitAssembledAppReadiness: @MainActor @Sendable () async -> AssembledAppReadiness? = {
+            while true {
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      let workspaceSessionCommandClient,
+                      workspaceSessionCommandClient.sessionID == workspaceSessionID,
+                      let snapshot = workspaceSessionCommandClient.snapshot,
+                      snapshot.sessionID == workspaceSessionID,
+                      case let .admitted(initialAdmission) = await workspaceSessionCommandClient.acquireAdmission()
+                else { return nil }
+                let projection = WorkspaceRuntimeReadinessProjection(snapshot)
+                guard !Task.isCancelled, !runtimePublicationFence.isClosing else { return nil }
+
+                await agentModeViewModel.awaitInitialActiveSessionRestore()
+
+                guard !Task.isCancelled,
+                      !runtimePublicationFence.isClosing,
+                      let currentSnapshot = workspaceSessionCommandClient.snapshot,
+                      currentSnapshot.sessionID == workspaceSessionID
+                else { return nil }
+                guard WorkspaceRuntimeReadinessProjection(currentSnapshot) == projection else { continue }
+                #if DEBUG
+                    testHooks?.recordActivationEvent?(.initialActiveSessionRestoreSettled)
+                    await testHooks?.waitAfterInitialActiveSessionRestore?()
+                    guard !Task.isCancelled,
+                          !runtimePublicationFence.isClosing,
+                          let finalSnapshot = workspaceSessionCommandClient.snapshot,
+                          WorkspaceRuntimeReadinessProjection(finalSnapshot) == projection
+                    else { continue }
+                #endif
+                return AssembledAppReadiness(
+                    admission: initialAdmission,
+                    projection: projection
+                )
+            }
+        }
+
+        let publishRuntimeWhenReady: @MainActor @Sendable (
+            WorkspaceSessionRuntimeBundle,
+            WorkspaceSessionSnapshot
+        ) async -> Bool = { runtime, fallbackSnapshot in
+            while let readiness = await awaitAssembledAppReadiness() {
+                switch await publishActivatedRuntime(runtime, readiness, fallbackSnapshot) {
+                case .published:
+                    return true
+                case .projectionSuperseded:
+                    continue
+                case .failed:
+                    return false
+                }
+            }
+            return false
+        }
+
+        let workspaceSessionActivationTask: Task<Void, Never>? = if let runtimeBootstrap,
+                                                                    let workspaceSessionObservationBridge,
+                                                                    let workspaceSessionCommandClient
+        {
+            Task { @MainActor in
+                do {
+                    let runtime = try await runtimeBootstrap.runtimeTask.value
+                    switch await runtime.hydrate() {
+                    case let .awaitingFirstSnapshotApplication(firstSnapshot):
+                        await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(firstSnapshot)
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.firstAuthoritativeProjectionApplied)
+                        #endif
+                        workspaceSessionObservationBridge.startObserving()
+                        let activation = await runtime.activateAfterApplyingFirstSnapshot(
+                            firstSnapshot.snapshotSequence
+                        )
+                        guard case .activated = activation else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        guard await publishRuntimeWhenReady(runtime, firstSnapshot) else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                    case let .alreadyHydrated(snapshot):
+                        guard let snapshot else {
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                        await workspaceSessionObservationBridge.applyFirstAuthoritativeSnapshot(snapshot)
+                        #if DEBUG
+                            testHooks?.recordActivationEvent?(.firstAuthoritativeProjectionApplied)
+                        #endif
+                        workspaceSessionObservationBridge.startObserving()
+                        guard await publishRuntimeWhenReady(runtime, snapshot) else {
+                            workspaceSessionObservationBridge.stop()
+                            await runtime.shutdown()
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                            return
+                        }
+                    case .failed:
+                        await runtime.shutdown()
+                        appCoreContainer.releaseRuntime(windowID: windowID)
+                        return
+                    }
+                } catch {
+                    appCoreContainer.releaseRuntime(windowID: windowID)
+                    return
+                }
+            }
+        } else {
+            nil
+        }
         workspaceManager.registerSwitchSessionProvider(
             ContextBuilderWorkspaceSwitchSessionProvider(
                 contextBuilderAgentViewModel: contextBuilderAgentViewModel
@@ -196,6 +610,32 @@ enum WindowStateCompositionFactory {
 
         #if DEBUG
             return WindowStateComposition(
+                workspaceSessionID: workspaceSessionID,
+                workspaceRuntimeID: workspaceRuntimeID,
+                runtimeAdapter: runtimeAdapter,
+                workspaceRuntimeBeginClose: {
+                    runtimePublicationFence.beginClosing()
+                    mcpServer.beginRuntimeClose()
+                    if let workspaceRuntimeID {
+                        _ = appCoreContainer.runtimeAdapterRegistry?.beginClosing(runtimeID: workspaceRuntimeID)
+                    }
+                },
+                workspaceSessionCommandClient: workspaceSessionCommandClient,
+                workspaceSessionQuery: workspaceSessionQuery,
+                workspaceSessionObservationBridge: workspaceSessionObservationBridge,
+                workspaceSessionActivationTask: workspaceSessionActivationTask,
+                workspaceSessionShutdown: {
+                    if let runtimeBootstrap, let runtime = try? await runtimeBootstrap.runtimeTask.value {
+                        await runtime.shutdown()
+                        await MainActor.run {
+                            if let workspaceRuntimeID {
+                                _ = appCoreContainer.runtimeAdapterRegistry?.markRemoved(runtimeID: workspaceRuntimeID)
+                                _ = appCoreContainer.runtimeAdapterRegistry?.purgeRemoved(runtimeID: workspaceRuntimeID)
+                            }
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                        }
+                    }
+                },
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -216,6 +656,32 @@ enum WindowStateCompositionFactory {
             )
         #else
             return WindowStateComposition(
+                workspaceSessionID: workspaceSessionID,
+                workspaceRuntimeID: workspaceRuntimeID,
+                runtimeAdapter: runtimeAdapter,
+                workspaceRuntimeBeginClose: {
+                    runtimePublicationFence.beginClosing()
+                    mcpServer.beginRuntimeClose()
+                    if let workspaceRuntimeID {
+                        _ = appCoreContainer.runtimeAdapterRegistry?.beginClosing(runtimeID: workspaceRuntimeID)
+                    }
+                },
+                workspaceSessionCommandClient: workspaceSessionCommandClient,
+                workspaceSessionQuery: workspaceSessionQuery,
+                workspaceSessionObservationBridge: workspaceSessionObservationBridge,
+                workspaceSessionActivationTask: workspaceSessionActivationTask,
+                workspaceSessionShutdown: {
+                    if let runtimeBootstrap, let runtime = try? await runtimeBootstrap.runtimeTask.value {
+                        await runtime.shutdown()
+                        await MainActor.run {
+                            if let workspaceRuntimeID {
+                                _ = appCoreContainer.runtimeAdapterRegistry?.markRemoved(runtimeID: workspaceRuntimeID)
+                                _ = appCoreContainer.runtimeAdapterRegistry?.purgeRemoved(runtimeID: workspaceRuntimeID)
+                            }
+                            appCoreContainer.releaseRuntime(windowID: windowID)
+                        }
+                    }
+                },
                 workspaceFileContextStore: workspaceFileContextStore,
                 workspaceSearchService: workspaceSearchService,
                 selectionCoordinator: selectionCoordinator,
@@ -234,5 +700,39 @@ enum WindowStateCompositionFactory {
                 workspaceManager: workspaceManager
             )
         #endif
+    }
+
+    private static func resolvedWorkspaceStorageRoot() -> URL {
+        if let path = UserDefaults.standard.string(forKey: "GlobalCustomStorageURL") {
+            return URL(fileURLWithPath: path)
+        }
+        return WorkspaceStoragePaths.defaultRoot
+    }
+
+    private nonisolated static func loadWorkspaceHydrationInput(
+        storageRoot: URL
+    ) throws -> WorkspaceSessionHydrationInput {
+        let indexURL = storageRoot.appendingPathComponent("workspacesIndex.json")
+        let entries: [WorkspaceIndexEntry] = if FileManager.default.fileExists(atPath: indexURL.path) {
+            (try? JSONDecoder().decode([WorkspaceIndexEntry].self, from: Data(contentsOf: indexURL))) ?? []
+        } else {
+            []
+        }
+        var workspaces: [WorkspaceModel] = []
+        for entry in entries {
+            let url = entry.customStoragePath?.appendingPathComponent("workspace.json")
+                ?? storageRoot
+                .appendingPathComponent("Workspace-\(entry.name)-\(entry.id.uuidString)")
+                .appendingPathComponent("workspace.json")
+            guard FileManager.default.fileExists(atPath: url.path),
+                  let workspace = try? JSONDecoder().decode(WorkspaceModel.self, from: Data(contentsOf: url))
+            else { continue }
+            workspaces.append(workspace)
+        }
+        if workspaces.isEmpty {
+            workspaces = [WorkspaceModel(name: "Default", repoPaths: [], isSystemWorkspace: true)]
+        }
+        let activeID = workspaces.first(where: \.isSystemWorkspace)?.id ?? workspaces.first?.id
+        return WorkspaceSessionHydrationInput(workspaces: workspaces, activeWorkspaceID: activeID)
     }
 }

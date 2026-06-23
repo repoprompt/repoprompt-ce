@@ -1,0 +1,74 @@
+name: Headless v1
+
+on:
+  pull_request:
+    paths:
+      - "Sources/RepoPromptHeadless/**"
+      - "Tests/RepoPromptHeadlessTests/**"
+      - "Sources/RepoPromptCore/**"
+      - "Sources/RepoPromptCoreMacOS/**"
+      - "Sources/RepoPromptPOSIXSupport/**"
+      - "Tests/RepoPromptPOSIXSupportTests/**"
+      - "Package.swift"
+      - "Scripts/**headless**"
+      - "Scripts/conductor.py"
+      - "Scripts/core_isolation_guardrails.py"
+      - "Scripts/test_suite_optimizer.py"
+      - "docs/core-isolation/**"
+      - ".github/workflows/headless.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  debug-contract:
+    name: Headless debug contract
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Structural and negative guards
+        run: |
+          make guardrails
+          python3 Scripts/test_core_isolation_guardrails.py
+      - name: Headless tests and authoritative list
+        run: |
+          make dev-headless-test
+          make dev-headless-test-list
+      - name: Curated ledger reconciliation
+        run: python3 Scripts/test_suite_optimizer.py verify-ledger --ledger Scripts/Fixtures/test-suite-contract-ledger.tsv
+      - name: Xcode graph validation
+        run: |
+          make xcode-generator-test
+          make xcode-validate
+      - name: Debug package and provenance
+        run: |
+          make dev-headless-package HEADLESS_CONFIGURATION=debug
+          make dev-headless-provenance HEADLESS_CONFIGURATION=debug
+      - name: Packaged direct-stdio smoke
+        run: make dev-headless-smoke HEADLESS_CONFIGURATION=debug SKIP_PACKAGE=1
+      - name: Isolated install, status, and uninstall
+        run: |
+          original_home="$HOME"
+          export REPOPROMPT_HEADLESS_TOOLS_ROOT="$original_home/Library/Application Support/RepoPrompt CE/HeadlessTools"
+          export HOME="$RUNNER_TEMP/headless-install-home"
+          export REPOPROMPT_HEADLESS_STATE_DIR="$HOME/state/v1"
+          export REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH="$HOME/bin/rpce-headless-debug"
+          mkdir -p "$HOME/bin" "$REPOPROMPT_HEADLESS_STATE_DIR"
+          printf 'preserve\n' > "$REPOPROMPT_HEADLESS_STATE_DIR/sentinel"
+          make dev-headless-install HEADLESS_CONFIGURATION=debug
+          make dev-headless-status
+          make dev-headless-uninstall HEADLESS_CONFIGURATION=debug
+          test -f "$REPOPROMPT_HEADLESS_STATE_DIR/sentinel"
+          test ! -e "$REPOPROMPT_HEADLESS_DEBUG_INSTALL_PATH"
+
+  release-contract:
+    name: Headless universal release contract
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+      - name: Universal release package
+        run: make dev-headless-package HEADLESS_CONFIGURATION=release
+      - name: Architecture and provenance verification
+        run: make dev-headless-provenance HEADLESS_CONFIGURATION=release
+      - name: Release direct-stdio smoke
+        run: make dev-headless-smoke HEADLESS_CONFIGURATION=release SKIP_PACKAGE=1

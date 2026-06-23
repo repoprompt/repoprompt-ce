@@ -8,6 +8,13 @@ import RepoPromptShared
 final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
     let group: MCPWindowToolGroup = .agentSessionControl
 
+    static let setStatusDescription = """
+    Set or rename the current Agent Mode session title.
+
+    Call this tool whenever the user explicitly asks to name, rename, or retitle the session.
+    Do not tell the user the title changed unless this tool returns success.
+    """
+
     private let runtime: MCPWindowToolRuntime
     private let dependencies: MCPWindowToolDependencies
 
@@ -67,17 +74,13 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
         runtime.tool(
             name: MCPWindowToolName.setStatus,
             freshnessPolicy: .none,
-            description: """
-            Rename the current agent session/tab.
-
-            Use this tool near session start to set a helpful session title.
-            """,
+            description: Self.setStatusDescription,
             annotations: .repoPromptLocalEphemeralState,
             inputSchema: .object(
                 properties: [
-                    "session_name": .string(description: "Optional session/tab title to set for the active session tab.")
+                    "session_name": .string(description: "Required title to apply to the current Agent Mode session.")
                 ],
-                required: []
+                required: ["session_name"]
             )
         ) { [dependencies] _, args in
             try await Self.executeSetStatus(args: args, dependencies: dependencies)
@@ -155,29 +158,39 @@ final class MCPAgentSessionControlToolProvider: MCPWindowToolProviding {
         dependencies: MCPWindowToolDependencies
     ) async throws -> Value {
         let connectionID = try await dependencies.requireAgentModeConnection(MCPWindowToolName.setStatus)
-        let trimmedSessionName = args["session_name"]?.stringValue?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let sessionNameToApply = (trimmedSessionName?.isEmpty == false) ? trimmedSessionName : nil
-
         let targetWindow = try dependencies.requireTargetWindow()
         let tabID = try await dependencies.resolveAgentModeTabID(args, connectionID)
+        return try await executeSetStatus(args: args, targetWindow: targetWindow, tabID: tabID)
+    }
 
-        // Invariant: background status updates are tab-scoped and must not steal tab focus.
-        await MainActor.run {
-            if let sessionNameToApply {
-                targetWindow.agentModeViewModel.renameSession(tabID: tabID, to: sessionNameToApply)
-            }
+    @MainActor
+    static func executeSetStatus(
+        args: [String: Value],
+        targetWindow: WindowState,
+        tabID: UUID
+    ) async throws -> Value {
+        guard let rawSessionName = args["session_name"]?.stringValue else {
+            throw MCPError.invalidParams("session_name is required")
+        }
+        let trimmedSessionName = rawSessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSessionName.isEmpty else {
+            throw MCPError.invalidParams("session_name must not be blank")
         }
 
-        var result: [String: Value] = [
+        // Invariant: background title updates are tab-scoped and must not steal tab focus.
+        guard let canonicalName = await targetWindow.agentModeViewModel.renameSession(
+            tabID: tabID,
+            to: trimmedSessionName
+        ) else {
+            throw MCPError.internalError("The session title could not be applied and verified.")
+        }
+
+        return .object([
             "ok": .bool(true),
             "context_id": .string(tabID.uuidString),
-            "session_name_applied": .bool(sessionNameToApply != nil)
-        ]
-        if let sessionNameToApply {
-            result["session_name"] = .string(sessionNameToApply)
-        }
-        return .object(result)
+            "session_name_applied": .bool(true),
+            "session_name": .string(canonicalName)
+        ])
     }
 
     static func resolvedInstructionWaitTimeoutSeconds(_ value: Value?) throws -> TimeInterval {

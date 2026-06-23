@@ -10,6 +10,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 
@@ -91,10 +92,13 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         copied = self.outputs[Path(generator.WORKSPACE_NAME) / "xcshareddata/swiftpm/Package.resolved"]
         self.assertEqual((generator.REPO_ROOT / "Package.resolved").read_bytes(), copied)
 
-    def test_generated_readme_documents_native_xcode_limitations(self) -> None:
+    def test_generated_readme_documents_active_headless_and_native_xcode_limitations(self) -> None:
         readme = self.outputs[Path("README.md")].decode()
         self.assertIn("not mutate `Vendor/`", readme)
         self.assertIn("RepoPromptMCP", readme)
+        self.assertIn("repoprompt-headless", readme)
+        self.assertIn("standalone packaging, provenance, install", readme)
+        self.assertIn("RepoPromptHeadlessTests", readme)
 
     def test_project_has_exactly_three_convenience_targets(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
@@ -102,6 +106,19 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         self.assertIn(generator.APP_SCHEME, project)
         self.assertIn(generator.MCP_SCHEME, project)
         self.assertIn(generator.TEST_SCHEME, project)
+
+    def test_generation_metadata_includes_active_isolated_graph(self) -> None:
+        metadata = json.loads(self.outputs[Path("generation.json")])
+        self.assertTrue(
+            set(generator.REQUIRED_EXECUTABLE_PRODUCTS).issubset(
+                metadata["package"]["products"]
+            )
+        )
+        self.assertTrue(
+            set(generator.REQUIRED_PACKAGE_TARGETS).issubset(
+                metadata["package"]["targets"]
+            )
+        )
 
     def test_convenience_targets_do_not_pass_xcode_build_settings(self) -> None:
         project = self.outputs[Path(generator.PROJECT_NAME) / "project.pbxproj"].decode()
@@ -155,6 +172,29 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         path = Path(generator.PROJECT_NAME) / f"xcshareddata/xcschemes/{generator.MCP_SCHEME}.xcscheme"
         self.assertIn(".build/debug/repoprompt-mcp", self.outputs[path].decode())
 
+    def test_xcodebuild_list_requires_native_headless_product_scheme(self) -> None:
+        schemes = [
+            generator.APP_SCHEME,
+            generator.MCP_SCHEME,
+            generator.TEST_SCHEME,
+            "RepoPrompt",
+        ]
+        result = subprocess.CompletedProcess(
+            ["xcodebuild", "-list"],
+            0,
+            json.dumps({"workspace": {"schemes": schemes}}),
+            "",
+        )
+        with mock.patch.object(generator.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(generator.GeneratorError, "repoprompt-headless"):
+                generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
+        result.stdout = json.dumps(
+            {"workspace": {"schemes": [*schemes, "repoprompt-headless"]}}
+        )
+        with mock.patch.object(generator.subprocess, "run", return_value=result):
+            generator.validate_xcodebuild_list(Path("/tmp/generated-xcode"))
+
     def test_check_detects_corruption(self) -> None:
         temporary, destination = self.generate_in_temporary_directory()
         self.addCleanup(temporary.cleanup)
@@ -206,6 +246,27 @@ class XcodeWorkspaceGeneratorTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptShared'"):
             generator.validate_manifest(missing_target, generator.REPO_ROOT)
+
+        missing_scaffold_target = deepcopy(self.manifest)
+        missing_scaffold_target["targets"] = [
+            target
+            for target in missing_scaffold_target["targets"]
+            if target["name"] != "RepoPromptCore"
+        ]
+        with self.assertRaisesRegex(generator.GeneratorError, "target 'RepoPromptCore'"):
+            generator.validate_manifest(missing_scaffold_target, generator.REPO_ROOT)
+
+        missing_headless_product = deepcopy(self.manifest)
+        missing_headless_product["products"] = [
+            product
+            for product in missing_headless_product["products"]
+            if product["name"] != "repoprompt-headless"
+        ]
+        with self.assertRaisesRegex(
+            generator.GeneratorError,
+            "executable product 'repoprompt-headless'",
+        ):
+            generator.validate_manifest(missing_headless_product, generator.REPO_ROOT)
 
         bad_resources = deepcopy(self.manifest)
         for target in bad_resources["targets"]:

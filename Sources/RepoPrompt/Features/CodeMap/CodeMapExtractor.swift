@@ -1,16 +1,6 @@
 import Foundation
 import SwiftUI
 
-/// Determines how CodeMap definitions are inserted.
-enum CodeMapUsage: String, CaseIterable, Codable {
-    case auto
-    case complete
-    /// Include code-map for selected files only (handled at injection sites;
-    /// returning it here would duplicate).
-    case selected
-    case none
-}
-
 /// A small struct returning code-map text + the number of files included in that text.
 struct DefinitionBlockResult {
     let text: String

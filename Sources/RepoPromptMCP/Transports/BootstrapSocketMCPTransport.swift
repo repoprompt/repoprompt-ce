@@ -10,6 +10,7 @@ import Dispatch
 import Foundation
 import Logging
 import MCP
+import RepoPromptPOSIXSupport
 import RepoPromptShared
 import SystemPackage
 

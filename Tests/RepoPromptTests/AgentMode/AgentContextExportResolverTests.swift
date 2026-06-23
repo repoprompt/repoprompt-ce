@@ -141,12 +141,13 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(previewText, "let origin = \"worktree\"\n")
         XCTAssertFalse(previewText?.contains("base") ?? true)
 
-        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+        let clipboard = try await AgentContextExportResolver.buildClipboardContent(
             AgentContextClipboardRequest(
                 cfg: makeConfig(gitInclusion: .none),
                 source: source,
                 store: fixture.store,
                 lookupContext: model.lookupContext,
+                factualProvider: nil,
                 filePathDisplay: .relative,
                 onlyIncludeRootsWithSelectedFiles: true,
                 showCodeMapMarkers: true,
@@ -537,12 +538,13 @@ final class AgentContextExportResolverTests: XCTestCase {
         )
         let lookupContext = await AgentContextExportResolver.lookupContext(source: source, store: fixture.store)
 
-        let clipboard = await AgentContextExportResolver.buildClipboardContent(
+        let clipboard = try await AgentContextExportResolver.buildClipboardContent(
             AgentContextClipboardRequest(
                 cfg: makeConfig(gitInclusion: .complete),
                 source: source,
                 store: fixture.store,
                 lookupContext: lookupContext,
+                factualProvider: nil,
                 filePathDisplay: .relative,
                 onlyIncludeRootsWithSelectedFiles: true,
                 showCodeMapMarkers: true,

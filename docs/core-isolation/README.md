@@ -1,0 +1,129 @@
+# Core Isolation Execution Packet
+
+**Created:** 2026-06-21
+**Current phase:** Phase 8 — independently packaged standalone headless v1; see [phase-8.md](phases/phase-8.md)
+**Disposition:** **GO through Phase 8; Phase 9 remains unstarted**
+**Production behavior change:** one selected workspace authority with next-launch legacy rollback
+**Activated isolated tests:** `RepoPromptCoreTests`, `RepoPromptCoreMacOSTests`, `RepoPromptPOSIXSupportTests`, and `RepoPromptHeadlessTests`
+
+This directory is the compact execution record for
+[Core Isolation Reconstruction](../plans/core-isolation-reconstruction-2026-06-20.md).
+It is not a second issue tracker. Later phases append newly discovered boundary rows
+with provenance rather than rewriting the Phase 0 census.
+
+## Frozen provenance
+
+| Item | Revision / SHA-256 |
+| --- | --- |
+| Phase 0 implementation base (`dev`, `main`, `origin/main`) | `8e42951159c9f1d6973a4538a309908baacdb371` |
+| Execution plan | `d3af73d32ae00d27fd8b09240986a579605b7d01245dea45c4e31533e3956464` |
+| Source investigation | `e70138f9c73cd9d4e8e4f70e58bb91ef2ca2a59bb1c18b8547a030c350432a92` |
+| Phase 0 `Package.swift` | `f8aee0f3d6b2f4397f1827f763b92ff58814b1611f15e33c27ef19a5b83586fd` |
+| Phase 4 final `Package.swift` | `2df851a230445e9199d4e84867de9c5211ead25f6f86fa54369168e6e92b0eca` |
+| Current `Package.resolved` | `619a752f9015f1544aa4d8438e5ebad106b8402aba4d6b7febe5bdb4b518dacc` |
+| Reference feature snapshot | `f86746c8007a2dc95faf40d78cd5467e59792086` |
+| Rebased reviewed snapshot | `444c599cb63d9a5439c5db961f819a3a74a2722b` |
+| Review hardening follow-up / `pr/118-rebase` | `21b5603f5a333454aee899dd39ff38d860a5b716` |
+| Reference feature branch tip | `3dd01a3efe1326e4774cd677e1f6773323ad65ae` |
+| Reference linear history tip | `f4b8d59839fc389074168f1d3dfc4760f8131cb7` |
+
+The parallel reference checkout was dirty during Phase 0 in three unrelated MCP/Codex
+files. It was used only through immutable Git objects; no working-tree bytes were
+accepted as contract evidence.
+
+The currently fetchable reference tips are `origin/feature/core-isolation-headless-foundation`
+at `3dd01a3efe1326e4774cd677e1f6773323ad65ae` and `origin/core_split` at
+`f4b8d59839fc389074168f1d3dfc4760f8131cb7`. Snapshot `f86746c` is reachable
+from the former and security hardening `487cd71d` is reachable from the latter.
+The reviewed rebase snapshots `444c599c` and `21b5603f` existed only on the local
+`pr/118-rebase` archaeology branch and are not ancestors of either current remote
+tip. Their contracts were transcribed and spot-checked during Phase 0; this packet,
+not continued availability of those local objects, is the canonical execution
+contract. No later phase may depend on fetching those two objects.
+
+## Packet index
+
+- [ADR-001 — Target graph and CE C-symbol namespace](decisions/ADR-001-target-graph-and-c-symbol-namespace.md)
+- [ADR-002 — Headless version and transport identity](decisions/ADR-002-headless-version-and-transport-identity.md)
+- [ADR-003 — Runtime and weak UI compatibility identity](decisions/ADR-003-runtime-and-ui-identity.md)
+- [Behavior, hazards, tests, and performance](contracts/behavior-and-performance.md)
+- [Persistence schema and compatibility](contracts/persistence-schema.md)
+- [Standalone headless v1 contract](contracts/headless-v1.md)
+- [Phase 1–4 migration ledger](migration-ledger.tsv)
+- [Phase 0 evidence and disposition](phases/phase-0.md)
+- [Phase 1 evidence and disposition](phases/phase-1.md)
+- [Phase 2 evidence and disposition](phases/phase-2.md)
+- [Phase 3 evidence and disposition](phases/phase-3.md)
+- [Phase 4 evidence, lifecycle continuation, and final GO disposition](phases/phase-4.md)
+- [Phase 5 authority-cutover execution record](phases/phase-5.md)
+- [Phase 6 factual prompt execution record](phases/phase-6.md)
+- [Phase 7 runtime lifecycle execution record](phases/phase-7.md)
+- [Phase 8 standalone headless execution record](phases/phase-8.md)
+- [Deferred Phase 9+ work](deferred-work.md)
+
+## Mutation policy
+
+- Accepted ADRs are immutable; supersede them with a new ADR.
+- Contract files are frozen at Phase 0 close. Later corrections are append-only and
+  must name the correcting phase and evidence.
+- `migration-ledger.tsv` is append-only after Phase 0 close. Do not delete or
+  rewrite a row; append a superseding row with provenance.
+- Phase records have mutable work/risk/evidence sections until close and an
+  append-only close disposition thereafter.
+- Deferred work is append-only.
+
+## Gate summary
+
+Phase 0 freezes:
+
+- one acyclic target/product graph and one owner/destination for every inventoried
+  Phase 1–2 boundary;
+- current persistence locations, fields, defaults, ordering, dates, generations,
+  revisions, and stale-write behavior;
+- exact authoritative root/provider test censuses and scenario totals;
+- current or reviewed-reference oracles for P0-01 through P0-12;
+- the standalone headless v1 CLI, NDJSON, tool, error, state, root, secret,
+  permission, and shutdown contract;
+- five normal search/catalog samples, five normal selection/prompt samples,
+  four comparable warm packaged app-proxy smoke samples, and one cold lifecycle
+  smoke sample.
+
+Phase 1 added package/control-plane scaffolding. Phase 2 moved ledger-owned
+neutral declarations and faithful deterministic tests. Phase 3 added neutral
+platform contracts and moved low-level macOS/POSIX/syntax ownership; its close
+disposition is **GO** with no blockers. Phase 4 now extracts the current
+workspace/file-context engine and its catalog, lookup, search, slice, codemap,
+neutral syntax, cache, ingress, and lifetime collaborators into Core while the
+legacy app still constructs one engine per window and remains the sole writable
+workspace authority. Its deterministic behavior, performance, lists/ledgers,
+style, guardrails, builds, full tests, and non-launching debug package gates are
+green. An explicitly approved continuation launched the matching packaged CE
+debug app, passed one cold and four warm app-proxy smokes, stopped the matching
+app, and confirmed no matching process remained. Phase 4 is **GO**. Phase 5 began
+from clean checkpoint `e76b39f1` and is now **GO**: the atomic authority cutover,
+rollback parity, deterministic/package ladder, curated Oracle review, approved
+packaged live smokes, and exact stopped-process proof are all complete.
+
+
+Phase 6 began from clean checkpoint `33b32e47` and is now **GO**. Core owns one
+admitted immutable factual capture, logical projection, tree/codemap/content
+rendering, and accounting generation. The app retains Git authorization and
+capture, provider selection, fallback, envelopes, and presentation. Exact lists,
+all full deterministic/package lanes, the manually curated Oracle review, and the
+approved packaged live capture/stop proof are green.
+
+Phase 7 began from clean checkpoint `397a9b70` and is now **GO**. Core owns
+runtime lifecycle/admission and strong admitted handles; the app retains only
+weak compatibility adapters and immutable routing snapshots. Exact runtime and
+mapping identity, exhaustive lifetime classification, drain-based teardown,
+all deterministic/package/style/ledger lanes, the bounded curated Oracle review,
+performance samples, packaged app-proxy smoke, and exact stopped-process proof
+are green. Phase 8 starts only from that frozen `5f0dab77` checkpoint; Phase 7 identity remains unchanged.
+
+Phase 8 is now **GO**. It activates the independently packaged direct-stdio
+runtime, exact nine-tool profile, isolated v1 state/secret namespace,
+descriptor-confined roots, and standalone distribution lanes. The full
+deterministic/security/build/Xcode/package/install/provenance/direct-stdio matrix,
+one curated Oracle review and its corrections, the separate unchanged app-proxy
+smoke, and exact stopped-process proof are green. Phase 9 convergence and
+compatibility cleanup remain unstarted.

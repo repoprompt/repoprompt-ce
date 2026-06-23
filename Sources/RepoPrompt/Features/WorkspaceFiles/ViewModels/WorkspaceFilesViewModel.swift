@@ -730,8 +730,11 @@ class WorkspaceFilesViewModel: ObservableObject {
     private var fileSystemSettingsCancellable: AnyCancellable?
     private var forceReloadOnNextFileSystemSettingsRefresh = false
 
-    private let selectionSliceCoordinator = SelectionSliceCoordinator()
+    private let selectionSliceCoordinator = SelectionSliceCoordinator(
+        store: LegacyWorkspaceRuntimeFactory.partitionStore()
+    )
     private var currentSlicesByRoot: [String: [String: PartitionStore.StoredSlices]] = [:]
+    private(set) var explicitSelectionSliceMutationRevision: UInt64 = 0
     @Published private(set) var selectionSlicesByFileID: [UUID: [LineRange]] = [:] {
         didSet {
             guard selectionSlicesByFileID != oldValue else { return }
@@ -1546,7 +1549,7 @@ class WorkspaceFilesViewModel: ObservableObject {
                   !targets.isEmpty
             else { continue }
             let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
-            let sourceSnapshot: SliceRebaseSourceSnapshot? = eventSource.flatMap { source in
+            let sourceSnapshot: SliceRebaseSourceSnapshot? = eventSource.flatMap { source -> SliceRebaseSourceSnapshot? in
                 guard source.rootID == event.rootID,
                       source.rootLifetimeID == rootLifetimeID,
                       source.fileID == fileID,
@@ -3165,6 +3168,37 @@ class WorkspaceFilesViewModel: ObservableObject {
         let rootKey = root.standardizedFullPath
         guard workspaceFileContextRootsByRootKey[rootKey]?.id != root.id else { return }
         preloadedWorkspaceFileContextRootsByRootKey[rootKey] = root
+    }
+
+    /// Applies a root-shell projection from the selected session's immutable query facade.
+    /// Store load/unload remains exclusively owned by `WorkspaceSessionLifecycleOwner`.
+    @MainActor
+    func applySessionRootProjection(
+        _ records: [WorkspaceRootRecord],
+        workspaceID: UUID?,
+        orderedPrimaryPaths: [String]
+    ) async {
+        let desiredPrimary = records.filter { $0.kind == .primaryWorkspace }
+        let desiredIDs = Set(desiredPrimary.map(\.id))
+        let obsolete = rootFolders.filter { folder in
+            guard let record = workspaceFileContextRootsByRootKey[rootKey(forPath: folder.fullPath)] else {
+                return false
+            }
+            return record.kind == .primaryWorkspace && !desiredIDs.contains(record.id)
+        }
+        for folder in obsolete {
+            _ = await detachRootShell(forRootPath: folder.fullPath, unloadStoreRoot: false)
+        }
+        for record in desiredPrimary where !rootFolders.contains(where: { $0.id == record.id }) {
+            do {
+                try attachRootShell(for: record, workspaceID: workspaceID)
+            } catch {
+                self.error = .failedToLoadFolder(error)
+            }
+        }
+        currentWorkspaceID = workspaceID
+        reorderRootFolders(to: orderedPrimaryPaths)
+        refreshRootFolderState()
     }
 
     @MainActor
@@ -9836,6 +9870,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw SelectionSliceError.noWorkspaceLoaded
         }
 
+        explicitSelectionSliceMutationRevision &+= 1
         let scope = try currentPartitionScope()
 
         if entries.isEmpty {
@@ -10131,6 +10166,7 @@ class WorkspaceFilesViewModel: ObservableObject {
             throw SelectionSliceError.noWorkspaceLoaded
         }
 
+        explicitSelectionSliceMutationRevision &+= 1
         let scope = try currentPartitionScope()
         let rootKey = file.standardizedRootFolderPath
         let relKey = file.standardizedRelativePath
@@ -11322,6 +11358,17 @@ extension WorkspaceFilesViewModel {
         commitSelectionState([], [])
     }
 
+    #if DEBUG
+        @MainActor
+        func test_emitEmptySelectionForAuthoritativeProjectionFeedback() {
+            if selectedFiles.isEmpty {
+                selectedFiles = []
+            } else {
+                resetSelection()
+            }
+        }
+    #endif
+
     /// Remove a single file from selection state if present. Returns true if a change occurred.
     @MainActor
     @discardableResult
@@ -11792,6 +11839,7 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func setFileAsFullContent(_ file: FileViewModel) {
+        explicitSelectionSliceMutationRevision &+= 1
         performSelectionBatch {
             if !file.isChecked {
                 file.setIsChecked(true)
@@ -11809,6 +11857,7 @@ extension WorkspaceFilesViewModel {
         // Only allow files with codemap support to be added as codemaps
         guard file.supportsCodeMap else { return }
 
+        explicitSelectionSliceMutationRevision &+= 1
         performSelectionBatch {
             if file.isChecked {
                 file.setIsChecked(false)
@@ -12441,30 +12490,6 @@ extension WorkspaceFilesViewModel {
             } catch {
                 continue
             }
-        }
-    }
-}
-
-enum FileManagerError: Error, LocalizedError {
-    case failedToLoadFolder(Error)
-    case failedToLoadFile(Error)
-    case fileSystemServiceNotFound
-    case failedToLoadContent
-    // New: richer, contextual variant used by MCP tools and FS ops
-    case fileSystemServiceNotFoundWithContext(String)
-
-    var errorDescription: String? {
-        switch self {
-        case let .failedToLoadFolder(err):
-            "Failed to load folder: \(err.localizedDescription)"
-        case let .failedToLoadFile(err):
-            "Failed to load file: \(err.localizedDescription)"
-        case .fileSystemServiceNotFound:
-            "No matching workspace folder for the requested path."
-        case .failedToLoadContent:
-            "Failed to load content."
-        case let .fileSystemServiceNotFoundWithContext(context):
-            context
         }
     }
 }
@@ -13314,6 +13339,7 @@ extension WorkspaceFilesViewModel {
     @MainActor
     private func syncFileSystemPreferencesFromGlobalSettings() {
         let settings = GlobalSettingsStore.shared.fileSystemSettingsSnapshot()
+        LegacyWorkspaceGlobalIgnoreDefaults.shared.update(settings.globalIgnoreDefaults)
         respectGitignore = settings.respectGitignore
         respectRepoIgnore = settings.respectRepoIgnore
         respectCursorignore = settings.respectCursorignore

@@ -399,13 +399,13 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     }
 
     private func resolveRepositoryContext(args: [String: Value]) async throws -> RepositoryContext {
-        guard dependencies.workspaceManager?.activeWorkspace != nil else {
+        guard await dependencies.workspaceManager()?.activeWorkspace != nil else {
             throw MCPError.invalidParams("No active workspace in this window. Load a workspace before using manage_worktree.")
         }
 
         let metadata = await dependencies.captureRequestMetadata()
         let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
+        let visibleRoots = await dependencies.workspaceFileContextStore.rootRefs(scope: lookupContext.rootScope)
         let allRepos = try await discoverAllGitRepos(rootScope: lookupContext.rootScope)
         let defaultRepo = try await resolveDefaultGitRepo(rootScope: lookupContext.rootScope)
         let repo: GitRepoDescriptor
@@ -456,7 +456,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     }
 
     private func discoverAllGitRepos(rootScope: WorkspaceLookupRootScope) async throws -> [GitRepoDescriptor] {
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
+        let visibleRoots = await dependencies.workspaceFileContextStore.rootRefs(scope: rootScope)
         var repos: [GitRepoDescriptor] = []
         var seen = Set<String>()
         for root in visibleRoots {
@@ -472,7 +472,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     }
 
     private func resolveDefaultGitRepo(rootScope: WorkspaceLookupRootScope) async throws -> GitRepoDescriptor {
-        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: rootScope)
+        let visibleRoots = await dependencies.workspaceFileContextStore.rootRefs(scope: rootScope)
         for root in visibleRoots {
             if let resolved = await vcsService.resolveRepo(from: URL(fileURLWithPath: root.standardizedFullPath)) {
                 return GitRepoDescriptor(rootURL: resolved.rootURL)

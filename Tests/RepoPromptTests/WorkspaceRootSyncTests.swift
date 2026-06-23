@@ -133,44 +133,6 @@ final class WorkspaceRootSyncTests: XCTestCase {
         XCTAssertFalse(windowPath.contains("/Application Support/RepoPrompt/windowSessions.json"), windowPath)
     }
 
-    func testWorkspaceDecodeCreatesDefaultComposeTabAndIgnoresRemovedLegacyFields() throws {
-        let workspaceID = UUID()
-        let payload = """
-        {
-          "id": "\(workspaceID.uuidString)",
-          "schemaVersion": 1,
-          "dateModified": 0,
-          "name": "Legacy Fields",
-          "repoPaths": ["/tmp/root"],
-          "presets": [],
-          "lastUsed": 0,
-          "selectedMetaPromptIDs": [],
-          "workingFilePaths": ["/tmp/root/legacy.swift"],
-          "workingExpandedFolders": ["/tmp/root"],
-          "contextBuilderState": { "useOverridePrompt": true, "overridePromptText": "legacy override" },
-          "discoveryInstructions": "legacy instructions",
-          "discoveryAgentRaw": "codexExec",
-          "composeTabs": [],
-          "stashedTabs": []
-        }
-        """
-
-        let decoded = try JSONDecoder().decode(WorkspaceModel.self, from: Data(payload.utf8))
-
-        XCTAssertEqual(decoded.composeTabs.count, 1)
-        XCTAssertEqual(decoded.activeComposeTabID, decoded.composeTabs[0].id)
-        XCTAssertEqual(decoded.composeTabs[0].selection, StoredSelection())
-        XCTAssertEqual(decoded.composeTabs[0].expandedFolders, [])
-        XCTAssertEqual(decoded.composeTabs[0].contextOverrides, ContextBuilderOverrides())
-        XCTAssertEqual(decoded.composeTabs[0].contextBuilder.instructions, "")
-        XCTAssertTrue(decoded.normalizationRequiresSave)
-
-        let encoded = try String(data: JSONEncoder().encode(decoded), encoding: .utf8) ?? ""
-        XCTAssertFalse(encoded.contains("workingFilePaths"), encoded)
-        XCTAssertFalse(encoded.contains("contextBuilderState"), encoded)
-        XCTAssertFalse(encoded.contains("discoveryInstructions"), encoded)
-    }
-
     func testWorkspaceFolderLoadConcurrencyLimitIsBounded() {
         XCTAssertEqual(WorkspaceManagerViewModel.boundedWorkspaceRootLoadLimit(forRootCount: 0), 0)
         XCTAssertEqual(WorkspaceManagerViewModel.boundedWorkspaceRootLoadLimit(forRootCount: 1), 1)

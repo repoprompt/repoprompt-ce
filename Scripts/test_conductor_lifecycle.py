@@ -75,7 +75,114 @@ class LifecycleTestCase(unittest.TestCase):
 
 class LifecycleQueueTests(LifecycleTestCase):
     def test_protocol_version_bump_replaces_older_daemons(self) -> None:
-        self.assertEqual(conductor.PROTOCOL_VERSION, 9)
+        self.assertEqual(conductor.PROTOCOL_VERSION, 11)
+
+    def test_swift_build_cli_accepts_products_and_phase_one_targets(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        selections = [
+            (["--product", product], {"product": product})
+            for product in (*conductor.SWIFT_BUILD_PRODUCTS, "all")
+        ] + [
+            (["--target", target], {"target": target})
+            for target in conductor.SWIFT_BUILD_TARGETS
+        ]
+
+        with mock.patch.object(conductor, "enqueue_and_maybe_wait", return_value=0) as enqueue:
+            for argv, expected_args in selections:
+                with self.subTest(argv=argv):
+                    self.assertEqual(
+                        conductor.handle_real_operation(state.paths, "swift-build", argv),
+                        0,
+                    )
+                    self.assertEqual(enqueue.call_args.args[2], expected_args)
+
+        with self.assertRaises(SystemExit):
+            conductor.handle_real_operation(
+                state.paths,
+                "swift-build",
+                ["--product", "RepoPrompt", "--target", "RepoPromptCore"],
+            )
+
+    def test_swift_build_target_uses_build_lane_and_exact_swiftpm_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = conductor.OperationRegistry(Path(tmp))
+            for target in conductor.SWIFT_BUILD_TARGETS:
+                with self.subTest(target=target):
+                    argv, lanes, cwd, _env, timeout = registry.prepare(
+                        {"operation": "swift-build", "args": {"target": target}}
+                    )
+                    self.assertEqual(argv, ["swift", "build", "--target", target])
+                    self.assertEqual(lanes, ["build"])
+                    self.assertEqual(cwd, Path(tmp))
+                    self.assertEqual(timeout, conductor.MEDIUM_TIMEOUT_SECONDS)
+
+    def test_headless_operations_use_independent_artifact_lane(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            registry = conductor.OperationRegistry(root)
+            script = lambda name: str(root / "Scripts" / name)
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-build", "args": {}})
+            self.assertEqual(argv, ["swift", "build", "--product", "repoprompt-headless"])
+            self.assertEqual(lanes, ["build"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-package", "args": {"configuration": "release"}})
+            self.assertEqual(argv, [script("package_headless.sh"), "release"])
+            self.assertEqual(lanes, ["build", "headlessArtifact", "release"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-provenance", "args": {"configuration": "debug"}})
+            self.assertEqual(argv, [script("verify_headless_package.sh"), "debug"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-status", "args": {}})
+            self.assertEqual(argv, [script("install_headless.sh"), "status"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-smoke", "args": {"configuration": "debug", "skipPackage": True}})
+            self.assertEqual(argv, [script("smoke_packaged_headless_roundtrip.sh"), "--configuration", "debug", "--skip-package"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+            argv, lanes, *_ = registry.prepare({"operation": "headless-uninstall", "args": {"configuration": "debug", "deleteState": True}})
+            self.assertEqual(argv, [script("install_headless.sh"), "uninstall", "--configuration", "debug", "--delete-state"])
+            self.assertEqual(lanes, ["headlessArtifact"])
+
+    def test_swift_build_all_compiles_three_products_then_verifies_linked_symbols(self) -> None:
+        completed = subprocess.CompletedProcess(["swift", "build"], 0, "/tmp/repoprompt-bin\n", "")
+        with mock.patch.object(
+            conductor.subprocess,
+            "run",
+            return_value=completed,
+        ) as run, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(conductor.operation_swift_build_all(Path.cwd()), 0)
+
+        commands = [call.args[0] for call in run.call_args_list]
+        expected_commands = [
+            ["swift", "build", "--product", product]
+            for product in conductor.SWIFT_BUILD_PRODUCTS
+        ]
+        expected_commands.append(["swift", "build", "--show-bin-path"])
+        expected_commands.extend([
+            [
+                sys.executable,
+                str(Path.cwd() / "Scripts" / "verify_tree_sitter_symbols.py"),
+                "--binary",
+                f"/tmp/repoprompt-bin/{binary}",
+                "--expect",
+                expectation,
+                "--label",
+                label,
+            ]
+            for binary, expectation, label in (
+                ("RepoPrompt", "exact", "Conductor RepoPrompt app"),
+                ("repoprompt-headless", "exact", "Conductor RepoPrompt Headless"),
+                ("repoprompt-mcp", "absent", "Conductor repoprompt-mcp proxy"),
+            )
+        ])
+        self.assertEqual(
+            commands,
+            expected_commands,
+        )
 
     def test_ensure_daemon_stops_and_replaces_idle_protocol_3_daemon(self) -> None:
         tmp, state = self.make_state()
@@ -614,9 +721,15 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         jobs = [
             ("build", {}, "pipe"),
             ("test", {}, "pipe"),
+            ("core-test", {}, "pipe"),
+            ("core-macos-test", {}, "pipe"),
+            ("posix-test", {}, "pipe"),
             ("provider-test", {}, "pipe"),
             ("test", {"list": True, "xctestStallSeconds": 5.0}, "pipe"),
             ("test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("core-test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("core-macos-test", {"xctestStallSeconds": 5.0}, "pty"),
+            ("posix-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("provider-test", {"xctestStallSeconds": 5.0}, "pty"),
             ("test", {"xctestStallSeconds": 5.0, "xctestStallWakeProbe": True}, "pty"),
         ]
@@ -1178,13 +1291,57 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
         root_argv, root_lanes, root_cwd, _env, _timeout = registry.prepare(
             {"operation": "test", "args": {"list": True}}
         )
+        core_argv, core_lanes, core_cwd, _env, _timeout = registry.prepare(
+            {"operation": "core-test", "args": {"list": True}}
+        )
+        core_macos_argv, core_macos_lanes, core_macos_cwd, _env, _timeout = registry.prepare(
+            {"operation": "core-macos-test", "args": {"list": True}}
+        )
+        posix_argv, posix_lanes, posix_cwd, _env, _timeout = registry.prepare(
+            {"operation": "posix-test", "args": {"list": True}}
+        )
+        headless_argv, headless_lanes, headless_cwd, _env, _timeout = registry.prepare(
+            {"operation": "headless-test", "args": {"list": True}}
+        )
         provider_argv, provider_lanes, provider_cwd, _env, _timeout = registry.prepare(
             {"operation": "provider-test", "args": {"list": True}}
         )
 
-        self.assertEqual(root_argv, ["swift", "test", "list"])
+        self.assertEqual(root_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptTests",
+        ])
         self.assertEqual(root_lanes, ["build"])
         self.assertEqual(root_cwd, state.paths.repo_root)
+        self.assertEqual(core_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptCoreTests",
+        ])
+        self.assertEqual(core_lanes, ["build"])
+        self.assertEqual(core_cwd, state.paths.repo_root)
+        self.assertEqual(core_macos_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptCoreMacOSTests",
+        ])
+        self.assertEqual(core_macos_lanes, ["build"])
+        self.assertEqual(core_macos_cwd, state.paths.repo_root)
+        self.assertEqual(posix_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptPOSIXSupportTests",
+        ])
+        self.assertEqual(posix_lanes, ["build"])
+        self.assertEqual(posix_cwd, state.paths.repo_root)
+        self.assertEqual(headless_argv, [
+            sys.executable,
+            str(state.paths.repo_root / "Scripts" / "list_swift_tests.py"),
+            "RepoPromptHeadlessTests",
+        ])
+        self.assertEqual(headless_lanes, ["build"])
+        self.assertEqual(headless_cwd, state.paths.repo_root)
         self.assertEqual(provider_argv, ["swift", "test", "list"])
         self.assertEqual(provider_lanes, ["build"])
         self.assertEqual(
@@ -1210,6 +1367,62 @@ class XCTestStallWatchdogTests(LifecycleTestCase):
                 {
                     "operation": "test",
                     "args": {"list": True, "filter": "ExampleTests"},
+                }
+            )
+
+    def test_test_filters_are_fenced_to_their_lane_module(self) -> None:
+        tmp, state = self.make_state()
+        self.addCleanup(tmp.cleanup)
+        registry = conductor.OperationRegistry(state.paths.repo_root)
+
+        root_argv, *_ = registry.prepare(
+            {"operation": "test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        core_argv, *_ = registry.prepare(
+            {"operation": "core-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        core_macos_argv, *_ = registry.prepare(
+            {"operation": "core-macos-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        posix_argv, *_ = registry.prepare(
+            {"operation": "posix-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        headless_argv, *_ = registry.prepare(
+            {"operation": "headless-test", "args": {"filter": "ExampleTests/testBehavior"}}
+        )
+        self.assertEqual(
+            root_argv,
+            ["swift", "test", "--filter", "RepoPromptTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            core_argv,
+            ["swift", "test", "--filter", "RepoPromptCoreTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            core_macos_argv,
+            ["swift", "test", "--filter", "RepoPromptCoreMacOSTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            posix_argv,
+            ["swift", "test", "--filter", "RepoPromptPOSIXSupportTests.ExampleTests/testBehavior"],
+        )
+        self.assertEqual(
+            headless_argv,
+            ["swift", "test", "--filter", "RepoPromptHeadlessTests.ExampleTests/testBehavior"],
+        )
+
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot target test module"):
+            registry.prepare(
+                {
+                    "operation": "core-test",
+                    "args": {"filter": "RepoPromptTests.ExampleTests/testBehavior"},
+                }
+            )
+        with self.assertRaisesRegex(conductor.ConductorError, "cannot target test module"):
+            registry.prepare(
+                {
+                    "operation": "test",
+                    "args": {"filter": "RepoPromptCoreTests.ExampleTests/testBehavior"},
                 }
             )
 

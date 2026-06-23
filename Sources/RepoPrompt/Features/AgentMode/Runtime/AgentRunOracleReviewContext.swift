@@ -166,6 +166,7 @@ struct AgentRunOracleReviewTargetSnapshot: Equatable {
     let workspaceID: UUID
     let agentSessionID: UUID
     let activationID: UUID
+    let initialSelectionRevision: UInt64
     let expectedParentSessionID: UUID?
     let worktreeBindings: [AgentSessionWorktreeBinding]
     let validationFailure: AgentRunOracleReviewUnavailableReason?

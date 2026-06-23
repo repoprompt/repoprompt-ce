@@ -567,6 +567,13 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         )
         XCTAssertEqual(delegated.targetRunID, runID)
         XCTAssertEqual(delegated.target.worktreeBindings, [targetBinding])
+        XCTAssertEqual(
+            delegated.target.initialSelectionRevision,
+            window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: target.tabID
+            )
+        )
         XCTAssertEqual(delegated.capturedSource?.sourceWorktreeBindings, [])
         XCTAssertEqual(delegated.capturedSource?.promptText, "frozen canonical prompt")
         XCTAssertEqual(delegated.capturedSource?.exactSelectedIdentities, [selectedPath])
@@ -595,6 +602,101 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             sessionID: targetSessionID,
             runID: runID
         ))
+    }
+
+    func testAgentRunReviewSelectionRevisionIgnoresDecoyTabAndUsesDirectChildAfterExplicitClear() async throws {
+        let root = try makeTemporaryDirectory(named: "selection-revision-review-root")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Selection revision child",
+            parentSessionID: nil
+        )
+        let targetSessionID = try XCTUnwrap(target.sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID,
+            sessionID: targetSessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        let source = AgentRunOracleReviewSource.captured(.init(
+            sourceTabID: sourceTabID,
+            workspaceID: workspaceID,
+            sourceSelectionRevision: 23,
+            promptText: "frozen launch package",
+            selection: StoredSelection(selectedPaths: [root.appendingPathComponent("Launch.swift").path]),
+            lookupContext: .visibleWorkspace,
+            reviewGitContext: .automaticOnly(base: "HEAD", workspaceRootPaths: [root.path]),
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            sourceWorktreeBindings: []
+        ))
+        try viewModel.mcpStageAgentRunOracleReviewSource(
+            source,
+            targetTabID: target.tabID,
+            targetSessionID: targetSessionID,
+            expectedParentSessionID: nil
+        )
+        let runID = UUID()
+        let delegated = try XCTUnwrap(
+            viewModel.mcpBindPendingAgentRunOracleReviewContext(tabID: target.tabID, runID: runID)
+        )
+        let initialTargetRevision = delegated.target.initialSelectionRevision
+
+        let sourceIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: sourceTabID)
+        _ = await window.selectionCoordinator.persistSelection(
+            StoredSelection(selectedPaths: [root.appendingPathComponent("Decoy-MAP.txt").path]),
+            for: sourceIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+        XCTAssertNotNil(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: target.tabID,
+            workspaceID: workspaceID,
+            sessionID: targetSessionID,
+            runID: runID
+        ))
+
+        let targetIdentity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: target.tabID)
+        _ = await window.selectionCoordinator.persistSelection(
+            StoredSelection(selectedPaths: [root.appendingPathComponent("Child-MAP.txt").path]),
+            for: targetIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+        _ = await window.selectionCoordinator.persistSelection(
+            StoredSelection(codemapAutoEnabled: false),
+            for: targetIdentity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: true
+        )
+        XCTAssertNotEqual(
+            window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: target.tabID
+            ),
+            initialTargetRevision
+        )
+        XCTAssertNil(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: target.tabID,
+            workspaceID: workspaceID,
+            sessionID: targetSessionID,
+            runID: runID
+        ))
+        XCTAssertTrue(
+            try XCTUnwrap(window.workspaceManager.composeTab(with: target.tabID))
+                .selection.selectedPaths.isEmpty
+        )
+
+        await viewModel.mcpDeactivateControlContext(
+            sessionID: targetSessionID,
+            cleanupSessionStore: true
+        )
     }
 
     func testExternalStarterStagesFrozenReviewSourceWhenTargetIsSourceTab() async throws {

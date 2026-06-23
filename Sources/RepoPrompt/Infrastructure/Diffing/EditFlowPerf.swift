@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 import RepoPromptShared
 #if DEBUG
     import Synchronization
@@ -1254,7 +1255,126 @@ enum EditFlowPerf {
         }
 
         static func resetDebugCaptureForTesting() {
+            coreRuntimeIntervalRecorder.reset()
             debugCaptureRecorder.resetForTesting()
+        }
+
+        private struct CoreRuntimeIntervalStart {
+            let stageName: String
+            let sanitizedDimensions: String
+            let captureEpoch: UInt64?
+            let startNanoseconds: UInt64
+            let signpostState: OSSignpostIntervalState?
+        }
+
+        private final class CoreRuntimeIntervalRecorder {
+            private let lock = NSLock()
+            private var starts: [UUID: CoreRuntimeIntervalStart] = [:]
+
+            func store(_ start: CoreRuntimeIntervalStart, intervalID: UUID) {
+                lock.lock()
+                starts[intervalID] = start
+                lock.unlock()
+            }
+
+            func remove(intervalID: UUID) -> CoreRuntimeIntervalStart? {
+                lock.lock()
+                defer { lock.unlock() }
+                return starts.removeValue(forKey: intervalID)
+            }
+
+            func reset() {
+                lock.lock()
+                starts.removeAll(keepingCapacity: false)
+                lock.unlock()
+            }
+        }
+
+        private static let coreRuntimeIntervalRecorder = CoreRuntimeIntervalRecorder()
+
+        static func recordCoreRuntimeEvent(_ event: RuntimeDiagnosticEvent) {
+            let dimensions = event.fields
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: " ")
+
+            switch event.kind {
+            case .intervalBegan:
+                guard let intervalID = event.intervalID else { return }
+                let capture = debugCaptureRecorder.startTimestampIfActive()
+                let signpostState = isEnabled ? signposter.beginInterval("CoreRuntime") : nil
+                guard capture != nil || signpostState != nil else { return }
+                if isEnabled {
+                    logger.debug("core begin stage=\(event.name, privacy: .public) dimensions=\(dimensions, privacy: .public)")
+                }
+                coreRuntimeIntervalRecorder.store(
+                    CoreRuntimeIntervalStart(
+                        stageName: event.name,
+                        sanitizedDimensions: dimensions,
+                        captureEpoch: capture?.epoch,
+                        startNanoseconds: capture?.startNanoseconds ?? DispatchTime.now().uptimeNanoseconds,
+                        signpostState: signpostState
+                    ),
+                    intervalID: intervalID
+                )
+            case .intervalEnded:
+                guard let intervalID = event.intervalID,
+                      let start = coreRuntimeIntervalRecorder.remove(intervalID: intervalID)
+                else { return }
+                if let captureEpoch = start.captureEpoch {
+                    debugCaptureRecorder.record(
+                        stageName: start.stageName,
+                        sanitizedDimensions: dimensions.isEmpty ? start.sanitizedDimensions : dimensions,
+                        captureEpoch: captureEpoch,
+                        startNanoseconds: start.startNanoseconds
+                    )
+                }
+                if let signpostState = start.signpostState {
+                    signposter.endInterval("CoreRuntime", signpostState)
+                    logger.debug("core end stage=\(event.name, privacy: .public) dimensions=\(dimensions, privacy: .public)")
+                }
+            case .lifecycle:
+                guard let correlationID = event.correlationID else { return }
+                let correlation = LifecycleCorrelation(
+                    id: correlationID,
+                    captureEpoch: debugCaptureRecorder.activeEpochIfActive(),
+                    requestIdentity: coreRuntimeRequestIdentity(event.context)
+                )
+                if debugCaptureRecorder.shouldRecordLifecycleEvent(correlation) {
+                    debugCaptureRecorder.recordLifecycleEvent(
+                        eventName: event.name,
+                        correlation: correlation,
+                        sanitizedDimensions: dimensions
+                    )
+                }
+                if isEnabled {
+                    signposter.emitEvent("CoreRuntime")
+                    logger.debug("core lifecycle event=\(event.name, privacy: .public) dimensions=\(dimensions, privacy: .public)")
+                }
+            case .counter:
+                if isEnabled {
+                    signposter.emitEvent("CoreRuntime")
+                    logger.debug("core counter event=\(event.name, privacy: .public) dimensions=\(dimensions, privacy: .public)")
+                }
+            }
+        }
+
+        private static func coreRuntimeRequestIdentity(_ context: [String: String]) -> MCPRequestTimelineIdentity? {
+            let requestID = context["jsonRPCRequestID"].flatMap(JSONRPCBridgeID.parseFaultSelector)
+            let connectionID = context["connectionID"]
+            let generation = context["connectionGeneration"].flatMap(UInt64.init)
+            let invocationID = context["appInvocationID"]
+            let ordinal = context["requestOrdinal"].flatMap(UInt64.init)
+            guard requestID != nil || connectionID != nil || generation != nil || invocationID != nil || ordinal != nil else {
+                return nil
+            }
+            return MCPRequestTimelineIdentity(
+                jsonRPCRequestID: requestID,
+                connectionID: connectionID,
+                connectionGeneration: generation,
+                appInvocationID: invocationID,
+                requestOrdinal: ordinal
+            )
         }
     #endif
 

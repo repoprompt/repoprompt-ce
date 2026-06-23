@@ -529,6 +529,9 @@ final class MCPCodeStructureWorktreeTests: XCTestCase {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
         let window = WindowState()
+        window.promptManager.attachPromptFactualContextProvider(
+            TestPromptFactualContextProvider(store: window.workspaceFileContextStore)
+        )
         WindowStatesManager.shared.registerWindowState(window)
         GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
 

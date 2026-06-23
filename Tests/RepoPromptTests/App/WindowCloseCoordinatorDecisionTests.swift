@@ -136,9 +136,26 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
 
         XCTAssertFalse(window.isClosing)
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
-        window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
+        // Keep the Context Builder's production polling policy aligned with the
+        // subscription this lifecycle test installs.
+        let attachedBothSubscribers = await waitForSubscriberCount(
+            2,
+            pollingService: pollingService,
+            beforeSample: {
+                window.contextBuilderAgentViewModel.selectedAgent = .codexExec
+                window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
+                window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
+            }
+        )
+        XCTAssertTrue(
+            window.apiSettingsViewModel.test_hasCodexModelsSubscriptionTask,
+            "API settings subscription task should remain installed"
+        )
+        XCTAssertTrue(
+            window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask,
+            "Context Builder subscription task should remain installed"
+        )
+        guard attachedBothSubscribers else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
         XCTAssertEqual(attachedSubscriberCount, 2)
         guard await waitForClientObservation(
@@ -235,26 +252,23 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
 
     private func waitForSubscriberCount(
         _ expectedCount: Int,
-        pollingService: CodexModelPollingService
+        pollingService: CodexModelPollingService,
+        beforeSample: (@MainActor () -> Void)? = nil
     ) async -> Bool {
-        let reachedExpectedCount = expectation(description: "subscriber count reaches \(expectedCount)")
-        reachedExpectedCount.assertForOverFulfill = false
-        let updates = await pollingService.test_subscriberCountUpdates()
-        let observationTask = Task { @MainActor in
-            var didFulfill = false
-            for await count in updates where count == expectedCount && !didFulfill {
-                didFulfill = true
-                reachedExpectedCount.fulfill()
+        for _ in 0 ..< 500 {
+            beforeSample?()
+            if await pollingService.test_subscriberCount() == expectedCount {
+                await Task.yield()
+                if await pollingService.test_subscriberCount() == expectedCount {
+                    return true
+                }
             }
+            try? await Task.sleep(for: .milliseconds(10))
         }
-
-        await fulfillment(of: [reachedExpectedCount], timeout: 5)
-        observationTask.cancel()
-        await observationTask.value
 
         let actualCount = await pollingService.test_subscriberCount()
         XCTAssertEqual(actualCount, expectedCount)
-        return actualCount == expectedCount
+        return false
     }
 
     private func waitForClientObservation(

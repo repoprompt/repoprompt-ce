@@ -87,40 +87,13 @@ struct FileSearchResultCard: View {
     let item: AgentChatItem
     @State private var isExpanded = false
 
-    private var dto: ToolResultDTOs.SearchResultDTO? {
-        ToolJSON.decode(ToolResultDTOs.SearchResultDTO.self, from: item.toolResultJSON)
-    }
-
-    /// Compact summary: "\"query\" • 42 matches in 8 files"
-    private var summary: String {
-        if let summary = StoredToolCardPresentation.fromSummaryOnly(raw: item.toolResultJSON)?.inlineSubtitle {
-            return summary
-        }
-        var parts: [String] = []
-        if let pattern = ToolJSON.decodeArgs(ToolArgsDTOs.FileSearchArgs.self, from: item.toolArgsJSON)?.pattern,
-           !pattern.isEmpty
-        {
-            parts.append("\"\(pattern)\"")
-        }
-        if let dto {
-            var text = "\(dto.totalMatches) matches in \(dto.totalFiles) files"
-            if dto.limitHit || (dto.sizeLimitHit ?? false) {
-                text += " (limited)"
-            }
-            parts.append(text)
-        }
-        return parts.joined(separator: " • ")
-    }
-
-    private var status: ToolCardStatus {
-        if item.toolIsError == true { return .failure }
-        if let dto {
-            if dto.errorMessage != nil { return .failure }
-            if dto.limitHit || (dto.sizeLimitHit ?? false) { return .warning }
-            if dto.totalMatches > 0 { return .success }
-            return .neutral
-        }
-        return ToolResultStatusResolver.resolve(toolIsError: item.toolIsError, raw: item.toolResultJSON, fallback: .neutral)
+    private var presentation: FileSearchCardPresentation {
+        let pattern = ToolJSON.decodeArgs(ToolArgsDTOs.FileSearchArgs.self, from: item.toolArgsJSON)?.pattern
+        return FileSearchCardPresentationBuilder.build(
+            pattern: pattern,
+            toolIsError: item.toolIsError,
+            raw: item.toolResultJSON
+        )
     }
 
     var body: some View {
@@ -128,13 +101,97 @@ struct FileSearchResultCard: View {
             iconName: toolIcon(for: item.toolName),
             iconColor: ToolCardAccentResolver.color(for: item.toolName),
             title: "Search",
-            subtitle: nonEmptyToolCardSummary(summary, fallbackStatusFor: item),
-            status: status,
+            subtitle: nonEmptyToolCardSummary(presentation.subtitle, fallbackStatusFor: item),
+            status: presentation.status,
             timestamp: item.timestamp,
             isExpandable: toolResultHasPayload(item),
             isExpanded: $isExpanded
         ) {
             ToolMarkdownExpandedContent(item: item)
+        }
+    }
+}
+
+struct FileSearchCardPresentation: Equatable {
+    let subtitle: String
+    let status: ToolCardStatus
+}
+
+enum FileSearchCardPresentationBuilder {
+    static func build(pattern: String?, toolIsError: Bool?, raw: String?) -> FileSearchCardPresentation {
+        let dto = ToolJSON.decode(ToolResultDTOs.SearchResultDTO.self, from: raw)
+        let trimmedPattern = pattern?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let patternSummary = trimmedPattern.isEmpty ? nil : "\"\(trimmedPattern)\""
+
+        if let dto, hasError(dto) {
+            let error = errorPresentation(for: dto)
+            return FileSearchCardPresentation(
+                subtitle: inlineToolCardSummary(patternSummary, error.label) ?? error.label,
+                status: toolIsError == true ? .failure : error.status
+            )
+        }
+
+        if let stored = StoredToolCardPresentation.fromSummaryOnly(raw: raw),
+           let summary = stored.inlineSubtitle
+        {
+            return FileSearchCardPresentation(
+                subtitle: summary,
+                status: toolIsError == true
+                    ? .failure
+                    : (stored.status ?? ToolResultStatusResolver.resolve(toolIsError: toolIsError, raw: raw, fallback: .neutral))
+            )
+        }
+
+        if let dto {
+            var countSummary = "\(dto.totalMatches) matches in \(dto.totalFiles) files"
+            let isLimited = dto.limitHit || (dto.sizeLimitHit ?? false)
+            if isLimited {
+                countSummary += " (limited)"
+            }
+            let status: ToolCardStatus = if toolIsError == true {
+                .failure
+            } else if isLimited {
+                .warning
+            } else if dto.totalMatches > 0 {
+                .success
+            } else {
+                .neutral
+            }
+            return FileSearchCardPresentation(
+                subtitle: inlineToolCardSummary(patternSummary, countSummary) ?? countSummary,
+                status: status
+            )
+        }
+
+        return FileSearchCardPresentation(
+            subtitle: patternSummary ?? "",
+            status: ToolResultStatusResolver.resolve(toolIsError: toolIsError, raw: raw, fallback: .neutral)
+        )
+    }
+
+    private static func hasError(_ dto: ToolResultDTOs.SearchResultDTO) -> Bool {
+        dto.errorMessage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            || dto.errorCode?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+    }
+
+    private static func errorPresentation(
+        for dto: ToolResultDTOs.SearchResultDTO
+    ) -> (label: String, status: ToolCardStatus) {
+        switch dto.errorCode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "search_backpressure":
+            ("Temporarily busy", .warning)
+        case "worktree_scope_unavailable":
+            ("Worktree unavailable", .warning)
+        case "workspace_freshness_timeout":
+            ("Workspace freshness timed out", .warning)
+        case "workspace_readiness_unavailable":
+            ("Workspace readiness unavailable", .warning)
+        case "workspace_readiness_timeout":
+            ("Workspace readiness timed out", .warning)
+        case "workspace_readiness_superseded":
+            ("Workspace changed during search", .warning)
+        default:
+            ("Search failed", .failure)
         }
     }
 }

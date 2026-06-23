@@ -1,5 +1,6 @@
 import Foundation
 @testable import RepoPrompt
+import RepoPromptCore
 import XCTest
 
 final class AutomaticReviewGitDiffCoordinatorTests: XCTestCase {

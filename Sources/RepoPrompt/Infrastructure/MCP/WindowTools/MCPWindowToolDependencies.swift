@@ -1,5 +1,6 @@
 import Foundation
 import MCP
+import RepoPromptCore
 
 /// Constructor-time dependency bundle for extracted window-tool providers.
 ///
@@ -34,6 +35,9 @@ struct MCPWindowToolDependencies {
         _ fuzzySpaceMatching: Bool,
         _ rootScope: WorkspaceLookupRootScope
     ) async throws -> SearchResults
+    typealias PromptViewModelProvider = @MainActor @Sendable () -> PromptViewModel?
+    typealias WorkspaceManagerProvider = @MainActor @Sendable () -> WorkspaceManagerViewModel?
+    typealias SelectionCoordinatorProvider = @MainActor @Sendable () -> WorkspaceSelectionCoordinator?
     typealias RequireTargetWindow = @MainActor @Sendable () throws -> WindowState
     typealias RequireCurrentTabContext = @MainActor @Sendable (_ toolName: String) async throws -> MCPServerViewModel.TabScopedContext
     typealias RequireAgentModeConnection = @Sendable (_ toolName: String) async throws -> UUID
@@ -233,7 +237,8 @@ struct MCPWindowToolDependencies {
     typealias PersistResolvedTabContextSnapshot = @MainActor @Sendable (
         _ resolvedContext: MCPServerViewModel.ResolvedTabContextSnapshot,
         _ metadata: MCPServerViewModel.RequestMetadata,
-        _ mutated: Bool
+        _ mutated: Bool,
+        _ expectedCurrentSelection: StoredSelection?
     ) async -> MCPServerViewModel.MCPSelectionPersistenceVerification?
     typealias MakeSelectionHintError = @MainActor @Sendable (_ paths: [String], _ operation: String, _ lookupContext: WorkspaceLookupContext) async -> String
     typealias PerformFileAction = @MainActor @Sendable (_ action: String, _ path: String, _ content: String?, _ newPath: String?, _ ifExists: String?) async throws -> String?
@@ -278,7 +283,7 @@ struct MCPWindowToolDependencies {
         _ selectionOverride: StoredSelection?,
         _ display: FilePathDisplay
     ) async throws -> [ToolResultDTOs.SelectedFileInfo]
-    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async -> String
+    typealias BuildTabClipboardContent = @MainActor @Sendable (_ cfg: PromptContextResolved, _ context: MCPServerViewModel.TabScopedContext) async throws -> String
     typealias WritePromptExportFile = @MainActor @Sendable (_ path: String, _ content: String) async throws -> String
     typealias LatestTokenBreakdown = @MainActor @Sendable () -> TokenCountingViewModel.TokenBreakdown
 
@@ -307,9 +312,11 @@ struct MCPWindowToolDependencies {
     let runMCPPlanOrQuestion: RunMCPPlanOrQuestion
 
     let windowID: Int
-    let promptVM: PromptViewModel
-    let workspaceManager: WorkspaceManagerViewModel?
-    let selectionCoordinator: WorkspaceSelectionCoordinator?
+    let promptVM: PromptViewModelProvider
+    let workspaceManager: WorkspaceManagerProvider
+    let selectionCoordinator: SelectionCoordinatorProvider
+    let workspaceFileContextStore: WorkspaceFileContextStore
+    let workspaceSessionQuery: WorkspaceSessionQueryCapability?
     let applyEditsApprovalStore: ApplyEditsApprovalStore
     let captureRequestMetadata: CaptureRequestMetadata
     let resolveImplicitContextBuilderGitTarget: ResolveImplicitContextBuilderGitTarget

@@ -101,6 +101,14 @@ jobs:
             "extracted/RepoPrompt CE.app" \
             "arm64,x86_64" \
             "Reviewed ZIP app"
+          python3 ./trusted-control-plane/Scripts/verify_tree_sitter_symbols.py \
+            --binary "extracted/RepoPrompt CE.app/Contents/MacOS/RepoPrompt" \
+            --expect exact \
+            --label "Reviewed ZIP RepoPrompt app"
+          python3 ./trusted-control-plane/Scripts/verify_tree_sitter_symbols.py \
+            --binary "extracted/RepoPrompt CE.app/Contents/MacOS/repoprompt-mcp" \
+            --expect absent \
+            --label "Reviewed ZIP repoprompt-mcp proxy"
           ./trusted-control-plane/Scripts/write_app_artifact_manifest.py verify \
             --app "extracted/RepoPrompt CE.app" \
             --manifest "${artifact_manifests[0]}" \

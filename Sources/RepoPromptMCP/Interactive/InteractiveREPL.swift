@@ -13,6 +13,8 @@ import MCP
 struct InteractiveOptions {
     var snapshotPath: String?
     var initialWindowID: Int?
+    var initialTabID: String?
+    var initialContextID: String?
     var prettyJSON: Bool = true
     var rawJSON: Bool = false
     var verbose: Bool = false
@@ -84,6 +86,7 @@ actor InteractiveREPL {
 
         if let toolName = options.callTool {
             await session.setSelectedWindowID(options.initialWindowID)
+            try await applySingleShotStartupBinding()
             try await callToolSingleShot(name: toolName, argsJSON: options.callArgs)
             return
         }
@@ -776,6 +779,23 @@ actor InteractiveREPL {
         if result.isError == true {
             throw ExecError.commandFailed
         }
+    }
+
+    private func applySingleShotStartupBinding() async throws {
+        let result: CallTool.Result? = if let contextID = options.initialContextID {
+            try await session.bindContextID(contextID, windowID: options.initialWindowID)
+        } else if let tabID = options.initialTabID {
+            try await session.bindTab(selector: tabID, windowID: options.initialWindowID)
+        } else {
+            nil
+        }
+
+        guard let result, result.isError == true else { return }
+        let detail = result.content.compactMap { content -> String? in
+            if case let .text(text, _, _) = content { return text }
+            return nil
+        }.first ?? "unknown error"
+        throw InteractiveSessionError.handshakeFailed(reason: "Startup binding failed: \(detail)")
     }
 
     private func toolsSchemaSingleShot(mode: ToolListMode) async throws {

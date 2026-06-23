@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 import RepoPromptShared
 
 struct ContextBuilderReviewDiagnosticEvent: Equatable, CustomStringConvertible {

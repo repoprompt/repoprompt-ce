@@ -1,4 +1,5 @@
 import Foundation
+import RepoPromptCore
 
 enum ContextBuilderReviewTargetUnavailableReason: Equatable, LocalizedError {
     case missingFrozenTarget
@@ -208,7 +209,7 @@ struct ContextBuilderReviewTargetResolver {
 
     func resolve(
         input: ContextBuilderReviewTargetInput,
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async throws -> ContextBuilderReviewTargetResolution {
         let physicalSelection = input.lookupContext.physicalizeSelection(input.selection)
         guard !Self.reviewCandidates(
@@ -226,7 +227,7 @@ struct ContextBuilderReviewTargetResolver {
 
         return switch try await resolveOwnership(
             input: input,
-            store: store,
+            query: query,
             phase: .initialElection
         ) {
         case let .unavailable(reason):
@@ -238,7 +239,7 @@ struct ContextBuilderReviewTargetResolver {
 
     private func resolveOwnership(
         input: ContextBuilderReviewTargetInput,
-        store: WorkspaceFileContextStore,
+        query: WorkspaceSessionQueryCapability,
         phase: ContextBuilderReviewDiagnosticEvent.Phase
     ) async throws -> OwnershipPipelineResolution {
         let physicalSelection = input.lookupContext.physicalizeSelection(input.selection)
@@ -263,7 +264,7 @@ struct ContextBuilderReviewTargetResolver {
                 ExactSelectedGitArtifactAuthorizationRequest(
                     exactAbsolutePaths: artifactPaths,
                     capability: artifactCapability,
-                    store: store
+                    store: query
                 )
             )
             let rejectedCount = authorization.dispositions.reduce(into: 0) { count, disposition in
@@ -339,7 +340,7 @@ struct ContextBuilderReviewTargetResolver {
                 return .unavailable(.staleWorkspaceRoot)
             }
             exactAuthorizations.append(authorization)
-            switch try await store.resolveContextBuilderSelectionCandidate(
+            switch try await query.resolveContextBuilderSelectionCandidate(
                 path: standardized,
                 authorization: authorization,
                 folderPolicy: .expandFolders
@@ -370,12 +371,11 @@ struct ContextBuilderReviewTargetResolver {
         }
 
         if !canonicalCandidates.isEmpty {
-            let canonicalResolution = await WorkspaceGitDiffSelectionResolver.resolveSelectedGitDiffPaths(
+            let canonicalResolution = await query.resolveSelectedGitDiffPaths(
                 for: StoredSelection(
                     selectedPaths: canonicalCandidates,
                     codemapAutoEnabled: false
                 ),
-                store: store,
                 rootScope: input.lookupContext.rootScope.excludingWorkspaceGitData,
                 folderPolicy: .expandFolders,
                 profile: .mcpSelection,
@@ -392,7 +392,7 @@ struct ContextBuilderReviewTargetResolver {
         )
         if let stale = await firstStaleAuthorization(
             in: exactAuthorizations,
-            store: store
+            query: query
         ) {
             emitResolutionDiagnostic(
                 input: input,
@@ -431,7 +431,7 @@ struct ContextBuilderReviewTargetResolver {
         } catch {
             if let stale = await firstStaleAuthorization(
                 in: exactAuthorizations,
-                store: store
+                query: query
             ) {
                 emitResolutionDiagnostic(
                     input: input,
@@ -449,7 +449,7 @@ struct ContextBuilderReviewTargetResolver {
         }
         if let stale = await firstStaleAuthorization(
             in: exactAuthorizations,
-            store: store
+            query: query
         ) {
             emitResolutionDiagnostic(
                 input: input,
@@ -466,10 +466,10 @@ struct ContextBuilderReviewTargetResolver {
         guard ownership.pathIssues.isEmpty else {
             return .unavailable(.nonGitSelection(count: ownership.pathIssues.count))
         }
-        let scopedRoots = await store.rootRefs(scope: input.lookupContext.rootScope.excludingWorkspaceGitData)
+        let scopedRoots = await query.rootRefs(scope: input.lookupContext.rootScope.excludingWorkspaceGitData)
         if let stale = await firstStaleAuthorization(
             in: exactAuthorizations,
-            store: store
+            query: query
         ) {
             emitResolutionDiagnostic(
                 input: input,
@@ -586,7 +586,7 @@ struct ContextBuilderReviewTargetResolver {
 
     func revalidate(
         _ target: ContextBuilderReviewTarget,
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async -> ContextBuilderReviewTargetUnavailableReason? {
         var sessionAuthorizations: [WorkspaceSessionRootAuthorization] = []
         for checkout in target.checkouts {
@@ -601,7 +601,7 @@ struct ContextBuilderReviewTargetResolver {
                     )
                     return .staleWorkspaceRoot
                 }
-                if let mismatch = await store.validateSessionRootAuthorization(authorization) {
+                if let mismatch = await query.validateSessionRootAuthorization(authorization) {
                     emitRevalidationDiagnostic(
                         target: target,
                         outcome: .staleAuthority,
@@ -613,7 +613,7 @@ struct ContextBuilderReviewTargetResolver {
                 sessionAuthorizations.append(authorization)
                 sessionAuthorization = authorization
             } else {
-                guard await store.exactRootRef(
+                guard await query.exactRootRef(
                     path: checkout.physicalWorkspaceRoot.standardizedFullPath,
                     kind: checkout.physicalWorkspaceRootKind
                 ) == checkout.physicalWorkspaceRoot else {
@@ -632,7 +632,7 @@ struct ContextBuilderReviewTargetResolver {
             else { return .checkoutIdentityChanged }
 
             if let authorization = sessionAuthorization,
-               let mismatch = await store.validateSessionRootAuthorization(authorization)
+               let mismatch = await query.validateSessionRootAuthorization(authorization)
             {
                 emitRevalidationDiagnostic(
                     target: target,
@@ -662,7 +662,7 @@ struct ContextBuilderReviewTargetResolver {
 
         if let stale = await firstStaleAuthorization(
             in: sessionAuthorizations,
-            store: store
+            query: query
         ) {
             let authorization = Set(sessionAuthorizations).count == 1
                 ? sessionAuthorizations.first
@@ -693,7 +693,7 @@ struct ContextBuilderReviewTargetResolver {
     func finalizeSelection(
         input: ContextBuilderReviewTargetInput,
         initialResolution: ContextBuilderReviewTargetResolution,
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async throws -> ContextBuilderFinalReviewAuthorization {
         let electionOrigin: ContextBuilderReviewElectionOrigin
         let frozenTarget: ContextBuilderReviewTarget?
@@ -740,7 +740,7 @@ struct ContextBuilderReviewTargetResolver {
         let current: OwnershipPipelineResult
         switch try await resolveOwnership(
             input: input,
-            store: store,
+            query: query,
             phase: phase
         ) {
         case let .available(ownership):
@@ -756,11 +756,11 @@ struct ContextBuilderReviewTargetResolver {
             else {
                 throw ContextBuilderReviewTargetUnavailableReason.selectionOwnershipChanged
             }
-            if let reason = await revalidate(frozenTarget, store: store) {
+            if let reason = await revalidate(frozenTarget, query: query) {
                 throw reason
             }
         }
-        if let reason = await revalidate(finalTarget, store: store) {
+        if let reason = await revalidate(finalTarget, query: query) {
             throw reason
         }
 
@@ -866,10 +866,10 @@ struct ContextBuilderReviewTargetResolver {
 
     private func firstStaleAuthorization(
         in authorizations: [WorkspaceSessionRootAuthorization],
-        store: WorkspaceFileContextStore
+        query: WorkspaceSessionQueryCapability
     ) async -> WorkspaceSessionRootAuthorizationMismatch? {
         for authorization in Set(authorizations) {
-            if let mismatch = await store.validateSessionRootAuthorization(authorization) {
+            if let mismatch = await query.validateSessionRootAuthorization(authorization) {
                 return mismatch
             }
         }

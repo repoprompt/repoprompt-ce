@@ -218,9 +218,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
         guard let initialResultTab = targetWindow.workspaceManager.composeTab(for: resolvedIdentity) else {
             throw MCPError.internalError("Resolved Context Builder tab is unavailable in its workspace")
         }
-        try await workspaceContext?.validateReviewTargetAvailability(
-            store: dependencies.promptVM.workspaceFileContextStore
-        )
+        try await workspaceContext?.validateReviewTargetAvailability()
 
         if tabResolution.bindCaller, let connectionID {
             let clientName = await ServerNetworkManager.shared.clientIdentifier(forConnection: connectionID)
@@ -487,8 +485,7 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             sel,
                             workspaceID: committedTab.identity.workspaceID,
                             tabID: committedTab.identity.tabID,
-                            selectionRevision: committedTab.selectionRevision,
-                            store: dependencies.promptVM.workspaceFileContextStore
+                            selectionRevision: committedTab.selectionRevision
                         )
                         await dependencies.didFinalizeContextBuilderReview(authorization)
 
