@@ -6580,60 +6580,71 @@ final class AgentModeViewModel: ObservableObject {
             codexAttemptID = nil
             signalsDeliveryAfterDispatch = false
         }
-        defer {
-            if Task.isCancelled, let codexAttemptID {
-                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-            }
-        }
 
-        let submission: UserTurnSubmissionResult
-        session.isMCPInstructionDispatchInProgress = true
-        defer {
-            session.isMCPInstructionDispatchInProgress = false
+        let ackCancellationTarget = codexAttemptID.map {
+            (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
-        submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
-            if let nativePreparedTurn {
-                return submitPreparedUserTurn(
+        return try await withTaskCancellationHandler {
+            defer {
+                if Task.isCancelled, let codexAttemptID {
+                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+                }
+            }
+
+            let submission: UserTurnSubmissionResult
+            session.isMCPInstructionDispatchInProgress = true
+            defer {
+                session.isMCPInstructionDispatchInProgress = false
+            }
+            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
+                if let nativePreparedTurn {
+                    return submitPreparedUserTurn(
+                        tabID: session.tabID,
+                        session: session,
+                        trimmedText: trimmedText,
+                        attachmentsToSend: [],
+                        taggedFilesToSend: [],
+                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
+                        nativePreparedTurn: nativePreparedTurn,
+                        codexAttemptID: codexAttemptID
+                    )
+                }
+                return submitUserTurn(
+                    text: trimmedText,
                     tabID: session.tabID,
-                    session: session,
-                    trimmedText: trimmedText,
-                    attachmentsToSend: [],
-                    taggedFilesToSend: [],
-                    activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                    nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID
                 )
             }
-            return submitUserTurn(
-                text: trimmedText,
-                tabID: session.tabID,
-                codexAttemptID: codexAttemptID
-            )
-        }
-        switch submission {
-        case .submitted:
-            Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
-            if delivery == .queuedClaudeInterrupt {
-                await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+            switch submission {
+            case .submitted:
+                Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
+                if delivery == .queuedClaudeInterrupt {
+                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                }
+                try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
+                if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
+                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                }
+                if let codexAttemptID {
+                    session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
+                    delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
+                }
+                if signalsDeliveryAfterDispatch {
+                    await signalMCPInstructionDelivered(for: session)
+                }
+                handleObservedMCPStateChange(for: session)
+                return delivery
+            case let .blocked(message):
+                if let codexAttemptID {
+                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+                }
+                throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
             }
-            try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
-            if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
-                await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+        } onCancel: {
+            guard let ackCancellationTarget else { return }
+            Task { @MainActor in
+                ackCancellationTarget.tracker.cancel(attemptID: ackCancellationTarget.attemptID)
             }
-            if let codexAttemptID {
-                session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
-                delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
-            }
-            if signalsDeliveryAfterDispatch {
-                await signalMCPInstructionDelivered(for: session)
-            }
-            handleObservedMCPStateChange(for: session)
-            return delivery
-        case let .blocked(message):
-            if let codexAttemptID {
-                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-            }
-            throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
         }
     }
 

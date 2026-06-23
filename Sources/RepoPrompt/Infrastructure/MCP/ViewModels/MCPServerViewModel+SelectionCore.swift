@@ -106,7 +106,8 @@ extension MCPServerViewModel {
         let resolved = try resolveTabContextSnapshot(
             from: metadata,
             toolName: "selection",
-            policy: .allowLegacyImplicitRouting
+            policy: .allowLegacyImplicitRouting,
+            startMirroring: false
         )
         let stabilized = try stabilizedSelectionReadSnapshot(resolved)
         return await selectionCollections(for: stabilized.snapshot)

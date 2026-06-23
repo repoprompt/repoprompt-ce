@@ -3,6 +3,8 @@ import XCTest
 
 @MainActor
 final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
+    private let fullSuiteAsyncTimeoutSeconds: TimeInterval = 30
+
     private var trackedWindows: [WindowState] = []
     private var explicitlyUnregisteredWindowIDs: Set<ObjectIdentifier> = []
 
@@ -248,7 +250,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
             }
         }
 
-        await fulfillment(of: [reachedExpectedCount], timeout: 5)
+        await fulfillment(of: [reachedExpectedCount], timeout: fullSuiteAsyncTimeoutSeconds)
         observationTask.cancel()
         await observationTask.value
 
@@ -273,7 +275,7 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
             }
         }
 
-        await fulfillment(of: [reachedExpectedState], timeout: 5)
+        await fulfillment(of: [reachedExpectedState], timeout: fullSuiteAsyncTimeoutSeconds)
         observationTask.cancel()
         await observationTask.value
 

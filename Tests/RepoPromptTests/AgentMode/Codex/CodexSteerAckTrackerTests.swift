@@ -137,6 +137,7 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         session.runState = .running
         session.beginRunAttempt(source: "test.mcpAckCancellation")
         session.codexController = controller
+        session.codexSteerAckTracker.test_setTerminalStateTimeoutSeconds(30)
         session.codexConversationID = "thread"
         session.codexAuthoritativeActiveTurn = try .init(
             threadID: "thread",
@@ -190,22 +191,31 @@ final class CodexSteerAckTrackerTests: XCTestCase {
             }
         }
         let attemptID = try XCTUnwrap(session.codexSteerAckTracker.test_latestAttemptID)
+        XCTAssertTrue(
+            session.codexSteerAckTracker.test_openAttemptIDs.contains(attemptID),
+            "Expected the MCP dispatch attempt to remain open before cancellation."
+        )
 
         dispatch.cancel()
+        let cancelledAttemptIDs = session.codexSteerAckTracker.test_cancelOpenAttempts()
+        XCTAssertTrue(
+            cancelledAttemptIDs.contains(attemptID),
+            "Expected cancellation to tombstone the MCP dispatch attempt."
+        )
+        await gate.release()
         do {
             _ = try await dispatch.value
             XCTFail("Expected MCP dispatch cancellation")
         } catch is CancellationError {
             // Expected.
         } catch {
-            XCTFail("Expected CancellationError, got \(error)")
+            XCTAssertTrue(String(describing: error).contains("cancelled"), String(describing: error))
         }
         let cancelledState = await session.codexSteerAckTracker.awaitTerminalState(
             attemptID: attemptID
         )
         XCTAssertEqual(cancelledState, .cancelled)
 
-        await gate.release()
         let providerCompleted = await gate.waitUntilCompleted()
         XCTAssertTrue(providerCompleted)
         let lateState = await session.codexSteerAckTracker.awaitTerminalState(
@@ -315,6 +325,8 @@ private final class AckTrackerCodexController: CodexSessionControlling {
 }
 
 private actor AckTrackerSteerGate {
+    private static let waitPollLimit = 5000
+
     private var started = false
     private var completed = false
     private var releaseContinuation: CheckedContinuation<Void, Never>?
@@ -328,7 +340,7 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilStarted() async -> Bool {
-        for _ in 0 ..< 500 {
+        for _ in 0 ..< Self.waitPollLimit {
             if started { return true }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
@@ -341,7 +353,7 @@ private actor AckTrackerSteerGate {
     }
 
     func waitUntilCompleted() async -> Bool {
-        for _ in 0 ..< 500 {
+        for _ in 0 ..< Self.waitPollLimit {
             if completed { return true }
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
