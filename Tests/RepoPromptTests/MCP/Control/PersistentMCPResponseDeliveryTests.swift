@@ -402,7 +402,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         _ = try await ledger.beginConnection()
 
         let plan: MCPInitializeReplayPlan
-        switch await replayState.replayPlan() {
+        switch await Self.waitUntilReplayPlanReady(replayState) {
         case let .success(value):
             plan = value
         case let .failure(reason):
@@ -578,7 +578,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         _ = try await ledger.beginConnection()
 
         let plan: MCPInitializeReplayPlan
-        switch await replayState.replayPlan() {
+        switch await Self.waitUntilReplayPlanReady(replayState) {
         case let .success(value):
             plan = value
         case let .failure(reason):
@@ -630,7 +630,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
 
         snapshot = await ledger.snapshot()
         XCTAssertEqual(snapshot.activeRequestCount, 0)
-        let remainingReplayFrames = await outstandingReplayState.replayFrames()
+        let remainingReplayFrames = await Self.waitUntilReplayFramesDrained(outstandingReplayState)
         XCTAssertEqual(remainingReplayFrames, [])
         XCTAssertNil(snapshot.terminalReason)
     }
@@ -727,7 +727,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         _ = try await ledger.beginConnection()
 
         let plan: MCPInitializeReplayPlan
-        switch await replayState.replayPlan() {
+        switch await Self.waitUntilReplayPlanReady(replayState) {
         case let .success(value):
             plan = value
         case let .failure(reason):
@@ -779,7 +779,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
 
         snapshot = await ledger.snapshot()
         XCTAssertEqual(snapshot.activeRequestCount, 0)
-        let remainingReplayFrames = await outstandingReplayState.replayFrames()
+        let remainingReplayFrames = await Self.waitUntilReplayFramesDrained(outstandingReplayState)
         XCTAssertEqual(remainingReplayFrames, [])
         XCTAssertNil(snapshot.terminalReason)
     }
@@ -1906,6 +1906,33 @@ private extension PersistentMCPResponseDeliveryTests {
         }
 
         throw POSIXError(.ETIMEDOUT)
+    }
+
+    static func waitUntilReplayFramesDrained(
+        _ replayState: MCPOutstandingRequestReplayState,
+        timeout: TimeInterval = 2
+    ) async -> [Data] {
+        let deadline = Date().addingTimeInterval(timeout)
+        var frames = await replayState.replayFrames()
+        while !frames.isEmpty, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            frames = await replayState.replayFrames()
+        }
+        return frames
+    }
+
+    static func waitUntilReplayPlanReady(
+        _ replayState: MCPInitializeReplayState,
+        timeout: TimeInterval = 2
+    ) async -> Result<MCPInitializeReplayPlan, MCPInitializeReplayUnavailableReason> {
+        let deadline = Date().addingTimeInterval(timeout)
+        var result = await replayState.replayPlan()
+        while Date() < deadline {
+            if case .success = result { return result }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            result = await replayState.replayPlan()
+        }
+        return result
     }
 
     static func assertJSONLineEqual(
