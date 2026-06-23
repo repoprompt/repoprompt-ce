@@ -730,39 +730,18 @@ extension MCPServerViewModel {
                         return
                     }
 
-                    // 3) Merge snapshot into bound context, but preserve manual codemap mode once set.
+                    // 3) Keep connection-owned selection snapshots frozen. Selection reads
+                    // stabilize a local copy from canonical state, and selection mutations
+                    // update only their owning connection after persistence succeeds.
                     guard var bound = self.tabContextByConnectionID[connectionID] else { return }
-                    var incomingSelection = snapshot.selection
 
-                    // Preserve manual=false stickiness
-                    let wasManual = (bound.selection.codemapAutoEnabled == false)
-                    if wasManual && incomingSelection.codemapAutoEnabled == true {
-                        incomingSelection = StoredSelection(
-                            selectedPaths: incomingSelection.selectedPaths,
-                            autoCodemapPaths: incomingSelection.autoCodemapPaths,
-                            slices: incomingSelection.slices,
-                            codemapAutoEnabled: false
-                        )
-                        // DON'T call commitTabContext here - it creates an infinite loop!
-                        // The bound context correction is enough; next operation will sync to UI.
-                        tabContextLog("preserved manual mode on snapshot connectionID=\(connectionID) tab=\(context.tabID)")
-                    }
-
-                    // 4) Apply if changed
-                    let selectionChanged = bound.selection != incomingSelection
+                    // 4) Apply non-selection presentation changes if needed.
                     let promptChanged = bound.promptText != snapshot.promptText
                     let metaChanged = bound.selectedMetaPromptIDs != snapshot.selectedMetaPromptIDs
                     let nameChanged = bound.tabName != snapshot.name
                     let sessionChanged = bound.runID == nil
                         && bound.activeAgentSessionID != snapshot.activeAgentSessionID
-                    if selectionChanged || promptChanged || metaChanged || nameChanged || sessionChanged {
-                        bound.selection = incomingSelection
-                        if let workspaceID = bound.workspaceID {
-                            bound.selectionRevision = manager.selectionRevisionForMCP(
-                                workspaceID: workspaceID,
-                                tabID: bound.tabID
-                            )
-                        }
+                    if promptChanged || metaChanged || nameChanged || sessionChanged {
                         bound.promptText = snapshot.promptText
                         bound.selectedMetaPromptIDs = snapshot.selectedMetaPromptIDs
                         bound.tabName = snapshot.name
@@ -775,8 +754,11 @@ extension MCPServerViewModel {
                             self.pendingFileToolLookupContextResolutionByConnectionID.removeValue(forKey: connectionID)?.task.cancel()
                         }
                         self.tabContextByConnectionID[connectionID] = bound
-                        tabContextLog("applied snapshot connectionID=\(connectionID) tab=\(context.tabID) selCount=\(incomingSelection.selectedPaths.count) promptChars=\(snapshot.promptText.count)")
+                        tabContextLog("applied snapshot connectionID=\(connectionID) tab=\(context.tabID) promptChars=\(snapshot.promptText.count)")
                     }
+                    #if DEBUG
+                        self.tabContextMirrorSnapshotHandledForTesting?(connectionID)
+                    #endif
                 }
             }
             .store(in: &bag)

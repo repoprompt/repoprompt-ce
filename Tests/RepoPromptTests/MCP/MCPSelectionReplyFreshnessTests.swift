@@ -245,6 +245,21 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             Set([fullFile.standardizedFileURL.path, slicedFile.standardizedFileURL.path])
         )
 
+        let mirrorHandled = expectation(description: "Canonical tab snapshot mirror handled")
+        var observedMirror = false
+        window.mcpServer.tabContextMirrorSnapshotHandledForTesting = { mirroredConnectionID in
+            guard mirroredConnectionID == connectionID, !observedMirror else { return }
+            observedMirror = true
+            mirrorHandled.fulfill()
+        }
+        defer { window.mcpServer.tabContextMirrorSnapshotHandledForTesting = nil }
+        window.promptManager.promptText = "mirror checkpoint"
+        window.workspaceManager.publishActiveComposeTabSnapshot(
+            commitToMemory: true,
+            touchModified: false
+        )
+        await fulfillment(of: [mirrorHandled], timeout: 3)
+
         let cachedContext = try XCTUnwrap(window.mcpServer.tabContextByConnectionID[connectionID])
         XCTAssertEqual(cachedContext.selection, staleSelection)
         XCTAssertEqual(cachedContext.selectionRevision, 0)

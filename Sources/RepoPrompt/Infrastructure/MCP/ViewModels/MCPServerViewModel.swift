@@ -1649,6 +1649,10 @@ final class MCPServerViewModel: ObservableObject {
     var windowIDByConnection: [UUID: Int] = [:]
     @MainActor
     var tabContextCancellablesByConnectionID: [UUID: Set<AnyCancellable>] = [:]
+    #if DEBUG
+        @MainActor
+        var tabContextMirrorSnapshotHandledForTesting: ((UUID) -> Void)?
+    #endif
     @MainActor
     var lastContextByClientAndWindow: [String: [Int: TabScopedContext]] = [:]
     /// Temporary legacy routing switch. Diagnostics/tests can disable active-tab
