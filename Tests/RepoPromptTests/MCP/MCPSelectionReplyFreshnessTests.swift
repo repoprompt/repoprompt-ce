@@ -23,7 +23,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             stopAutomaticTokenRecounts: true
         )
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
             in: window,
             path: root.path
         )
@@ -34,25 +34,21 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             tabID: tabID,
             selection: staleSelection
         )
-        let ingressBeforeReply = await window.workspaceFileContextStore.scopedIngressBarrierStatsForTesting(
-            rootID: loadedRoot.id
-        )
         var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         liveTab.selection = freshSelection
         XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
-        let reply = await window.mcpServer.buildSelectionMutationReply(
-            from: staleSelection,
-            includeBlocks: false,
-            display: .full,
-            virtualContext: providerStabilizedContext,
-            lookupContext: .visibleWorkspace
-        )
+        let (reply, replyOwnedIngressLaunchCount) = await measureReplyOwnedIngressLaunches(in: window) {
+            await window.mcpServer.buildSelectionMutationReply(
+                from: staleSelection,
+                includeBlocks: false,
+                display: .full,
+                virtualContext: providerStabilizedContext,
+                lookupContext: .visibleWorkspace
+            )
+        }
 
-        let ingressAfterReply = await window.workspaceFileContextStore.scopedIngressBarrierStatsForTesting(
-            rootID: loadedRoot.id
-        )
         XCTAssertEqual(reply.files?.map(\.path), [freshFile.path])
-        XCTAssertEqual(ingressAfterReply.launchCount, ingressBeforeReply.launchCount)
+        XCTAssertEqual(replyOwnedIngressLaunchCount, 0)
     }
 
     func testCurrentReplyRereadsLiveTabSelectionAfterProviderStabilization() async throws {
@@ -73,7 +69,7 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             stopAutomaticTokenRecounts: true
         )
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
-        let loadedRoot = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+        _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
             in: window,
             path: root.path
         )
@@ -88,24 +84,20 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             snapshot: providerStabilizedContext,
             usesActiveTabCompatibility: false
         )
-        let ingressBeforeReply = await window.workspaceFileContextStore.scopedIngressBarrierStatsForTesting(
-            rootID: loadedRoot.id
-        )
         var liveTab = try XCTUnwrap(window.workspaceManager.composeTab(with: tabID))
         liveTab.selection = freshSelection
         XCTAssertTrue(window.workspaceManager.updateComposeTabStoredOnly(liveTab, inWorkspaceID: workspaceID))
-        let reply = await window.mcpServer.buildCurrentSelectionReply(
-            includeBlocks: false,
-            display: .full,
-            resolvedContext: resolvedContext,
-            lookupContext: .visibleWorkspace
-        )
+        let (reply, replyOwnedIngressLaunchCount) = await measureReplyOwnedIngressLaunches(in: window) {
+            await window.mcpServer.buildCurrentSelectionReply(
+                includeBlocks: false,
+                display: .full,
+                resolvedContext: resolvedContext,
+                lookupContext: .visibleWorkspace
+            )
+        }
 
-        let ingressAfterReply = await window.workspaceFileContextStore.scopedIngressBarrierStatsForTesting(
-            rootID: loadedRoot.id
-        )
         XCTAssertEqual(reply.files?.map(\.path), [freshFile.path])
-        XCTAssertEqual(ingressAfterReply.launchCount, ingressBeforeReply.launchCount)
+        XCTAssertEqual(replyOwnedIngressLaunchCount, 0)
     }
 
     func testStabilizedVirtualContextRefreshesCanonicalSelectionAndRevisionTogether() async throws {
@@ -1223,6 +1215,22 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
         )
     }
 
+    private func measureReplyOwnedIngressLaunches<T>(
+        in window: WindowState,
+        operation: () async -> T
+    ) async -> (result: T, launchCount: Int) {
+        let recorder = MCPSelectionReplyIngressLaunchRecorder()
+        await window.workspaceFileContextStore.setScopedIngressBarrierWillFlushHandler { _ in
+            guard MCPSelectionReplyIngressMeasurement.isReplyUnderTest else { return }
+            await recorder.recordLaunch()
+        }
+        let result = await MCPSelectionReplyIngressMeasurement.$isReplyUnderTest.withValue(true) {
+            await operation()
+        }
+        await window.workspaceFileContextStore.setScopedIngressBarrierWillFlushHandler(nil)
+        return await (result, recorder.launchCount())
+    }
+
     private func makeWindow(
         root: URL,
         tabID: UUID,
@@ -1320,6 +1328,22 @@ final class MCPSelectionReplyFreshnessTests: XCTestCase {
             withIntermediateDirectories: true
         )
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+private enum MCPSelectionReplyIngressMeasurement {
+    @TaskLocal static var isReplyUnderTest = false
+}
+
+private actor MCPSelectionReplyIngressLaunchRecorder {
+    private var count = 0
+
+    func recordLaunch() {
+        count += 1
+    }
+
+    func launchCount() -> Int {
+        count
     }
 }
 
