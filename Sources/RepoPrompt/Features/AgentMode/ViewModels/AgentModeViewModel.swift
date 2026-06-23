@@ -753,6 +753,10 @@ final class AgentModeViewModel: ObservableObject {
             pendingAssistantPresentationByTabID.count
         }
 
+        func test_installLiveSession(_ session: TabSession) {
+            sessions[session.tabID] = session
+        }
+
         func test_installPersistentSessionBinding(
             sessionID: UUID?,
             on session: TabSession,

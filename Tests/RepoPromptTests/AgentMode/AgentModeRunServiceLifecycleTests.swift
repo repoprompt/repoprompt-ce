@@ -642,6 +642,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         let processID = try XCTUnwrap(pid_t(processIDText))
         XCTAssertTrue(Self.processIsRunning(processID))
 
+        harness.host.test_installLiveSession(session)
         await cleanupRegisteredRuntime()
 
         try await waitUntil("OpenCode process should exit during lifecycle cleanup") {
@@ -650,6 +651,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(Self.processIsRunning(processID))
         let remainsReusable = await controller.hasReusableSession
         XCTAssertFalse(remainsReusable)
+    }
+
+    func testWindowCloseShutsDownRetainedACPController() async throws {
+        let fixture = try await makeRetainedACPFixture(processIDFileName: "window-close-acp-process-id.txt")
+        fixture.host.test_installLiveSession(fixture.session)
+        XCTAssertTrue(Self.processIsRunning(fixture.processID))
+
+        await fixture.host.prepareForWindowClose()
+
+        XCTAssertNil(fixture.session.acpController)
+        try await waitUntil("Window close should terminate retained ACP process") {
+            !Self.processIsRunning(fixture.processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(fixture.processID))
+        let remainsReusable = await fixture.controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+    }
+
+    func testComposeTabRemovalShutsDownRetainedACPControllerBeforeRemovingSession() async throws {
+        let rows: [(PromptViewModel.ComposeTabRemovalReason, String)] = [
+            (.close, "close"),
+            (.stash, "stash"),
+            (.deleteStashed, "delete-stashed")
+        ]
+
+        for (reason, name) in rows {
+            let fixture = try await makeRetainedACPFixture(processIDFileName: "compose-\(name)-acp-process-id.txt")
+            fixture.host.test_installLiveSession(fixture.session)
+            XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
+
+            await fixture.host.handleComposeTabsWillClose([fixture.session.tabID], reason: reason)
+
+            XCTAssertNil(fixture.session.acpController, name)
+            XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
+            try await waitUntil("Compose tab \(name) should terminate retained ACP process") {
+                !Self.processIsRunning(fixture.processID)
+            }
+            XCTAssertFalse(Self.processIsRunning(fixture.processID), name)
+            let remainsReusable = await fixture.controller.hasReusableSession
+            XCTAssertFalse(remainsReusable, name)
+            acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+        }
     }
 
     func testTerminalBarrierRejectsStaleOwnership() async {
@@ -1536,6 +1580,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             prependPendingHandoffIfNeeded: { text, _ in text },
             recordPendingHandoffSendOutcome: { _, didSend in recorder.record("handoff:\(didSend)") },
             signalMCPInstructionDelivered: { _ in recorder.record("delivered") }
+        )
+    }
+
+    private struct RetainedACPFixture {
+        let host: AgentModeViewModel
+        let session: AgentModeViewModel.TabSession
+        let controller: ACPAgentSessionController
+        let processID: pid_t
+    }
+
+    private func makeRetainedACPFixture(processIDFileName: String) async throws -> RetainedACPFixture {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent(processIDFileName)
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let request = makeACPRunRequest(workspacePath: workspace.path)
+        let controller = try makeACPController(provider: provider, request: request, recorder: recorder)
+        try await withLifecycleTimeout("ACP bootstrap") {
+            _ = try await controller.bootstrap()
+        }
+        try await waitUntil("ACP process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+        session.runID = UUID()
+        session.runState = .completed
+        session.acpController = controller
+        return RetainedACPFixture(
+            host: harness.host,
+            session: session,
+            controller: controller,
+            processID: processID
         )
     }
 
