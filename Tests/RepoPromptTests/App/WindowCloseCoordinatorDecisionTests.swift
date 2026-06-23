@@ -2,7 +2,7 @@
 import XCTest
 
 @MainActor
-final class WindowCloseCoordinatorDecisionTests: XCTestCase {
+final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
     private var trackedWindows: [WindowState] = []
     private var explicitlyUnregisteredWindowIDs: Set<ObjectIdentifier> = []
 
@@ -18,28 +18,43 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
         try await super.tearDown()
     }
 
-    func testUnregisterStopsPeriodicWindowBackgroundWork() throws {
-        let rootURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("WindowCloseCoordinatorDecisionTests-\(UUID().uuidString)", isDirectory: true)
-        try FileManager.default.createDirectory(at: rootURL, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: rootURL) }
-
+    func testWindowTeardownDrainsGitBackgroundWork() async {
+        let refreshGate = GitContextRefreshGate()
+        let teardownProbe = LifecycleCompletionProbe()
         let window = trackWindow(WindowState())
         let manager = WindowStatesManager.shared
         manager.registerWindowState(window)
-        let root = FolderViewModel(
-            folder: Folder(name: rootURL.lastPathComponent, path: rootURL.path, modificationDate: Date()),
-            rootPath: rootURL.path
-        )
-        window.promptManager.gitViewModel.updateRootFolders([root])
-
-        XCTAssertTrue(window.workspaceManager.test_isPollTimerActive)
-        XCTAssertTrue(window.promptManager.gitViewModel.test_hasGitContextRefreshTask)
+        let refreshTask = Task {
+            _ = await refreshGate.refresh(rootPaths: ["/tmp/window-close-git-refresh"])
+        }
+        window.promptManager.gitViewModel.test_installGitContextRefreshTask(refreshTask)
+        await refreshGate.waitUntilEntered()
 
         unregisterTrackedWindow(window)
+        XCTAssertTrue(refreshTask.isCancelled)
+        let teardownTask = Task { @MainActor in
+            await teardownProbe.markStarted()
+            await window.tearDown()
+            await teardownProbe.markCompleted()
+        }
+        await teardownProbe.waitUntilStarted()
+        await Task.yield()
 
-        XCTAssertFalse(window.workspaceManager.test_isPollTimerActive)
         XCTAssertFalse(window.promptManager.gitViewModel.test_hasGitContextRefreshTask)
+        let completedBeforeRelease = await teardownProbe.isCompleted
+        XCTAssertFalse(completedBeforeRelease)
+        XCTAssertGreaterThanOrEqual(window.promptManager.gitViewModel.test_pendingWindowCloseTaskCount, 1)
+
+        await refreshGate.release()
+        await teardownTask.value
+
+        let observation = await refreshGate.observation
+        XCTAssertEqual(observation.entryCount, 1)
+        XCTAssertEqual(observation.cancellationCount, 1)
+        XCTAssertEqual(observation.activeCount, 0)
+        let completedAfterRelease = await teardownProbe.isCompleted
+        XCTAssertTrue(completedAfterRelease)
+        XCTAssertEqual(window.promptManager.gitViewModel.test_pendingWindowCloseTaskCount, 0)
     }
 
     func testSuspendedGitContextRefreshDoesNotRetainViewModel() async throws {
@@ -99,7 +114,7 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
         XCTAssertNil(weakManager.value)
     }
 
-    func testUnregisterDisposesPerWindowCodexModelSubscribersAndStopsOwnedClient() async throws {
+    func testUnregisterDisposesPerWindowCodexModelSubscribersAndStopsOwnedClient() async {
         let client = WindowClosePollingClientSpy()
         let pollingService = CodexModelPollingService(
             client: client,
@@ -113,44 +128,54 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
         let manager = WindowStatesManager.shared
         manager.registerWindowState(window)
 
-        try await waitUntil("initial API settings load to settle", timeout: .seconds(15)) {
-            window.apiSettingsViewModel.test_hasFinishedInitialStoredDataLoad
-        }
-        window.apiSettingsViewModel.test_stopCodexModelsSubscription()
-        window.contextBuilderAgentViewModel.test_stopCodexModelsSubscription()
-        try await waitUntil("startup model subscribers to detach") {
-            await pollingService.test_subscriberCount() == 0
-        }
+        await window.apiSettingsViewModel.loadStoredDataIfNeeded()
+        await waitForPendingMainQueueWork()
+        await window.apiSettingsViewModel.test_cancelAndDrainCodexModelsSubscription()
+        await window.contextBuilderAgentViewModel.test_cancelAndDrainCodexModelsSubscription()
+        guard await waitForSubscriberCount(0, pollingService: pollingService) else { return }
 
-        window.apiSettingsViewModel.isCodexConnected = true
-        window.apiSettingsViewModel.test_completeContextBuilderProviderValidation(
-            verifiedProviders: [.codexExec]
-        )
         XCTAssertFalse(window.isClosing)
         XCTAssertFalse(window.apiSettingsViewModel.test_hasPreparedForWindowClose)
         window.apiSettingsViewModel.test_startCodexModelsSubscriptionIfNeeded()
         window.contextBuilderAgentViewModel.test_startCodexModelsSubscriptionIfNeeded()
-        try await waitUntil("two per-window subscribers to attach") {
-            await pollingService.test_subscriberCount() == 2
-        }
+        guard await waitForSubscriberCount(2, pollingService: pollingService) else { return }
         let attachedSubscriberCount = await pollingService.test_subscriberCount()
-        XCTAssertEqual(
-            attachedSubscriberCount,
-            2,
-            "apiTask=\(window.apiSettingsViewModel.test_hasCodexModelsSubscriptionTask) contextBuilderTask=\(window.contextBuilderAgentViewModel.test_hasCodexModelsSubscriptionTask)"
-        )
-        let stopCallCountBeforeClose = client.stopCallCount
+        XCTAssertEqual(attachedSubscriberCount, 2)
+        guard await waitForClientObservation(
+            "an in-flight polling request to enter",
+            client: client,
+            matching: { !$0.isQuiescent && $0.activeRequestCount == 1 }
+        ) else { return }
+        let requestObservationBeforeClose = await client.requestObservation()
+        let stopCallCountBeforeClose = requestObservationBeforeClose.stopCallCount
+        XCTAssertFalse(requestObservationBeforeClose.isQuiescent)
 
         unregisterTrackedWindow(window)
 
-        try await waitUntil("window-close subscriber disposal and client stop") {
-            await pollingService.test_subscriberCount() == 0
-                && client.stopCallCount > stopCallCountBeforeClose
-        }
+        guard await waitForSubscriberCount(0, pollingService: pollingService) else { return }
+        guard await waitForClientObservation(
+            "window-close polling request exit and client stop",
+            client: client,
+            matching: {
+                $0.isQuiescent
+                    && $0.activeRequestCount == 0
+                    && $0.exitedRequestCount > requestObservationBeforeClose.exitedRequestCount
+                    && $0.stopCallCount > stopCallCountBeforeClose
+            }
+        ) else { return }
+
         let subscriberCount = await pollingService.test_subscriberCount()
+        let requestObservationAfterClose = await client.requestObservation()
+        let stopCallCountAfterClose = requestObservationAfterClose.stopCallCount
         XCTAssertTrue(window.isClosing)
         XCTAssertEqual(subscriberCount, 0)
-        XCTAssertGreaterThan(client.stopCallCount, stopCallCountBeforeClose)
+        XCTAssertGreaterThan(stopCallCountAfterClose, stopCallCountBeforeClose)
+        XCTAssertGreaterThan(
+            requestObservationAfterClose.exitedRequestCount,
+            requestObservationBeforeClose.exitedRequestCount
+        )
+        XCTAssertTrue(requestObservationAfterClose.isQuiescent)
+        XCTAssertEqual(requestObservationAfterClose.activeRequestCount, 0)
     }
 
     func testAPISettingsCloseDuringInitialLoadDoesNotStartProviderValidation() async throws {
@@ -200,6 +225,66 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
         explicitlyUnregisteredWindowIDs.insert(ObjectIdentifier(window))
     }
 
+    private func waitForPendingMainQueueWork() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func waitForSubscriberCount(
+        _ expectedCount: Int,
+        pollingService: CodexModelPollingService
+    ) async -> Bool {
+        let reachedExpectedCount = expectation(description: "subscriber count reaches \(expectedCount)")
+        reachedExpectedCount.assertForOverFulfill = false
+        let updates = await pollingService.test_subscriberCountUpdates()
+        let observationTask = Task { @MainActor in
+            var didFulfill = false
+            for await count in updates where count == expectedCount && !didFulfill {
+                didFulfill = true
+                reachedExpectedCount.fulfill()
+            }
+        }
+
+        await fulfillment(of: [reachedExpectedCount], timeout: 5)
+        observationTask.cancel()
+        await observationTask.value
+
+        let actualCount = await pollingService.test_subscriberCount()
+        XCTAssertEqual(actualCount, expectedCount)
+        return actualCount == expectedCount
+    }
+
+    private func waitForClientObservation(
+        _ description: String,
+        client: WindowClosePollingClientSpy,
+        matching predicate: @escaping @MainActor (WindowClosePollingClientSpy.RequestObservation) -> Bool
+    ) async -> Bool {
+        let reachedExpectedState = expectation(description: description)
+        reachedExpectedState.assertForOverFulfill = false
+        let updates = await client.requestObservationUpdates()
+        let observationTask = Task { @MainActor in
+            var didFulfill = false
+            for await observation in updates where predicate(observation) && !didFulfill {
+                didFulfill = true
+                reachedExpectedState.fulfill()
+            }
+        }
+
+        await fulfillment(of: [reachedExpectedState], timeout: 5)
+        observationTask.cancel()
+        await observationTask.value
+
+        let finalObservation = await client.requestObservation()
+        XCTAssertTrue(predicate(finalObservation), description)
+        return predicate(finalObservation)
+    }
+}
+
+@MainActor
+final class WindowCloseCoordinatorPolicyTests: XCTestCase {
     func testTerminationAndAuthorizationAllowDespiteOtherwiseBlockingImpact() {
         let otherwiseBlockingSnapshot = makeSnapshot(
             isLastAppWindow: true,
@@ -318,22 +403,6 @@ final class WindowCloseCoordinatorDecisionTests: XCTestCase {
                 testCase.expected,
                 testCase.name
             )
-        }
-    }
-
-    private func waitUntil(
-        _ description: String,
-        timeout: Duration = .seconds(5),
-        condition: @escaping @MainActor () async -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while await !condition() {
-            guard clock.now < deadline else {
-                XCTFail("Timed out waiting for \(description)")
-                return
-            }
-            try await Task.sleep(for: .milliseconds(10))
         }
     }
 
@@ -466,24 +535,39 @@ private actor APISettingsProviderValidationProbe {
 }
 
 private actor GitContextRefreshGate {
+    struct Observation: Equatable {
+        let entryCount: Int
+        let cancellationCount: Int
+        let activeCount: Int
+    }
+
     private var hasEntered = false
     private var hasReleased = false
     private var entryWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
-    private(set) var observedCancellation = false
+    private var cancellationWaiters: [CheckedContinuation<Void, Never>] = []
+    private var entryCount = 0
+    private var cancellationCount = 0
+    private var activeCount = 0
 
     func refresh(rootPaths _: [String]) async -> [GitStatusActor.RepoDetection] {
         hasEntered = true
+        entryCount += 1
+        activeCount += 1
         let waiters = entryWaiters
         entryWaiters.removeAll()
         waiters.forEach { $0.resume() }
 
-        if !hasReleased {
-            await withCheckedContinuation { continuation in
-                releaseWaiters.append(continuation)
+        await withTaskCancellationHandler {
+            if !hasReleased {
+                await withCheckedContinuation { continuation in
+                    releaseWaiters.append(continuation)
+                }
             }
+        } onCancel: {
+            Task { await self.recordCancellation() }
         }
-        observedCancellation = Task.isCancelled
+        activeCount -= 1
         return []
     }
 
@@ -500,6 +584,56 @@ private actor GitContextRefreshGate {
         releaseWaiters.removeAll()
         waiters.forEach { $0.resume() }
     }
+
+    func waitUntilCancellationObserved() async {
+        guard cancellationCount == 0 else { return }
+        await withCheckedContinuation { continuation in
+            cancellationWaiters.append(continuation)
+        }
+    }
+
+    var observedCancellation: Bool {
+        cancellationCount > 0
+    }
+
+    var observation: Observation {
+        Observation(
+            entryCount: entryCount,
+            cancellationCount: cancellationCount,
+            activeCount: activeCount
+        )
+    }
+
+    private func recordCancellation() {
+        cancellationCount += 1
+        let waiters = cancellationWaiters
+        cancellationWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
+private actor LifecycleCompletionProbe {
+    private var isStarted = false
+    private(set) var isCompleted = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func markStarted() {
+        isStarted = true
+        let waiters = startWaiters
+        startWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    func waitUntilStarted() async {
+        guard !isStarted else { return }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func markCompleted() {
+        isCompleted = true
+    }
 }
 
 private final class WeakLifecycleReference<Value: AnyObject> {
@@ -510,22 +644,101 @@ private final class WeakLifecycleReference<Value: AnyObject> {
     }
 }
 
-private final class WindowClosePollingClientSpy: CodexModelListingClient, @unchecked Sendable {
-    private let lock = NSLock()
-    private var _stopCallCount = 0
+private actor WindowClosePollingClientSpy: CodexModelListingClient {
+    struct RequestObservation: Equatable {
+        let enteredRequestCount: Int
+        let exitedRequestCount: Int
+        let activeRequestCount: Int
+        let stopCallCount: Int
 
-    var stopCallCount: Int {
-        lock.withLock { _stopCallCount }
+        var isQuiescent: Bool {
+            activeRequestCount == 0
+        }
     }
 
+    private var pendingRequests: [UUID: CheckedContinuation<[CodexAppServerClient.RemoteModel], Error>] = [:]
+    private var activeRequestIDs: Set<UUID> = []
+    private var cancelledRequestIDs: Set<UUID> = []
+    private var enteredRequestCount = 0
+    private var exitedRequestCount = 0
+    private(set) var stopCallCount = 0
+    private var requestObservationObservers: [UUID: AsyncStream<RequestObservation>.Continuation] = [:]
+
     func listModels(limit _: Int) async throws -> [CodexAppServerClient.RemoteModel] {
-        try await Task.sleep(for: .seconds(60))
-        return []
+        let requestID = UUID()
+        activeRequestIDs.insert(requestID)
+        enteredRequestCount += 1
+        publishRequestObservation()
+        defer {
+            activeRequestIDs.remove(requestID)
+            cancelledRequestIDs.remove(requestID)
+            exitedRequestCount += 1
+            publishRequestObservation()
+        }
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled || cancelledRequestIDs.remove(requestID) != nil {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    pendingRequests[requestID] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelRequest(requestID) }
+        }
+    }
+
+    func requestObservation() -> RequestObservation {
+        RequestObservation(
+            enteredRequestCount: enteredRequestCount,
+            exitedRequestCount: exitedRequestCount,
+            activeRequestCount: activeRequestIDs.count,
+            stopCallCount: stopCallCount
+        )
+    }
+
+    func requestObservationUpdates() -> AsyncStream<RequestObservation> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<RequestObservation>.makeStream(bufferingPolicy: .bufferingNewest(1))
+        requestObservationObservers[id] = continuation
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removeRequestObservationObserver(id) }
+        }
+        continuation.yield(requestObservation())
+        return stream
+    }
+
+    func failPendingRequestsAsStopped() {
+        let continuations = Array(pendingRequests.values)
+        pendingRequests.removeAll()
+        for continuation in continuations {
+            continuation.resume(throwing: CodexAppServerClient.ClientError.processNotRunning)
+        }
     }
 
     func stop() async {
-        lock.withLock {
-            _stopCallCount += 1
+        stopCallCount += 1
+        failPendingRequestsAsStopped()
+        publishRequestObservation()
+    }
+
+    private func cancelRequest(_ requestID: UUID) {
+        if let continuation = pendingRequests.removeValue(forKey: requestID) {
+            continuation.resume(throwing: CancellationError())
+        } else if activeRequestIDs.contains(requestID) {
+            cancelledRequestIDs.insert(requestID)
         }
+    }
+
+    private func publishRequestObservation() {
+        let observation = requestObservation()
+        for continuation in requestObservationObservers.values {
+            continuation.yield(observation)
+        }
+    }
+
+    private func removeRequestObservationObserver(_ id: UUID) {
+        requestObservationObservers.removeValue(forKey: id)
     }
 }

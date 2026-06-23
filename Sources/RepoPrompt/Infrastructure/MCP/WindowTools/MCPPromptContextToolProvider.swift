@@ -92,7 +92,9 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
                 throw CancellationError()
             }
             let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            if includeArr.contains("files") {
+                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+            }
             let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
             let dto = try await dependencies.buildTabWorkspaceContext(
                 resolvedTabContext.snapshot,

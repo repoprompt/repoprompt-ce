@@ -3,6 +3,103 @@ import Foundation
 import XCTest
 
 final class ClaudeNativeApprovalAndResumeTests: XCTestCase {
+    enum ResolverError: Error {
+        case unsupportedModel
+    }
+
+    actor RecordingLaunchEnvironmentResolver: ClaudeCodeLaunchEnvironmentResolving {
+        private(set) var requestedModels: [String?] = []
+
+        func resolve(
+            variant _: ClaudeCodeRuntimeVariant,
+            requestedModel: String?
+        ) async throws -> ClaudeCodeLaunchEnvironment {
+            requestedModels.append(requestedModel)
+            guard requestedModel != "glm-5-turbo:xhigh" else {
+                throw ResolverError.unsupportedModel
+            }
+            return ClaudeCodeLaunchEnvironment(
+                effectiveModel: "sonnet",
+                environmentOverrides: [:],
+                backend: .compatible(.glmZAI)
+            )
+        }
+    }
+
+    func testNativeFlagResolutionPassesEncodedGLMModelToResolver() async throws {
+        let resolver = RecordingLaunchEnvironmentResolver()
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .glm
+            ),
+            environmentResolver: resolver
+        )
+
+        do {
+            _ = try await controller.test_resolveApplyFlagSettingsRequest(model: "glm-5-turbo:xhigh")
+            XCTFail("Expected encoded unsupported GLM XHigh model to be rejected by the resolver")
+        } catch ResolverError.unsupportedModel {
+            // Expected.
+        }
+
+        let requestedModels = await resolver.requestedModels
+        XCTAssertEqual(requestedModels, ["glm-5-turbo:xhigh"])
+    }
+
+    func testNativeLiveModelSwitchRequiresRestartWhenLaunchEnvironmentChanges() async {
+        let controller = ClaudeNativeProcessSessionController(
+            runID: UUID(),
+            tabID: UUID(),
+            windowID: 1,
+            workspacePath: nil,
+            config: .discovery(
+                commandName: "/usr/bin/false",
+                runtimeVariant: .glm
+            )
+        )
+        let directGLM = ClaudeCodeLaunchEnvironment(
+            effectiveModel: "sonnet",
+            environmentOverrides: [
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5-turbo",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo"
+            ],
+            backend: .compatible(.glmZAI),
+            suppressesEffortSettings: true
+        )
+        let slotGLM = ClaudeCodeLaunchEnvironment(
+            effectiveModel: "sonnet",
+            environmentOverrides: [
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.7",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.7"
+            ],
+            backend: .compatible(.glmZAI),
+            suppressesEffortSettings: true
+        )
+        let sameEnvironmentDifferentFlagModel = ClaudeCodeLaunchEnvironment(
+            effectiveModel: "opus",
+            environmentOverrides: directGLM.environmentOverrides,
+            backend: .compatible(.glmZAI),
+            suppressesEffortSettings: true
+        )
+
+        let directToSlotRequiresRestart = await controller.test_liveFlagSettingsRequiresProcessRestart(
+            activeLaunchEnvironment: directGLM,
+            nextLaunchEnvironment: slotGLM
+        )
+        let sameEnvironmentRequiresRestart = await controller.test_liveFlagSettingsRequiresProcessRestart(
+            activeLaunchEnvironment: directGLM,
+            nextLaunchEnvironment: sameEnvironmentDifferentFlagModel
+        )
+
+        XCTAssertTrue(directToSlotRequiresRestart)
+        XCTAssertFalse(sameEnvironmentRequiresRestart)
+    }
+
     func testRepoPromptPermissionAutoApprovalAndAllowPayloadPreserveToolUseID() throws {
         let repoPromptPayload: [String: Any] = [
             "tool_name": "mcp__RepoPromptCE__read_file",

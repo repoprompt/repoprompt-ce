@@ -6,6 +6,12 @@ public enum MCPTimeoutPolicy {
     public static let boundedToolExecutionDeadlineSeconds = 30
     public static let boundedToolExecutionDeadline: Duration = .seconds(boundedToolExecutionDeadlineSeconds)
 
+    public static let workspaceFreshnessWaitTimeoutSeconds = 30
+    public static let workspaceFreshnessWaitTimeout: Duration = .seconds(workspaceFreshnessWaitTimeoutSeconds)
+
+    public static let workspaceReadinessWaitTimeoutSeconds = 30
+    public static let workspaceReadinessWaitTimeout: Duration = .seconds(workspaceReadinessWaitTimeoutSeconds)
+
     public static let workspaceSwitchToolExecutionDeadlineSeconds = 120
     public static let workspaceSwitchToolExecutionDeadline: Duration = .seconds(
         workspaceSwitchToolExecutionDeadlineSeconds

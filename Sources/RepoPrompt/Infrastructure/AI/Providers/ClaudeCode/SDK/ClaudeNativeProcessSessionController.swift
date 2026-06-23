@@ -99,6 +99,7 @@ final actor ClaudeNativeProcessSessionController {
         case invalidControlResponse(String)
         case inputWriteFailed(String)
         case controlRequestTimedOut(requestID: String)
+        case liveModelSwitchRequiresRestart
 
         var errorDescription: String? {
             switch self {
@@ -112,6 +113,8 @@ final actor ClaudeNativeProcessSessionController {
                 "Failed writing to Claude process stdin: \(message)"
             case let .controlRequestTimedOut(requestID):
                 "Claude control request timed out: \(requestID)"
+            case .liveModelSwitchRequiresRestart:
+                "Changing to the selected model requires restarting Claude because its launch environment changes."
             }
         }
     }
@@ -119,6 +122,18 @@ final actor ClaudeNativeProcessSessionController {
     private struct PendingPermissionRequest {
         let requestID: String
         let request: [String: Any]
+    }
+
+    private struct LaunchEnvironmentSignature: Equatable {
+        let environmentOverrides: [String: String]
+        let removedEnvironmentKeys: Set<String>
+        let backend: ClaudeCodeLaunchEnvironment.Backend
+
+        init(_ launchEnvironment: ClaudeCodeLaunchEnvironment) {
+            environmentOverrides = launchEnvironment.environmentOverrides
+            removedEnvironmentKeys = launchEnvironment.removedEnvironmentKeys
+            backend = launchEnvironment.backend
+        }
     }
 
     private let runID: UUID
@@ -148,6 +163,7 @@ final actor ClaudeNativeProcessSessionController {
 
     private var initialFlagSettingsRequest: [String: Any]?
     private var latestFlagSettingsIntentGeneration: UInt64 = 0
+    private var activeLaunchEnvironmentSignature: LaunchEnvironmentSignature?
     private var flagSettingsRequestGeneration: UInt64 = 0
     private var hasCompletedInitialFlagSettings = false
     private var isInitialized = false
@@ -330,6 +346,13 @@ final actor ClaudeNativeProcessSessionController {
         let intentGeneration = latestFlagSettingsIntentGeneration
         let resolved = try await resolveLaunchFlagSettings(model: model, effortLevel: effortLevel)
         guard intentGeneration == latestFlagSettingsIntentGeneration else { return }
+        if liveFlagSettingsRequiresProcessRestart(for: resolved.launchEnvironment) {
+            writeRawEventLogRecord(kind: "session.flagSettingsDeferred", payload: [
+                "reason": "launch_environment_changed",
+                "model": model ?? NSNull()
+            ] as [String: Any])
+            throw ControllerError.liveModelSwitchRequiresRestart
+        }
         storeFlagSettingsRequest(resolved.request)
 
         guard process != nil else { return }
@@ -449,6 +472,7 @@ final actor ClaudeNativeProcessSessionController {
         }
         await clearExpectedAgentPIDIfNeeded()
         process = nil
+        activeLaunchEnvironmentSignature = nil
         isInitialized = false
         hasCompletedInitialFlagSettings = false
         stdoutFramer = LineFramer()
@@ -500,6 +524,7 @@ final actor ClaudeNativeProcessSessionController {
             preferredBasenames: [config.commandName]
         )
         storeFlagSettingsRequest(resolvedFlags.request)
+        activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(launchEnvironment)
         let arguments = buildArguments(
             existingSessionID: existingSessionID,
             model: nil
@@ -584,7 +609,7 @@ final actor ClaudeNativeProcessSessionController {
     ) async throws -> (launchEnvironment: ClaudeCodeLaunchEnvironment, request: [String: Any]?) {
         let modelSpecifier = model.map { ClaudeModelSpecifier(raw: $0) }
         let requestedModel = modelSpecifier != nil
-            ? modelSpecifier?.runtimeModelParam
+            ? model
             : config.modelString
         let effectiveEffortLevel = modelSpecifier?.explicitEffortLevel
             ?? suppliedEffortLevel
@@ -601,6 +626,13 @@ final actor ClaudeNativeProcessSessionController {
             effortLevel: requestEffortLevel
         )
         return (launchEnvironment, request)
+    }
+
+    private func liveFlagSettingsRequiresProcessRestart(for launchEnvironment: ClaudeCodeLaunchEnvironment) -> Bool {
+        guard let activeLaunchEnvironmentSignature else {
+            return false
+        }
+        return activeLaunchEnvironmentSignature != LaunchEnvironmentSignature(launchEnvironment)
     }
 
     private func storeFlagSettingsRequest(_ request: [String: Any]?) {
@@ -1573,6 +1605,14 @@ final actor ClaudeNativeProcessSessionController {
                 resolverOverrides: resolverOverrides,
                 resolverRemovedKeys: resolverRemovedKeys
             )
+        }
+
+        func test_liveFlagSettingsRequiresProcessRestart(
+            activeLaunchEnvironment: ClaudeCodeLaunchEnvironment,
+            nextLaunchEnvironment: ClaudeCodeLaunchEnvironment
+        ) -> Bool {
+            activeLaunchEnvironmentSignature = LaunchEnvironmentSignature(activeLaunchEnvironment)
+            return liveFlagSettingsRequiresProcessRestart(for: nextLaunchEnvironment)
         }
 
         /// Build the initialize control request payload for testing.

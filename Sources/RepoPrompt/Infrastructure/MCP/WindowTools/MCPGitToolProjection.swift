@@ -13,7 +13,7 @@ enum MCPGitToolProjection {
         let modeDetails: String
         let inline: Reply.InlineDTO?
         let emptyReason: String?
-        let primaryArtifactCandidates: [String]
+        let publishedArtifacts: GitDiffPublishedArtifactSet
     }
 
     @MainActor
@@ -170,9 +170,13 @@ enum MCPGitToolProjection {
 
             let summary = summaryDTO(summary: manifest.summary, files: manifest.files)
             let artifacts = artifactsDTO(snapshotDirURL: snapshotDirURL, manifest: manifest)
-            let primary = GitDiffSnapshotStore.primaryArtifacts(
-                snapshotDir: snapshotDir,
-                mapRelativePath: artifacts.map,
+            guard let snapshotRef = GitDiffSnapshotStore().parseSnapshotRef(snapshotDir) else {
+                throw GitDiffPublishedArtifactError.invalidSnapshotReference
+            }
+            let publishedArtifacts = try GitDiffPublishedArtifactSet(
+                snapshotDirectoryURL: snapshotDirURL,
+                snapshotRef: snapshotRef,
+                manifest: manifest,
                 allPatchRelativePath: artifacts.allPatch
             )
             return ArtifactProjection(
@@ -218,7 +222,7 @@ enum MCPGitToolProjection {
                     requestedPaths: manifest.requestedPaths,
                     compareRaw: manifest.compare
                 ),
-                primaryArtifactCandidates: primary.selectionCandidates
+                publishedArtifacts: publishedArtifacts
             )
         }
     }
@@ -244,7 +248,8 @@ enum MCPGitToolProjection {
     static func decorateArtifactRepoResults(
         _ repoResults: [Reply.RepoResultDTO],
         manifestsBySnapshotDir: [String: GitDiffSnapshotManifest],
-        autoSelectedPaths: [String]
+        autoSelectedPaths: [String],
+        readinessWarningsBySnapshotDir: [String: String] = [:]
     ) async throws -> [Reply.RepoResultDTO] {
         try await MCPProviderProjectionWorker.run(toolName: MCPWindowToolName.git, phase: "artifact_repo_dto") {
             let state = EditFlowPerf.begin(EditFlowPerf.Stage.Git.dtoConstruction)
@@ -256,6 +261,13 @@ enum MCPGitToolProjection {
                 else {
                     return repoResult
                 }
+                let warning = [
+                    repoResult.warning,
+                    readinessWarningsBySnapshotDir[snapshotDir]
+                ]
+                .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
                 return Reply.RepoResultDTO(
                     repoRoot: repoResult.repoRoot,
                     repoKey: repoResult.repoKey,
@@ -280,7 +292,7 @@ enum MCPGitToolProjection {
                     inputs: repoResult.inputs,
                     modeDetails: repoResult.modeDetails,
                     inline: repoResult.inline,
-                    warning: repoResult.warning,
+                    warning: warning.isEmpty ? nil : warning,
                     emptyReason: repoResult.emptyReason,
                     error: repoResult.error
                 )

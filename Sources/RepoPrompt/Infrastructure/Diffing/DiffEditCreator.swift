@@ -14,7 +14,11 @@ struct DiffEdit {
 }
 
 class DiffEditCreator {
-    static func myersDiff(oldLines: [String], newLines: [String]) -> [DiffEdit] {
+    static func myersDiff(
+        oldLines: [String],
+        newLines: [String],
+        maximumEditDistance: Int? = nil
+    ) -> [DiffEdit] {
         // Step 1: Initialize variables
         let n = oldLines.count
         let m = newLines.count
@@ -25,6 +29,9 @@ class DiffEditCreator {
 
         // Step 2: Loop over the edit distance
         for d in 0 ... max {
+            if let maximumEditDistance, d > maximumEditDistance {
+                return []
+            }
             var newV = v
             for k in stride(from: -d, through: d, by: 2) {
                 // Determine the direction to move
@@ -74,7 +81,7 @@ class DiffEditCreator {
             while x > prevX, y > prevY {
                 // Equal lines
                 if x > 0, y > 0 {
-                    edits.insert(DiffEdit(type: .equal, lines: [oldLines[x - 1]]), at: 0)
+                    edits.append(DiffEdit(type: .equal, lines: [oldLines[x - 1]]))
                 }
                 x -= 1
                 y -= 1
@@ -82,17 +89,17 @@ class DiffEditCreator {
             if x == prevX {
                 // Addition
                 if y > 0 {
-                    edits.insert(DiffEdit(type: .addition, lines: [newLines[y - 1]]), at: 0)
+                    edits.append(DiffEdit(type: .addition, lines: [newLines[y - 1]]))
                 }
                 y -= 1
             } else {
                 // Deletion
                 if x > 0 {
-                    edits.insert(DiffEdit(type: .deletion, lines: [oldLines[x - 1]]), at: 0)
+                    edits.append(DiffEdit(type: .deletion, lines: [oldLines[x - 1]]))
                 }
                 x -= 1
             }
         }
-        return edits
+        return Array(edits.reversed())
     }
 }

@@ -83,6 +83,7 @@ actor InteractiveREPL {
         }
 
         if let toolName = options.callTool {
+            await session.setSelectedWindowID(options.initialWindowID)
             try await callToolSingleShot(name: toolName, argsJSON: options.callArgs)
             return
         }
@@ -116,7 +117,7 @@ actor InteractiveREPL {
 
         while isRunning {
             // Check for tool list changes
-            if await session.toolsDirty {
+            if await session.toolsChangeNoticePending {
                 printColored("\n(Tools changed on server - run 'tools' to refresh)", .yellow)
                 await session.acknowledgeToolsChanged()
             }
@@ -461,11 +462,11 @@ actor InteractiveREPL {
             return
 
         case .all:
-            let tools = await session.tools()
+            let tools = try await session.cachedToolsOrRefresh()
             printFilteredToolList(tools, groupFilter: nil)
 
         case let .groups(groups):
-            let allTools = await session.tools()
+            let allTools = try await session.cachedToolsOrRefresh()
             let filtered = ToolGroupCatalog.filter(tools: allTools, groups: groups)
             let groupNames = groups.map(\.rawValue)
             printFilteredToolList(filtered, groupFilter: groupNames)
@@ -522,11 +523,11 @@ actor InteractiveREPL {
         let tools: [MCP.Tool]
         switch mode {
         case .groupNames:
-            tools = await session.tools()
+            tools = try await session.cachedToolsOrRefresh()
         case .all:
-            tools = await session.tools()
+            tools = try await session.cachedToolsOrRefresh()
         case let .groups(groups):
-            let allTools = await session.tools()
+            let allTools = try await session.cachedToolsOrRefresh()
             tools = ToolGroupCatalog.filter(tools: allTools, groups: groups)
         }
 
@@ -543,7 +544,8 @@ actor InteractiveREPL {
     private func describeTool(_ name: String) async throws {
         // Resolve alias to actual tool name
         let resolvedName = MCPCommandParser.resolveToolAlias(name)
-        guard let tool = await session.tool(named: resolvedName) else {
+        let tools = try await session.cachedToolsOrRefresh()
+        guard let tool = tools.first(where: { $0.name == resolvedName }) else {
             if resolvedName != name {
                 printError("Tool '\(name)' (resolved to '\(resolvedName)') not found. Run 'tools' to see available tools.")
             } else {
@@ -650,11 +652,11 @@ actor InteractiveREPL {
             return
 
         case .all:
-            let tools = await session.tools()
+            let tools = try await session.cachedToolsOrRefresh()
             printFilteredToolListSingleShot(tools, groupFilter: nil)
 
         case let .groups(groups):
-            let allTools = await session.tools()
+            let allTools = try await session.cachedToolsOrRefresh()
             let filtered = ToolGroupCatalog.filter(tools: allTools, groups: groups)
             let groupNames = groups.map(\.rawValue)
             printFilteredToolListSingleShot(filtered, groupFilter: groupNames)
@@ -707,7 +709,8 @@ actor InteractiveREPL {
     private func describeToolSingleShot(_ name: String) async throws {
         // Resolve alias to actual tool name
         let resolvedName = MCPCommandParser.resolveToolAlias(name)
-        guard let tool = await session.tool(named: resolvedName) else {
+        let tools = try await session.cachedToolsOrRefresh()
+        guard let tool = tools.first(where: { $0.name == resolvedName }) else {
             if resolvedName != name {
                 printError("Tool '\(name)' (resolved to '\(resolvedName)') not found.")
             } else {
@@ -779,9 +782,9 @@ actor InteractiveREPL {
         let tools: [MCP.Tool]
         switch mode {
         case .groupNames, .all:
-            tools = await session.tools()
+            tools = try await session.cachedToolsOrRefresh()
         case let .groups(groups):
-            let allTools = await session.tools()
+            let allTools = try await session.cachedToolsOrRefresh()
             tools = ToolGroupCatalog.filter(tools: allTools, groups: groups)
         }
 

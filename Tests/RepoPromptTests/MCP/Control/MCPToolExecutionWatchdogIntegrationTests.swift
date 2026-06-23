@@ -64,6 +64,273 @@ import XCTest
             }
         }
 
+        func testSameWindowExclusiveResourceReleasesBeforeCompletionObserverTail() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let manager = fixture.networkManager
+                let firstEndpoint = try fixture.endpointA()
+                let secondEndpoint = try fixture.endpointARead()
+                let providerProbe = MCPPostProviderAdmissionProbe()
+                let observerTailGate = MCPExecutionIgnoringCancellationGate()
+                var firstTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var secondTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.manageSelection) {
+                    await providerProbe.record(connectionID: ServerNetworkManager.currentConnectionID)
+                }
+                await manager.debugSetBeforeToolCompletionObserversForTesting { connectionID, toolName in
+                    guard connectionID == firstEndpoint.connectionID,
+                          toolName == MCPWindowToolName.manageSelection
+                    else { return }
+                    await observerTailGate.enterAndWait()
+                }
+
+                do {
+                    let arguments: [String: Any] = [
+                        "op": "get",
+                        "context_id": fixture.contextA.tabID.uuidString,
+                        "_rawJSON": true
+                    ]
+                    let blockedFirst = Task {
+                        try await firstEndpoint.callTool(
+                            name: MCPWindowToolName.manageSelection,
+                            arguments: arguments
+                        )
+                    }
+                    firstTask = blockedFirst
+                    try await observerTailGate.waitUntilEntered(count: 1)
+                    try await providerProbe.waitUntilEntered(connectionID: firstEndpoint.connectionID)
+
+                    let firstLimiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: firstEndpoint.connectionID,
+                        lane: .ordinary
+                    )
+                    XCTAssertEqual(firstLimiter?.activePermitCount, 1)
+
+                    let competingSecond = Task {
+                        try await secondEndpoint.callTool(
+                            name: MCPWindowToolName.manageSelection,
+                            arguments: arguments
+                        )
+                    }
+                    secondTask = competingSecond
+                    try await providerProbe.waitUntilEntered(connectionID: secondEndpoint.connectionID)
+                    _ = try await competingSecond.value
+                    secondTask = nil
+
+                    await observerTailGate.release()
+                    _ = try await blockedFirst.value
+                    firstTask = nil
+
+                    await manager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.manageSelection,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await observerTailGate.release()
+                    firstTask?.cancel()
+                    secondTask?.cancel()
+                    if let firstTask { _ = try? await firstTask.value }
+                    if let secondTask { _ = try? await secondTask.value }
+                    await manager.debugSetBeforeToolCompletionObserversForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.manageSelection,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testSameWindowSmallReadResourcesReleaseBeforeFormattingTail() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let manager = fixture.networkManager
+                let firstEndpoint = try fixture.endpointA()
+                let secondEndpoint = try fixture.endpointARead()
+                let thirdEndpoint = try fixture.endpointAQueuedSearch()
+                let providerProbe = MCPPostProviderAdmissionProbe()
+                let formattingTailGate = MCPExecutionIgnoringCancellationGate()
+                let blockedConnectionIDs = Set([firstEndpoint.connectionID, secondEndpoint.connectionID])
+                var tasks: [Task<PersistentMCPTestRPCResponse, Error>] = []
+
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPWindowToolName.readFile) {
+                    await providerProbe.record(connectionID: ServerNetworkManager.currentConnectionID)
+                }
+                await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                    guard blockedConnectionIDs.contains(connectionID),
+                          toolName == MCPWindowToolName.readFile
+                    else { return }
+                    await formattingTailGate.enterAndWait()
+                }
+
+                do {
+                    let arguments: [String: Any] = [
+                        "path": fixture.contextA.fileURL.path,
+                        "context_id": fixture.contextA.tabID.uuidString,
+                        "_rawJSON": true
+                    ]
+                    let first = Task {
+                        try await firstEndpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: arguments
+                        )
+                    }
+                    let second = Task {
+                        try await secondEndpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: arguments
+                        )
+                    }
+                    tasks = [first, second]
+                    try await formattingTailGate.waitUntilEntered(count: 2)
+                    try await providerProbe.waitUntilEntered(connectionID: firstEndpoint.connectionID)
+                    try await providerProbe.waitUntilEntered(connectionID: secondEndpoint.connectionID)
+
+                    for endpoint in [firstEndpoint, secondEndpoint] {
+                        let limiter = await manager.connectionLimiterSnapshotForTesting(
+                            connectionID: endpoint.connectionID,
+                            lane: .smallRead
+                        )
+                        XCTAssertEqual(limiter?.activePermitCount, 1)
+                    }
+
+                    let third = Task {
+                        try await thirdEndpoint.callTool(
+                            name: MCPWindowToolName.readFile,
+                            arguments: arguments
+                        )
+                    }
+                    tasks.append(third)
+                    try await providerProbe.waitUntilEntered(connectionID: thirdEndpoint.connectionID)
+                    _ = try await third.value
+                    tasks.removeLast()
+
+                    await formattingTailGate.release()
+                    _ = try await first.value
+                    _ = try await second.value
+                    tasks.removeAll()
+
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await formattingTailGate.release()
+                    tasks.forEach { $0.cancel() }
+                    for task in tasks {
+                        _ = try? await task.value
+                    }
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPWindowToolName.readFile,
+                        operation: nil
+                    )
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
+        func testAppWideExclusiveResourceReleasesBeforeFormattingTail() async throws {
+            try await MCPSharedServerTestLease.shared.withLease { lease in
+                let fixture = try await PersistentMCPTestFixture.make(lease: lease)
+                let manager = fixture.networkManager
+                let firstEndpoint = try fixture.endpointA()
+                let secondEndpoint = try fixture.endpointB()
+                let providerProbe = MCPPostProviderAdmissionProbe()
+                let formattingTailGate = MCPExecutionIgnoringCancellationGate()
+                var appSettingsScope: MCPAppSettingsServiceScope?
+                var firstTask: Task<PersistentMCPTestRPCResponse, Error>?
+                var secondTask: Task<PersistentMCPTestRPCResponse, Error>?
+
+                await manager.debugSetResolvedToolOperationOverride(toolName: MCPGlobalToolName.appSettings) {
+                    await providerProbe.record(connectionID: ServerNetworkManager.currentConnectionID)
+                }
+                await manager.debugSetBeforeToolResultFormattingForTesting { connectionID, toolName in
+                    guard connectionID == firstEndpoint.connectionID,
+                          toolName == MCPGlobalToolName.appSettings
+                    else { return }
+                    await formattingTailGate.enterAndWait()
+                }
+
+                do {
+                    let installedScope = try await MCPAppSettingsServiceScope.install()
+                    appSettingsScope = installedScope
+                    let arguments: [String: Any] = [
+                        "op": "get",
+                        "key": "ui.appearance_mode",
+                        "_rawJSON": true
+                    ]
+                    let blockedFirst = Task {
+                        try await firstEndpoint.callTool(
+                            name: MCPGlobalToolName.appSettings,
+                            arguments: arguments
+                        )
+                    }
+                    firstTask = blockedFirst
+                    try await formattingTailGate.waitUntilEntered(count: 1)
+                    try await providerProbe.waitUntilEntered(connectionID: firstEndpoint.connectionID)
+
+                    let firstLimiter = await manager.connectionLimiterSnapshotForTesting(
+                        connectionID: firstEndpoint.connectionID,
+                        lane: .ordinary
+                    )
+                    XCTAssertEqual(firstLimiter?.activePermitCount, 1)
+
+                    let competingSecond = Task {
+                        try await secondEndpoint.callTool(
+                            name: MCPGlobalToolName.appSettings,
+                            arguments: arguments
+                        )
+                    }
+                    secondTask = competingSecond
+                    try await providerProbe.waitUntilEntered(connectionID: secondEndpoint.connectionID)
+                    _ = try await competingSecond.value
+                    secondTask = nil
+
+                    await formattingTailGate.release()
+                    _ = try await blockedFirst.value
+                    firstTask = nil
+
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.appSettings,
+                        operation: nil
+                    )
+                    await installedScope.restore()
+                    installedScope.assertRestored()
+                    appSettingsScope = nil
+                    await fixture.cleanup()
+                    try await fixture.assertCleanedUp()
+                } catch {
+                    await formattingTailGate.release()
+                    firstTask?.cancel()
+                    secondTask?.cancel()
+                    if let firstTask { _ = try? await firstTask.value }
+                    if let secondTask { _ = try? await secondTask.value }
+                    await manager.debugSetBeforeToolResultFormattingForTesting(nil)
+                    await manager.debugSetResolvedToolOperationOverride(
+                        toolName: MCPGlobalToolName.appSettings,
+                        operation: nil
+                    )
+                    if let appSettingsScope {
+                        await appSettingsScope.restore()
+                        appSettingsScope.assertRestored()
+                    }
+                    await fixture.cleanup()
+                    throw error
+                }
+            }
+        }
+
         func testManageSelectionAndFileActionsReportReplyConstructionPhase() async throws {
             try await MCPSharedServerTestLease.shared.withLease { lease in
                 let fixture = try await PersistentMCPTestFixture.make(lease: lease)
@@ -1734,6 +2001,37 @@ import XCTest
             cancellationCount += 1
             continuation?.resume(throwing: CancellationError())
             continuation = nil
+        }
+    }
+
+    private actor MCPPostProviderAdmissionProbe {
+        private static let synchronizationTimeout: Duration = .seconds(10)
+
+        private var connectionIDs: [UUID] = []
+
+        func record(connectionID: UUID?) -> Value {
+            if let connectionID {
+                connectionIDs.append(connectionID)
+            }
+            return .object(["status": .string("ok")])
+        }
+
+        func waitUntilEntered(
+            connectionID: UUID,
+            timeout: Duration = synchronizationTimeout
+        ) async throws {
+            let clock = ContinuousClock()
+            let deadline = clock.now.advanced(by: timeout)
+            while !connectionIDs.contains(connectionID) {
+                try Task.checkCancellation()
+                guard clock.now < deadline else {
+                    throw MCPExecutionWatchdogIntegrationFixtureError.gateDidNotEnter(
+                        expected: 1,
+                        actual: connectionIDs.count
+                    )
+                }
+                try await Task.sleep(for: .milliseconds(10))
+            }
         }
     }
 

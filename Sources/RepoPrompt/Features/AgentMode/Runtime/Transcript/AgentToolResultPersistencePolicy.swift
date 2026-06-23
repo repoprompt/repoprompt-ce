@@ -145,6 +145,7 @@ enum AgentToolResultPersistencePolicy {
             || normalizedToolName == "agent_manage"
             || normalizedToolName == "ask_oracle"
             || normalizedToolName == "oracle_send"
+            || normalizedToolName == "context_builder"
         let looksLikeCursorACPPayload = rawResultJSON?.contains("\"acp_status\"") == true
         let needsRawObjectFallbacks =
             requiresStructuredSummaryDetails
@@ -298,7 +299,8 @@ enum AgentToolResultPersistencePolicy {
             let allowedTools: Set = [
                 "apply_edits",
                 "ask_oracle",
-                "oracle_send"
+                "oracle_send",
+                "context_builder"
             ]
             guard let normalizedToolName,
                   let resultJSON = sanitized?.resultJSON,
@@ -514,6 +516,8 @@ enum AgentToolResultPersistencePolicy {
         _ transcript: AgentTranscript,
         previousSanitizedTranscript: AgentTranscript? = nil,
         reusablePrefixTurnCount: Int? = nil,
+        trustedReusablePrefixTurnCount: Int? = nil,
+        trustedIncrementalFinalTurnStartSequenceIndex: Int? = nil,
         preservedVisibleToolResultRowIDs: Set<UUID>? = nil,
         context: AgentToolResultProcessingContext? = nil,
         purpose: AgentToolResultSanitizationPurpose = .runtimePresentation
@@ -523,10 +527,34 @@ enum AgentToolResultPersistencePolicy {
             validatedReusablePrefixTurnCount(
                 in: transcript,
                 previousSanitizedTranscript: previousSanitizedTranscript,
-                requestedPrefixTurnCount: reusablePrefixTurnCount
+                requestedPrefixTurnCount: trustedReusablePrefixTurnCount ?? reusablePrefixTurnCount
             )
         case .persistentStorage:
             0
+        }
+        if purpose == .runtimePresentation,
+           let trustedIncrementalFinalTurnStartSequenceIndex,
+           let previousSanitizedTranscript,
+           transcript.turns.count == previousSanitizedTranscript.turns.count,
+           reusedTurnCount == max(0, transcript.turns.count - 1),
+           let currentFinalTurn = transcript.turns.last,
+           let previousFinalTurn = previousSanitizedTranscript.turns.last,
+           currentFinalTurn.id == previousFinalTurn.id
+        {
+            var sanitizedTranscript = transcript
+            if let sanitizedActivityCount = sanitizeFinalTurnIncrementally(
+                &sanitizedTranscript.turns[sanitizedTranscript.turns.count - 1],
+                previousSanitizedTurn: previousFinalTurn,
+                startingAtSequenceIndex: trustedIncrementalFinalTurnStartSequenceIndex,
+                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs ?? [],
+                context: context
+            ) {
+                return AgentSanitizedTranscriptMetrics(
+                    transcript: sanitizedTranscript,
+                    sanitizedActivityCount: sanitizedActivityCount,
+                    reusedTurnCount: reusedTurnCount
+                )
+            }
         }
         let containsSanitizableActivities: Bool = switch purpose {
         case .runtimePresentation:
@@ -573,6 +601,101 @@ enum AgentToolResultPersistencePolicy {
         )
     }
 
+    private static func sanitizeFinalTurnIncrementally(
+        _ turn: inout AgentTranscriptTurn,
+        previousSanitizedTurn: AgentTranscriptTurn,
+        startingAtSequenceIndex: Int,
+        preservedVisibleToolResultRowIDs: Set<UUID>,
+        context: AgentToolResultProcessingContext?
+    ) -> Int? {
+        guard turn.request?.id == previousSanitizedTurn.request?.id,
+              turn.responseSpans.count == previousSanitizedTurn.responseSpans.count
+        else {
+            return nil
+        }
+
+        var updatedTurn = turn
+        var reachedChangedSuffix = false
+        var sanitizedActivityCount = 0
+
+        for spanIndex in updatedTurn.responseSpans.indices {
+            let currentSpan = turn.responseSpans[spanIndex]
+            let previousSpan = previousSanitizedTurn.responseSpans[spanIndex]
+            guard currentSpan.id == previousSpan.id else { return nil }
+
+            if !reachedChangedSuffix {
+                let changedActivityIndex = lowerBoundActivityIndex(
+                    in: currentSpan.activities,
+                    sequenceIndex: startingAtSequenceIndex
+                )
+                if changedActivityIndex == currentSpan.activities.count {
+                    guard currentSpan.activities.count == previousSpan.activities.count,
+                          currentSpan.activities.first?.id == previousSpan.activities.first?.id,
+                          currentSpan.activities.last?.id == previousSpan.activities.last?.id
+                    else {
+                        return nil
+                    }
+                    updatedTurn.responseSpans[spanIndex].activities = previousSpan.activities
+                    continue
+                }
+
+                guard changedActivityIndex <= previousSpan.activities.count else { return nil }
+                if changedActivityIndex > 0 {
+                    guard currentSpan.activities[changedActivityIndex - 1].id
+                        == previousSpan.activities[changedActivityIndex - 1].id
+                    else {
+                        return nil
+                    }
+                }
+
+                var mergedActivities = previousSpan.activities
+                mergedActivities.replaceSubrange(
+                    changedActivityIndex ..< mergedActivities.count,
+                    with: currentSpan.activities[changedActivityIndex...]
+                )
+                updatedTurn.responseSpans[spanIndex].activities = mergedActivities
+                sanitizedActivityCount += sanitizeActivities(
+                    in: &updatedTurn.responseSpans[spanIndex],
+                    startingAt: changedActivityIndex,
+                    preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                    context: context,
+                    purpose: .runtimePresentation
+                )
+                reachedChangedSuffix = true
+                continue
+            }
+
+            sanitizedActivityCount += sanitizeActivities(
+                in: &updatedTurn.responseSpans[spanIndex],
+                startingAt: 0,
+                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                context: context,
+                purpose: .runtimePresentation
+            )
+        }
+
+        guard reachedChangedSuffix else { return nil }
+        turn = updatedTurn
+        return sanitizedActivityCount
+    }
+
+    private static func lowerBoundActivityIndex(
+        in activities: [AgentTranscriptActivity],
+        sequenceIndex: Int
+    ) -> Int {
+        var lowerBound = activities.startIndex
+        var upperBound = activities.endIndex
+        while lowerBound < upperBound {
+            let midpoint = lowerBound + (upperBound - lowerBound) / 2
+            if activities[midpoint].sequenceIndex < sequenceIndex {
+                lowerBound = midpoint + 1
+            } else {
+                upperBound = midpoint
+            }
+        }
+        return lowerBound
+    }
+
     private static func validatedReusablePrefixTurnCount(
         in transcript: AgentTranscript,
         previousSanitizedTranscript: AgentTranscript?,
@@ -587,10 +710,7 @@ enum AgentToolResultPersistencePolicy {
         for index in 0 ..< candidatePrefixTurnCount {
             let currentTurn = transcript.turns[index]
             let previousTurn = previousSanitizedTranscript.turns[index]
-            guard currentTurn.retentionTier != .full,
-                  previousTurn.retentionTier != .full,
-                  currentTurn == previousTurn
-            else {
+            guard currentTurn == previousTurn else {
                 break
             }
             reusableTurnCount += 1
@@ -629,28 +749,47 @@ enum AgentToolResultPersistencePolicy {
     ) -> Int {
         var sanitizedActivityCount = 0
         for spanIndex in turn.responseSpans.indices {
-            var spanDidMutate = false
-            for activityIndex in turn.responseSpans[spanIndex].activities.indices {
-                var activity = turn.responseSpans[spanIndex].activities[activityIndex]
-                let didNormalizeToolIdentity = normalizeToolIdentity(&activity, context: context)
-                let didSanitize: Bool = switch purpose {
-                case .runtimePresentation:
-                    sanitizeRuntimeActivity(
-                        &activity,
-                        preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
-                        context: context
-                    )
-                case .persistentStorage:
-                    sanitizePersistentStorageActivity(&activity, context: context)
-                }
-                guard didNormalizeToolIdentity || didSanitize else { continue }
-                turn.responseSpans[spanIndex].activities[activityIndex] = activity
-                spanDidMutate = true
-                sanitizedActivityCount += 1
+            sanitizedActivityCount += sanitizeActivities(
+                in: &turn.responseSpans[spanIndex],
+                startingAt: 0,
+                preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                context: context,
+                purpose: purpose
+            )
+        }
+        return sanitizedActivityCount
+    }
+
+    private static func sanitizeActivities(
+        in span: inout AgentTranscriptProviderResponseSpan,
+        startingAt startIndex: Int,
+        preservedVisibleToolResultRowIDs: Set<UUID>,
+        context: AgentToolResultProcessingContext?,
+        purpose: AgentToolResultSanitizationPurpose
+    ) -> Int {
+        guard startIndex < span.activities.count else { return 0 }
+        var sanitizedActivityCount = 0
+        var spanDidMutate = false
+        for activityIndex in startIndex ..< span.activities.count {
+            var activity = span.activities[activityIndex]
+            let didNormalizeToolIdentity = normalizeToolIdentity(&activity, context: context)
+            let didSanitize: Bool = switch purpose {
+            case .runtimePresentation:
+                sanitizeRuntimeActivity(
+                    &activity,
+                    preservedVisibleToolResultRowIDs: preservedVisibleToolResultRowIDs,
+                    context: context
+                )
+            case .persistentStorage:
+                sanitizePersistentStorageActivity(&activity, context: context)
             }
-            if spanDidMutate {
-                turn.responseSpans[spanIndex].fullRenderGroupedHistoryCache = nil
-            }
+            guard didNormalizeToolIdentity || didSanitize else { continue }
+            span.activities[activityIndex] = activity
+            spanDidMutate = true
+            sanitizedActivityCount += 1
+        }
+        if spanDidMutate {
+            span.fullRenderGroupedHistoryCache = nil
         }
         return sanitizedActivityCount
     }
@@ -1284,6 +1423,14 @@ enum AgentToolResultPersistencePolicy {
                 renderSummary: renderSummary
             )
         }
+        if normalizedToolName == "context_builder",
+           let rawOutput = rawObject?["rawOutput"] as? [String: Any]
+        {
+            return contextBuilderSummaryJSON(
+                statusWord: statusWord,
+                rawObject: rawOutput
+            )
+        }
         if let cursorSummaryJSON = cursorACPSummaryJSON(
             normalizedToolName: normalizedToolName,
             statusWord: statusWord,
@@ -1319,6 +1466,11 @@ enum AgentToolResultPersistencePolicy {
         case "ask_oracle", "oracle_send":
             return oracleChatSummaryJSON(
                 normalizedToolName: normalizedToolName,
+                statusWord: statusWord,
+                rawObject: rawObject
+            )
+        case "context_builder":
+            return contextBuilderSummaryJSON(
                 statusWord: statusWord,
                 rawObject: rawObject
             )
@@ -1537,6 +1689,11 @@ enum AgentToolResultPersistencePolicy {
         }
         if let title = smallStringValue(rawObject, keys: ["title"]) {
             object["title"] = title
+        }
+        if normalizedToolName == "ask_oracle" || normalizedToolName == "oracle_send",
+           let chatID = smallStringValue(rawObject, keys: ["chat_id", "chatID"])
+        {
+            object["chat_id"] = chatID
         }
         return object
     }
@@ -1931,6 +2088,49 @@ enum AgentToolResultPersistencePolicy {
             object["summary_text"] = "\(skippedCount) skipped"
         }
         return jsonString(from: object)
+    }
+
+    private static func contextBuilderSummaryJSON(
+        statusWord: String,
+        rawObject: [String: Any]?
+    ) -> String? {
+        var object = genericSummaryObject(
+            normalizedToolName: "context_builder",
+            statusWord: statusWord,
+            processID: nil,
+            exitCode: nil
+        )
+        guard let rawObject else { return jsonString(from: object) }
+
+        if let contextID = smallStringValue(rawObject, keys: ["context_id", "tab_id", "tabID"]) {
+            object["context_id"] = contextID
+        }
+        let responseType = smallStringValue(rawObject, keys: ["response_type", "responseType"])
+        if let responseType {
+            object["response_type"] = responseType
+        }
+
+        if let branch = ContextBuilderFollowUpBranch.select(responseType: responseType),
+           let reply = boundedContextBuilderReply(rawObject[branch.rawValue] as? [String: Any])
+        {
+            object[branch.rawValue] = reply
+        }
+
+        guard let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) else {
+            return minimalResultJSON(statusWord: statusWord, normalizedToolName: "context_builder")
+        }
+        return json
+    }
+
+    private static func boundedContextBuilderReply(_ rawReply: [String: Any]?) -> [String: Any]? {
+        guard let rawReply,
+              let chatID = smallStringValue(rawReply, keys: ["chat_id", "chatID"])
+        else { return nil }
+        var reply: [String: Any] = ["chat_id": chatID]
+        if let mode = smallStringValue(rawReply, keys: ["mode"]) {
+            reply["mode"] = mode
+        }
+        return reply
     }
 
     private static func oracleChatSummaryJSON(

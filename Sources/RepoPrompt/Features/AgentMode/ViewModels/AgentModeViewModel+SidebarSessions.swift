@@ -13,7 +13,7 @@ extension AgentModeViewModel {
                 return computed
             }
         }
-        return sessionListSortDates[tabID]
+        return ownerValidatedSessionListSortDates[tabID]
     }
 
     struct SidebarSessionDateInfo: Equatable {
@@ -55,7 +55,7 @@ extension AgentModeViewModel {
     }
 
     private func archivedSidebarSessionLookup() -> ArchivedSidebarSessionLookup {
-        ArchivedSidebarSessionLookup(sessionIndex: sessionIndex)
+        ArchivedSidebarSessionLookup(sessionIndex: ownerValidatedSessionIndex)
     }
 
     private func preferredArchivedSidebarEntry(
@@ -71,19 +71,20 @@ extension AgentModeViewModel {
     }
 
     private func shouldFreezeSidebarOrdering(for tabs: [ComposeTabState]) -> Bool {
-        guard !sessionListCacheReady, !sidebarRestoreFrozenOrderByTabID.isEmpty else { return false }
-        return tabs.allSatisfy { sidebarRestoreFrozenOrderByTabID[$0.id] != nil }
+        let frozenOrder = ownerValidatedSidebarRestoreFrozenOrderByTabID
+        guard !ownerValidatedSessionListCacheReady, !frozenOrder.isEmpty else { return false }
+        return tabs.allSatisfy { frozenOrder[$0.id] != nil }
     }
 
     private func frozenSidebarOrderIndex(for tabID: UUID, fallback: Int) -> Int {
-        sidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
+        ownerValidatedSidebarRestoreFrozenOrderByTabID[tabID] ?? fallback
     }
 
     func preferredSidebarEntry(for tabID: UUID, tabName: String? = nil) -> AgentSessionIndexEntry? {
         AgentModeSidebarSessionBuilder.preferredSidebarEntry(
             for: tabID,
             tabName: tabName,
-            sessionIndex: sessionIndex
+            sessionIndex: ownerValidatedSessionIndex
         )
     }
 
@@ -308,32 +309,40 @@ extension AgentModeViewModel {
     /// Session-linked sidebar data source.
     /// Blank compose tabs stay hidden until they are explicitly linked to an agent session.
     func sidebarSessions(for tabs: [ComposeTabState]) -> [SidebarSession] {
-        var explicitTabIDBySessionID: [UUID: UUID] = [:]
-        for tab in tabs {
-            if let explicitSessionID = tab.activeAgentSessionID ?? explicitActiveSessionID(for: tab.id) {
-                explicitTabIDBySessionID[explicitSessionID] = tab.id
+        let currentIndex = ownerValidatedSessionIndex
+        let indexEntriesByTabID = Dictionary(grouping: currentIndex.values, by: \.tabID)
+        let authoritativeSessionIDByTabID = Dictionary(
+            uniqueKeysWithValues: tabs.compactMap { tab in
+                authoritativeSessionID(for: tab).map { (tab.id, $0) }
             }
-        }
+        )
+        let explicitTabIDBySessionID = Dictionary(
+            authoritativeSessionIDByTabID.map { ($0.value, $0.key) },
+            uniquingKeysWith: { _, latest in latest }
+        )
         let linkedTabs = tabs.filter { tab in
-            if tab.activeAgentSessionID != nil || explicitActiveSessionID(for: tab.id) != nil {
+            if authoritativeSessionIDByTabID[tab.id] != nil {
                 return true
             }
-            guard let preferredSessionID = preferredSidebarEntry(for: tab.id)?.id else {
-                return false
+            let candidateEntries = (indexEntriesByTabID[tab.id] ?? []).filter { entry in
+                guard let explicitTabID = explicitTabIDBySessionID[entry.id] else { return true }
+                return explicitTabID == tab.id
             }
-            if let explicitTabID = explicitTabIDBySessionID[preferredSessionID], explicitTabID != tab.id {
-                return false
-            }
-            return true
+            return AgentModeSidebarSessionBuilder.preferredSidebarEntry(
+                for: tab.id,
+                tabName: tab.name,
+                entries: candidateEntries
+            ) != nil
         }
         return AgentModeSidebarSessionBuilder(
             allTabs: tabs,
             linkedTabs: linkedTabs,
             sessions: sessions,
-            sessionIndex: sessionIndex,
-            sessionListSortDates: sessionListSortDates,
-            sessionListCacheReady: sessionListCacheReady,
-            sidebarRestoreFrozenOrderByTabID: sidebarRestoreFrozenOrderByTabID,
+            authoritativeSessionIDByTabID: authoritativeSessionIDByTabID,
+            sessionIndex: currentIndex,
+            sessionListSortDates: ownerValidatedSessionListSortDates,
+            sessionListCacheReady: ownerValidatedSessionListCacheReady,
+            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID,
             mcpControlledTabIDs: mcpControlledTabIDs
         ).build()
     }
@@ -394,7 +403,11 @@ extension AgentModeViewModel {
                     matchedIDs.insert(session.id)
                     // Include ancestor chain
                     var cursor = session.parentSessionID
-                    while let pid = cursor, let parent = sessionByID[pid] {
+                    var visitedSessionIDs: Set<UUID> = []
+                    while let pid = cursor,
+                          visitedSessionIDs.insert(pid).inserted,
+                          let parent = sessionByID[pid]
+                    {
                         matchedIDs.insert(parent.id)
                         cursor = parent.parentSessionID
                     }
@@ -407,20 +420,19 @@ extension AgentModeViewModel {
             {
                 matchedIDs.insert(activeSession.id)
                 var cursor = activeSession.parentSessionID
-                while let pid = cursor, let parent = sessionByID[pid] {
+                var visitedSessionIDs: Set<UUID> = []
+                while let pid = cursor,
+                      visitedSessionIDs.insert(pid).inserted,
+                      let parent = sessionByID[pid]
+                {
                     matchedIDs.insert(parent.id)
                     cursor = parent.parentSessionID
                 }
             }
 
             let filtered = sortedSessions.filter { matchedIDs.contains($0.id) }
-            let reordered = sidebarSearchRowsPromotingActiveThread(
-                filtered,
-                currentTabID: currentTabID,
-                sessionByID: sessionByID
-            )
             result = sidebarRowsApplyingThreadCollapse(
-                reordered,
+                filtered,
                 currentTabID: currentTabID,
                 searchText: effectiveSearchText,
                 diagnosticSource: source
@@ -441,44 +453,6 @@ extension AgentModeViewModel {
             )
         #endif
         return result
-    }
-
-    private func sidebarSearchRowsPromotingActiveThread(
-        _ rows: [SidebarSession],
-        currentTabID: UUID?,
-        sessionByID: [UUID: SidebarSession]
-    ) -> [SidebarSession] {
-        guard let activeTabID = currentTabID,
-              let activeIndex = rows.firstIndex(where: { $0.tabID == activeTabID })
-        else {
-            return rows
-        }
-        var rootID = rows[activeIndex].id
-        var cursor = rows[activeIndex].parentSessionID
-        while let parentSessionID = cursor,
-              let parent = sessionByID[parentSessionID]
-        {
-            rootID = parent.id
-            cursor = parent.parentSessionID
-        }
-        guard let groupStartIndex = rows.firstIndex(where: { $0.id == rootID }) else {
-            var reordered = rows
-            let active = reordered.remove(at: activeIndex)
-            reordered.insert(active, at: 0)
-            return reordered
-        }
-        let rootDepth = rows[groupStartIndex].depth
-        let groupEndIndex = rows[(groupStartIndex + 1)...]
-            .firstIndex(where: { $0.depth <= rootDepth }) ?? rows.endIndex
-        let groupRange = groupStartIndex ..< groupEndIndex
-        guard groupRange.contains(activeIndex), groupStartIndex != rows.startIndex else {
-            return rows
-        }
-        var reordered = rows
-        let group = Array(reordered[groupRange])
-        reordered.removeSubrange(groupRange)
-        reordered.insert(contentsOf: group, at: rows.startIndex)
-        return reordered
     }
 
     private func sidebarRowsApplyingThreadCollapse(
@@ -637,6 +611,7 @@ extension AgentModeViewModel {
             depth: row.depth,
             isMCPControlled: row.isMCPControlled,
             worktree: row.worktree,
+            worktreeMergeAttention: row.worktreeMergeAttention,
             threadKey: threadKey,
             hasThreadChildren: hasThreadChildren,
             isThreadCollapsed: isThreadCollapsed,

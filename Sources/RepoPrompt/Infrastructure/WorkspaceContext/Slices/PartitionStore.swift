@@ -42,6 +42,13 @@ actor PartitionStore {
     static let notifTabIDKey = "tabID"
     static let notifSourceIDKey = "sourceID"
     nonisolated let notificationSourceID = UUID()
+    private static let partitionFileLock = NSLock()
+
+    private static func withPartitionFileLock<T>(_ body: () throws -> T) rethrows -> T {
+        partitionFileLock.lock()
+        defer { partitionFileLock.unlock() }
+        return try body()
+    }
 
     /// <AppSupport>/RepoPrompt CE/Partitions
     private static func partitionsBaseURL() -> URL {
@@ -137,6 +144,19 @@ actor PartitionStore {
     private let decoder: JSONDecoder
     private let dateFormatter = ISO8601DateFormatter()
 
+    #if DEBUG
+        private var didPersistHandlerForTesting: (@Sendable () -> Void)?
+        private var didValidateCurrentHandlerForTesting: (@Sendable () -> Void)?
+
+        func setDidPersistHandlerForTesting(_ handler: (@Sendable () -> Void)?) {
+            didPersistHandlerForTesting = handler
+        }
+
+        func setDidValidateCurrentHandlerForTesting(_ handler: (@Sendable () -> Void)?) {
+            didValidateCurrentHandlerForTesting = handler
+        }
+    #endif
+
     init(baseURL: URL? = nil) {
         self.baseURL = baseURL ?? Self.partitionsBaseURL()
         let encoder = JSONEncoder()
@@ -146,14 +166,32 @@ actor PartitionStore {
     }
 
     func load(forRoot rootPath: String, scope: PartitionScope) async -> PartitionData {
-        let primaryURL = partitionURL(forRoot: rootPath, scope: scope)
-        if let partition = loadPartition(at: primaryURL) {
-            return partition
+        Self.withPartitionFileLock {
+            loadData(forRoot: rootPath, scope: scope)
         }
-        return PartitionData.empty()
     }
 
-    func save(forRoot rootPath: String, scope: PartitionScope, data: PartitionData) async throws {
+    private func loadData(forRoot rootPath: String, scope: PartitionScope) -> PartitionData {
+        let primaryURL = partitionURL(forRoot: rootPath, scope: scope)
+        return loadPartition(at: primaryURL) ?? PartitionData.empty()
+    }
+
+    func save(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        data: PartitionData
+    ) async throws {
+        try Self.withPartitionFileLock {
+            try saveData(forRoot: rootPath, scope: scope, data: data)
+        }
+    }
+
+    private func saveData(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        data: PartitionData
+    ) throws {
+        try Task.checkCancellation()
         let url = partitionURL(forRoot: rootPath, scope: scope)
 
         // Ensure directories exist: .../Application Support/RepoPrompt CE/Partitions/<repoKey>/
@@ -164,9 +202,15 @@ actor PartitionStore {
         dataToPersist.updatedAt = dateFormatter.string(from: Date())
 
         let encoded = try encoder.encode(dataToPersist)
+        try Task.checkCancellation()
         try encoded.write(to: url, options: [.atomic])
+        #if DEBUG
+            didPersistHandlerForTesting?()
+        #endif
 
-        // Inform other windows/tabs within the process to reload slices for this scope
+        // The atomic replacement is the commit point. Once it succeeds, always publish
+        // the matching notification even if the caller is cancelled concurrently.
+        // Inform other windows/tabs within the process to reload slices for this scope.
         postSaveNotification(rootPath: rootPath, scope: scope)
     }
 
@@ -179,7 +223,56 @@ actor PartitionStore {
         updates: [String: SliceUpdate],
         mode: SliceMutationMode
     ) async throws -> [String: StoredSlices] {
-        var data = await load(forRoot: rootPath, scope: scope)
+        try applyBody(
+            forRoot: rootPath,
+            scope: scope,
+            updates: updates,
+            mode: mode,
+            expectedCurrent: nil
+        ) ?? [:]
+    }
+
+    /// Atomically applies file-scoped updates only when the persisted inputs still match.
+    @discardableResult
+    func applyIfCurrent(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        updates: [String: SliceUpdate],
+        mode: SliceMutationMode,
+        expectedCurrent: [String: StoredSlices]
+    ) async throws -> [String: StoredSlices]? {
+        try applyBody(
+            forRoot: rootPath,
+            scope: scope,
+            updates: updates,
+            mode: mode,
+            expectedCurrent: expectedCurrent
+        )
+    }
+
+    private func applyBody(
+        forRoot rootPath: String,
+        scope: PartitionScope,
+        updates: [String: SliceUpdate],
+        mode: SliceMutationMode,
+        expectedCurrent: [String: StoredSlices]?
+    ) throws -> [String: StoredSlices]? {
+        Self.partitionFileLock.lock()
+        defer { Self.partitionFileLock.unlock() }
+
+        try Task.checkCancellation()
+        var data = loadData(forRoot: rootPath, scope: scope)
+        try Task.checkCancellation()
+        if let expectedCurrent,
+           !expectedCurrent.allSatisfy({ data.files[$0.key] == $0.value })
+        {
+            return nil
+        }
+        #if DEBUG
+            if expectedCurrent != nil {
+                didValidateCurrentHandlerForTesting?()
+            }
+        #endif
         switch mode {
         case .set:
             var next: [String: StoredSlices] = [:]
@@ -266,7 +359,8 @@ actor PartitionStore {
             }
         }
 
-        try await save(forRoot: rootPath, scope: scope, data: data)
+        try Task.checkCancellation()
+        try saveData(forRoot: rootPath, scope: scope, data: data)
         return data.files
     }
 

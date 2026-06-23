@@ -611,6 +611,96 @@ class OracleViewModel: ObservableObject {
         return sessions.filter { $0.composeTabID == tabID }
     }
 
+    @MainActor
+    func resolveExactSessionForPopover(
+        chatID rawID: String,
+        workspaceID: UUID,
+        tabID: UUID
+    ) async -> ChatSession? {
+        let trimmedID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedID.isEmpty,
+              workspaceManager.activeWorkspaceID == workspaceID,
+              let workspace = workspaceManager.activeWorkspace,
+              workspace.id == workspaceID
+        else { return nil }
+
+        let targetUUID = UUID(uuidString: trimmedID)
+        func matchesIdentity(_ session: ChatSession) -> Bool {
+            if let targetUUID {
+                return session.id == targetUUID
+            }
+            return session.shortID == trimmedID
+        }
+        func matchesRequestedTab(_ session: ChatSession) -> Bool {
+            matchesIdentity(session)
+                && session.workspaceID == workspaceID
+                && session.composeTabID == tabID
+        }
+        func registeredMatch(for sessionID: UUID) -> ChatSession? {
+            sessions.first(where: { $0.id == sessionID }).flatMap { session in
+                matchesRequestedTab(session) ? session : nil
+            }
+        }
+
+        let initialIdentityMatches = sessions.filter(matchesIdentity)
+        let initialScopedMatches = initialIdentityMatches.filter(matchesRequestedTab)
+        guard initialScopedMatches.count <= 1 else { return nil }
+        if targetUUID != nil, let inMemory = initialScopedMatches.first {
+            guard initialIdentityMatches.count == 1,
+                  let loaded = await ensureSessionLoadedForBackground(inMemory),
+                  matchesRequestedTab(loaded)
+            else { return nil }
+            return registeredMatch(for: loaded.id)
+        }
+        if targetUUID != nil, !initialIdentityMatches.isEmpty { return nil }
+
+        let persistedLookup: ChatSessionLookupResult
+        do {
+            persistedLookup = try await chatData.findSessionResult(
+                for: workspace,
+                id: trimmedID,
+                composeTabID: tabID
+            )
+        } catch {
+            return nil
+        }
+        guard workspaceManager.activeWorkspaceID == workspaceID else { return nil }
+        let persisted: ChatSession?
+        switch persistedLookup {
+        case .notFound:
+            persisted = nil
+        case let .unique(session):
+            persisted = session
+        case .ambiguous:
+            return nil
+        }
+        if let persisted, !matchesRequestedTab(persisted) { return nil }
+
+        let refreshedIdentityMatches = sessions.filter(matchesIdentity)
+        let refreshedScopedMatches = refreshedIdentityMatches.filter(matchesRequestedTab)
+        guard refreshedScopedMatches.count <= 1 else { return nil }
+        if let persisted,
+           refreshedIdentityMatches.contains(where: { $0.id == persisted.id && !matchesRequestedTab($0) })
+        {
+            return nil
+        }
+        if let inMemory = refreshedScopedMatches.first {
+            guard persisted.map({ $0.id == inMemory.id }) ?? true,
+                  let loaded = await ensureSessionLoadedForBackground(inMemory),
+                  matchesRequestedTab(loaded)
+            else { return nil }
+            return registeredMatch(for: loaded.id)
+        }
+        if targetUUID != nil, !refreshedIdentityMatches.isEmpty { return nil }
+        guard let persisted else { return nil }
+
+        sessions.append(persisted)
+        guard let loaded = await ensureSessionLoadedForBackground(persisted), matchesRequestedTab(loaded) else {
+            return nil
+        }
+        return registeredMatch(for: loaded.id)
+    }
+
     var isAnySessionStreaming: Bool {
         !streamingSessions.isEmpty
     }
@@ -875,6 +965,33 @@ class OracleViewModel: ObservableObject {
     // Dependencies
     let aiQueriesService: AIQueriesService
     var promptViewModel: PromptViewModel
+
+    #if DEBUG
+        typealias OraclePostPackagingTransportOverride = @MainActor @Sendable (
+            _ message: AIMessage,
+            _ model: AIModel
+        ) async throws -> (
+            id: ChatStreamID,
+            stream: AsyncThrowingStream<ChatStreamOutput, Error>
+        )
+
+        var oracleReviewPackagingTraceObserverForTesting:
+            OracleReviewPackagingTraceContext.Observer?
+        private var oraclePostPackagingTransportOverrideForTesting:
+            OraclePostPackagingTransportOverride?
+
+        func setOracleReviewPackagingTraceObserverForTesting(
+            _ observer: OracleReviewPackagingTraceContext.Observer?
+        ) {
+            oracleReviewPackagingTraceObserverForTesting = observer
+        }
+
+        func setOraclePostPackagingTransportOverrideForTesting(
+            _ override: OraclePostPackagingTransportOverride?
+        ) {
+            oraclePostPackagingTransportOverrideForTesting = override
+        }
+    #endif
 
     /// Track the active retry task so it can be properly cancelled
     private var activeRetryTask: Task<Void, Error>?
@@ -2657,6 +2774,7 @@ class OracleViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
@@ -2793,16 +2911,28 @@ class OracleViewModel: ObservableObject {
                         gitInclusionOverride: gitInclusionOverride,
                         gitBaseOverride: gitBaseOverride,
                         selectionOverride: selectionOverride,
-                        lookupContextOverride: lookupContextOverride
+                        lookupContextOverride: lookupContextOverride,
+                        reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
                 }
-                let (streamID, stream) = try await aiQueriesService.sendPrompt(
-                    aiMessage,
-                    model: model
-                )
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordSubmission(aiMessage)
+                    let (streamID, stream) = if let transportOverride =
+                        oraclePostPackagingTransportOverrideForTesting
+                    {
+                        try await transportOverride(aiMessage, model)
+                    } else {
+                        try await aiQueriesService.sendPrompt(aiMessage, model: model)
+                    }
+                #else
+                    let (streamID, stream) = try await aiQueriesService.sendPrompt(
+                        aiMessage,
+                        model: model
+                    )
+                #endif
 
                 guard await shouldContinueStreaming() else {
                     await aiQueriesService.cancelStream(id: streamID)
@@ -2893,6 +3023,9 @@ class OracleViewModel: ObservableObject {
                     Task { await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer) }
                 }
             } catch {
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordFailure(error)
+                #endif
                 await MainActor.run {
                     self.clearSessionStreaming(targetSessionID)
                 }

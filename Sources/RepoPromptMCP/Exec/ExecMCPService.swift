@@ -55,16 +55,24 @@ actor ExecMCPService: Service {
         do {
             try await connectWithRetry(session: session)
         } catch {
+            await session.disconnect()
+            self.session = nil
             handleConnectionError(error)
             throw error
         }
 
-        defer {
-            Task {
-                await session.disconnect()
-            }
+        do {
+            try await runConnectedSession(session)
+        } catch {
+            await session.disconnect()
+            self.session = nil
+            throw error
         }
+        await session.disconnect()
+        self.session = nil
+    }
 
+    private func runConnectedSession(_ session: InteractiveMCPClientSession) async throws {
         // Apply explicit local routing first so explicit CLI selectors still route
         // subsequent calls if bind_context validation is unavailable or times out.
         if let windowID = options.windowID {
@@ -195,6 +203,7 @@ actor ExecMCPService: Service {
     func shutdown() async throws {
         logger.debug("Shutting down exec MCP service...")
         await session?.disconnect()
+        session = nil
     }
 
     // MARK: - Connection

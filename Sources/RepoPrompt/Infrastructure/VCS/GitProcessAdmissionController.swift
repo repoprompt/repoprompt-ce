@@ -17,6 +17,13 @@ actor GitProcessAdmissionController {
         let queueWaitMicroseconds: Int
     }
 
+    struct Snapshot: Equatable {
+        let activeGlobal: Int
+        let activeByRepository: [String: Int]
+        let activeLeaseCount: Int
+        let waiterCount: Int
+    }
+
     private struct Waiter {
         let id: UUID
         let repositoryKey: String
@@ -74,6 +81,15 @@ actor GitProcessAdmissionController {
         let repositoryCount = max(0, (activeByRepository[lease.repositoryKey] ?? 1) - 1)
         activeByRepository[lease.repositoryKey] = repositoryCount == 0 ? nil : repositoryCount
         drainWaiters()
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(
+            activeGlobal: activeGlobal,
+            activeByRepository: activeByRepository,
+            activeLeaseCount: activeLeaseIDs.count,
+            waiterCount: waiters.count
+        )
     }
 
     private func canAcquire(repositoryKey: String) -> Bool {

@@ -3,58 +3,66 @@ import Foundation
 import XCTest
 
 final class MCPFileSearchDisplayPathTests: XCTestCase {
-    func testCachedDisplayPathResolverPreservesRepeatedMatchesAllRootFallbackAliasesAndLegacyParity() throws {
-        let visibleRoot = try Self.root(
-            id: "00000000-0000-0000-0000-000000000001",
-            name: "App",
-            fullPath: "/tmp/RepoPromptDisplay/AppRoot"
-        )
-        let hiddenRoot = try Self.root(
-            id: "00000000-0000-0000-0000-000000000002",
-            name: "Lib",
-            fullPath: "/tmp/RepoPromptDisplay/LibRoot"
-        )
-        let displayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(
-            visibleRoots: [visibleRoot],
-            allRoots: [visibleRoot, hiddenRoot]
-        )
-        let legacyDisplayPath = MCPServerViewModel.makeCachedMCPDisplayPathResolver(
-            visibleRoots: [visibleRoot],
-            allRoots: [visibleRoot, hiddenRoot]
-        )
+    func testCachedDisplayPathResolverPreservesSingleAndMultiRootAliasesAndLegacyParity() throws {
+        do {
+            let caseLabel = "testCachedDisplayPathResolverPreservesRepeatedMatchesAllRootFallbackAliasesAndLegacyParity"
+            let visibleRoot = try Self.root(
+                id: "00000000-0000-0000-0000-000000000001",
+                name: "App",
+                fullPath: "/tmp/RepoPromptDisplay/AppRoot",
+                label: caseLabel
+            )
+            let hiddenRoot = try Self.root(
+                id: "00000000-0000-0000-0000-000000000002",
+                name: "Lib",
+                fullPath: "/tmp/RepoPromptDisplay/LibRoot",
+                label: caseLabel
+            )
+            let displayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(
+                visibleRoots: [visibleRoot],
+                allRoots: [visibleRoot, hiddenRoot]
+            )
+            let legacyDisplayPath = MCPServerViewModel.makeCachedMCPDisplayPathResolver(
+                visibleRoots: [visibleRoot],
+                allRoots: [visibleRoot, hiddenRoot]
+            )
 
-        let repeatedVisiblePath = "/tmp/RepoPromptDisplay/AppRoot/Sources/App.swift"
-        let expectations = [
-            (repeatedVisiblePath, "Sources/App.swift"),
-            (repeatedVisiblePath, "Sources/App.swift"),
-            ("/tmp/RepoPromptDisplay/LibRoot/Sources/Lib.swift", "Lib/Sources/Lib.swift")
-        ]
-        for (rawPath, expected) in expectations {
-            XCTAssertEqual(displayPath(rawPath), expected)
-            XCTAssertEqual(displayPath(rawPath), legacyDisplayPath(rawPath))
+            let repeatedVisiblePath = "/tmp/RepoPromptDisplay/AppRoot/Sources/App.swift"
+            let expectations = [
+                (repeatedVisiblePath, "Sources/App.swift"),
+                (repeatedVisiblePath, "Sources/App.swift"),
+                ("/tmp/RepoPromptDisplay/LibRoot/Sources/Lib.swift", "Lib/Sources/Lib.swift")
+            ]
+            for (rawPath, expected) in expectations {
+                XCTAssertEqual(displayPath(rawPath), expected, caseLabel)
+                XCTAssertEqual(displayPath(rawPath), legacyDisplayPath(rawPath), caseLabel)
+            }
         }
-    }
 
-    func testCachedDisplayPathResolverPreservesMultiRootLabels() throws {
-        let appRoot = try Self.root(
-            id: "00000000-0000-0000-0000-000000000011",
-            name: "App",
-            fullPath: "/tmp/RepoPromptDisplay/AppRoot"
-        )
-        let libRoot = try Self.root(
-            id: "00000000-0000-0000-0000-000000000012",
-            name: "Lib",
-            fullPath: "/tmp/RepoPromptDisplay/LibRoot"
-        )
-        let displayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(
-            visibleRoots: [appRoot, libRoot],
-            allRoots: [appRoot, libRoot]
-        )
+        do {
+            let caseLabel = "testCachedDisplayPathResolverPreservesMultiRootLabels"
+            let appRoot = try Self.root(
+                id: "00000000-0000-0000-0000-000000000011",
+                name: "App",
+                fullPath: "/tmp/RepoPromptDisplay/AppRoot",
+                label: caseLabel
+            )
+            let libRoot = try Self.root(
+                id: "00000000-0000-0000-0000-000000000012",
+                name: "Lib",
+                fullPath: "/tmp/RepoPromptDisplay/LibRoot",
+                label: caseLabel
+            )
+            let displayPath = MCPWindowWorkspaceToolHelpers.makeCachedMCPDisplayPathResolver(
+                visibleRoots: [appRoot, libRoot],
+                allRoots: [appRoot, libRoot]
+            )
 
-        XCTAssertEqual(displayPath(appRoot.fullPath), "App")
-        XCTAssertEqual(displayPath(libRoot.fullPath), "Lib")
-        XCTAssertEqual(displayPath(appRoot.fullPath + "/Sources/App.swift"), "App/Sources/App.swift")
-        XCTAssertEqual(displayPath(libRoot.fullPath + "/Sources/Lib.swift"), "Lib/Sources/Lib.swift")
+            XCTAssertEqual(displayPath(appRoot.fullPath), "App", caseLabel)
+            XCTAssertEqual(displayPath(libRoot.fullPath), "Lib", caseLabel)
+            XCTAssertEqual(displayPath(appRoot.fullPath + "/Sources/App.swift"), "App/Sources/App.swift", caseLabel)
+            XCTAssertEqual(displayPath(libRoot.fullPath + "/Sources/Lib.swift"), "Lib/Sources/Lib.swift", caseLabel)
+        }
     }
 
     func testCappedPathOnlyFixturePreservesEightyOrderedDisplayPathsAndScannedFileMetadata() throws {
@@ -148,9 +156,14 @@ final class MCPFileSearchDisplayPathTests: XCTestCase {
         XCTAssertEqual(displayPath(docsRoot.fullPath + "/README.md"), "Docs/README.md")
     }
 
-    private static func root(id: String, name: String, fullPath: String) throws -> WorkspaceRootRef {
+    private static func root(
+        id: String,
+        name: String,
+        fullPath: String,
+        label: String = ""
+    ) throws -> WorkspaceRootRef {
         try WorkspaceRootRef(
-            id: XCTUnwrap(UUID(uuidString: id)),
+            id: XCTUnwrap(UUID(uuidString: id), label),
             name: name,
             fullPath: fullPath
         )

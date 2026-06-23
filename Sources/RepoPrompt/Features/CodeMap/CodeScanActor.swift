@@ -189,6 +189,8 @@ actor CodeScanActor {
     // -------------------------------------
     private var resultContinuations = [UUID: AsyncStream<[ScanResult]>.Continuation]()
     private var resultBatchBuffer = [ScanResult]()
+    /// File IDs yielded to the store but not yet acknowledged as installed or rejected.
+    private var resultDeliveryPendingFileIDs = Set<UUID>()
     private var resultsCoalescingTask: Task<Void, Never>?
     private let resultsCoalescingDelay: UInt64 = 2_000_000_000 // e.g. 2 seconds
     private var lastResultsScheduleCall = DispatchTime.now()
@@ -1054,12 +1056,25 @@ actor CodeScanActor {
 
     func requestSelfHealingScans(
         _ requests: [ScanRequest],
-        rootFolderPaths: [String] = []
+        rootFolderPaths: [String] = [],
+        existingScanModificationDatesByFileID: [UUID: Date] = [:]
     ) async -> SelfHealingScanRequestResult {
         let requestedFileIDs = Set(requests.map(\.fileID))
-        let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { hasQueuedOrActiveScan(for: $0) })
+        let alreadyScheduledFileIDs = Set(requestedFileIDs.filter { fileID in
+            if hasQueuedOrActiveScan(for: fileID)
+                || resultBatchBuffer.contains(where: { $0.fileID == fileID })
+                || resultDeliveryPendingFileIDs.contains(fileID)
+            {
+                return true
+            }
+            guard acceptedAPIFileIDs.contains(fileID),
+                  let expectedModificationDate = existingScanModificationDatesByFileID[fileID],
+                  let latestModificationDate = latestFileModDates[fileID]
+            else { return false }
+            return latestModificationDate >= expectedModificationDate
+        })
         let submittedFileIDs = await requestScans(
-            requests,
+            requests.filter { !alreadyScheduledFileIDs.contains($0.fileID) },
             purpose: .selfHealing,
             rootFolderPaths: rootFolderPaths
         )
@@ -1378,12 +1393,17 @@ actor CodeScanActor {
 
         let batch = resultBatchBuffer
         resultBatchBuffer.removeAll()
+        resultDeliveryPendingFileIDs.formUnion(batch.map(\.fileID))
         CodeMapPerfRuntime.sharedPipelineStats?.recordResultBatch(size: batch.count)
 
         for continuation in resultContinuations.values {
             continuation.yield(batch)
         }
         resultsCoalescingTask = nil
+    }
+
+    func acknowledgeScanResults(fileIDs: some Sequence<UUID>) {
+        resultDeliveryPendingFileIDs.subtract(fileIDs)
     }
 
     // -------------------------------------------------------
@@ -1487,6 +1507,7 @@ actor CodeScanActor {
                 }
                 acceptedAPIFileIDs.remove(fileID)
                 latestFileModDates.removeValue(forKey: fileID)
+                resultDeliveryPendingFileIDs.remove(fileID)
             }
         }
     }

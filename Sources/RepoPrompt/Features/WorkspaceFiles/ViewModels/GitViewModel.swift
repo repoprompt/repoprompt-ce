@@ -110,6 +110,11 @@ final class GitViewModel: ObservableObject {
     private let gitContextRefreshIntervalNanoseconds: UInt64
     private let refreshGitContexts: @Sendable ([String]) async -> [GitStatusActor.RepoDetection]
     private var isRefreshingGitContexts = false
+    private var isPreparingForWindowClose = false
+    private var pendingWindowCloseTasks: [Task<Void, Never>] = []
+    #if DEBUG
+        private var testWindowCloseTask: Task<Void, Never>?
+    #endif
 
     private var resolvedStateTask: Task<Void, Never>?
     private var latestStatusGeneration: Int = 0
@@ -347,6 +352,7 @@ final class GitViewModel: ObservableObject {
     }
 
     func updateRootFolders(_ rootFolders: [FolderViewModel]) {
+        guard !isPreparingForWindowClose else { return }
         availableRootFolders = rootFolders
 
         gitEnabledStatus = gitEnabledStatus.filter { key, _ in
@@ -427,6 +433,7 @@ final class GitViewModel: ObservableObject {
     }
 
     private func updateGitContextRefreshLoop() {
+        guard !isPreparingForWindowClose else { return }
         guard !lastVisibleRootRawPaths.isEmpty else {
             gitContextRefreshTask?.cancel()
             gitContextRefreshTask = nil
@@ -457,12 +464,39 @@ final class GitViewModel: ObservableObject {
     }
 
     func prepareForWindowClose() {
-        statusStreamTask?.cancel()
-        searchDebounceTask?.cancel()
-        rootUpdateTask?.cancel()
-        gitContextRefreshTask?.cancel()
+        guard !isPreparingForWindowClose else { return }
+        isPreparingForWindowClose = true
+
+        var tasks = [
+            statusStreamTask,
+            searchDebounceTask,
+            rootUpdateTask,
+            gitContextRefreshTask,
+            resolvedStateTask
+        ].compactMap(\.self)
+        #if DEBUG
+            if let testWindowCloseTask {
+                tasks.append(testWindowCloseTask)
+                self.testWindowCloseTask = nil
+            }
+        #endif
+        tasks.forEach { $0.cancel() }
+        pendingWindowCloseTasks = tasks
+
+        statusStreamTask = nil
+        searchDebounceTask = nil
+        rootUpdateTask = nil
         gitContextRefreshTask = nil
-        resolvedStateTask?.cancel()
+        resolvedStateTask = nil
+    }
+
+    func shutdownForWindowClose() async {
+        prepareForWindowClose()
+        let tasks = pendingWindowCloseTasks
+        for task in tasks {
+            await task.value
+        }
+        pendingWindowCloseTasks.removeAll()
     }
 
     #if DEBUG
@@ -473,6 +507,16 @@ final class GitViewModel: ObservableObject {
         var test_gitContextRefreshTask: Task<Void, Never>? {
             gitContextRefreshTask
         }
+
+        var test_pendingWindowCloseTaskCount: Int {
+            pendingWindowCloseTasks.count
+        }
+
+        func test_installGitContextRefreshTask(_ task: Task<Void, Never>) {
+            precondition(testWindowCloseTask == nil)
+            testWindowCloseTask = task
+        }
+
     #endif
 
     private struct PeriodicGitContextRefreshRequest {
@@ -823,6 +867,10 @@ final class GitViewModel: ObservableObject {
         rootUpdateTask?.cancel()
         gitContextRefreshTask?.cancel()
         resolvedStateTask?.cancel()
+        pendingWindowCloseTasks.forEach { $0.cancel() }
+        #if DEBUG
+            testWindowCloseTask?.cancel()
+        #endif
     }
 
     private func getResolvedPath(for relativePath: String) -> String {

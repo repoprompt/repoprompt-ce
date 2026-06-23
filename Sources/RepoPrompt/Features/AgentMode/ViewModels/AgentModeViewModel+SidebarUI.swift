@@ -334,14 +334,14 @@ extension AgentModeViewModel {
             }
         return AgentSessionSidebarContentFingerprint(
             currentTabID: currentTabID,
-            sessionListCacheReady: sessionListCacheReady,
+            sessionListCacheReady: ownerValidatedSessionListCacheReady,
             tabsWithActiveAgentRun: tabsWithActiveAgentRun,
             mcpControlledTabIDs: mcpControlledTabIDs,
             tabMetadataSignatures: tabMetadataSignatures,
             sessionSignatures: signatures,
-            sessionIndex: sessionIndex,
-            sessionListSortDates: sessionListSortDates,
-            sidebarRestoreFrozenOrderByTabID: sidebarRestoreFrozenOrderByTabID
+            sessionIndex: ownerValidatedSessionIndex,
+            sessionListSortDates: ownerValidatedSessionListSortDates,
+            sidebarRestoreFrozenOrderByTabID: ownerValidatedSidebarRestoreFrozenOrderByTabID
         )
     }
 }

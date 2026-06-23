@@ -115,7 +115,7 @@ struct GitContextBranchSwitchCapsule: View {
     }
 
     private var capsuleLabelMaxWidth: CGFloat {
-        fontPreset.scaledClamped(88, min: 56, max: 128)
+        fontPreset.scaledClamped(136, min: 72, max: 210)
     }
 
     private var popoverWidth: CGFloat {
@@ -159,6 +159,7 @@ struct GitContextBranchSwitchCapsule: View {
             .padding(.vertical, fontPreset.scaledClamped(1, max: 2))
             .background(Capsule().fill(Color.secondary.opacity(0.10)))
             .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.35), lineWidth: 0.75))
+            .fixedSize(horizontal: true, vertical: true)
         }
         .buttonStyle(.plain)
         .disabled(isSwitching)

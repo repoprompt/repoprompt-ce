@@ -24,6 +24,11 @@ struct AgentRunSpec {
 /// Shared coordinator for preparing, launching, and cleaning up headless agent runs.
 /// This centralises policy installation and provider orchestration for headless runs.
 final class AgentRunCoordinator {
+    struct GateRoutingReleaseResult {
+        let routed: Bool
+        let gateRelease: HeadlessAgentConnectionGate.ReleaseResult
+    }
+
     static let shared = AgentRunCoordinator()
 
     private let log = Logger(subsystem: "com.repoprompt.agents", category: "AgentRunCoordinator")
@@ -139,9 +144,13 @@ final class AgentRunCoordinator {
     ///   - runID: The run identifier associated with routing state and waiter notifications.
     ///   - gateID: The gate ownership identifier to release when routing completes. Defaults to `runID`.
     ///   - timeoutMs: Maximum time to wait for routing before forcing release (default: 10,000 ms).
-    /// - Returns: `true` if routing succeeded, `false` on timeout, failure, or cancellation.
+    /// - Returns: Routing and gate-release diagnostics for the run.
     @discardableResult
-    func releaseGateWhenRouted(runID: UUID, gateID: UUID? = nil, timeoutMs: Int = defaultRoutingTimeoutMs) async -> Bool {
+    func releaseGateWhenRouted(
+        runID: UUID,
+        gateID: UUID? = nil,
+        timeoutMs: Int = defaultRoutingTimeoutMs
+    ) async -> GateRoutingReleaseResult {
         let timeoutSeconds = TimeInterval(timeoutMs) / 1000.0
 
         // Event-driven wait with cancellation support:
@@ -154,17 +163,15 @@ final class AgentRunCoordinator {
         }
 
         let gateKey = gateID ?? runID
-        let released = await HeadlessAgentConnectionGate.completeIfActive(gateKey)
+        let gateRelease = await HeadlessAgentConnectionGate.completeIfActiveWithDiagnostics(gateKey)
 
         if routed {
-            log.info("Gate release after routing event: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(released)")
+            log.info("Gate release after routing event: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         } else {
-            log.info("Gate release after timeout/failure/cancel: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(released)")
+            log.info("Gate release after timeout/failure/cancel: runID=\(runID.uuidString) gateID=\(gateKey.uuidString) released=\(gateRelease.released)")
         }
 
-        // Clean up waiter state to prevent memory leaks
-        await MCPRoutingWaiter.cleanup(runID: runID)
-        return routed
+        return GateRoutingReleaseResult(routed: routed, gateRelease: gateRelease)
     }
 }
 

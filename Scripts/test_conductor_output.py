@@ -368,6 +368,51 @@ class OutputSummarizerTests(unittest.TestCase):
         self.assertIn("outputSummary", enriched)
         self.assertNotIn("logTail", enriched)
 
+    def test_job_payload_exposes_additive_process_timing_and_lifecycle_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            diagnostic = root / "stall.sample.txt"
+            job = conductor.Job(
+                ticket="ticket",
+                request_key=None,
+                fingerprint="fingerprint",
+                operation="test",
+                args={},
+                lanes=["build"],
+                timeout=None,
+                verbose=False,
+                env={},
+                created_at=10.0,
+                started_at=12.5,
+                finished_at=20.0,
+                process_started_at=13.0,
+                process_finished_at=19.25,
+                progress_transport="pty",
+                xctest_progress_sequence=17,
+                xctest_last_progress_test="RepoPromptTests.ExampleTests.testProgress",
+                xctest_last_progress_action="started",
+                xctest_last_progress_observed_at=18.75,
+                log_path=root / "ticket.log",
+                state="completed",
+                exit_code=0,
+                diagnostic_paths=[diagnostic],
+            )
+
+            payload = job.to_payload()
+
+        self.assertEqual(payload["queuedAt"], 10.0)
+        self.assertEqual(payload["processStartedAt"], 13.0)
+        self.assertEqual(payload["processFinishedAt"], 19.25)
+        self.assertEqual(payload["queueWaitSeconds"], 2.5)
+        self.assertEqual(payload["executionSeconds"], 6.25)
+        self.assertFalse(payload["measurementInvalid"])
+        self.assertEqual(payload["progressTransport"], "pty")
+        self.assertEqual(payload["progressSequence"], 17)
+        self.assertEqual(payload["lastProgressTest"], "RepoPromptTests.ExampleTests.testProgress")
+        self.assertEqual(payload["lastProgressAction"], "started")
+        self.assertEqual(payload["lastProgressObservedAt"], 18.75)
+        self.assertEqual(payload["diagnosticPaths"], [str(diagnostic)])
+
     def test_terminal_job_status_attaches_missing_output_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

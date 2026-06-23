@@ -4,6 +4,212 @@ import Foundation
 import XCTest
 
 final class MCPBootstrapLeaseTests: XCTestCase {
+    func testPIDOwnedSameClientLeasesReleaseBootstrapGateBeforeEitherRoutes() async throws {
+        #if DEBUG
+            let firstRunID = UUID()
+            let secondRunID = UUID()
+            let firstGateID = UUID()
+            let secondGateID = UUID()
+            let clientName = "bootstrap-lease-parallel-same-client"
+            let recorder = PolicyRecorder()
+
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: firstRunID)
+            await MCPRoutingWaiter.cleanup(runID: secondRunID)
+            await ServerNetworkManager.shared.debugClearRunRoutingHistoryForTesting()
+
+            func makeLease(runID: UUID, gateID: UUID, tabID: UUID) -> MCPBootstrapLease {
+                MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: gateID,
+                        windowID: 1,
+                        tabID: tabID,
+                        clientName: clientName,
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "parallel PID-owned bootstrap regression",
+                        ttl: 10,
+                        purpose: .agentModeRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: true
+                    ),
+                    policyInstaller: { _ in await recorder.recordInstall() },
+                    expectedPIDPolicyArmer: { _ in await recorder.recordArm() },
+                    policyClearer: { _ in await recorder.recordClear() }
+                )
+            }
+
+            let firstLease = makeLease(runID: firstRunID, gateID: firstGateID, tabID: UUID())
+            let secondLease = makeLease(runID: secondRunID, gateID: secondGateID, tabID: UUID())
+            let firstAcquired = await firstLease.acquire()
+            let activeGateAfterFirstAcquire = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertTrue(firstAcquired)
+            XCTAssertNil(activeGateAfterFirstAcquire)
+
+            let secondCompleted = expectation(description: "second same-client PID-owned lease acquires before first routes")
+            let secondAcquisition = Task {
+                let acquired = await secondLease.acquire()
+                secondCompleted.fulfill()
+                return acquired
+            }
+            await fulfillment(of: [secondCompleted], timeout: 1)
+            let secondAcquired = await secondAcquisition.value
+
+            let installCount = await recorder.installCount
+            let armCount = await recorder.armCount
+            let activeGateAfterSecondAcquire = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertTrue(secondAcquired)
+            XCTAssertEqual(installCount, 2)
+            XCTAssertEqual(armCount, 2)
+            XCTAssertNil(activeGateAfterSecondAcquire)
+
+            await firstLease.providerInitializationStarted(provider: "test-provider")
+            await firstLease.providerInitializationCompleted(provider: "test-provider", outcome: "ready")
+            let firstHistory = await ServerNetworkManager.shared.debugRunRoutingHistoryPayload(
+                runID: firstRunID,
+                limit: 50
+            )
+            let firstEvents = try XCTUnwrap(firstHistory["events"] as? [[String: Any]])
+            XCTAssertTrue(firstEvents.contains { $0["event"] as? String == "lease_gate_wait_started" })
+            XCTAssertTrue(firstEvents.contains { $0["event"] as? String == "lease_gate_acquired" })
+            XCTAssertTrue(firstEvents.contains { $0["event"] as? String == "provider_initialization_started" })
+            let providerCompleted = try XCTUnwrap(firstEvents.first { $0["event"] as? String == "provider_initialization_completed" })
+            let providerFields = try XCTUnwrap(providerCompleted["fields"] as? [String: String])
+            XCTAssertEqual(providerFields["provider"], "test-provider")
+            XCTAssertEqual(providerFields["outcome"], "ready")
+            let earlyRelease = try XCTUnwrap(firstEvents.first { $0["event"] as? String == "lease_gate_release" })
+            let releaseFields = try XCTUnwrap(earlyRelease["fields"] as? [String: String])
+            XCTAssertEqual(releaseFields["reason"], "expected_pid_policy_armed")
+            XCTAssertEqual(releaseFields["released"], "true")
+            XCTAssertNotNil(releaseFields["queue_depth_before_release"])
+
+            await firstLease.cancelAndCleanup()
+            await secondLease.cancelAndCleanup()
+            let clearCount = await recorder.clearCount
+            let firstWaiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: firstRunID)
+            let secondWaiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: secondRunID)
+            let activeGateAfterCleanup = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertEqual(clearCount, 2)
+            XCTAssertEqual(firstWaiterCount, 0)
+            XCTAssertEqual(secondWaiterCount, 0)
+            XCTAssertNil(activeGateAfterCleanup)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testPIDOwnedEarlyReleaseCleanupRemovesRetainedPolicyForEveryExit() async throws {
+        #if DEBUG
+            enum ExitMode: String, CaseIterable {
+                case timeout
+                case cancellation
+                case failure
+            }
+
+            let manager = ServerNetworkManager.shared
+            await HeadlessAgentConnectionGate.cancelAll()
+
+            for mode in ExitMode.allCases {
+                let runID = UUID()
+                let gateID = UUID()
+                let clientName = "bootstrap-lease-early-release-\(mode.rawValue)-\(runID.uuidString)"
+                let lease = MCPBootstrapLease(
+                    spec: MCPBootstrapLeaseSpec(
+                        runID: runID,
+                        gateID: gateID,
+                        windowID: 1,
+                        tabID: UUID(),
+                        clientName: clientName,
+                        restrictedTools: [],
+                        additionalTools: nil,
+                        oneShot: true,
+                        reason: "early release \(mode.rawValue) cleanup regression",
+                        ttl: 10,
+                        purpose: .agentModeRun,
+                        taskLabelKind: nil,
+                        allowsAgentExternalControlTools: false,
+                        requiresExpectedAgentPID: true
+                    )
+                )
+
+                await MCPRoutingWaiter.cleanup(runID: runID)
+                let acquired = await lease.acquire()
+                let activeGateAfterAcquire = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                let pendingBeforeExit = await manager.debugPendingPolicySnapshot(for: clientName)
+                XCTAssertTrue(acquired, mode.rawValue)
+                XCTAssertNil(activeGateAfterAcquire, mode.rawValue)
+                XCTAssertTrue(pendingBeforeExit.contains { $0.runID == runID }, mode.rawValue)
+
+                switch mode {
+                case .timeout:
+                    let routed = await lease.releaseWhenRouted(timeoutMs: 10)
+                    XCTAssertFalse(routed)
+                case .cancellation:
+                    await lease.cancelAndCleanup()
+                case .failure:
+                    await lease.failAndRelease()
+                }
+
+                let pendingAfterExit = await manager.debugPendingPolicySnapshot(for: clientName)
+                let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+                let activeGateAfterExit = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+                XCTAssertFalse(pendingAfterExit.contains { $0.runID == runID }, mode.rawValue)
+                XCTAssertEqual(waiterCount, 0, mode.rawValue)
+                XCTAssertNil(activeGateAfterExit, mode.rawValue)
+                await manager.cleanupRunRoutingState(for: runID, windowID: 1)
+                await MCPRoutingWaiter.cleanup(runID: runID)
+            }
+        #else
+            throw XCTSkip("PID-owned policy diagnostics require DEBUG helpers.")
+        #endif
+    }
+
+    func testPIDOwnedAcquireFailsClosedWhenPolicyCannotBeArmed() async throws {
+        #if DEBUG
+            let runID = UUID()
+            let gateID = UUID()
+            let recorder = PolicyRecorder()
+            await HeadlessAgentConnectionGate.cancelAll()
+            await MCPRoutingWaiter.cleanup(runID: runID)
+
+            let lease = MCPBootstrapLease(
+                spec: MCPBootstrapLeaseSpec(
+                    runID: runID,
+                    gateID: gateID,
+                    windowID: 1,
+                    tabID: UUID(),
+                    clientName: "bootstrap-lease-unarmed-policy",
+                    restrictedTools: [],
+                    additionalTools: nil,
+                    oneShot: true,
+                    reason: "unarmed PID policy regression",
+                    ttl: 10,
+                    purpose: .agentModeRun,
+                    taskLabelKind: nil,
+                    allowsAgentExternalControlTools: false,
+                    requiresExpectedAgentPID: true
+                ),
+                policyInstaller: { _ in await recorder.recordInstall() },
+                expectedPIDPolicyArmer: { _ in false },
+                policyClearer: { _ in await recorder.recordClear() }
+            )
+
+            let acquired = await lease.acquire()
+            let clearCount = await recorder.clearCount
+            let waiterCount = await MCPRoutingWaiter.debugContinuationCount(runID: runID)
+            let activeGate = await HeadlessAgentConnectionGate.shared.debugActiveConnectionID()
+            XCTAssertFalse(acquired)
+            XCTAssertEqual(clearCount, 1)
+            XCTAssertEqual(waiterCount, 0)
+            XCTAssertNil(activeGate)
+        #else
+            throw XCTSkip("Bootstrap gate diagnostics require DEBUG helpers.")
+        #endif
+    }
+
     func testCleanupWhileQueuedReleasesGateOwnershipThatArrivesLater() async throws {
         #if DEBUG
             let blockerGateID = UUID()
@@ -313,10 +519,16 @@ private extension MCPBootstrapLeaseTests {
 
 private actor PolicyRecorder {
     private(set) var installCount = 0
+    private(set) var armCount = 0
     private(set) var clearCount = 0
 
     func recordInstall() {
         installCount += 1
+    }
+
+    func recordArm() -> Bool {
+        armCount += 1
+        return true
     }
 
     func recordClear() {

@@ -16,10 +16,9 @@ struct ExecutableFileIdentity: Equatable {
             throw ExecutableFileIdentityError.pathMustBeAbsolute(rawPath)
         }
 
-        let canonicalPath = URL(fileURLWithPath: rawPath)
-            .resolvingSymlinksInPath()
-            .standardizedFileURL
-            .path
+        guard let canonicalPath = FileSystemService.realpathString(rawPath) else {
+            throw ExecutableFileIdentityError.unavailable((rawPath as NSString).standardizingPath)
+        }
         var info = stat()
         guard stat(canonicalPath, &info) == 0 else {
             throw ExecutableFileIdentityError.unavailable(canonicalPath)
@@ -79,28 +78,28 @@ struct ExecutableFileIdentity: Equatable {
             throw ExecutableFileIdentityError.untrustedWritableFile(canonicalPath, executableInfo.st_mode)
         }
 
-        var directory = URL(fileURLWithPath: canonicalPath).deletingLastPathComponent()
+        var directoryPath = (canonicalPath as NSString).deletingLastPathComponent
         while true {
             var directoryInfo = stat()
-            guard stat(directory.path, &directoryInfo) == 0,
+            guard stat(directoryPath, &directoryInfo) == 0,
                   directoryInfo.st_mode & mode_t(S_IFMT) == mode_t(S_IFDIR)
             else {
-                throw ExecutableFileIdentityError.unavailable(directory.path)
+                throw ExecutableFileIdentityError.unavailable(directoryPath)
             }
             guard trustedUIDs.contains(directoryInfo.st_uid) else {
-                throw ExecutableFileIdentityError.untrustedOwner(directory.path, directoryInfo.st_uid)
+                throw ExecutableFileIdentityError.untrustedOwner(directoryPath, directoryInfo.st_uid)
             }
 
             let isGroupOrWorldWritable = directoryInfo.st_mode & mode_t(S_IWGRP | S_IWOTH) != 0
             let isRootOwnedStickyDirectory = directoryInfo.st_uid == 0
                 && directoryInfo.st_mode & mode_t(S_ISVTX) != 0
             guard !isGroupOrWorldWritable || isRootOwnedStickyDirectory else {
-                throw ExecutableFileIdentityError.untrustedWritableDirectory(directory.path, directoryInfo.st_mode)
+                throw ExecutableFileIdentityError.untrustedWritableDirectory(directoryPath, directoryInfo.st_mode)
             }
 
-            let parent = directory.deletingLastPathComponent()
-            if parent.path == directory.path { break }
-            directory = parent
+            let parent = (directoryPath as NSString).deletingLastPathComponent
+            if parent == directoryPath || parent.isEmpty { break }
+            directoryPath = parent
         }
     }
 }

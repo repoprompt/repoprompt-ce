@@ -8,6 +8,8 @@ import MCP
 /// Shared utility functions used by `AgentRunMCPToolService` and `AgentManageMCPToolService`.
 /// Extracted to eliminate duplication across the two tool services and the snapshot model.
 enum AgentMCPToolHelpers {
+    static let maximumTimeoutSeconds: TimeInterval = 86400
+
     // MARK: - String parsing
 
     /// Trims whitespace and returns nil for empty strings.
@@ -56,23 +58,20 @@ enum AgentMCPToolHelpers {
     /// Parses a timeout in seconds from int, double, or string Value representations.
     static func parseTimeoutSeconds(_ value: Value?) throws -> TimeInterval? {
         guard let value else { return nil }
+        let seconds: TimeInterval
         switch value {
         case let .int(intValue):
-            let seconds = TimeInterval(intValue)
-            guard seconds >= 0 else {
-                throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
-            }
-            return seconds
+            seconds = TimeInterval(intValue)
         case let .double(doubleValue):
             guard doubleValue.isFinite, doubleValue >= 0 else {
                 throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
             }
-            return doubleValue
+            seconds = doubleValue
         case let .string(stringValue):
             guard let parsed = Double(stringValue), parsed.isFinite, parsed >= 0 else {
                 throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
             }
-            return parsed
+            seconds = parsed
         case .null:
             return nil
         case .bool, .array, .object:
@@ -80,6 +79,17 @@ enum AgentMCPToolHelpers {
         default:
             throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
         }
+        guard seconds >= 0 else {
+            throw MCPError.invalidParams("timeout must be a non-negative number of seconds.")
+        }
+        guard seconds <= maximumTimeoutSeconds else {
+            throw MCPError.invalidParams("timeout must be \(Self.renderTimeout(maximumTimeoutSeconds)) seconds or less.")
+        }
+        return seconds
+    }
+
+    private static func renderTimeout(_ seconds: TimeInterval) -> String {
+        seconds.rounded(.down) == seconds ? String(Int(seconds)) : String(seconds)
     }
 
     // MARK: - Timestamps

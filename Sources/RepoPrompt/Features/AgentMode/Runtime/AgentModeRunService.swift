@@ -8,12 +8,16 @@ final class AgentModeRunService {
         let acpProviderFactory: AgentModeViewModel.ACPProviderFactory
         let acpControllerFactory: AgentModeViewModel.ACPControllerFactory
         let connectionPolicyInstaller: AgentModeViewModel.ConnectionPolicyInstaller
+        let expectedPIDPolicyArmer: (MCPBootstrapLeaseSpec) async -> Bool
         let mcpServerEnabler: AgentModeViewModel.MCPServerEnabler
         let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
         let codexCoordinator: CodexAgentModeCoordinator
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
         let providerRuntimePermissionResolver: (_ agent: AgentProviderKind, _ profile: AgentProviderPermissionProfile) -> AgentProviderRuntimePermissionBinding
+        /// Promotes an immutable launch review snapshot to the exact process run before its MCP
+        /// bootstrap lease can expose nested tools.
+        let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
         let cancelMCPToolsForRun: (_ runID: UUID, _ reason: String) -> Void
         /// Waits until the given runID has zero active MCP tool executions.
         /// Throws `CancellationError` if the calling Task is cancelled.
@@ -74,7 +78,8 @@ final class AgentModeRunService {
         let makeTerminalPublicationEnvelope: (
             AgentModeViewModel.TabSession,
             AgentRunOwnership,
-            AgentSessionRunState
+            AgentSessionRunState,
+            UUID?
         ) -> AgentRunTerminalPublicationEnvelope?
         let publishTerminalCommit: (
             AgentModeViewModel.TabSession,
@@ -204,9 +209,11 @@ final class AgentModeRunService {
         let windowID = dependencies.windowID
         let mcpServerEnabler = dependencies.mcpServerEnabler
         let connectionPolicyInstaller = dependencies.connectionPolicyInstaller
+        let expectedPIDPolicyArmer = dependencies.expectedPIDPolicyArmer
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
+            self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
                 tabID: tabID,
                 runID: runID,
@@ -219,7 +226,8 @@ final class AgentModeRunService {
             return MCPBootstrapLease(
                 spec: leaseSpec,
                 mcpServerEnabler: mcpServerEnabler,
-                policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller)
+                policyInstaller: MCPBootstrapLease.agentModePolicyInstaller(connectionPolicyInstaller),
+                expectedPIDPolicyArmer: expectedPIDPolicyArmer
             )
         }
         if selectedAgent.usesClaudeNativeRuntime {

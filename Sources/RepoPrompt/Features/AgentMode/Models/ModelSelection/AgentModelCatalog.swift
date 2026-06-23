@@ -1027,7 +1027,18 @@ enum AgentModelCatalog {
 
     private static func claudeBaseModelKey(_ rawModel: String, agentKind: AgentProviderKind) -> String {
         if let normalized = ClaudeCompatibleModelCatalogAdapter.canonicalCompatibleBackendModelRaw(rawModel, for: agentKind) {
-            return ClaudeModelSpecifier(raw: normalized).baseModel ?? normalized
+            let base = ClaudeModelSpecifier(raw: normalized).baseModel ?? normalized
+            if agentKind == .claudeCodeGLM,
+               ClaudeCompatibleProviderRuntimeBridge.isDirectSelectableGLMModel(base)
+            {
+                return "direct:\(base.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            }
+            if agentKind == .claudeCodeGLM,
+               [AgentModel.claudeHaiku.rawValue, AgentModel.claudeSonnet.rawValue, AgentModel.claudeOpus.rawValue].contains(base)
+            {
+                return "slot:\(base.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())"
+            }
+            return base
         }
         return rawModel.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -2069,7 +2080,10 @@ enum AgentModelCatalog {
                 let specifier = ClaudeModelSpecifier(raw: option.rawValue)
                 let effortDisplayName = specifier.effortLevel?.displayName
                 let targetNameSuffix = effortDisplayName.map { "\(group.displayName) \($0)" } ?? option.displayName
-                let contextWindow = AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.contextWindowTokens
+                let contextWindow = ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
+                    forRequestedModelRaw: option.rawValue,
+                    agentKind: agent
+                ) ?? AgentModel.resolvedModel(forRaw: option.rawValue, agentKind: agent)?.contextWindowTokens
                 return DiscoveryStartTarget(
                     selectionID: selectionID,
                     modelRaw: option.rawValue,
@@ -2096,7 +2110,10 @@ enum AgentModelCatalog {
                 description: representative?.description,
                 available: true,
                 tags: tags,
-                contextWindowTokens: representativeModel?.contextWindowTokens,
+                contextWindowTokens: ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
+                    forRequestedModelRaw: group.baseModelRaw,
+                    agentKind: agent
+                ) ?? representativeModel?.contextWindowTokens,
                 supportedReasoningEfforts: [],
                 defaultReasoningEffort: nil,
                 startTargets: targets

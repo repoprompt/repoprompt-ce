@@ -13,204 +13,190 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         super.tearDown()
     }
 
-    func testNewSessionModernModeUsesAdvertisedConfigIDAndCanonicalValue() async throws {
-        let fixture = try makeFixture(shape: "custom_id")
+    func testSessionOpenRoutesInjectMCPAndUseModernModeConfiguration() async throws {
+        let cases = [
+            SessionOpenRouteCase(
+                label: "new",
+                shape: "custom_id",
+                resumeSessionID: nil,
+                expectedRoute: "session/new",
+                oppositeRoute: "session/load",
+                requestedMode: "PLAN",
+                expectedConfigID: "permission_mode"
+            ),
+            SessionOpenRouteCase(
+                label: "load",
+                shape: "modern",
+                resumeSessionID: "loaded-session",
+                expectedRoute: "session/load",
+                oppositeRoute: "session/new",
+                requestedMode: "plan",
+                expectedConfigID: "mode"
+            )
+        ]
+
+        for route in cases {
+            let fixture = try makeFixture(
+                shape: route.shape,
+                resumeSessionID: route.resumeSessionID,
+                mcpServers: [makeFixtureMCPServer()]
+            )
+            try await withBootstrappedController(fixture.controller) { controller in
+                try await controller.setSessionMode(route.requestedMode)
+            }
+
+            let routeRequests = recordedRequests(at: fixture.recordURL, method: route.expectedRoute)
+            XCTAssertEqual(routeRequests.count, 1, route.label)
+            XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: route.oppositeRoute).count, 0, route.label)
+            try assertFixtureMCPServer(in: XCTUnwrap(routeRequests.first), label: route.label)
+
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
+            let mutation = try XCTUnwrap(mutations.first, route.label)
+            XCTAssertEqual(mutations.count, 1, route.label)
+            XCTAssertEqual(mutation.params["configId"] as? String, route.expectedConfigID, route.label)
+            XCTAssertEqual(mutation.params["value"] as? String, "plan", route.label)
+        }
+    }
+
+    func testModeAdvertisementPrefersModernAndRejectsLegacyOnlyMetadata() async throws {
+        do {
+            let fixture = try makeFixture(shape: "dual")
+            try await withBootstrappedController(fixture.controller) { controller in
+                try await controller.setSessionMode("plan")
+            }
+
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
+            let mutation = try XCTUnwrap(mutations.first, "dual")
+            XCTAssertEqual(mutations.count, 1, "dual")
+            XCTAssertEqual(mutation.params["value"] as? String, "plan", "dual")
+        }
+
+        do {
+            let diagnostics = LockedStrings()
+            let fixture = try makeFixture(shape: "legacy", diagnostics: diagnostics)
+            try await withBootstrappedController(fixture.controller) { controller in
+                await assertThrows(
+                    containing: "does not advertise a modern session mode configOptions selector",
+                    label: "legacy-only"
+                ) {
+                    try await controller.setSessionMode("plan")
+                }
+            }
+
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "legacy-only")
+            XCTAssertTrue(
+                diagnostics.values.contains { $0.contains("Ignoring legacy ACP modes metadata") },
+                "legacy-only"
+            )
+        }
+    }
+
+    func testAbsentModernModeAllowsImplicitDefaultButRejectsExplicitMode() async throws {
+        let fixture = try makeFixture(shape: "none")
         try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("PLAN")
+            try await controller.setSessionMode("default")
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "implicit default")
+            await assertThrows(
+                containing: "does not advertise a modern session mode configOptions selector",
+                label: "explicit plan"
+            ) {
+                try await controller.setSessionMode("plan")
+            }
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "explicit plan")
+        }
+    }
+
+    func testInvalidModernModeSelectorShapesFailWithoutMutation() async throws {
+        let cases = [
+            ModeSelectorFailureCase(
+                label: "malformed",
+                shape: "malformed",
+                requestedValues: ["plan", "default"],
+                expectedError: "malformed modern session mode config option",
+                expectedDiagnostic: "malformed modern mode config option"
+            ),
+            ModeSelectorFailureCase(
+                label: "duplicate",
+                shape: "duplicate_mode",
+                requestedValues: ["plan"],
+                expectedError: "multiple mode config options",
+                expectedDiagnostic: nil
+            ),
+            ModeSelectorFailureCase(
+                label: "conflicting",
+                shape: "conflicting_mode",
+                requestedValues: ["plan"],
+                expectedError: "conflicting id/category semantics",
+                expectedDiagnostic: nil
+            )
+        ]
+
+        for selectorCase in cases {
+            let diagnostics = LockedStrings()
+            let fixture = try makeFixture(shape: selectorCase.shape, diagnostics: diagnostics)
+            try await withBootstrappedController(fixture.controller) { controller in
+                for value in selectorCase.requestedValues {
+                    let label = "\(selectorCase.label):\(value)"
+                    await assertThrows(containing: selectorCase.expectedError, label: label) {
+                        try await controller.setSessionMode(value)
+                    }
+                    XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, label)
+                }
+            }
+            if let expectedDiagnostic = selectorCase.expectedDiagnostic {
+                XCTAssertTrue(
+                    diagnostics.values.contains { $0.contains(expectedDiagnostic) },
+                    selectorCase.label
+                )
+            }
+        }
+    }
+
+    func testModeCanonicalizationHandlesGroupedAndCaseCollidingChoices() async throws {
+        do {
+            let fixture = try makeFixture(shape: "grouped")
+            try await withBootstrappedController(fixture.controller) { controller in
+                try await controller.setSessionMode("PLAN")
+            }
+
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
+            let mutation = try XCTUnwrap(mutations.first, "grouped")
+            XCTAssertEqual(mutations.count, 1, "grouped")
+            XCTAssertEqual(mutation.params["value"] as? String, "Plan", "grouped")
+        }
+
+        do {
+            let fixture = try makeFixture(shape: "case_collision")
+            try await withBootstrappedController(fixture.controller) { controller in
+                await assertThrows(containing: "case-colliding", label: "case-collision ambiguous") {
+                    try await controller.setSessionMode("PLAN")
+                }
+                XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "case-collision ambiguous")
+                try await controller.setSessionMode("plan")
+            }
+
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
+            let mutation = try XCTUnwrap(mutations.first, "case-collision exact")
+            XCTAssertEqual(mutations.count, 1, "case-collision exact")
+            XCTAssertEqual(mutation.params["value"] as? String, "plan", "case-collision exact")
+        }
+    }
+
+    func testModernModeValidationListsChoicesAndDeduplicatesConfirmedMutation() async throws {
+        let fixture = try makeFixture(shape: "modern")
+        try await withBootstrappedController(fixture.controller) { controller in
+            await assertThrows(containing: "Available modes: ask, plan", label: "invalid choice") {
+                try await controller.setSessionMode("unknown")
+            }
+            XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "invalid choice")
+            try await controller.setSessionMode("plan")
+            try await controller.setSessionMode("plan")
         }
 
         let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
         let mutation = try XCTUnwrap(mutations.first)
         XCTAssertEqual(mutations.count, 1)
-        XCTAssertEqual(mutation.params["configId"] as? String, "permission_mode")
         XCTAssertEqual(mutation.params["value"] as? String, "plan")
-    }
-
-    func testLoadSessionModernModeUsesConfigOptionEndpoint() async throws {
-        let fixture = try makeFixture(shape: "modern", resumeSessionID: "loaded-session")
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("plan")
-        }
-
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/load").count, 1)
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
-    }
-
-    func testSessionNewInjectsACPStdioMCPServerShape() async throws {
-        let fixtureServer = RepoPromptMCPServerConfiguration(
-            name: "RepoPromptFixture",
-            command: "/bin/echo",
-            args: ["--window", "4"],
-            env: [.init(name: "RPCE_TEST", value: "1")]
-        )
-        let fixture = try makeFixture(shape: "modern", mcpServers: [fixtureServer])
-        try await withBootstrappedController(fixture.controller) { _ in }
-
-        let sessionNew = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/new").first)
-        let mcpServers = try XCTUnwrap(sessionNew.params["mcpServers"] as? [[String: Any]])
-        let server = try XCTUnwrap(mcpServers.first)
-        XCTAssertEqual(mcpServers.count, 1)
-        XCTAssertEqual(server["type"] as? String, "stdio")
-        XCTAssertEqual(server["name"] as? String, "RepoPromptFixture")
-        XCTAssertEqual(server["command"] as? String, "/bin/echo")
-        XCTAssertEqual(server["args"] as? [String], ["--window", "4"])
-        let env = try XCTUnwrap(server["env"] as? [[String: String]])
-        XCTAssertEqual(env, [["name": "RPCE_TEST", "value": "1"]])
-    }
-
-    func testSessionLoadInjectsACPStdioMCPServerShape() async throws {
-        let fixtureServer = RepoPromptMCPServerConfiguration(
-            name: "RepoPromptFixture",
-            command: "/bin/echo",
-            args: ["--window", "4"],
-            env: [.init(name: "RPCE_TEST", value: "1")]
-        )
-        let fixture = try makeFixture(shape: "modern", resumeSessionID: "loaded-session", mcpServers: [fixtureServer])
-        try await withBootstrappedController(fixture.controller) { _ in }
-
-        let sessionLoad = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/load").first)
-        let mcpServers = try XCTUnwrap(sessionLoad.params["mcpServers"] as? [[String: Any]])
-        let server = try XCTUnwrap(mcpServers.first)
-        XCTAssertEqual(mcpServers.count, 1)
-        XCTAssertEqual(server["type"] as? String, "stdio")
-        XCTAssertEqual(server["name"] as? String, "RepoPromptFixture")
-        XCTAssertEqual(server["command"] as? String, "/bin/echo")
-        XCTAssertEqual(server["args"] as? [String], ["--window", "4"])
-        let env = try XCTUnwrap(server["env"] as? [[String: String]])
-        XCTAssertEqual(env, [["name": "RPCE_TEST", "value": "1"]])
-    }
-
-    func testDualAdvertisementPrefersModernSnapshot() async throws {
-        let fixture = try makeFixture(shape: "dual")
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("plan")
-        }
-
-        let modern = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
-        let mutation = try XCTUnwrap(modern.first)
-        XCTAssertEqual(modern.count, 1)
-        XCTAssertEqual(mutation.params["value"] as? String, "plan")
-    }
-
-    func testLegacyOnlyModeAdvertisementIsIgnored() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(shape: "legacy", diagnostics: diagnostics)
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "does not advertise a modern session mode configOptions selector") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-        XCTAssertTrue(diagnostics.values.contains { $0.contains("Ignoring legacy ACP modes metadata") })
-    }
-
-    func testMissingModeAdvertisementPreservesUnsupportedError() async throws {
-        let fixture = try makeFixture(shape: "none")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "does not advertise a modern session mode configOptions selector") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testMalformedModernModeFailsWithoutMutation() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(shape: "malformed", diagnostics: diagnostics)
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "malformed modern session mode config option") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-        XCTAssertTrue(diagnostics.values.contains { $0.contains("malformed modern mode config option") })
-    }
-
-    func testMalformedModernModeRejectsExplicitDefaultWithoutMutation() async throws {
-        let fixture = try makeFixture(shape: "malformed")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "malformed modern session mode config option") {
-            try await fixture.controller.setSessionMode("default")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testAbsentModernModeAllowsImplicitDefaultWithoutMutation() async throws {
-        let fixture = try makeFixture(shape: "none")
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("default")
-        }
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testDuplicateModernModeSelectorsFailWithoutMutation() async throws {
-        let fixture = try makeFixture(shape: "duplicate_mode")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "multiple mode config options") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testConflictingModeSelectorSemanticsFailWithoutMutation() async throws {
-        let fixture = try makeFixture(shape: "conflicting_mode")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "conflicting id/category semantics") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testGroupedModeChoicesAndUniqueCaseInsensitiveMatchUseCanonicalValue() async throws {
-        let fixture = try makeFixture(shape: "grouped")
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("PLAN")
-        }
-
-        let mutation = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").first)
-        XCTAssertEqual(mutation.params["value"] as? String, "Plan")
-    }
-
-    func testCaseCollidingModeChoicesRequireExactValue() async throws {
-        let fixture = try makeFixture(shape: "case_collision")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "case-colliding") {
-            try await fixture.controller.setSessionMode("PLAN")
-        }
-        try await fixture.controller.setSessionMode("plan")
-        await fixture.controller.shutdown()
-
-        let mutation = try XCTUnwrap(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").first)
-        XCTAssertEqual(mutation.params["value"] as? String, "plan")
-    }
-
-    func testInvalidModeListsCanonicalAvailableValues() async throws {
-        let fixture = try makeFixture(shape: "modern")
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "Available modes: ask, plan") {
-            try await fixture.controller.setSessionMode("unknown")
-        }
-        await fixture.controller.shutdown()
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-    }
-
-    func testSuccessfulModernResponseUpdatesSnapshotAndSkipsDuplicateMutation() async throws {
-        let fixture = try makeFixture(shape: "modern")
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("plan")
-            try await controller.setSessionMode("plan")
-        }
-
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
     }
 
     func testModernMutationRequiresCompleteMatchingResponseAndNeverRetriesLegacy() async throws {
@@ -229,7 +215,7 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
-    func testMatchingConfigOptionUpdateReplacesStateAndSkipsSameValue() async throws {
+    func testAuthoritativeConfigUpdateSurvivesTurnReuseAndSkipsConfirmedValue() async throws {
         let diagnostics = LockedStrings()
         let normalizedUpdates = LockedStrings()
         let fixture = try makeFixture(
@@ -242,7 +228,13 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         try await waitUntil("authoritative config update") {
             diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
         }
+
         try await fixture.controller.setSessionMode("plan")
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "before turn reuse")
+        let didPrepare = await fixture.controller.prepareForNextTurn()
+        XCTAssertTrue(didPrepare)
+        try await fixture.controller.setSessionMode("plan")
+        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, "after turn reuse")
         try await fixture.controller.setSessionMode("ask")
         await fixture.controller.shutdown()
 
@@ -253,86 +245,101 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertFalse(normalizedUpdates.values.contains("config_option_update"))
     }
 
-    func testIncompleteConfigOptionUpdateIsIgnored() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: [
-                "ACP_NOTIFICATION_MODE": "plan",
-                "ACP_NOTIFICATION_BEHAVIOR": "missing"
-            ],
-            diagnostics: diagnostics
-        )
-        _ = try await fixture.controller.bootstrap()
-        try await waitUntil("incomplete config update rejection") {
-            diagnostics.values.contains { $0.contains("Ignoring") && $0.contains("config_option_update") }
-        }
-        try await fixture.controller.setSessionMode("plan")
-        await fixture.controller.shutdown()
+    func testNonAuthoritativeConfigUpdatesAreIgnored() async throws {
+        let cases = [
+            IgnoredConfigUpdateCase(
+                label: "missing-payload",
+                environment: [
+                    "ACP_NOTIFICATION_MODE": "plan",
+                    "ACP_NOTIFICATION_BEHAVIOR": "missing"
+                ],
+                expectedDiagnostic: "config_option_update"
+            ),
+            IgnoredConfigUpdateCase(
+                label: "wrong-session",
+                environment: [
+                    "ACP_NOTIFICATION_MODE": "plan",
+                    "ACP_NOTIFICATION_SESSION_ID": "other-session"
+                ],
+                expectedDiagnostic: nil
+            )
+        ]
 
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
-        XCTAssertTrue(diagnostics.values.contains { $0.contains("Ignoring") && $0.contains("config_option_update") })
+        for updateCase in cases {
+            let diagnostics = LockedStrings()
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: updateCase.environment,
+                diagnostics: diagnostics
+            )
+            try await withBootstrappedController(fixture.controller) { controller in
+                if let expectedDiagnostic = updateCase.expectedDiagnostic {
+                    try await waitUntil("\(updateCase.label) config update rejection") {
+                        diagnostics.values.contains {
+                            $0.contains("Ignoring") && $0.contains(expectedDiagnostic)
+                        }
+                    }
+                }
+                try await controller.setSessionMode("plan")
+            }
+
+            let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
+            XCTAssertEqual(mutations.count, 1, updateCase.label)
+            XCTAssertEqual(mutations.first?.params["value"] as? String, "plan", updateCase.label)
+            if let expectedDiagnostic = updateCase.expectedDiagnostic {
+                XCTAssertTrue(
+                    diagnostics.values.contains { $0.contains("Ignoring") && $0.contains(expectedDiagnostic) },
+                    updateCase.label
+                )
+            }
+        }
     }
 
-    func testMalformedConfigOptionUpdateInvalidatesStaleModeAuthority() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: [
+    func testMalformedConfigUpdatesInvalidateModeAuthorityBeforeAndAfterMutation() async throws {
+        for phase in MalformedAuthorityPhase.allCases {
+            let diagnostics = LockedStrings()
+            var environment = [
                 "ACP_NOTIFICATION_MODE": "plan",
                 "ACP_NOTIFICATION_BEHAVIOR": "malformed"
-            ],
-            diagnostics: diagnostics
-        )
-        _ = try await fixture.controller.bootstrap()
-        try await waitUntil("malformed config update invalidation") {
-            diagnostics.values.contains { $0.contains("Invalidated session mode authority") }
-        }
-        await assertThrows(containing: "malformed modern session mode config option") {
-            try await fixture.controller.setSessionMode("ask")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-        XCTAssertTrue(diagnostics.values.contains { $0.contains("Invalidated session mode authority") })
-    }
-
-    func testConfigOptionUpdateStateSurvivesTurnReuse() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: ["ACP_NOTIFICATION_MODE": "plan"],
-            diagnostics: diagnostics
-        )
-        _ = try await fixture.controller.bootstrap()
-        try await waitUntil("authoritative config update") {
-            diagnostics.values.contains("Processed authoritative config_option_update snapshot.")
-        }
-        let didPrepare = await fixture.controller.prepareForNextTurn()
-        XCTAssertTrue(didPrepare)
-        try await fixture.controller.setSessionMode("plan")
-        try await fixture.controller.setSessionMode("ask")
-        await fixture.controller.shutdown()
-
-        let mutations = recordedRequests(at: fixture.recordURL, method: "session/set_config_option")
-        let mutation = try XCTUnwrap(mutations.first)
-        XCTAssertEqual(mutations.count, 1)
-        XCTAssertEqual(mutation.params["value"] as? String, "ask")
-    }
-
-    func testWrongSessionConfigOptionUpdateIsIgnored() async throws {
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: [
-                "ACP_NOTIFICATION_MODE": "plan",
-                "ACP_NOTIFICATION_SESSION_ID": "other-session"
             ]
-        )
-        try await withBootstrappedController(fixture.controller) { controller in
-            try await controller.setSessionMode("plan")
-        }
+            if phase == .afterMutation {
+                environment = [
+                    "ACP_AFTER_SET_NOTIFICATION_MODE": "ask",
+                    "ACP_AFTER_SET_NOTIFICATION_BEHAVIOR": "malformed",
+                    "ACP_AFTER_SET_NOTIFICATION_DELAY": "0.05"
+                ]
+            }
+            let fixture = try makeFixture(
+                shape: "modern",
+                extraEnvironment: environment,
+                diagnostics: diagnostics
+            )
+            _ = try await fixture.controller.bootstrap()
 
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
+            if phase == .afterMutation {
+                try await fixture.controller.setSessionMode("plan")
+            }
+            try await waitUntil("\(phase.label) malformed config update invalidation") {
+                diagnostics.values.contains { $0.contains("Invalidated session mode authority") }
+            }
+            await assertThrows(
+                containing: "malformed modern session mode config option",
+                label: phase.label
+            ) {
+                try await fixture.controller.setSessionMode(phase == .beforeMutation ? "ask" : "plan")
+            }
+            await fixture.controller.shutdown()
+
+            let mutations = recordedMutationRequests(at: fixture.recordURL)
+            XCTAssertEqual(mutations.count, phase == .beforeMutation ? 0 : 1, phase.label)
+            if phase == .afterMutation {
+                XCTAssertEqual(mutations.first?.params["value"] as? String, "plan", phase.label)
+            }
+            XCTAssertTrue(
+                diagnostics.values.contains { $0.contains("Invalidated session mode authority") },
+                phase.label
+            )
+        }
     }
 
     func testNewerNotificationRemainsAuthoritativeAfterMutationResponse() async throws {
@@ -391,30 +398,6 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         #endif
     }
 
-    func testMalformedNotificationAfterMutationInvalidatesConfirmedMode() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: [
-                "ACP_AFTER_SET_NOTIFICATION_MODE": "ask",
-                "ACP_AFTER_SET_NOTIFICATION_BEHAVIOR": "malformed",
-                "ACP_AFTER_SET_NOTIFICATION_DELAY": "0.05"
-            ],
-            diagnostics: diagnostics
-        )
-        _ = try await fixture.controller.bootstrap()
-        try await fixture.controller.setSessionMode("plan")
-        try await waitUntil("malformed authoritative config update") {
-            diagnostics.values.contains { $0.contains("Invalidated session mode authority") }
-        }
-        await assertThrows(containing: "malformed modern session mode config option") {
-            try await fixture.controller.setSessionMode("plan")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertEqual(recordedRequests(at: fixture.recordURL, method: "session/set_config_option").count, 1)
-    }
-
     func testModernModelSelectorOverridesConflictingLegacyModels() async throws {
         let fixture = try makeFixture(
             shape: "modern",
@@ -443,22 +426,31 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
     }
 
-    func testCursorAutoWithMalformedModernModelSelectorFailsWithoutMutation() async throws {
+    func testMalformedModernModelRejectsCursorDefaultAndLegacyFallbackWithoutMutation() async throws {
+        let diagnostics = LockedStrings()
         let fixture = try makeFixture(
             shape: "modern",
             extraEnvironment: [
                 "ACP_INCLUDE_MODEL": "1",
-                "ACP_MALFORMED_MODEL": "1"
+                "ACP_MALFORMED_MODEL": "1",
+                "ACP_INCLUDE_LEGACY_MODELS": "1"
             ],
+            diagnostics: diagnostics,
             providerID: .cursor
         )
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "malformed modern model config option") {
-            try await fixture.controller.setSessionModel(AgentModel.cursorAuto.rawValue)
+        try await withBootstrappedController(fixture.controller) { controller in
+            for requestedModel in [AgentModel.cursorAuto.rawValue, "legacy-model"] {
+                await assertThrows(
+                    containing: "malformed modern model config option",
+                    label: requestedModel
+                ) {
+                    try await controller.setSessionModel(requestedModel)
+                }
+                XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty, requestedModel)
+            }
         }
-        await fixture.controller.shutdown()
 
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
+        XCTAssertTrue(diagnostics.values.contains { $0.contains("legacy fallback is disabled") })
     }
 
     func testLegacyOnlyModelAdvertisementIsIgnored() async throws {
@@ -482,27 +474,6 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
         XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
         XCTAssertTrue(diagnostics.values.contains { $0.contains("Ignoring legacy ACP models metadata") })
-    }
-
-    func testMalformedModernModelDoesNotFallBackToLegacyModels() async throws {
-        let diagnostics = LockedStrings()
-        let fixture = try makeFixture(
-            shape: "modern",
-            extraEnvironment: [
-                "ACP_INCLUDE_MODEL": "1",
-                "ACP_MALFORMED_MODEL": "1",
-                "ACP_INCLUDE_LEGACY_MODELS": "1"
-            ],
-            diagnostics: diagnostics
-        )
-        _ = try await fixture.controller.bootstrap()
-        await assertThrows(containing: "malformed modern model config option") {
-            try await fixture.controller.setSessionModel("legacy-model")
-        }
-        await fixture.controller.shutdown()
-
-        XCTAssertTrue(recordedMutationRequests(at: fixture.recordURL).isEmpty)
-        XCTAssertTrue(diagnostics.values.contains { $0.contains("legacy fallback is disabled") })
     }
 
     func testModelCanonicalizationRejectsAmbiguityAndRequiresExactResponse() async throws {
@@ -669,85 +640,48 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
-    func testShutdownDrainsPromptSettlementWaitersWithTransportClosed() async throws {
+    func testTransportTerminationDrainsPromptSettlementWaiters() async throws {
         #if DEBUG
-            let fixture = try makeFixture(
-                shape: "modern",
-                extraEnvironment: ["ACP_HANG_PROMPT": "1"]
-            )
-            _ = try await fixture.controller.bootstrap()
-            let promptTask = Task {
-                try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
-            }
-            try await waitUntil("prompt request") {
-                self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
-            }
+            for termination in TransportTerminationKind.allCases {
+                let releaseURL = try makeTemporaryDirectory().appendingPathComponent("exit-release")
+                var environment = ["ACP_HANG_PROMPT": "1"]
+                if termination == .processExit {
+                    environment["ACP_EXIT_ON_CANCEL_RELEASE_PATH"] = releaseURL.path
+                }
+                let fixture = try makeFixture(
+                    shape: "modern",
+                    extraEnvironment: environment
+                )
+                _ = try await fixture.controller.bootstrap()
+                let promptTask = Task {
+                    try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
+                }
+                try await waitUntil("\(termination.label) prompt request") {
+                    self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
+                }
 
-            let interruptTask = Task {
-                try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
-            }
-            try await waitUntilAsync("prompt settlement waiter") {
-                await fixture.controller.debugPromptSettlementWaiterCount() == 1
-            }
+                let interruptTask = Task {
+                    try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
+                }
+                try await waitUntilAsync("\(termination.label) prompt settlement waiter") {
+                    await fixture.controller.debugPromptSettlementWaiterCount() == 1
+                }
+                let waiterCount = await fixture.controller.debugPromptSettlementWaiterCount()
+                XCTAssertEqual(waiterCount, 1, termination.label)
 
-            await fixture.controller.shutdown()
+                switch termination {
+                case .shutdown:
+                    await fixture.controller.shutdown()
+                case .processExit:
+                    try Data().write(to: releaseURL)
+                }
 
-            do {
-                try await interruptTask.value
-                XCTFail("Expected steering interrupt to fail when transport closes")
-            } catch {
-                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
+                await assertTransportClosed(interruptTask, label: "\(termination.label) steering interrupt")
+                await assertTransportClosed(promptTask, label: "\(termination.label) prompt")
+                if termination == .processExit {
+                    await fixture.controller.shutdown()
+                }
             }
-            do {
-                try await promptTask.value
-                XCTFail("Expected prompt to fail when transport closes")
-            } catch {
-                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
-            }
-        #else
-            throw XCTSkip("Prompt settlement waiter inspection is DEBUG-only.")
-        #endif
-    }
-
-    func testProcessExitDrainsPromptSettlementWaitersWithTransportClosed() async throws {
-        #if DEBUG
-            let releaseURL = try makeTemporaryDirectory().appendingPathComponent("exit-release")
-            let fixture = try makeFixture(
-                shape: "modern",
-                extraEnvironment: [
-                    "ACP_HANG_PROMPT": "1",
-                    "ACP_EXIT_ON_CANCEL_RELEASE_PATH": releaseURL.path
-                ]
-            )
-            _ = try await fixture.controller.bootstrap()
-            let promptTask = Task {
-                try await fixture.controller.prompt(AgentMessage(userMessage: "hang"))
-            }
-            try await waitUntil("prompt request") {
-                self.recordedRequests(at: fixture.recordURL, method: "session/prompt").count == 1
-            }
-
-            let interruptTask = Task {
-                try await fixture.controller.interruptActivePromptForSteering(timeoutSeconds: 30)
-            }
-            try await waitUntilAsync("prompt settlement waiter") {
-                await fixture.controller.debugPromptSettlementWaiterCount() == 1
-            }
-            try Data().write(to: releaseURL)
-
-            do {
-                try await interruptTask.value
-                XCTFail("Expected steering interrupt to fail after process exit")
-            } catch {
-                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
-            }
-            do {
-                try await promptTask.value
-                XCTFail("Expected prompt to fail after process exit")
-            } catch {
-                XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.")
-            }
-            await fixture.controller.shutdown()
         #else
             throw XCTSkip("Prompt settlement waiter inspection is DEBUG-only.")
         #endif
@@ -829,6 +763,9 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         #if DEBUG
             let runID = UUID()
             await ServerNetworkManager.shared.debugClearRunRoutingHistoryForTesting()
+            addTeardownBlock {
+                await ServerNetworkManager.shared.debugClearRunRoutingHistoryForTesting()
+            }
             let injectedServer = RepoPromptMCPServerConfiguration(
                 name: "RepoPromptFixture",
                 command: "/bin/echo",
@@ -907,6 +844,54 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         #endif
     }
 
+    private struct SessionOpenRouteCase {
+        let label: String
+        let shape: String
+        let resumeSessionID: String?
+        let expectedRoute: String
+        let oppositeRoute: String
+        let requestedMode: String
+        let expectedConfigID: String
+    }
+
+    private struct ModeSelectorFailureCase {
+        let label: String
+        let shape: String
+        let requestedValues: [String]
+        let expectedError: String
+        let expectedDiagnostic: String?
+    }
+
+    private struct IgnoredConfigUpdateCase {
+        let label: String
+        let environment: [String: String]
+        let expectedDiagnostic: String?
+    }
+
+    private enum MalformedAuthorityPhase: CaseIterable {
+        case beforeMutation
+        case afterMutation
+
+        var label: String {
+            switch self {
+            case .beforeMutation: "before-mutation"
+            case .afterMutation: "after-mutation"
+            }
+        }
+    }
+
+    private enum TransportTerminationKind: CaseIterable {
+        case shutdown
+        case processExit
+
+        var label: String {
+            switch self {
+            case .shutdown: "shutdown"
+            case .processExit: "process-exit"
+            }
+        }
+    }
+
     private struct Fixture {
         let controller: ACPAgentSessionController
         let recordURL: URL
@@ -916,6 +901,27 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
     private struct RecordedRequest {
         let method: String
         let params: [String: Any]
+    }
+
+    private func makeFixtureMCPServer() -> RepoPromptMCPServerConfiguration {
+        RepoPromptMCPServerConfiguration(
+            name: "RepoPromptFixture",
+            command: "/bin/echo",
+            args: ["--window", "4"],
+            env: [.init(name: "RPCE_TEST", value: "1")]
+        )
+    }
+
+    private func assertFixtureMCPServer(in request: RecordedRequest, label: String) throws {
+        let mcpServers = try XCTUnwrap(request.params["mcpServers"] as? [[String: Any]], label)
+        let server = try XCTUnwrap(mcpServers.first, label)
+        XCTAssertEqual(mcpServers.count, 1, label)
+        XCTAssertEqual(server["type"] as? String, "stdio", label)
+        XCTAssertEqual(server["name"] as? String, "RepoPromptFixture", label)
+        XCTAssertEqual(server["command"] as? String, "/bin/echo", label)
+        XCTAssertEqual(server["args"] as? [String], ["--window", "4"], label)
+        let environment = try XCTUnwrap(server["env"] as? [[String: String]], label)
+        XCTAssertEqual(environment, [["name": "RPCE_TEST", "value": "1"]], label)
     }
 
     private func makeFixture(
@@ -986,16 +992,27 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
 
     private func assertThrows(
         containing expectedText: String,
+        label: String? = nil,
         operation: () async throws -> Void
     ) async {
+        let context = label.map { " [\($0)]" } ?? ""
         do {
             try await operation()
-            XCTFail("Expected operation to throw an error containing: \(expectedText)")
+            XCTFail("Expected operation\(context) to throw an error containing: \(expectedText)")
         } catch {
             XCTAssertTrue(
                 error.localizedDescription.contains(expectedText),
-                "Expected '\(error.localizedDescription)' to contain '\(expectedText)'"
+                "Expected '\(error.localizedDescription)'\(context) to contain '\(expectedText)'"
             )
+        }
+    }
+
+    private func assertTransportClosed(_ task: Task<Void, Error>, label: String) async {
+        do {
+            try await task.value
+            XCTFail("Expected \(label) to fail when the ACP transport closed")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, "ACP transport closed unexpectedly.", label)
         }
     }
 

@@ -52,20 +52,24 @@ final class BindContextRoutingRecoveryTests: XCTestCase {
         XCTAssertEqual(request.workingDirs, ["/tmp/repoprompt-a", "/tmp/repoprompt-b"])
     }
 
-    func testBindContextRejectsMultiplePrimarySelectors() {
-        XCTAssertThrowsError(try WindowRoutingService.parseBindContextRequest([
-            "op": .string("bind"),
-            "context_id": .string(UUID().uuidString),
-            "working_dirs": .array([.string("/tmp/repoprompt-a")])
-        ]))
-    }
+    func testBindContextRejectsInvalidPrimarySelectorCombinations() {
+        do {
+            let caseLabel = "testBindContextRejectsMultiplePrimarySelectors"
+            XCTAssertThrowsError(try WindowRoutingService.parseBindContextRequest([
+                "op": .string("bind"),
+                "context_id": .string(UUID().uuidString),
+                "working_dirs": .array([.string("/tmp/repoprompt-a")])
+            ]), caseLabel)
+        }
 
-    func testBindContextRejectsCreateIfMissingWithoutWorkingDirs() {
-        XCTAssertThrowsError(try WindowRoutingService.parseBindContextRequest([
-            "op": .string("bind"),
-            "window_id": .int(1),
-            "create_if_missing": .bool(true)
-        ]))
+        do {
+            let caseLabel = "testBindContextRejectsCreateIfMissingWithoutWorkingDirs"
+            XCTAssertThrowsError(try WindowRoutingService.parseBindContextRequest([
+                "op": .string("bind"),
+                "window_id": .int(1),
+                "create_if_missing": .bool(true)
+            ]), caseLabel)
+        }
     }
 
     func testMCPConnectionManagerHasNoIncompleteBindContextFastPathOrUnsafeRegisteredServicesSnapshot() throws {

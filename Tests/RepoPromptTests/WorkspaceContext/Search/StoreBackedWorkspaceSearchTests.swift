@@ -199,6 +199,359 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     }
 
     #if DEBUG
+        func testDebugColdScopedPathSearchPhaseAccounting() async throws {
+            let visibleRoot = try makeTemporaryRoot(name: "DebugPhaseVisible")
+            try write("visible", to: visibleRoot.appendingPathComponent("Visible.swift"))
+            let worktreeRoot = try makeTemporaryRoot(name: "DebugPhaseWorktree")
+            let expectedRelativePath = "Sources/00-FirstPhaseNeedle.swift"
+            let expected = worktreeRoot.appendingPathComponent(expectedRelativePath)
+            for index in 1 ... 4 {
+                try write(
+                    "other \(index)",
+                    to: worktreeRoot.appendingPathComponent(String(format: "Sources/%02d-Other.swift", index))
+                )
+            }
+
+            let store = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            _ = try await store.loadRoot(path: visibleRoot.path)
+            let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+            let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [worktreeRoot.standardizedFileURL.path]
+            )
+
+            try write("needle", to: expected)
+            await store.replayObservedFileSystemDeltas(
+                rootID: worktreeRecord.id,
+                deltas: [.fileAdded(expectedRelativePath)]
+            )
+            let beforeFirstPathDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(beforeFirstPathDiagnostics.catalogRebuild.rebuildCount, 0)
+            let beforeFirstPathShard = try XCTUnwrap(
+                beforeFirstPathDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertNil(beforeFirstPathShard.publishedTopologyGeneration)
+            XCTAssertEqual(beforeFirstPathShard.buildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.authoritativeRebuildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.pathIndexBuildCount, 0)
+            XCTAssertEqual(beforeFirstPathShard.overlayPathIndexBuildCount, 0)
+
+            let collector = WorkspaceFileSearchPhaseCollector()
+            let started = DispatchTime.now()
+            let result = try await WorkspaceFileSearchDebugContext.$collector.withValue(collector) {
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "FirstPhaseNeedle",
+                    mode: .path,
+                    maxPaths: 1,
+                    rootScope: scope,
+                    store: store,
+                    workspaceManager: nil
+                )
+            }
+            let finished = DispatchTime.now()
+            let phases = collector.snapshot(
+                readySearchNanoseconds: finished.uptimeNanoseconds - started.uptimeNanoseconds
+            )
+
+            XCTAssertEqual(result.paths, [expected.path])
+            XCTAssertEqual(phases.status, .completed)
+            XCTAssertGreaterThanOrEqual(phases.topLevel.residualOrchestrationMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.fileActor.residualMicroseconds, 0)
+
+            XCTAssertEqual(phases.catalog.sortInvocationCount, 1)
+            XCTAssertEqual(phases.catalog.sortFileInputCount, 5)
+            XCTAssertEqual(phases.catalog.sortFolderInputCount, 2)
+            XCTAssertGreaterThanOrEqual(phases.catalog.fileSortMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.catalog.folderSortMicroseconds, 0)
+            XCTAssertGreaterThanOrEqual(phases.catalog.sortResidualMicroseconds, 0)
+            let nestedSortChildren = phases.catalog.fileSortMicroseconds
+                + phases.catalog.folderSortMicroseconds
+                + phases.catalog.sortResidualMicroseconds
+            XCTAssertLessThanOrEqual(nestedSortChildren, phases.catalog.sortMicroseconds + 1000)
+            XCTAssertLessThanOrEqual(abs(phases.catalog.sortReconciliationDeltaMicroseconds), 1000)
+
+            let catalogChildren = phases.catalog.filterMicroseconds
+                + phases.catalog.sortMicroseconds
+                + phases.catalog.materializationMicroseconds
+                + phases.catalog.pathIndexKeyMicroseconds
+                + phases.catalog.pathIndexConstructionMicroseconds
+                + phases.catalog.compositionCacheResidualMicroseconds
+            XCTAssertLessThanOrEqual(catalogChildren, phases.catalog.totalMicroseconds + 1000)
+
+            let actorChildren = phases.fileActor.descriptorMicroseconds
+                + phases.fileActor.filterMicroseconds
+                + phases.fileActor.sortAndInputMicroseconds
+                + phases.fileActor.batchConstructionAndInitialEnqueueMicroseconds
+                + phases.fileActor.deterministicDrainToHitMicroseconds
+                + phases.fileActor.postHitResidualMicroseconds
+            XCTAssertLessThanOrEqual(
+                actorChildren,
+                phases.topLevel.fileSearchActorMicroseconds + 1000
+            )
+
+            let reconciledReadyMicroseconds = Int64(phases.topLevel.readinessFreshnessPreambleMicroseconds)
+                + Int64(phases.topLevel.firstCatalogAccessMicroseconds)
+                + Int64(phases.topLevel.fileSearchActorMicroseconds)
+                + phases.topLevel.residualOrchestrationMicroseconds
+            XCTAssertLessThanOrEqual(
+                abs(reconciledReadyMicroseconds - Int64(phases.topLevel.readySearchMicroseconds)),
+                1000
+            )
+            XCTAssertLessThanOrEqual(abs(phases.topLevel.reconciliationDeltaMicroseconds), 1000)
+
+            XCTAssertEqual(phases.counts.sourceFileCount, 5)
+            XCTAssertEqual(phases.counts.descriptorsBuilt, 5)
+            XCTAssertEqual(phases.counts.admittedFileCount, 5)
+            XCTAssertEqual(phases.counts.sortInputCount, 5)
+            XCTAssertEqual(phases.counts.totalBatchCount, 1)
+            XCTAssertEqual(phases.counts.initiallyEnqueuedBatchCount, 1)
+            XCTAssertEqual(phases.counts.deterministicallyDrainedBatchCount, 1)
+            XCTAssertEqual(phases.counts.entriesExaminedByDrainedBatches, 5)
+            XCTAssertEqual(phases.counts.returnedHitPrefixLength, 1)
+
+            XCTAssertEqual(phases.catalog.rebuildCount, 1)
+            XCTAssertEqual(phases.catalog.rootCount, 1)
+            XCTAssertEqual(phases.catalog.fileCount, 5)
+            XCTAssertEqual(phases.catalog.pathIndexKeyMicroseconds, 0)
+            XCTAssertEqual(phases.catalog.pathIndexConstructionMicroseconds, 0)
+            let recordsOnlySnapshot = await store.searchCatalogSnapshot(
+                rootScope: scope,
+                requirement: .recordsOnly
+            )
+            XCTAssertTrue(recordsOnlySnapshot.rootPathIndexes.isEmpty)
+            let coldDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(coldDiagnostics.catalogRebuild.rebuildCount, 1)
+            let worktreeShard = try XCTUnwrap(
+                coldDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(worktreeShard.authoritativeRebuildCount, 1)
+            XCTAssertEqual(worktreeShard.pathIndexBuildCount, 0)
+            XCTAssertEqual(worktreeShard.overlayPathIndexBuildCount, 0)
+
+            let warm = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .path,
+                maxPaths: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(warm.paths, [expected.path])
+            var warmDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.rebuildCount, 1)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortInvocationCount, 1)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortFileInputCount, 5)
+            XCTAssertEqual(warmDiagnostics.catalogRebuild.sortFolderInputCount, 2)
+            XCTAssertLessThanOrEqual(
+                abs(warmDiagnostics.catalogRebuild.sortReconciliationDeltaMicroseconds),
+                1000
+            )
+            var warmShard = try XCTUnwrap(
+                warmDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(warmShard.buildCount, worktreeShard.buildCount)
+            XCTAssertEqual(warmShard.pathIndexBuildCount, 0)
+
+            let auto = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .auto,
+                maxPaths: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(auto.paths, [expected.path])
+            warmDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            warmShard = try XCTUnwrap(
+                warmDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(warmShard.authoritativeRebuildCount, 1)
+            XCTAssertEqual(warmShard.buildCount, worktreeShard.buildCount + 1)
+            XCTAssertEqual(warmShard.pathIndexBuildCount, 1)
+            XCTAssertEqual(warmShard.overlayPathIndexBuildCount, 0)
+
+            _ = try await StoreBackedWorkspaceSearch.search(
+                pattern: "FirstPhaseNeedle",
+                mode: .both,
+                maxPaths: 1,
+                maxMatches: 1,
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            let bothDiagnostics = await store.storeWorkDiagnosticsSnapshot()
+            let bothShard = try XCTUnwrap(
+                bothDiagnostics.rootCatalogShards.roots.first { $0.rootID == worktreeRecord.id }
+            )
+            XCTAssertEqual(bothShard.buildCount, warmShard.buildCount)
+            XCTAssertEqual(bothShard.pathIndexBuildCount, 1)
+            XCTAssertEqual(bothShard.overlayPathIndexBuildCount, 0)
+
+            let probeContainer = try makeTemporaryRoot(name: "DebugCatalogSortProbe")
+            let nestedRoot = probeContainer.appendingPathComponent("Nested")
+            let probePaths = [
+                "a.swift",
+                "É-Precomposed.swift",
+                "Prefix-long",
+                "File-2.swift",
+                "E\u{301}-Decomposed.swift",
+                "A.swift",
+                "Prefix",
+                "中.swift",
+                "File-10.swift",
+                "Ω.swift",
+                "relative/Child.swift"
+            ]
+            for relativePath in probePaths {
+                try write(
+                    relativePath,
+                    to: nestedRoot.appendingPathComponent(relativePath)
+                )
+            }
+            try write("absolute", to: probeContainer.appendingPathComponent("Absolute.swift"))
+
+            let probeStore = WorkspaceFileContextStore(enableCatalogShardShadowValidation: false)
+            let parentRecord = try await probeStore.loadRoot(path: probeContainer.path)
+            let nestedRecord = try await probeStore.loadRoot(path: nestedRoot.path, kind: .sessionWorktree)
+            let probeScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [probeContainer.standardizedFileURL.path],
+                physicalRootPaths: [nestedRoot.standardizedFileURL.path]
+            )
+            let expectedFiles = await probeStore.files(inRoot: parentRecord.id)
+                + probeStore.files(inRoot: nestedRecord.id)
+            let nestedPrefix = nestedRoot.standardizedFileURL.path + "/"
+            let expectedNestedPathOrder = [
+                "E\u{301}-Decomposed.swift",
+                "E\u{301}-Precomposed.swift",
+                "File-10.swift",
+                "File-2.swift",
+                "Prefix",
+                "Prefix-long",
+                "a.swift",
+                "relative/Child.swift",
+                "Ω.swift",
+                "中.swift"
+            ]
+            let absolutePath = probeContainer
+                .appendingPathComponent("Absolute.swift")
+                .standardizedFileURL.path
+            let expectedUniquePaths = [absolutePath]
+                + expectedNestedPathOrder.map { nestedPrefix + $0 }
+            let expectedOrderedPaths = [absolutePath]
+                + expectedNestedPathOrder.flatMap { relativePath in
+                    Array(repeating: nestedPrefix + relativePath, count: 2)
+                }
+            let expectedOrder = expectedUniquePaths.flatMap { expectedPath in
+                expectedFiles
+                    .filter {
+                        $0.standardizedFullPath.utf8.elementsEqual(expectedPath.utf8)
+                    }
+                    .sorted {
+                        $0.id.uuidString.utf8.lexicographicallyPrecedes($1.id.uuidString.utf8)
+                    }
+            }
+            XCTAssertEqual(expectedOrder.map(\.standardizedFullPath), expectedOrderedPaths)
+            let expectedFolderCount = await probeStore.folders(inRoot: parentRecord.id).count
+                + probeStore.folders(inRoot: nestedRecord.id).count
+            let singleRootScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [nestedRoot.standardizedFileURL.path]
+            )
+            let expectedSingleRootFiles = await probeStore.files(inRoot: nestedRecord.id)
+            let expectedSingleRootOrder = expectedSingleRootFiles.sorted { lhs, rhs in
+                if lhs.standardizedRelativePath.utf8.elementsEqual(rhs.standardizedRelativePath.utf8) {
+                    return lhs.id.uuidString.utf8.lexicographicallyPrecedes(rhs.id.uuidString.utf8)
+                }
+                return lhs.standardizedRelativePath.utf8.lexicographicallyPrecedes(
+                    rhs.standardizedRelativePath.utf8
+                )
+            }
+            XCTAssertEqual(
+                expectedSingleRootOrder.map(\.standardizedRelativePath),
+                expectedNestedPathOrder
+            )
+            let expectedSingleRootFolderCount = await probeStore.folders(inRoot: nestedRecord.id).count
+            let workBeforeProbe = await probeStore.storeWorkDiagnosticsSnapshot()
+            let catalogCacheCountBeforeProbe = await probeStore.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheCountBeforeProbe = await probeStore.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationBeforeProbe = await probeStore.sessionCatalogGenerationForTesting(scope: probeScope)
+            let singleRootGenerationBeforeProbe = await probeStore
+                .sessionCatalogGenerationForTesting(scope: singleRootScope)
+
+            let singleRootProbe = await probeStore.debugAuthoritativeCatalogSortProbe(
+                rootScope: singleRootScope
+            )
+            XCTAssertEqual(singleRootProbe.status, .completed)
+            XCTAssertEqual(singleRootProbe.sourceFileCount, expectedSingleRootFiles.count)
+            XCTAssertEqual(singleRootProbe.sourceFolderCount, expectedSingleRootFolderCount)
+            XCTAssertEqual(singleRootProbe.samples.count, 3)
+            XCTAssertTrue(singleRootProbe.directAndProjectedOrdersMatch)
+            XCTAssertNil(singleRootProbe.firstMismatchIndex)
+            XCTAssertEqual(singleRootProbe.orderedFileIDs, expectedSingleRootOrder.map(\.id))
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy(\.directAndProjectedOrdersMatch))
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.firstMismatchIndex == nil })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.directFileComparatorCalls > 0 })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.projectedFileComparatorCalls > 0 })
+            XCTAssertTrue(singleRootProbe.samples.allSatisfy { $0.folderComparatorCalls > 0 })
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.directFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.projectedFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(singleRootProbe.samples.map(\.folderComparatorCalls)).count, 1)
+
+            let probe = await probeStore.debugAuthoritativeCatalogSortProbe(rootScope: probeScope)
+            XCTAssertEqual(probe.status, .completed)
+            XCTAssertEqual(probe.sourceFileCount, expectedFiles.count)
+            XCTAssertEqual(probe.sourceFolderCount, expectedFolderCount)
+            XCTAssertEqual(probe.samples.count, 3)
+            XCTAssertTrue(probe.directAndProjectedOrdersMatch)
+            XCTAssertNil(probe.firstMismatchIndex)
+            XCTAssertEqual(probe.orderedFileIDs, expectedOrder.map(\.id))
+            XCTAssertTrue(probe.samples.allSatisfy(\.directAndProjectedOrdersMatch))
+            XCTAssertTrue(probe.samples.allSatisfy { $0.firstMismatchIndex == nil })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.directFileComparatorCalls > 0 })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.projectedFileComparatorCalls > 0 })
+            XCTAssertTrue(probe.samples.allSatisfy { $0.folderComparatorCalls > 0 })
+            XCTAssertEqual(Set(probe.samples.map(\.directFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(probe.samples.map(\.projectedFileComparatorCalls)).count, 1)
+            XCTAssertEqual(Set(probe.samples.map(\.folderComparatorCalls)).count, 1)
+
+            let duplicateGroups = Dictionary(
+                grouping: expectedFiles,
+                by: { Array($0.standardizedFullPath.utf8) }
+            )
+            .values
+            .filter { $0.count > 1 }
+            XCTAssertFalse(duplicateGroups.isEmpty)
+            for group in duplicateGroups {
+                let orderedIDs = probe.orderedFileIDs.filter { id in group.contains { $0.id == id } }
+                XCTAssertEqual(
+                    orderedIDs,
+                    group.map(\.id).sorted {
+                        $0.uuidString.utf8.lexicographicallyPrecedes($1.uuidString.utf8)
+                    }
+                )
+            }
+
+            let unavailableScope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [],
+                physicalRootPaths: [probeContainer.appendingPathComponent("Missing").path]
+            )
+            let unavailable = await probeStore.debugAuthoritativeCatalogSortProbe(rootScope: unavailableScope)
+            XCTAssertEqual(unavailable.status, .unavailable)
+            XCTAssertTrue(unavailable.samples.isEmpty)
+
+            let workAfterProbe = await probeStore.storeWorkDiagnosticsSnapshot()
+            let catalogCacheCountAfterProbe = await probeStore.searchCatalogSnapshotCacheCountForTesting()
+            let staticCacheCountAfterProbe = await probeStore.staticPathMatchSnapshotCacheCountForTesting()
+            let sessionGenerationAfterProbe = await probeStore.sessionCatalogGenerationForTesting(scope: probeScope)
+            let singleRootGenerationAfterProbe = await probeStore
+                .sessionCatalogGenerationForTesting(scope: singleRootScope)
+            XCTAssertEqual(workAfterProbe, workBeforeProbe)
+            XCTAssertEqual(catalogCacheCountAfterProbe, catalogCacheCountBeforeProbe)
+            XCTAssertEqual(staticCacheCountAfterProbe, staticCacheCountBeforeProbe)
+            XCTAssertEqual(sessionGenerationAfterProbe, sessionGenerationBeforeProbe)
+            XCTAssertEqual(singleRootGenerationAfterProbe, singleRootGenerationBeforeProbe)
+        }
+
         func testWatcherQualifiedWarmSearchSkipsPerFileMetadataValidation() async throws {
             let root = try makeTemporaryRoot(name: "WatcherQualifiedWarmSearch")
             let fileCount = 48
@@ -247,6 +600,55 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
                     .reduce(0) { $0 + $1.sampleCount },
                 0
             )
+        }
+
+        func testAbsoluteScopedWarmSearchIgnoresUnrelatedUnqualifiedRoot() async throws {
+            let qualifiedRoot = try makeTemporaryRoot(name: "ScopedWarmQualified")
+            let unqualifiedRoot = try makeTemporaryRoot(name: "ScopedWarmUnqualified")
+            let qualifiedFile = qualifiedRoot.appendingPathComponent("Qualified.swift")
+            try write("let scopedWarmNeedle = true\n", to: qualifiedFile)
+            try write("let unrelatedNeedle = true\n", to: unqualifiedRoot.appendingPathComponent("Unqualified.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let qualifiedRecord = try await store.loadRoot(path: qualifiedRoot.path)
+            let unqualifiedRecord = try await store.loadRoot(path: unqualifiedRoot.path)
+            let attachedPublisherIngress = try await store
+                .attachPublisherIngressWithoutStartingWatcherForTesting(rootID: qualifiedRecord.id)
+            XCTAssertTrue(attachedPublisherIngress)
+            try await store.setCachedSearchContentWatcherActiveOverrideForTesting(
+                rootID: qualifiedRecord.id,
+                true
+            )
+            addTeardownBlock {
+                try? await store.setCachedSearchContentWatcherActiveOverrideForTesting(
+                    rootID: qualifiedRecord.id,
+                    nil
+                )
+                await store.stopWatchingRoot(id: qualifiedRecord.id)
+            }
+
+            let cold = try await searchContent(
+                pattern: "scopedWarmNeedle",
+                paths: [qualifiedFile.path],
+                store: store
+            )
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: qualifiedRecord.id)
+            try await store.resetSearchContentFingerprintRequestCountForTesting(rootID: unqualifiedRecord.id)
+
+            let warm = try await searchContent(
+                pattern: "scopedWarmNeedle",
+                paths: [qualifiedFile.path],
+                store: store
+            )
+            let qualifiedFingerprintRequests = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: qualifiedRecord.id)
+            let unqualifiedFingerprintRequests = try await store
+                .searchContentFingerprintRequestCountForTesting(rootID: unqualifiedRecord.id)
+
+            XCTAssertEqual(cold.matches?.map(\.filePath), [qualifiedFile.path])
+            XCTAssertEqual(warm.matches, cold.matches)
+            XCTAssertEqual(qualifiedFingerprintRequests, 0)
+            XCTAssertEqual(unqualifiedFingerprintRequests, 0)
         }
 
         func testWatcherQualifiedWarmSearchReloadsAppliedModificationBeforeMatching() async throws {
@@ -1038,6 +1440,590 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             XCTAssertEqual(cache.latestRevision, 1)
         }
 
+        func testExactPathKindIsResolvedAgainAfterFreshnessApplies() async throws {
+            let root = try makeTemporaryRoot(name: "ExactPathKindTransition")
+            let targetURL = root.appendingPathComponent("Target")
+            try write("let oldFileValue = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            let nestedURL = targetURL.appendingPathComponent("Nested.swift")
+            try write("let refreshedKindNeedle = true\n", to: nestedURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [
+                    .fileRemoved("Target"),
+                    .folderAdded("Target"),
+                    .fileAdded("Target/Nested.swift")
+                ]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "refreshedKindNeedle",
+                    paths: [targetURL.path],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [nestedURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testExactFolderBecomingFileIsResolvedAfterFreshnessApplies() async throws {
+            let root = try makeTemporaryRoot(name: "ExactFolderToFileTransition")
+            let targetURL = root.appendingPathComponent("Target")
+            try write("let oldNestedValue = true\n", to: targetURL.appendingPathComponent("Old.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try write("let refreshedFileKindNeedle = true\n", to: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [
+                    .folderRemoved("Target"),
+                    .fileAdded("Target")
+                ]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "refreshedFileKindNeedle",
+                    paths: [targetURL.path],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [targetURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testExactPathDisappearanceRetainsMissingPathFallbackSemantics() async throws {
+            let root = try makeTemporaryRoot(name: "ExactPathDisappearance")
+            let targetURL = root.appendingPathComponent("Target.swift")
+            try write("let disappearingNeedle = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileRemoved("Target.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "disappearingNeedle",
+                    paths: [targetURL.path, "/tmp/invalid\0.swift"],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertTrue(result.matches?.isEmpty ?? true)
+            XCTAssertEqual(result.scopedFileCount, 0)
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
+        func testDeduplicatedExactPathRetainsEveryDisappearanceFallback() async throws {
+            let targetRoot = try makeTemporaryRoot(name: "DeduplicatedExactTarget")
+            let fallbackRoot = try makeTemporaryRoot(name: "DeduplicatedExactFallback")
+            let targetURL = targetRoot.appendingPathComponent("Foo.swift")
+            let fallbackURL = fallbackRoot.appendingPathComponent("Foo.swift")
+            try write("let oldTargetValue = true\n", to: targetURL)
+
+            let store = WorkspaceFileContextStore()
+            let targetRecord = try await store.loadRoot(path: targetRoot.path)
+            let fallbackRecord = try await store.loadRoot(path: fallbackRoot.path)
+            try await store.startWatchingRoot(id: targetRecord.id)
+            try await store.startWatchingRoot(id: fallbackRecord.id)
+            let sinkGate = AsyncGate()
+            let barrierCaptured = AsyncSignal()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == targetRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            await store.setAppliedIngressDidCaptureWatermarksHandler { _ in
+                await barrierCaptured.mark()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+                await store.stopWatchingRoot(id: targetRecord.id)
+                await store.stopWatchingRoot(id: fallbackRecord.id)
+            }
+
+            try FileManager.default.removeItem(at: targetURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: targetRecord.id,
+                deltas: [.fileRemoved("Foo.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let searchTask = Task {
+                try await self.searchContent(
+                    pattern: "deduplicatedFallbackNeedle",
+                    paths: [
+                        targetURL.path,
+                        "\(targetRecord.name)/Foo.swift",
+                        "Foo.swift"
+                    ],
+                    store: store
+                )
+            }
+            await assertAsyncTrue(barrierCaptured.waitUntilMarked())
+
+            try write("let deduplicatedFallbackNeedle = true\n", to: fallbackURL)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: fallbackRecord.id,
+                deltas: [.fileAdded("Foo.swift")]
+            )
+            _ = await store.awaitAppliedIngress(rootRefs: [
+                WorkspaceRootRef(
+                    id: fallbackRecord.id,
+                    name: fallbackRecord.name,
+                    fullPath: fallbackRecord.standardizedFullPath
+                )
+            ])
+            await sinkGate.release()
+
+            let result = try await searchTask.value
+            XCTAssertEqual(result.matches?.map(\.filePath), [fallbackURL.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.setAppliedIngressDidCaptureWatermarksHandler(nil)
+            await store.stopWatchingRoot(id: targetRecord.id)
+            await store.stopWatchingRoot(id: fallbackRecord.id)
+        }
+
+        func testMultipleRelativeAndAliasExactSearchPathsBuildOneStaticLookupSnapshot() async throws {
+            let root = try makeTemporaryRoot(name: "BatchedExactSearchScopes")
+            let firstURL = root.appendingPathComponent("First.swift")
+            let secondURL = root.appendingPathComponent("Second.swift")
+            try write("let batchedExactNeedle = 1\n", to: firstURL)
+            try write("let batchedExactNeedle = 2\n", to: secondURL)
+
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            _ = startedCapture(label: "batched-exact-search-scopes", maxSamples: 200)
+
+            let result = try await searchContent(
+                pattern: "batchedExactNeedle",
+                paths: [
+                    "\(record.name)/First.swift",
+                    "Second.swift"
+                ],
+                store: store
+            )
+            let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
+            let snapshotBuildCount = capture.stages
+                .filter {
+                    $0.stageName == String(describing: EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
+                }
+                .reduce(0) { $0 + $1.sampleCount }
+
+            XCTAssertEqual(Set(result.matches?.map(\.filePath) ?? []), Set([firstURL.path, secondURL.path]))
+            XCTAssertEqual(snapshotBuildCount, 1)
+        }
+
+        func testRootRestrictedSearchPathsDoNotWaitForUnrelatedRepresentedRoot() async throws {
+            let targetRoot = try makeTemporaryRoot(name: "ScopedFreshnessTarget")
+            let blockedRoot = try makeTemporaryRoot(name: "ScopedFreshnessBlocked")
+            let targetFile = targetRoot.appendingPathComponent("Target.swift")
+            let blockedFile = blockedRoot.appendingPathComponent("Blocked.swift")
+            try write("let scopedFreshnessNeedle = true\n", to: targetFile)
+
+            let store = WorkspaceFileContextStore()
+            let targetRecord = try await store.loadRoot(path: targetRoot.path)
+            let blockedRecord = try await store.loadRoot(path: blockedRoot.path)
+            try await store.startWatchingRoot(id: blockedRecord.id)
+            let sinkGate = AsyncGate()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == blockedRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: blockedRecord.id)
+            }
+
+            try write("let unrelatedBlockedNeedle = true\n", to: blockedFile)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: blockedRecord.id,
+                deltas: [.fileAdded("Blocked.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let scopedPaths: [([String], [String])] = [
+                ([targetFile.path], [targetFile.path]),
+                (["\(targetRecord.name)/Target.swift"], [targetFile.path]),
+                (["\(targetRecord.name)/*.swift"], [targetFile.path]),
+                ([targetRoot.appendingPathComponent("*.swift").path], [targetFile.path]),
+                (["/tmp/RepoPromptOutside-\(UUID().uuidString).swift"], [])
+            ]
+            for (paths, expectedPaths) in scopedPaths {
+                let completionSignal = AsyncSignal()
+                let searchTask = Task { () -> Result<SearchResults, Error> in
+                    do {
+                        let result = try await self.searchContent(
+                            pattern: "scopedFreshnessNeedle",
+                            paths: paths,
+                            store: store
+                        )
+                        await completionSignal.mark()
+                        return .success(result)
+                    } catch {
+                        await completionSignal.mark()
+                        return .failure(error)
+                    }
+                }
+
+                let completedWhileUnrelatedRootBlocked = await completionSignal.waitUntilMarked()
+                XCTAssertTrue(
+                    completedWhileUnrelatedRootBlocked,
+                    "Root-restricted paths \(paths) must not wait for another represented root"
+                )
+                switch await searchTask.value {
+                case let .success(result):
+                    XCTAssertEqual(result.matches?.map(\.filePath) ?? [], expectedPaths)
+                case let .failure(error):
+                    XCTFail("Expected targeted search success for \(paths), got \(error)")
+                }
+            }
+
+            let targetStats = await store.scopedIngressBarrierStatsForTesting(rootID: targetRecord.id)
+            let blockedStats = await store.scopedIngressBarrierStatsForTesting(rootID: blockedRecord.id)
+            XCTAssertGreaterThanOrEqual(targetStats.launchCount, 1)
+            XCTAssertEqual(blockedStats.launchCount, 0)
+
+            await sinkGate.release()
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.stopWatchingRoot(id: blockedRecord.id)
+        }
+
+        func testAmbiguousAndUnrestrictedSearchPathsWaitForFullFreshnessScope() async throws {
+            let containerA = try makeTemporaryRoot(name: "AmbiguousFreshnessA")
+            let containerB = try makeTemporaryRoot(name: "AmbiguousFreshnessB")
+            let rootA = containerA.appendingPathComponent("SharedRoot", isDirectory: true)
+            let rootB = containerB.appendingPathComponent("SharedRoot", isDirectory: true)
+            try write("let ambiguousNeedle = true\n", to: rootA.appendingPathComponent("A.swift"))
+            try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: rootA.path)
+            let blockedRecord = try await store.loadRoot(path: rootB.path)
+            try await store.startWatchingRoot(id: blockedRecord.id)
+            let sinkGate = AsyncGate()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == blockedRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: blockedRecord.id)
+            }
+
+            try write("let blockedNeedle = true\n", to: rootB.appendingPathComponent("Blocked.swift"))
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: blockedRecord.id,
+                deltas: [.fileAdded("Blocked.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            for paths in [
+                ["SharedRoot/*.swift"],
+                ["*.swift"],
+                ["Missing/Relative.swift"],
+                ["SharedRoot/[broken"],
+                ["Missing/[broken"],
+                ["/tmp/invalid\0.swift"]
+            ] {
+                let completionSignal = AsyncSignal()
+                let searchTask = Task { () -> Result<SearchResults, Error> in
+                    do {
+                        let result = try await self.searchContent(
+                            pattern: "ambiguousNeedle",
+                            paths: paths,
+                            store: store
+                        )
+                        await completionSignal.mark()
+                        return .success(result)
+                    } catch {
+                        await completionSignal.mark()
+                        return .failure(error)
+                    }
+                }
+
+                let completedWhileBlocked = await completionSignal.waitUntilMarked(timeoutNanoseconds: 100_000_000)
+                XCTAssertFalse(completedWhileBlocked, "Conservative path \(paths) must await all represented roots")
+                searchTask.cancel()
+                if case let .success(result) = await searchTask.value {
+                    XCTFail("Expected cancellation while full freshness was blocked, got \(result)")
+                }
+            }
+
+            let blockedStats = await store.scopedIngressBarrierStatsForTesting(rootID: blockedRecord.id)
+            XCTAssertGreaterThan(blockedStats.launchCount + blockedStats.joinCount, 0)
+            await sinkGate.release()
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.stopWatchingRoot(id: blockedRecord.id)
+        }
+
+        func testInitializingSessionWorktreeIsNarrowedOrTimesOutWithoutSearchingIncompleteCatalog() async throws {
+            let canonicalRoot = try makeTemporaryRoot(name: "InitializingCanonical")
+            let worktreeContainer = try makeTemporaryRoot(name: "InitializingWorktreeContainer")
+            let worktreeRoot = worktreeContainer.appendingPathComponent("InitiallyAbsent", isDirectory: true)
+            let canonicalFile = canonicalRoot.appendingPathComponent("Canonical.swift")
+            let initializingFile = worktreeRoot.appendingPathComponent("Initializing.swift")
+            try write("let canonicalNeedle = true\n", to: canonicalFile)
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: canonicalRoot.path)
+            let scope = WorkspaceLookupRootScope.sessionBoundWorkspace(
+                canonicalRootPaths: [canonicalRoot.path],
+                physicalRootPaths: [worktreeRoot.path]
+            )
+            do {
+                _ = try await StoreBackedWorkspaceSearch.search(
+                    pattern: "initializingNeedle",
+                    mode: .content,
+                    paths: [initializingFile.path],
+                    rootScope: scope,
+                    store: store,
+                    workspaceManager: nil
+                )
+                XCTFail("Expected the absent physical worktree to be unavailable")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(
+                    error,
+                    .worktreeScopeUnavailable(missingPhysicalRootPaths: [worktreeRoot.standardizedFileURL.path])
+                )
+            }
+
+            // loadRoot performs its initial crawl and catalog commit atomically before exposing
+            // the root, so there is no searchable incomplete pre-commit state to pause. Blocking
+            // the first accepted ingress immediately after the real load is the closest explicit
+            // initial-publication seam and exercises the Search freshness boundary.
+            try write("let initialCatalogNeedle = true\n", to: worktreeRoot.appendingPathComponent("Initial.swift"))
+            let worktreeRecord = try await store.loadRoot(path: worktreeRoot.path, kind: .sessionWorktree)
+            try await store.startWatchingRoot(id: worktreeRecord.id)
+            let sinkGate = AsyncGate()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == worktreeRecord.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: worktreeRecord.id)
+            }
+
+            try write("let initializingNeedle = true\n", to: initializingFile)
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: worktreeRecord.id,
+                deltas: [.fileAdded("Initializing.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let canonicalResult = try await StoreBackedWorkspaceSearch.search(
+                pattern: "canonicalNeedle",
+                mode: .content,
+                paths: [canonicalFile.path],
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(canonicalResult.matches?.map(\.filePath), [canonicalFile.path])
+
+            do {
+                _ = try await StoreBackedWorkspaceSearch.$freshnessWaitTimeoutOverrideForTesting.withValue(.milliseconds(50)) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "initializingNeedle",
+                        mode: .content,
+                        paths: [initializingFile.path],
+                        rootScope: scope,
+                        store: store,
+                        workspaceManager: nil
+                    )
+                }
+                XCTFail("Expected the requested initializing worktree to report freshness timeout")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceFreshnessTimedOut)
+            }
+
+            await sinkGate.release()
+            let readyResult = try await StoreBackedWorkspaceSearch.search(
+                pattern: "initializingNeedle",
+                mode: .content,
+                paths: [initializingFile.path],
+                rootScope: scope,
+                store: store,
+                workspaceManager: nil
+            )
+            XCTAssertEqual(readyResult.matches?.map(\.filePath), [initializingFile.path])
+
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.stopWatchingRoot(id: worktreeRecord.id)
+        }
+
+        func testFreshnessTimeoutDoesNotAwaitCancellationInsensitiveLoser() async throws {
+            let root = try makeTemporaryRoot(name: "FreshnessRaceTimeout")
+            try write("let raceTimeoutNeedle = true\n", to: root.appendingPathComponent("A.swift"))
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            let freshnessGate = AsyncGate()
+            let freshnessCompleted = AsyncSignal()
+
+            let clock = ContinuousClock()
+            let started = clock.now
+            do {
+                _ = try await StoreBackedWorkspaceSearch.$freshnessWaitOperationOverrideForTesting.withValue({ _, _ in
+                    await freshnessGate.markStartedAndWaitForRelease()
+                    await freshnessCompleted.mark()
+                    return []
+                }) {
+                    try await StoreBackedWorkspaceSearch.$freshnessWaitTimeoutOverrideForTesting.withValue(.milliseconds(50)) {
+                        try await searchContent(
+                            pattern: "raceTimeoutNeedle",
+                            store: store
+                        )
+                    }
+                }
+                XCTFail("Expected workspace freshness timeout")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceFreshnessTimedOut)
+            }
+            let freshnessStarted = await freshnessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(freshnessStarted)
+            XCTAssertLessThan(started.duration(to: clock.now), .milliseconds(500))
+            let completedBeforeRelease = await freshnessCompleted.waitUntilMarked(timeoutNanoseconds: 20_000_000)
+            XCTAssertFalse(completedBeforeRelease)
+
+            await freshnessGate.release()
+            let completedAfterRelease = await freshnessCompleted.waitUntilMarked()
+            XCTAssertTrue(completedAfterRelease)
+        }
+
+        func testBlockedFreshnessWaitReturnsDedicatedTimeout() async throws {
+            let root = try makeTemporaryRoot(name: "FreshnessTimeout")
+            let store = WorkspaceFileContextStore()
+            let record = try await store.loadRoot(path: root.path)
+            try await store.startWatchingRoot(id: record.id)
+            let sinkGate = AsyncGate()
+            await store.setWatcherSinkWillApplyHandler { observedRootID in
+                guard observedRootID == record.id else { return }
+                await sinkGate.markStartedAndWaitForRelease()
+            }
+            addTeardownBlock {
+                await sinkGate.release()
+                await store.setWatcherSinkWillApplyHandler(nil)
+                await store.stopWatchingRoot(id: record.id)
+            }
+
+            try write("let timeoutNeedle = true\n", to: root.appendingPathComponent("Added.swift"))
+            try await store.publishSyntheticFileSystemDeltasForTesting(
+                rootID: record.id,
+                deltas: [.fileAdded("Added.swift")]
+            )
+            await sinkGate.waitUntilStarted()
+
+            let clock = ContinuousClock()
+            let started = clock.now
+            do {
+                _ = try await StoreBackedWorkspaceSearch.$freshnessWaitTimeoutOverrideForTesting.withValue(.milliseconds(50)) {
+                    try await searchContent(
+                        pattern: "timeoutNeedle",
+                        store: store
+                    )
+                }
+                XCTFail("Expected workspace freshness timeout")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceFreshnessTimedOut)
+                XCTAssertTrue(error.localizedDescription.contains("Workspace freshness timed out"))
+            }
+            XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+
+            await sinkGate.release()
+            await store.setWatcherSinkWillApplyHandler(nil)
+            await store.stopWatchingRoot(id: record.id)
+        }
+
         func testStoreBackedSearchAcquiresBroadPermitBeforeAwaitingScopedFreshnessAndCatalogSnapshot() async throws {
             let root = try makeTemporaryRoot(name: "ScopedSearchFreshness")
             let addedURL = root.appendingPathComponent("Added.swift")
@@ -1147,6 +2133,404 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             await store.stopWatchingRoot(id: record.id)
         }
 
+        @MainActor
+        func testReadinessWaitMapsTimeoutCancellationAndIdleUnavailable() async throws {
+            let root = try makeTemporaryRoot(name: "SearchReadinessWait")
+            let fileURL = root.appendingPathComponent("OldWorkspace.swift")
+            try write("let oldWorkspaceNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Search Readiness Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Search Readiness Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "searchReadinessErrors")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await readinessGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+
+            do {
+                _ = try await StoreBackedWorkspaceSearch.$readinessWaitTimeoutOverrideForTesting.withValue(.milliseconds(20)) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "oldWorkspaceNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+                XCTFail("Expected workspace readiness timeout")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessTimedOut)
+                XCTAssertTrue(error.localizedDescription.contains("readiness timed out"))
+            }
+            XCTAssertEqual(manager.workspaceSearchReadinessWaiterCountForTesting, 0)
+
+            let cancelledSearch = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.$readinessWaitTimeoutOverrideForTesting.withValue(.seconds(2)) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "oldWorkspaceNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+            }
+            try await waitForReadinessWaiterCount(1, manager: manager)
+            cancelledSearch.cancel()
+            do {
+                _ = try await cancelledSearch.value
+                XCTFail("Expected readiness cancellation")
+            } catch is CancellationError {
+                // Expected: search must preserve manager cancellation rather than remapping it.
+            }
+            try await waitForReadinessWaiterCount(0, manager: manager)
+
+            await manager.cancelCurrentWorkspaceSwitchAndReturnToSystem()
+            XCTAssertEqual(manager.workspaceSearchReadinessState, .idle)
+            do {
+                _ = try await StoreBackedWorkspaceSearch.search(
+                    pattern: "oldWorkspaceNeedle",
+                    mode: .content,
+                    paths: [fileURL.path],
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+                XCTFail("Expected idle readiness to be unavailable")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessUnavailable)
+            }
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+
+        @MainActor
+        func testWorkspaceSearchReadinessSnapshotFenceMatchesMainActorAuthorityAcrossGenerationChange() async throws {
+            let sourceRoot = try makeTemporaryRoot(name: "ReadinessFenceSource")
+            let targetRoot = try makeTemporaryRoot(name: "ReadinessFenceTarget")
+            try write("let sourceNeedle = true\n", to: sourceRoot.appendingPathComponent("Source.swift"))
+            try write("let targetNeedle = true\n", to: targetRoot.appendingPathComponent("Target.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Readiness Fence Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [sourceRoot.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let sourceTicket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+            XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(sourceTicket))
+            let sourceAcceptedOffMain = await Task.detached {
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    return true
+                } catch {
+                    return false
+                }
+            }.value
+            XCTAssertTrue(sourceAcceptedOffMain)
+
+            var generationAdvanceProbeCount = 0
+            manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting {
+                generationAdvanceProbeCount += 1
+                do {
+                    try manager.validateWorkspaceSearchReadiness(sourceTicket)
+                    XCTFail("Expected main-actor readiness authority to reject the old ticket")
+                } catch {
+                    XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+                }
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    XCTFail("Expected the readiness snapshot fence to reject the old ticket")
+                } catch {
+                    XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+                }
+            }
+            let invalidationGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await invalidationGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Readiness Fence Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [targetRoot.path],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "readinessFenceEquivalence")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting(nil)
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await invalidationGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedInvalidationGate = await invalidationGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedInvalidationGate)
+            XCTAssertEqual(generationAdvanceProbeCount, 1)
+
+            XCTAssertThrowsError(try manager.validateWorkspaceSearchReadiness(sourceTicket)) { error in
+                XCTAssertEqual(error as? WorkspaceSearchReadinessWaitError, .superseded)
+            }
+            let invalidatedTicketRejectedOffMain = await Task.detached {
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    return false
+                } catch let error as WorkspaceSearchReadinessWaitError {
+                    return error == .superseded
+                } catch {
+                    return false
+                }
+            }.value
+            XCTAssertTrue(invalidatedTicketRejectedOffMain)
+
+            manager.setWorkspaceHydrationGenerationDidAdvanceHandlerForTesting(nil)
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await invalidationGate.release()
+            let targetSwitchResult = await switchTask.value
+            XCTAssertTrue(targetSwitchResult.didSwitch)
+            let targetTicket = try await manager.awaitWorkspaceSearchReadiness(timeout: .seconds(2))
+            XCTAssertEqual(targetTicket.workspaceID, target.id)
+            XCTAssertNotEqual(targetTicket, sourceTicket)
+            XCTAssertNoThrow(try manager.validateWorkspaceSearchReadiness(targetTicket))
+
+            let generationValidation = await Task.detached {
+                let targetAccepted: Bool
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(targetTicket)
+                    targetAccepted = true
+                } catch {
+                    targetAccepted = false
+                }
+                let oldRejected: Bool
+                do {
+                    try manager.validateWorkspaceSearchReadinessSnapshot(sourceTicket)
+                    oldRejected = false
+                } catch let error as WorkspaceSearchReadinessWaitError {
+                    oldRejected = error == .superseded
+                } catch {
+                    oldRejected = false
+                }
+                return (targetAccepted, oldRejected)
+            }.value
+            XCTAssertTrue(generationValidation.0)
+            XCTAssertTrue(generationValidation.1)
+        }
+
+        @MainActor
+        func testQueuedBroadSearchRejectsSupersededReadinessTicketAfterAdmission() async throws {
+            let root = try makeTemporaryRoot(name: "QueuedReadinessSupersession")
+            try write("let queuedReadinessNeedle = true\n", to: root.appendingPathComponent("Old.swift"))
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Queued Search Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            await configureSingleLeaseSearchLane(store)
+            let admissionGate = AsyncGate()
+            await store.setSearchLanePermitAcquiredHandlerForTesting {
+                await admissionGate.markStartedAndWaitForRelease()
+            }
+            let held = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "queuedReadinessNeedle",
+                    mode: .content,
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+            }
+            addTeardownBlock {
+                held.cancel()
+                await admissionGate.release()
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                _ = try? await held.value
+            }
+            let heldSearchReachedAdmission = await admissionGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(heldSearchReachedAdmission)
+            let queued = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.search(
+                    pattern: "queuedReadinessNeedle",
+                    mode: .content,
+                    rootScope: .visibleWorkspace,
+                    store: store,
+                    workspaceManager: manager
+                )
+            }
+            addTeardownBlock {
+                queued.cancel()
+                await admissionGate.release()
+                _ = try? await queued.value
+            }
+            await assertAsyncTrue(waitForAdmissionWaiterCount(1, store: store))
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Queued Search Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "queuedSearchSupersession")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await admissionGate.release()
+                await readinessGate.release()
+                await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+            await admissionGate.release()
+
+            for searchTask in [held, queued] {
+                do {
+                    _ = try await searchTask.value
+                    XCTFail("Expected the old readiness ticket to be rejected")
+                } catch let error as StoreBackedWorkspaceSearchError {
+                    XCTAssertEqual(error, .workspaceReadinessSuperseded)
+                }
+            }
+            let searchLaneBecameIdle = await waitForSearchLaneIdle(store: store)
+            XCTAssertTrue(searchLaneBecameIdle)
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+            await store.setSearchLanePermitAcquiredHandlerForTesting(nil)
+        }
+
+        @MainActor
+        func testSearchRejectsSupersededReadinessAfterAppliedIngressWait() async throws {
+            let root = try makeTemporaryRoot(name: "IngressReadinessSupersession")
+            let fileURL = root.appendingPathComponent("Old.swift")
+            try write("let ingressReadinessNeedle = true\n", to: fileURL)
+            let store = WorkspaceFileContextStore()
+            let composition = makeComposition(store: store)
+            let manager = composition.workspaceManager
+            await manager.awaitInitialized()
+            let source = manager.createWorkspace(
+                name: "Ingress Search Source \(UUID().uuidString.prefix(8))",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            let sourceSwitchResult = await manager.switchWorkspace(to: source, saveState: false)
+            XCTAssertTrue(sourceSwitchResult.didSwitch)
+
+            let ingressGate = AsyncGate()
+            let searchTask = Task { @MainActor in
+                try await StoreBackedWorkspaceSearch.$freshnessWaitOperationOverrideForTesting.withValue({ _, _ in
+                    await ingressGate.markStartedAndWaitForRelease()
+                    return []
+                }) {
+                    try await StoreBackedWorkspaceSearch.search(
+                        pattern: "ingressReadinessNeedle",
+                        mode: .content,
+                        paths: [fileURL.path],
+                        rootScope: .visibleWorkspace,
+                        store: store,
+                        workspaceManager: manager
+                    )
+                }
+            }
+            addTeardownBlock {
+                searchTask.cancel()
+                await ingressGate.release()
+                _ = try? await searchTask.value
+            }
+            let searchReachedIngressGate = await ingressGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(searchReachedIngressGate)
+
+            let readinessGate = AsyncGate()
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting {
+                await readinessGate.markStartedAndWaitForRelease()
+            }
+            let target = manager.createWorkspace(
+                name: "Ingress Search Target \(UUID().uuidString.prefix(8))",
+                repoPaths: [],
+                ephemeral: true
+            )
+            let switchTask = Task { @MainActor in
+                await manager.switchWorkspace(to: target, saveState: false, reason: "ingressSearchSupersession")
+            }
+            addTeardownBlock {
+                switchTask.cancel()
+                await MainActor.run {
+                    manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+                }
+                await ingressGate.release()
+                await readinessGate.release()
+                _ = await switchTask.value
+            }
+            let switchReachedReadinessGate = await readinessGate.waitUntilStartedWithinTimeout()
+            XCTAssertTrue(switchReachedReadinessGate)
+            let rootsBeforeUnload = await store.roots()
+            XCTAssertTrue(rootsBeforeUnload.contains { $0.standardizedFullPath == root.path })
+            await ingressGate.release()
+
+            do {
+                _ = try await searchTask.value
+                XCTFail("Expected post-ingress readiness validation to reject old-root results")
+            } catch let error as StoreBackedWorkspaceSearchError {
+                XCTAssertEqual(error, .workspaceReadinessSuperseded)
+            }
+
+            manager.setWorkspaceSwitchReadinessDidInvalidateHandlerForTesting(nil)
+            await readinessGate.release()
+            _ = await switchTask.value
+        }
+
         func testMissingSessionWorktreeScopeThrowsTypedUnavailableErrorBeforeAdmission() async throws {
             let logicalRoot = try makeTemporaryRoot(name: "UnavailableWorktreeLogical")
             try write("let baseNeedle = true\n", to: logicalRoot.appendingPathComponent("A.swift"))
@@ -1243,17 +2627,43 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
         )
         try assertOrdered([
             "try await ensureRootScopeAvailable(rootScope, store: store)",
-            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
+            "let readinessTicket = try await acquireSearchReadiness(",
+            "readinessTicket: readinessTicket,",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
             "let effectiveMode = mode == .auto ? FileSearchActor.inferredAutoMode(pattern) : mode",
             "return try await store.withStoreBackedSearchAccess(",
-            "try await ensureRootScopeAvailable(rootScope, store: store)",
-            "try await ensureSearchReady(store: store, workspaceManager: workspaceManager)",
-            "let appliedIngressSamples = await store.awaitAppliedIngress(rootScope: rootScope)",
-            "try Task.checkCancellation()",
+            "if admissionClass != nil {",
+            "try await ensureRootScopeAvailable(",
+            "readinessTicket: readinessTicket,",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "var parsedSearchScope:",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let freshnessRootRefs:",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "appliedIngressSamples = try await awaitAppliedIngress(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
             "let contentFreshnessPolicy = await store.contentSearchFreshnessPolicy(",
-            "try Task.checkCancellation()",
-            "try await performSearch("
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "parsedSearchScope = await refreshExactSearchScopeClauses(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "return try await performSearch("
         ], in: source)
+        let performSearchStart = try XCTUnwrap(source.range(of: "private static func performSearch("))
+        try assertOrdered([
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let catalogRequirement: WorkspaceSearchCatalogAccessRequirement = switch mode",
+            "let catalogAccess = await store.searchCatalogAccess(",
+            "requirement: catalogRequirement",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let visibleRootRefs = await store.rootRefs(scope: .visibleWorkspace)",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "let filterResult = await withTaskCancellationHandler",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "results = try await EditFlowPerf.measure(",
+            "try await fileSearchActor.searchUnified(",
+            "try await validateSearchReadiness(readinessTicket, workspaceManager: workspaceManager)",
+            "results.scopedFileCount = filesToSearch.count"
+        ], in: String(source[performSearchStart.lowerBound...]))
     }
 
     func testSearchScopeParserKeepsRequiredResolutionOrder() throws {
@@ -1265,10 +2675,16 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
             "let hasWildcard = normalized.contains(\"*\")",
             "if hasWildcard {",
             "await store.exactPathResolutionIssue(for: normalized, kind: .either, rootScope: rootScope)",
-            "await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(normalized, rootScope: rootScope)",
-            "await store.lookupPath(WorkspacePathLookupRequest(userPath: normalized, profile: .mcpSearchScope, rootScope: rootScope))",
-            "appendClause(.legacyPrefix(candidateLower: normalized.lowercased()))"
+            "await store.lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(",
+            "let lookupResults = await store.lookupPaths(lookupRequests)",
+            "appendClause(.legacyPrefix(candidateLower: normalizedPath.lowercased()))",
+            "await store.lookupDiscoverablePath("
         ], in: source)
+        XCTAssertEqual(
+            source.components(separatedBy: "parseSearchScopePaths(").count - 1,
+            2,
+            "Explicit search paths must be parsed once, then exact clauses refreshed by root-local lookup"
+        )
     }
 
     private func searchSwiftFiles(paths: [String], store: WorkspaceFileContextStore) async throws -> SearchResults {
@@ -1324,6 +2740,47 @@ final class StoreBackedWorkspaceSearchTests: XCTestCase {
     }
 
     #if DEBUG
+        @MainActor
+        private func makeComposition(
+            store: WorkspaceFileContextStore
+        ) -> WindowStateComposition {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            defer {
+                GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            }
+            return WindowStateCompositionFactory.make(
+                windowID: -700 - Int.random(in: 1 ... 99),
+                deferredInitialAgentSystemWorkspaceRefresh: true,
+                sharedMCPService: MCPService(),
+                workspaceFileContextStore: store
+            )
+        }
+
+        @MainActor
+        private func waitForReadinessWaiterCount(
+            _ expectedCount: Int,
+            manager: WorkspaceManagerViewModel,
+            timeoutNanoseconds: UInt64 = 1_000_000_000,
+            file: StaticString = #filePath,
+            line: UInt = #line
+        ) async throws {
+            let interval: UInt64 = 10_000_000
+            var waited: UInt64 = 0
+            while manager.workspaceSearchReadinessWaiterCountForTesting != expectedCount,
+                  waited < timeoutNanoseconds
+            {
+                try await Task.sleep(nanoseconds: interval)
+                waited += interval
+            }
+            XCTAssertEqual(
+                manager.workspaceSearchReadinessWaiterCountForTesting,
+                expectedCount,
+                file: file,
+                line: line
+            )
+        }
+
         private func assertAsyncTrue(
             _ value: Bool,
             _ message: @autoclosure () -> String = "",

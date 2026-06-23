@@ -799,59 +799,157 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         #endif
     }
 
-    func testNonImportableCLISourcesUseSharedDescriptorHardening() throws {
-        let root = try RepoRoot.url()
-        let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
-        let interactive = try Self.sourceText(
-            "Sources/RepoPromptMCP/Interactive/InteractiveMCPClientSession.swift",
-            relativeTo: root
-        )
-        let transport = try Self.sourceText(
-            "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
-            relativeTo: root
-        )
+    func testNonImportableCLISourcesHardenDescriptorsAndFenceAdoptedSocketReconnects() throws {
+        do {
+            let caseLabel = "testNonImportableCLISourcesUseSharedDescriptorHardening"
+            let root = try RepoRoot.url()
+            let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
+            let interactive = try Self.sourceText(
+                "Sources/RepoPromptMCP/Interactive/InteractiveMCPClientSession.swift",
+                relativeTo: root
+            )
+            let transport = try Self.sourceText(
+                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                relativeTo: root
+            )
 
-        XCTAssertGreaterThanOrEqual(
-            main.occurrenceCount(of: "POSIXDescriptorSupport.setCloseOnExec"),
-            2,
-            "Proxy sockets and kill-signal watcher descriptors should both be hardened"
-        )
-        XCTAssertTrue(main.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)"))
-        XCTAssertTrue(interactive.contains("POSIXDescriptorSupport.setCloseOnExec(fd)"))
-        XCTAssertTrue(interactive.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(fd)"))
-        XCTAssertTrue(transport.contains("POSIXDescriptorSupport.setCloseOnExec(connectedFD)"))
-        XCTAssertTrue(transport.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)"))
+            XCTAssertGreaterThanOrEqual(
+                main.occurrenceCount(of: "POSIXDescriptorSupport.setCloseOnExec"),
+                2,
+                caseLabel + ": Proxy sockets and kill-signal watcher descriptors should both be hardened"
+            )
+            XCTAssertTrue(main.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)"), caseLabel)
+            XCTAssertTrue(interactive.contains("POSIXDescriptorSupport.setCloseOnExec(fd)"), caseLabel)
+            XCTAssertTrue(interactive.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(fd)"), caseLabel)
+            XCTAssertTrue(transport.contains("POSIXDescriptorSupport.setCloseOnExec(connectedFD)"), caseLabel)
+            XCTAssertTrue(transport.contains("POSIXDescriptorSupport.shutdownSocketReadWrite(socketFD)"), caseLabel)
+        }
+
+        do {
+            let caseLabel = "testNonImportableCLISourcesCaptureKillWatcherFDAndFenceAdoptedTransportReconnects"
+            let root = try RepoRoot.url()
+            let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
+            let transport = try Self.sourceText(
+                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                relativeTo: root
+            )
+
+            Self.assertSourceContains(
+                [
+                    "source.setCancelHandler {\n            close(fd)\n        }",
+                    "let source = killSignalSource\n        killSignalSource = nil\n        killSignalFD = -1\n        source?.cancel()"
+                ],
+                in: main,
+                label: caseLabel
+            )
+            Self.assertSourceContains(
+                [
+                    "private var connectionAttempted = false",
+                    "guard !isConnected else { return }",
+                    "guard !connectionAttempted, !socketClosed, !streamFinished else {",
+                    "throw MCPError.connectionClosed",
+                    "connectionAttempted = true"
+                ],
+                in: transport,
+                label: caseLabel
+            )
+            XCTAssertEqual(
+                transport.occurrenceCount(of: "connectionAttempted = false"),
+                1,
+                caseLabel + ": An adopted CLI socket must never become reconnectable after teardown."
+            )
+            XCTAssertFalse(
+                transport.contains("streamFinished = false\n        socketClosed = false"),
+                caseLabel + ": CLI reconnect must not reset torn-down adopted-socket state."
+            )
+        }
     }
 
-    func testAppAndCLIReadersShareFairOneShotTerminalCancellationLifecycle() throws {
-        let root = try RepoRoot.url()
-        let appReader = try Self.sourceText(
-            "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
-            relativeTo: root
-        )
-        let cliReader = try Self.sourceText(
-            "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift",
-            relativeTo: root
-        )
+    func testAppAndCLIReadersPreserveOneShotTerminalCancellationOwnership() throws {
+        do {
+            let caseLabel = "testAppAndCLIReadersShareFairOneShotTerminalCancellationLifecycle"
+            let root = try RepoRoot.url()
+            let appReader = try Self.sourceText(
+                "Sources/RepoPrompt/Infrastructure/MCP/AppShared/NewlineDelimitedSocketReader.swift",
+                relativeTo: root
+            )
+            let cliReader = try Self.sourceText(
+                "Sources/RepoPromptMCP/Shared/NewlineDelimitedSocketReader.swift",
+                relativeTo: root
+            )
 
-        XCTAssertEqual(appReader, cliReader)
-        Self.assertSourceContains(
-            [
-                "public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable",
-                "onTerminal: @escaping (NewlineDelimitedSocketReaderTerminal) -> Void",
-                "onEOF: { onTerminal(.eof(hasResidualData: $0)) }",
-                "onError: { onTerminal(.error($0)) }",
-                "private enum Lifecycle: Equatable",
-                "private var generation: UInt64 = 0",
-                "private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]",
-                "finishTerminalOnQueue(.failure(posixError), generation: pumpGeneration)",
-                "finishTerminalOnQueue(.success(!buffer.isEmpty), generation: pumpGeneration)",
-                "guard terminalGeneration == generation, lifecycle == .running else { return }",
-                "cancelCurrentSourceOnQueue()",
-                "guard pendingCancelledSources.removeValue(forKey: sourceID) != nil else { return }"
-            ],
-            in: appReader
-        )
+            XCTAssertEqual(appReader, cliReader, caseLabel)
+            Self.assertSourceContains(
+                [
+                    "public enum NewlineDelimitedSocketReaderTerminal: @unchecked Sendable",
+                    "onTerminal: @escaping (NewlineDelimitedSocketReaderTerminal) -> Void",
+                    "onEOF: { onTerminal(.eof(hasResidualData: $0)) }",
+                    "onError: { onTerminal(.error($0)) }",
+                    "private enum Lifecycle: Equatable",
+                    "private var generation: UInt64 = 0",
+                    "private var pendingCancelledSources: [ObjectIdentifier: ReadEventSource] = [:]",
+                    "finishTerminalOnQueue(.failure(posixError), generation: pumpGeneration)",
+                    "finishTerminalOnQueue(.success(!buffer.isEmpty), generation: pumpGeneration)",
+                    "guard terminalGeneration == generation, lifecycle == .running else { return }",
+                    "cancelCurrentSourceOnQueue()",
+                    "guard pendingCancelledSources.removeValue(forKey: sourceID) != nil else { return }"
+                ],
+                in: appReader,
+                label: caseLabel
+            )
+        }
+
+        do {
+            let caseLabel = "testNonImportableCLITransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce"
+            let root = try RepoRoot.url()
+            let transport = try Self.sourceText(
+                "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
+                relativeTo: root
+            )
+
+            Self.assertSourceContains(
+                [
+                    "private struct ReaderIdentity: Hashable {",
+                    "private struct ActiveReaderOwnership {",
+                    "private struct PendingReaderCancellation {",
+                    "let reader: NewlineDelimitedSocketReader",
+                    "let transportRetainer: BootstrapSocketMCPTransport",
+                    "private var activeReaderOwnership: ActiveReaderOwnership?",
+                    "private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]",
+                    "private var earlyReaderCancellations: Set<ReaderIdentity> = []",
+                    "activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)",
+                    "activeReaderOwnership = nil\n\n        let identity = activeOwnership.identity",
+                    "pendingReaderCancellations[identity.token] = PendingReaderCancellation(",
+                    "transportRetainer: self",
+                    "activeOwnership.reader.stop()",
+                    "if earlyReaderCancellations.contains(identity) {\n            finalizeReaderCancellation(identity)",
+                    "if pendingReaderCancellations[identity.token]?.identity == identity {",
+                    "if activeReaderOwnership?.identity == identity {\n            earlyReaderCancellations.insert(identity)",
+                    "let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)",
+                    "earlyReaderCancellations.remove(identity)",
+                    "withExtendedLifetime(ownership) {",
+                    "Task { await transport.handleReaderTerminal(terminal, from: identity) }",
+                    "guard activeReaderOwnership?.identity == identity else {",
+                    "if !pendingReaderCancellationOwnsCurrentSocket() {",
+                    "closeSocketIfNeeded()"
+                ],
+                in: transport,
+                label: caseLabel
+            )
+
+            XCTAssertTrue(
+                transport.contains(
+                    "onTerminal: { [weak self] terminal in\n                guard let transport = self else { return }"
+                ),
+                caseLabel + ": Reader terminal delivery must avoid a permanent reader/transport cycle."
+            )
+            XCTAssertTrue(
+                transport.contains(
+                    "transport.scheduleReaderCancellationCallback {\n                    Task { await transport.readSourceDidCancel(identity) }"
+                ),
+                caseLabel + ": Cancellation delivery must strongly retain the transport until the actor claims the identity."
+            )
+        }
     }
 
     func testAppTransportReplacesTerminalInboundChannelsBeforeReconnect() throws {
@@ -881,100 +979,18 @@ final class MCPSocketDescriptorHardeningTests: XCTestCase {
         )
     }
 
-    func testNonImportableCLITransportClaimsEarlyAndDelayedReaderCancellationExactlyOnce() throws {
-        let root = try RepoRoot.url()
-        let transport = try Self.sourceText(
-            "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
-            relativeTo: root
-        )
-
-        Self.assertSourceContains(
-            [
-                "private struct ReaderIdentity: Hashable {",
-                "private struct ActiveReaderOwnership {",
-                "private struct PendingReaderCancellation {",
-                "let reader: NewlineDelimitedSocketReader",
-                "let transportRetainer: BootstrapSocketMCPTransport",
-                "private var activeReaderOwnership: ActiveReaderOwnership?",
-                "private var pendingReaderCancellations: [UInt64: PendingReaderCancellation] = [:]",
-                "private var earlyReaderCancellations: Set<ReaderIdentity> = []",
-                "activeReaderOwnership = ActiveReaderOwnership(identity: identity, reader: newReader)",
-                "activeReaderOwnership = nil\n\n        let identity = activeOwnership.identity",
-                "pendingReaderCancellations[identity.token] = PendingReaderCancellation(",
-                "transportRetainer: self",
-                "activeOwnership.reader.stop()",
-                "if earlyReaderCancellations.contains(identity) {\n            finalizeReaderCancellation(identity)",
-                "if pendingReaderCancellations[identity.token]?.identity == identity {",
-                "if activeReaderOwnership?.identity == identity {\n            earlyReaderCancellations.insert(identity)",
-                "let ownership = pendingReaderCancellations.removeValue(forKey: identity.token)",
-                "earlyReaderCancellations.remove(identity)",
-                "withExtendedLifetime(ownership) {",
-                "Task { await transport.handleReaderTerminal(terminal, from: identity) }",
-                "guard activeReaderOwnership?.identity == identity else {",
-                "if !pendingReaderCancellationOwnsCurrentSocket() {",
-                "closeSocketIfNeeded()"
-            ],
-            in: transport
-        )
-
-        XCTAssertTrue(
-            transport.contains(
-                "onTerminal: { [weak self] terminal in\n                guard let transport = self else { return }"
-            ),
-            "Reader terminal delivery must avoid a permanent reader/transport cycle."
-        )
-        XCTAssertTrue(
-            transport.contains(
-                "transport.scheduleReaderCancellationCallback {\n                    Task { await transport.readSourceDidCancel(identity) }"
-            ),
-            "Cancellation delivery must strongly retain the transport until the actor claims the identity."
-        )
-    }
-
-    func testNonImportableCLISourcesCaptureKillWatcherFDAndFenceAdoptedTransportReconnects() throws {
-        let root = try RepoRoot.url()
-        let main = try Self.sourceText("Sources/RepoPromptMCP/main.swift", relativeTo: root)
-        let transport = try Self.sourceText(
-            "Sources/RepoPromptMCP/Transports/BootstrapSocketMCPTransport.swift",
-            relativeTo: root
-        )
-
-        Self.assertSourceContains(
-            [
-                "source.setCancelHandler {\n            close(fd)\n        }",
-                "let source = killSignalSource\n        killSignalSource = nil\n        killSignalFD = -1\n        source?.cancel()"
-            ],
-            in: main
-        )
-        Self.assertSourceContains(
-            [
-                "private var connectionAttempted = false",
-                "guard !isConnected else { return }",
-                "guard !connectionAttempted, !socketClosed, !streamFinished else {",
-                "throw MCPError.connectionClosed",
-                "connectionAttempted = true"
-            ],
-            in: transport
-        )
-        XCTAssertEqual(
-            transport.occurrenceCount(of: "connectionAttempted = false"),
-            1,
-            "An adopted CLI socket must never become reconnectable after teardown."
-        )
-        XCTAssertFalse(
-            transport.contains("streamFinished = false\n        socketClosed = false"),
-            "CLI reconnect must not reset torn-down adopted-socket state."
-        )
-    }
-
     private static func assertSourceContains(
         _ requiredSnippets: [String],
         in source: String,
+        label: String? = nil,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         for snippet in requiredSnippets {
-            XCTAssertTrue(source.contains(snippet), "Missing CLI transport cleanup invariant: \(snippet)", file: file, line: line)
+            let message = [label, "Missing CLI transport cleanup invariant: \(snippet)"]
+                .compactMap(\.self)
+                .joined(separator: ": ")
+            XCTAssertTrue(source.contains(snippet), message, file: file, line: line)
         }
     }
 

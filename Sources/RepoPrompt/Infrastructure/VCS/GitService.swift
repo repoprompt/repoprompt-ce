@@ -49,7 +49,20 @@ actor GitService {
 
     private let worktreeMutationCoordinator = GitWorktreeMutationCoordinator()
     private let inheritedProcessEnvironment = ProcessInfo.processInfo.environment
+    private let gitExecutableURL: URL
+    private let processAdmissionController: GitProcessAdmissionController
+    private let processTerminationGrace: Duration
     private var preparedBaseProcessEnvironment: [String: String]?
+
+    init(
+        gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
+        processAdmissionController: GitProcessAdmissionController = .shared,
+        processTerminationGrace: Duration = GitService.gitProcessTerminationGrace
+    ) {
+        self.gitExecutableURL = gitExecutableURL
+        self.processAdmissionController = processAdmissionController
+        self.processTerminationGrace = processTerminationGrace
+    }
 
     struct UncommittedFile: Equatable {
         let path: String
@@ -2344,7 +2357,7 @@ actor GitService {
         let budgetURL = budgetRepoURL ?? repoURL
         let repositoryKey = getLayout(for: budgetURL)?.commonDir.standardizedFileURL.path
             ?? budgetURL.standardizedFileURL.path
-        let lease = try await GitProcessAdmissionController.shared.acquire(repositoryKey: repositoryKey)
+        let lease = try await processAdmissionController.acquire(repositoryKey: repositoryKey)
         do {
             try Task.checkCancellation()
             let result = try await runAdmittedGit(
@@ -2355,10 +2368,10 @@ actor GitService {
                 diagnosticRepositoryPath: budgetURL.standardizedFileURL.path,
                 processQueueWaitMicroseconds: lease.queueWaitMicroseconds
             )
-            await GitProcessAdmissionController.shared.release(lease)
+            await processAdmissionController.release(lease)
             return result
         } catch {
-            await GitProcessAdmissionController.shared.release(lease)
+            await processAdmissionController.release(lease)
             throw error
         }
     }
@@ -2373,8 +2386,9 @@ actor GitService {
     ) async throws -> (String, String, Int32) {
         let process = Process()
         let timeoutController = GitProcessTimeoutController()
+        let lifecycleController = GitProcessLifecycleController()
         let commandRecorder = MCPToolWorkCountDiagnostics.gitCommandRecorder()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.executableURL = gitExecutableURL
         process.arguments = args
         process.currentDirectoryURL = repoURL
         process.environment = environment
@@ -2420,7 +2434,7 @@ actor GitService {
             return buf
         }
 
-        return try await withTaskCancellationHandler(operation: {
+        let result = try await withTaskCancellationHandler(operation: {
             try await withCheckedThrowingContinuation { continuation in
                 // Drain stdout
                 outPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -2436,6 +2450,7 @@ actor GitService {
                 }
 
                 process.terminationHandler = { proc in
+                    lifecycleController.didTerminate()
                     timeoutController.cancel()
 
                     // Stop handlers to break strong reference cycles
@@ -2466,15 +2481,26 @@ actor GitService {
                 }
 
                 do {
+                    try lifecycleController.checkCancellationBeforeSpawn()
                     let spawnStart = DispatchTime.now().uptimeNanoseconds
                     try process.run()
                     let processIdentifier = process.processIdentifier
-                    timeoutController.schedule(
+                    let spawnState = lifecycleController.didSpawn(
                         process: process,
                         processIdentifier: processIdentifier,
-                        timeout: Self.gitProcessTimeout,
-                        terminationGrace: Self.gitProcessTerminationGrace
+                        terminationGrace: processTerminationGrace
                     )
+                    if spawnState == .running {
+                        timeoutController.schedule(
+                            process: process,
+                            processIdentifier: processIdentifier,
+                            timeout: Self.gitProcessTimeout,
+                            terminationGrace: processTerminationGrace
+                        )
+                        if !lifecycleController.shouldKeepNormalTimeout() {
+                            timeoutController.cancel()
+                        }
+                    }
                     let spawnEnd = DispatchTime.now().uptimeNanoseconds
                     processMetrics.spawnMicroseconds = Int(
                         clamping: spawnEnd >= spawnStart ? (spawnEnd - spawnStart) / 1000 : 0
@@ -2515,21 +2541,21 @@ actor GitService {
                     errPipe.fileHandleForReading.readabilityHandler = nil
                     outDrain.cancel()
                     errDrain.cancel()
-                    continuation.resume(throwing: error)
+                    continuation.resume(throwing: lifecycleController.cancellationErrorIfRequested() ?? error)
                 }
             }
         }, onCancel: {
             timeoutController.cancel()
-            // Stop callbacks and terminate before waiting on a drain lock. A callback may be
-            // blocked in FileHandle.availableData until the child closes its pipe.
-            outPipe.fileHandleForReading.readabilityHandler = nil
-            errPipe.fileHandleForReading.readabilityHandler = nil
-            if process.isRunning {
-                process.terminate()
-            }
-            outDrain.cancel()
-            errDrain.cancel()
+            // Keep stdout/stderr drains active until termination. A child may flush more than
+            // pipe capacity while handling SIGTERM; closing the drains here can block that
+            // flush forever and prevent the termination handler from reaping the process.
+            lifecycleController.requestCancellation(
+                process: process,
+                terminationGrace: processTerminationGrace
+            )
         })
+        try Task.checkCancellation()
+        return result
     }
 
     static func shouldFallbackFromWorktreeListZError(_ stderr: String) -> Bool {
@@ -3161,6 +3187,136 @@ private final class GitProcessTimeoutController: @unchecked Sendable {
         defer { lock.unlock() }
         task?.cancel()
         task = nil
+    }
+}
+
+private final class GitProcessLifecycleController: @unchecked Sendable {
+    enum SpawnState: Equatable {
+        case running
+        case cancellationRequested
+        case terminated
+    }
+
+    private let lock = NSLock()
+    private var cancellationRequested = false
+    private var processIdentifier: pid_t?
+    private var terminated = false
+    private var cancellationEscalationTask: Task<Void, Never>?
+
+    func checkCancellationBeforeSpawn() throws {
+        lock.lock()
+        let shouldCancel = cancellationRequested
+        lock.unlock()
+        if shouldCancel {
+            throw CancellationError()
+        }
+    }
+
+    func didSpawn(
+        process: Process,
+        processIdentifier: pid_t,
+        terminationGrace: Duration
+    ) -> SpawnState {
+        lock.lock()
+        if terminated {
+            let wasCancelled = cancellationRequested
+            lock.unlock()
+            return wasCancelled ? .cancellationRequested : .terminated
+        }
+
+        self.processIdentifier = processIdentifier
+        let shouldTerminate = cancellationRequested
+        if shouldTerminate {
+            armCancellationEscalationLocked(
+                process: process,
+                processIdentifier: processIdentifier,
+                terminationGrace: terminationGrace
+            )
+        }
+        lock.unlock()
+
+        if shouldTerminate, process.isRunning {
+            process.terminate()
+        }
+        return shouldTerminate ? .cancellationRequested : .running
+    }
+
+    func requestCancellation(
+        process: Process,
+        terminationGrace: Duration
+    ) {
+        lock.lock()
+        cancellationRequested = true
+        let processIdentifier = terminated ? nil : processIdentifier
+        if let processIdentifier {
+            armCancellationEscalationLocked(
+                process: process,
+                processIdentifier: processIdentifier,
+                terminationGrace: terminationGrace
+            )
+        }
+        lock.unlock()
+
+        if processIdentifier != nil, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func shouldKeepNormalTimeout() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !cancellationRequested && !terminated
+    }
+
+    func cancellationErrorIfRequested() -> CancellationError? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationRequested ? CancellationError() : nil
+    }
+
+    func didTerminate() {
+        lock.lock()
+        terminated = true
+        processIdentifier = nil
+        let escalationTask = cancellationEscalationTask
+        cancellationEscalationTask = nil
+        lock.unlock()
+        escalationTask?.cancel()
+    }
+
+    private func armCancellationEscalationLocked(
+        process: Process,
+        processIdentifier: pid_t,
+        terminationGrace: Duration
+    ) {
+        guard cancellationEscalationTask == nil else { return }
+        cancellationEscalationTask = Task.detached { [self] in
+            do {
+                try await Task.sleep(for: terminationGrace)
+            } catch {
+                return
+            }
+            sendCancellationKillIfNeeded(
+                process: process,
+                processIdentifier: processIdentifier
+            )
+        }
+    }
+
+    private func sendCancellationKillIfNeeded(
+        process: Process,
+        processIdentifier: pid_t
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard cancellationRequested,
+              !terminated,
+              self.processIdentifier == processIdentifier,
+              process.isRunning
+        else {
+            return
+        }
+        _ = kill(processIdentifier, SIGKILL)
     }
 }
 

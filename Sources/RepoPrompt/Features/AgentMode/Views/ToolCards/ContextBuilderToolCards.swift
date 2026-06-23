@@ -415,11 +415,10 @@ private struct ContextBuilderPlanProgressView: View {
     }
 
     private func openOraclePreview() {
-        guard let oracleOpenContext, let followUpChatID else { return }
-        let userInfo = contextBuilderOraclePopoverUserInfo(
+        guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
             chatID: followUpChatID
-        )
+        ) else { return }
         NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
     }
 
@@ -453,7 +452,10 @@ private struct ContextBuilderPlanProgressView: View {
                 }
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(oracleOpenContext == nil || followUpChatID == nil)
+                .disabled(contextBuilderOraclePopoverUserInfo(
+                    openContext: oracleOpenContext,
+                    chatID: followUpChatID
+                ) == nil)
 
                 Button("Cancel") {
                     onCancelPlan()
@@ -470,7 +472,7 @@ private struct ContextBuilderCompletedSummaryView: View {
     let oracleOpenContext: AgentOracleOpenContext?
 
     private var followUpChatID: String? {
-        contextBuilderFollowUpChatID(for: dto) ?? nonEmptyContextBuilderValue(oracleOpenContext?.chatID)
+        contextBuilderFollowUpChatID(for: dto)
     }
 
     private var detailParts: [String] {
@@ -495,11 +497,10 @@ private struct ContextBuilderCompletedSummaryView: View {
     }
 
     private func openOraclePreview() {
-        guard let oracleOpenContext else { return }
-        let userInfo = contextBuilderOraclePopoverUserInfo(
+        guard let userInfo = contextBuilderOraclePopoverUserInfo(
             openContext: oracleOpenContext,
             chatID: followUpChatID
-        )
+        ) else { return }
         NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
     }
 
@@ -531,7 +532,10 @@ private struct ContextBuilderCompletedSummaryView: View {
             Button("Open Oracle", action: openOraclePreview)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
-                .disabled(oracleOpenContext == nil || followUpChatID == nil)
+                .disabled(contextBuilderOraclePopoverUserInfo(
+                    openContext: oracleOpenContext,
+                    chatID: followUpChatID
+                ) == nil)
         }
     }
 }
@@ -543,36 +547,24 @@ private enum ContextBuilderCardPhase {
 }
 
 func contextBuilderOraclePopoverUserInfo(
-    openContext: AgentOracleOpenContext,
+    openContext: AgentOracleOpenContext?,
     chatID: String?
-) -> [AnyHashable: Any] {
-    var userInfo: [AnyHashable: Any] = ["windowID": openContext.windowID]
-    if let tabID = openContext.tabID {
-        userInfo["tabID"] = tabID
-    }
-    if let resolvedChatID = nonEmptyContextBuilderValue(chatID) ?? nonEmptyContextBuilderValue(openContext.chatID) {
-        userInfo["chatID"] = resolvedChatID
-    }
-    return userInfo
+) -> [AnyHashable: Any]? {
+    AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: chatID
+    )
 }
 
 func contextBuilderFollowUpChatID(for dto: ToolResultDTOs.ContextBuilderDTO?) -> String? {
-    guard let dto else { return nil }
-    let planChatID = nonEmptyContextBuilderValue(dto.plan?.chatID)
-    let reviewChatID = nonEmptyContextBuilderValue(dto.review?.chatID)
-    let responseType = dto.responseType?
-        .trimmingCharacters(in: .whitespacesAndNewlines)
-        .lowercased()
-
-    switch responseType {
-    case "review":
-        return reviewChatID ?? planChatID
-    case "plan":
-        return planChatID ?? reviewChatID
-    default:
-        // Legacy payloads did not always include response_type; preserve the prior
-        // plan-first fallback unless the payload only contains a review branch.
-        return planChatID ?? reviewChatID
+    guard let dto,
+          let branch = ContextBuilderFollowUpBranch.select(responseType: dto.responseType)
+    else { return nil }
+    switch branch {
+    case .review:
+        return nonEmptyContextBuilderValue(dto.review?.chatID)
+    case .plan:
+        return nonEmptyContextBuilderValue(dto.plan?.chatID)
     }
 }
 

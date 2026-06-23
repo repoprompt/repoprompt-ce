@@ -299,6 +299,7 @@ struct AgentRunMCPSnapshot: Equatable {
     // MARK: - Snapshot properties
 
     let sessionID: UUID
+    let runID: UUID?
     let tabID: UUID?
     let sessionName: String?
 
@@ -319,6 +320,46 @@ struct AgentRunMCPSnapshot: Equatable {
     let worktreeBindings: [WorktreeBinding]
     let activeWorktreeMerges: [AgentSessionWorktreeMergeSummary]
 
+    init(
+        sessionID: UUID,
+        runID: UUID? = nil,
+        tabID: UUID?,
+        sessionName: String?,
+        agentRaw: String?,
+        agentDisplayName: String?,
+        modelRaw: String?,
+        reasoningEffortRaw: String?,
+        status: Status,
+        statusText: String?,
+        latestAssistantPreview: String?,
+        interaction: Interaction?,
+        transcriptItemCount: Int,
+        updatedAt: Date,
+        parentSessionID: UUID?,
+        failureReason: FailureReason?,
+        worktreeBindings: [WorktreeBinding],
+        activeWorktreeMerges: [AgentSessionWorktreeMergeSummary]
+    ) {
+        self.sessionID = sessionID
+        self.runID = runID
+        self.tabID = tabID
+        self.sessionName = sessionName
+        self.agentRaw = agentRaw
+        self.agentDisplayName = agentDisplayName
+        self.modelRaw = modelRaw
+        self.reasoningEffortRaw = reasoningEffortRaw
+        self.status = status
+        self.statusText = statusText
+        self.latestAssistantPreview = latestAssistantPreview
+        self.interaction = interaction
+        self.transcriptItemCount = transcriptItemCount
+        self.updatedAt = updatedAt
+        self.parentSessionID = parentSessionID
+        self.failureReason = failureReason
+        self.worktreeBindings = worktreeBindings
+        self.activeWorktreeMerges = activeWorktreeMerges
+    }
+
     var isActionableForMCPWait: Bool {
         interaction != nil || status == .waitingForInput || status.isTerminal
     }
@@ -330,6 +371,9 @@ struct AgentRunMCPSnapshot: Equatable {
             "transcript_item_count": .int(transcriptItemCount),
             "updated_at": .string(Self.timestampFormatter.string(from: updatedAt))
         ]
+        if let runID {
+            obj["run_id"] = .string(runID.uuidString)
+        }
         if let statusText, !statusText.isEmpty {
             obj["status_text"] = .string(statusText)
         }

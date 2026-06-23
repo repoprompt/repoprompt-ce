@@ -479,9 +479,14 @@ final class ACPIntegratedAgentModeRunner {
             return
         }
 
+        var providerInitializationCompleted = false
         do {
+            let providerName = runRequest.agentKind.rawValue
+            await lease.providerInitializationStarted(provider: providerName)
             log("bootstrap begin", runID: runID)
             let bootstrap = try await controller.bootstrap()
+            providerInitializationCompleted = true
+            await lease.providerInitializationCompleted(provider: providerName, outcome: "ready")
             log("bootstrap completed sessionID=\(bootstrap.sessionID)", runID: runID)
             guard session.runID == runID,
                   session.activeRunAttemptID == runAttemptID
@@ -543,6 +548,9 @@ final class ACPIntegratedAgentModeRunner {
                 prepareControllerForNextTurn: false
             )
         } catch is CancellationError {
+            if !providerInitializationCompleted {
+                await lease.providerInitializationCompleted(provider: runRequest.agentKind.rawValue, outcome: "cancelled")
+            }
             log("fresh start cancelled", runID: runID)
             await finalize(
                 session: session,
@@ -556,6 +564,9 @@ final class ACPIntegratedAgentModeRunner {
                 shouldShutdownController: true
             )
         } catch {
+            if !providerInitializationCompleted {
+                await lease.providerInitializationCompleted(provider: runRequest.agentKind.rawValue, outcome: "failed")
+            }
             let normalized = await controller.normalizeError(error)
             let normalizedText = displayText(for: normalized)
             log("fresh start failed raw=\(String(describing: error)) normalized=\(normalizedText)", runID: runID)

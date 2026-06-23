@@ -175,11 +175,27 @@ enum ToolOutputFormatter {
         var lines: [String] = []
         let isBackpressure = dto.errorCode == "search_backpressure" && dto.retryable == true
         let isWorktreeUnavailable = dto.errorCode == "worktree_scope_unavailable" && dto.retryable == true
-        lines.append((isBackpressure || isWorktreeUnavailable) ? "## Search Results ⚠️" : "## Search Results ❌")
+        let isFreshnessTimeout = dto.errorCode == "workspace_freshness_timeout" && dto.retryable == true
+        let readinessStatus: String? = switch dto.errorCode {
+        case "workspace_readiness_unavailable":
+            "Workspace readiness unavailable"
+        case "workspace_readiness_timeout":
+            "Workspace readiness timed out"
+        case "workspace_readiness_superseded":
+            "Workspace changed during search"
+        default:
+            nil
+        }
+        let isReadinessFailure = readinessStatus != nil && dto.retryable == true
+        lines.append((isBackpressure || isWorktreeUnavailable || isFreshnessTimeout || isReadinessFailure) ? "## Search Results ⚠️" : "## Search Results ❌")
         if isBackpressure {
             lines.append("- **Status**: Temporarily busy")
         } else if isWorktreeUnavailable {
             lines.append("- **Status**: Worktree unavailable")
+        } else if isFreshnessTimeout {
+            lines.append("- **Status**: Workspace freshness timed out")
+        } else if isReadinessFailure, let readinessStatus {
+            lines.append("- **Status**: \(readinessStatus)")
         }
         lines.append("- **Error**: \(error)")
         if let errorCode = dto.errorCode, !errorCode.isEmpty {
@@ -2270,6 +2286,9 @@ extension ToolOutputFormatter {
                     out.append("- Git: \(formatTokenCount(git))")
                 }
             }
+            if let accounting = ctx.tokenAccounting {
+                out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
+            }
             if let sel = ctx.selection {
                 if let summary = sel.summary {
                     let totalCount = summary.fullCount + summary.sliceCount + summary.codemapCount
@@ -2713,6 +2732,10 @@ extension ToolOutputFormatter {
             if let total = dto.totalTokens {
                 out.append("- Total tokens: \(total) (Auto view)")
             }
+        }
+
+        if let accounting = dto.tokenAccounting {
+            out.append("- Token accounting: \(accounting.status) from \(accounting.source)\(accounting.refreshPending ? "; refresh pending" : "")")
         }
 
         // Copy preset effect (only if it differs from auto)
@@ -4841,6 +4864,7 @@ extension ToolOutputFormatter {
         let interaction = object["interaction"]?.objectValue
         let meta = object["_meta"]?.objectValue
         let sessionID = object["session_id"]?.stringValue ?? session?["id"]?.stringValue
+        let runID = object["run_id"]?.stringValue
         let status = prettifiedAgentStatus(object["status"]?.stringValue)
         let statusText = object["status_text"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionName = session?["name"]?.stringValue
@@ -4884,6 +4908,9 @@ extension ToolOutputFormatter {
         }
         if let sessionID, !sessionID.isEmpty {
             lines.append("- Session ID: `\(sessionID)`")
+        }
+        if let runID, !runID.isEmpty {
+            lines.append("- Run ID: `\(runID)`")
         }
         lines.append(contentsOf: formattedAgentRunWorktreeLines(worktrees))
         // Multi-wait metadata

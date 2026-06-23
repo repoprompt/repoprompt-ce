@@ -71,6 +71,11 @@ private struct ContentReadResult {
     }
 }
 
+struct FileContentPrefix {
+    let content: String
+    let truncated: Bool
+}
+
 private struct ValidatedContentFile {
     let url: URL
     let fileSize: Int64
@@ -97,6 +102,8 @@ actor ContentReadAsyncLimiter {
             let interactiveGrantCount: Int
             let normalGrantCount: Int
             let bulkGrantCount: Int
+            let backgroundPermitLimit: Int
+            let activeBackgroundPermitCount: Int
 
             var isIdle: Bool {
                 activePermitCount == 0 && queuedWaiterCount == 0 && ownerLaneCount == 0
@@ -112,6 +119,7 @@ actor ContentReadAsyncLimiter {
 
     private struct PermitAcquisition {
         let ownerID: UUID
+        let priorityClass: PriorityClass
         let waited: Bool
         let queueDepth: Int
         let waiterCount: Int
@@ -132,7 +140,10 @@ actor ContentReadAsyncLimiter {
     private let retryAfterMilliseconds: Int
     private let agePromotionNanoseconds: UInt64
     private let maxConsecutiveInteractiveGrants: Int
+    private let backgroundPermitLimit: Int
+    private let nowUptimeNanoseconds: @Sendable () -> UInt64
     private var availablePermits: Int
+    private var activeBackgroundPermitCount = 0
     private var waiterStates: [UUID: WaiterState] = [:]
     private var activePermitCountsByOwner: [UUID: Int] = [:]
     private var lastGrantOrdinalByOwner: [UUID: UInt64] = [:]
@@ -151,7 +162,8 @@ actor ContentReadAsyncLimiter {
         maxQueuedWaiterCount: Int = 512,
         retryAfterMilliseconds: Int = 1000,
         agePromotionNanoseconds: UInt64 = 1_000_000_000,
-        maxConsecutiveInteractiveGrants: Int = 4
+        maxConsecutiveInteractiveGrants: Int = 4,
+        nowUptimeNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) {
         precondition(capacity > 0, "Content read limiter must have at least one permit")
         precondition(maxQueuedWaiterCount >= 0)
@@ -162,6 +174,8 @@ actor ContentReadAsyncLimiter {
         self.retryAfterMilliseconds = retryAfterMilliseconds
         self.agePromotionNanoseconds = agePromotionNanoseconds
         self.maxConsecutiveInteractiveGrants = maxConsecutiveInteractiveGrants
+        backgroundPermitLimit = capacity > 1 ? capacity - 1 : 1
+        self.nowUptimeNanoseconds = nowUptimeNanoseconds
         availablePermits = capacity
     }
 
@@ -221,10 +235,11 @@ actor ContentReadAsyncLimiter {
     ) async throws -> PermitAcquisition {
         try Task.checkCancellation()
         scheduleAvailablePermits()
-        if availablePermits > 0, waiterStates.isEmpty {
+        let priorityClass = Self.priorityClass(for: workloadClass)
+        if waiterStates.isEmpty, canAllocatePermit(priorityClass: priorityClass) {
             return allocatePermit(
                 ownerID: ownerID,
-                priorityClass: Self.priorityClass(for: workloadClass),
+                priorityClass: priorityClass,
                 waited: false
             )
         }
@@ -293,7 +308,7 @@ actor ContentReadAsyncLimiter {
             priorityClass: Self.priorityClass(for: workloadClass),
             lifecycleCorrelation: lifecycleCorrelation,
             enqueueOrdinal: nextEnqueueOrdinal,
-            enqueuedAtUptimeNanoseconds: DispatchTime.now().uptimeNanoseconds
+            enqueuedAtUptimeNanoseconds: nowUptimeNanoseconds()
         )
         EditFlowPerf.lifecycleEvent(
             EditFlowPerf.Lifecycle.FileSystem.contentReadWorkerPermitWaitBegan,
@@ -325,6 +340,12 @@ actor ContentReadAsyncLimiter {
     }
 
     private func release(_ acquisition: PermitAcquisition) {
+        if acquisition.priorityClass == .bulk {
+            #if DEBUG
+                assert(activeBackgroundPermitCount > 0, "Content read limiter background over-release detected")
+            #endif
+            activeBackgroundPermitCount = max(0, activeBackgroundPermitCount - 1)
+        }
         if let activeCount = activePermitCountsByOwner[acquisition.ownerID] {
             if activeCount <= 1 {
                 activePermitCountsByOwner.removeValue(forKey: acquisition.ownerID)
@@ -362,8 +383,11 @@ actor ContentReadAsyncLimiter {
     }
 
     private func nextWaiterID() -> UUID? {
-        let now = DispatchTime.now().uptimeNanoseconds
-        if let aged = waiterStates.min(by: { lhs, rhs in
+        let now = nowUptimeNanoseconds()
+        let eligibleWaiters = waiterStates.filter {
+            canAllocatePermit(priorityClass: $0.value.priorityClass)
+        }
+        if let aged = eligibleWaiters.min(by: { lhs, rhs in
             let lhsAged = elapsedNanoseconds(since: lhs.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds
             let rhsAged = elapsedNanoseconds(since: rhs.value.enqueuedAtUptimeNanoseconds, now: now) >= agePromotionNanoseconds
             if lhsAged != rhsAged { return lhsAged && !rhsAged }
@@ -372,9 +396,15 @@ actor ContentReadAsyncLimiter {
             return aged.key
         }
 
-        let hasInteractive = waiterStates.values.contains { $0.priorityClass == .interactive }
-        let hasNormal = waiterStates.values.contains { $0.priorityClass == .normal }
-        let hasBulk = waiterStates.values.contains { $0.priorityClass == .bulk }
+        let hasInteractive = waiterStates.values.contains {
+            $0.priorityClass == .interactive && canAllocatePermit(priorityClass: $0.priorityClass)
+        }
+        let hasNormal = waiterStates.values.contains {
+            $0.priorityClass == .normal && canAllocatePermit(priorityClass: $0.priorityClass)
+        }
+        let hasBulk = waiterStates.values.contains {
+            $0.priorityClass == .bulk && canAllocatePermit(priorityClass: $0.priorityClass)
+        }
         let selectedPriority: PriorityClass
         if hasInteractive,
            consecutiveInteractiveGrants < maxConsecutiveInteractiveGrants || (!hasNormal && !hasBulk)
@@ -394,7 +424,9 @@ actor ContentReadAsyncLimiter {
 
     private func nextWaiterID(priorityClass: PriorityClass) -> UUID? {
         var firstByOwner: [UUID: (id: UUID, state: WaiterState)] = [:]
-        for (id, state) in waiterStates where state.priorityClass == priorityClass {
+        for (id, state) in waiterStates
+            where state.priorityClass == priorityClass && canAllocatePermit(priorityClass: state.priorityClass)
+        {
             if let existing = firstByOwner[state.ownerID], existing.state.enqueueOrdinal <= state.enqueueOrdinal {
                 continue
             }
@@ -422,7 +454,13 @@ actor ContentReadAsyncLimiter {
         priorityClass: PriorityClass,
         waited: Bool
     ) -> PermitAcquisition {
+        #if DEBUG
+            assert(canAllocatePermit(priorityClass: priorityClass), "Content read limiter allocation exceeded workload capacity")
+        #endif
         availablePermits -= 1
+        if priorityClass == .bulk {
+            activeBackgroundPermitCount += 1
+        }
         activePermitCountsByOwner[ownerID, default: 0] += 1
         nextGrantOrdinal &+= 1
         lastGrantOrdinalByOwner[ownerID] = nextGrantOrdinal
@@ -440,10 +478,16 @@ actor ContentReadAsyncLimiter {
         }
         return PermitAcquisition(
             ownerID: ownerID,
+            priorityClass: priorityClass,
             waited: waited,
             queueDepth: waiterStates.count,
             waiterCount: waiterStates.count
         )
+    }
+
+    private func canAllocatePermit(priorityClass: PriorityClass) -> Bool {
+        guard availablePermits > 0 else { return false }
+        return priorityClass != .bulk || activeBackgroundPermitCount < backgroundPermitLimit
     }
 
     private func cleanupOwnerIfIdle(_ ownerID: UUID) {
@@ -461,9 +505,9 @@ actor ContentReadAsyncLimiter {
         switch workloadClass {
         case .interactiveRead:
             .interactive
-        case .contentSearch, .unspecified:
+        case .contentSearch:
             .normal
-        case .codemap, .encodingDetection:
+        case .codemap, .encodingDetection, .promptAccounting, .unspecified:
             .bulk
         }
     }
@@ -483,7 +527,9 @@ actor ContentReadAsyncLimiter {
                 overloadCount: overloadCount,
                 interactiveGrantCount: interactiveGrantCount,
                 normalGrantCount: normalGrantCount,
-                bulkGrantCount: bulkGrantCount
+                bulkGrantCount: bulkGrantCount,
+                backgroundPermitLimit: backgroundPermitLimit,
+                activeBackgroundPermitCount: activeBackgroundPermitCount
             )
         }
     #endif
@@ -555,6 +601,25 @@ extension FileSystemService {
             modificationDate: result.modificationDate ?? acceptedFingerprint.modificationDate,
             fingerprint: acceptedFingerprint
         )
+    }
+
+    func loadContentPrefix(
+        ofRelativePath relativePath: String,
+        maximumBytes: Int,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> FileContentPrefix? {
+        guard maximumBytes > 0 else { return FileContentPrefix(content: "", truncated: true) }
+        if Self.hasAlwaysBinaryExtension(relativePath) { return nil }
+        let request = try makeContentReadRequest(
+            cacheKey: relativePath,
+            chunkSize: min(maximumBytes + 1, 1_048_576),
+            fileSizeLimit: 10_000_000,
+            mode: .automatic,
+            workloadClass: workloadClass
+        )
+        let prefix = try await Self.performContentPrefixReadOffActor(request, maximumBytes: maximumBytes)
+        try Task.checkCancellation()
+        return prefix
     }
 
     func loadContent(
@@ -920,6 +985,28 @@ extension FileSystemService {
         encodingMap[cacheKey] = detectedEncoding
     }
 
+    private nonisolated static func performContentPrefixReadOffActor(
+        _ request: ContentReadRequest,
+        maximumBytes: Int
+    ) async throws -> FileContentPrefix? {
+        let workerPriority = Task.currentPriority
+        return try await contentReadWorkerLimiter.withPermit(
+            workloadClass: request.workloadClass,
+            ownerID: request.schedulerOwnerID
+        ) {
+            try await withThrowingTaskGroup(of: FileContentPrefix?.self) { group in
+                group.addTask(priority: workerPriority) {
+                    try await readContentPrefixFromDisk(request, maximumBytes: maximumBytes)
+                }
+                guard let result = try await group.next() else {
+                    throw CancellationError()
+                }
+                group.cancelAll()
+                return result
+            }
+        }
+    }
+
     private nonisolated static func performContentReadOffActor(
         _ request: ContentReadRequest,
         expectedFingerprint: FileContentFingerprint? = nil,
@@ -945,6 +1032,56 @@ extension FileSystemService {
                 return result
             }
         }
+    }
+
+    private nonisolated static func readContentPrefixFromDisk(
+        _ request: ContentReadRequest,
+        maximumBytes: Int
+    ) async throws -> FileContentPrefix? {
+        if hasAlwaysBinaryExtension(request.relativePath) {
+            return nil
+        }
+        try Task.checkCancellation()
+        let requestedByteCount = max(0, maximumBytes)
+        let validated = try validateContentFileForReading(request)
+        if validated.fileSize <= Int64(requestedByteCount) {
+            let result = try await readAutomaticContent(
+                request,
+                validated: validated,
+                requireStableIdentity: false
+            )
+            return result.content.map { FileContentPrefix(content: $0, truncated: false) }
+        }
+
+        let handle = try openValidatedContentHandle(
+            request,
+            validated: validated,
+            requireStableIdentity: false
+        )
+        defer { try? handle.close() }
+
+        try await runContentReadChunkHook(request)
+        let data = try handle.read(upToCount: requestedByteCount + 1) ?? Data()
+        try Task.checkCancellation()
+        guard !data.isEmpty else {
+            return FileContentPrefix(content: "", truncated: false)
+        }
+
+        let probe = data.prefix(min(data.count, 8192))
+        if isProbablyBinary(probe) {
+            return nil
+        }
+
+        let wasTruncated = data.count > requestedByteCount || validated.fileSize > Int64(requestedByteCount)
+        var prefixData = Data(data.prefix(requestedByteCount))
+        let encoding: String.Encoding = detectBOMEncoding(in: prefixData) ?? detectEncodingFull(prefixData)
+        while !prefixData.isEmpty {
+            if let decoded = String(data: prefixData, encoding: encoding) {
+                return FileContentPrefix(content: decoded, truncated: wasTruncated)
+            }
+            prefixData.removeLast()
+        }
+        return FileContentPrefix(content: "", truncated: wasTruncated)
     }
 
     private nonisolated static func readContentFromDisk(

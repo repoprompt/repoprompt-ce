@@ -48,6 +48,16 @@ class PromptViewModel: ObservableObject {
     /// Set to true to enable debug logging for settings sync
     static var debugLoggingEnabled = false
 
+    #if DEBUG
+        private var automaticReviewGitDiffProviderOverrideForTesting: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+
+        func setAutomaticReviewGitDiffProviderOverrideForTesting(
+            _ override: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+        ) {
+            automaticReviewGitDiffProviderOverrideForTesting = override
+        }
+    #endif
+
     // MARK: - Type Definitions and Enums
 
     enum PlanActMode: String, CaseIterable, Codable {
@@ -1040,7 +1050,10 @@ class PromptViewModel: ObservableObject {
         )
 
         // Ensure _git_data is visible and refreshed
-        await fileManager.ensureGitDataRootLoaded(workspace: workspace, workspaceManager: workspaceManager)
+        _ = try await fileManager.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: workspaceManager
+        )
         await fileManager.flushPendingDeltas(aggressive: true)
 
         return result
@@ -2455,6 +2468,17 @@ class PromptViewModel: ObservableObject {
         return try await operation()
     }
 
+    @MainActor
+    private func withComposeTabActivationSnapshotSuspended<T>(
+        targetTabID: UUID,
+        manager: WorkspaceManagerViewModel,
+        operation: () async throws -> T
+    ) async rethrows -> T {
+        manager.beginApplyingTabContext(forTabID: targetTabID)
+        defer { manager.endApplyingTabContext(forTabID: targetTabID) }
+        return try await operation()
+    }
+
     @discardableResult
     @MainActor
     private func flushAndSnapshotSourceTabIfNeeded(
@@ -2530,16 +2554,17 @@ class PromptViewModel: ObservableObject {
         }
 
         manager.workspaces[index].composeTabs.append(newTab)
-        manager.workspaces[index].activeComposeTabID = newTab.id
-        activeComposeTabID = newTab.id
-        dirtyTabIDs.remove(newTab.id)
+        await withComposeTabActivationSnapshotSuspended(targetTabID: newTab.id, manager: manager) {
+            manager.workspaces[index].activeComposeTabID = newTab.id
+            activeComposeTabID = newTab.id
+            dirtyTabIDs.remove(newTab.id)
+            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            await withComposeTabSwitching(targetTabID: newTab.id) {
+                await manager.applyComposeTabState(newTab)
+            }
+        }
 
         manager.markWorkspaceDirty()
-
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        await withComposeTabSwitching(targetTabID: newTab.id) {
-            await manager.applyComposeTabState(newTab)
-        }
         manager.pollAndSaveState()
     }
 
@@ -2646,23 +2671,25 @@ class PromptViewModel: ObservableObject {
         // Flush pending editor state and snapshot current tab before switching
         flushAndSnapshotActiveTab(in: manager, workspaceIndex: index)
 
-        manager.workspaces[index].activeComposeTabID = id
-        activeComposeTabID = id
+        await withComposeTabActivationSnapshotSuspended(targetTabID: id, manager: manager) {
+            manager.workspaces[index].activeComposeTabID = id
+            activeComposeTabID = id
 
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
-        guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
+            loadComposeTabsFromWorkspace(manager.workspaces[index])
+            guard let target = manager.workspaces[index].composeTabs.first(where: { $0.id == id }) else { return }
 
-        activeTabApplyTask?.cancel()
+            activeTabApplyTask?.cancel()
 
-        let task = Task { [weak self, weak manager] in
-            guard let self, let manager else { return }
-            await withComposeTabSwitching(targetTabID: id) {
-                await manager.applyComposeTabStateAsync(tab: target, windowID: self.windowID)
+            let task = Task { [weak self, weak manager] in
+                guard let self, let manager else { return }
+                await withComposeTabSwitching(targetTabID: id) {
+                    await manager.applyComposeTabStateAsync(tab: target, windowID: self.windowID)
+                }
             }
-        }
 
-        activeTabApplyTask = task
-        await task.value
+            activeTabApplyTask = task
+            await task.value
+        }
     }
 
     @MainActor
@@ -2729,7 +2756,8 @@ class PromptViewModel: ObservableObject {
         withIDs ids: Set<UUID>,
         preferredActiveID: UUID? = nil,
         reason: ComposeTabRemovalReason = .close,
-        expandCascade: Bool = true
+        expandCascade: Bool = true,
+        isMutationContextCurrent: (@MainActor () -> Bool)? = nil
     ) async {
         guard !ids.isEmpty else { return }
         guard
@@ -2738,6 +2766,17 @@ class PromptViewModel: ObservableObject {
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return }
 
+        func mutationContextIsCurrent() -> Bool {
+            guard manager.activeWorkspace?.id == workspace.id,
+                  manager.workspaces.indices.contains(index),
+                  manager.workspaces[index].id == workspace.id
+            else {
+                return false
+            }
+            return isMutationContextCurrent?() ?? true
+        }
+
+        guard mutationContextIsCurrent() else { return }
         var tabs = manager.workspaces[index].composeTabs
         let tabsBeforeClose = tabs
         let originalCount = tabs.count
@@ -2745,6 +2784,7 @@ class PromptViewModel: ObservableObject {
         var stashedTabIDsToDelete: Set<UUID> = []
         if expandCascade, let composeTabCascadeResolver {
             let cascadePlan = await composeTabCascadeResolver(ids, reason)
+            guard mutationContextIsCurrent() else { return }
             resolvedIDs.formUnion(cascadePlan.composeTabIDs)
             if reason == .close {
                 stashedTabIDsToDelete.formUnion(cascadePlan.stashedTabIDs)
@@ -2767,8 +2807,11 @@ class PromptViewModel: ObservableObject {
         }()
 
         // Notify listeners BEFORE mutation so they can cancel running tasks
+        guard mutationContextIsCurrent() else { return }
         await notifyComposeTabsWillClose(tabsBeingClosed, reason: reason)
+        guard mutationContextIsCurrent() else { return }
         await cleanupMCPStateForClosingTabs(tabsBeingClosed)
+        guard mutationContextIsCurrent() else { return }
         #if DEBUG
             for tabID in tabsBeingClosed {
                 AgentModePerfDiagnostics.markSidebarDeleteFullCleanupComplete(
@@ -2811,7 +2854,6 @@ class PromptViewModel: ObservableObject {
         manager.workspaces[index].composeTabs = tabs
 
         if tabs.isEmpty {
-            manager.workspaces[index].activeComposeTabID = nil
             await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
             loadComposeTabsFromWorkspace(manager.workspaces[index])
             #if DEBUG
@@ -2844,16 +2886,20 @@ class PromptViewModel: ObservableObject {
             newActiveID = tabs.first?.id
         }
 
-        manager.workspaces[index].activeComposeTabID = newActiveID
-        activeComposeTabID = newActiveID
-
         if newActiveID != previousActiveID,
            let newActiveID,
            let tab = tabs.first(where: { $0.id == newActiveID })
         {
-            await withComposeTabSwitching(targetTabID: newActiveID) {
-                await manager.applyComposeTabState(tab)
+            await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
+                manager.workspaces[index].activeComposeTabID = newActiveID
+                activeComposeTabID = newActiveID
+                await withComposeTabSwitching(targetTabID: newActiveID) {
+                    await manager.applyComposeTabState(tab)
+                }
             }
+        } else {
+            manager.workspaces[index].activeComposeTabID = newActiveID
+            activeComposeTabID = newActiveID
         }
 
         loadComposeTabsFromWorkspace(manager.workspaces[index])
@@ -2914,11 +2960,13 @@ class PromptViewModel: ObservableObject {
             manager: manager
         ) else { return }
         manager.workspaces[workspaceIndex].composeTabs.append(blankTab)
-        manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
-        activeComposeTabID = blankTab.id
-        dirtyTabIDs.remove(blankTab.id)
-        await withComposeTabSwitching(targetTabID: blankTab.id) {
-            await manager.applyComposeTabState(blankTab)
+        await withComposeTabActivationSnapshotSuspended(targetTabID: blankTab.id, manager: manager) {
+            manager.workspaces[workspaceIndex].activeComposeTabID = blankTab.id
+            activeComposeTabID = blankTab.id
+            dirtyTabIDs.remove(blankTab.id)
+            await withComposeTabSwitching(targetTabID: blankTab.id) {
+                await manager.applyComposeTabState(blankTab)
+            }
         }
     }
 
@@ -3017,11 +3065,16 @@ class PromptViewModel: ObservableObject {
 
     @discardableResult
     @MainActor
-    func autoArchiveComposeTabsForSidebarPolicy(withIDs ids: Set<UUID>) async -> Set<UUID> {
-        guard !ids.isEmpty else { return [] }
+    func autoArchiveComposeTabsForSidebarPolicy(
+        withIDs ids: Set<UUID>,
+        expectedWorkspaceID: UUID,
+        isArchiveContextCurrent: @escaping @MainActor () -> Bool
+    ) async -> Set<UUID> {
+        guard !ids.isEmpty, isArchiveContextCurrent() else { return [] }
         guard
             let manager = workspaceManager,
             let workspace = manager.activeWorkspace,
+            workspace.id == expectedWorkspaceID,
             let index = manager.workspaces.firstIndex(where: { $0.id == workspace.id })
         else { return [] }
 
@@ -3046,10 +3099,20 @@ class PromptViewModel: ObservableObject {
                 }
 
             for tabID in requestedOpenIDs {
+                guard isArchiveContextCurrent(),
+                      manager.activeWorkspace?.id == expectedWorkspaceID
+                else {
+                    return ([], [])
+                }
                 guard tabID != activeTabID else { continue }
                 guard composeTabAutoStashEligibilityProvider?(tabID) ?? true else { continue }
 
                 let affectedTabIDs = await autoStashAffectedComposeTabIDs(for: tabID)
+                guard isArchiveContextCurrent(),
+                      manager.activeWorkspace?.id == expectedWorkspaceID
+                else {
+                    return ([], [])
+                }
                 guard canAutoStashAffectedComposeTabs(affectedTabIDs, among: tabs, excluding: activeTabID) else {
                     continue
                 }
@@ -3085,13 +3148,27 @@ class PromptViewModel: ObservableObject {
             activeTabID: refreshedActiveTabID
         )
         guard !refreshedPlan.rootIDs.isEmpty else { return [] }
+        guard isArchiveContextCurrent(),
+              manager.activeWorkspace?.id == expectedWorkspaceID
+        else {
+            return []
+        }
 
         await closeComposeTabs(
             withIDs: refreshedPlan.affectedOpenTabIDs,
             reason: .stash,
-            expandCascade: false
+            expandCascade: false,
+            isMutationContextCurrent: {
+                isArchiveContextCurrent()
+                    && manager.activeWorkspace?.id == expectedWorkspaceID
+            }
         )
-        guard manager.workspaces.indices.contains(index) else { return [] }
+        guard isArchiveContextCurrent(),
+              manager.activeWorkspace?.id == expectedWorkspaceID,
+              manager.workspaces.indices.contains(index)
+        else {
+            return []
+        }
         let remainingOpenTabIDs = Set(manager.workspaces[index].composeTabs.map(\.id))
         return refreshedPlan.affectedOpenTabIDs.subtracting(remainingOpenTabIDs)
     }
@@ -3143,11 +3220,7 @@ class PromptViewModel: ObservableObject {
 
         // Add to compose tabs
         manager.workspaces[index].composeTabs.append(restoredTab)
-        manager.workspaces[index].activeComposeTabID = restoredTab.id
         manager.workspaces[index].dateModified = Date()
-
-        // Reload state
-        loadComposeTabsFromWorkspace(manager.workspaces[index])
         currentStashedTabs = manager.workspaces[index].stashedTabs
 
         // Switch to the restored tab
@@ -3208,7 +3281,6 @@ class PromptViewModel: ObservableObject {
                 dirtyTabIDs.subtract(composeTabIDsBeingDeleted)
                 manager.workspaces[index].composeTabs = remainingComposeTabs
                 if remainingComposeTabs.isEmpty {
-                    manager.workspaces[index].activeComposeTabID = nil
                     await appendReplacementBlankComposeTabIfNeeded(manager: manager, workspaceIndex: index)
                 } else {
                     var newActiveID = previousActiveID
@@ -3225,15 +3297,20 @@ class PromptViewModel: ObservableObject {
                     } else if newActiveID == nil {
                         newActiveID = remainingComposeTabs.first?.id
                     }
-                    manager.workspaces[index].activeComposeTabID = newActiveID
-                    activeComposeTabID = newActiveID
                     if newActiveID != previousActiveID,
                        let newActiveID,
                        let tab = remainingComposeTabs.first(where: { $0.id == newActiveID })
                     {
-                        await withComposeTabSwitching(targetTabID: newActiveID) {
-                            await manager.applyComposeTabState(tab)
+                        await withComposeTabActivationSnapshotSuspended(targetTabID: newActiveID, manager: manager) {
+                            manager.workspaces[index].activeComposeTabID = newActiveID
+                            activeComposeTabID = newActiveID
+                            await withComposeTabSwitching(targetTabID: newActiveID) {
+                                await manager.applyComposeTabState(tab)
+                            }
                         }
+                    } else {
+                        manager.workspaces[index].activeComposeTabID = newActiveID
+                        activeComposeTabID = newActiveID
                     }
                 }
             }
@@ -4032,7 +4109,7 @@ class PromptViewModel: ObservableObject {
                 includeFiles: includeFiles,
                 includeUserPrompt: includeUserPrompt,
                 filePathDisplay: filePathDisplayOption,
-                codemapSnapshots: preAssembly.codemapSnapshots,
+                codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
                 includeDatetimeInUserInstructions: includeDatetime,
                 promptSectionsOrder: promptSectionsOrder,
                 disabledPromptSections: disabledPromptSections,
@@ -4778,7 +4855,8 @@ class PromptViewModel: ObservableObject {
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
-        lookupContextOverride: WorkspaceLookupContext? = nil
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
     ) async -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
@@ -4815,12 +4893,16 @@ class PromptViewModel: ObservableObject {
         // active chat packaging no longer needs FileViewModel selection snapshots.
         let filePathDisplay = filePathDisplayOption
         let temperature = setModelTemperature ? modelTemperature : nil
+        let frozenReviewGitContext = if let reviewGitContextOverride {
+            reviewGitContextOverride
+        } else {
+            await freezePromptGitReviewContext(base: gitBaseOverride ?? gitViewModel.selectedDiffBranch)
+        }
         let preAssembly = await preAssemblePromptContext(
             cfg: activeConfig,
             selection: logicalSelection,
             lookupContext: lookupContext,
-            includeLocalDefinitionsInFileTree: true,
-            gitBaseOverride: gitBaseOverride
+            reviewGitContext: frozenReviewGitContext
         )
         let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
@@ -4856,16 +4938,20 @@ class PromptViewModel: ObservableObject {
             }
         }
 
-        // Build file contents with effective code map usage
-        let fileBlocks = PromptPackagingService.generateFileContents(
+        // Render the canonical codemap partition with the file map and full/sliced content separately.
+        let partitionedBlocks = PromptPackagingService.generatePartitionedFileBlocks(
             codeEntries,
             filePathDisplay: filePathDisplay,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             displayPathResolver: { entry in
                 preAssembly.displayPath(for: entry)
             }
         )
-        let fileTreeString = preAssembly.fileTreeContent ?? ""
+        let fileBlocks = partitionedBlocks.contentBlocks
+        let fileTreeString = PromptPackagingService.combinedFileMapContent(
+            fileTreeContent: preAssembly.fileTreeContent,
+            codemapBlocks: partitionedBlocks.codemapBlocks
+        ) ?? ""
         let gitDiff = preAssembly.gitDiff
 
         // Meta prompts:
@@ -4882,7 +4968,7 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
+        let message = PromptPackagingService.buildAIMessage(
             systemPrompt: systemPrompt,
             metaInstructions: metaForThisChat,
             fileTree: fileTreeString,
@@ -4894,6 +4980,20 @@ class PromptViewModel: ObservableObject {
             disabledPromptSections: disabledPromptSections,
             duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
         )
+        #if DEBUG
+            OracleReviewPackagingDiagnostics.recordPreassembly(
+                mode: effectiveMode,
+                model: overrideModel,
+                chatPreset: preset,
+                config: activeConfig,
+                selectedArtifactPolicy: .includeBeforeGitInclusion,
+                logicalSelection: logicalSelection,
+                preassembly: preAssembly,
+                message: message,
+                disabledPromptSections: disabledPromptSections
+            )
+        #endif
+        return message
     }
 
     func getSystemPrompt() -> String {
@@ -5395,11 +5495,24 @@ extension PromptViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool = false,
-        gitBaseOverride: String? = nil
+        reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> PromptContextPreAssemblyResult {
-        let diffBase = gitBaseOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveBase = (diffBase?.isEmpty == false) ? diffBase : nil
+        let frozenReviewContext = if let reviewGitContext {
+            reviewGitContext
+        } else {
+            await freezePromptGitReviewContext(base: gitViewModel.selectedDiffBranch)
+        }
+        let effectiveBase: String? = switch frozenReviewContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
         let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator()
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
         return await PromptContextPreAssemblyService.resolve(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
@@ -5412,14 +5525,116 @@ extension PromptViewModel {
                 selectedGitDiffFolderPolicy: .expandFolders,
                 selectedGitDiffLookupProfile: .uiAssisted,
                 includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
-                selectedGitDiffProvider: { [gitVM] selectedPaths in
-                    await gitVM.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
+                reviewGitContext: frozenReviewContext,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
                 },
                 completeGitDiffProvider: { [gitVM] in
                     await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
                 }
             )
         )
+    }
+
+    func preAssembleStrictPromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        sourceTabID: UUID,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> PromptContextPreAssemblyResult {
+        let effectiveBase: String? = switch reviewGitContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
+        let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(store: workspaceFileContextStore)
+        )
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return try await PromptContextPreAssemblyService.resolveStrict(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: selection,
+                store: workspaceFileContextStore,
+                lookupContext: lookupContext,
+                filePathDisplay: filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .expandFolders,
+                selectedGitDiffLookupProfile: .uiAssisted,
+                reviewGitContext: reviewGitContext,
+                sourceTabID: sourceTabID,
+                finalReviewAuthorization: finalReviewAuthorization,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
+                },
+                completeGitDiffProvider: { [gitVM] in
+                    await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+                }
+            )
+        )
+    }
+
+    func freezePromptGitReviewContext(
+        workspaceID: UUID? = nil,
+        tabID: UUID? = nil,
+        sessionID: UUID? = nil,
+        bindings: [AgentSessionWorktreeBinding] = [],
+        base: String? = nil
+    ) async -> FrozenPromptGitReviewContext {
+        let effectiveBase = base ?? gitViewModel.selectedDiffBranch
+        guard let manager = workspaceManager else {
+            return .automaticOnly(base: effectiveBase, bindings: bindings)
+        }
+        guard let workspace = Self.workspaceForFrozenPromptGitReviewContext(
+            requestedWorkspaceID: workspaceID,
+            workspaces: manager.workspaces,
+            activeWorkspace: manager.activeWorkspace
+        ),
+            let creatorTabID = tabID ?? activeComposeTabID
+        else {
+            return .automaticOnly(
+                base: effectiveBase,
+                bindings: bindings
+            )
+        }
+        return await FrozenPromptGitReviewContext.make(
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceRootPaths: workspace.repoPaths,
+            tabID: creatorTabID,
+            sessionID: sessionID,
+            bindings: bindings,
+            base: effectiveBase,
+            store: workspaceFileContextStore
+        )
+    }
+
+    static func workspaceForFrozenPromptGitReviewContext(
+        requestedWorkspaceID: UUID?,
+        workspaces: [WorkspaceModel],
+        activeWorkspace: WorkspaceModel?
+    ) -> WorkspaceModel? {
+        if let requestedWorkspaceID {
+            return workspaces.first { $0.id == requestedWorkspaceID }
+        }
+        return activeWorkspace
     }
 
     /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.
@@ -5454,7 +5669,7 @@ extension PromptViewModel {
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
             filePathDisplay: filePathDisplayOption,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: includeDatetimeInUserInstructions,
             promptSectionsOrder: promptSectionsOrder,
             disabledPromptSections: disabledPromptSections,
@@ -5571,7 +5786,7 @@ extension PromptViewModel {
         // falling back to the current copy configuration only if unavailable.
         let cfg: PromptContextResolved = resolvedPromptContext(from: chatPreset) ?? resolvePromptContext()
         guard cfg.gitInclusion == .none else {
-            let text = await buildClipboard(for: cfg, includeLocalDefinitionsInFileTree: true)
+            let text = await buildClipboard(for: cfg)
             return estimateTokens(for: text)
         }
         let cacheKey = chatContextTokenBaselineCacheKey(chatPreset: chatPreset, config: cfg)
@@ -5591,8 +5806,7 @@ extension PromptViewModel {
 
         let text = await buildClipboard(
             for: cfg,
-            promptTextOverride: promptTextSnapshot,
-            includeLocalDefinitionsInFileTree: true
+            promptTextOverride: promptTextSnapshot
         )
         let tokenCount = estimateTokens(for: text)
 

@@ -368,9 +368,64 @@ private struct FolderTopologyApplyOutcome {
     let parentFolderForStateRecompute: FolderViewModel?
 }
 
+private struct SliceRebaseSourceSnapshot {
+    let text: String
+    let modificationTime: Double
+}
+
 private struct ReplaySliceRebaseRequest {
     let file: FileViewModel
     let relativePath: String
+    let sourceSnapshot: SliceRebaseSourceSnapshot?
+}
+
+private struct HiddenSessionSliceRebaseTarget {
+    let identity: WorkspaceSelectionIdentity
+    let logicalFullPath: String
+    let agentSessionID: UUID
+    let bindingFingerprint: String
+    let physicalRootPaths: Set<String>
+}
+
+private struct HiddenSessionSliceRebaseRequest {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+    let fileID: UUID
+    let physicalRootPath: String
+    let physicalFullPath: String
+    let relativePath: String
+    let sourceSnapshot: SliceRebaseSourceSnapshot?
+    let targets: [HiddenSessionSliceRebaseTarget]
+}
+
+private struct HiddenSessionRootLifetimeKey: Hashable {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+}
+
+private struct SlicePartitionRebaseCommit {
+    let scope: PartitionScope
+    let ranges: [LineRange]
+    let anchors: [SliceAnchor]?
+    let expectedStoredSlices: PartitionStore.StoredSlices
+    let hiddenSessionTarget: HiddenSessionSliceRebaseTarget?
+    let expectedLogicalRanges: [LineRange]?
+
+    init(
+        scope: PartitionScope,
+        ranges: [LineRange],
+        anchors: [SliceAnchor]?,
+        expectedStoredSlices: PartitionStore.StoredSlices,
+        hiddenSessionTarget: HiddenSessionSliceRebaseTarget? = nil,
+        expectedLogicalRanges: [LineRange]? = nil
+    ) {
+        self.scope = scope
+        self.ranges = ranges
+        self.anchors = anchors
+        self.expectedStoredSlices = expectedStoredSlices
+        self.hiddenSessionTarget = hiddenSessionTarget
+        self.expectedLogicalRanges = expectedLogicalRanges
+    }
 }
 
 private struct ReplayRootPassAccumulator {
@@ -516,6 +571,20 @@ class WorkspaceFilesViewModel: ObservableObject {
         case supplementalSystem
     }
 
+    enum GitDataRootLoadError: LocalizedError, Equatable {
+        case systemWorkspace(workspaceID: UUID)
+        case exactRootUnavailable(path: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .systemWorkspace(workspaceID):
+                "Git-data roots are unavailable for system workspace \(workspaceID.uuidString)."
+            case let .exactRootUnavailable(path):
+                "The loaded Git-data root does not have the expected workspace Git-data identity: \(path)"
+            }
+        }
+    }
+
     private func workspaceRootKind(for rootKind: RootKind, url: URL) -> WorkspaceRootKind {
         switch rootKind {
         case .user:
@@ -653,6 +722,7 @@ class WorkspaceFilesViewModel: ObservableObject {
     let workspaceFileContextStore: WorkspaceFileContextStore
     private weak var selectionCoordinator: WorkspaceSelectionCoordinator?
     private var selectionCoordinatorCancellable: AnyCancellable?
+    private var pendingPresentationTasks: [UUID: Task<Void, Never>] = [:]
     private var workspaceFileContextRootsByRootKey: [RootKey: WorkspaceRootRecord] = [:]
     private var preloadedWorkspaceFileContextRootsByRootKey: [RootKey: WorkspaceRootRecord] = [:]
     private var rootShellPersistenceKeysByRootKey: [RootKey: WorkspaceRootShellPersistenceKey] = [:]
@@ -676,6 +746,13 @@ class WorkspaceFilesViewModel: ObservableObject {
     #endif
     private var sliceRebaseTasksByFullPath: [String: Task<Void, Never>] = [:]
     private var sliceRebaseTaskIDsByFullPath: [String: UUID] = [:]
+    private var sliceRebaseRegistrationGenerationByFullPath: [String: UInt64] = [:]
+    private var sliceRebaseSourceSnapshotByFullPath: [String: SliceRebaseSourceSnapshot] = [:]
+    private var sliceRebaseCommitTasksByFullPath: [String: Task<Void, Never>] = [:]
+    private var sliceRebaseCommitIDsByFullPath: [String: UUID] = [:]
+    private var sessionWorktreeBindingsProvider: (@MainActor (UUID) -> [AgentSessionWorktreeBinding])?
+    private var hiddenSessionHandledGenerationByRootLifetime: [HiddenSessionRootLifetimeKey: UInt64] = [:]
+    private var hiddenSessionRootLifetimeByPhysicalPath: [String: HiddenSessionRootLifetimeKey] = [:]
     /// Monotonic revision incremented for any partition save seen in the current workspace.
     /// Used to avoid re-checking files already confirmed as "no slices" until new saves occur.
     private var partitionSliceSaveRevision: UInt64 = 0
@@ -1012,6 +1089,12 @@ class WorkspaceFilesViewModel: ObservableObject {
             let indexRebuildVisitedFileCount: Int
         }
 
+        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
+            let handledGeneration: UInt64
+            let registrationGeneration: UInt64
+            let hasPendingRebaseTask: Bool
+        }
+
         private var appliedIndexProjectionHandledEventCount = 0
         private var appliedIndexProjectionDirectFileIDLookupCount = 0
         private var appliedIndexProjectionDirectFolderIDLookupCount = 0
@@ -1023,6 +1106,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         private var appliedIndexProjectionIndexRebuildVisitedFolderCount = 0
         private var appliedIndexProjectionIndexRebuildVisitedFileCount = 0
         private var appliedIndexProjectionWillHandleHandler: (@Sendable (UUID, UInt64) async -> Void)?
+        private var hiddenSessionSliceRebaseWillCommitHandler: (@Sendable (String) async -> Void)?
         private var appliedIndexProjectionStateObserver: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
 
         func setAppliedIndexProjectionWillHandleHandlerForTesting(
@@ -1031,11 +1115,45 @@ class WorkspaceFilesViewModel: ObservableObject {
             appliedIndexProjectionWillHandleHandler = handler
         }
 
+        func setHiddenSessionSliceRebaseWillCommitHandlerForTesting(
+            _ handler: (@Sendable (String) async -> Void)?
+        ) {
+            hiddenSessionSliceRebaseWillCommitHandler = handler
+        }
+
         func setAppliedIndexProjectionStateObserverForTesting(
             _ observer: ((AppliedIndexProjectionDiagnosticsSnapshot) -> Void)?
         ) {
             appliedIndexProjectionStateObserver = observer
             observer?(appliedIndexProjectionDiagnosticsSnapshot())
+        }
+
+        @MainActor
+        func debugApplyEditsRebaseProbePathSnapshot(
+            fullPath rawFullPath: String,
+            rootID: UUID
+        ) -> ApplyEditsRebaseProbePathSnapshot {
+            let fullPath = StandardizedPath.absolute(rawFullPath)
+            return ApplyEditsRebaseProbePathSnapshot(
+                handledGeneration: appliedIndexProjectionHandledGenerationByRootID[rootID] ?? 0,
+                registrationGeneration: sliceRebaseRegistrationGenerationByFullPath[fullPath] ?? 0,
+                hasPendingRebaseTask: sliceRebaseTasksByFullPath[fullPath] != nil
+            )
+        }
+
+        @MainActor
+        func debugWaitForAppliedIndexGeneration(
+            rootID: UUID,
+            targetGeneration: UInt64,
+            deadline: ContinuousClock.Instant
+        ) async -> Bool {
+            let clock = ContinuousClock()
+            while appliedIndexProjectionHandledGenerationByRootID[rootID, default: 0] < targetGeneration,
+                  clock.now < deadline
+            {
+                try? await Task.sleep(for: .milliseconds(5))
+            }
+            return appliedIndexProjectionHandledGenerationByRootID[rootID, default: 0] >= targetGeneration
         }
 
         func appliedIndexProjectionDiagnosticsSnapshot() -> AppliedIndexProjectionDiagnosticsSnapshot {
@@ -1113,9 +1231,19 @@ class WorkspaceFilesViewModel: ObservableObject {
         sliceRebaseTasksByFullPath.removeAll()
         sliceRebaseTaskIDsByFullPath.removeAll()
         workspaceSaveDebounceTask?.cancel()
+        for task in pendingPresentationTasks.values {
+            task.cancel()
+        }
+        pendingPresentationTasks.removeAll()
         selectionCoordinatorCancellable?.cancel()
         partitionStoreSaveCancellable?.cancel()
         fileSystemSettingsCancellable?.cancel()
+    }
+
+    func setSessionWorktreeBindingsProvider(
+        _ provider: @escaping @MainActor (UUID) -> [AgentSessionWorktreeBinding]
+    ) {
+        sessionWorktreeBindingsProvider = provider
     }
 
     func attachSelectionCoordinator(_ coordinator: WorkspaceSelectionCoordinator) {
@@ -1124,21 +1252,23 @@ class WorkspaceFilesViewModel: ObservableObject {
         selectionCoordinatorCancellable = coordinator.changes
             .sink { [weak self, weak coordinator] change in
                 guard change.source != .uiFlush, !change.source.isMCPSelectionSource else { return }
-                Task { @MainActor [weak self, weak coordinator] in
-                    guard let self, let coordinator else { return }
-                    if let changeTabID = change.tabID {
-                        guard let activeIdentity = coordinator.activeSelectionIdentity(),
-                              activeIdentity.tabID == changeTabID,
-                              coordinator.selectionSnapshot(
-                                  for: activeIdentity,
-                                  flushPendingUIIfActive: false
-                              )?.selection == change.selection
-                        else { return }
-                    }
-                    let current = snapshotSelection()
-                    guard current != change.selection else { return }
-                    await coordinator.withApplyingSelectionMirror {
-                        await self.applyStoredSelection(change.selection)
+                MainActor.assumeIsolated {
+                    self?.launchPresentationTask { [weak self, weak coordinator] in
+                        guard let self, let coordinator else { return }
+                        if let changeTabID = change.tabID {
+                            guard let activeIdentity = coordinator.activeSelectionIdentity(),
+                                  activeIdentity.tabID == changeTabID,
+                                  coordinator.selectionSnapshot(
+                                      for: activeIdentity,
+                                      flushPendingUIIfActive: false
+                                  )?.selection == change.selection
+                            else { return }
+                        }
+                        let current = snapshotSelection()
+                        guard current != change.selection else { return }
+                        await coordinator.withApplyingSelectionMirror {
+                            await self.applyStoredSelection(change.selection)
+                        }
                     }
                 }
             }
@@ -1148,18 +1278,42 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspaceManager = manager
         currentWorkspaceID = manager.activeWorkspaceID
         manager.addWorkspaceDidSwitchListener(label: "fileManager") { [weak self] workspace in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.handleWorkspaceSwitch(to: workspace)
+            MainActor.assumeIsolated {
+                self?.launchPresentationTask { [weak self] in
+                    await self?.handleWorkspaceSwitch(to: workspace)
+                }
             }
         }
         if let activeWorkspace = manager.activeWorkspace {
-            Task { @MainActor in
-                await self.handleWorkspaceSwitch(to: activeWorkspace)
+            launchPresentationTask { [weak self] in
+                await self?.handleWorkspaceSwitch(to: activeWorkspace)
             }
         } else {
             currentSlicesByRoot.removeAll()
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
+        }
+    }
+
+    private func launchPresentationTask(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        let taskID = UUID()
+        let task = Task { @MainActor [weak self] in
+            defer { self?.pendingPresentationTasks.removeValue(forKey: taskID) }
+            await operation()
+        }
+        pendingPresentationTasks[taskID] = task
+    }
+
+    /// Waits for concrete workspace-switch and stored-selection presentation tasks that were
+    /// synchronously registered before this barrier, including work they register in turn.
+    /// Callers must not invoke this from inside a tracked presentation task.
+    func waitForPendingPresentationTasks() async {
+        while !pendingPresentationTasks.isEmpty {
+            let tasks = Array(pendingPresentationTasks.values)
+            for task in tasks {
+                await task.value
+            }
         }
     }
 
@@ -1295,9 +1449,9 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
         #endif
 
-        guard !Task.isCancelled,
-              let (rootKey, targetRootVM) = currentWorkspaceAppliedIndexRoot(for: event)
-        else { return }
+        guard !Task.isCancelled else { return }
+        _ = await handleHiddenSessionRootAppliedIndexEvent(event)
+        guard let (rootKey, targetRootVM) = currentWorkspaceAppliedIndexRoot(for: event) else { return }
         let handledGeneration = appliedIndexProjectionHandledGenerationByRootID[event.rootID] ?? 0
         guard event.generation > handledGeneration else { return }
 
@@ -1343,8 +1497,363 @@ class WorkspaceFilesViewModel: ObservableObject {
             useCanonicalSnapshotMetadata: false,
             modificationTargets: modificationTargets
         ) else { return }
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordProjectionModification(
+                rootID: event.rootID,
+                fileIDs: event.modifiedFileIDs,
+                generation: event.generation
+            )
+        #endif
         appliedIndexProjectionHandledGenerationByRootID[event.rootID] = event.generation
         recordHandledWorkspaceAppliedIndexEvent()
+    }
+
+    @MainActor
+    private func handleHiddenSessionRootAppliedIndexEvent(
+        _ event: WorkspaceAppliedIndexBatchEvent
+    ) async -> Bool {
+        guard let rootLifetimeID = event.rootLifetimeID else { return false }
+        let lifetimeKey = HiddenSessionRootLifetimeKey(
+            rootID: event.rootID,
+            rootLifetimeID: rootLifetimeID
+        )
+        if event.isRootUnload {
+            cancelHiddenSessionSliceRebases(for: lifetimeKey)
+            hiddenSessionHandledGenerationByRootLifetime.removeValue(forKey: lifetimeKey)
+            return true
+        }
+        guard let snapshot = await workspaceFileContextStore.appliedIndexRootSnapshot(rootID: event.rootID),
+              snapshot.root.kind == .sessionWorktree,
+              snapshot.root.standardizedFullPath == StandardizedPath.absolute(event.rootPath)
+        else { return false }
+
+        let handled = hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] ?? 0
+        guard event.generation > handled else { return true }
+        let expected = handled &+ 1
+        guard event.generation == expected, !event.requiresFullResync else {
+            cancelHiddenSessionSliceRebases(for: lifetimeKey)
+            hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+            return true
+        }
+
+        for fileID in event.modifiedFileIDs {
+            guard let file = snapshot.files.first(where: { $0.id == fileID }),
+                  file.rootID == event.rootID,
+                  let targets = await hiddenSessionSliceRebaseTargets(
+                      physicalRootPath: snapshot.root.standardizedFullPath,
+                      physicalFullPath: file.standardizedFullPath
+                  ),
+                  !targets.isEmpty
+            else { continue }
+            let eventSource = event.modifiedFileSourceSnapshotsByID[fileID]
+            let sourceSnapshot: SliceRebaseSourceSnapshot? = eventSource.flatMap { source in
+                guard source.rootID == event.rootID,
+                      source.rootLifetimeID == rootLifetimeID,
+                      source.fileID == fileID,
+                      source.relativePath == file.standardizedRelativePath,
+                      source.fullPath == file.standardizedFullPath
+                else { return nil }
+                return SliceRebaseSourceSnapshot(
+                    text: source.text,
+                    modificationTime: source.modificationTime
+                )
+            }
+            scheduleHiddenSessionSliceRebase(HiddenSessionSliceRebaseRequest(
+                rootID: event.rootID,
+                rootLifetimeID: rootLifetimeID,
+                fileID: fileID,
+                physicalRootPath: snapshot.root.standardizedFullPath,
+                physicalFullPath: file.standardizedFullPath,
+                relativePath: file.standardizedRelativePath,
+                sourceSnapshot: sourceSnapshot,
+                targets: targets
+            ))
+        }
+        hiddenSessionHandledGenerationByRootLifetime[lifetimeKey] = event.generation
+        return true
+    }
+
+    @MainActor
+    private func hiddenSessionSliceRebaseTargets(
+        physicalRootPath: String,
+        physicalFullPath: String
+    ) async -> [HiddenSessionSliceRebaseTarget]? {
+        guard let provider = sessionWorktreeBindingsProvider,
+              let workspace = workspaceManager?.activeWorkspace
+        else { return nil }
+        var targets: [HiddenSessionSliceRebaseTarget] = []
+        for tab in workspace.composeTabs {
+            guard let sessionID = tab.activeAgentSessionID else { continue }
+            let bindings = provider(sessionID)
+            let matchingBindings = bindings.filter {
+                StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath) == physicalRootPath
+            }
+            guard matchingBindings.count == 1, let binding = matchingBindings.first else { continue }
+            let physicalRootPaths = Set(bindings.map {
+                StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)
+            })
+            let fingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
+            guard await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
+                ownerID: sessionID,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: physicalRootPaths
+            ), let logicalFullPath = WorkspaceRootBindingProjection.logicalAbsolutePath(
+                forPhysicalPath: physicalFullPath,
+                binding: binding
+            ) else { continue }
+            let slices = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)
+            guard slices[logicalFullPath]?.isEmpty == false else { continue }
+            targets.append(HiddenSessionSliceRebaseTarget(
+                identity: WorkspaceSelectionIdentity(workspaceID: workspace.id, tabID: tab.id),
+                logicalFullPath: logicalFullPath,
+                agentSessionID: sessionID,
+                bindingFingerprint: fingerprint,
+                physicalRootPaths: physicalRootPaths
+            ))
+        }
+        return targets
+    }
+
+    @MainActor
+    private func scheduleHiddenSessionSliceRebase(_ request: HiddenSessionSliceRebaseRequest) {
+        let fullPath = request.physicalFullPath
+        if sliceRebaseSourceSnapshotByFullPath[fullPath] == nil, let sourceSnapshot = request.sourceSnapshot {
+            sliceRebaseSourceSnapshotByFullPath[fullPath] = sourceSnapshot
+        }
+        guard sliceRebaseSourceSnapshotByFullPath[fullPath] != nil else { return }
+        let lifetimeKey = HiddenSessionRootLifetimeKey(
+            rootID: request.rootID,
+            rootLifetimeID: request.rootLifetimeID
+        )
+        hiddenSessionRootLifetimeByPhysicalPath[fullPath] = lifetimeKey
+        registerSliceRebaseTask(fullPath: fullPath) { [weak self] taskID in
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard let self, !Task.isCancelled else { return }
+            if let commitTask = sliceRebaseCommitTasksByFullPath[fullPath] {
+                await commitTask.value
+            }
+            let registrationGeneration = sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+            guard await isHiddenSessionSliceRebaseCurrent(
+                request,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            ), let sourceSnapshot = sliceRebaseSourceSnapshotByFullPath[fullPath],
+            let loadedSnapshot = await stableSliceRebaseSnapshot(
+                rootID: request.rootID,
+                relativePath: request.relativePath
+            ), await isHiddenSessionSliceRebaseCurrent(
+                request,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            )
+            else { return }
+
+            var currentTargets: [HiddenSessionSliceRebaseTarget] = []
+            for target in request.targets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
+                currentTargets.append(target)
+            }
+            guard !currentTargets.isEmpty else { return }
+
+            var partitionCommits: [SlicePartitionRebaseCommit] = []
+            for target in currentTargets {
+                guard let expectedLogicalRanges = await hiddenSessionSliceRangesIfTargetCurrent(target) else {
+                    continue
+                }
+                let scope = PartitionScope(
+                    workspaceID: target.identity.workspaceID,
+                    tabID: target.identity.tabID
+                )
+                let data = await selectionSliceCoordinator.loadSlices(
+                    forRootPath: request.physicalRootPath,
+                    scope: scope
+                )
+                guard let stored = data[request.relativePath], !stored.ranges.isEmpty else { continue }
+                let oldText = sliceRebaseSourceText(
+                    sourceSnapshot: sourceSnapshot,
+                    stored: stored,
+                    currentText: loadedSnapshot.text
+                )
+                guard oldText != loadedSnapshot.text else { continue }
+                let computed = await Self.computeSliceRebaseConsumer(
+                    oldText: oldText,
+                    newText: loadedSnapshot.text,
+                    stored: stored,
+                    fullPath: fullPath,
+                    scope: "hidden-partition"
+                )
+                guard !computed.isStale else { continue }
+                partitionCommits.append(SlicePartitionRebaseCommit(
+                    scope: scope,
+                    ranges: computed.ranges,
+                    anchors: computed.anchors,
+                    expectedStoredSlices: stored,
+                    hiddenSessionTarget: target,
+                    expectedLogicalRanges: expectedLogicalRanges
+                ))
+            }
+
+            #if DEBUG
+                if let hiddenSessionSliceRebaseWillCommitHandler {
+                    await hiddenSessionSliceRebaseWillCommitHandler(fullPath)
+                }
+            #endif
+
+            let commitID = UUID()
+            sliceRebaseCommitIDsByFullPath[fullPath] = commitID
+            let commitTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer {
+                    if sliceRebaseCommitIDsByFullPath[fullPath] == commitID {
+                        sliceRebaseCommitTasksByFullPath.removeValue(forKey: fullPath)
+                        sliceRebaseCommitIDsByFullPath.removeValue(forKey: fullPath)
+                    }
+                }
+                guard await isHiddenSessionSliceRebaseCurrent(
+                    request,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                for commit in partitionCommits {
+                    guard await isHiddenSessionSliceRebaseCurrent(
+                        request,
+                        taskID: taskID,
+                        registrationGeneration: registrationGeneration
+                    ) else { return }
+                    if let target = commit.hiddenSessionTarget,
+                       let expectedLogicalRanges = commit.expectedLogicalRanges
+                    {
+                        guard await hiddenSessionSliceRangesIfTargetCurrent(target) == expectedLogicalRanges else {
+                            continue
+                        }
+                    }
+                    do {
+                        guard try await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
+                            forRootPath: request.physicalRootPath,
+                            scope: commit.scope,
+                            updates: [
+                                request.relativePath: PartitionStore.SliceUpdate(
+                                    ranges: commit.ranges,
+                                    fileModificationTime: loadedSnapshot.modificationTime,
+                                    anchors: commit.anchors
+                                )
+                            ],
+                            mode: .setPaths,
+                            expectedCurrent: [request.relativePath: commit.expectedStoredSlices]
+                        ) != nil else {
+                            return
+                        }
+                    } catch {
+                        return
+                    }
+                }
+                var stillCurrentTargets: [HiddenSessionSliceRebaseTarget] = []
+                for target in currentTargets where await isHiddenSessionSliceRebaseTargetCurrent(target) {
+                    stillCurrentTargets.append(target)
+                }
+                guard !stillCurrentTargets.isEmpty else { return }
+                let targets = stillCurrentTargets.map { (identity: $0.identity, fullPath: $0.logicalFullPath) }
+                await workspaceManager?.rebaseSlicesForFilesAcrossTabs(
+                    targets: targets,
+                    asyncTransform: { _, logicalFullPath, currentRanges in
+                        await Task.detached(priority: .utility) {
+                            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+                            let result = SliceRebaseEngine.rebase(
+                                oldText: sourceSnapshot.text,
+                                newText: loadedSnapshot.text,
+                                oldRanges: currentRanges,
+                                anchors: nil
+                            )
+                            #if DEBUG
+                                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                                    fullPath: logicalFullPath,
+                                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                                    scope: "hidden-tab"
+                                )
+                            #endif
+                            return result.isStale ? currentRanges : result.rebased
+                        }.value
+                    }
+                )
+                guard await isHiddenSessionSliceRebaseCurrent(
+                    request,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                sliceRebaseSourceSnapshotByFullPath[fullPath] = loadedSnapshot
+            }
+            sliceRebaseCommitTasksByFullPath[fullPath] = commitTask
+            await commitTask.value
+        }
+    }
+
+    @MainActor
+    private func isHiddenSessionSliceRebaseCurrent(
+        _ request: HiddenSessionSliceRebaseRequest,
+        taskID: UUID,
+        registrationGeneration: UInt64
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              sliceRebaseTaskIDsByFullPath[request.physicalFullPath] == taskID,
+              sliceRebaseRegistrationGenerationByFullPath[request.physicalFullPath, default: 0] == registrationGeneration,
+              hiddenSessionRootLifetimeByPhysicalPath[request.physicalFullPath] == HiddenSessionRootLifetimeKey(
+                  rootID: request.rootID,
+                  rootLifetimeID: request.rootLifetimeID
+              ), await workspaceFileContextStore.sliceRebaseFileIsCurrent(
+                  rootID: request.rootID,
+                  rootLifetimeID: request.rootLifetimeID,
+                  fileID: request.fileID,
+                  relativePath: request.relativePath,
+                  fullPath: request.physicalFullPath
+              )
+        else { return false }
+        return true
+    }
+
+    @MainActor
+    private func isHiddenSessionSliceRebaseTargetCurrent(
+        _ target: HiddenSessionSliceRebaseTarget
+    ) async -> Bool {
+        await hiddenSessionSliceRangesIfTargetCurrent(target) != nil
+    }
+
+    @MainActor
+    private func hiddenSessionSliceRangesIfTargetCurrent(
+        _ target: HiddenSessionSliceRebaseTarget
+    ) async -> [LineRange]? {
+        guard let provider = sessionWorktreeBindingsProvider,
+              let manager = workspaceManager,
+              let tab = manager.composeTab(for: target.identity),
+              tab.activeAgentSessionID == target.agentSessionID,
+              let ranges = StoredSelectionPathNormalization.standardizedSlices(tab.selection.slices)[target.logicalFullPath],
+              !ranges.isEmpty
+        else { return nil }
+        let bindings = provider(target.agentSessionID)
+        guard AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings) == target.bindingFingerprint,
+              Set(bindings.map {
+                  StandardizedPath.absolute(($0.worktreeRootPath as NSString).expandingTildeInPath)
+              }) == target.physicalRootPaths,
+              await workspaceFileContextStore.sessionWorktreeOwnershipCovers(
+                  ownerID: target.agentSessionID,
+                  bindingFingerprint: target.bindingFingerprint,
+                  physicalRootPaths: target.physicalRootPaths
+              )
+        else { return nil }
+        return SliceRangeMath.normalize(ranges)
+    }
+
+    @MainActor
+    private func cancelHiddenSessionSliceRebases(for lifetimeKey: HiddenSessionRootLifetimeKey) {
+        let paths = hiddenSessionRootLifetimeByPhysicalPath.compactMap { path, key in
+            key == lifetimeKey ? path : nil
+        }
+        for path in paths {
+            sliceRebaseTasksByFullPath.removeValue(forKey: path)?.cancel()
+            sliceRebaseCommitTasksByFullPath.removeValue(forKey: path)?.cancel()
+            sliceRebaseTaskIDsByFullPath.removeValue(forKey: path)
+            sliceRebaseCommitIDsByFullPath.removeValue(forKey: path)
+            sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: path)
+            hiddenSessionRootLifetimeByPhysicalPath.removeValue(forKey: path)
+        }
     }
 
     @MainActor
@@ -1779,6 +2288,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
         for fileID in event.modifiedFileIDs {
             guard let fileVM = modificationTargets.filesByID[fileID] else { continue }
+            let sourceSnapshot = await trustworthySliceRebaseSourceSnapshot(for: fileVM)
             let date: Date
             do {
                 date = try await workspaceFileContextStore.fileModificationDate(
@@ -1797,7 +2307,11 @@ class WorkspaceFilesViewModel: ObservableObject {
             }
             requestCodeScan(for: fileVM)
             scheduleSliceRebasesForModifiedFiles([
-                ReplaySliceRebaseRequest(file: fileVM, relativePath: fileVM.relativePath)
+                ReplaySliceRebaseRequest(
+                    file: fileVM,
+                    relativePath: fileVM.relativePath,
+                    sourceSnapshot: sourceSnapshot
+                )
             ])
         }
         for folderID in event.modifiedFolderIDs {
@@ -2681,23 +3195,27 @@ class WorkspaceFilesViewModel: ObservableObject {
         workspace: WorkspaceModel,
         workspaceManager: WorkspaceManagerViewModel,
         refreshRootFolderStateAfterLoad: Bool = true
-    ) async {
+    ) async throws -> WorkspaceRootRef {
         guard workspace.isSystemWorkspace == false else {
-            return
+            throw GitDataRootLoadError.systemWorkspace(workspaceID: workspace.id)
         }
+
         let gitDataURL = workspaceManager.gitDataDirectory(for: workspace)
-        if isFolderAlreadyLoaded(gitDataURL) {
-            return
-        }
-        do {
+        if !isFolderAlreadyLoaded(gitDataURL) {
             try await loadSupplementalRoot(
                 at: gitDataURL,
                 for: workspace,
                 refreshRootFolderStateAfterLoad: refreshRootFolderStateAfterLoad
             )
-        } catch {
-            print("Failed to load _git_data root: \(error)")
         }
+
+        guard let exactRoot = await workspaceFileContextStore.exactRootRef(
+            path: gitDataURL.path,
+            kind: .workspaceGitData
+        ) else {
+            throw GitDataRootLoadError.exactRootUnavailable(path: gitDataURL.path)
+        }
+        return exactRoot
     }
 
     private func removeFolderBeingAdded() {
@@ -3606,6 +4124,7 @@ class WorkspaceFilesViewModel: ObservableObject {
 
             case let .fileModified(_, maybeDate):
                 if let fileVM = findFileByFullPath(fullPath) {
+                    let sourceSnapshot = await trustworthySliceRebaseSourceSnapshot(for: fileVM)
                     observedStoreDeltas.append(prepared)
                     if let date = maybeDate {
                         await fileVM.setModificationDate(date, forceInvalidation: true)
@@ -3621,9 +4140,11 @@ class WorkspaceFilesViewModel: ObservableObject {
                         }
                     }
                     batchedCodeScanFiles[fileVM.id] = fileVM
+                    let existingRebase = batchedSliceRebases[fileVM.standardizedFullPath]
                     batchedSliceRebases[fileVM.standardizedFullPath] = ReplaySliceRebaseRequest(
                         file: fileVM,
-                        relativePath: rel
+                        relativePath: rel,
+                        sourceSnapshot: existingRebase?.sourceSnapshot ?? sourceSnapshot
                     )
                 }
                 processedDigests.append(.fileModified(rel))
@@ -4626,6 +5147,10 @@ class WorkspaceFilesViewModel: ObservableObject {
             sliceRebaseTasksByFullPath[file.standardizedFullPath]?.cancel()
             sliceRebaseTasksByFullPath.removeValue(forKey: file.standardizedFullPath)
             sliceRebaseTaskIDsByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseCommitTasksByFullPath[file.standardizedFullPath]?.cancel()
+            sliceRebaseCommitTasksByFullPath.removeValue(forKey: file.standardizedFullPath)
+            sliceRebaseCommitIDsByFullPath.removeValue(forKey: file.standardizedFullPath)
             noSlicesKnownRevisionByFullPath.removeValue(forKey: file.standardizedFullPath)
         }
         if shouldRebuildSelectionSliceSnapshot {
@@ -4718,7 +5243,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         for request in requests {
             scheduleSliceRebaseForModifiedFile(
                 request.file,
-                relativePath: request.relativePath
+                relativePath: request.relativePath,
+                sourceSnapshot: request.sourceSnapshot
             )
         }
     }
@@ -5250,7 +5776,8 @@ class WorkspaceFilesViewModel: ObservableObject {
         switch scope {
         case .allLoaded:
             return getAllFileViewModels()
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .sessionBoundWorkspace:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoadedExcludingGitData, .sessionBoundWorkspace,
+             .validatedSessionBoundWorkspace:
             let allowedRoots = allowedRootPaths(in: scope)
             return allFilesSnapshot(sorted: false).filter {
                 allowedRoots.contains($0.standardizedRootFolderPath)
@@ -7589,16 +8116,26 @@ class WorkspaceFilesViewModel: ObservableObject {
     private func roots(in scope: LookupRootScope) -> [FolderViewModel] {
         switch scope {
         case .visibleWorkspace:
-            visibleRootFolders
+            return visibleRootFolders
         case .visibleWorkspacePlusGitData:
-            visibleRootFolders + gitDataRootFolders()
+            return visibleRootFolders + gitDataRootFolders()
         case .allLoaded:
-            rootFolders
+            return rootFolders
+        case .allLoadedExcludingGitData:
+            let gitDataRootIDs = Set(gitDataRootFolders().map(\.id))
+            return rootFolders.filter { !gitDataRootIDs.contains($0.id) }
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
-            rootFolders.filter { root in
+            return rootFolders.filter { root in
                 if physicalRootPaths.contains(root.standardizedFullPath) { return true }
                 return visibleRootFolders.contains(where: { $0.id == root.id })
                     && canonicalRootPaths.contains(root.standardizedFullPath)
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let allowedRootsByID = Dictionary(
+                uniqueKeysWithValues: canonicalRoots.union(physicalRoots).map { ($0.id, $0) }
+            )
+            return rootFolders.filter { root in
+                allowedRootsByID[root.id]?.standardizedFullPath == root.standardizedFullPath
             }
         }
     }
@@ -9244,8 +9781,11 @@ class WorkspaceFilesViewModel: ObservableObject {
     @MainActor
     private func sliceAnchorContent(for file: FileViewModel) async -> String? {
         let snapshot = await file.cachedContentSnapshot()
-        if let content = snapshot.content {
+        if let content = snapshot.content, snapshot.isFresh {
             return content
+        }
+        if let loaded = await file.latestContent {
+            return loaded
         }
 
         let rootKey = file.standardizedRootFolderPath
@@ -10126,6 +10666,12 @@ class WorkspaceFilesViewModel: ObservableObject {
         guard let fileExt = fileVM.fileExtension,
               SyntaxManager.isSupportedFileExtension(fileExt) else { return }
 
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordCodemapRequest(
+                rootID: fileVM.rootIdentifier,
+                fileID: fileVM.id
+            )
+        #endif
         let id = fileVM.id
         let scanTask = Task { [weak self] in
             guard let self else { return }
@@ -10931,10 +11477,10 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func clearAutoCodemapFiles(disableAuto: Bool = true) {
-        guard !autoCodemapFiles.isEmpty else { return }
-        if disableAuto, codemapAutoEnabled {
-            codemapAutoEnabled = false
+        if disableAuto {
+            enterManualCodemapMode()
         }
+        guard !autoCodemapFiles.isEmpty else { return }
         resetAutoCodemapFiles([])
     }
 
@@ -10946,8 +11492,10 @@ extension WorkspaceFilesViewModel {
         // Only sync when auto mode is enabled
         if codemapAutoEnabled {
             // Recompute the auto-codemap set immediately from the store codemap mirror.
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
+            let aggregate = await workspaceFileContextStore.codemapFileAPIAggregate(
+                rootScope: .visibleWorkspace
+            )
+            syncAutoCodemaps(aggregate: aggregate)
         }
     }
 
@@ -11026,14 +11574,16 @@ extension WorkspaceFilesViewModel {
             defer { self.autoCodemapSyncTask = nil }
             guard !Task.isCancelled else { return }
             guard codemapAutoEnabled else { return }
-            let allFileAPIs = await workspaceFileContextStore.allCodemapFileAPIs()
+            let aggregate = await workspaceFileContextStore.codemapFileAPIAggregate(
+                rootScope: .visibleWorkspace
+            )
             guard !Task.isCancelled else { return }
-            syncAutoCodemaps(allFileAPIs: allFileAPIs)
+            syncAutoCodemaps(aggregate: aggregate)
         }
     }
 
     @MainActor
-    private func syncAutoCodemaps(allFileAPIs: [FileAPI]) {
+    private func syncAutoCodemaps(aggregate: WorkspaceCodemapFileAPIAggregate) {
         guard codemapAutoEnabled else {
             resetAutoCodemapFiles([])
             return
@@ -11044,21 +11594,22 @@ extension WorkspaceFilesViewModel {
             return
         }
 
-        let selectedFilesSnapshot = selectedFiles
+        let visibleRootIDs = Set(visibleRootFolders.map(\.id))
+        let selectedFilesSnapshot = selectedFiles.filter { visibleRootIDs.contains($0.rootIdentifier) }
         guard !selectedFilesSnapshot.isEmpty else {
             resetAutoCodemapFiles([])
             return
         }
 
         let selectedPaths = Set(selectedFilesSnapshot.map(\.standardizedFullPath))
-        guard !allFileAPIs.isEmpty else {
+        guard !aggregate.orderedFileAPIs.isEmpty else {
             resetAutoCodemapFiles([])
             return
         }
 
         let referencedPaths = CodeMapExtractor.resolveReferencedFilePaths(
             from: selectedFilesSnapshot,
-            among: allFileAPIs
+            among: aggregate.orderedFileAPIs
         )
 
         if referencedPaths.isEmpty {
@@ -11070,6 +11621,7 @@ extension WorkspaceFilesViewModel {
         let resolved = referencedPaths.compactMap { standardizedPath -> FileViewModel? in
             guard !selectedPaths.contains(standardizedPath),
                   let vm = fileHierarchyIndex.filesByFullPath[standardizedPath],
+                  visibleRootIDs.contains(vm.rootIdentifier),
                   unique.insert(vm.id).inserted
             else { return nil }
             return vm
@@ -11240,11 +11792,6 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func setFileAsFullContent(_ file: FileViewModel) {
-        // If switching from codemap to full content, disable auto mode
-        if isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
-
         performSelectionBatch {
             if !file.isChecked {
                 file.setIsChecked(true)
@@ -11252,7 +11799,7 @@ extension WorkspaceFilesViewModel {
         }
 
         selectionSlicesByFileID.removeValue(forKey: file.id)
-        removeAutoCodemapFile(file)
+        removeCodemapFile(file)
         requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
     }
 
@@ -11279,24 +11826,20 @@ extension WorkspaceFilesViewModel {
 
     @MainActor
     func removeCodemapFile(_ file: FileViewModel) {
+        guard isAutoCodemapFile(file) else { return }
+        enterManualCodemapMode()
         removeAutoCodemapFile(file)
     }
 
     @MainActor
     func removeFileFromAllSelections(_ file: FileViewModel) {
-        // If auto-mode is on and the user is removing an auto-added file,
-        // interpret this as a switch to manual mode.
-        if codemapAutoEnabled, isAutoCodemapFile(file) {
-            codemapAutoEnabled = false
-        }
+        removeCodemapFile(file)
 
         performSelectionBatch {
             // Remove from selected files if present
             if file.isChecked {
                 file.setIsChecked(false)
             }
-            // Remove from auto-codemap files
-            removeAutoCodemapFile(file)
             // Remove any slices for this file
             selectionSlicesByFileID.removeValue(forKey: file.id)
         }
@@ -12015,46 +12558,155 @@ extension WorkspaceFilesViewModel {
     }
 
     @MainActor
-    private func scheduleSliceRebaseForModifiedFile(
-        _ file: FileViewModel,
-        relativePath: String
+    private func registerSliceRebaseTask(
+        fullPath: String,
+        operation: @escaping @MainActor (UUID) async -> Void
     ) {
-        let fullPath = file.standardizedFullPath
-        guard shouldScheduleSliceRebase(for: file, fullPath: fullPath) else { return }
+        let replaced = sliceRebaseTasksByFullPath[fullPath] != nil
         sliceRebaseTasksByFullPath[fullPath]?.cancel()
+        sliceRebaseCommitTasksByFullPath[fullPath]?.cancel()
 
         let taskID = UUID()
         sliceRebaseTaskIDsByFullPath[fullPath] = taskID
+        sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] &+= 1
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordRebaseRegistration(
+                fullPath: fullPath,
+                replaced: replaced,
+                generation: sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+            )
+        #endif
 
-        let task = Task { [weak self] in
+        let task = Task { @MainActor [weak self] in
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseTaskStart(fullPath: fullPath)
+            #endif
             defer {
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    guard self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordRebaseCompletion(
+                        fullPath: fullPath,
+                        cancelled: Task.isCancelled
+                    )
+                #endif
+                if let self,
+                   self.sliceRebaseTaskIDsByFullPath[fullPath] == taskID
+                {
                     self.sliceRebaseTasksByFullPath.removeValue(forKey: fullPath)
                     self.sliceRebaseTaskIDsByFullPath.removeValue(forKey: fullPath)
                 }
             }
+            await operation(taskID)
+        }
+        sliceRebaseTasksByFullPath[fullPath] = task
+    }
+
+    @MainActor
+    private func trustworthySliceRebaseSourceSnapshot(for file: FileViewModel) async -> SliceRebaseSourceSnapshot? {
+        let snapshot = await file.cachedContentSnapshot()
+        guard snapshot.isFresh, let content = snapshot.content else { return nil }
+        return SliceRebaseSourceSnapshot(
+            text: content,
+            modificationTime: snapshot.modificationDate.timeIntervalSince1970
+        )
+    }
+
+    @MainActor
+    private func scheduleSliceRebaseForModifiedFile(
+        _ file: FileViewModel,
+        relativePath: String,
+        sourceSnapshot: SliceRebaseSourceSnapshot?
+    ) {
+        let fullPath = file.standardizedFullPath
+        let shouldSchedule = shouldScheduleSliceRebase(for: file, fullPath: fullPath)
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordRebaseScheduleDecision(
+                fileID: file.id,
+                fullPath: fullPath,
+                relativePath: relativePath,
+                shouldSchedule: shouldSchedule
+            )
+        #endif
+        guard shouldSchedule else { return }
+
+        if sliceRebaseSourceSnapshotByFullPath[fullPath] == nil, let sourceSnapshot {
+            sliceRebaseSourceSnapshotByFullPath[fullPath] = sourceSnapshot
+        }
+
+        registerSliceRebaseTask(fullPath: fullPath) { [weak self, weak file] taskID in
             try? await Task.sleep(nanoseconds: 300_000_000)
-            guard let self else { return }
-            guard !Task.isCancelled else { return }
+            guard let self, let file, !Task.isCancelled else { return }
+            if let commitTask = sliceRebaseCommitTasksByFullPath[fullPath] {
+                await commitTask.value
+            }
+            guard !Task.isCancelled, sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
             let hasSlices = await hasAnySlicesForFile(file)
             guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == taskID else { return }
+            guard sliceRebaseTaskIDsByFullPath[fullPath] == taskID else {
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordRebaseStaleExit(fullPath: fullPath)
+                #endif
+                return
+            }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseExecution(
+                    fullPath: fullPath,
+                    generation: sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
+                )
+            #endif
             guard hasSlices else {
                 noSlicesKnownRevisionByFullPath[fullPath] = partitionSliceSaveRevision
+                sliceRebaseSourceSnapshotByFullPath.removeValue(forKey: fullPath)
                 return
             }
             noSlicesKnownRevisionByFullPath.removeValue(forKey: fullPath)
+            let retainedSourceSnapshot = sliceRebaseSourceSnapshotByFullPath[fullPath]
+            let registrationGeneration = sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0]
             await rebaseSlicesForModifiedFile(
                 file,
                 relativePath: relativePath,
-                expectedTaskID: taskID
+                sourceSnapshot: retainedSourceSnapshot,
+                expectedTaskID: taskID,
+                expectedRegistrationGeneration: registrationGeneration
+            )
+        }
+    }
+
+    #if DEBUG
+        @MainActor
+        struct HiddenSessionSliceRebaseDebugSnapshot: Equatable {
+            let handledGeneration: UInt64
+            let registrationGeneration: UInt64
+            let hasPendingTask: Bool
+            let hasSourceSnapshot: Bool
+            let hasLifetimeMapping: Bool
+        }
+
+        func hiddenSessionSliceRebaseDebugSnapshotForTesting(
+            fullPath: String,
+            rootID: UUID,
+            rootLifetimeID: UUID
+        ) -> HiddenSessionSliceRebaseDebugSnapshot {
+            let standardized = StandardizedPath.absolute(fullPath)
+            let key = HiddenSessionRootLifetimeKey(rootID: rootID, rootLifetimeID: rootLifetimeID)
+            return HiddenSessionSliceRebaseDebugSnapshot(
+                handledGeneration: hiddenSessionHandledGenerationByRootLifetime[key] ?? 0,
+                registrationGeneration: sliceRebaseRegistrationGenerationByFullPath[standardized, default: 0],
+                hasPendingTask: sliceRebaseTasksByFullPath[standardized] != nil,
+                hasSourceSnapshot: sliceRebaseSourceSnapshotByFullPath[standardized] != nil,
+                hasLifetimeMapping: hiddenSessionRootLifetimeByPhysicalPath[standardized] == key
             )
         }
 
-        sliceRebaseTasksByFullPath[fullPath] = task
-    }
+        func debugRegisterSliceRebaseTask(
+            fullPath: String,
+            operation: @escaping @MainActor () async -> Void
+        ) {
+            guard let standardizedFullPath = StoredSelectionPathNormalization.standardizedPath(fullPath) else { return }
+            registerSliceRebaseTask(fullPath: standardizedFullPath) { _ in
+                await operation()
+            }
+        }
+    #endif
 
     /// Waits for pending slice-rebase tasks that affect currently selected files.
     /// Used by selection/reporting paths so line-range metadata reflects post-edit rebases.
@@ -12064,50 +12716,116 @@ extension WorkspaceFilesViewModel {
         await waitForPendingSliceRebases(affectingFullPaths: selectedFullPaths)
     }
 
-    /// Waits for pending slice-rebase tasks affecting candidate file paths.
-    /// Candidates can be absolute full paths or relative paths.
+    /// Waits for currently pending slice-rebase work, then captures the exact path set whose
+    /// quiescence must be revalidated before authoritative selection verification completes.
     @MainActor
-    func waitForPendingSliceRebases(affectingCandidatePaths candidatePaths: [String]) async {
-        let fullPaths = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
-        await waitForPendingSliceRebases(affectingFullPaths: fullPaths)
+    func waitForPendingSliceRebasesAndCaptureFence(
+        affectingCandidatePaths candidatePaths: [String]
+    ) async -> WorkspaceSliceRebaseFence {
+        let unresolvedAppliedIndexPaths = await waitForAppliedIndexConsumers(
+            affectingCandidatePaths: candidatePaths
+        )
+        let normalized = normalizedFullPathsForSliceRebaseWait(from: candidatePaths)
+        await waitForPendingSliceRebases(affectingFullPaths: normalized.fullPaths)
+        return WorkspaceSliceRebaseFence(
+            registrationGenerationsByFullPath: Dictionary(uniqueKeysWithValues: normalized.fullPaths.map {
+                ($0, sliceRebaseRegistrationGenerationByFullPath[$0, default: 0])
+            }),
+            unresolvedCandidatePaths: normalized.unresolved.union(unresolvedAppliedIndexPaths)
+        )
+    }
+
+    @MainActor
+    func isSliceRebaseFenceCurrent(_ fence: WorkspaceSliceRebaseFence) -> Bool {
+        guard fence.unresolvedCandidatePaths.isEmpty else { return false }
+        return fence.registrationGenerationsByFullPath.allSatisfy { fullPath, capturedGeneration in
+            sliceRebaseTasksByFullPath[fullPath] == nil
+                && sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] == capturedGeneration
+        }
+    }
+
+    @MainActor
+    private func waitForAppliedIndexConsumers(
+        affectingCandidatePaths candidatePaths: [String]
+    ) async -> Set<String> {
+        var required: [(fullPath: String, state: WorkspaceSliceRebasePathState)] = []
+        for rawPath in candidatePaths {
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/"),
+                  let state = await workspaceFileContextStore.sliceRebasePathState(fullPath: trimmed),
+                  state.appliedIndexGeneration > 0
+            else { continue }
+            required.append((StandardizedPath.absolute(trimmed), state))
+        }
+        guard !required.isEmpty else { return [] }
+
+        let isCaughtUp: (WorkspaceSliceRebasePathState) -> Bool = { state in
+            switch state.rootKind {
+            case .sessionWorktree:
+                self.hiddenSessionHandledGenerationByRootLifetime[
+                    HiddenSessionRootLifetimeKey(
+                        rootID: state.rootID,
+                        rootLifetimeID: state.rootLifetimeID
+                    ),
+                    default: 0
+                ] >= state.appliedIndexGeneration
+            default:
+                self.appliedIndexProjectionHandledGenerationByRootID[state.rootID, default: 0]
+                    >= state.appliedIndexGeneration
+            }
+        }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+        while ContinuousClock.now < deadline {
+            if required.allSatisfy({ isCaughtUp($0.state) }) { return [] }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return Set(required.compactMap { isCaughtUp($0.state) ? nil : $0.fullPath })
     }
 
     @MainActor
     private func waitForPendingSliceRebases(affectingFullPaths fullPaths: Set<String>) async {
         guard !fullPaths.isEmpty else { return }
-        let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
-            fullPaths.contains(path) ? task : nil
-        }
-        guard !pending.isEmpty else { return }
+        for _ in 0 ..< 3 {
+            let pending = sliceRebaseTasksByFullPath.compactMap { path, task -> Task<Void, Never>? in
+                fullPaths.contains(path) ? task : nil
+            }
+            guard !pending.isEmpty else { return }
 
-        for task in pending {
-            await task.value
+            for task in pending {
+                await task.value
+            }
+            await Task.yield()
         }
     }
 
     @MainActor
-    private func normalizedFullPathsForSliceRebaseWait(from candidatePaths: [String]) -> Set<String> {
-        var result: Set<String> = []
+    private func normalizedFullPathsForSliceRebaseWait(
+        from candidatePaths: [String]
+    ) -> (fullPaths: Set<String>, unresolved: Set<String>) {
+        var fullPaths: Set<String> = []
+        var unresolved: Set<String> = []
         for raw in candidatePaths {
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { continue }
             let standardized = (trimmed as NSString).standardizingPath
 
             if standardized.hasPrefix("/") {
-                result.insert(standardized)
+                fullPaths.insert(standardized)
                 continue
             }
 
             if let file = findFileByRelativePath(standardized) {
-                result.insert(file.standardizedFullPath)
+                fullPaths.insert(file.standardizedFullPath)
                 continue
             }
 
             if let full = findFullPath(for: standardized) {
-                result.insert((full as NSString).standardizingPath)
+                fullPaths.insert((full as NSString).standardizingPath)
+            } else {
+                unresolved.insert(standardized)
             }
         }
-        return result
+        return (fullPaths, unresolved)
     }
 
     @MainActor
@@ -12193,94 +12911,301 @@ extension WorkspaceFilesViewModel {
     private func rebaseSlicesForModifiedFile(
         _ file: FileViewModel,
         relativePath: String,
-        expectedTaskID: UUID
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        expectedTaskID: UUID,
+        expectedRegistrationGeneration: UInt64
     ) async {
         guard let workspaceID = currentWorkspaceID else { return }
 
         let rootKey = file.standardizedRootFolderPath
         let relKey = file.standardizedRelativePath
         let fullPath = file.standardizedFullPath
-        guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
+        guard let workspaceRoot = workspaceFileContextRootsByRootKey[rootKey],
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: workspaceRoot.id,
+                  relativePath: relKey,
+                  fullPath: fullPath,
+                  fileID: file.id,
+                  taskID: expectedTaskID,
+                  registrationGeneration: expectedRegistrationGeneration
+              )
+        else { return }
         let activeScope = try? currentPartitionScope()
-        let fileModificationTime = file.modificationDate.timeIntervalSince1970
 
-        let oldSnapshot = await file.cachedContentSnapshot()
-        let oldText = oldSnapshot.content
-        let loadedNewText: String? = if let workspaceRoot = workspaceFileContextRootsByRootKey[rootKey] {
-            try? await workspaceFileContextStore.readContent(
-                rootID: workspaceRoot.id,
-                relativePath: relativePath
+        let readStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+        let loadedSnapshot = await stableSliceRebaseSnapshot(
+            rootID: workspaceRoot.id,
+            relativePath: relativePath
+        )
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordFullFileRead(
+                fullPath: fullPath,
+                durationMS: ProcessInfo.processInfo.systemUptime * 1000 - readStartedMS
             )
-        } else {
-            nil
-        }
-        let canRebase = (loadedNewText != nil)
-        let newText = loadedNewText ?? ""
+        #endif
+        guard let loadedSnapshot,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: workspaceRoot.id,
+                  relativePath: relKey,
+                  fullPath: fullPath,
+                  fileID: file.id,
+                  taskID: expectedTaskID,
+                  registrationGeneration: expectedRegistrationGeneration
+              )
+        else { return }
 
-        var activeScopeChanged = false
+        var partitionCommits: [SlicePartitionRebaseCommit] = []
+        var encounteredStalePartition = false
 
         for scope in scopesForSliceRebase(workspaceID: workspaceID) {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: workspaceRoot.id,
+                relativePath: relKey,
+                fullPath: fullPath,
+                fileID: file.id,
+                taskID: expectedTaskID,
+                registrationGeneration: expectedRegistrationGeneration
+            ) else { return }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordPartitionInspection(fullPath: fullPath)
+            #endif
             let data = await selectionSliceCoordinator.loadSlices(forRootPath: rootKey, scope: scope)
             guard let stored = data[relKey], !stored.ranges.isEmpty else { continue }
 
-            let storedRanges = stored.ranges
-            let storedAnchors = stored.anchors
-            let oldTextSnapshot = oldText
-            let newTextSnapshot = newText
-            let canRebaseSnapshot = canRebase
-
-            let computed: (ranges: [LineRange], anchors: [SliceAnchor]?) = await Task.detached(priority: .utility) { [storedRanges, storedAnchors, oldTextSnapshot, newTextSnapshot, canRebaseSnapshot] in
-                if Task.isCancelled {
-                    return (storedRanges, storedAnchors)
-                }
-                let nextRanges: [LineRange]
-                if canRebaseSnapshot {
-                    let result = SliceRebaseEngine.rebase(
-                        oldText: oldTextSnapshot,
-                        newText: newTextSnapshot,
-                        oldRanges: storedRanges,
-                        anchors: storedAnchors
-                    )
-                    nextRanges = result.rebased
-                } else {
-                    nextRanges = []
-                }
-
-                let normalizedRanges = SliceRangeMath.normalize(nextRanges)
-                let nextAnchors: [SliceAnchor]? = {
-                    guard canRebaseSnapshot, !normalizedRanges.isEmpty else { return nil }
-                    if Task.isCancelled { return storedAnchors }
-                    return SliceRebaseEngine.buildAnchors(content: newTextSnapshot, ranges: normalizedRanges)
-                }()
-
-                return (normalizedRanges, nextAnchors)
-            }.value
-
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-
-            let normalizedRanges = computed.ranges
-            let nextAnchors = computed.anchors
-            if normalizedRanges == storedRanges, nextAnchors == storedAnchors {
+            let oldText = sliceRebaseSourceText(
+                sourceSnapshot: sourceSnapshot,
+                stored: stored,
+                currentText: loadedSnapshot.text
+            )
+            let computed = await Self.computeSliceRebaseConsumer(
+                oldText: oldText,
+                newText: loadedSnapshot.text,
+                stored: stored,
+                fullPath: fullPath,
+                scope: "partition"
+            )
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: workspaceRoot.id,
+                relativePath: relKey,
+                fullPath: fullPath,
+                fileID: file.id,
+                taskID: expectedTaskID,
+                registrationGeneration: expectedRegistrationGeneration
+            ) else { return }
+            if computed.isStale {
+                encounteredStalePartition = true
                 continue
             }
+            guard computed.ranges != stored.ranges || computed.anchors != stored.anchors else { continue }
+            partitionCommits.append(SlicePartitionRebaseCommit(
+                scope: scope,
+                ranges: computed.ranges,
+                anchors: computed.anchors,
+                expectedStoredSlices: stored
+            ))
+        }
+
+        await beginSliceRebaseCommit(
+            workspaceID: workspaceID,
+            rootID: workspaceRoot.id,
+            fileID: file.id,
+            taskID: expectedTaskID,
+            registrationGeneration: expectedRegistrationGeneration,
+            fullPath: fullPath,
+            rootKey: rootKey,
+            relativePath: relKey,
+            activeScope: activeScope,
+            partitionCommits: partitionCommits,
+            sourceSnapshot: sourceSnapshot,
+            loadedSnapshot: loadedSnapshot,
+            encounteredStalePartition: encounteredStalePartition
+        )
+    }
+
+    private func sliceRebaseSourceText(
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        stored: PartitionStore.StoredSlices,
+        currentText: String
+    ) -> String {
+        guard let sourceSnapshot else { return currentText }
+        let storedVersionMatches = stored.fileModificationTime.map {
+            abs($0 - sourceSnapshot.modificationTime) <= Self.sliceTimestampTolerance
+        } ?? false
+        return storedVersionMatches ? sourceSnapshot.text : currentText
+    }
+
+    private nonisolated static func computeSliceRebaseConsumer(
+        oldText: String,
+        newText: String,
+        stored: PartitionStore.StoredSlices,
+        fullPath: String,
+        scope: String
+    ) async -> (ranges: [LineRange], anchors: [SliceAnchor]?, isStale: Bool) {
+        await Task.detached(priority: .utility) {
+            if Task.isCancelled {
+                return (stored.ranges, stored.anchors, true)
+            }
+            let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+            let result = SliceRebaseEngine.rebase(
+                oldText: oldText,
+                newText: newText,
+                oldRanges: stored.ranges,
+                anchors: stored.anchors
+            )
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                    fullPath: fullPath,
+                    durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                    scope: scope
+                )
+            #endif
+            guard !result.isStale else {
+                return (stored.ranges, stored.anchors, true)
+            }
+
+            let normalizedRanges = SliceRangeMath.normalize(result.rebased)
+            let nextAnchors: [SliceAnchor]? = {
+                guard !normalizedRanges.isEmpty else { return nil }
+                if Task.isCancelled { return stored.anchors }
+                return SliceRebaseEngine.buildAnchors(content: newText, ranges: normalizedRanges)
+            }()
+            return (normalizedRanges, nextAnchors, false)
+        }.value
+    }
+
+    private func isSliceRebaseCurrent(
+        workspaceID: UUID,
+        rootID: UUID,
+        relativePath: String,
+        fullPath: String,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64
+    ) async -> Bool {
+        guard !Task.isCancelled,
+              currentWorkspaceID == workspaceID,
+              sliceRebaseTaskIDsByFullPath[fullPath] == taskID,
+              sliceRebaseRegistrationGenerationByFullPath[fullPath, default: 0] == registrationGeneration,
+              findFileByFullPath(fullPath)?.id == fileID,
+              await workspaceFileContextStore.file(rootID: rootID, relativePath: relativePath)?.id == fileID
+        else {
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordRebaseStaleExit(fullPath: fullPath)
+            #endif
+            return false
+        }
+        return true
+    }
+
+    @MainActor
+    private func beginSliceRebaseCommit(
+        workspaceID: UUID,
+        rootID: UUID,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64,
+        fullPath: String,
+        rootKey: String,
+        relativePath: String,
+        activeScope: PartitionScope?,
+        partitionCommits: [SlicePartitionRebaseCommit],
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        loadedSnapshot: SliceRebaseSourceSnapshot,
+        encounteredStalePartition: Bool
+    ) async {
+        let commitID = UUID()
+        sliceRebaseCommitIDsByFullPath[fullPath] = commitID
+        let commitTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if sliceRebaseCommitIDsByFullPath[fullPath] == commitID {
+                    sliceRebaseCommitTasksByFullPath.removeValue(forKey: fullPath)
+                    sliceRebaseCommitIDsByFullPath.removeValue(forKey: fullPath)
+                }
+            }
+            await commitSliceRebase(
+                workspaceID: workspaceID,
+                rootID: rootID,
+                fileID: fileID,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration,
+                fullPath: fullPath,
+                rootKey: rootKey,
+                relativePath: relativePath,
+                activeScope: activeScope,
+                partitionCommits: partitionCommits,
+                sourceSnapshot: sourceSnapshot,
+                loadedSnapshot: loadedSnapshot,
+                encounteredStalePartition: encounteredStalePartition
+            )
+        }
+        sliceRebaseCommitTasksByFullPath[fullPath] = commitTask
+        await commitTask.value
+    }
+
+    @MainActor
+    private func commitSliceRebase(
+        workspaceID: UUID,
+        rootID: UUID,
+        fileID: UUID,
+        taskID: UUID,
+        registrationGeneration: UInt64,
+        fullPath: String,
+        rootKey: String,
+        relativePath: String,
+        activeScope: PartitionScope?,
+        partitionCommits: [SlicePartitionRebaseCommit],
+        sourceSnapshot: SliceRebaseSourceSnapshot?,
+        loadedSnapshot: SliceRebaseSourceSnapshot,
+        encounteredStalePartition: Bool
+    ) async {
+        var activeScopeChanged = false
+        var persistenceSucceeded = true
+
+        for commit in partitionCommits {
+            guard await isSliceRebaseCurrent(
+                workspaceID: workspaceID,
+                rootID: rootID,
+                relativePath: relativePath,
+                fullPath: fullPath,
+                fileID: fileID,
+                taskID: taskID,
+                registrationGeneration: registrationGeneration
+            ) else { return }
             do {
-                let post = try await selectionSliceCoordinator.applyPartitionUpdates(
+                guard let post = try await selectionSliceCoordinator.applyPartitionUpdatesIfCurrent(
                     forRootPath: rootKey,
-                    scope: scope,
+                    scope: commit.scope,
                     updates: [
-                        relKey: PartitionStore.SliceUpdate(
-                            ranges: normalizedRanges,
-                            fileModificationTime: fileModificationTime,
-                            anchors: nextAnchors
+                        relativePath: PartitionStore.SliceUpdate(
+                            ranges: commit.ranges,
+                            fileModificationTime: loadedSnapshot.modificationTime,
+                            anchors: commit.anchors
                         )
                     ],
-                    mode: .setPaths
-                )
-
-                if let activeScope, scope == activeScope {
+                    mode: .setPaths,
+                    expectedCurrent: [relativePath: commit.expectedStoredSlices]
+                ) else {
+                    persistenceSucceeded = false
+                    break
+                }
+                guard await isSliceRebaseCurrent(
+                    workspaceID: workspaceID,
+                    rootID: rootID,
+                    relativePath: relativePath,
+                    fullPath: fullPath,
+                    fileID: fileID,
+                    taskID: taskID,
+                    registrationGeneration: registrationGeneration
+                ) else { return }
+                #if DEBUG
+                    MCPApplyEditsRebaseProbeRecorder.recordPartitionWrite(fullPath: fullPath)
+                #endif
+                if let activeScope, commit.scope == activeScope {
                     activeScopeChanged = true
                     if post.isEmpty {
                         currentSlicesByRoot.removeValue(forKey: rootKey)
@@ -12289,9 +13214,11 @@ extension WorkspaceFilesViewModel {
                     }
                 }
             } catch {
+                persistenceSucceeded = false
                 if Self.isLoggingEnabled {
-                    print("Failed to rebase slices for \(relKey) in scope \(String(describing: scope.tabID)) – \(error)")
+                    print("Failed to rebase slices for \(relativePath) in scope \(String(describing: commit.scope.tabID)) – \(error)")
                 }
+                break
             }
         }
 
@@ -12299,30 +13226,77 @@ extension WorkspaceFilesViewModel {
             requestSelectionSliceSnapshotRebuild(reason: "selection.slicesSnapshot")
         }
 
-        // Always rebase tab-stored slices when this file has any slices.
-        // Virtual/background tabs can carry slice state in tab selection storage
-        // before partition entries exist for that tab scope.
-        if canRebase {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-            await workspaceManager?.rebaseSlicesForFileAcrossTabs(
-                fullPath: fullPath,
-                asyncTransform: { current in
-                    await Task.detached(priority: .utility) { [oldText, newText, current] in
-                        SliceRebaseEngine.rebase(
-                            oldText: oldText,
-                            newText: newText,
-                            oldRanges: current,
-                            anchors: nil
-                        ).rebased
-                    }.value
-                }
+        guard persistenceSucceeded,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: rootID,
+                  relativePath: relativePath,
+                  fullPath: fullPath,
+                  fileID: fileID,
+                  taskID: taskID,
+                  registrationGeneration: registrationGeneration
+              )
+        else { return }
+
+        let tabOldText = sourceSnapshot?.text ?? loadedSnapshot.text
+        await workspaceManager?.rebaseSlicesForFileAcrossTabs(
+            fullPath: fullPath,
+            asyncTransform: { _, current in
+                await Task.detached(priority: .utility) {
+                    let engineStartedMS = ProcessInfo.processInfo.systemUptime * 1000
+                    let result = SliceRebaseEngine.rebase(
+                        oldText: tabOldText,
+                        newText: loadedSnapshot.text,
+                        oldRanges: current,
+                        anchors: nil
+                    )
+                    #if DEBUG
+                        MCPApplyEditsRebaseProbeRecorder.recordEngineCall(
+                            fullPath: fullPath,
+                            durationMS: ProcessInfo.processInfo.systemUptime * 1000 - engineStartedMS,
+                            scope: "tab"
+                        )
+                    #endif
+                    return result.isStale ? current : result.rebased
+                }.value
+            }
+        )
+
+        guard persistenceSucceeded,
+              !encounteredStalePartition,
+              sourceSnapshot != nil,
+              await isSliceRebaseCurrent(
+                  workspaceID: workspaceID,
+                  rootID: rootID,
+                  relativePath: relativePath,
+                  fullPath: fullPath,
+                  fileID: fileID,
+                  taskID: taskID,
+                  registrationGeneration: registrationGeneration
+              )
+        else { return }
+        sliceRebaseSourceSnapshotByFullPath[fullPath] = loadedSnapshot
+    }
+
+    private func stableSliceRebaseSnapshot(
+        rootID: UUID,
+        relativePath: String
+    ) async -> SliceRebaseSourceSnapshot? {
+        for _ in 0 ..< 3 {
+            guard !Task.isCancelled else { return nil }
+            guard let loaded = try? await workspaceFileContextStore.readValidatedContentSnapshot(
+                rootID: rootID,
+                relativePath: relativePath,
+                workloadClass: .contentSearch
+            ), let content = loaded.content
+            else { continue }
+
+            return SliceRebaseSourceSnapshot(
+                text: content,
+                modificationTime: loaded.modificationDate.timeIntervalSince1970
             )
-        } else {
-            guard !Task.isCancelled else { return }
-            guard sliceRebaseTaskIDsByFullPath[fullPath] == expectedTaskID else { return }
-            workspaceManager?.rebaseSlicesForFileAcrossTabs(fullPath: fullPath) { _ in [] }
         }
+        return nil
     }
 
     private func subscribeToFileSystemPreferenceChanges() {
@@ -12405,6 +13379,18 @@ extension WorkspaceFilesViewModel {
         @MainActor
         func _testBumpPartitionSliceSaveRevision() {
             partitionSliceSaveRevision &+= 1
+        }
+
+        @MainActor
+        func _testLoadSlicesForScope(
+            rootPath: String,
+            scope: PartitionScope,
+            relativePath: String
+        ) async -> PartitionStore.StoredSlices? {
+            await selectionSliceCoordinator.loadSlices(
+                forRootPath: rootPath,
+                scope: scope
+            )[StandardizedPath.relative(relativePath)]
         }
 
         @MainActor

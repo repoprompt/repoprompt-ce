@@ -24,6 +24,7 @@ class Changelog {
         - Staged /goal drafts are now visible in the Agent Mode status row
         - ask_user prompts no longer expire while you're typing your answer
         - Faster file tree updates during heavy filesystem activity
+        - Updated Z.ai GLM defaults to GLM-5.2 with 1M-context Claude Code routing support
 
         ### Fixes
         - Fixed file tree churn when folders changed on disk
@@ -75,6 +76,7 @@ class Changelog {
             - Staged /goal drafts are now visible in the Agent Mode status row
             - ask_user prompts no longer expire while you're typing your answer
             - Faster file tree updates during heavy filesystem activity
+            - Updated Z.ai GLM defaults to GLM-5.2 with 1M-context Claude Code routing support
 
             ### Fixes
             - Fixed file tree churn when folders changed on disk

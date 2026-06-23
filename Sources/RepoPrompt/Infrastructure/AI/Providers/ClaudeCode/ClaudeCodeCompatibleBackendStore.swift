@@ -25,7 +25,16 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
     func config(for id: ClaudeCodeCompatibleBackendID) -> ClaudeCodeCompatibleBackendConfig {
         lock.lock()
         defer { lock.unlock() }
-        return loadConfigsLocked()[id.rawValue] ?? id.defaultPreset
+        var configs = loadConfigsLocked()
+        guard let persisted = configs[id.rawValue] else { return id.defaultPreset }
+
+        if let migrated = migratedConfigIfNeededLocked(persisted, for: id) {
+            configs[id.rawValue] = migrated
+            saveConfigsLocked(configs)
+            return migrated
+        }
+
+        return persisted
     }
 
     func saveConfig(_ config: ClaudeCodeCompatibleBackendConfig) {
@@ -101,6 +110,43 @@ final class ClaudeCodeCompatibleBackendStore: @unchecked Sendable {
 
     func configuredDefaultsKey(for id: ClaudeCodeCompatibleBackendID) -> String {
         Self.configuredDefaultsKeyPrefix + id.rawValue
+    }
+
+    private static let legacyGLMDefaultSlotMapping = ClaudeCodeCompatibleBackendConfig.ClaudeSlotMapping(
+        haiku: "glm-4.7",
+        sonnet: "glm-5-turbo",
+        opus: "glm-5.1"
+    )
+
+    /// Callers must hold `lock` for the entire read/migration sequence.
+    private func migratedConfigIfNeededLocked(
+        _ config: ClaudeCodeCompatibleBackendConfig,
+        for id: ClaudeCodeCompatibleBackendID
+    ) -> ClaudeCodeCompatibleBackendConfig? {
+        guard id == .glmZAI,
+              case let .claudeSlotMapping(mapping) = config.modelBehavior,
+              case let .claudeSlotMapping(defaultMapping) = ClaudeCodeCompatibleBackendID.glmZAI.defaultPreset.modelBehavior
+        else { return nil }
+
+        var migratedMapping = mapping
+        var didMigrate = false
+        if migratedMapping.haiku == Self.legacyGLMDefaultSlotMapping.haiku {
+            migratedMapping.haiku = defaultMapping.haiku
+            didMigrate = true
+        }
+        if migratedMapping.sonnet == Self.legacyGLMDefaultSlotMapping.sonnet {
+            migratedMapping.sonnet = defaultMapping.sonnet
+            didMigrate = true
+        }
+        if migratedMapping.opus == Self.legacyGLMDefaultSlotMapping.opus {
+            migratedMapping.opus = defaultMapping.opus
+            didMigrate = true
+        }
+        guard didMigrate else { return nil }
+
+        var migrated = config
+        migrated.modelBehavior = .claudeSlotMapping(migratedMapping)
+        return migrated
     }
 
     /// Callers must hold `lock` for the entire read/legacy-migration sequence.

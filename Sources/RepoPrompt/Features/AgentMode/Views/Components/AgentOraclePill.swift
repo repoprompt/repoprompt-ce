@@ -3,6 +3,44 @@ import SwiftUI
 // MARK: - Oracle Pill
 
 enum AgentOraclePillLogic {
+    struct ExplicitOpenRequest: Equatable {
+        let generation: UInt64
+        let workspaceID: UUID
+        let tabID: UUID
+        let chatID: String
+    }
+
+    static func explicitOpenRequest(
+        chatID rawChatID: String,
+        workspaceID: UUID,
+        tabID: UUID,
+        generation: UInt64
+    ) -> ExplicitOpenRequest? {
+        let chatID = rawChatID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !chatID.isEmpty else { return nil }
+        return ExplicitOpenRequest(
+            generation: generation,
+            workspaceID: workspaceID,
+            tabID: tabID,
+            chatID: chatID
+        )
+    }
+
+    static func shouldPresent(
+        session: ChatSession,
+        for request: ExplicitOpenRequest,
+        currentGeneration: UInt64,
+        currentWorkspaceID: UUID?,
+        currentTabID: UUID?
+    ) -> Bool {
+        guard request.generation == currentGeneration,
+              request.workspaceID == currentWorkspaceID,
+              request.tabID == currentTabID,
+              session.workspaceID == request.workspaceID,
+              session.composeTabID == request.tabID else { return false }
+        return Self.session(matchingChatID: request.chatID, in: [session]) != nil
+    }
+
     static func hasRenderableMessages(session: ChatSession, liveMessageCount: Int?) -> Bool {
         if let liveMessageCount {
             return liveMessageCount > 0
@@ -81,13 +119,16 @@ enum AgentOraclePillLogic {
     static func reconciledPresentedSessionID(
         currentSessionID: UUID?,
         isExplicit: Bool,
+        currentWorkspaceID: UUID?,
         sameTabSessions: [ChatSession],
         eligibleSessions: [ChatSession],
         streamingSessionIDs: Set<UUID>
     ) -> UUID? {
+        let sameWorkspaceSessions = sameTabSessions.filter { $0.workspaceID == currentWorkspaceID }
+        let sameWorkspaceEligibleSessions = eligibleSessions.filter { $0.workspaceID == currentWorkspaceID }
         if isExplicit {
             guard let currentSessionID,
-                  sameTabSessions.contains(where: { $0.id == currentSessionID })
+                  sameWorkspaceSessions.contains(where: { $0.id == currentSessionID })
             else {
                 return nil
             }
@@ -95,19 +136,25 @@ enum AgentOraclePillLogic {
         }
 
         if let currentSessionID,
-           eligibleSessions.contains(where: { $0.id == currentSessionID })
+           sameWorkspaceEligibleSessions.contains(where: { $0.id == currentSessionID })
         {
             return currentSessionID
         }
-        return latestSession(in: eligibleSessions, streamingSessionIDs: streamingSessionIDs)?.id
+        return latestSession(in: sameWorkspaceEligibleSessions, streamingSessionIDs: streamingSessionIDs)?.id
     }
 
     static func session(matchingChatID raw: String, in sessions: [ChatSession]) -> ChatSession? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        return sessions.first { session in
-            session.id.uuidString == trimmed || session.shortID == trimmed
+        let targetUUID = UUID(uuidString: trimmed)
+        let matches = sessions.filter { session in
+            if let targetUUID {
+                return session.id == targetUUID
+            }
+            return session.shortID == trimmed
         }
+        guard matches.count == 1 else { return nil }
+        return matches[0]
     }
 }
 
@@ -129,6 +176,7 @@ struct AgentOraclePill: View {
     @State private var autoScrollEnabled = false
     @State private var presentedSessionID: UUID?
     @State private var presentedSessionSource: PresentedSessionSource = .latest
+    @State private var openRequestGeneration: UInt64 = 0
     @ObservedObject private var fontScale = FontScaleManager.shared
     private var fontPreset: FontScalePreset {
         fontScale.preset
@@ -222,29 +270,28 @@ struct AgentOraclePill: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .showAgentOraclePopover)) { note in
-            guard let targetWindowID = note.userInfo?["windowID"] as? Int,
-                  targetWindowID == windowID else { return }
-
-            let requestedTabID: UUID? = {
-                if let tabID = note.userInfo?["tabID"] as? UUID { return tabID }
-                if let tabIDString = note.userInfo?["tabID"] as? String { return UUID(uuidString: tabIDString) }
-                return nil
-            }()
-            if let requestedTabID, requestedTabID != currentTabID { return }
-
-            let requestedChatID: String? = {
-                if let chatID = note.userInfo?["chatID"] as? String { return chatID }
-                if let chatID = note.userInfo?["chatID"] as? UUID { return chatID.uuidString }
-                return nil
-            }()
-
-            openPopover(chatID: requestedChatID)
+            guard let route = AgentOraclePopoverRoute(notificationUserInfo: note.userInfo),
+                  route.windowID == windowID,
+                  route.tabID == currentTabID,
+                  route.workspaceID == oracleViewModel.workspaceManager.activeWorkspaceID
+            else { return }
+            openPopover(chatID: route.chatID, workspaceID: route.workspaceID)
         }
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             oraclePopoverContent
         }
         .onChange(of: currentTabID) { _, _ in
+            openRequestGeneration &+= 1
             reconcilePresentedSession()
+        }
+        .onReceive(oracleViewModel.workspaceManager.$activeWorkspaceID) { _ in
+            openRequestGeneration &+= 1
+            if presentedSessionSource == .explicit {
+                presentedSessionID = nil
+                showPopover = false
+            } else {
+                reconcilePresentedSession()
+            }
         }
         .onChange(of: activeAgentSessionID) { _, _ in
             reconcilePresentedSession()
@@ -301,6 +348,7 @@ struct AgentOraclePill: View {
         let resolvedID = AgentOraclePillLogic.reconciledPresentedSessionID(
             currentSessionID: presentedSessionID,
             isExplicit: presentedSessionSource == .explicit,
+            currentWorkspaceID: oracleViewModel.workspaceManager.activeWorkspaceID,
             sameTabSessions: sameTabSessions,
             eligibleSessions: eligibleTabSessions,
             streamingSessionIDs: oracleViewModel.streamingSessions
@@ -313,25 +361,48 @@ struct AgentOraclePill: View {
         presentedSessionID = resolvedID
     }
 
-    private func openPopover(chatID: String?) {
+    private func openPopover(chatID: String?, workspaceID: UUID? = nil) {
         guard let tabID = currentTabID else { return }
-        let target: ChatSession?
-        let source: PresentedSessionSource
-        if let chatID {
-            target = AgentOraclePillLogic.session(
-                matchingChatID: chatID,
-                in: oracleViewModel.sessions(forTabID: tabID)
-            )
-            source = .explicit
-            guard target != nil else { return }
-        } else {
-            target = latestTabSession
-            source = .latest
-        }
-        guard let target else { return }
+        openRequestGeneration &+= 1
+        let generation = openRequestGeneration
 
-        presentedSessionID = target.id
-        presentedSessionSource = source
-        showPopover = true
+        guard let chatID else {
+            guard let target = latestTabSession else { return }
+            presentedSessionID = target.id
+            presentedSessionSource = .latest
+            showPopover = true
+            return
+        }
+
+        presentedSessionID = nil
+        presentedSessionSource = .explicit
+        showPopover = false
+        guard let workspaceID,
+              let request = AgentOraclePillLogic.explicitOpenRequest(
+                  chatID: chatID,
+                  workspaceID: workspaceID,
+                  tabID: tabID,
+                  generation: generation
+              ) else { return }
+
+        Task { @MainActor in
+            guard let target = await oracleViewModel.resolveExactSessionForPopover(
+                chatID: request.chatID,
+                workspaceID: request.workspaceID,
+                tabID: request.tabID
+            ),
+                AgentOraclePillLogic.shouldPresent(
+                    session: target,
+                    for: request,
+                    currentGeneration: openRequestGeneration,
+                    currentWorkspaceID: oracleViewModel.workspaceManager.activeWorkspaceID,
+                    currentTabID: currentTabID
+                )
+            else { return }
+
+            presentedSessionID = target.id
+            presentedSessionSource = .explicit
+            showPopover = true
+        }
     }
 }

@@ -510,6 +510,43 @@ import XCTest
             await manager.unloadAllRootFolders()
         }
 
+        func testHiddenSessionRootEventAdvancesOnlyHiddenConsumerWithoutProjectingRootShell() async throws {
+            let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexHiddenSessionRoot")
+            let fileURL = rootURL.appendingPathComponent("Hidden.swift")
+            try "let hidden = true\n".write(to: fileURL, atomically: false, encoding: .utf8)
+            let store = WorkspaceFileContextStore()
+            let root = try await store.loadRoot(path: rootURL.path, kind: .sessionWorktree)
+            let rootLifetimeID = try await store.rootLifetimeIDForTesting(rootID: root.id)
+            let files = await store.files(inRoot: root.id)
+            let file = try XCTUnwrap(files.first { $0.standardizedRelativePath == "Hidden.swift" })
+            let manager = WorkspaceFilesViewModel(workspaceFileContextStore: store)
+            await manager.setCodeScanEnabled(false)
+
+            await manager.applyWorkspaceAppliedIndexEventForTesting(WorkspaceAppliedIndexBatchEvent(
+                rootID: root.id,
+                rootPath: root.standardizedFullPath,
+                generation: 1,
+                rootLifetimeID: rootLifetimeID,
+                modifiedFileIDs: [file.id]
+            ))
+
+            XCTAssertTrue(manager.rootFolders.isEmpty)
+            XCTAssertNil(manager.findFileByFullPath(file.standardizedFullPath))
+            let visible = manager.appliedIndexProjectionDiagnosticsSnapshot()
+            XCTAssertEqual(visible.handledEventCount, 0)
+            XCTAssertNil(visible.handledGenerationByRootID[root.id])
+            let hidden = manager.hiddenSessionSliceRebaseDebugSnapshotForTesting(
+                fullPath: file.standardizedFullPath,
+                rootID: root.id,
+                rootLifetimeID: rootLifetimeID
+            )
+            XCTAssertEqual(hidden.handledGeneration, 1)
+            XCTAssertEqual(hidden.registrationGeneration, 0)
+            XCTAssertFalse(hidden.hasPendingTask)
+            XCTAssertFalse(hidden.hasSourceSnapshot)
+            XCTAssertFalse(hidden.hasLifetimeMapping)
+        }
+
         func testValidRootUnloadClearsUUIDPathIndexesAndHandledGeneration() async throws {
             let rootURL = try temporaryRoots.makeRoot(suiteName: "AppliedIndexValidUnload")
             let store = WorkspaceFileContextStore()

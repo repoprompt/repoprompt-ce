@@ -90,6 +90,10 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
     public let permitActive: Bool?
     public let publicationPending: Bool?
     public let terminalBarrier: Bool?
+    #if DEBUG
+        /// Same-process monotonic timestamp used to correlate response delivery with deferred work.
+        public let monotonicUptimeMS: Double
+    #endif
 
     public init(
         layer: String,
@@ -147,10 +151,13 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
         self.permitActive = permitActive
         self.publicationPending = publicationPending
         self.terminalBarrier = terminalBarrier
+        #if DEBUG
+            monotonicUptimeMS = ProcessInfo.processInfo.systemUptime * 1000
+        #endif
     }
 
     public var payload: [String: Any] {
-        [
+        var value: [String: Any] = [
             "layer": layer,
             "phase": phase,
             "connection_id": connectionID ?? NSNull(),
@@ -172,6 +179,10 @@ public struct MCPResponseDeliveryTraceEvent: Equatable, Sendable, CustomStringCo
             "publication_pending": publicationPending ?? NSNull(),
             "terminal_barrier": terminalBarrier ?? NSNull()
         ]
+        #if DEBUG
+            value["monotonic_uptime_ms"] = monotonicUptimeMS
+        #endif
+        return value
     }
 
     public var description: String {

@@ -205,49 +205,6 @@ final class ProcessLauncherDescriptorInheritanceTests: XCTestCase {
         #endif
     }
 
-    func testLauncherSourcesCheckSpawnFileActionAndAttributeInitializationResults() throws {
-        let root = try RepoRoot.url()
-        let launcher = try String(
-            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/Process/ProcessLauncher.swift"),
-            encoding: .utf8
-        )
-        let runner = try String(
-            contentsOf: root.appendingPathComponent("Sources/RepoPrompt/Infrastructure/Process/CLIProcessRunner.swift"),
-            encoding: .utf8
-        )
-
-        Self.assertSourceContains(
-            [
-                "let fileActionsInitResult: Int32 = if case let .fileActions(errno)? = initializationFailure",
-                "posix_spawn_file_actions_init(&fileActions)",
-                "if fileActionsInitResult != 0 {",
-                "throw ProcessLauncherError.spawnFileActionsFailed(operation: \"init\", errno: fileActionsInitResult)",
-                "try checkFileAction(\"adddup2(stdin)\", result: posix_spawn_file_actions_adddup2(&fileActions, stdinPipe[0], STDIN_FILENO))",
-                "try checkFileAction(\"addclose(stderr read)\", result: posix_spawn_file_actions_addclose(&fileActions, stderrPipe[0]))",
-                "let attributesInitResult: Int32 = if case let .attributes(errno)? = initializationFailure",
-                "posix_spawnattr_init(&attributes)",
-                "if attributesInitResult != 0 {",
-                "throw ProcessLauncherError.spawnAttributesFailed(operation: \"init\", errno: attributesInitResult)",
-                "let getFlagsResult = posix_spawnattr_getflags(&attributes, &spawnFlags)",
-                "if getFlagsResult != 0 {",
-                "let setSigDefaultResult = posix_spawnattr_setsigdefault(&attributes, &defaultSignals)",
-                "if setSigDefaultResult != 0 {",
-                "let setFlagsResult = posix_spawnattr_setflags(&attributes, configuredSpawnFlags)",
-                "if setFlagsResult != 0 {"
-            ],
-            in: launcher
-        )
-        Self.assertSourceContains(
-            [
-                "catch let launcherError as ProcessLauncherError",
-                "throw mapLauncherError(launcherError, command: resolvedCommand, workingDirectory: workingDirectory)",
-                "case let .spawnFileActionsFailed(operation, errnoValue):",
-                "case let .spawnAttributesFailed(operation, errnoValue):"
-            ],
-            in: runner
-        )
-    }
-
     private static func assertSourceContains(
         _ snippets: [String],
         in source: String,

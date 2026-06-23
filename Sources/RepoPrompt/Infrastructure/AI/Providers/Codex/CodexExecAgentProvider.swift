@@ -59,7 +59,6 @@ final class CodexExecAgentProvider: HeadlessAgentProvider {
             webSearchRequestEnabled: nil,
             viewImageToolEnabled: false,
             includeApplyPatchTool: false,
-            parallelToolCallsEnabled: false,
             multiAgentEnabled: false,
             modelReasoningSummary: nil
         )

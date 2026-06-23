@@ -4,6 +4,224 @@ import XCTest
 
 @MainActor
 final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
+    func testCoverageIdentityNormalizesOrderingCoalescingAndRejectsExpansion() throws {
+        let firstIntent = MCPReadFileAutoSelectionCoordinator.Intent.slices(entries: [
+            WorkspaceSelectionSliceInput(
+                path: "Logical/A.swift",
+                ranges: [LineRange(start: 10, end: 20), LineRange(start: 18, end: 30)]
+            ),
+            WorkspaceSelectionSliceInput(path: "Logical/B.swift", ranges: [LineRange(start: 2, end: 4)])
+        ])
+        let reorderedIntent = MCPReadFileAutoSelectionCoordinator.Intent.slices(entries: [
+            WorkspaceSelectionSliceInput(path: "Other/B.swift", ranges: [LineRange(start: 2, end: 4)]),
+            WorkspaceSelectionSliceInput(
+                path: "Other/A.swift",
+                ranges: [LineRange(start: 10, end: 15), LineRange(start: 16, end: 30)]
+            )
+        ])
+        let first = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: firstIntent,
+            resolvedPaths: ["/worktree/A.swift", "/worktree/B.swift"]
+        ))
+        let reordered = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: reorderedIntent,
+            resolvedPaths: ["/worktree/B.swift", "/worktree/A.swift"]
+        ))
+        XCTAssertEqual(first, reordered)
+
+        let expansion = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: .slices(entries: [
+                WorkspaceSelectionSliceInput(path: "Logical/A.swift", ranges: [LineRange(start: 10, end: 31)]),
+                WorkspaceSelectionSliceInput(path: "Logical/B.swift", ranges: [LineRange(start: 2, end: 4)])
+            ]),
+            resolvedPaths: ["/worktree/A.swift", "/worktree/B.swift"]
+        ))
+        XCTAssertNotEqual(first, expansion)
+
+        var expandedBatch = MCPReadFileAutoSelectionCoordinator.CanonicalBatch(
+            intent: firstIntent,
+            coverageIdentity: first
+        )
+        let coalescedExpansionIntent = MCPReadFileAutoSelectionCoordinator.Intent.slices(entries: [
+            WorkspaceSelectionSliceInput(path: "Logical/A.swift", ranges: [LineRange(start: 25, end: 31)])
+        ])
+        let coalescedExpansionCoverage = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: coalescedExpansionIntent,
+            resolvedPaths: ["/worktree/A.swift"]
+        ))
+        expandedBatch.merge(coalescedExpansionIntent, coverageIdentity: coalescedExpansionCoverage)
+        XCTAssertEqual(expandedBatch.coverageIdentity, expansion)
+        XCTAssertNotEqual(expandedBatch.coverageIdentity, first)
+
+        var batch = MCPReadFileAutoSelectionCoordinator.CanonicalBatch(
+            intent: firstIntent,
+            coverageIdentity: first
+        )
+        let fullIntent = MCPReadFileAutoSelectionCoordinator.Intent.full(paths: ["Logical/A.swift"])
+        let fullCoverage = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: fullIntent,
+            resolvedPaths: ["/worktree/A.swift"]
+        ))
+        batch.merge(fullIntent, coverageIdentity: fullCoverage)
+        XCTAssertEqual(batch.coverageIdentity?.fullPaths, ["/worktree/A.swift"])
+        XCTAssertEqual(batch.coverageIdentity?.slices.map(\.path), ["/worktree/B.swift"])
+    }
+
+    func testCoverageIdentityRequiresExactPhysicalPathsAndChecksFullAndSliceCoverage() throws {
+        XCTAssertNil(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: .full(paths: ["A.swift"]),
+            resolvedPaths: ["relative/A.swift"]
+        ))
+        let requested = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: .slices(entries: [
+                WorkspaceSelectionSliceInput(path: "A.swift", ranges: [LineRange(start: 100, end: 120)])
+            ]),
+            resolvedPaths: ["/worktree/A.swift"]
+        ))
+        XCTAssertTrue(requested.isCovered(by: StoredSelection(selectedPaths: ["/worktree/A.swift"])))
+        XCTAssertTrue(requested.isCovered(by: StoredSelection(
+            selectedPaths: ["/worktree/A.swift"],
+            slices: ["/worktree/A.swift": [LineRange(start: 90, end: 130)]]
+        )))
+        XCTAssertFalse(requested.isCovered(by: StoredSelection(
+            selectedPaths: ["/worktree/A.swift"],
+            slices: ["/worktree/A.swift": [LineRange(start: 100, end: 119)]]
+        )))
+    }
+
+    func testAuthoritativeSelectionPreservationRequiresFullCanonicalSuperset() {
+        let expected = StoredSelection(
+            selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+            autoCodemapPaths: ["/workspace/C.swift"],
+            slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
+            codemapAutoEnabled: true
+        )
+        let scenarios: [(String, StoredSelection, Bool)] = [
+            ("exact", expected, true),
+            (
+                "additive wider slice",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift", "/workspace/D.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift", "/workspace/E.swift"],
+                    slices: ["/workspace/B.swift": [LineRange(start: 5, end: 25)]],
+                    codemapAutoEnabled: true
+                ),
+                true
+            ),
+            (
+                "full selection supersedes expected slice",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift"],
+                    codemapAutoEnabled: true
+                ),
+                true
+            ),
+            (
+                "unrelated selected path dropped",
+                StoredSelection(
+                    selectedPaths: ["/workspace/B.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift"],
+                    slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
+                    codemapAutoEnabled: true
+                ),
+                false
+            ),
+            (
+                "expected full file demoted to slice",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift"],
+                    slices: [
+                        "/workspace/A.swift": [LineRange(start: 1, end: 2)],
+                        "/workspace/B.swift": [LineRange(start: 10, end: 20)]
+                    ],
+                    codemapAutoEnabled: true
+                ),
+                false
+            ),
+            (
+                "auto codemap path dropped",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+                    slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
+                    codemapAutoEnabled: true
+                ),
+                false
+            ),
+            (
+                "slice narrowed",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift"],
+                    slices: ["/workspace/B.swift": [LineRange(start: 11, end: 20)]],
+                    codemapAutoEnabled: true
+                ),
+                false
+            ),
+            (
+                "codemap mode changed",
+                StoredSelection(
+                    selectedPaths: ["/workspace/A.swift", "/workspace/B.swift"],
+                    autoCodemapPaths: ["/workspace/C.swift"],
+                    slices: ["/workspace/B.swift": [LineRange(start: 10, end: 20)]],
+                    codemapAutoEnabled: false
+                ),
+                false
+            )
+        ]
+
+        for (label, candidate, expectedResult) in scenarios {
+            XCTAssertEqual(
+                MCPReadFileAutoSelectionCoordinator.authoritativeSelection(
+                    expected,
+                    isPreservedBy: candidate
+                ),
+                expectedResult,
+                label
+            )
+        }
+    }
+
+    func testDiagnosticsAccountCertificateHitsFallbacksAndMissReasons() async throws {
+        let recorder = CoordinatorRecorder()
+        let key = contextKey()
+        let coverage = try XCTUnwrap(MCPReadFileAutoSelectionCoordinator.CoverageIdentity(
+            intent: .full(paths: ["A.swift"]),
+            resolvedPaths: ["/worktree/A.swift"]
+        ))
+        var invocation = 0
+        let coordinator = makeCoordinator(recorder: recorder) { _, _ in
+            invocation += 1
+            return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(
+                mirrorKey: nil,
+                disposition: .semanticNoOp,
+                coverageCertificateOutcome: invocation == 1
+                    ? .authoritativeFallback(.noCertificate)
+                    : .hit
+            )
+        }
+
+        for _ in 0 ..< 2 {
+            XCTAssertTrue(coordinator.enqueue(
+                intent: .full(paths: ["A.swift"]),
+                coverageIdentity: coverage,
+                for: key
+            ))
+            let drainResult = await coordinator.drain(.canonicalSelection, for: key)
+            XCTAssertEqual(drainResult, .completed)
+        }
+
+        let snapshot = try XCTUnwrap(coordinator.debugContextSnapshot(for: key))
+        XCTAssertEqual(snapshot.coverageCertificateHitCount, 1)
+        XCTAssertEqual(snapshot.authoritativeFallbackCount, 1)
+        XCTAssertEqual(snapshot.coverageCertificateMissReasonCounts[.noCertificate], 1)
+        XCTAssertEqual(snapshot.mutationSamples.map(\.coverageCertificateOutcome), [
+            .authoritativeFallback(.noCertificate),
+            .hit
+        ])
+    }
+
     func testEnqueueReturnsWhileCanonicalMutationIsBlocked() async {
         let gate = CoordinatorAsyncGate()
         let recorder = CoordinatorRecorder()
@@ -59,6 +277,17 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(batches[1].sliceEntries, [
             WorkspaceSelectionSliceInput(path: "/tmp/B.swift", ranges: [LineRange(start: 4, end: 8)])
         ])
+        let accounting = try? XCTUnwrap(coordinator.debugContextSnapshot(for: key))
+        XCTAssertEqual(accounting?.acceptedIntentCount, 4)
+        XCTAssertEqual(accounting?.completedIntentCount, 4)
+        XCTAssertEqual(accounting?.canonicalApplyAttemptCount, 2)
+        XCTAssertEqual(accounting?.semanticNoOpApplyCount, 2)
+        XCTAssertEqual(accounting?.semanticNoOpIntentCount, 4)
+        XCTAssertEqual(accounting?.changedApplyCount, 0)
+        XCTAssertEqual(accounting?.rejectedApplyCount, 0)
+        XCTAssertEqual(accounting?.invalidatedIntentCount, 0)
+        XCTAssertEqual(accounting?.mutationSamples.map(\.acceptedIntentCount), [1, 3])
+        XCTAssertEqual(accounting?.sampleOverflowCount, 0)
     }
 
     func testCanonicalIdentityIsConnectionAndRunScopedWhileMirrorsCoalescePerTab() async {
@@ -331,6 +560,23 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
                     && $0.target == 1
             })
         }
+
+        let boundedCoordinator = makeCoordinator(recorder: CoordinatorRecorder())
+        let boundedKey = contextKey()
+        for ordinal in 0 ..< 258 {
+            XCTAssertTrue(boundedCoordinator.enqueue(intent: .full(paths: ["/tmp/Bounded-\(ordinal).swift"]), for: boundedKey))
+            let result = await boundedCoordinator.drain(.canonicalSelection, for: boundedKey)
+            XCTAssertEqual(result, .completed)
+        }
+        let bounded = try XCTUnwrap(boundedCoordinator.debugContextSnapshot(for: boundedKey))
+        XCTAssertEqual(bounded.acceptedIntentCount, 258)
+        XCTAssertEqual(bounded.completedIntentCount, 258)
+        XCTAssertEqual(bounded.canonicalApplyAttemptCount, 258)
+        XCTAssertEqual(bounded.semanticNoOpIntentCount, 258)
+        XCTAssertEqual(bounded.mutationSamples.count, 256)
+        XCTAssertEqual(bounded.sampleOverflowCount, 2)
+        XCTAssertEqual(bounded.mutationSamples.first?.ordinal, 3)
+        XCTAssertEqual(bounded.mutationSamples.last?.ordinal, 258)
     }
 
     func testInvalidationDropsPendingWorkBeforeStoredCommit() async {
@@ -362,10 +608,10 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
     func testFinishDrainsAcceptedWorkAndRejectsLaterEnqueues() async {
         let gate = CoordinatorAsyncGate()
         let recorder = CoordinatorRecorder()
-        let coordinator = makeCoordinator(recorder: recorder) { _, batch in
+        let coordinator = makeCoordinator(recorder: recorder) { key, batch in
             await gate.markStartedAndWaitForRelease()
             await recorder.recordCanonical(batch)
-            return .unchanged
+            return MCPReadFileAutoSelectionCoordinator.CanonicalApplyResult(mirrorKey: key.mirrorKey)
         }
         let key = contextKey()
 
@@ -384,6 +630,7 @@ final class MCPReadFileAutoSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(recordedBatches.count, 1)
         await Task.yield()
         XCTAssertEqual(coordinator.debugSnapshot().canonicalLaneCount, 0)
+        XCTAssertEqual(coordinator.debugSnapshot().mirrorLaneCount, 0)
         XCTAssertEqual(coordinator.debugSnapshot().closingContextCount, 0)
     }
 

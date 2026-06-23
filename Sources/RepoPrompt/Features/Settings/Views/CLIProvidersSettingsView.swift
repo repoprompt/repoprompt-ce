@@ -1345,17 +1345,17 @@ struct CLIProvidersSettingsView: View {
             slotEditorRow(label: "Haiku", value: Binding(
                 get: { mapping.haiku },
                 set: { updateSlot(.haiku, value: $0) }
-            ), isEmpty: haikuEmpty, placeholder: "e.g. glm-4.7")
+            ), isEmpty: haikuEmpty, placeholder: "e.g. glm-4.5-air")
 
             slotEditorRow(label: "Sonnet", value: Binding(
                 get: { mapping.sonnet },
                 set: { updateSlot(.sonnet, value: $0) }
-            ), isEmpty: sonnetEmpty, placeholder: "e.g. glm-5-turbo")
+            ), isEmpty: sonnetEmpty, placeholder: "e.g. glm-5.2[1m]")
 
             slotEditorRow(label: "Opus", value: Binding(
                 get: { mapping.opus },
                 set: { updateSlot(.opus, value: $0) }
-            ), isEmpty: opusEmpty, placeholder: "e.g. glm-5.1")
+            ), isEmpty: opusEmpty, placeholder: "e.g. glm-5.2[1m]")
 
             if haikuEmpty || sonnetEmpty || opusEmpty {
                 Text("All three slots must be filled for the backend to launch.")

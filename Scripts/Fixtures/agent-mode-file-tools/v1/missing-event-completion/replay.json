@@ -1,0 +1,1088 @@
+{
+  "agents": {
+    "local": {
+      "start_response": {
+        "session": {
+          "id": "local-session"
+        },
+        "session_id": "local-session",
+        "status": "running"
+      },
+      "status": "completed",
+      "transcript_xml": "<tool_call name=\"set_status\">{\"session_name\":\"sanitized-diagnostic\"}</tool_call>\n<tool_call name=\"file_search\">{\"pattern\":\"SANITIZED_MARKER\",\"regex\":false,\"mode\":\"content\",\"filter\":{\"paths\":[\"Sources/Sanitized/Marker.swift\"]},\"max_results\":20,\"context_lines\":1}</tool_call>\n<tool_call name=\"read_file\">{\"path\":\"Sources/Sanitized/Marker.swift\",\"start_line\":1,\"limit\":24,\"key_paths\":[\"content\"]}</tool_call>\n<assistant>AGENT_FILE_TOOL_DIAGNOSTIC_OK</assistant>",
+      "wait_response": {
+        "assistant_text": "AGENT_FILE_TOOL_DIAGNOSTIC_OK",
+        "run_id": "local-run",
+        "session": {
+          "id": "local-session"
+        },
+        "session_id": "local-session",
+        "status": "completed"
+      }
+    },
+    "worktree": {
+      "start_response": {
+        "session": {
+          "id": "worktree-session"
+        },
+        "session_id": "worktree-session",
+        "status": "running",
+        "worktree_bindings": [
+          {
+            "worktree_root_path": "fixture-worktree"
+          }
+        ]
+      },
+      "status": "completed",
+      "transcript_xml": "<tool_call name=\"set_status\">{\"session_name\":\"sanitized-diagnostic\"}</tool_call>\n<tool_call name=\"read_file\">{\"path\":\"Sources/Sanitized/Marker.swift\",\"start_line\":1,\"limit\":24,\"key_paths\":[\"content\"]}</tool_call>\n<tool_call name=\"file_search\">{\"pattern\":\"SANITIZED_MARKER\",\"regex\":false,\"mode\":\"content\",\"filter\":{\"paths\":[\"Sources/Sanitized/Marker.swift\"]},\"max_results\":20,\"context_lines\":1}</tool_call>\n<assistant>AGENT_FILE_TOOL_DIAGNOSTIC_OK</assistant>",
+      "wait_response": {
+        "assistant_text": "AGENT_FILE_TOOL_DIAGNOSTIC_OK",
+        "run_id": "worktree-run",
+        "session": {
+          "id": "worktree-session"
+        },
+        "session_id": "worktree-session",
+        "status": "completed",
+        "worktree": {
+          "path": "fixture-worktree"
+        }
+      }
+    }
+  },
+  "capture": {
+    "active": false,
+    "dropped_lifecycle_event_count": 0,
+    "label": "sanitized-missing-event-completion",
+    "lifecycle_events": [
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.Received",
+        "offset_ms": 15356.388,
+        "ordinal": 137,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.RoutingSnapshotCompleted",
+        "offset_ms": 15356.676,
+        "ordinal": 138,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.LimiterWaitBegan",
+        "offset_ms": 15356.77,
+        "ordinal": 139,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.PermitQueued",
+        "offset_ms": 15356.884,
+        "ordinal": 140,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search outcome=queued activeCount=0 admissionClass=file_search queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.PermitAcquired",
+        "offset_ms": 15356.977,
+        "ordinal": 141,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search outcome=acquired activeCount=1 admissionClass=file_search queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=true publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.LimiterAcquired",
+        "offset_ms": 15356.999,
+        "ordinal": 142,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.ResolvedProviderBegan",
+        "offset_ms": 15359.908,
+        "ordinal": 149,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "Search.ProviderEntered",
+        "offset_ms": 15360.748,
+        "ordinal": 155,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "Search.ProviderWorkspaceSearchReturned",
+        "offset_ms": 15458.298,
+        "ordinal": 184,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "outcome=completed searchMode=content countOnly=false"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "Search.ProviderDTOReady",
+        "offset_ms": 15458.749,
+        "ordinal": 185,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "outcome=completed searchMode=content countOnly=false usesWorktreeProjection=false matchCount=5"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "Search.ProviderResultReady",
+        "offset_ms": 15459.712,
+        "ordinal": 187,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.ResolvedProviderEnded",
+        "offset_ms": 15460.066,
+        "ordinal": 195,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search outcome=success"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.MainActorScheduled",
+        "offset_ms": 15460.931,
+        "ordinal": 200,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search observerType=event_completion runID=local-run"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.MainActorEntered",
+        "offset_ms": 15461.008,
+        "ordinal": 201,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search observerType=event_completion queueDelayUs=66 runID=local-run"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.HandlerResultReady",
+        "offset_ms": 15461.077,
+        "ordinal": 204,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search outcome=success"
+      },
+      {
+        "correlation_id": "local-call-search",
+        "event_name": "MCP.ToolCall.PermitReleased",
+        "offset_ms": 15461.223,
+        "ordinal": 205,
+        "request_identity": {
+          "app_invocation_id": "local-call-search",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 1,
+          "request_ordinal": 1
+        },
+        "sanitized_dimensions": "tool=file_search outcome=completed activeCount=0 admissionClass=file_search queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=true terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.Received",
+        "offset_ms": 16528.178,
+        "ordinal": 207,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.RoutingSnapshotCompleted",
+        "offset_ms": 16528.597,
+        "ordinal": 208,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.LimiterWaitBegan",
+        "offset_ms": 16528.682,
+        "ordinal": 209,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.PermitQueued",
+        "offset_ms": 16528.774,
+        "ordinal": 210,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.PermitAcquired",
+        "offset_ms": 16528.859,
+        "ordinal": 211,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=true publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.LimiterAcquired",
+        "offset_ms": 16528.881,
+        "ordinal": 212,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.ResolvedProviderBegan",
+        "offset_ms": 16531.694,
+        "ordinal": 219,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ProviderEntered",
+        "offset_ms": 16532.168,
+        "ordinal": 225,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ExplicitFreshnessBegan",
+        "offset_ms": 16532.513,
+        "ordinal": 226,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ExplicitFreshnessEnded",
+        "offset_ms": 16532.626,
+        "ordinal": 227,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "rootCount=1 pendingRootCount=0 pendingRawEventCount=0"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ExactCatalogLookupResolved",
+        "offset_ms": 16532.997,
+        "ordinal": 228,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "status=relative outcome=matched"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ExactCatalogLookupResolved",
+        "offset_ms": 16537.384,
+        "ordinal": 249,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "status=relative outcome=matched"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ProviderResultReady",
+        "offset_ms": 16537.449,
+        "ordinal": 252,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "ReadFile.ExactCatalogLookupResolved",
+        "offset_ms": 16537.511,
+        "ordinal": 254,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "status=absolute outcome=matched"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.ResolvedProviderEnded",
+        "offset_ms": 16537.791,
+        "ordinal": 261,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file outcome=success"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.MainActorScheduled",
+        "offset_ms": 16538.239,
+        "ordinal": 267,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion runID=local-run"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.MainActorEntered",
+        "offset_ms": 16538.32,
+        "ordinal": 268,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion queueDelayUs=70 runID=local-run"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.HandlerResultReady",
+        "offset_ms": 16538.396,
+        "ordinal": 271,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file outcome=success"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.PermitReleased",
+        "offset_ms": 16538.564,
+        "ordinal": 272,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=local-run ownerResource=local-connection permitActive=false publicationPending=true terminalBarrier=false"
+      },
+      {
+        "correlation_id": "local-call-read",
+        "event_name": "MCP.ToolCall.MainActorExited",
+        "offset_ms": 16538.962,
+        "ordinal": 273,
+        "request_identity": {
+          "app_invocation_id": "local-call-read",
+          "connection_generation": 1,
+          "connection_id": "local-connection",
+          "jsonrpc_request_id": 2,
+          "request_ordinal": 2
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion durationUs=636 resultBytes=1146 runID=local-run"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.Received",
+        "offset_ms": 23019.226,
+        "ordinal": 609,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.RoutingSnapshotCompleted",
+        "offset_ms": 23023.396,
+        "ordinal": 610,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.LimiterWaitBegan",
+        "offset_ms": 23023.473,
+        "ordinal": 611,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.PermitQueued",
+        "offset_ms": 23023.569,
+        "ordinal": 612,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file outcome=queued activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.PermitAcquired",
+        "offset_ms": 23023.644,
+        "ordinal": 613,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file outcome=acquired activeCount=1 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=true publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.LimiterAcquired",
+        "offset_ms": 23023.664,
+        "ordinal": 614,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.ResolvedProviderBegan",
+        "offset_ms": 23025.722,
+        "ordinal": 621,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "ReadFile.ProviderEntered",
+        "offset_ms": 23026.68,
+        "ordinal": 627,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "ReadFile.ExplicitFreshnessBegan",
+        "offset_ms": 23036.702,
+        "ordinal": 628,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "ReadFile.ExplicitFreshnessEnded",
+        "offset_ms": 23036.786,
+        "ordinal": 629,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "rootCount=1 pendingRootCount=0 pendingRawEventCount=0"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "ReadFile.ExactCatalogLookupResolved",
+        "offset_ms": 23036.904,
+        "ordinal": 630,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "status=absolute outcome=matched"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "ReadFile.ProviderResultReady",
+        "offset_ms": 23040.267,
+        "ordinal": 653,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.ResolvedProviderEnded",
+        "offset_ms": 23040.708,
+        "ordinal": 661,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file outcome=success"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.MainActorScheduled",
+        "offset_ms": 23041.21,
+        "ordinal": 667,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion runID=worktree-run"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.MainActorEntered",
+        "offset_ms": 23041.315,
+        "ordinal": 668,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion queueDelayUs=96 runID=worktree-run"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.HandlerResultReady",
+        "offset_ms": 23041.429,
+        "ordinal": 671,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file outcome=success"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.PermitReleased",
+        "offset_ms": 23041.658,
+        "ordinal": 672,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file outcome=completed activeCount=0 admissionClass=small_read queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=true terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-read",
+        "event_name": "MCP.ToolCall.MainActorExited",
+        "offset_ms": 23042.155,
+        "ordinal": 673,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-read",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 3,
+          "request_ordinal": 3
+        },
+        "sanitized_dimensions": "tool=read_file observerType=event_completion durationUs=853 resultBytes=1820 runID=worktree-run"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.Received",
+        "offset_ms": 24113.766,
+        "ordinal": 748,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.RoutingSnapshotCompleted",
+        "offset_ms": 24114.029,
+        "ordinal": 749,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.LimiterWaitBegan",
+        "offset_ms": 24114.119,
+        "ordinal": 750,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.PermitQueued",
+        "offset_ms": 24114.223,
+        "ordinal": 751,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search outcome=queued activeCount=0 admissionClass=file_search queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.PermitAcquired",
+        "offset_ms": 24114.31,
+        "ordinal": 752,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search outcome=acquired activeCount=1 admissionClass=file_search queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=true publicationPending=false terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.LimiterAcquired",
+        "offset_ms": 24114.331,
+        "ordinal": 753,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.ResolvedProviderBegan",
+        "offset_ms": 24116.651,
+        "ordinal": 760,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "Search.ProviderEntered",
+        "offset_ms": 24117.17,
+        "ordinal": 766,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "Search.ProviderWorkspaceSearchReturned",
+        "offset_ms": 24153.803,
+        "ordinal": 767,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "outcome=completed searchMode=content countOnly=false"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "Search.ProviderDTOReady",
+        "offset_ms": 24154.435,
+        "ordinal": 768,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "outcome=completed searchMode=content countOnly=false usesWorktreeProjection=true matchCount=5"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "Search.ProviderResultReady",
+        "offset_ms": 24155.593,
+        "ordinal": 770,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": ""
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.ResolvedProviderEnded",
+        "offset_ms": 24156.019,
+        "ordinal": 778,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search outcome=success"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.MainActorScheduled",
+        "offset_ms": 24156.943,
+        "ordinal": 783,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search observerType=event_completion runID=worktree-run"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.MainActorEntered",
+        "offset_ms": 24157.022,
+        "ordinal": 784,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search observerType=event_completion queueDelayUs=75 runID=worktree-run"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.HandlerResultReady",
+        "offset_ms": 24157.111,
+        "ordinal": 787,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search outcome=success"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.PermitReleased",
+        "offset_ms": 24157.295,
+        "ordinal": 788,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search outcome=completed activeCount=0 admissionClass=file_search queueDepth=0 windowID=1 runID=worktree-run ownerResource=worktree-connection permitActive=false publicationPending=true terminalBarrier=false"
+      },
+      {
+        "correlation_id": "worktree-call-search",
+        "event_name": "MCP.ToolCall.MainActorExited",
+        "offset_ms": 24157.799,
+        "ordinal": 789,
+        "request_identity": {
+          "app_invocation_id": "worktree-call-search",
+          "connection_generation": 1,
+          "connection_id": "worktree-connection",
+          "jsonrpc_request_id": 4,
+          "request_ordinal": 4
+        },
+        "sanitized_dimensions": "tool=file_search observerType=event_completion durationUs=759 resultBytes=2720 runID=worktree-run"
+      }
+    ],
+    "retained_lifecycle_event_count": 71,
+    "stages": [
+      {
+        "max_ms": 0.352,
+        "p50_ms": 0.352,
+        "p95_ms": 0.352,
+        "sample_count": 1,
+        "sanitized_dimensions": "outcome=completed matchCount=5 scannedFileCount=14 matchedFileCount=1 contentMatchCount=5 limitHit=false usesWorktreeProjection=false searchMode=content countOnly=false",
+        "stage_name": "EditFlow.Search.DTOBuild",
+        "total_ms": 0.352
+      },
+      {
+        "max_ms": 0.536,
+        "p50_ms": 0.536,
+        "p95_ms": 0.536,
+        "sample_count": 1,
+        "sanitized_dimensions": "outcome=completed matchCount=5 scannedFileCount=14 matchedFileCount=1 contentMatchCount=5 limitHit=false usesWorktreeProjection=true searchMode=content countOnly=false",
+        "stage_name": "EditFlow.Search.DTOBuild",
+        "total_ms": 0.536
+      }
+    ]
+  },
+  "configuration": {
+    "marker": "SANITIZED_MARKER",
+    "path": "Sources/Sanitized/Marker.swift",
+    "read_count": 1,
+    "read_limit": 24,
+    "search_count": 1,
+    "worktree_path": "fixture-worktree"
+  },
+  "expected": {
+    "failure_contains": "event_completion MainActorExited",
+    "status": "failed"
+  },
+  "schema_version": 1,
+  "source_note": "Privacy-scrubbed timing subset derived from a real paired capture dated 2026-06-18; agent prose, absolute paths, identifiers, and unrelated events removed. Negative variant removes one required event_completion endpoint."
+}

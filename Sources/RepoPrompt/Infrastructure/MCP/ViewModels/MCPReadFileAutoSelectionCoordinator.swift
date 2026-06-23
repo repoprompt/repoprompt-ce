@@ -53,20 +53,178 @@ final class MCPReadFileAutoSelectionCoordinator {
         case slices(entries: [WorkspaceSelectionSliceInput])
     }
 
+    /// Exact normalized physical coverage requested by one complete canonical batch.
+    /// Logical/display paths remain in `Intent`; this identity is carried separately so
+    /// equivalent ordering/coalescing compares equal without ever projecting the fast path.
+    struct CoverageIdentity: Hashable {
+        struct Slice: Hashable {
+            let path: String
+            let ranges: [LineRange]
+        }
+
+        let fullPaths: [String]
+        let slices: [Slice]
+
+        init?(intent: Intent, resolvedPaths: [String]) {
+            var fullPathKeys = Set<String>()
+            var rangesByPath: [String: [LineRange]] = [:]
+
+            switch intent {
+            case let .full(paths):
+                guard paths.count == resolvedPaths.count else { return nil }
+                for resolvedPath in resolvedPaths {
+                    guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
+                    fullPathKeys.insert(path)
+                }
+            case let .slices(entries):
+                guard entries.count == resolvedPaths.count else { return nil }
+                for (entry, resolvedPath) in zip(entries, resolvedPaths) {
+                    guard let path = Self.normalizedPhysicalPath(resolvedPath) else { return nil }
+                    let ranges = SliceRangeMath.normalize(entry.ranges).map {
+                        LineRange(start: $0.start, end: $0.end)
+                    }
+                    guard !ranges.isEmpty else { return nil }
+                    rangesByPath[path, default: []].append(contentsOf: ranges)
+                }
+            }
+
+            self.init(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+        }
+
+        private init(fullPathKeys: Set<String>, rangesByPath: [String: [LineRange]]) {
+            fullPaths = fullPathKeys.sorted()
+            slices = rangesByPath.keys
+                .filter { !fullPathKeys.contains($0) }
+                .sorted()
+                .compactMap { path in
+                    let ranges = SliceRangeMath.normalize(rangesByPath[path] ?? []).map {
+                        LineRange(start: $0.start, end: $0.end)
+                    }
+                    return ranges.isEmpty ? nil : Slice(path: path, ranges: ranges)
+                }
+        }
+
+        func merging(_ other: CoverageIdentity) -> CoverageIdentity {
+            var fullPathKeys = Set(fullPaths)
+            fullPathKeys.formUnion(other.fullPaths)
+            var rangesByPath = Dictionary(uniqueKeysWithValues: slices.map { ($0.path, $0.ranges) })
+            for slice in other.slices {
+                rangesByPath[slice.path, default: []].append(contentsOf: slice.ranges)
+            }
+            return CoverageIdentity(fullPathKeys: fullPathKeys, rangesByPath: rangesByPath)
+        }
+
+        func isCovered(by physicalSelection: StoredSelection) -> Bool {
+            let selectedPathKeys = Set(StoredSelectionPathNormalization.standardizedPaths(physicalSelection.selectedPaths))
+            let normalizedSlices = StoredSelectionPathNormalization.standardizedSlices(physicalSelection.slices)
+
+            for path in fullPaths {
+                guard selectedPathKeys.contains(path), normalizedSlices[path]?.isEmpty != false else { return false }
+            }
+            for slice in slices {
+                guard selectedPathKeys.contains(slice.path) else { return false }
+                guard normalizedSlices[slice.path]?.isEmpty != false || Self.ranges(slice.ranges, areCoveredBy: normalizedSlices[slice.path] ?? []) else {
+                    return false
+                }
+            }
+            return true
+        }
+
+        private static func ranges(_ requested: [LineRange], areCoveredBy selected: [LineRange]) -> Bool {
+            let selected = SliceRangeMath.normalize(selected)
+            return requested.allSatisfy { request in
+                selected.contains { $0.start <= request.start && $0.end >= request.end }
+            }
+        }
+
+        private static func normalizedPhysicalPath(_ rawPath: String) -> String? {
+            let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard trimmed.hasPrefix("/") else { return nil }
+            return StandardizedPath.absolute((trimmed as NSString).expandingTildeInPath)
+        }
+    }
+
+    static func authoritativeSelection(
+        _ expected: StoredSelection,
+        isPreservedBy candidate: StoredSelection
+    ) -> Bool {
+        let expectedSelectedPaths = Set(StoredSelectionPathNormalization.standardizedPaths(expected.selectedPaths))
+        let candidateSelectedPaths = Set(StoredSelectionPathNormalization.standardizedPaths(candidate.selectedPaths))
+        guard expectedSelectedPaths.isSubset(of: candidateSelectedPaths) else { return false }
+
+        let expectedAutoCodemapPaths = Set(StoredSelectionPathNormalization.standardizedPaths(expected.autoCodemapPaths))
+        let candidateAutoCodemapPaths = Set(StoredSelectionPathNormalization.standardizedPaths(candidate.autoCodemapPaths))
+        guard expectedAutoCodemapPaths.isSubset(of: candidateAutoCodemapPaths),
+              expected.codemapAutoEnabled == candidate.codemapAutoEnabled
+        else { return false }
+
+        let expectedSlices = StoredSelectionPathNormalization.standardizedSlices(expected.slices).mapValues {
+            SliceRangeMath.normalize($0)
+        }
+        let candidateSlices = StoredSelectionPathNormalization.standardizedSlices(candidate.slices).mapValues {
+            SliceRangeMath.normalize($0)
+        }
+
+        for path in expectedSelectedPaths {
+            let expectedRanges = expectedSlices[path] ?? []
+            let candidateRanges = candidateSlices[path] ?? []
+            if expectedRanges.isEmpty {
+                guard candidateRanges.isEmpty else { return false }
+            } else if !candidateRanges.isEmpty {
+                guard ranges(expectedRanges, areCoveredBy: candidateRanges) else { return false }
+            }
+        }
+
+        for (path, expectedRanges) in expectedSlices where !expectedRanges.isEmpty {
+            guard candidateSelectedPaths.contains(path) else { return false }
+            let candidateRanges = candidateSlices[path] ?? []
+            if !candidateRanges.isEmpty,
+               !ranges(expectedRanges, areCoveredBy: candidateRanges)
+            {
+                return false
+            }
+        }
+        return true
+    }
+
+    private static func ranges(_ expected: [LineRange], areCoveredBy candidate: [LineRange]) -> Bool {
+        let candidate = SliceRangeMath.normalize(candidate)
+        return SliceRangeMath.normalize(expected).allSatisfy { expectedRange in
+            candidate.contains { $0.start <= expectedRange.start && $0.end >= expectedRange.end }
+        }
+    }
+
+    enum CoverageCertificateOutcome: Equatable {
+        case hit
+        case authoritativeFallback(ReadFileAutoSelectionCoverageCertificateMissReason)
+    }
+
     struct CanonicalBatch: Equatable {
         private(set) var fullPaths: [String] = []
         private(set) var sliceEntries: [WorkspaceSelectionSliceInput] = []
+        private(set) var coverageIdentity: CoverageIdentity?
 
         private var fullPathKeys = Set<String>()
         private var slicePathOrder: [String] = []
         private var sliceRangesByPath: [String: [LineRange]] = [:]
         private var originalSlicePathByKey: [String: String] = [:]
+        private var coveragePermitted: Bool
 
-        init(intent: Intent) {
-            merge(intent)
+        init(intent: Intent, coverageIdentity: CoverageIdentity? = nil) {
+            self.coverageIdentity = nil
+            coveragePermitted = coverageIdentity != nil
+            merge(intent, coverageIdentity: coverageIdentity)
         }
 
-        mutating func merge(_ intent: Intent) {
+        mutating func merge(_ intent: Intent, coverageIdentity incomingCoverageIdentity: CoverageIdentity? = nil) {
+            if coveragePermitted {
+                if let incomingCoverageIdentity {
+                    coverageIdentity = coverageIdentity?.merging(incomingCoverageIdentity) ?? incomingCoverageIdentity
+                } else {
+                    coveragePermitted = false
+                    coverageIdentity = nil
+                }
+            }
             switch intent {
             case let .full(paths):
                 for rawPath in paths {
@@ -113,12 +271,76 @@ final class MCPReadFileAutoSelectionCoordinator {
     }
 
     struct CanonicalApplyResult {
-        let mirrorKey: TabMirrorKey?
+        enum Disposition: String {
+            case changed
+            case semanticNoOp
+            case rejected
+        }
 
-        static let unchanged = CanonicalApplyResult(mirrorKey: nil)
+        let mirrorKey: TabMirrorKey?
+        let disposition: Disposition
+        let coverageCertificateOutcome: CoverageCertificateOutcome?
+
+        init(
+            mirrorKey: TabMirrorKey?,
+            disposition: Disposition? = nil,
+            coverageCertificateOutcome: CoverageCertificateOutcome? = nil
+        ) {
+            self.mirrorKey = mirrorKey
+            self.disposition = disposition ?? (mirrorKey == nil ? .semanticNoOp : .changed)
+            self.coverageCertificateOutcome = coverageCertificateOutcome
+        }
+
+        static let unchanged = CanonicalApplyResult(mirrorKey: nil, disposition: .semanticNoOp)
+        static let rejected = CanonicalApplyResult(mirrorKey: nil, disposition: .rejected)
     }
 
     #if DEBUG
+        enum DebugCanonicalApplyOutcome: String, Equatable {
+            case changed
+            case semanticNoOp = "semantic_noop"
+            case rejected
+            case invalidated
+        }
+
+        struct DebugCanonicalApplySample: Equatable {
+            let ordinal: UInt64
+            let durationMilliseconds: Double
+            let outcome: DebugCanonicalApplyOutcome
+            let acceptedIntentCount: UInt64
+            let completedHighWaterSequence: UInt64
+            let coverageCertificateOutcome: CoverageCertificateOutcome?
+        }
+
+        struct DebugContextSnapshot: Equatable {
+            let acceptedHighWaterSequence: UInt64
+            let completedHighWaterSequence: UInt64
+            let acceptedIntentCount: UInt64
+            let completedIntentCount: UInt64
+            let canonicalApplyAttemptCount: UInt64
+            let changedApplyCount: UInt64
+            let semanticNoOpApplyCount: UInt64
+            let rejectedApplyCount: UInt64
+            let changedIntentCount: UInt64
+            let semanticNoOpIntentCount: UInt64
+            let rejectedIntentCount: UInt64
+            let invalidatedIntentCount: UInt64
+            let coverageCertificateHitCount: UInt64
+            let authoritativeFallbackCount: UInt64
+            let coverageCertificateMissReasonCounts: [ReadFileAutoSelectionCoverageCertificateMissReason: UInt64]
+            let mutationTotalMilliseconds: Double
+            let mutationSamples: [DebugCanonicalApplySample]
+            let sampleOverflowCount: UInt64
+            let workerActive: Bool
+            let pendingWork: Bool
+            let waiterCount: Int
+        }
+
+        struct DebugDrainResult: Equatable {
+            let result: DrainResult
+            let capturedTargetSequence: UInt64
+        }
+
         struct DebugSnapshot: Equatable {
             let canonicalLaneCount: Int
             let canonicalWorkerCount: Int
@@ -140,6 +362,7 @@ final class MCPReadFileAutoSelectionCoordinator {
         var batch: CanonicalBatch
         let lowestSequence: UInt64
         var highestSequence: UInt64
+        var acceptedIntentCount: UInt64
         var lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation?
         let queueWaitState: EditFlowPerf.IntervalState?
     }
@@ -199,7 +422,29 @@ final class MCPReadFileAutoSelectionCoordinator {
     private var invalidatedContexts = Set<ContextKey>()
     private var retiringContexts = Set<ContextKey>()
     #if DEBUG
+        private struct DebugContextAccounting {
+            var acceptedIntentCount: UInt64 = 0
+            var completedIntentCount: UInt64 = 0
+            var canonicalApplyAttemptCount: UInt64 = 0
+            var changedApplyCount: UInt64 = 0
+            var semanticNoOpApplyCount: UInt64 = 0
+            var rejectedApplyCount: UInt64 = 0
+            var changedIntentCount: UInt64 = 0
+            var semanticNoOpIntentCount: UInt64 = 0
+            var rejectedIntentCount: UInt64 = 0
+            var invalidatedIntentCount: UInt64 = 0
+            var coverageCertificateHitCount: UInt64 = 0
+            var authoritativeFallbackCount: UInt64 = 0
+            var coverageCertificateMissReasonCounts: [ReadFileAutoSelectionCoverageCertificateMissReason: UInt64] = [:]
+            var mutationTotalMilliseconds: Double = 0
+            var nextSampleOrdinal: UInt64 = 0
+            var mutationSamples: [DebugCanonicalApplySample] = []
+            var sampleOverflowCount: UInt64 = 0
+        }
+
+        private static let debugMutationSampleLimit = 256
         private var canonicalApplyGateForTesting: (() async -> Void)?
+        private var debugAccountingByContext: [ContextKey: DebugContextAccounting] = [:]
     #endif
 
     init(
@@ -215,6 +460,7 @@ final class MCPReadFileAutoSelectionCoordinator {
     @discardableResult
     func enqueue(
         intent: Intent,
+        coverageIdentity: CoverageIdentity? = nil,
         for key: ContextKey,
         lifecycleCorrelation: EditFlowPerf.LifecycleCorrelation? = EditFlowPerf.currentLifecycleCorrelation
     ) -> Bool {
@@ -242,8 +488,9 @@ final class MCPReadFileAutoSelectionCoordinator {
         let previousAcceptedSequence = lane.acceptedSequence
         lane.acceptedSequence = sequence
         if var pending = lane.pending {
-            pending.batch.merge(intent)
+            pending.batch.merge(intent, coverageIdentity: coverageIdentity)
             pending.highestSequence = sequence
+            pending.acceptedIntentCount &+= 1
             pending.lifecycleCorrelation = lifecycleCorrelation ?? pending.lifecycleCorrelation
             lane.pending = pending
             outcome = "coalesced"
@@ -254,9 +501,10 @@ final class MCPReadFileAutoSelectionCoordinator {
             )
         } else {
             lane.pending = QueuedCanonicalBatch(
-                batch: CanonicalBatch(intent: intent),
+                batch: CanonicalBatch(intent: intent, coverageIdentity: coverageIdentity),
                 lowestSequence: sequence,
                 highestSequence: sequence,
+                acceptedIntentCount: 1,
                 lifecycleCorrelation: lifecycleCorrelation,
                 queueWaitState: EditFlowPerf.begin(
                     EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalQueueWait,
@@ -270,6 +518,9 @@ final class MCPReadFileAutoSelectionCoordinator {
             )
         }
         canonicalLanes[key] = lane
+        #if DEBUG
+            debugAccountingByContext[key, default: DebugContextAccounting()].acceptedIntentCount &+= 1
+        #endif
         scheduleCanonicalWorkerIfNeeded(for: key)
         emitCanonicalDiagnostic(
             .acceptedHighWaterAdvanced,
@@ -371,6 +622,40 @@ final class MCPReadFileAutoSelectionCoordinator {
             canonicalApplyGateForTesting = gate
         }
 
+        func debugContextSnapshot(for key: ContextKey) -> DebugContextSnapshot? {
+            guard let lane = canonicalLanes[key] else { return nil }
+            let accounting = debugAccountingByContext[key] ?? DebugContextAccounting()
+            return DebugContextSnapshot(
+                acceptedHighWaterSequence: lane.acceptedSequence,
+                completedHighWaterSequence: lane.completedSequence,
+                acceptedIntentCount: accounting.acceptedIntentCount,
+                completedIntentCount: accounting.completedIntentCount,
+                canonicalApplyAttemptCount: accounting.canonicalApplyAttemptCount,
+                changedApplyCount: accounting.changedApplyCount,
+                semanticNoOpApplyCount: accounting.semanticNoOpApplyCount,
+                rejectedApplyCount: accounting.rejectedApplyCount,
+                changedIntentCount: accounting.changedIntentCount,
+                semanticNoOpIntentCount: accounting.semanticNoOpIntentCount,
+                rejectedIntentCount: accounting.rejectedIntentCount,
+                invalidatedIntentCount: accounting.invalidatedIntentCount,
+                coverageCertificateHitCount: accounting.coverageCertificateHitCount,
+                authoritativeFallbackCount: accounting.authoritativeFallbackCount,
+                coverageCertificateMissReasonCounts: accounting.coverageCertificateMissReasonCounts,
+                mutationTotalMilliseconds: accounting.mutationTotalMilliseconds,
+                mutationSamples: accounting.mutationSamples,
+                sampleOverflowCount: accounting.sampleOverflowCount,
+                workerActive: canonicalWorkers.contains(key),
+                pendingWork: lane.pending != nil,
+                waiterCount: lane.waiters.count
+            )
+        }
+
+        func debugDrainCanonical(for key: ContextKey) async -> DebugDrainResult {
+            let target = canonicalLanes[key]?.acceptedSequence ?? 0
+            let result = await drain(.canonicalSelection, for: key)
+            return DebugDrainResult(result: result, capturedTargetSequence: target)
+        }
+
         func debugSnapshot() -> DebugSnapshot {
             DebugSnapshot(
                 canonicalLaneCount: canonicalLanes.count,
@@ -427,6 +712,11 @@ final class MCPReadFileAutoSelectionCoordinator {
 
             var outcome = "invalidated"
             var mirrorTicket: UInt64?
+            #if DEBUG
+                var debugApplyOutcome: DebugCanonicalApplyOutcome?
+                var debugMutationDurationMilliseconds: Double?
+                var debugCoverageCertificateOutcome: CoverageCertificateOutcome?
+            #endif
             if !invalidatedContexts.contains(key), isContextCurrent(key) {
                 #if DEBUG
                     if let canonicalApplyGateForTesting {
@@ -436,6 +726,10 @@ final class MCPReadFileAutoSelectionCoordinator {
                 // The debug gate models any suspension before mutation. Revalidate identity
                 // afterward so an invalidated or replaced route can never apply stale work.
                 if !invalidatedContexts.contains(key), isContextCurrent(key) {
+                    #if DEBUG
+                        let debugMutationClock = ContinuousClock()
+                        let debugMutationStartedAt = debugMutationClock.now
+                    #endif
                     let result = await EditFlowPerf.$currentLifecycleCorrelation.withValue(queued.lifecycleCorrelation) {
                         await EditFlowPerf.measure(
                             EditFlowPerf.Stage.ReadFile.AutoSelect.canonicalMutation,
@@ -444,17 +738,62 @@ final class MCPReadFileAutoSelectionCoordinator {
                             await applyCanonical(key, queued.batch)
                         }
                     }
-                    if !invalidatedContexts.contains(key), isContextCurrent(key), let mirrorKey = result.mirrorKey {
-                        mirrorTicket = enqueueMirror(
-                            for: mirrorKey,
-                            lifecycleCorrelation: queued.lifecycleCorrelation
+                    #if DEBUG
+                        debugMutationDurationMilliseconds = Self.debugMilliseconds(
+                            debugMutationStartedAt.duration(to: debugMutationClock.now)
                         )
-                        outcome = "changed"
-                    } else if !invalidatedContexts.contains(key), isContextCurrent(key) {
-                        outcome = "unchanged"
+                        debugCoverageCertificateOutcome = result.coverageCertificateOutcome
+                    #endif
+                    if !invalidatedContexts.contains(key), isContextCurrent(key) {
+                        switch result.disposition {
+                        case .changed:
+                            if let mirrorKey = result.mirrorKey {
+                                mirrorTicket = enqueueMirror(
+                                    for: mirrorKey,
+                                    lifecycleCorrelation: queued.lifecycleCorrelation
+                                )
+                                outcome = "changed"
+                                #if DEBUG
+                                    debugApplyOutcome = .changed
+                                #endif
+                            } else {
+                                outcome = "rejected"
+                                #if DEBUG
+                                    debugApplyOutcome = .rejected
+                                #endif
+                            }
+                        case .semanticNoOp:
+                            outcome = "unchanged"
+                            #if DEBUG
+                                debugApplyOutcome = .semanticNoOp
+                            #endif
+                        case .rejected:
+                            outcome = "rejected"
+                            #if DEBUG
+                                debugApplyOutcome = .rejected
+                            #endif
+                        }
+                    } else {
+                        #if DEBUG
+                            debugApplyOutcome = .invalidated
+                        #endif
                     }
                 }
             }
+            #if DEBUG
+                if let debugApplyOutcome, let debugMutationDurationMilliseconds {
+                    recordDebugCanonicalApply(
+                        for: key,
+                        outcome: debugApplyOutcome,
+                        acceptedIntentCount: queued.acceptedIntentCount,
+                        durationMilliseconds: debugMutationDurationMilliseconds,
+                        completedHighWaterSequence: queued.highestSequence,
+                        coverageCertificateOutcome: debugCoverageCertificateOutcome
+                    )
+                } else {
+                    debugAccountingByContext[key, default: DebugContextAccounting()].invalidatedIntentCount &+= queued.acceptedIntentCount
+                }
+            #endif
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.ReadFileAutoSelect.canonicalApplyEnded,
                 correlation: queued.lifecycleCorrelation,
@@ -463,15 +802,24 @@ final class MCPReadFileAutoSelectionCoordinator {
             completeCanonicalBatch(
                 for: key,
                 throughSequence: queued.highestSequence,
+                acceptedIntentCount: queued.acceptedIntentCount,
                 mirrorTicket: mirrorTicket
             )
             await Task.yield()
         }
     }
 
-    private func completeCanonicalBatch(for key: ContextKey, throughSequence: UInt64, mirrorTicket: UInt64?) {
+    private func completeCanonicalBatch(
+        for key: ContextKey,
+        throughSequence: UInt64,
+        acceptedIntentCount: UInt64,
+        mirrorTicket: UInt64?
+    ) {
         guard var lane = canonicalLanes[key] else { return }
         lane.completedSequence = max(lane.completedSequence, throughSequence)
+        #if DEBUG
+            debugAccountingByContext[key, default: DebugContextAccounting()].completedIntentCount &+= acceptedIntentCount
+        #endif
         if let mirrorTicket {
             lane.latestRequiredMirrorTicket = max(lane.latestRequiredMirrorTicket ?? 0, mirrorTicket)
         }
@@ -491,6 +839,65 @@ final class MCPReadFileAutoSelectionCoordinator {
             waiter.continuation.resume(returning: .completed(requiredMirrorTicket: lane.latestRequiredMirrorTicket))
         }
     }
+
+    #if DEBUG
+        private func recordDebugCanonicalApply(
+            for key: ContextKey,
+            outcome: DebugCanonicalApplyOutcome,
+            acceptedIntentCount: UInt64,
+            durationMilliseconds: Double,
+            completedHighWaterSequence: UInt64,
+            coverageCertificateOutcome: CoverageCertificateOutcome?
+        ) {
+            var accounting = debugAccountingByContext[key] ?? DebugContextAccounting()
+            accounting.canonicalApplyAttemptCount &+= 1
+            switch outcome {
+            case .changed:
+                accounting.changedApplyCount &+= 1
+                accounting.changedIntentCount &+= acceptedIntentCount
+            case .semanticNoOp:
+                accounting.semanticNoOpApplyCount &+= 1
+                accounting.semanticNoOpIntentCount &+= acceptedIntentCount
+            case .rejected:
+                accounting.rejectedApplyCount &+= 1
+                accounting.rejectedIntentCount &+= acceptedIntentCount
+            case .invalidated:
+                accounting.rejectedApplyCount &+= 1
+                accounting.invalidatedIntentCount &+= acceptedIntentCount
+            }
+            switch coverageCertificateOutcome {
+            case .hit:
+                accounting.coverageCertificateHitCount &+= 1
+            case let .authoritativeFallback(reason):
+                accounting.authoritativeFallbackCount &+= 1
+                accounting.coverageCertificateMissReasonCounts[reason, default: 0] &+= 1
+            case nil:
+                break
+            }
+            accounting.mutationTotalMilliseconds += durationMilliseconds
+            accounting.nextSampleOrdinal &+= 1
+            let sample = DebugCanonicalApplySample(
+                ordinal: accounting.nextSampleOrdinal,
+                durationMilliseconds: durationMilliseconds,
+                outcome: outcome,
+                acceptedIntentCount: acceptedIntentCount,
+                completedHighWaterSequence: completedHighWaterSequence,
+                coverageCertificateOutcome: coverageCertificateOutcome
+            )
+            if accounting.mutationSamples.count == Self.debugMutationSampleLimit {
+                accounting.mutationSamples.removeFirst()
+                accounting.sampleOverflowCount &+= 1
+            }
+            accounting.mutationSamples.append(sample)
+            debugAccountingByContext[key] = accounting
+        }
+
+        private nonisolated static func debugMilliseconds(_ duration: Duration) -> Double {
+            let components = duration.components
+            return Double(components.seconds) * 1000
+                + Double(components.attoseconds) / 1_000_000_000_000_000
+        }
+    #endif
 
     @discardableResult
     private func enqueueMirror(
@@ -562,6 +969,7 @@ final class MCPReadFileAutoSelectionCoordinator {
                 for: key,
                 workerID: workerID
             )
+            cleanupMirrorLaneIfSettled(key)
         }
         while var lane = mirrorLanes[key], let queued = lane.pending {
             lane.pending = nil
@@ -711,6 +1119,7 @@ final class MCPReadFileAutoSelectionCoordinator {
             waiterID: waiterID
         )
         waiter.continuation.resume(returning: .cancelled)
+        cleanupMirrorLaneIfSettled(key)
     }
 
     private func emitCanonicalDiagnostic(
@@ -782,8 +1191,21 @@ final class MCPReadFileAutoSelectionCoordinator {
               canonicalLanes[key]?.waiters.isEmpty != false
         else { return }
         canonicalLanes.removeValue(forKey: key)
+        #if DEBUG
+            debugAccountingByContext.removeValue(forKey: key)
+        #endif
         closingContexts.remove(key)
         invalidatedContexts.remove(key)
         retiringContexts.remove(key)
+        cleanupMirrorLaneIfSettled(key.mirrorKey)
+    }
+
+    private func cleanupMirrorLaneIfSettled(_ key: TabMirrorKey) {
+        guard !mirrorWorkers.contains(key),
+              mirrorLanes[key]?.pending == nil,
+              mirrorLanes[key]?.waiters.isEmpty != false,
+              !canonicalLanes.keys.contains(where: { $0.mirrorKey == key })
+        else { return }
+        mirrorLanes.removeValue(forKey: key)
     }
 }

@@ -128,6 +128,11 @@ struct WorkspaceFileMutationService {
         selectedFileFullPaths: Set<String> = [],
         pathResolutionPolicy: WorkspaceFileCreatePathResolutionPolicy = .literalPreferredIfStronger
     ) async throws -> WorkspaceFileMutationWriteResult {
+        guard await store.rootScopeAvailability(rootScope) == .available else {
+            throw FileManagerError.fileSystemServiceNotFoundWithContext(
+                "The session-bound workspace scope is unavailable. File creation stopped rather than using a replacement root."
+            )
+        }
         let roots = await store.rootRefs(scope: rootScope)
         let preflight: CreatePathPreflight.Result
         do {
@@ -144,7 +149,12 @@ struct WorkspaceFileMutationService {
         if pathResolutionPolicy == .literalPreferredIfStronger,
            let literal = await resolvedLiteralCreateResult(for: standardizedInput, preflight: preflight, rootScope: rootScope)
         {
-            return try await createWithPostcondition(using: literal, userPath: userPath, content: content)
+            return try await createWithPostcondition(
+                using: literal,
+                userPath: userPath,
+                content: content,
+                rootScope: rootScope
+            )
         }
 
         if let folder = await exactExistingFolder(standardizedInput, rootScope: rootScope) {
@@ -184,43 +194,44 @@ struct WorkspaceFileMutationService {
                 "Path '\(userPath)' could match multiple workspace roots: \(candidates). Please disambiguate using 'RootName/\(userPath)' or provide an absolute path."
             )
         case let .unique(result):
-            return try await createWithPostcondition(using: result, userPath: userPath, content: content)
+            return try await createWithPostcondition(
+                using: result,
+                userPath: userPath,
+                content: content,
+                rootScope: rootScope
+            )
         }
-    }
-
-    private func create(
-        using result: FileCreationResult,
-        userPath: String,
-        content: String
-    ) async throws -> WorkspaceFileRecord {
-        let writeResult = try await createWithPostcondition(using: result, userPath: userPath, content: content)
-        if let file = writeResult.materializedFile {
-            return file
-        }
-        let reason = writeResult.catalogIneligibility?.description ?? "no catalog record was returned"
-        throw FileManagerError.fileSystemServiceNotFoundWithContext(
-            "File creation succeeded on disk, but RepoPrompt did not add it to the workspace catalog: \(reason)."
-        )
     }
 
     private func createWithPostcondition(
         using result: FileCreationResult,
         userPath: String,
-        content: String
+        content: String,
+        rootScope: WorkspaceLookupRootScope
     ) async throws -> WorkspaceFileMutationWriteResult {
+        guard await store.rootScopeAvailability(rootScope) == .available else {
+            throw FileManagerError.fileSystemServiceNotFoundWithContext(
+                "The session-bound workspace scope changed during path resolution. File creation stopped rather than using a replacement root."
+            )
+        }
         let rootPath = StandardizedPath.absolute(result.rootFolder.rootPath)
-        guard let root = await store.rootRefs(scope: .allLoaded).first(where: { $0.standardizedFullPath == rootPath }) else {
+        guard let root = await store.rootRefs(scope: rootScope).first(where: { $0.standardizedFullPath == rootPath }) else {
             throw FileManagerError.fileSystemServiceNotFoundWithContext("Internal error: computed creation root is not currently loaded.")
         }
         let relativePath = StandardizedPath.relative(result.componentsToCreate.joined(separator: "/"))
         let absolutePath = StandardizedPath.join(standardizedRoot: root.standardizedFullPath, standardizedRelativePath: relativePath)
-        if let folder = await exactExistingFolder(absolutePath, rootScope: .allLoaded) {
-            throw await FileManagerError.fileSystemServiceNotFoundWithContext("'\(displayPath(for: folder, rootScope: .allLoaded))' resolves to a folder. Provide a file path.")
+        if let folder = await exactExistingFolder(absolutePath, rootScope: rootScope) {
+            throw await FileManagerError.fileSystemServiceNotFoundWithContext("'\(displayPath(for: folder, rootScope: rootScope))' resolves to a folder. Provide a file path.")
         }
-        if await exactExistingFile(absolutePath, rootScope: .allLoaded) != nil {
+        if await exactExistingFile(absolutePath, rootScope: rootScope) != nil {
             throw FileManagerError.fileSystemServiceNotFoundWithContext("path already exists: \(userPath)")
         }
-        let result = try await store.createFile(rootID: root.id, relativePath: relativePath, content: content)
+        let result = try await store.createFile(
+            rootID: root.id,
+            relativePath: relativePath,
+            content: content,
+            validating: rootScope
+        )
         return .fromCatalogMaterialization(result)
     }
 

@@ -5,7 +5,12 @@ enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
+    case allLoadedExcludingGitData
     case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
+    case validatedSessionBoundWorkspace(
+        canonicalRoots: Set<WorkspaceRootRef>,
+        physicalRoots: Set<WorkspaceRootRef>
+    )
 }
 
 enum WorkspaceLookupRootScopeAvailability: Equatable {
@@ -62,6 +67,17 @@ struct WorkspaceRootLoadFailure: Equatable, Identifiable {
     }
 }
 
+struct WorkspaceSearchReadinessTicket: Equatable, Hashable {
+    let workspaceID: UUID?
+    let generation: UInt64
+}
+
+enum WorkspaceSearchReadinessWaitError: Error, Equatable {
+    case unavailable
+    case timedOut
+    case superseded
+}
+
 enum WorkspaceSearchReadinessState: Equatable {
     case idle
     case activating(workspaceID: UUID?, generation: UInt64)
@@ -69,6 +85,28 @@ enum WorkspaceSearchReadinessState: Equatable {
     case buildingIndexes(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64, failures: [WorkspaceRootLoadFailure])
     case ready(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64, indexedGeneration: UInt64, diagnostics: WorkspaceCatalogDiagnostics)
     case degraded(workspaceID: UUID?, generation: UInt64, catalogGeneration: UInt64?, indexedGeneration: UInt64?, failures: [WorkspaceRootLoadFailure], diagnostics: WorkspaceCatalogDiagnostics?)
+
+    var ticket: WorkspaceSearchReadinessTicket? {
+        switch self {
+        case .idle:
+            nil
+        case let .activating(workspaceID, generation),
+             let .loadingCatalog(workspaceID, generation, _, _, _),
+             let .buildingIndexes(workspaceID, generation, _, _),
+             let .ready(workspaceID, generation, _, _, _),
+             let .degraded(workspaceID, generation, _, _, _, _):
+            WorkspaceSearchReadinessTicket(workspaceID: workspaceID, generation: generation)
+        }
+    }
+
+    var isSearchAdmissible: Bool {
+        switch self {
+        case .ready, .degraded:
+            true
+        case .idle, .activating, .loadingCatalog, .buildingIndexes:
+            false
+        }
+    }
 }
 
 struct WorkspaceCatalogDiagnostics: Equatable {
@@ -135,6 +173,24 @@ final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
     }
 }
 
+enum WorkspaceSearchCatalogAccessRequirement: Equatable {
+    case recordsOnly
+    case recordsAndPathIndexes
+
+    func satisfies(_ requirement: WorkspaceSearchCatalogAccessRequirement) -> Bool {
+        switch (self, requirement) {
+        case (.recordsAndPathIndexes, _), (.recordsOnly, .recordsOnly):
+            true
+        case (.recordsOnly, .recordsAndPathIndexes):
+            false
+        }
+    }
+
+    var requiresPathIndexes: Bool {
+        self == .recordsAndPathIndexes
+    }
+}
+
 struct WorkspaceSearchCatalogSnapshot: Equatable {
     let generation: UInt64
     let rootScope: WorkspaceLookupRootScope
@@ -163,6 +219,19 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         self.rootPathIndexes = rootPathIndexes
         self.diagnostics = diagnostics
         self.generationLease = generationLease
+    }
+
+    func recordsOnlyProjection() -> WorkspaceSearchCatalogSnapshot {
+        guard !rootPathIndexes.isEmpty else { return self }
+        return WorkspaceSearchCatalogSnapshot(
+            generation: generation,
+            rootScope: rootScope,
+            roots: roots,
+            files: files,
+            entries: entries,
+            diagnostics: diagnostics,
+            generationLease: generationLease
+        )
     }
 
     static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {
@@ -347,6 +416,7 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
     let mode: PromptFileEntryMode
     let loadedContent: String?
     let rootFolderPath: String?
+    let role: ResolvedPromptFileEntryRole
 
     init(
         file: WorkspaceFileRecord,
@@ -354,7 +424,8 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         lineRanges: [LineRange]? = nil,
         mode: PromptFileEntryMode = .fullFile,
         loadedContent: String? = nil,
-        rootFolderPath: String? = nil
+        rootFolderPath: String? = nil,
+        role: ResolvedPromptFileEntryRole = .ordinary
     ) {
         id = ResolvedPromptFileEntryID(fileID: file.id, mode: mode, lineRanges: lineRanges)
         self.file = file
@@ -363,7 +434,13 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         self.mode = mode
         self.loadedContent = loadedContent
         self.rootFolderPath = rootFolderPath
+        self.role = role
     }
+}
+
+enum ResolvedPromptFileEntryRole: Equatable {
+    case ordinary
+    case authorizedGitDiffArtifact
 }
 
 struct ResolvedPromptFileBlockRecord: Equatable {
@@ -418,10 +495,29 @@ struct WorkspaceAppliedIndexRootSnapshot: Equatable {
     let folders: [WorkspaceFolderRecord]
 }
 
+struct WorkspaceSliceRebasePathState: Equatable {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+    let rootKind: WorkspaceRootKind
+    let appliedIndexGeneration: UInt64
+}
+
+struct WorkspaceSliceRebaseSourceSnapshot: Equatable {
+    let rootID: UUID
+    let rootLifetimeID: UUID
+    let fileID: UUID
+    let relativePath: String
+    let fullPath: String
+    let text: String
+    let modificationTime: Double
+}
+
 struct WorkspaceAppliedIndexBatchEvent: Equatable {
     let rootID: UUID
     let rootPath: String
     let generation: UInt64
+    let rootLifetimeID: UUID?
+    let modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot]
     let upsertedFiles: [WorkspaceFileRecord]
     let upsertedFolders: [WorkspaceFolderRecord]
     let removedFileIDs: [UUID]
@@ -437,6 +533,8 @@ struct WorkspaceAppliedIndexBatchEvent: Equatable {
         rootID: UUID,
         rootPath: String,
         generation: UInt64,
+        rootLifetimeID: UUID? = nil,
+        modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot] = [:],
         upsertedFiles: [WorkspaceFileRecord] = [],
         upsertedFolders: [WorkspaceFolderRecord] = [],
         removedFileIDs: [UUID] = [],
@@ -451,6 +549,8 @@ struct WorkspaceAppliedIndexBatchEvent: Equatable {
         self.rootID = rootID
         self.rootPath = rootPath
         self.generation = generation
+        self.rootLifetimeID = rootLifetimeID
+        self.modifiedFileSourceSnapshotsByID = modifiedFileSourceSnapshotsByID
         self.upsertedFiles = upsertedFiles
         self.upsertedFolders = upsertedFolders
         self.removedFileIDs = removedFileIDs
@@ -472,6 +572,60 @@ struct WorkspaceCodemapSnapshot {
     let fullPath: String
     let modificationDate: Date
     let fileAPI: FileAPI?
+}
+
+/// Immutable codemap state captured once for a context-building operation.
+/// Consumers keep using this value even if the workspace store changes across awaits.
+struct WorkspaceCodemapSnapshotBundle {
+    struct RenderedCodemap {
+        let text: String
+        let tokenCount: Int
+    }
+
+    static let empty = WorkspaceCodemapSnapshotBundle(snapshots: [])
+
+    let snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]
+    let orderedSnapshots: [WorkspaceCodemapSnapshot]
+
+    init(snapshots: [WorkspaceCodemapSnapshot]) {
+        orderedSnapshots = snapshots.sorted {
+            let lhsPath = StandardizedPath.absolute($0.fullPath)
+            let rhsPath = StandardizedPath.absolute($1.fullPath)
+            if lhsPath != rhsPath { return lhsPath < rhsPath }
+            return $0.fileID.uuidString < $1.fileID.uuidString
+        }
+        snapshotsByFileID = Dictionary(uniqueKeysWithValues: orderedSnapshots.map { ($0.fileID, $0) })
+    }
+
+    init(snapshotsByFileID: [UUID: WorkspaceCodemapSnapshot]) {
+        self.init(snapshots: Array(snapshotsByFileID.values))
+    }
+
+    var count: Int {
+        snapshotsByFileID.count
+    }
+
+    func snapshot(for file: WorkspaceFileRecord) -> WorkspaceCodemapSnapshot? {
+        guard let snapshot = snapshotsByFileID[file.id],
+              snapshot.rootID == file.rootID,
+              StandardizedPath.absolute(snapshot.fullPath) == file.standardizedFullPath
+        else { return nil }
+        return snapshot
+    }
+
+    func hasRenderableCodemap(for file: WorkspaceFileRecord) -> Bool {
+        snapshot(for: file)?.fileAPI != nil
+    }
+
+    func renderedCodemap(for file: WorkspaceFileRecord, displayPath: String) -> RenderedCodemap? {
+        guard let api = snapshot(for: file)?.fileAPI else { return nil }
+        let text = api.getFullAPIDescription(displayPath: displayPath)
+        guard !text.isEmpty else { return nil }
+        return RenderedCodemap(
+            text: text,
+            tokenCount: TokenCalculationService.estimateTokens(for: text)
+        )
+    }
 }
 
 struct WorkspaceCodemapRepairResult {

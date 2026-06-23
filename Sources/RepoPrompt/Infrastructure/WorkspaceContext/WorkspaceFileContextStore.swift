@@ -108,6 +108,73 @@ struct WorkspaceDisplayRootRefsSnapshot: Equatable {
     let allRoots: [WorkspaceRootRef]
 }
 
+private final class WorkspaceSessionRootLifetimeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var generation: UInt64 = 0
+
+    func advance() {
+        lock.lock()
+        generation &+= 1
+        lock.unlock()
+    }
+
+    func snapshot(physicalRootPaths: [String]) -> WorkspaceSessionRootLifetimeSnapshot {
+        lock.lock()
+        let capturedGeneration = generation
+        lock.unlock()
+        return WorkspaceSessionRootLifetimeSnapshot(
+            clock: self,
+            generation: capturedGeneration,
+            physicalRootPaths: physicalRootPaths
+        )
+    }
+
+    func performIfGenerationCurrent(
+        generation expectedGeneration: UInt64,
+        operation: () -> Void
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expectedGeneration else { return false }
+        operation()
+        return true
+    }
+}
+
+struct WorkspaceSessionRootLifetimeSnapshot: @unchecked Sendable {
+    fileprivate let clock: WorkspaceSessionRootLifetimeClock
+    fileprivate let generation: UInt64
+    fileprivate let physicalRootPaths: [String]
+
+    func isGenerationCurrent() -> Bool {
+        clock.performIfGenerationCurrent(
+            generation: generation,
+            operation: {}
+        )
+    }
+
+    func isCurrent() async -> Bool {
+        let physicalRootPaths = physicalRootPaths
+        let rootsExist = await Task.detached(priority: .userInitiated) {
+            physicalRootPaths.allSatisfy { path in
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                    && isDirectory.boolValue
+            }
+        }.value
+        guard rootsExist else { return false }
+        return isGenerationCurrent()
+    }
+
+    @discardableResult
+    func performIfGenerationCurrent(_ operation: () -> Void) -> Bool {
+        clock.performIfGenerationCurrent(
+            generation: generation,
+            operation: operation
+        )
+    }
+}
+
 actor WorkspaceFileContextStore {
     private struct RootState {
         let lifetimeID: UUID
@@ -134,6 +201,167 @@ actor WorkspaceFileContextStore {
         let respectCursorignore: Bool
         let skipSymlinks: Bool
         let enableHierarchicalIgnores: Bool
+    }
+
+    private struct RootLoadCompletionIdentity {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private final class RootLoadFlightCompletion: @unchecked Sendable {
+        private let lock = NSLock()
+        private var completionIdentity: RootLoadCompletionIdentity?
+
+        func record(rootID: UUID, lifetimeID: UUID) {
+            lock.lock()
+            completionIdentity = RootLoadCompletionIdentity(
+                rootID: rootID,
+                lifetimeID: lifetimeID
+            )
+            lock.unlock()
+        }
+
+        func identity() -> RootLoadCompletionIdentity? {
+            lock.lock()
+            let identity = completionIdentity
+            lock.unlock()
+            return identity
+        }
+    }
+
+    private struct RootLoadFlight {
+        let id: UUID
+        let task: Task<WorkspaceRootRecord, Error>
+        let completion: RootLoadFlightCompletion
+    }
+
+    private struct SessionWorktreeRootLifetimeKey: Hashable {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private struct WatcherInfrastructureKey: Hashable {
+        let rootID: UUID
+        let lifetimeID: UUID
+    }
+
+    private struct WatcherPublisherAttachment {
+        let subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+        let cancellable: AnyCancellable
+    }
+
+    private struct WatcherInfrastructureFlight {
+        let id: UUID
+        let task: Task<Void, Error>
+    }
+
+    private struct SessionWorktreeOwnershipRecord {
+        let bindingFingerprint: String
+        let roots: [WorkspaceSessionWorktreeOwnedRoot]
+    }
+
+    private struct SessionWorktreeReservedLoadFlight {
+        let standardizedPath: String
+        let flight: RootLoadFlight
+    }
+
+    private struct SessionWorktreeOwnershipRemoval {
+        var ownedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+        var reservedLoadFlights: [SessionWorktreeReservedLoadFlight] = []
+
+        mutating func append(_ other: SessionWorktreeOwnershipRemoval) {
+            ownedRoots.append(contentsOf: other.ownedRoots)
+            reservedLoadFlights.append(contentsOf: other.reservedLoadFlights)
+        }
+    }
+
+    private final class RootLoadTaskWaitRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resolution: Result<WorkspaceRootRecord, Error>?
+        private var continuation: CheckedContinuation<WorkspaceRootRecord, Error>?
+
+        func value() async throws -> WorkspaceRootRecord {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let resolution {
+                    lock.unlock()
+                    continuation.resume(with: resolution)
+                } else {
+                    precondition(self.continuation == nil)
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func resolve(_ resolution: Result<WorkspaceRootRecord, Error>) {
+            let continuation: CheckedContinuation<WorkspaceRootRecord, Error>?
+            lock.lock()
+            guard self.resolution == nil else {
+                lock.unlock()
+                return
+            }
+            self.resolution = resolution
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: resolution)
+        }
+
+        func cancel() {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    private final class WatcherInfrastructureTaskWaitRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var resolution: Result<Void, Error>?
+        private var continuation: CheckedContinuation<Void, Error>?
+
+        func value() async throws {
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if let resolution {
+                    lock.unlock()
+                    continuation.resume(with: resolution)
+                } else {
+                    precondition(self.continuation == nil)
+                    self.continuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func resolve(_ resolution: Result<Void, Error>) {
+            let continuation: CheckedContinuation<Void, Error>?
+            lock.lock()
+            guard self.resolution == nil else {
+                lock.unlock()
+                return
+            }
+            self.resolution = resolution
+            continuation = self.continuation
+            self.continuation = nil
+            lock.unlock()
+            continuation?.resume(with: resolution)
+        }
+
+        func cancel() {
+            resolve(.failure(CancellationError()))
+        }
+    }
+
+    private struct SliceRebaseSourceCacheKey: Hashable {
+        let rootID: UUID
+        let rootLifetimeID: UUID
+        let fileID: UUID
+        let relativePath: String
+    }
+
+    private struct SliceRebaseSourceCacheEntry {
+        let snapshot: WorkspaceSliceRebaseSourceSnapshot
+        let byteCost: Int
+        var accessOrdinal: UInt64
     }
 
     private enum CatalogInvalidationReason: String, Hashable {
@@ -376,22 +604,46 @@ actor WorkspaceFileContextStore {
             let rebuildCount: Int
             let filterMicroseconds: UInt64
             let sortMicroseconds: UInt64
+            let fileSortMicroseconds: UInt64
+            let folderSortMicroseconds: UInt64
+            let sortResidualMicroseconds: UInt64
+            let sortReconciliationDeltaMicroseconds: Int64
+            let sortInvocationCount: Int
+            let sortFileInputCount: Int
+            let sortFolderInputCount: Int
             let materializationMicroseconds: UInt64
+            let pathIndexKeyMicroseconds: UInt64
+            let pathIndexConstructionMicroseconds: UInt64
+            let compositionCacheResidualMicroseconds: UInt64
             let totalMicroseconds: UInt64
             let lastFileCount: Int
             let lastRootCount: Int
         }
 
+        enum RootCatalogShardFallbackReason: String, CaseIterable, Hashable {
+            case missingReusableShard
+            case generationGap
+            case fullResync
+            case unsafeOrAmbiguousBatch
+            case retentionBoundary
+            case patchThresholdExceeded
+            case patchApplicationBackstop
+            case shadowValidationMismatch
+        }
+
         struct RootCatalogShardGenerationDebugSnapshot: Equatable {
             let rootID: UUID
+            let lifetimeID: UUID?
             let publishedTopologyGeneration: UInt64?
             let liveTopologyGenerations: [UInt64]
             let retainedTopologyGenerations: [UInt64]
             let buildCount: Int
             let pathIndexBuildCount: Int
+            let overlayPathIndexBuildCount: Int
             let patchCount: Int
             let authoritativeRebuildCount: Int
-            let fallbackReasonCounts: [String: Int]
+            let fallbackCount: Int
+            let fallbackReasonCounts: [RootCatalogShardFallbackReason: Int]
             let lastAppliedIndexGeneration: UInt64?
             let deltaStateDirty: Bool
             let backstopCount: Int
@@ -401,9 +653,12 @@ actor WorkspaceFileContextStore {
         struct RootCatalogShardDebugSnapshot: Equatable {
             let liveGenerationCapPerRoot: Int
             let maxPatchLogicalMutationCount: Int
+            let maxPathIndexOverlayChangedFileCount: Int
             let publishedShardCount: Int
             let totalBuildCount: Int
             let totalBackstopCount: Int
+            let singleShardCompositionReuseCount: Int
+            let genericMergeElementVisitCount: Int
             let shadowComparisonCount: Int
             let shadowMismatchCount: Int
             let lastShadowByteCount: Int
@@ -423,10 +678,24 @@ actor WorkspaceFileContextStore {
             let rootKind: String
             let crawlCount: Int
             let watcherActive: Bool
+            let explicitWatcherDemand: Bool
+            let sessionWorktreeOwnerCount: Int
             let ingress: WorkspaceFileSystemIngressCoordinator.DebugSnapshot
             let barrier: ScopedIngressBarrierDebugSnapshot
             let freshness: FileSystemService.FreshnessWorkDiagnosticsSnapshot
             let invalidation: PublicationInvalidationHistoryDebugSnapshot
+            let producedAppliedIndexGeneration: UInt64
+        }
+
+        struct ApplyEditsRebaseProbePathSnapshot: Equatable {
+            let rootID: UUID
+            let rootLifetimeID: UUID
+            let rootToken: UUID
+            let rootPath: String
+            let fileID: UUID
+            let fullPath: String
+            let relativePath: String
+            let isSessionWorktree: Bool
             let producedAppliedIndexGeneration: UInt64
         }
 
@@ -461,8 +730,13 @@ actor WorkspaceFileContextStore {
         private var rootLoadDidJoinInFlightHandler: (@Sendable (String) async -> Void)?
         private var rootUnloadDidDetachHandler: (@Sendable ([String]) async -> Void)?
         private var ensureIndexedFilesEligibilityDidResolveHandler: (@Sendable (UUID, String) async -> Void)?
+        private var contextBuilderSelectionCandidateEligibilityDidResolveHandler: (@Sendable (UUID) async -> Void)?
+        private var publishedGitArtifactIngressDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var watcherSinkWillApplyHandler: (@Sendable (UUID) async -> Void)?
+        private var storeEditDeferredPublicationDidRegisterHandler: (@Sendable (UUID, String) async -> Void)?
         private var publisherIngressWillWaitHandler: (@Sendable (Set<UUID>) async -> Void)?
+        private var watcherPublisherIngressDidOpenHandler: (@Sendable (UUID, UUID) async -> Void)?
+        private var watcherInfrastructureDidJoinFlightHandler: (@Sendable (UUID, UUID) async -> Void)?
         private var watcherServiceStateWillReconcileHandler: (@Sendable (UUID, Bool) async -> Void)?
         private var watcherStopWillBeginHandler: (@Sendable (UUID) async -> Void)?
         private var rootUnloadTerminationDidCompleteHandler: (@Sendable (WorkspaceRootUnloadTerminationDiagnostics) async -> Void)?
@@ -485,16 +759,32 @@ actor WorkspaceFileContextStore {
         private var catalogRebuildCount = 0
         private var catalogRebuildFilterMicroseconds: UInt64 = 0
         private var catalogRebuildSortMicroseconds: UInt64 = 0
+        private var catalogRebuildFileSortMicroseconds: UInt64 = 0
+        private var catalogRebuildFolderSortMicroseconds: UInt64 = 0
+        private var catalogRebuildSortResidualMicroseconds: UInt64 = 0
+        private var catalogRebuildSortReconciliationDeltaMicroseconds: Int64 = 0
+        private var catalogRebuildSortInvocationCount = 0
+        private var catalogRebuildSortFileInputCount = 0
+        private var catalogRebuildSortFolderInputCount = 0
         private var catalogRebuildMaterializationMicroseconds: UInt64 = 0
+        private var catalogRebuildPathIndexKeyMicroseconds: UInt64 = 0
+        private var catalogRebuildPathIndexConstructionMicroseconds: UInt64 = 0
+        private var catalogRebuildCompositionCacheResidualMicroseconds: UInt64 = 0
         private var catalogRebuildTotalMicroseconds: UInt64 = 0
         private var catalogRebuildLastFileCount = 0
         private var catalogRebuildLastRootCount = 0
         private var rootCatalogShardBuildCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardFullPathIndexBuildCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardOverlayPathIndexBuildCountsByRootID: [UUID: Int] = [:]
         private var rootCatalogShardPatchCountsByRootID: [UUID: Int] = [:]
         private var rootCatalogShardAuthoritativeRebuildCountsByRootID: [UUID: Int] = [:]
-        private var rootCatalogShardFallbackReasonCountsByRootID: [UUID: [String: Int]] = [:]
+        private var rootCatalogShardFallbackCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardFallbackReasonCountsByRootID: [UUID: [RootCatalogShardFallbackReason: Int]] = [:]
+        private var rootCatalogShardFallbackLifetimeIDsByRootID: [UUID: UUID] = [:]
         private var rootCatalogShardBackstopCountsByRootID: [UUID: Int] = [:]
         private var rootCatalogShardMaxLiveGenerationCountsByRootID: [UUID: Int] = [:]
+        private var rootCatalogShardSingleShardCompositionReuseCount = 0
+        private var rootCatalogShardGenericMergeElementVisitCount = 0
         private var rootCatalogShardShadowComparisonCount = 0
         private var rootCatalogShardShadowMismatchCount = 0
         private var rootCatalogShardLastShadowByteCount = 0
@@ -515,12 +805,36 @@ actor WorkspaceFileContextStore {
             ensureIndexedFilesEligibilityDidResolveHandler = handler
         }
 
+        func setContextBuilderSelectionCandidateEligibilityDidResolveHandler(
+            _ handler: (@Sendable (UUID) async -> Void)?
+        ) {
+            contextBuilderSelectionCandidateEligibilityDidResolveHandler = handler
+        }
+
+        func setPublishedGitArtifactIngressDidRegisterHandler(
+            _ handler: (@Sendable (UUID, String) async -> Void)?
+        ) {
+            publishedGitArtifactIngressDidRegisterHandler = handler
+        }
+
         func setWatcherSinkWillApplyHandler(_ handler: (@Sendable (UUID) async -> Void)?) {
             watcherSinkWillApplyHandler = handler
         }
 
         func setPublisherIngressWillWaitHandler(_ handler: (@Sendable (Set<UUID>) async -> Void)?) {
             publisherIngressWillWaitHandler = handler
+        }
+
+        func setWatcherPublisherIngressDidOpenHandler(_ handler: (@Sendable (UUID, UUID) async -> Void)?) {
+            watcherPublisherIngressDidOpenHandler = handler
+        }
+
+        func setWatcherInfrastructureDidJoinFlightHandler(_ handler: (@Sendable (UUID, UUID) async -> Void)?) {
+            watcherInfrastructureDidJoinFlightHandler = handler
+        }
+
+        func watcherInfrastructureFlightCountForTesting(rootID: UUID) -> Int {
+            watcherInfrastructureFlightsByKey.keys.count(where: { $0.rootID == rootID })
         }
 
         func setWatcherServiceStateWillReconcileHandler(_ handler: (@Sendable (UUID, Bool) async -> Void)?) {
@@ -571,6 +885,34 @@ actor WorkspaceFileContextStore {
             rootStatesByID[rootID]?.service
         }
 
+        func debugApplyEditsRebaseProbePathSnapshot(
+            fullPath rawFullPath: String,
+            rootScope: WorkspaceLookupRootScope
+        ) -> ApplyEditsRebaseProbePathSnapshot? {
+            let fullPath = StandardizedPath.absolute(rawFullPath)
+            guard let root = rootsForPathLookup(scope: rootScope)
+                .filter({ StandardizedPath.isDescendant(fullPath, of: $0.standardizedFullPath) })
+                .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count }),
+                let state = rootStatesByID[root.id]
+            else { return nil }
+            let relativePath = URL(fileURLWithPath: fullPath)
+                .relativePath(from: URL(fileURLWithPath: root.standardizedFullPath))
+            guard let file = file(rootID: root.id, relativePath: relativePath),
+                  file.standardizedFullPath == fullPath
+            else { return nil }
+            return ApplyEditsRebaseProbePathSnapshot(
+                rootID: root.id,
+                rootLifetimeID: state.lifetimeID,
+                rootToken: state.service.diagnosticRootToken,
+                rootPath: root.standardizedFullPath,
+                fileID: file.id,
+                fullPath: file.standardizedFullPath,
+                relativePath: file.standardizedRelativePath,
+                isSessionWorktree: root.kind == .sessionWorktree,
+                producedAppliedIndexGeneration: appliedIndexGenerationsByRootID[root.id] ?? 0
+            )
+        }
+
         func readSearchRootDiagnosticsSnapshot(
             recentPublicationLimit: Int = 8
         ) async -> [ReadSearchRootDiagnosticsSnapshot] {
@@ -589,6 +931,8 @@ actor WorkspaceFileContextStore {
                     rootKind: Self.rootKindDiagnosticLabel(state.root.kind),
                     crawlCount: rootCrawlCountsByRootID[rootID] ?? 0,
                     watcherActive: watcherActive,
+                    explicitWatcherDemand: explicitWatcherDemandRootIDs.contains(rootID),
+                    sessionWorktreeOwnerCount: sessionWorktreeOwnerCount(rootID: rootID, lifetimeID: state.lifetimeID),
                     ingress: publisherIngressCoordinator.debugSnapshot(rootID: rootID),
                     barrier: scopedIngressBarrierDebugSnapshot(rootID: rootID),
                     freshness: freshness,
@@ -611,7 +955,17 @@ actor WorkspaceFileContextStore {
                     rebuildCount: catalogRebuildCount,
                     filterMicroseconds: catalogRebuildFilterMicroseconds,
                     sortMicroseconds: catalogRebuildSortMicroseconds,
+                    fileSortMicroseconds: catalogRebuildFileSortMicroseconds,
+                    folderSortMicroseconds: catalogRebuildFolderSortMicroseconds,
+                    sortResidualMicroseconds: catalogRebuildSortResidualMicroseconds,
+                    sortReconciliationDeltaMicroseconds: catalogRebuildSortReconciliationDeltaMicroseconds,
+                    sortInvocationCount: catalogRebuildSortInvocationCount,
+                    sortFileInputCount: catalogRebuildSortFileInputCount,
+                    sortFolderInputCount: catalogRebuildSortFolderInputCount,
                     materializationMicroseconds: catalogRebuildMaterializationMicroseconds,
+                    pathIndexKeyMicroseconds: catalogRebuildPathIndexKeyMicroseconds,
+                    pathIndexConstructionMicroseconds: catalogRebuildPathIndexConstructionMicroseconds,
+                    compositionCacheResidualMicroseconds: catalogRebuildCompositionCacheResidualMicroseconds,
                     totalMicroseconds: catalogRebuildTotalMicroseconds,
                     lastFileCount: catalogRebuildLastFileCount,
                     lastRootCount: catalogRebuildLastRootCount
@@ -642,7 +996,17 @@ actor WorkspaceFileContextStore {
         private func recordCatalogRebuild(
             filterMicroseconds: UInt64,
             sortMicroseconds: UInt64,
+            fileSortMicroseconds: UInt64,
+            folderSortMicroseconds: UInt64,
+            sortResidualMicroseconds: UInt64,
+            sortReconciliationDeltaMicroseconds: Int64,
+            sortInvocationCount: Int,
+            sortFileInputCount: Int,
+            sortFolderInputCount: Int,
             materializationMicroseconds: UInt64,
+            pathIndexKeyMicroseconds: UInt64,
+            pathIndexConstructionMicroseconds: UInt64,
+            compositionCacheResidualMicroseconds: UInt64,
             totalMicroseconds: UInt64,
             fileCount: Int,
             rootCount: Int
@@ -650,7 +1014,17 @@ actor WorkspaceFileContextStore {
             catalogRebuildCount += 1
             catalogRebuildFilterMicroseconds &+= filterMicroseconds
             catalogRebuildSortMicroseconds &+= sortMicroseconds
+            catalogRebuildFileSortMicroseconds &+= fileSortMicroseconds
+            catalogRebuildFolderSortMicroseconds &+= folderSortMicroseconds
+            catalogRebuildSortResidualMicroseconds &+= sortResidualMicroseconds
+            catalogRebuildSortReconciliationDeltaMicroseconds += sortReconciliationDeltaMicroseconds
+            catalogRebuildSortInvocationCount += sortInvocationCount
+            catalogRebuildSortFileInputCount += sortFileInputCount
+            catalogRebuildSortFolderInputCount += sortFolderInputCount
             catalogRebuildMaterializationMicroseconds &+= materializationMicroseconds
+            catalogRebuildPathIndexKeyMicroseconds &+= pathIndexKeyMicroseconds
+            catalogRebuildPathIndexConstructionMicroseconds &+= pathIndexConstructionMicroseconds
+            catalogRebuildCompositionCacheResidualMicroseconds &+= compositionCacheResidualMicroseconds
             catalogRebuildTotalMicroseconds &+= totalMicroseconds
             catalogRebuildLastFileCount = fileCount
             catalogRebuildLastRootCount = rootCount
@@ -664,9 +1038,13 @@ actor WorkspaceFileContextStore {
             let staleDiagnosticRootIDs = Set(rootCatalogShardBuildCountsByRootID.keys).subtracting(trackedRootIDs)
             for rootID in staleDiagnosticRootIDs {
                 rootCatalogShardBuildCountsByRootID.removeValue(forKey: rootID)
+                rootCatalogShardFullPathIndexBuildCountsByRootID.removeValue(forKey: rootID)
+                rootCatalogShardOverlayPathIndexBuildCountsByRootID.removeValue(forKey: rootID)
                 rootCatalogShardPatchCountsByRootID.removeValue(forKey: rootID)
                 rootCatalogShardAuthoritativeRebuildCountsByRootID.removeValue(forKey: rootID)
+                rootCatalogShardFallbackCountsByRootID.removeValue(forKey: rootID)
                 rootCatalogShardFallbackReasonCountsByRootID.removeValue(forKey: rootID)
+                rootCatalogShardFallbackLifetimeIDsByRootID.removeValue(forKey: rootID)
                 rootCatalogShardBackstopCountsByRootID.removeValue(forKey: rootID)
                 rootCatalogShardMaxLiveGenerationCountsByRootID.removeValue(forKey: rootID)
             }
@@ -684,15 +1062,29 @@ actor WorkspaceFileContextStore {
                     liveShards.count
                 )
                 rootCatalogShardMaxLiveGenerationCountsByRootID[rootID] = maxLiveCount
+                let lifetimeID = publishedShard?.key.lifetimeID
+                    ?? rootCatalogShardDeltaStatesByRootID[rootID]?.lifetimeID
+                    ?? rootStatesByID[rootID]?.lifetimeID
+                    ?? rootCatalogShardFallbackLifetimeIDsByRootID[rootID]
+                    ?? liveShards.first?.key.lifetimeID
+                if let lifetimeID {
+                    resetRootCatalogShardFallbackDiagnosticsIfLifetimeChanged(
+                        rootID: rootID,
+                        lifetimeID: lifetimeID
+                    )
+                }
                 return RootCatalogShardGenerationDebugSnapshot(
                     rootID: rootID,
+                    lifetimeID: lifetimeID,
                     publishedTopologyGeneration: publishedShard?.key.topologyGeneration,
                     liveTopologyGenerations: liveGenerations,
                     retainedTopologyGenerations: retainedGenerations,
                     buildCount: rootCatalogShardBuildCountsByRootID[rootID] ?? 0,
-                    pathIndexBuildCount: rootCatalogShardBuildCountsByRootID[rootID] ?? 0,
+                    pathIndexBuildCount: rootCatalogShardFullPathIndexBuildCountsByRootID[rootID] ?? 0,
+                    overlayPathIndexBuildCount: rootCatalogShardOverlayPathIndexBuildCountsByRootID[rootID] ?? 0,
                     patchCount: rootCatalogShardPatchCountsByRootID[rootID] ?? 0,
                     authoritativeRebuildCount: rootCatalogShardAuthoritativeRebuildCountsByRootID[rootID] ?? 0,
+                    fallbackCount: rootCatalogShardFallbackCountsByRootID[rootID] ?? 0,
                     fallbackReasonCounts: rootCatalogShardFallbackReasonCountsByRootID[rootID] ?? [:],
                     lastAppliedIndexGeneration: rootCatalogShardDeltaStatesByRootID[rootID]?.lastAppliedIndexGeneration,
                     deltaStateDirty: rootCatalogShardDeltaStatesByRootID[rootID]?.isDirty ?? false,
@@ -703,9 +1095,12 @@ actor WorkspaceFileContextStore {
             return RootCatalogShardDebugSnapshot(
                 liveGenerationCapPerRoot: Self.maxLiveRootCatalogShardGenerationsPerRoot,
                 maxPatchLogicalMutationCount: Self.maxRootCatalogShardPatchLogicalMutationCount,
+                maxPathIndexOverlayChangedFileCount: WorkspaceSearchRootPathIndex.maxOverlayChangedFileCount,
                 publishedShardCount: publishedRootCatalogShardsByRootID.count,
                 totalBuildCount: rootCatalogShardBuildCountsByRootID.values.reduce(0, +),
                 totalBackstopCount: rootCatalogShardBackstopCountsByRootID.values.reduce(0, +),
+                singleShardCompositionReuseCount: rootCatalogShardSingleShardCompositionReuseCount,
+                genericMergeElementVisitCount: rootCatalogShardGenericMergeElementVisitCount,
                 shadowComparisonCount: rootCatalogShardShadowComparisonCount,
                 shadowMismatchCount: rootCatalogShardShadowMismatchCount,
                 lastShadowByteCount: rootCatalogShardLastShadowByteCount,
@@ -730,8 +1125,12 @@ actor WorkspaceFileContextStore {
                 "visible_workspace_plus_git_data"
             case .allLoaded:
                 "all_loaded"
+            case .allLoadedExcludingGitData:
+                "all_loaded_excluding_git_data"
             case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
                 "session_bound_workspace(logical=\(logicalRootPaths.sorted().joined(separator: ","));physical=\(physicalRootPaths.sorted().joined(separator: ",")))"
+            case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+                "validated_session_bound_workspace(logical=\(canonicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ","));physical=\(physicalRoots.map(\.standardizedFullPath).sorted().joined(separator: ",")))"
             }
         }
 
@@ -897,6 +1296,12 @@ actor WorkspaceFileContextStore {
             await storeBackedSearchLane.setPermitAcquiredHandlerForTesting(handler)
         }
 
+        func setStoreEditDeferredPublicationDidRegisterHandlerForTesting(
+            _ handler: (@Sendable (UUID, String) async -> Void)?
+        ) {
+            storeEditDeferredPublicationDidRegisterHandler = handler
+        }
+
         func setSearchContentReadChunkHandlerForTesting(
             rootID: UUID,
             _ handler: (@Sendable (String) async -> Void)?
@@ -954,7 +1359,7 @@ actor WorkspaceFileContextStore {
         let files: [WorkspaceFileRecord]
         let folders: [WorkspaceFolderRecord]
         let entries: [WorkspaceSearchCatalogEntry]
-        let pathSearchIndex: WorkspaceSearchRootPathIndex
+        let pathSearchIndex: WorkspaceSearchRootPathIndex?
         let appliedIndexGeneration: UInt64
 
         var folderCount: Int {
@@ -967,6 +1372,7 @@ actor WorkspaceFileContextStore {
             files: [WorkspaceFileRecord],
             folders: [WorkspaceFolderRecord],
             entries: [WorkspaceSearchCatalogEntry],
+            pathSearchIndex: WorkspaceSearchRootPathIndex?,
             appliedIndexGeneration: UInt64
         ) {
             self.key = key
@@ -974,15 +1380,7 @@ actor WorkspaceFileContextStore {
             self.files = files
             self.folders = folders
             self.entries = entries
-            pathSearchIndex = WorkspaceSearchRootPathIndex(
-                identity: WorkspaceSearchRootPathIndexIdentity(
-                    rootID: key.rootID,
-                    lifetimeID: key.lifetimeID,
-                    topologyGeneration: key.topologyGeneration
-                ),
-                rootPath: root.standardizedFullPath,
-                entries: entries
-            )
+            self.pathSearchIndex = pathSearchIndex
             self.appliedIndexGeneration = appliedIndexGeneration
         }
     }
@@ -1010,29 +1408,20 @@ actor WorkspaceFileContextStore {
         let lifetimeID: UUID
         var lastAppliedIndexGeneration: UInt64
         var isDirty: Bool
-    }
-
-    private enum RootCatalogShardFallbackReason: String {
-        case missingShard = "missing_shard"
-        case generationGap = "generation_gap"
-        case generationOverflow = "generation_overflow"
-        case fullResync = "full_resync"
-        case dirtyRecovery = "dirty_recovery"
-        case thresholdExceeded = "threshold_exceeded"
-        case unsafeAmbiguity = "unsafe_ambiguity"
-        case unload
-        case retentionBackstop = "retention_backstop"
+        let capability: WorkspaceSearchCatalogAccessRequirement
     }
 
     private enum RootCatalogShardBuildKind {
         case patch
         case authoritative
+        case promotion
     }
 
     private struct RootCatalogShardBuilderOutput {
         let files: [WorkspaceFileRecord]
         let folders: [WorkspaceFolderRecord]
         let logicalMutationCount: Int
+        let pathIndexChangedFileIDs: Set<UUID>
     }
 
     private struct SearchCatalogRootDependency: Hashable {
@@ -1053,6 +1442,7 @@ actor WorkspaceFileContextStore {
 
     private struct SearchCatalogSnapshotCacheEntry {
         let validationToken: SearchCatalogSnapshotValidationToken
+        let capability: WorkspaceSearchCatalogAccessRequirement
         let snapshot: WorkspaceSearchCatalogSnapshot
         var lastAccessSequence: UInt64
     }
@@ -1062,6 +1452,12 @@ actor WorkspaceFileContextStore {
         let generation: UInt64
     }
 
+    private struct StaticPathMatchSnapshotCacheEntry {
+        let snapshot: StaticPathMatchData
+        var lastAccessSequence: UInt64
+    }
+
+    private let sessionRootLifetimeClock = WorkspaceSessionRootLifetimeClock()
     private var rootStatesByID: [UUID: RootState] = [:]
     private var rootIDsByStandardizedPath: [String: UUID] = [:]
     private var foldersByID: [UUID: WorkspaceFolderRecord] = [:]
@@ -1073,7 +1469,7 @@ actor WorkspaceFileContextStore {
     private var rootLoadOrder: [UUID] = []
     private var unloadingRootPaths: Set<String> = []
     private var unloadWaitersByRootPath: [String: [UUID: CheckedContinuation<Void, Error>]] = [:]
-    private var rootLoadTasksByPath: [String: Task<WorkspaceRootRecord, Error>] = [:]
+    private var rootLoadFlightsByPath: [String: RootLoadFlight] = [:]
     private var rootLoadConfigurationsByPath: [String: RootLoadConfiguration] = [:]
     private var catalogGenerationsByScope: [WorkspaceLookupRootScope: UInt64] = [
         .visibleWorkspace: 0,
@@ -1089,6 +1485,8 @@ actor WorkspaceFileContextStore {
     private var rootCatalogShardWeakReferencesByRootID: [UUID: [WeakRootCatalogShardReference]] = [:]
     private var rootCatalogShardDeltaStatesByRootID: [UUID: RootCatalogShardDeltaState] = [:]
     private var pathMatchSnapshotIdentitiesByScope: [WorkspaceLookupRootScope: PathMatchCacheIdentity] = [:]
+    private var staticPathMatchSnapshotsByScope: [WorkspaceLookupRootScope: StaticPathMatchSnapshotCacheEntry] = [:]
+    private var nextStaticPathMatchSnapshotAccessSequence: UInt64 = 0
     private let storeBackedSearchLane: StoreBackedWorkspaceSearchLane
     private let searchDecodedContentCache = WorkspaceSearchDecodedContentCache()
     private let interactiveReadCache = WorkspaceInteractiveReadCache()
@@ -1101,6 +1499,7 @@ actor WorkspaceFileContextStore {
     private var nextSearchContentInvalidationEpoch: UInt64 = 0
     private var activePublicationInvalidationBatch: PublicationInvalidationBatch?
     private static let maxCachedSearchCatalogSnapshotScopes = 16
+    private static let maxCachedStaticPathMatchSnapshotScopes = 16
     /// Covers overlapping readers/index builds while bounding retained full-root arrays. At the cap,
     /// callers receive an authoritative uncached rebuild until older ARC leases drain.
     private static let maxLiveRootCatalogShardGenerationsPerRoot = 8
@@ -1118,14 +1517,32 @@ actor WorkspaceFileContextStore {
     )
     private var codemapSnapshotsByFileID: [UUID: WorkspaceCodemapSnapshot] = [:]
     private var codemapFileIDsByRootID: [UUID: Set<UUID>] = [:]
+    private var pendingCodemapRepairFileIDs = Set<UUID>()
     private var initializingSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var initializedSessionWorktreeCodemapRootIDs = Set<UUID>()
     private var cachedCodemapFileAPIAggregate: WorkspaceCodemapFileAPIAggregate?
+    private var cachedCodemapFileAPIAggregatesByScope: [WorkspaceLookupRootScope: WorkspaceCodemapFileAPIAggregate] = [:]
     private var codemapUpdateContinuations: [UUID: AsyncStream<WorkspaceCodemapUpdateEvent>.Continuation] = [:]
     private var fileSystemDeltaContinuations: [UUID: AsyncStream<WorkspaceFileSystemDeltaEvent>.Continuation] = [:]
     private var appliedIndexContinuations: [UUID: AsyncStream<WorkspaceAppliedIndexBatchEvent>.Continuation] = [:]
     private var appliedIndexGenerationsByRootID: [UUID: UInt64] = [:]
-    private var watcherCancellablesByRootID: [UUID: AnyCancellable] = [:]
+    private var sliceRebaseSourceEntries: [SliceRebaseSourceCacheKey: SliceRebaseSourceCacheEntry] = [:]
+    private var sliceRebaseSourceEstimatedBytes = 0
+    private var sliceRebaseSourceAccessOrdinal: UInt64 = 0
+    private static let maxSliceRebaseSourceEntryCount = 64
+    private static let maxSliceRebaseSourceTotalBytes = 32 * 1024 * 1024
+    private static let maxSliceRebaseSourceEntryBytes = 8 * 1024 * 1024
+    private var watcherPublisherAttachmentsByKey: [WatcherInfrastructureKey: WatcherPublisherAttachment] = [:]
+    private var watcherInfrastructureFlightsByKey: [WatcherInfrastructureKey: WatcherInfrastructureFlight] = [:]
+    private var explicitWatcherDemandRootIDs = Set<UUID>()
+    private var explicitWatcherDemandGenerationByKey: [WatcherInfrastructureKey: UInt64] = [:]
+    private var latestSessionWorktreeOwnershipGenerationByOwnerID: [UUID: UInt64] = [:]
+    private var installedSessionWorktreeOwnershipTokenByOwnerID: [UUID: WorkspaceSessionWorktreeOwnershipToken] = [:]
+    private var sessionWorktreeOwnershipRecordsByToken: [WorkspaceSessionWorktreeOwnershipToken: SessionWorktreeOwnershipRecord] = [:]
+    private var sessionWorktreeOwnershipTokensByRootLifetime: [SessionWorktreeRootLifetimeKey: Set<WorkspaceSessionWorktreeOwnershipToken>] = [:]
+    private var sessionWorktreeReservationTokensByStandardizedPath: [String: Set<WorkspaceSessionWorktreeOwnershipToken>] = [:]
+    private var sessionWorktreeReservedPathsByToken: [WorkspaceSessionWorktreeOwnershipToken: Set<String>] = [:]
+    private var sessionWorktreeReservationLoadFlightsByToken: [WorkspaceSessionWorktreeOwnershipToken: [String: RootLoadFlight]] = [:]
     private let publisherIngressCoordinator: WorkspaceFileSystemIngressCoordinator
     private let unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy
     private var scopedIngressBarrierFlightStatesByRootID: [UUID: ScopedIngressBarrierRootFlightState] = [:]
@@ -1136,17 +1553,20 @@ actor WorkspaceFileContextStore {
     private var codeScanResultTask: Task<Void, Never>?
     #if DEBUG
         private let debugNowNanoseconds: @Sendable () -> UInt64
+        private let isCatalogShardShadowValidationEnabled: Bool
     #endif
 
     #if DEBUG
         init(
             searchLaneConfiguration: StoreBackedWorkspaceSearchLane.Configuration = .production,
             debugNowNanoseconds: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
-            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production
+            unloadTerminationPolicy: WorkspaceRootUnloadTerminationPolicy = .production,
+            enableCatalogShardShadowValidation: Bool = true
         ) {
             storeBackedSearchLane = StoreBackedWorkspaceSearchLane(configuration: searchLaneConfiguration)
             self.debugNowNanoseconds = debugNowNanoseconds
             self.unloadTerminationPolicy = unloadTerminationPolicy
+            isCatalogShardShadowValidationEnabled = enableCatalogShardShadowValidation
             publisherIngressCoordinator = WorkspaceFileSystemIngressCoordinator(debugNowNanoseconds: debugNowNanoseconds)
             #if os(macOS)
                 let source = DispatchSource.makeMemoryPressureSource(
@@ -1187,8 +1607,11 @@ actor WorkspaceFileContextStore {
             searchContentMemoryPressureSource.cancel()
         #endif
         codeScanResultTask?.cancel()
-        for cancellable in watcherCancellablesByRootID.values {
-            cancellable.cancel()
+        for attachment in watcherPublisherAttachmentsByKey.values {
+            attachment.cancellable.cancel()
+        }
+        for flight in watcherInfrastructureFlightsByKey.values {
+            flight.task.cancel()
         }
         for continuation in codemapUpdateContinuations.values {
             continuation.finish()
@@ -1249,30 +1672,146 @@ actor WorkspaceFileContextStore {
 
     func startWatchingRoot(id rootID: UUID) async throws {
         let state = try state(for: rootID)
-        if watcherCancellablesByRootID[rootID] != nil {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
-            return
-        }
-        guard try await attachPublisherIngress(state: state, rootID: rootID) else { return }
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        let demandGeneration = (explicitWatcherDemandGenerationByKey[key] ?? 0) &+ 1
+        explicitWatcherDemandGenerationByKey[key] = demandGeneration
+        explicitWatcherDemandRootIDs.insert(rootID)
         do {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
+            try await reconcileAggregateWatcherDemand(rootID: rootID)
         } catch {
-            watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-            publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
-            try? await reconcileWatcherServiceState(state.service, rootID: rootID)
-            await waitForCurrentPublisherIngress(rootIDs: [rootID])
+            if explicitWatcherDemandGenerationByKey[key] == demandGeneration,
+               isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: key.lifetimeID)
+            {
+                explicitWatcherDemandRootIDs.remove(rootID)
+                try? await reconcileAggregateWatcherDemand(rootID: rootID)
+            }
             throw error
         }
     }
 
-    private func attachPublisherIngress(state: RootState, rootID: UUID) async throws -> Bool {
+    private func ensureWatcherInfrastructure(state: RootState, rootID: UUID) async throws {
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: key.lifetimeID) else {
+            throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(state.root.standardizedFullPath)
+        }
+        if let flight = watcherInfrastructureFlightsByKey[key] {
+            #if DEBUG
+                if let watcherInfrastructureDidJoinFlightHandler {
+                    await watcherInfrastructureDidJoinFlightHandler(rootID, key.lifetimeID)
+                }
+            #endif
+            try await awaitWatcherInfrastructureFlight(flight)
+            return
+        }
+
+        let flightID = UUID()
+        let rootPath = state.root.standardizedFullPath
+        let task = Task { [weak self] in
+            guard let self else { throw CancellationError() }
+            do {
+                try await performWatcherInfrastructureSetup(key: key, rootPath: rootPath)
+                await clearWatcherInfrastructureFlight(key: key, expectedID: flightID)
+            } catch {
+                await clearWatcherInfrastructureFlight(key: key, expectedID: flightID)
+                throw error
+            }
+        }
+        let flight = WatcherInfrastructureFlight(id: flightID, task: task)
+        watcherInfrastructureFlightsByKey[key] = flight
+        try await awaitWatcherInfrastructureFlight(flight)
+    }
+
+    private func awaitWatcherInfrastructureFlight(_ flight: WatcherInfrastructureFlight) async throws {
+        let race = WatcherInfrastructureTaskWaitRace()
+        Task {
+            let result = await flight.task.result
+            race.resolve(result)
+        }
+        try await withTaskCancellationHandler {
+            try await race.value()
+        } onCancel: {
+            race.cancel()
+        }
+    }
+
+    private func clearWatcherInfrastructureFlight(key: WatcherInfrastructureKey, expectedID: UUID) {
+        guard watcherInfrastructureFlightsByKey[key]?.id == expectedID else { return }
+        watcherInfrastructureFlightsByKey.removeValue(forKey: key)
+    }
+
+    private func performWatcherInfrastructureSetup(
+        key: WatcherInfrastructureKey,
+        rootPath: String
+    ) async throws {
+        while true {
+            guard let state = rootStatesByID[key.rootID],
+                  state.lifetimeID == key.lifetimeID,
+                  hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+            else {
+                throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+            }
+
+            let subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+            if let attachment = watcherPublisherAttachmentsByKey[key],
+               publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
+            {
+                subscription = attachment.subscription
+            } else {
+                watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
+                guard let attachedSubscription = try await attachPublisherIngress(
+                    state: state,
+                    key: key
+                ) else {
+                    guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
+                          hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+                    else {
+                        throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+                    }
+                    continue
+                }
+                subscription = attachedSubscription
+            }
+
+            do {
+                try await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+            } catch {
+                removeWatcherPublisherAttachment(key: key, subscription: subscription)
+                if isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) {
+                    try? await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                    await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+                }
+                throw error
+            }
+
+            guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
+                  hasAggregateWatcherDemand(rootID: key.rootID, lifetimeID: key.lifetimeID)
+            else {
+                removeWatcherPublisherAttachment(key: key, subscription: subscription)
+                if isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) {
+                    try? await reconcileWatcherServiceState(state.service, rootID: key.rootID)
+                    await waitForCurrentPublisherIngress(rootIDs: [key.rootID])
+                }
+                throw WorkspaceSessionWorktreeOwnershipError.unavailableRoot(rootPath)
+            }
+            guard watcherPublisherAttachmentsByKey[key]?.subscription == subscription,
+                  publisherIngressCoordinator.isPublisherIngressOpen(subscription)
+            else {
+                continue
+            }
+            return
+        }
+    }
+
+    private func attachPublisherIngress(
+        state: RootState,
+        key: WatcherInfrastructureKey
+    ) async throws -> WorkspaceFileSystemIngressCoordinator.Subscription? {
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID) else { return nil }
         let root = state.root
-        let lifetimeID = state.lifetimeID
         let diagnosticRootToken = state.service.diagnosticRootToken
         let publisherIngressCoordinator = publisherIngressCoordinator
-        let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: rootID) { [weak self] publication, publicationCorrelation in
+        let subscription = publisherIngressCoordinator.openPublisherIngress(rootID: key.rootID) { [weak self] publication, publicationCorrelation in
             EditFlowPerf.lifecycleEvent(
                 EditFlowPerf.Lifecycle.WorkspaceIngress.storeSinkBegan,
                 correlation: publicationCorrelation,
@@ -1286,17 +1825,22 @@ actor WorkspaceFileContextStore {
             await self?.handleObservedPublisherFileSystemPublication(
                 publication,
                 root: root,
-                expectedLifetimeID: lifetimeID,
+                expectedLifetimeID: key.lifetimeID,
                 publicationCorrelation: publicationCorrelation,
                 diagnosticRootToken: diagnosticRootToken
             )
         }
+        #if DEBUG
+            if let watcherPublisherIngressDidOpenHandler {
+                await watcherPublisherIngressDidOpenHandler(key.rootID, key.lifetimeID)
+            }
+        #endif
         let publisher = await state.service.publisherForChanges()
-        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            return false
+            publisherIngressCoordinator.closePublisherIngress(subscription)
+            return nil
         }
         let cancellable = publisher.sink { publication in
             #if DEBUG || EDIT_FLOW_PERF
@@ -1320,33 +1864,535 @@ actor WorkspaceFileContextStore {
                 lifecycleCorrelation: publicationCorrelation
             )
         }
-        guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: lifetimeID),
+        guard isRootLifetimeCurrent(rootID: key.rootID, expectedLifetimeID: key.lifetimeID),
               publisherIngressCoordinator.isPublisherIngressOpen(subscription)
         else {
             cancellable.cancel()
-            try await reconcileWatcherServiceState(state.service, rootID: rootID)
-            return false
+            publisherIngressCoordinator.closePublisherIngress(subscription)
+            return nil
         }
-        watcherCancellablesByRootID[rootID] = cancellable
-        return true
+        watcherPublisherAttachmentsByKey[key] = WatcherPublisherAttachment(
+            subscription: subscription,
+            cancellable: cancellable
+        )
+        return subscription
+    }
+
+    private func removeWatcherPublisherAttachment(
+        key: WatcherInfrastructureKey,
+        subscription: WorkspaceFileSystemIngressCoordinator.Subscription
+    ) {
+        if watcherPublisherAttachmentsByKey[key]?.subscription == subscription {
+            watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
+        }
+        publisherIngressCoordinator.closePublisherIngress(subscription)
     }
 
     #if DEBUG
         func attachPublisherIngressWithoutStartingWatcherForTesting(rootID: UUID) async throws -> Bool {
-            if watcherCancellablesByRootID[rootID] != nil { return true }
             let state = try state(for: rootID)
-            return try await attachPublisherIngress(state: state, rootID: rootID)
+            let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+            if let attachment = watcherPublisherAttachmentsByKey[key],
+               publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
+            {
+                return true
+            }
+            return try await attachPublisherIngress(state: state, key: key) != nil
         }
     #endif
 
     func stopWatchingRoot(id rootID: UUID) async {
-        watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
-        publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        if let state = rootStatesByID[rootID] {
+            let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+            explicitWatcherDemandGenerationByKey[key, default: 0] &+= 1
+        }
+        explicitWatcherDemandRootIDs.remove(rootID)
+        try? await reconcileAggregateWatcherDemand(rootID: rootID)
+    }
+
+    func prepareSessionWorktreeOwnership(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: [String]
+    ) async throws -> WorkspaceSessionWorktreeOwnershipPreparation {
+        let standardizedPaths = Array(Set(physicalRootPaths.map {
+            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+        })).sorted()
+        if let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+           let installedRecord = sessionWorktreeOwnershipRecordsByToken[installedToken],
+           installedRecord.bindingFingerprint == bindingFingerprint,
+           installedRecord.roots.map(\.standardizedPhysicalPath).sorted() == standardizedPaths,
+           sessionWorktreeOwnershipRecordIsCurrent(installedRecord)
+        {
+            return WorkspaceSessionWorktreeOwnershipPreparation(
+                token: installedToken,
+                bindingFingerprint: bindingFingerprint,
+                roots: installedRecord.roots,
+                reusesInstalledOwnership: true
+            )
+        }
+
+        let generation = (latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] ?? 0) &+ 1
+        latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] = generation
+        let token = WorkspaceSessionWorktreeOwnershipToken(ownerID: ownerID, generation: generation)
+        let installedToken = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID]
+        let supersededTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
+            $0.ownerID == ownerID && $0 != installedToken
+        }
+        var supersededResources = SessionWorktreeOwnershipRemoval()
+        for supersededToken in supersededTokens {
+            supersededResources.append(removeSessionWorktreeOwnershipToken(supersededToken))
+        }
+        await cleanupOrphanedSessionWorktreeResources(supersededResources)
+        guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+            bindingFingerprint: bindingFingerprint,
+            roots: []
+        )
+        reserveSessionWorktreePaths(standardizedPaths, for: token)
+        do {
+            var preparedRoots: [WorkspaceSessionWorktreeOwnedRoot] = []
+            for path in standardizedPaths {
+                try Task.checkCancellation()
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation else {
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
+                let root = try await loadRoot(
+                    path: path,
+                    kind: .sessionWorktree,
+                    respectGitignore: true,
+                    respectRepoIgnore: true,
+                    respectCursorignore: true,
+                    sessionWorktreeReservationToken: token
+                )
+                try Task.checkCancellation()
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
+                      let state = rootStatesByID[root.id],
+                      state.root.kind == .sessionWorktree,
+                      state.root.standardizedFullPath == path
+                else {
+                    if latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] != generation {
+                        throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                    }
+                    throw WorkspaceSessionWorktreeOwnershipError.invalidRootKind(path)
+                }
+                let ownedRoot = WorkspaceSessionWorktreeOwnedRoot(
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    standardizedPhysicalPath: path
+                )
+                preparedRoots.append(ownedRoot)
+                try convertSessionWorktreeReservationToClaim(
+                    token: token,
+                    bindingFingerprint: bindingFingerprint,
+                    preparedRoots: preparedRoots,
+                    ownedRoot: ownedRoot
+                )
+                try await reconcileAggregateWatcherDemand(rootID: root.id)
+                try Task.checkCancellation()
+                guard latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID] == generation,
+                      isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: state.lifetimeID)
+                else {
+                    throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+                }
+            }
+            return WorkspaceSessionWorktreeOwnershipPreparation(
+                token: token,
+                bindingFingerprint: bindingFingerprint,
+                roots: preparedRoots,
+                reusesInstalledOwnership: false
+            )
+        } catch {
+            let resources = removeSessionWorktreeOwnershipToken(token)
+            await cleanupOrphanedSessionWorktreeResources(resources)
+            throw error
+        }
+    }
+
+    @discardableResult
+    func commitSessionWorktreeOwnership(
+        _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
+    ) async throws -> [WorkspaceSessionWorktreeOwnedRoot] {
+        if preparation.reusesInstalledOwnership {
+            guard installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] == preparation.token,
+                  let record = sessionWorktreeOwnershipRecordsByToken[preparation.token],
+                  sessionWorktreeOwnershipRecordIsCurrent(record)
+            else {
+                throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+            }
+            return record.roots
+        }
+        guard latestSessionWorktreeOwnershipGenerationByOwnerID[preparation.token.ownerID] == preparation.token.generation,
+              let record = sessionWorktreeOwnershipRecordsByToken[preparation.token],
+              record.bindingFingerprint == preparation.bindingFingerprint,
+              record.roots == preparation.roots,
+              sessionWorktreeOwnershipRecordIsCurrent(record)
+        else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        if record.roots.isEmpty {
+            installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: preparation.token.ownerID)
+            var releasedResources = removeSessionWorktreeOwnershipToken(preparation.token)
+            let previousTokens = sessionWorktreeOwnershipRecordsByToken.keys.filter {
+                $0.ownerID == preparation.token.ownerID
+            }
+            for previousToken in previousTokens {
+                releasedResources.append(removeSessionWorktreeOwnershipToken(previousToken))
+            }
+            scheduleOrphanedSessionWorktreeResourceCleanup(releasedResources)
+            return []
+        }
+
+        let previousToken = installedSessionWorktreeOwnershipTokenByOwnerID.updateValue(
+            preparation.token,
+            forKey: preparation.token.ownerID
+        )
+        var previousResources = SessionWorktreeOwnershipRemoval()
+        if let previousToken, previousToken != preparation.token {
+            previousResources = removeSessionWorktreeOwnershipToken(previousToken)
+        }
+        scheduleOrphanedSessionWorktreeResourceCleanup(previousResources)
+        return record.roots
+    }
+
+    func abortSessionWorktreeOwnership(
+        _ preparation: WorkspaceSessionWorktreeOwnershipPreparation
+    ) async {
+        guard !preparation.reusesInstalledOwnership,
+              installedSessionWorktreeOwnershipTokenByOwnerID[preparation.token.ownerID] != preparation.token
+        else { return }
+        let resources = removeSessionWorktreeOwnershipToken(preparation.token)
+        await cleanupOrphanedSessionWorktreeResources(resources)
+    }
+
+    func releaseSessionWorktreeOwnership(ownerID: UUID) async {
+        latestSessionWorktreeOwnershipGenerationByOwnerID[ownerID, default: 0] &+= 1
+        installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: ownerID)
+        let tokens = sessionWorktreeOwnershipRecordsByToken.keys.filter { $0.ownerID == ownerID }
+        var resources = SessionWorktreeOwnershipRemoval()
+        for token in tokens {
+            resources.append(removeSessionWorktreeOwnershipToken(token))
+        }
+        await cleanupOrphanedSessionWorktreeResources(resources)
+    }
+
+    func sessionWorktreeOwnershipCovers(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: Set<String>
+    ) -> Bool {
+        guard let token = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+              let record = sessionWorktreeOwnershipRecordsByToken[token],
+              record.bindingFingerprint == bindingFingerprint,
+              Set(record.roots.map(\.standardizedPhysicalPath)) == Set(physicalRootPaths.map {
+                  StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+              }),
+              sessionWorktreeOwnershipRecordIsCurrent(record)
+        else { return false }
+        return true
+    }
+
+    func installedSessionWorktreeRoots(
+        ownerID: UUID,
+        bindingFingerprint: String,
+        physicalRootPaths: Set<String>
+    ) -> [WorkspaceRootRecord]? {
+        guard sessionWorktreeOwnershipCovers(
+            ownerID: ownerID,
+            bindingFingerprint: bindingFingerprint,
+            physicalRootPaths: physicalRootPaths
+        ),
+            let token = installedSessionWorktreeOwnershipTokenByOwnerID[ownerID],
+            let record = sessionWorktreeOwnershipRecordsByToken[token]
+        else { return nil }
+        return record.roots.compactMap { rootStatesByID[$0.rootID]?.root }
+    }
+
+    func validateSessionRootAuthorization(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) -> WorkspaceSessionRootAuthorizationMismatch? {
+        sessionRootAuthorizationMismatch(authorization)
+    }
+
+    private func sessionRootAuthorizationMismatch(
+        _ authorization: WorkspaceSessionRootAuthorization
+    ) -> WorkspaceSessionRootAuthorizationMismatch? {
+        guard let token = installedSessionWorktreeOwnershipTokenByOwnerID[authorization.sessionID] else {
+            return .token
+        }
+        guard token.generation == authorization.ownershipGeneration else {
+            return .generation
+        }
+        guard let record = sessionWorktreeOwnershipRecordsByToken[token] else {
+            return .token
+        }
+        guard sessionWorktreeOwnershipRecordIsCurrent(record) else {
+            return .rootClaim
+        }
+        guard let ownedRoot = record.roots.first(where: { $0.rootID == authorization.root.id }) else {
+            return .rootID
+        }
+        guard ownedRoot.lifetimeID == authorization.lifetimeID else {
+            return .lifetime
+        }
+        guard ownedRoot.standardizedPhysicalPath == authorization.root.standardizedFullPath else {
+            return .path
+        }
+        guard let state = rootStatesByID[authorization.root.id] else {
+            return .rootID
+        }
+        guard state.lifetimeID == authorization.lifetimeID else {
+            return .lifetime
+        }
+        guard state.root.kind == .sessionWorktree else {
+            return .kind
+        }
+        guard state.root.standardizedFullPath == authorization.root.standardizedFullPath else {
+            return .path
+        }
+        let lifetimeKey = SessionWorktreeRootLifetimeKey(
+            rootID: authorization.root.id,
+            lifetimeID: authorization.lifetimeID
+        )
+        guard sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey]?.contains(token) == true else {
+            return .rootClaim
+        }
+        return nil
+    }
+
+    #if DEBUG
+        struct SessionWorktreeOwnershipDebugSnapshot: Equatable {
+            let installedOwnerCount: Int
+            let provisionalOwnerCount: Int
+            let rootClaimCount: Int
+            let pathReservationCount: Int
+            let explicitWatcherDemandCount: Int
+        }
+
+        func sessionWorktreeOwnershipDebugSnapshotForTesting() -> SessionWorktreeOwnershipDebugSnapshot {
+            let installedTokens = Set(installedSessionWorktreeOwnershipTokenByOwnerID.values)
+            return SessionWorktreeOwnershipDebugSnapshot(
+                installedOwnerCount: installedTokens.count,
+                provisionalOwnerCount: sessionWorktreeOwnershipRecordsByToken.keys.count(where: { !installedTokens.contains($0) }),
+                rootClaimCount: sessionWorktreeOwnershipTokensByRootLifetime.values.reduce(0) { $0 + $1.count },
+                pathReservationCount: sessionWorktreeReservationTokensByStandardizedPath.values.reduce(0) { $0 + $1.count },
+                explicitWatcherDemandCount: explicitWatcherDemandRootIDs.count
+            )
+        }
+    #endif
+
+    private func sessionWorktreeOwnershipRecordIsCurrent(_ record: SessionWorktreeOwnershipRecord) -> Bool {
+        record.roots.allSatisfy { root in
+            let watcherKey = WatcherInfrastructureKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            guard let state = rootStatesByID[root.rootID],
+                  state.lifetimeID == root.lifetimeID,
+                  state.root.kind == .sessionWorktree,
+                  state.root.standardizedFullPath == root.standardizedPhysicalPath,
+                  let attachment = watcherPublisherAttachmentsByKey[watcherKey],
+                  publisherIngressCoordinator.isPublisherIngressOpen(attachment.subscription)
+            else { return false }
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            return sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == false
+        }
+    }
+
+    private func reserveSessionWorktreePaths(
+        _ standardizedPaths: [String],
+        for token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        guard !standardizedPaths.isEmpty else { return }
+        let paths = Set(standardizedPaths)
+        sessionWorktreeReservedPathsByToken[token] = paths
+        for path in paths {
+            sessionWorktreeReservationTokensByStandardizedPath[path, default: []].insert(token)
+        }
+    }
+
+    private func registerSessionWorktreeReservationLoadFlight(
+        _ flight: RootLoadFlight,
+        standardizedPath: String,
+        token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        guard sessionWorktreeReservedPathsByToken[token]?.contains(standardizedPath) == true else { return }
+        sessionWorktreeReservationLoadFlightsByToken[token, default: [:]][standardizedPath] = flight
+    }
+
+    private func convertSessionWorktreeReservationToClaim(
+        token: WorkspaceSessionWorktreeOwnershipToken,
+        bindingFingerprint: String,
+        preparedRoots: [WorkspaceSessionWorktreeOwnedRoot],
+        ownedRoot: WorkspaceSessionWorktreeOwnedRoot
+    ) throws {
+        guard let record = sessionWorktreeOwnershipRecordsByToken[token],
+              record.bindingFingerprint == bindingFingerprint,
+              record.roots == Array(preparedRoots.dropLast()),
+              preparedRoots.last == ownedRoot,
+              sessionWorktreeReservedPathsByToken[token]?.contains(ownedRoot.standardizedPhysicalPath) == true,
+              sessionWorktreeReservationTokensByStandardizedPath[
+                  ownedRoot.standardizedPhysicalPath
+              ]?.contains(token) == true
+        else {
+            throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+        }
+
+        sessionWorktreeOwnershipRecordsByToken[token] = SessionWorktreeOwnershipRecord(
+            bindingFingerprint: bindingFingerprint,
+            roots: preparedRoots
+        )
+        let rootKey = SessionWorktreeRootLifetimeKey(
+            rootID: ownedRoot.rootID,
+            lifetimeID: ownedRoot.lifetimeID
+        )
+        sessionWorktreeOwnershipTokensByRootLifetime[rootKey, default: []].insert(token)
+        removeSessionWorktreeReservation(
+            standardizedPath: ownedRoot.standardizedPhysicalPath,
+            token: token
+        )
+    }
+
+    private func removeSessionWorktreeReservation(
+        standardizedPath: String,
+        token: WorkspaceSessionWorktreeOwnershipToken
+    ) {
+        sessionWorktreeReservationTokensByStandardizedPath[standardizedPath]?.remove(token)
+        if sessionWorktreeReservationTokensByStandardizedPath[standardizedPath]?.isEmpty == true {
+            sessionWorktreeReservationTokensByStandardizedPath.removeValue(forKey: standardizedPath)
+        }
+        sessionWorktreeReservedPathsByToken[token]?.remove(standardizedPath)
+        sessionWorktreeReservationLoadFlightsByToken[token]?.removeValue(forKey: standardizedPath)
+        if sessionWorktreeReservedPathsByToken[token]?.isEmpty == true {
+            sessionWorktreeReservedPathsByToken.removeValue(forKey: token)
+        }
+        if sessionWorktreeReservationLoadFlightsByToken[token]?.isEmpty == true {
+            sessionWorktreeReservationLoadFlightsByToken.removeValue(forKey: token)
+        }
+    }
+
+    private func removeSessionWorktreeOwnershipToken(
+        _ token: WorkspaceSessionWorktreeOwnershipToken
+    ) -> SessionWorktreeOwnershipRemoval {
+        let record = sessionWorktreeOwnershipRecordsByToken.removeValue(forKey: token)
+        let reservedPaths = sessionWorktreeReservedPathsByToken.removeValue(forKey: token) ?? []
+        let reservedLoadFlightsByPath =
+            sessionWorktreeReservationLoadFlightsByToken.removeValue(forKey: token) ?? [:]
+        for path in reservedPaths {
+            sessionWorktreeReservationTokensByStandardizedPath[path]?.remove(token)
+            if sessionWorktreeReservationTokensByStandardizedPath[path]?.isEmpty == true {
+                sessionWorktreeReservationTokensByStandardizedPath.removeValue(forKey: path)
+            }
+        }
+        for root in record?.roots ?? [] {
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            sessionWorktreeOwnershipTokensByRootLifetime[key]?.remove(token)
+            if sessionWorktreeOwnershipTokensByRootLifetime[key]?.isEmpty == true {
+                sessionWorktreeOwnershipTokensByRootLifetime.removeValue(forKey: key)
+            }
+        }
+        return SessionWorktreeOwnershipRemoval(
+            ownedRoots: record?.roots ?? [],
+            reservedLoadFlights: reservedLoadFlightsByPath.compactMap { path, flight in
+                guard reservedPaths.contains(path) else { return nil }
+                return SessionWorktreeReservedLoadFlight(
+                    standardizedPath: path,
+                    flight: flight
+                )
+            }
+        )
+    }
+
+    private func scheduleOrphanedSessionWorktreeResourceCleanup(
+        _ resources: SessionWorktreeOwnershipRemoval
+    ) {
+        guard !resources.ownedRoots.isEmpty || !resources.reservedLoadFlights.isEmpty else { return }
+        Task { await cleanupOrphanedSessionWorktreeResources(resources) }
+    }
+
+    private func cleanupOrphanedSessionWorktreeResources(
+        _ resources: SessionWorktreeOwnershipRemoval
+    ) async {
+        await cleanupOrphanedSessionWorktreeRoots(resources.ownedRoots)
+        scheduleOrphanedSessionWorktreeLoadFlightCleanup(resources.reservedLoadFlights)
+    }
+
+    private func cleanupOrphanedSessionWorktreeRoots(
+        _ roots: [WorkspaceSessionWorktreeOwnedRoot]
+    ) async {
+        var seen = Set<SessionWorktreeRootLifetimeKey>()
+        for root in roots {
+            let key = SessionWorktreeRootLifetimeKey(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            guard seen.insert(key).inserted,
+                  isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
+                  rootStatesByID[root.rootID]?.root.standardizedFullPath == root.standardizedPhysicalPath,
+                  !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID)
+            else { continue }
+            try? await reconcileAggregateWatcherDemand(rootID: root.rootID)
+            guard isRootLifetimeCurrent(rootID: root.rootID, expectedLifetimeID: root.lifetimeID),
+                  !hasAggregateWatcherDemand(rootID: root.rootID, lifetimeID: root.lifetimeID),
+                  rootStatesByID[root.rootID]?.root.kind == .sessionWorktree,
+                  rootStatesByID[root.rootID]?.root.standardizedFullPath == root.standardizedPhysicalPath
+            else { continue }
+            await unloadRoot(id: root.rootID)
+        }
+    }
+
+    private func scheduleOrphanedSessionWorktreeLoadFlightCleanup(
+        _ reservations: [SessionWorktreeReservedLoadFlight]
+    ) {
+        var scheduledFlightIDs = Set<UUID>()
+        for reservation in reservations where scheduledFlightIDs.insert(reservation.flight.id).inserted {
+            let flight = reservation.flight
+            Task { [weak self] in
+                guard let root = try? await flight.task.value,
+                      let identity = flight.completion.identity(),
+                      root.id == identity.rootID
+                else { return }
+                await self?.cleanupOrphanedSessionWorktreeRoots([
+                    WorkspaceSessionWorktreeOwnedRoot(
+                        rootID: identity.rootID,
+                        lifetimeID: identity.lifetimeID,
+                        standardizedPhysicalPath: reservation.standardizedPath
+                    )
+                ])
+            }
+        }
+    }
+
+    private func sessionWorktreeOwnerCount(rootID: UUID, lifetimeID: UUID) -> Int {
+        sessionWorktreeOwnershipTokensByRootLifetime[
+            SessionWorktreeRootLifetimeKey(rootID: rootID, lifetimeID: lifetimeID)
+        ]?.count ?? 0
+    }
+
+    private func hasAggregateWatcherDemand(rootID: UUID, lifetimeID: UUID) -> Bool {
+        let hasPathReservation: Bool = if let state = rootStatesByID[rootID], state.lifetimeID == lifetimeID {
+            sessionWorktreeReservationTokensByStandardizedPath[
+                state.root.standardizedFullPath
+            ]?.isEmpty == false
+        } else {
+            false
+        }
+        return explicitWatcherDemandRootIDs.contains(rootID)
+            || sessionWorktreeOwnerCount(rootID: rootID, lifetimeID: lifetimeID) > 0
+            || hasPathReservation
+    }
+
+    private func reconcileAggregateWatcherDemand(rootID: UUID) async throws {
         guard let state = rootStatesByID[rootID] else {
             await waitForCurrentPublisherIngress(rootIDs: [rootID])
             return
         }
-        try? await reconcileWatcherServiceState(state.service, rootID: rootID)
+        if hasAggregateWatcherDemand(rootID: rootID, lifetimeID: state.lifetimeID) {
+            try await ensureWatcherInfrastructure(state: state, rootID: rootID)
+            return
+        }
+        let key = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+        watcherPublisherAttachmentsByKey.removeValue(forKey: key)?.cancellable.cancel()
+        publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+        try await reconcileWatcherServiceState(state.service, rootID: rootID)
         await waitForCurrentPublisherIngress(rootIDs: [rootID])
     }
 
@@ -1482,6 +2528,22 @@ actor WorkspaceFileContextStore {
             applyAppliedIndexEventToRootCatalogShard(event)
         }
 
+        func recordRootCatalogShardFallbackForTesting(
+            rootID: UUID,
+            lifetimeID: UUID,
+            reason: RootCatalogShardFallbackReason
+        ) {
+            recordRootCatalogShardFallback(
+                rootID: rootID,
+                lifetimeID: lifetimeID,
+                reason: reason
+            )
+        }
+
+        func advanceRootCatalogTopologyGenerationForTesting(rootID: UUID) {
+            catalogGenerationsByRootID[rootID, default: 0] &+= 1
+        }
+
         func replayPublisherFileSystemPublicationForTesting(
             rootID: UUID,
             expectedLifetimeID: UUID,
@@ -1511,6 +2573,13 @@ actor WorkspaceFileContextStore {
             }
         #endif
         guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordPublisherIngress(
+                rootID: root.id,
+                source: publication.source,
+                deltas: publication.deltas
+            )
+        #endif
         if publication.source == .overflowRootRescan || publication.source == .recoveryFullResync {
             await invalidateRetainedSearchContentForRecoveryUncertainty(rootID: root.id)
             guard isRootLifetimeCurrent(rootID: root.id, expectedLifetimeID: expectedLifetimeID) else { return }
@@ -1627,6 +2696,22 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    struct ReadFileAutoSelectionCatalogValidationSnapshot: Equatable {
+        let visibleCatalogGeneration: UInt64
+        let rootScopeCatalogGeneration: UInt64
+        let rootScopeAvailability: WorkspaceLookupRootScopeAvailability
+    }
+
+    func readFileAutoSelectionCatalogValidationSnapshot(
+        rootScope: WorkspaceLookupRootScope
+    ) -> ReadFileAutoSelectionCatalogValidationSnapshot {
+        ReadFileAutoSelectionCatalogValidationSnapshot(
+            visibleCatalogGeneration: scopedSnapshotGeneration(scope: .visibleWorkspace),
+            rootScopeCatalogGeneration: scopedSnapshotGeneration(scope: rootScope),
+            rootScopeAvailability: rootScopeAvailability(rootScope)
+        )
+    }
+
     func catalogGeneration(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> UInt64 {
         scopedSnapshotGeneration(scope: rootScope)
     }
@@ -1661,113 +2746,405 @@ actor WorkspaceFileContextStore {
         )
     }
 
-    func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
-        guard case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths) = rootScope else {
-            return .available
+    func sessionBoundRootScopeValidationSnapshot(
+        _ rootScope: WorkspaceLookupRootScope,
+        expectedPhysicalRoots: [WorkspaceRootRef]
+    ) -> WorkspaceSessionRootLifetimeSnapshot? {
+        guard !expectedPhysicalRoots.isEmpty else { return nil }
+        let expectedPaths = Set(expectedPhysicalRoots.map(\.standardizedFullPath))
+        let requestedMatches: Bool = switch rootScope {
+        case let .sessionBoundWorkspace(_, requestedPhysicalRootPaths):
+            Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            }) == expectedPaths
+        case let .validatedSessionBoundWorkspace(_, requestedPhysicalRoots):
+            requestedPhysicalRoots == Set(expectedPhysicalRoots)
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
+            false
         }
-        let requested = Set(requestedPhysicalRootPaths.map {
-            StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
-        })
-        let missing = requested.filter { path in
-            guard let rootID = rootIDsByStandardizedPath[path],
-                  rootStatesByID[rootID]?.root.kind == .sessionWorktree
-            else { return true }
-            var isDirectory: ObjCBool = false
-            return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
-                !isDirectory.boolValue
-        }.sorted()
+        guard requestedMatches,
+              expectedPhysicalRoots.allSatisfy({ expectedRoot in
+                  guard let currentRoot = rootStatesByID[expectedRoot.id]?.root else { return false }
+                  return currentRoot.kind == .sessionWorktree
+                      && currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+              })
+        else { return nil }
+        guard rootScopeAvailability(rootScope) == .available else { return nil }
+
+        return sessionRootLifetimeClock.snapshot(physicalRootPaths: expectedPaths.sorted())
+    }
+
+    func rootScopeAvailability(_ rootScope: WorkspaceLookupRootScope) -> WorkspaceLookupRootScopeAvailability {
+        let missing: [String]
+        switch rootScope {
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
+            return .available
+        case let .sessionBoundWorkspace(requestedCanonicalRootPaths, requestedPhysicalRootPaths):
+            guard !requestedCanonicalRootPaths.isEmpty || !requestedPhysicalRootPaths.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            let requested = Set(requestedPhysicalRootPaths.map {
+                StandardizedPath.absolute(($0 as NSString).expandingTildeInPath)
+            })
+            missing = requested.filter { path in
+                guard let rootID = rootIDsByStandardizedPath[path],
+                      rootStatesByID[rootID]?.root.kind == .sessionWorktree
+                else { return true }
+                var isDirectory: ObjCBool = false
+                return !FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory) ||
+                    !isDirectory.boolValue
+            }.sorted()
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
+                return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
+            }
+            missing = (
+                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
+                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+            )
+            .compactMap { expectedRoot, expectedKind in
+                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
+                      currentRoot.kind == expectedKind,
+                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
+                else { return expectedRoot.standardizedFullPath }
+                var isDirectory: ObjCBool = false
+                return FileManager.default.fileExists(
+                    atPath: currentRoot.standardizedFullPath,
+                    isDirectory: &isDirectory
+                ) && isDirectory.boolValue ? nil : currentRoot.standardizedFullPath
+            }.sorted()
+        }
         return missing.isEmpty
             ? .available
             : .sessionWorktreeUnavailable(missingPhysicalRootPaths: missing)
     }
 
-    func searchCatalogAccess(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceSearchCatalogAccess {
+    #if DEBUG
+        private struct CatalogSortProjection {
+            let file: WorkspaceFileRecord
+            let standardizedSortPath: String
+        }
+
+        func debugAuthoritativeCatalogSortProbe(
+            rootScope: WorkspaceLookupRootScope,
+            warmupCount: Int = 1,
+            measuredCount: Int = 3
+        ) -> WorkspaceCatalogSortAttributionProbe {
+            guard rootScopeAvailability(rootScope) == .available else {
+                return WorkspaceCatalogSortAttributionProbe(
+                    status: .unavailable,
+                    sourceFileCount: 0,
+                    sourceFolderCount: 0,
+                    samples: [],
+                    directAndProjectedOrdersMatch: true,
+                    firstMismatchIndex: nil,
+                    orderedFileIDs: []
+                )
+            }
+
+            let roots = rootsForPathLookup(scope: rootScope)
+            let usesRootLocalFileOrder = roots.count == 1
+            let allowedRootIDs = Set(roots.map(\.id))
+            let sourceFiles = filesByID.values.filter {
+                allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.id)
+            }
+            let sourceFolders = foldersByID.values.filter {
+                allowedRootIDs.contains($0.rootID) && isDiscoverableFolderID($0.id)
+            }
+            guard !sourceFiles.isEmpty || !sourceFolders.isEmpty else {
+                return WorkspaceCatalogSortAttributionProbe(
+                    status: .empty,
+                    sourceFileCount: 0,
+                    sourceFolderCount: 0,
+                    samples: [],
+                    directAndProjectedOrdersMatch: true,
+                    firstMismatchIndex: nil,
+                    orderedFileIDs: []
+                )
+            }
+
+            func directFilePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
+                usesRootLocalFileOrder
+                    ? Self.searchRootCatalogFilePrecedes(lhs, rhs)
+                    : Self.searchCatalogFilePrecedes(lhs, rhs)
+            }
+
+            func projectionPrecedes(_ lhs: CatalogSortProjection, _ rhs: CatalogSortProjection) -> Bool {
+                switch Self.compareUTF8Binary(lhs.standardizedSortPath, rhs.standardizedSortPath) {
+                case .orderedAscending:
+                    true
+                case .orderedDescending:
+                    false
+                case .orderedSame:
+                    Self.compareUTF8Binary(
+                        lhs.file.id.uuidString,
+                        rhs.file.id.uuidString
+                    ) == .orderedAscending
+                }
+            }
+
+            func timedDirectFileSort() -> (nanoseconds: UInt64, files: [WorkspaceFileRecord]) {
+                let start = WorkspaceFileSearchDebugTiming.now()
+                let files = sourceFiles.sorted(by: directFilePrecedes)
+                let end = WorkspaceFileSearchDebugTiming.now()
+                return (
+                    WorkspaceFileSearchDebugTiming.elapsed(since: start, through: end),
+                    files
+                )
+            }
+
+            func timedProjectedPipeline() -> (
+                keyNanoseconds: UInt64,
+                assemblyNanoseconds: UInt64,
+                sortNanoseconds: UInt64,
+                mappingNanoseconds: UInt64,
+                projections: [CatalogSortProjection],
+                files: [WorkspaceFileRecord]
+            ) {
+                let keyStart = WorkspaceFileSearchDebugTiming.now()
+                let standardizedSortPaths = sourceFiles.map {
+                    usesRootLocalFileOrder
+                        ? $0.standardizedRelativePath
+                        : $0.standardizedFullPath
+                }
+                let keyEnd = WorkspaceFileSearchDebugTiming.now()
+
+                let assemblyStart = WorkspaceFileSearchDebugTiming.now()
+                let projections = zip(sourceFiles, standardizedSortPaths).map {
+                    CatalogSortProjection(file: $0.0, standardizedSortPath: $0.1)
+                }
+                let assemblyEnd = WorkspaceFileSearchDebugTiming.now()
+
+                let sortStart = WorkspaceFileSearchDebugTiming.now()
+                let orderedProjections = projections.sorted(by: projectionPrecedes)
+                let sortEnd = WorkspaceFileSearchDebugTiming.now()
+
+                let mappingStart = WorkspaceFileSearchDebugTiming.now()
+                let orderedFiles = orderedProjections.map(\.file)
+                let mappingEnd = WorkspaceFileSearchDebugTiming.now()
+
+                return (
+                    WorkspaceFileSearchDebugTiming.elapsed(since: keyStart, through: keyEnd),
+                    WorkspaceFileSearchDebugTiming.elapsed(since: assemblyStart, through: assemblyEnd),
+                    WorkspaceFileSearchDebugTiming.elapsed(since: sortStart, through: sortEnd),
+                    WorkspaceFileSearchDebugTiming.elapsed(since: mappingStart, through: mappingEnd),
+                    projections,
+                    orderedFiles
+                )
+            }
+
+            let excludedWarmupCount = max(0, warmupCount)
+            let retainedMeasuredCount = max(0, measuredCount)
+            var samples: [WorkspaceCatalogSortAttributionSample] = []
+            samples.reserveCapacity(retainedMeasuredCount)
+            var allOrdersMatch = true
+            var firstMismatchIndex: Int?
+            var orderedFileIDs: [UUID] = []
+
+            for repetitionIndex in 0 ..< (excludedWarmupCount + retainedMeasuredCount) {
+                let direct: (nanoseconds: UInt64, files: [WorkspaceFileRecord])
+                let projected: (
+                    keyNanoseconds: UInt64,
+                    assemblyNanoseconds: UInt64,
+                    sortNanoseconds: UInt64,
+                    mappingNanoseconds: UInt64,
+                    projections: [CatalogSortProjection],
+                    files: [WorkspaceFileRecord]
+                )
+                if repetitionIndex.isMultiple(of: 2) {
+                    direct = timedDirectFileSort()
+                    projected = timedProjectedPipeline()
+                } else {
+                    projected = timedProjectedPipeline()
+                    direct = timedDirectFileSort()
+                }
+
+                let folderStart = WorkspaceFileSearchDebugTiming.now()
+                _ = sourceFolders.sorted(by: Self.searchCatalogFolderPrecedes)
+                let folderEnd = WorkspaceFileSearchDebugTiming.now()
+                let directIDs = direct.files.map(\.id)
+                let projectedIDs = projected.files.map(\.id)
+                let sharedIndexRange = 0 ..< min(directIDs.count, projectedIDs.count)
+                let mismatchIndex = sharedIndexRange.first { directIDs[$0] != projectedIDs[$0] }
+                    ?? (directIDs.count == projectedIDs.count ? nil : sharedIndexRange.upperBound)
+                let ordersMatch = mismatchIndex == nil
+
+                var directFileComparatorCalls = 0
+                _ = sourceFiles.sorted {
+                    directFileComparatorCalls += 1
+                    return directFilePrecedes($0, $1)
+                }
+                var projectedFileComparatorCalls = 0
+                _ = projected.projections.sorted {
+                    projectedFileComparatorCalls += 1
+                    return projectionPrecedes($0, $1)
+                }
+                var folderComparatorCalls = 0
+                _ = sourceFolders.sorted {
+                    folderComparatorCalls += 1
+                    return Self.searchCatalogFolderPrecedes($0, $1)
+                }
+
+                guard repetitionIndex >= excludedWarmupCount else { continue }
+                if orderedFileIDs.isEmpty {
+                    orderedFileIDs = directIDs
+                }
+                allOrdersMatch = allOrdersMatch && ordersMatch
+                if firstMismatchIndex == nil {
+                    firstMismatchIndex = mismatchIndex
+                }
+                samples.append(WorkspaceCatalogSortAttributionSample(
+                    directFileSortNanoseconds: direct.nanoseconds,
+                    directFolderSortNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: folderStart,
+                        through: folderEnd
+                    ),
+                    keyDerivationNanoseconds: projected.keyNanoseconds,
+                    projectionAssemblyNanoseconds: projected.assemblyNanoseconds,
+                    projectedFileSortNanoseconds: projected.sortNanoseconds,
+                    projectionMappingNanoseconds: projected.mappingNanoseconds,
+                    directFileComparatorCalls: directFileComparatorCalls,
+                    projectedFileComparatorCalls: projectedFileComparatorCalls,
+                    folderComparatorCalls: folderComparatorCalls,
+                    directAndProjectedOrdersMatch: ordersMatch,
+                    firstMismatchIndex: mismatchIndex
+                ))
+            }
+
+            return WorkspaceCatalogSortAttributionProbe(
+                status: .completed,
+                sourceFileCount: sourceFiles.count,
+                sourceFolderCount: sourceFolders.count,
+                samples: samples,
+                directAndProjectedOrdersMatch: allOrdersMatch,
+                firstMismatchIndex: firstMismatchIndex,
+                orderedFileIDs: orderedFileIDs
+            )
+        }
+    #endif
+
+    func searchCatalogAccess(
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        requirement: WorkspaceSearchCatalogAccessRequirement = .recordsAndPathIndexes
+    ) -> WorkspaceSearchCatalogAccess {
         let availability = rootScopeAvailability(rootScope)
         guard availability == .available else {
             return .unavailable(availability)
         }
-        return .available(searchCatalogSnapshot(rootScope: rootScope))
+        return .available(searchCatalogSnapshot(rootScope: rootScope, requirement: requirement))
     }
 
-    func searchCatalogSnapshot(rootScope: WorkspaceLookupRootScope = .visibleWorkspace) -> WorkspaceSearchCatalogSnapshot {
+    func searchCatalogSnapshot(
+        rootScope: WorkspaceLookupRootScope = .visibleWorkspace,
+        requirement: WorkspaceSearchCatalogAccessRequirement = .recordsAndPathIndexes
+    ) -> WorkspaceSearchCatalogSnapshot {
         let catalogSnapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.Search.catalogSnapshot)
         let validationToken = searchCatalogSnapshotValidationToken(scope: rootScope)
         if var cached = searchCatalogSnapshotsByScope[rootScope] {
             if cached.validationToken == validationToken {
-                cached.lastAccessSequence = nextSearchCatalogAccessSequence()
-                searchCatalogSnapshotsByScope[rootScope] = cached
-                EditFlowPerf.end(
-                    EditFlowPerf.Stage.Search.catalogSnapshot,
-                    catalogSnapshotState,
-                    EditFlowPerf.Dimensions(
-                        fileCount: cached.snapshot.diagnostics.fileCount,
-                        cacheHit: true,
-                        rootCount: cached.snapshot.diagnostics.rootCount,
-                        folderCount: cached.snapshot.diagnostics.folderCount
+                if cached.capability.satisfies(requirement) {
+                    cached.lastAccessSequence = nextSearchCatalogAccessSequence()
+                    searchCatalogSnapshotsByScope[rootScope] = cached
+                    EditFlowPerf.end(
+                        EditFlowPerf.Stage.Search.catalogSnapshot,
+                        catalogSnapshotState,
+                        EditFlowPerf.Dimensions(
+                            fileCount: cached.snapshot.diagnostics.fileCount,
+                            cacheHit: true,
+                            rootCount: cached.snapshot.diagnostics.rootCount,
+                            folderCount: cached.snapshot.diagnostics.folderCount
+                        )
                     )
-                )
-                return cached.snapshot
+                    return requirement.requiresPathIndexes
+                        ? cached.snapshot
+                        : cached.snapshot.recordsOnlyProjection()
+                }
+            } else {
+                searchCatalogSnapshotsByScope.removeValue(forKey: rootScope)
             }
-            searchCatalogSnapshotsByScope.removeValue(forKey: rootScope)
         }
         #if DEBUG
-            let rebuildStart = DispatchTime.now().uptimeNanoseconds
+            let rebuildStart = WorkspaceFileSearchDebugTiming.now()
+            let catalogBuildObserver = WorkspaceFileSearchCatalogBuildObserver()
         #endif
         let roots = rootsForPathLookup(scope: rootScope)
-        let generation = scopedSnapshotGeneration(scope: rootScope)
+        let generation = scopedSnapshotGeneration(scope: rootScope, validationToken: validationToken)
         var shouldCacheSnapshot = false
         let snapshot: WorkspaceSearchCatalogSnapshot
-        if let shards = prepareAndPublishRootCatalogShardBatch(for: roots) {
+        #if DEBUG
+            let preparedShards = WorkspaceFileSearchDebugContext.$catalogBuildObserver.withValue(
+                catalogBuildObserver
+            ) {
+                prepareAndPublishRootCatalogShardBatch(for: roots, requirement: requirement)
+            }
+        #else
+            let preparedShards = prepareAndPublishRootCatalogShardBatch(for: roots, requirement: requirement)
+        #endif
+        if let shards = preparedShards {
             var composedSnapshot = composeSearchCatalogSnapshot(
                 rootScope: rootScope,
                 generation: generation,
                 roots: roots,
-                shards: shards
+                shards: shards,
+                requirement: requirement
             )
             shouldCacheSnapshot = true
             #if DEBUG
-                let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
-                    rootScope: rootScope,
-                    generation: generation,
-                    roots: roots,
-                    includePathIndexes: false
-                )
-                let composedBytes = catalogShadowBytes(composedSnapshot)
-                let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
-                let shadowMatches = composedBytes == authoritativeBytes
-                recordRootCatalogShardShadowComparison(
-                    matched: shadowMatches,
-                    byteCount: authoritativeBytes.count
-                )
-                if !shadowMatches {
-                    assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
-                    composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                if isCatalogShardShadowValidationEnabled {
+                    let authoritativeSnapshot = buildAuthoritativeSearchCatalogSnapshot(
                         rootScope: rootScope,
                         generation: generation,
-                        roots: roots
+                        roots: roots,
+                        requirement: .recordsOnly
                     )
-                    shouldCacheSnapshot = false
+                    let composedBytes = catalogShadowBytes(composedSnapshot)
+                    let authoritativeBytes = catalogShadowBytes(authoritativeSnapshot)
+                    let shadowMatches = composedBytes == authoritativeBytes
+                    recordRootCatalogShardShadowComparison(
+                        matched: shadowMatches,
+                        byteCount: authoritativeBytes.count
+                    )
+                    if !shadowMatches {
+                        for shard in shards {
+                            recordRootCatalogShardFallback(
+                                rootID: shard.key.rootID,
+                                lifetimeID: shard.key.lifetimeID,
+                                reason: .shadowValidationMismatch
+                            )
+                        }
+                        assertionFailure("Root catalog shard composition diverged from the authoritative full rebuild")
+                        composedSnapshot = buildAuthoritativeSearchCatalogSnapshot(
+                            rootScope: rootScope,
+                            generation: generation,
+                            roots: roots,
+                            requirement: requirement
+                        )
+                        shouldCacheSnapshot = false
+                    }
                 }
             #endif
             snapshot = composedSnapshot
         } else {
-            snapshot = buildAuthoritativeSearchCatalogSnapshot(
-                rootScope: rootScope,
-                generation: generation,
-                roots: roots
-            )
+            #if DEBUG
+                snapshot = WorkspaceFileSearchDebugContext.$catalogBuildObserver.withValue(
+                    catalogBuildObserver
+                ) {
+                    buildAuthoritativeSearchCatalogSnapshot(
+                        rootScope: rootScope,
+                        generation: generation,
+                        roots: roots,
+                        requirement: requirement
+                    )
+                }
+            #else
+                snapshot = buildAuthoritativeSearchCatalogSnapshot(
+                    rootScope: rootScope,
+                    generation: generation,
+                    roots: roots,
+                    requirement: requirement
+                )
+            #endif
         }
-        #if DEBUG
-            let rebuildEnd = DispatchTime.now().uptimeNanoseconds
-            recordCatalogRebuild(
-                filterMicroseconds: 0,
-                sortMicroseconds: 0,
-                materializationMicroseconds: 0,
-                totalMicroseconds: Self.debugElapsedMicroseconds(since: rebuildStart, through: rebuildEnd),
-                fileCount: snapshot.files.count,
-                rootCount: roots.count
-            )
-        #endif
         EditFlowPerf.end(
             EditFlowPerf.Stage.Search.catalogSnapshot,
             catalogSnapshotState,
@@ -1779,28 +3156,112 @@ actor WorkspaceFileContextStore {
             )
         )
         if shouldCacheSnapshot {
-            cacheSearchCatalogSnapshot(snapshot, validationToken: validationToken, scope: rootScope)
+            cacheSearchCatalogSnapshot(
+                snapshot,
+                validationToken: validationToken,
+                capability: requirement,
+                scope: rootScope
+            )
         }
+        #if DEBUG
+            let rebuildEnd = WorkspaceFileSearchDebugTiming.now()
+            let phaseNanoseconds = catalogBuildObserver.snapshot()
+            let filterMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(phaseNanoseconds.filterNanoseconds)
+            let sortMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(phaseNanoseconds.sortNanoseconds)
+            let fileSortMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.fileSortNanoseconds
+            )
+            let folderSortMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.folderSortNanoseconds
+            )
+            let sortResidualMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.sortResidualNanoseconds
+            )
+            let sortReconciliationDeltaMicroseconds =
+                phaseNanoseconds.sortReconciliationDeltaNanoseconds / 1000
+            let materializationMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.materializationNanoseconds
+            )
+            let pathIndexKeyMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.pathIndexKeyNanoseconds
+            )
+            let pathIndexConstructionMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                phaseNanoseconds.pathIndexConstructionNanoseconds
+            )
+            let totalMicroseconds = WorkspaceFileSearchDebugTiming.microseconds(
+                WorkspaceFileSearchDebugTiming.elapsed(since: rebuildStart, through: rebuildEnd)
+            )
+            let classifiedMicroseconds = filterMicroseconds &+ sortMicroseconds &+ materializationMicroseconds
+                &+ pathIndexKeyMicroseconds &+ pathIndexConstructionMicroseconds
+            let compositionCacheResidualMicroseconds = totalMicroseconds >= classifiedMicroseconds
+                ? totalMicroseconds - classifiedMicroseconds
+                : 0
+            let catalogPhases = WorkspaceFileSearchPhaseSnapshot.Catalog(
+                rebuildCount: 1,
+                filterMicroseconds: filterMicroseconds,
+                sortMicroseconds: sortMicroseconds,
+                fileSortMicroseconds: fileSortMicroseconds,
+                folderSortMicroseconds: folderSortMicroseconds,
+                sortResidualMicroseconds: sortResidualMicroseconds,
+                sortReconciliationDeltaMicroseconds: sortReconciliationDeltaMicroseconds,
+                sortInvocationCount: phaseNanoseconds.sortInvocationCount,
+                sortFileInputCount: phaseNanoseconds.sortFileInputCount,
+                sortFolderInputCount: phaseNanoseconds.sortFolderInputCount,
+                materializationMicroseconds: materializationMicroseconds,
+                pathIndexKeyMicroseconds: pathIndexKeyMicroseconds,
+                pathIndexConstructionMicroseconds: pathIndexConstructionMicroseconds,
+                compositionCacheResidualMicroseconds: compositionCacheResidualMicroseconds,
+                totalMicroseconds: totalMicroseconds,
+                fileCount: snapshot.files.count,
+                rootCount: roots.count
+            )
+            recordCatalogRebuild(
+                filterMicroseconds: filterMicroseconds,
+                sortMicroseconds: sortMicroseconds,
+                fileSortMicroseconds: fileSortMicroseconds,
+                folderSortMicroseconds: folderSortMicroseconds,
+                sortResidualMicroseconds: sortResidualMicroseconds,
+                sortReconciliationDeltaMicroseconds: sortReconciliationDeltaMicroseconds,
+                sortInvocationCount: phaseNanoseconds.sortInvocationCount,
+                sortFileInputCount: phaseNanoseconds.sortFileInputCount,
+                sortFolderInputCount: phaseNanoseconds.sortFolderInputCount,
+                materializationMicroseconds: materializationMicroseconds,
+                pathIndexKeyMicroseconds: pathIndexKeyMicroseconds,
+                pathIndexConstructionMicroseconds: pathIndexConstructionMicroseconds,
+                compositionCacheResidualMicroseconds: compositionCacheResidualMicroseconds,
+                totalMicroseconds: totalMicroseconds,
+                fileCount: snapshot.files.count,
+                rootCount: roots.count
+            )
+            WorkspaceFileSearchDebugContext.collector?.recordCatalogRebuild(catalogPhases)
+        #endif
         return snapshot
     }
 
     private func prepareAndPublishRootCatalogShardBatch(
-        for roots: [WorkspaceRootRecord]
+        for roots: [WorkspaceRootRecord],
+        requirement: WorkspaceSearchCatalogAccessRequirement
     ) -> [RootCatalogShard]? {
         var keysByRootID: [UUID: RootCatalogShardKey] = [:]
         keysByRootID.reserveCapacity(roots.count)
-        var rootsNeedingBuild: [(root: WorkspaceRootRecord, key: RootCatalogShardKey)] = []
-        rootsNeedingBuild.reserveCapacity(roots.count)
+        var rootsNeedingAuthoritativeBuild: [(root: WorkspaceRootRecord, key: RootCatalogShardKey)] = []
+        var rootsNeedingPromotion: [(root: WorkspaceRootRecord, key: RootCatalogShardKey, shard: RootCatalogShard)] = []
+        rootsNeedingAuthoritativeBuild.reserveCapacity(roots.count)
+        rootsNeedingPromotion.reserveCapacity(roots.count)
 
         for root in roots {
             guard let key = rootCatalogShardKey(for: root) else { return nil }
             keysByRootID[root.id] = key
-            if publishedRootCatalogShardsByRootID[root.id]?.key != key {
-                rootsNeedingBuild.append((root, key))
+            guard let published = publishedRootCatalogShardsByRootID[root.id], published.key == key else {
+                rootsNeedingAuthoritativeBuild.append((root, key))
+                continue
+            }
+            if requirement.requiresPathIndexes, published.pathSearchIndex == nil {
+                rootsNeedingPromotion.append((root, key, published))
             }
         }
 
-        for candidate in rootsNeedingBuild {
+        for candidate in rootsNeedingAuthoritativeBuild {
             let liveGenerationCount = liveRootCatalogShards(rootID: candidate.root.id).count
             if rootCatalogShardDeltaStatesByRootID[candidate.root.id]?.isDirty == true,
                liveGenerationCount >= Self.maxLiveRootCatalogShardGenerationsPerRoot
@@ -1808,36 +3269,85 @@ actor WorkspaceFileContextStore {
                 return nil
             }
             guard canPublishAnotherRootCatalogShard(rootID: candidate.root.id) else {
+                #if DEBUG
+                    recordRootCatalogShardFallback(
+                        rootID: candidate.root.id,
+                        lifetimeID: candidate.key.lifetimeID,
+                        reason: .retentionBoundary
+                    )
+                #endif
                 markRootCatalogShardDirty(
                     rootID: candidate.root.id,
                     lifetimeID: candidate.key.lifetimeID,
                     lastAppliedIndexGeneration: appliedIndexGenerationsByRootID[candidate.root.id] ?? 0,
-                    reason: .retentionBackstop
+                    capability: rootCatalogShardDeltaStatesByRootID[candidate.root.id]?.capability ?? .recordsOnly
                 )
                 publishedRootCatalogShardsByRootID.removeValue(forKey: candidate.root.id)
                 return nil
             }
         }
+        for candidate in rootsNeedingPromotion {
+            guard canPublishAnotherRootCatalogShard(rootID: candidate.root.id) else {
+                #if DEBUG
+                    recordRootCatalogShardFallback(
+                        rootID: candidate.root.id,
+                        lifetimeID: candidate.key.lifetimeID,
+                        reason: .retentionBoundary
+                    )
+                #endif
+                return nil
+            }
+        }
 
         // Build the complete replacement batch privately; the actor publishes it with one assignment below.
-        var newlyBuiltShardsByRootID: [UUID: RootCatalogShard] = [:]
-        newlyBuiltShardsByRootID.reserveCapacity(rootsNeedingBuild.count)
-        for candidate in rootsNeedingBuild {
+        var newlyBuiltShardsByRootID: [UUID: (shard: RootCatalogShard, kind: RootCatalogShardBuildKind)] = [:]
+        newlyBuiltShardsByRootID.reserveCapacity(
+            rootsNeedingAuthoritativeBuild.count + rootsNeedingPromotion.count
+        )
+        for candidate in rootsNeedingAuthoritativeBuild {
             let appliedIndexGeneration = appliedIndexGenerationsByRootID[candidate.root.id] ?? 0
-            newlyBuiltShardsByRootID[candidate.root.id] = buildAuthoritativeRootCatalogShard(
+            let savedCapability = rootCatalogShardDeltaStatesByRootID[candidate.root.id].flatMap { state in
+                state.lifetimeID == candidate.key.lifetimeID ? state.capability : nil
+            }
+            let buildRequirement = if let savedCapability, savedCapability.satisfies(requirement) {
+                savedCapability
+            } else {
+                requirement
+            }
+            let shard = buildAuthoritativeRootCatalogShard(
                 root: candidate.root,
                 key: candidate.key,
-                appliedIndexGeneration: appliedIndexGeneration
+                appliedIndexGeneration: appliedIndexGeneration,
+                requirement: buildRequirement
             )
+            newlyBuiltShardsByRootID[candidate.root.id] = (shard, .authoritative)
+        }
+        for candidate in rootsNeedingPromotion {
+            let promoted = RootCatalogShard(
+                key: candidate.shard.key,
+                root: candidate.shard.root,
+                files: candidate.shard.files,
+                folders: candidate.shard.folders,
+                entries: candidate.shard.entries,
+                pathSearchIndex: makeRootPathSearchIndex(
+                    key: candidate.shard.key,
+                    root: candidate.shard.root,
+                    entries: candidate.shard.entries
+                ),
+                appliedIndexGeneration: candidate.shard.appliedIndexGeneration
+            )
+            newlyBuiltShardsByRootID[candidate.root.id] = (promoted, .promotion)
         }
 
         var publication = publishedRootCatalogShardsByRootID
         publication.reserveCapacity(max(publication.count, roots.count))
         for root in roots {
             guard let key = keysByRootID[root.id] else { return nil }
-            if let newlyBuilt = newlyBuiltShardsByRootID[root.id] {
+            if let newlyBuilt = newlyBuiltShardsByRootID[root.id]?.shard {
                 publication[root.id] = newlyBuilt
-            } else if let retained = publishedRootCatalogShardsByRootID[root.id], retained.key == key {
+            } else if let retained = publishedRootCatalogShardsByRootID[root.id], retained.key == key,
+                      !requirement.requiresPathIndexes || retained.pathSearchIndex != nil
+            {
                 publication[root.id] = retained
             } else {
                 return nil
@@ -1845,13 +3355,19 @@ actor WorkspaceFileContextStore {
         }
 
         publishedRootCatalogShardsByRootID = publication
-        for shard in newlyBuiltShardsByRootID.values {
-            rootCatalogShardDeltaStatesByRootID[shard.key.rootID] = RootCatalogShardDeltaState(
-                lifetimeID: shard.key.lifetimeID,
-                lastAppliedIndexGeneration: shard.appliedIndexGeneration,
-                isDirty: false
-            )
-            registerPublishedRootCatalogShard(shard, kind: .authoritative)
+        for built in newlyBuiltShardsByRootID.values {
+            switch built.kind {
+            case .authoritative, .promotion:
+                rootCatalogShardDeltaStatesByRootID[built.shard.key.rootID] = RootCatalogShardDeltaState(
+                    lifetimeID: built.shard.key.lifetimeID,
+                    lastAppliedIndexGeneration: built.shard.appliedIndexGeneration,
+                    isDirty: false,
+                    capability: built.shard.pathSearchIndex == nil ? .recordsOnly : .recordsAndPathIndexes
+                )
+            case .patch:
+                break
+            }
+            registerPublishedRootCatalogShard(built.shard, kind: built.kind)
         }
         return roots.compactMap { publication[$0.id] }
     }
@@ -1874,7 +3390,8 @@ actor WorkspaceFileContextStore {
     private func buildAuthoritativeRootCatalogShard(
         root: WorkspaceRootRecord,
         key: RootCatalogShardKey,
-        appliedIndexGeneration: UInt64
+        appliedIndexGeneration: UInt64,
+        requirement: WorkspaceSearchCatalogAccessRequirement
     ) -> RootCatalogShard {
         let components = buildAuthoritativeCatalogComponents(roots: [root])
         return RootCatalogShard(
@@ -1883,7 +3400,26 @@ actor WorkspaceFileContextStore {
             files: components.files,
             folders: components.folders,
             entries: components.entries,
+            pathSearchIndex: requirement.requiresPathIndexes
+                ? makeRootPathSearchIndex(key: key, root: root, entries: components.entries)
+                : nil,
             appliedIndexGeneration: appliedIndexGeneration
+        )
+    }
+
+    private func makeRootPathSearchIndex(
+        key: RootCatalogShardKey,
+        root: WorkspaceRootRecord,
+        entries: [WorkspaceSearchCatalogEntry]
+    ) -> WorkspaceSearchRootPathIndex {
+        WorkspaceSearchRootPathIndex(
+            identity: WorkspaceSearchRootPathIndexIdentity(
+                rootID: key.rootID,
+                lifetimeID: key.lifetimeID,
+                topologyGeneration: key.topologyGeneration
+            ),
+            rootPath: root.standardizedFullPath,
+            entries: entries
         )
     }
 
@@ -1900,6 +3436,16 @@ actor WorkspaceFileContextStore {
                 rootCatalogShardPatchCountsByRootID[shard.key.rootID, default: 0] += 1
             case .authoritative:
                 rootCatalogShardAuthoritativeRebuildCountsByRootID[shard.key.rootID, default: 0] += 1
+            case .promotion:
+                break
+            }
+            switch shard.pathSearchIndex?.buildKind {
+            case .full:
+                rootCatalogShardFullPathIndexBuildCountsByRootID[shard.key.rootID, default: 0] += 1
+            case .overlay:
+                rootCatalogShardOverlayPathIndexBuildCountsByRootID[shard.key.rootID, default: 0] += 1
+            case .reused, nil:
+                break
             }
             let liveCount = liveRootCatalogShards(rootID: shard.key.rootID).count
             rootCatalogShardMaxLiveGenerationCountsByRootID[shard.key.rootID] = max(
@@ -1938,7 +3484,6 @@ actor WorkspaceFileContextStore {
         if event.isRootUnload {
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             rootCatalogShardDeltaStatesByRootID.removeValue(forKey: event.rootID)
-            recordRootCatalogShardFallback(rootID: event.rootID, reason: .unload)
             return
         }
 
@@ -1952,73 +3497,118 @@ actor WorkspaceFileContextStore {
         }
 
         guard let previousShard = publishedRootCatalogShardsByRootID[event.rootID] else {
-            let reason: RootCatalogShardFallbackReason = if let deltaState = rootCatalogShardDeltaStatesByRootID[event.rootID],
-                                                            deltaState.lifetimeID == state.lifetimeID,
-                                                            deltaState.isDirty
-            {
-                .dirtyRecovery
-            } else {
-                .missingShard
+            guard let deltaState = rootCatalogShardDeltaStatesByRootID[event.rootID],
+                  deltaState.lifetimeID == state.lifetimeID
+            else {
+                // The actor's authoritative records and generations already include this batch.
+                // Keep catalog publication fully lazy until a caller requests a catalog capability.
+                return
             }
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: deltaState.isDirty ? .retentionBoundary : .missingReusableShard
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: reason
+                requirement: deltaState.capability
             )
             return
         }
+        let fallbackRequirement: WorkspaceSearchCatalogAccessRequirement = previousShard.pathSearchIndex == nil
+            ? .recordsOnly
+            : .recordsAndPathIndexes
         let deltaState = rootCatalogShardDeltaStatesByRootID[event.rootID] ?? RootCatalogShardDeltaState(
             lifetimeID: previousShard.key.lifetimeID,
             lastAppliedIndexGeneration: previousShard.appliedIndexGeneration,
-            isDirty: false
+            isDirty: false,
+            capability: fallbackRequirement
         )
         guard deltaState.lifetimeID == state.lifetimeID,
               previousShard.key.lifetimeID == state.lifetimeID,
               previousShard.key.rootID == event.rootID,
               previousShard.key.canonicalConfigurationIdentity == currentKey.canonicalConfigurationIdentity
         else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .unsafeOrAmbiguousBatch
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .unsafeAmbiguity
+                requirement: fallbackRequirement
             )
             return
         }
         if deltaState.isDirty {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .retentionBoundary
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .dirtyRecovery
+                requirement: fallbackRequirement
             )
             return
         }
         if event.requiresFullResync {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .fullResync
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .fullResync
+                requirement: fallbackRequirement
             )
             return
         }
         if deltaState.lastAppliedIndexGeneration == UInt64.max || event.generation == 0 {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .generationGap
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .generationOverflow
+                requirement: fallbackRequirement
             )
             return
         }
         guard event.generation == deltaState.lastAppliedIndexGeneration + 1 else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .generationGap
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .generationGap
+                requirement: fallbackRequirement
             )
             return
         }
@@ -2032,11 +3622,18 @@ actor WorkspaceFileContextStore {
         let expectedTopologyGeneration: UInt64
         if hasTopologyMutation {
             guard previousShard.key.topologyGeneration != UInt64.max else {
+                #if DEBUG
+                    recordRootCatalogShardFallback(
+                        rootID: event.rootID,
+                        lifetimeID: state.lifetimeID,
+                        reason: .generationGap
+                    )
+                #endif
                 rebuildRootCatalogShardAuthoritatively(
                     root: state.root,
                     key: currentKey,
                     appliedIndexGeneration: event.generation,
-                    reason: .generationOverflow
+                    requirement: fallbackRequirement
                 )
                 return
             }
@@ -2044,43 +3641,89 @@ actor WorkspaceFileContextStore {
         } else {
             expectedTopologyGeneration = previousShard.key.topologyGeneration
         }
-        guard currentKey.topologyGeneration == expectedTopologyGeneration,
-              let builderOutput = buildRootCatalogShardPatch(event: event, previousShard: previousShard)
-        else {
+        guard currentKey.topologyGeneration == expectedTopologyGeneration else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .unsafeOrAmbiguousBatch
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .unsafeAmbiguity
+                requirement: fallbackRequirement
+            )
+            return
+        }
+        guard let builderOutput = buildRootCatalogShardPatch(event: event, previousShard: previousShard) else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .patchApplicationBackstop
+                )
+            #endif
+            rebuildRootCatalogShardAuthoritatively(
+                root: state.root,
+                key: currentKey,
+                appliedIndexGeneration: event.generation,
+                requirement: fallbackRequirement
             )
             return
         }
         guard builderOutput.logicalMutationCount <= Self.maxRootCatalogShardPatchLogicalMutationCount else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .patchThresholdExceeded
+                )
+            #endif
             rebuildRootCatalogShardAuthoritatively(
                 root: state.root,
                 key: currentKey,
                 appliedIndexGeneration: event.generation,
-                reason: .thresholdExceeded
+                requirement: fallbackRequirement
             )
             return
         }
         guard canPublishAnotherRootCatalogShard(rootID: event.rootID) else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: event.rootID,
+                    lifetimeID: state.lifetimeID,
+                    reason: .retentionBoundary
+                )
+            #endif
             markRootCatalogShardDirty(
                 rootID: event.rootID,
                 lifetimeID: state.lifetimeID,
                 lastAppliedIndexGeneration: event.generation,
-                reason: .retentionBackstop
+                capability: fallbackRequirement
             )
             publishedRootCatalogShardsByRootID.removeValue(forKey: event.rootID)
             return
         }
 
+        let patchedEntries = builderOutput.files.map { WorkspaceSearchCatalogEntry(file: $0, root: state.root) }
+        let patchedPathSearchIndex = previousShard.pathSearchIndex?.applyingPatch(
+            identity: WorkspaceSearchRootPathIndexIdentity(
+                rootID: currentKey.rootID,
+                lifetimeID: currentKey.lifetimeID,
+                topologyGeneration: currentKey.topologyGeneration
+            ),
+            entries: patchedEntries,
+            changedFileIDs: builderOutput.pathIndexChangedFileIDs
+        )
         let patchedShard = RootCatalogShard(
             key: currentKey,
             root: state.root,
             files: builderOutput.files,
             folders: builderOutput.folders,
-            entries: builderOutput.files.map { WorkspaceSearchCatalogEntry(file: $0, root: state.root) },
+            entries: patchedEntries,
+            pathSearchIndex: patchedPathSearchIndex,
             appliedIndexGeneration: event.generation
         )
         var publication = publishedRootCatalogShardsByRootID
@@ -2089,7 +3732,8 @@ actor WorkspaceFileContextStore {
         rootCatalogShardDeltaStatesByRootID[event.rootID] = RootCatalogShardDeltaState(
             lifetimeID: state.lifetimeID,
             lastAppliedIndexGeneration: event.generation,
-            isDirty: false
+            isDirty: false,
+            capability: fallbackRequirement
         )
         registerPublishedRootCatalogShard(patchedShard, kind: .patch)
     }
@@ -2098,15 +3742,21 @@ actor WorkspaceFileContextStore {
         root: WorkspaceRootRecord,
         key: RootCatalogShardKey,
         appliedIndexGeneration: UInt64,
-        reason: RootCatalogShardFallbackReason
+        requirement: WorkspaceSearchCatalogAccessRequirement = .recordsAndPathIndexes
     ) {
-        recordRootCatalogShardFallback(rootID: root.id, reason: reason)
         guard canPublishAnotherRootCatalogShard(rootID: root.id) else {
+            #if DEBUG
+                recordRootCatalogShardFallback(
+                    rootID: root.id,
+                    lifetimeID: key.lifetimeID,
+                    reason: .retentionBoundary
+                )
+            #endif
             markRootCatalogShardDirty(
                 rootID: root.id,
                 lifetimeID: key.lifetimeID,
                 lastAppliedIndexGeneration: appliedIndexGeneration,
-                reason: .retentionBackstop
+                capability: requirement
             )
             publishedRootCatalogShardsByRootID.removeValue(forKey: root.id)
             return
@@ -2114,7 +3764,8 @@ actor WorkspaceFileContextStore {
         let rebuiltShard = buildAuthoritativeRootCatalogShard(
             root: root,
             key: key,
-            appliedIndexGeneration: appliedIndexGeneration
+            appliedIndexGeneration: appliedIndexGeneration,
+            requirement: requirement
         )
         var publication = publishedRootCatalogShardsByRootID
         publication[root.id] = rebuiltShard
@@ -2122,7 +3773,8 @@ actor WorkspaceFileContextStore {
         rootCatalogShardDeltaStatesByRootID[root.id] = RootCatalogShardDeltaState(
             lifetimeID: key.lifetimeID,
             lastAppliedIndexGeneration: appliedIndexGeneration,
-            isDirty: false
+            isDirty: false,
+            capability: requirement
         )
         registerPublishedRootCatalogShard(rebuiltShard, kind: .authoritative)
     }
@@ -2131,24 +3783,44 @@ actor WorkspaceFileContextStore {
         rootID: UUID,
         lifetimeID: UUID,
         lastAppliedIndexGeneration: UInt64,
-        reason: RootCatalogShardFallbackReason
+        capability: WorkspaceSearchCatalogAccessRequirement
     ) {
         rootCatalogShardDeltaStatesByRootID[rootID] = RootCatalogShardDeltaState(
             lifetimeID: lifetimeID,
             lastAppliedIndexGeneration: lastAppliedIndexGeneration,
-            isDirty: true
+            isDirty: true,
+            capability: capability
         )
-        recordRootCatalogShardFallback(rootID: rootID, reason: reason)
     }
 
-    private func recordRootCatalogShardFallback(
-        rootID: UUID,
-        reason: RootCatalogShardFallbackReason
-    ) {
-        #if DEBUG
-            rootCatalogShardFallbackReasonCountsByRootID[rootID, default: [:]][reason.rawValue, default: 0] += 1
-        #endif
-    }
+    #if DEBUG
+        private func resetRootCatalogShardFallbackDiagnosticsIfLifetimeChanged(
+            rootID: UUID,
+            lifetimeID: UUID
+        ) {
+            guard rootCatalogShardFallbackLifetimeIDsByRootID[rootID] != lifetimeID else { return }
+            rootCatalogShardFallbackLifetimeIDsByRootID[rootID] = lifetimeID
+            rootCatalogShardFallbackCountsByRootID.removeValue(forKey: rootID)
+            rootCatalogShardFallbackReasonCountsByRootID.removeValue(forKey: rootID)
+        }
+
+        private func recordRootCatalogShardFallback(
+            rootID: UUID,
+            lifetimeID: UUID,
+            reason: RootCatalogShardFallbackReason
+        ) {
+            resetRootCatalogShardFallbackDiagnosticsIfLifetimeChanged(
+                rootID: rootID,
+                lifetimeID: lifetimeID
+            )
+            rootCatalogShardFallbackCountsByRootID[rootID, default: 0] += 1
+            rootCatalogShardFallbackReasonCountsByRootID[rootID, default: [:]][reason, default: 0] += 1
+            assert(
+                rootCatalogShardFallbackCountsByRootID[rootID]
+                    == rootCatalogShardFallbackReasonCountsByRootID[rootID]?.values.reduce(0, +)
+            )
+        }
+    #endif
 
     private func buildRootCatalogShardPatch(
         event: WorkspaceAppliedIndexBatchEvent,
@@ -2226,6 +3898,12 @@ actor WorkspaceFileContextStore {
 
         let upsertedFilePaths = Set(upsertedFilesByID.values.map(\.standardizedRelativePath))
         let upsertedFolderPaths = Set(upsertedFoldersByID.values.map(\.standardizedRelativePath))
+        var pathIndexChangedFileIDs = touchedFileIDs
+        for path in removedFilePaths.union(upsertedFilePaths) {
+            if let oldFileID = oldFileIDsByPath[path] {
+                pathIndexChangedFileIDs.insert(oldFileID)
+            }
+        }
         guard removedFileIDs.isDisjoint(with: upsertedFilesByID.keys),
               removedFolderIDs.isDisjoint(with: upsertedFoldersByID.keys),
               removedFilePaths.isDisjoint(with: upsertedFilePaths),
@@ -2239,7 +3917,8 @@ actor WorkspaceFileContextStore {
             return RootCatalogShardBuilderOutput(
                 files: previousShard.files,
                 folders: previousShard.folders,
-                logicalMutationCount: logicalMutationCount
+                logicalMutationCount: logicalMutationCount,
+                pathIndexChangedFileIDs: []
             )
         }
 
@@ -2248,7 +3927,7 @@ actor WorkspaceFileContextStore {
             var upperBound = files.count
             while lowerBound < upperBound {
                 let midpoint = (lowerBound + upperBound) / 2
-                if Self.searchCatalogFilePrecedes(files[midpoint], file) {
+                if Self.searchRootCatalogFilePrecedes(files[midpoint], file) {
                     lowerBound = midpoint + 1
                 } else {
                     upperBound = midpoint
@@ -2302,7 +3981,8 @@ actor WorkspaceFileContextStore {
         return RootCatalogShardBuilderOutput(
             files: files,
             folders: folders,
-            logicalMutationCount: logicalMutationCount
+            logicalMutationCount: logicalMutationCount,
+            pathIndexChangedFileIDs: pathIndexChangedFileIDs
         )
     }
 
@@ -2311,16 +3991,64 @@ actor WorkspaceFileContextStore {
     ) -> AuthoritativeCatalogComponents {
         let rootsByID = Dictionary(uniqueKeysWithValues: roots.map { ($0.id, $0) })
         let allowedRootIDs = Set(rootsByID.keys)
-        let files = filesByID.values
-            .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.id) }
-            .sorted(by: Self.searchCatalogFilePrecedes)
-        let folders = foldersByID.values
-            .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFolderID($0.id) }
-            .sorted(by: Self.searchCatalogFolderPrecedes)
-        let entries = files.compactMap { file -> WorkspaceSearchCatalogEntry? in
-            guard let root = rootsByID[file.rootID] else { return nil }
-            return WorkspaceSearchCatalogEntry(file: file, root: root)
-        }
+        let filePrecedes: (WorkspaceFileRecord, WorkspaceFileRecord) -> Bool = roots.count == 1
+            ? Self.searchRootCatalogFilePrecedes
+            : Self.searchCatalogFilePrecedes
+        #if DEBUG
+            let filterStart = WorkspaceFileSearchDebugTiming.now()
+            let filteredFiles = filesByID.values
+                .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.id) }
+            let filteredFolders = foldersByID.values
+                .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFolderID($0.id) }
+            let filterEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordFilter(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: filterStart, through: filterEnd)
+            )
+            let sortStart = WorkspaceFileSearchDebugTiming.now()
+            let fileSortStart = WorkspaceFileSearchDebugTiming.now()
+            let files = filteredFiles.sorted(by: filePrecedes)
+            let fileSortEnd = WorkspaceFileSearchDebugTiming.now()
+            let folderSortStart = WorkspaceFileSearchDebugTiming.now()
+            let folders = filteredFolders.sorted(by: Self.searchCatalogFolderPrecedes)
+            let folderSortEnd = WorkspaceFileSearchDebugTiming.now()
+            let sortEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordSort(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(since: sortStart, through: sortEnd),
+                fileNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: fileSortStart,
+                    through: fileSortEnd
+                ),
+                folderNanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: folderSortStart,
+                    through: folderSortEnd
+                ),
+                fileInputCount: filteredFiles.count,
+                folderInputCount: filteredFolders.count
+            )
+            let materializationStart = WorkspaceFileSearchDebugTiming.now()
+            let entries = files.compactMap { file -> WorkspaceSearchCatalogEntry? in
+                guard let root = rootsByID[file.rootID] else { return nil }
+                return WorkspaceSearchCatalogEntry(file: file, root: root)
+            }
+            let materializationEnd = WorkspaceFileSearchDebugTiming.now()
+            WorkspaceFileSearchDebugContext.catalogBuildObserver?.recordMaterialization(
+                nanoseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                    since: materializationStart,
+                    through: materializationEnd
+                )
+            )
+        #else
+            let files = filesByID.values
+                .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.id) }
+                .sorted(by: filePrecedes)
+            let folders = foldersByID.values
+                .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFolderID($0.id) }
+                .sorted(by: Self.searchCatalogFolderPrecedes)
+            let entries = files.compactMap { file -> WorkspaceSearchCatalogEntry? in
+                guard let root = rootsByID[file.rootID] else { return nil }
+                return WorkspaceSearchCatalogEntry(file: file, root: root)
+            }
+        #endif
         return AuthoritativeCatalogComponents(files: files, folders: folders, entries: entries)
     }
 
@@ -2328,7 +4056,7 @@ actor WorkspaceFileContextStore {
         rootScope: WorkspaceLookupRootScope,
         generation: UInt64,
         roots: [WorkspaceRootRecord],
-        includePathIndexes: Bool = true
+        requirement: WorkspaceSearchCatalogAccessRequirement
     ) -> WorkspaceSearchCatalogSnapshot {
         let components = buildAuthoritativeCatalogComponents(roots: roots)
         let diagnostics = WorkspaceCatalogDiagnostics(
@@ -2338,9 +4066,10 @@ actor WorkspaceFileContextStore {
             folderCount: components.folders.count,
             fileCount: components.files.count
         )
-        let rootPathIndexes = includePathIndexes
+        let rootPathIndexes = requirement.requiresPathIndexes
             ? buildAuthoritativeRootPathIndexes(roots: roots, entries: components.entries)
             : []
+        precondition(!requirement.requiresPathIndexes || rootPathIndexes.count == roots.count)
         return WorkspaceSearchCatalogSnapshot(
             generation: generation,
             rootScope: rootScope,
@@ -2375,9 +4104,21 @@ actor WorkspaceFileContextStore {
         rootScope: WorkspaceLookupRootScope,
         generation: UInt64,
         roots: [WorkspaceRootRecord],
-        shards: [RootCatalogShard]
+        shards: [RootCatalogShard],
+        requirement: WorkspaceSearchCatalogAccessRequirement
     ) -> WorkspaceSearchCatalogSnapshot {
-        let merged = mergeRootCatalogShards(shards)
+        let merged: (files: [WorkspaceFileRecord], entries: [WorkspaceSearchCatalogEntry])
+        if let shard = shards.first, shards.count == 1 {
+            merged = (shard.files, shard.entries)
+            #if DEBUG
+                rootCatalogShardSingleShardCompositionReuseCount += 1
+            #endif
+        } else {
+            merged = mergeRootCatalogShards(shards)
+            #if DEBUG
+                rootCatalogShardGenericMergeElementVisitCount += merged.files.count
+            #endif
+        }
         let diagnostics = WorkspaceCatalogDiagnostics(
             generation: generation,
             rootScope: rootScope,
@@ -2385,13 +4126,23 @@ actor WorkspaceFileContextStore {
             folderCount: shards.reduce(0) { $0 + $1.folderCount },
             fileCount: merged.files.count
         )
+        let rootPathIndexes: [WorkspaceSearchRootPathIndex] = if requirement.requiresPathIndexes {
+            shards.map { shard in
+                guard let pathSearchIndex = shard.pathSearchIndex else {
+                    preconditionFailure("Indexed catalog composition requires one path index per root")
+                }
+                return pathSearchIndex
+            }
+        } else {
+            []
+        }
         return WorkspaceSearchCatalogSnapshot(
             generation: generation,
             rootScope: rootScope,
             roots: roots,
             files: merged.files,
             entries: merged.entries,
-            rootPathIndexes: shards.map(\.pathSearchIndex),
+            rootPathIndexes: rootPathIndexes,
             diagnostics: diagnostics,
             generationLease: WorkspaceSearchCatalogGenerationLease(
                 retaining: shards.map { $0 as AnyObject }
@@ -2463,11 +4214,71 @@ actor WorkspaceFileContextStore {
         return (files, entries)
     }
 
-    private static func searchCatalogFilePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
-        if lhs.standardizedFullPath == rhs.standardizedFullPath {
-            return lhs.id.uuidString < rhs.id.uuidString
+    static func compareUTF8Binary(_ lhs: String, _ rhs: String) -> ComparisonResult {
+        var lhsIterator = lhs.utf8.makeIterator()
+        var rhsIterator = rhs.utf8.makeIterator()
+        while true {
+            switch (lhsIterator.next(), rhsIterator.next()) {
+            case let (lhsByte?, rhsByte?):
+                if lhsByte < rhsByte { return .orderedAscending }
+                if lhsByte > rhsByte { return .orderedDescending }
+            case (nil, nil):
+                return .orderedSame
+            case (nil, _?):
+                return .orderedAscending
+            case (_?, nil):
+                return .orderedDescending
+            }
         }
-        return lhs.standardizedFullPath < rhs.standardizedFullPath
+    }
+
+    private static func searchCatalogFilePrecedes(_ lhs: WorkspaceFileRecord, _ rhs: WorkspaceFileRecord) -> Bool {
+        searchCatalogFilePrecedes(
+            lhsPath: lhs.standardizedFullPath,
+            lhsID: lhs.id,
+            rhsPath: rhs.standardizedFullPath,
+            rhsID: rhs.id
+        )
+    }
+
+    private static func searchRootCatalogFilePrecedes(
+        _ lhs: WorkspaceFileRecord,
+        _ rhs: WorkspaceFileRecord
+    ) -> Bool {
+        searchCatalogFilePrecedes(
+            lhsPath: lhs.standardizedRelativePath,
+            lhsID: lhs.id,
+            rhsPath: rhs.standardizedRelativePath,
+            rhsID: rhs.id
+        )
+    }
+
+    static func searchCatalogEntryPrecedes(
+        _ lhs: WorkspaceSearchCatalogEntry,
+        _ rhs: WorkspaceSearchCatalogEntry
+    ) -> Bool {
+        searchCatalogFilePrecedes(
+            lhsPath: lhs.standardizedFullPath,
+            lhsID: lhs.id,
+            rhsPath: rhs.standardizedFullPath,
+            rhsID: rhs.id
+        )
+    }
+
+    private static func searchCatalogFilePrecedes(
+        lhsPath: String,
+        lhsID: UUID,
+        rhsPath: String,
+        rhsID: UUID
+    ) -> Bool {
+        switch compareUTF8Binary(lhsPath, rhsPath) {
+        case .orderedAscending:
+            true
+        case .orderedDescending:
+            false
+        case .orderedSame:
+            compareUTF8Binary(lhsID.uuidString, rhsID.uuidString) == .orderedAscending
+        }
     }
 
     private static func searchCatalogFolderPrecedes(_ lhs: WorkspaceFolderRecord, _ rhs: WorkspaceFolderRecord) -> Bool {
@@ -2626,18 +4437,31 @@ actor WorkspaceFileContextStore {
         await awaitAppliedIngress(rootIDs: rootsForPathLookup(scope: rootScope).map(\.id))
     }
 
+    func awaitAppliedIngress(rootRefs: [WorkspaceRootRef]) async -> [WorkspaceIngressBarrierSample] {
+        await awaitAppliedIngress(rootIDs: rootRefs.map(\.id))
+    }
+
     func contentSearchFreshnessPolicy(
         rootScope: WorkspaceLookupRootScope,
         appliedIngressSamples: [WorkspaceIngressBarrierSample]
     ) async -> FileContentFreshnessPolicy {
-        let scopedRoots = rootsForPathLookup(scope: rootScope)
-        guard !scopedRoots.isEmpty,
-              appliedIngressSamples.count == scopedRoots.count
+        await contentSearchFreshnessPolicy(
+            rootRefs: rootRefs(scope: rootScope),
+            appliedIngressSamples: appliedIngressSamples
+        )
+    }
+
+    func contentSearchFreshnessPolicy(
+        rootRefs: [WorkspaceRootRef],
+        appliedIngressSamples: [WorkspaceIngressBarrierSample]
+    ) async -> FileContentFreshnessPolicy {
+        guard !rootRefs.isEmpty,
+              appliedIngressSamples.count == rootRefs.count
         else {
             return .validateDiskMetadata
         }
         let samplesByRootID = Dictionary(uniqueKeysWithValues: appliedIngressSamples.map { ($0.rootID, $0) })
-        for root in scopedRoots {
+        for root in rootRefs {
             guard let state = rootStatesByID[root.id],
                   let sample = samplesByRootID[root.id],
                   await state.service.canUseCachedSearchContent(
@@ -3221,6 +5045,33 @@ actor WorkspaceFileContextStore {
         #else
             let APIs = allCodemapSnapshots().compactMap(\.fileAPI)
         #endif
+        let aggregate = makeCodemapFileAPIAggregate(APIs)
+        #if DEBUG || EDIT_FLOW_PERF
+            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)
+        #endif
+        cachedCodemapFileAPIAggregate = aggregate
+        return aggregate
+    }
+
+    func codemapFileAPIAggregate(rootScope: WorkspaceLookupRootScope) -> WorkspaceCodemapFileAPIAggregate {
+        if rootScope == .allLoaded {
+            return codemapFileAPIAggregate()
+        }
+        if let cached = cachedCodemapFileAPIAggregatesByScope[rootScope] {
+            return cached
+        }
+
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let APIs = codemapSnapshotsByFileID.values
+            .filter { allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.fileID) }
+            .sorted { $0.fullPath < $1.fullPath }
+            .compactMap(\.fileAPI)
+        let aggregate = makeCodemapFileAPIAggregate(APIs)
+        cachedCodemapFileAPIAggregatesByScope[rootScope] = aggregate
+        return aggregate
+    }
+
+    private func makeCodemapFileAPIAggregate(_ APIs: [FileAPI]) -> WorkspaceCodemapFileAPIAggregate {
         var firstFileAPIByStandardizedNestedPath: [String: FileAPI] = [:]
         firstFileAPIByStandardizedNestedPath.reserveCapacity(APIs.count)
         for api in APIs {
@@ -3229,19 +5080,24 @@ actor WorkspaceFileContextStore {
                 firstFileAPIByStandardizedNestedPath[standardizedNestedPath] = api
             }
         }
-        let aggregate = WorkspaceCodemapFileAPIAggregate(
+        return WorkspaceCodemapFileAPIAggregate(
             orderedFileAPIs: APIs,
             firstFileAPIByStandardizedNestedPath: firstFileAPIByStandardizedNestedPath
         )
-        #if DEBUG || EDIT_FLOW_PERF
-            EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.AutoSelect.AllCodemapFileAPIs.materialization, materialization)
-        #endif
-        cachedCodemapFileAPIAggregate = aggregate
-        return aggregate
+    }
+
+    func codemapSnapshotBundle(
+        rootScope: WorkspaceLookupRootScope = .allLoaded
+    ) -> WorkspaceCodemapSnapshotBundle {
+        let allowedRootIDs = Set(rootsForPathLookup(scope: rootScope).map(\.id))
+        let snapshots = codemapSnapshotsByFileID.values.filter {
+            allowedRootIDs.contains($0.rootID) && isDiscoverableFileID($0.fileID)
+        }
+        return WorkspaceCodemapSnapshotBundle(snapshots: Array(snapshots))
     }
 
     func codemapSnapshotDictionary() -> [UUID: WorkspaceCodemapSnapshot] {
-        codemapSnapshotsByFileID.filter { isDiscoverableFileID($0.key) }
+        codemapSnapshotBundle().snapshotsByFileID
     }
 
     func codemapSnapshots(inRoot rootID: UUID) -> [WorkspaceCodemapSnapshot] {
@@ -3430,12 +5286,17 @@ actor WorkspaceFileContextStore {
     }
 
     func makeFileTreeSelectionSnapshot(_ request: WorkspaceFileTreeSnapshotRequest) -> FileTreeSelectionSnapshot {
-        makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: request.selectedFileIDs)
+        makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: request.selectedFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle(rootScope: request.rootScope)
+        )
     }
 
     func makeFileTreeSelectionSnapshot(
         selection: StoredSelection,
         request: WorkspaceFileTreeSnapshotRequest,
+        codemapSnapshotBundle frozenCodemaps: WorkspaceCodemapSnapshotBundle? = nil,
         profile: PathLocateProfile = .uiAssisted
     ) async -> FileTreeSelectionSnapshot {
         var selectedStoreFileIDs = Set<UUID>()
@@ -3456,7 +5317,13 @@ actor WorkspaceFileContextStore {
             else { continue }
             selectedStoreFileIDs.insert(file.id)
         }
-        return await makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, profile: profile)
+        let codemapSnapshotBundle = frozenCodemaps ?? codemapSnapshotBundle(rootScope: request.rootScope)
+        return await makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            profile: profile
+        )
     }
 
     private func lookupSelectionPath(
@@ -3531,11 +5398,13 @@ actor WorkspaceFileContextStore {
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
-        selectedStoreFileIDs: Set<UUID>
+        selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle
     ) -> FileTreeSelectionSnapshot {
         makeFileTreeSelectionSnapshot(
             request,
             selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
             startFolder: nil
         )
     }
@@ -3543,19 +5412,31 @@ actor WorkspaceFileContextStore {
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         profile: PathLocateProfile
     ) async -> FileTreeSelectionSnapshot {
         let trimmedStartPath = request.startPath?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let trimmedStartPath, !trimmedStartPath.isEmpty else {
-            return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: nil)
+            return makeFileTreeSelectionSnapshot(
+                request,
+                selectedStoreFileIDs: selectedStoreFileIDs,
+                codemapSnapshotBundle: codemapSnapshotBundle,
+                startFolder: nil
+            )
         }
         let startFolder = await (lookupSelectionPath(trimmedStartPath, profile: profile, rootScope: request.rootScope))?.folder
-        return makeFileTreeSelectionSnapshot(request, selectedStoreFileIDs: selectedStoreFileIDs, startFolder: startFolder)
+        return makeFileTreeSelectionSnapshot(
+            request,
+            selectedStoreFileIDs: selectedStoreFileIDs,
+            codemapSnapshotBundle: codemapSnapshotBundle,
+            startFolder: startFolder
+        )
     }
 
     private func makeFileTreeSelectionSnapshot(
         _ request: WorkspaceFileTreeSnapshotRequest,
         selectedStoreFileIDs: Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         startFolder: WorkspaceFolderRecord?
     ) -> FileTreeSelectionSnapshot {
         let selectedFileIDs = selectedStoreFileIDs
@@ -3574,6 +5455,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: root.standardizedFullPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ).map { [$0] } ?? []
@@ -3591,6 +5473,7 @@ actor WorkspaceFileContextStore {
                     rootStandardizedPath: root.standardizedFullPath,
                     state: state,
                     visited: &visited,
+                    codemapSnapshotBundle: codemapSnapshotBundle,
                     explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                     explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
                 )
@@ -3625,6 +5508,7 @@ actor WorkspaceFileContextStore {
 
     func cancelAllCodemapScans() async {
         await codeScanActor.cancelAllScans()
+        pendingCodemapRepairFileIDs.removeAll()
     }
 
     func cancelCodemapScansForCheckoutMutation(rootIDs: [UUID]) async {
@@ -3688,7 +5572,8 @@ actor WorkspaceFileContextStore {
         respectCursorignore: Bool = true,
         skipSymlinks: Bool = true,
         enableHierarchicalIgnores: Bool = true,
-        cancelUnderlyingLoadOnCallerCancellation: Bool = false
+        cancelUnderlyingLoadOnCallerCancellation: Bool = false,
+        sessionWorktreeReservationToken: WorkspaceSessionWorktreeOwnershipToken? = nil
     ) async throws -> WorkspaceRootRecord {
         let standardizedPath = (path as NSString).standardizingPath
         #if DEBUG
@@ -3698,6 +5583,13 @@ actor WorkspaceFileContextStore {
         try Task.checkCancellation()
         try await waitForRootUnloadIfNeeded(standardizedPath: standardizedPath)
         try Task.checkCancellation()
+        if let sessionWorktreeReservationToken {
+            guard sessionWorktreeReservedPathsByToken[
+                sessionWorktreeReservationToken
+            ]?.contains(standardizedPath) == true else {
+                throw WorkspaceSessionWorktreeOwnershipError.staleUpdate
+            }
+        }
         let loadConfiguration = RootLoadConfiguration(
             kind: kind ?? (isSystemRoot ? .supplementalSystem : .primaryWorkspace),
             respectGitignore: respectGitignore,
@@ -3725,9 +5617,16 @@ actor WorkspaceFileContextStore {
             #endif
             return existing
         }
-        if let inFlight = rootLoadTasksByPath[standardizedPath] {
+        if let inFlight = rootLoadFlightsByPath[standardizedPath] {
             guard rootLoadConfigurationsByPath[standardizedPath] == loadConfiguration else {
                 throw WorkspaceFileContextStoreError.rootLoadInFlightWithDifferentConfiguration(standardizedPath)
+            }
+            if let sessionWorktreeReservationToken {
+                registerSessionWorktreeReservationLoadFlight(
+                    inFlight,
+                    standardizedPath: standardizedPath,
+                    token: sessionWorktreeReservationToken
+                )
             }
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
@@ -3742,7 +5641,8 @@ actor WorkspaceFileContextStore {
                 }
             #endif
             return try await awaitRootLoadTask(
-                inFlight,
+                inFlight.task,
+                flightID: inFlight.id,
                 standardizedPath: standardizedPath,
                 cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
             )
@@ -3757,6 +5657,7 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        let completion = RootLoadFlightCompletion()
         let task = Task { [weak self] in
             guard let self else { throw WorkspaceFileContextStoreError.storeDeallocated }
             return try await performLoadRoot(
@@ -3767,17 +5668,35 @@ actor WorkspaceFileContextStore {
                 respectRepoIgnore: respectRepoIgnore,
                 respectCursorignore: respectCursorignore,
                 skipSymlinks: skipSymlinks,
-                enableHierarchicalIgnores: enableHierarchicalIgnores
+                enableHierarchicalIgnores: enableHierarchicalIgnores,
+                completion: completion
             )
         }
-        rootLoadTasksByPath[standardizedPath] = task
+        let flightID = UUID()
+        let flight = RootLoadFlight(
+            id: flightID,
+            task: task,
+            completion: completion
+        )
+        rootLoadFlightsByPath[standardizedPath] = flight
         rootLoadConfigurationsByPath[standardizedPath] = loadConfiguration
+        if let sessionWorktreeReservationToken {
+            registerSessionWorktreeReservationLoadFlight(
+                flight,
+                standardizedPath: standardizedPath,
+                token: sessionWorktreeReservationToken
+            )
+        }
         Task { [weak self] in
             _ = try? await task.value
-            await self?.clearCompletedRootLoadTask(standardizedPath: standardizedPath)
+            await self?.clearCompletedRootLoadTask(
+                standardizedPath: standardizedPath,
+                expectedFlightID: flightID
+            )
         }
         return try await awaitRootLoadTask(
             task,
+            flightID: flightID,
             standardizedPath: standardizedPath,
             cancelUnderlyingLoadOnCallerCancellation: cancelUnderlyingLoadOnCallerCancellation
         )
@@ -3785,29 +5704,71 @@ actor WorkspaceFileContextStore {
 
     private func awaitRootLoadTask(
         _ task: Task<WorkspaceRootRecord, Error>,
+        flightID: UUID,
         standardizedPath: String,
         cancelUnderlyingLoadOnCallerCancellation: Bool
     ) async throws -> WorkspaceRootRecord {
-        try await withTaskCancellationHandler {
-            try await task.value
+        let race = RootLoadTaskWaitRace()
+        Task {
+            await race.resolve(task.result)
+        }
+        let root = try await withTaskCancellationHandler {
+            try await race.value()
         } onCancel: {
+            race.cancel()
             guard cancelUnderlyingLoadOnCallerCancellation else { return }
             task.cancel()
-            Task { await self.cancelRootLoad(path: standardizedPath) }
+            Task {
+                await self.cancelRootLoad(
+                    standardizedPath: standardizedPath,
+                    expectedFlightID: flightID
+                )
+            }
         }
+        try Task.checkCancellation()
+        return root
     }
 
     func cancelRootLoad(path: String) {
         let standardizedPath = (path as NSString).standardizingPath
-        rootLoadTasksByPath[standardizedPath]?.cancel()
-        rootLoadTasksByPath.removeValue(forKey: standardizedPath)
-        if rootIDsByStandardizedPath[standardizedPath] == nil {
-            rootLoadConfigurationsByPath.removeValue(forKey: standardizedPath)
-        }
+        guard let flight = rootLoadFlightsByPath[standardizedPath] else { return }
+        flight.task.cancel()
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: flight.id
+        )
     }
 
-    private func clearCompletedRootLoadTask(standardizedPath: String) {
-        rootLoadTasksByPath.removeValue(forKey: standardizedPath)
+    private func cancelRootLoad(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        guard let flight = rootLoadFlightsByPath[standardizedPath],
+              flight.id == expectedFlightID
+        else { return }
+        flight.task.cancel()
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: expectedFlightID
+        )
+    }
+
+    private func clearCompletedRootLoadTask(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        removeRootLoadFlight(
+            standardizedPath: standardizedPath,
+            expectedFlightID: expectedFlightID
+        )
+    }
+
+    private func removeRootLoadFlight(
+        standardizedPath: String,
+        expectedFlightID: UUID
+    ) {
+        guard rootLoadFlightsByPath[standardizedPath]?.id == expectedFlightID else { return }
+        rootLoadFlightsByPath.removeValue(forKey: standardizedPath)
         if rootIDsByStandardizedPath[standardizedPath] == nil {
             rootLoadConfigurationsByPath.removeValue(forKey: standardizedPath)
         }
@@ -3821,12 +5782,17 @@ actor WorkspaceFileContextStore {
         respectRepoIgnore: Bool,
         respectCursorignore: Bool,
         skipSymlinks: Bool,
-        enableHierarchicalIgnores: Bool
+        enableHierarchicalIgnores: Bool,
+        completion: RootLoadFlightCompletion
     ) async throws -> WorkspaceRootRecord {
         if let existingID = rootIDsByStandardizedPath[standardizedPath],
-           let existing = rootStatesByID[existingID]?.root
+           let existingState = rootStatesByID[existingID]
         {
-            return existing
+            completion.record(
+                rootID: existingState.root.id,
+                lifetimeID: existingState.lifetimeID
+            )
+            return existingState.root
         }
 
         #if DEBUG
@@ -3959,8 +5925,12 @@ actor WorkspaceFileContextStore {
                 ]
             )
         #endif
+        if root.kind == .sessionWorktree {
+            sessionRootLifetimeClock.advance()
+        }
         rootIDsByStandardizedPath[root.standardizedFullPath] = root.id
         rootStatesByID[root.id] = state
+        completion.record(rootID: root.id, lifetimeID: state.lifetimeID)
         rootLoadOrder.append(root.id)
         appliedIndexGenerationsByRootID[root.id] = 0
         catalogGenerationsByRootID[root.id] = 0
@@ -4030,15 +6000,41 @@ actor WorkspaceFileContextStore {
         guard !orderedRootIDs.isEmpty else { return }
 
         var statesToUnload: [(rootID: UUID, state: RootState)] = []
+        var ownershipResourcesReleasedByUnload = SessionWorktreeOwnershipRemoval()
+        var invalidatedOwnershipTokens = Set<WorkspaceSessionWorktreeOwnershipToken>()
         for rootID in orderedRootIDs {
+            explicitWatcherDemandRootIDs.remove(rootID)
+            if let state = rootStatesByID[rootID] {
+                let watcherKey = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                explicitWatcherDemandGenerationByKey.removeValue(forKey: watcherKey)
+            }
+            if let state = rootStatesByID[rootID], state.root.kind == .sessionWorktree {
+                let lifetimeKey = SessionWorktreeRootLifetimeKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                let ownershipTokens = (sessionWorktreeOwnershipTokensByRootLifetime[lifetimeKey] ?? [])
+                    .union(sessionWorktreeReservationTokensByStandardizedPath[state.root.standardizedFullPath] ?? [])
+                for token in ownershipTokens where invalidatedOwnershipTokens.insert(token).inserted {
+                    latestSessionWorktreeOwnershipGenerationByOwnerID[token.ownerID, default: 0] &+= 1
+                    if installedSessionWorktreeOwnershipTokenByOwnerID[token.ownerID] == token {
+                        installedSessionWorktreeOwnershipTokenByOwnerID.removeValue(forKey: token.ownerID)
+                    }
+                    ownershipResourcesReleasedByUnload.append(removeSessionWorktreeOwnershipToken(token))
+                }
+            }
             if let flightState = scopedIngressBarrierFlightStatesByRootID.removeValue(forKey: rootID) {
                 flightState.active?.task?.cancel()
                 flightState.active?.join.complete(with: nil)
                 flightState.pending?.join.complete(with: nil)
             }
             completedScopedIngressBarrierCutsByRootID.removeValue(forKey: rootID)
-            watcherCancellablesByRootID.removeValue(forKey: rootID)?.cancel()
+            if let state = rootStatesByID[rootID] {
+                let watcherKey = WatcherInfrastructureKey(rootID: rootID, lifetimeID: state.lifetimeID)
+                watcherPublisherAttachmentsByKey.removeValue(forKey: watcherKey)?.cancellable.cancel()
+                watcherInfrastructureFlightsByKey.removeValue(forKey: watcherKey)?.task.cancel()
+            }
             publisherIngressCoordinator.closePublisherIngress(rootID: rootID)
+            if rootStatesByID[rootID]?.root.kind == .sessionWorktree {
+                sessionRootLifetimeClock.advance()
+            }
             guard let state = rootStatesByID.removeValue(forKey: rootID) else { continue }
             statesToUnload.append((rootID, state))
         }
@@ -4052,6 +6048,7 @@ actor WorkspaceFileContextStore {
             for fileID in entry.state.fileIDsByRelativePath.values {
                 searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
             }
+            removeSliceRebaseSources(rootID: entry.rootID, rootLifetimeID: entry.state.lifetimeID)
             await searchDecodedContentCache.invalidate(rootID: entry.rootID)
             await interactiveReadCache.invalidate(rootID: entry.rootID)
         }
@@ -4081,6 +6078,8 @@ actor WorkspaceFileContextStore {
         #endif
 
         let removedRootIDSet = Set(statesToUnload.map(\.rootID))
+        let removedFileIDs = statesToUnload.flatMap(\.state.fileIDsByRelativePath.values)
+        pendingCodemapRepairFileIDs.subtract(removedFileIDs)
         initializingSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         initializedSessionWorktreeCodemapRootIDs.subtract(removedRootIDSet)
         rootLoadOrder.removeAll { removedRootIDSet.contains($0) }
@@ -4168,6 +6167,7 @@ actor WorkspaceFileContextStore {
                 rootID: rootID,
                 rootPath: state.root.standardizedFullPath,
                 generation: generation,
+                rootLifetimeID: state.lifetimeID,
                 removedFileIDs: Array(discoverableFileIDsByPath.values),
                 removedFolderIDs: Array(discoverableFolderIDsByPath.values),
                 removedFilePaths: Array(discoverableFileIDsByPath.keys).sorted(),
@@ -4215,6 +6215,20 @@ actor WorkspaceFileContextStore {
             )
         #endif
         finishRootUnload(for: unloadingPaths)
+        let removedLifetimeKeys = Set(statesToUnload.map {
+            SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.state.lifetimeID)
+        })
+        let removedStandardizedPaths = Set(statesToUnload.map(\.state.root.standardizedFullPath))
+        await cleanupOrphanedSessionWorktreeResources(SessionWorktreeOwnershipRemoval(
+            ownedRoots: ownershipResourcesReleasedByUnload.ownedRoots.filter {
+                !removedLifetimeKeys.contains(
+                    SessionWorktreeRootLifetimeKey(rootID: $0.rootID, lifetimeID: $0.lifetimeID)
+                )
+            },
+            reservedLoadFlights: ownershipResourcesReleasedByUnload.reservedLoadFlights.filter {
+                !removedStandardizedPaths.contains($0.standardizedPath)
+            }
+        ))
         #if DEBUG
             WorkspaceRestorePerfLog.event(
                 "store.rootUnload.end",
@@ -4301,6 +6315,43 @@ actor WorkspaceFileContextStore {
         return foldersByID[folderID]
     }
 
+    func cachedSearchContentSnapshot(
+        for expectedRecord: WorkspaceFileRecord
+    ) async -> FileSearchContentSnapshot {
+        guard let current = file(
+            rootID: expectedRecord.rootID,
+            relativePath: expectedRecord.standardizedRelativePath
+        ), current.id == expectedRecord.id else {
+            return staleSearchContentSnapshot(for: expectedRecord)
+        }
+        let epoch = searchContentInvalidationEpochsByFileID[current.id] ?? 0
+        let cacheKey = WorkspaceSearchContentCacheKey(
+            rootID: current.rootID,
+            fileID: current.id,
+            standardizedRelativePath: current.standardizedRelativePath
+        )
+        guard let cached = await searchDecodedContentCache.cachedSnapshot(
+            for: cacheKey,
+            invalidationEpoch: epoch
+        ), searchContentRecordIsCurrent(current, invalidationEpoch: epoch) else {
+            return staleSearchContentSnapshot(for: current)
+        }
+        if let state = rootStatesByID[current.rootID] {
+            retainSliceRebaseSource(
+                content: cached.content,
+                modificationDate: cached.modificationDate,
+                file: current,
+                rootLifetimeID: state.lifetimeID
+            )
+        }
+        return FileSearchContentSnapshot(
+            content: cached.content,
+            contentRevision: cached.revision,
+            modificationDate: cached.modificationDate,
+            isFresh: true
+        )
+    }
+
     func searchContentSnapshot(
         for expectedRecord: WorkspaceFileRecord,
         freshnessPolicy: FileContentFreshnessPolicy = .validateDiskMetadata
@@ -4331,6 +6382,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return staleSearchContentSnapshot(for: current)
                 }
+                retainSliceRebaseSource(
+                    content: cached.content,
+                    modificationDate: cached.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return FileSearchContentSnapshot(
                     content: cached.content,
                     contentRevision: cached.revision,
@@ -4379,6 +6436,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return staleSearchContentSnapshot(for: current)
                 }
+                retainSliceRebaseSource(
+                    content: cached.content,
+                    modificationDate: cached.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return FileSearchContentSnapshot(
                     content: cached.content,
                     contentRevision: cached.revision,
@@ -4468,6 +6531,12 @@ actor WorkspaceFileContextStore {
                     if attempt == 0 { continue }
                     return nil
                 }
+                retainSliceRebaseSource(
+                    content: preparedContent.linesWithEndings.joined(),
+                    modificationDate: fingerprint.modificationDate,
+                    file: current,
+                    rootLifetimeID: state.lifetimeID
+                )
                 return WorkspaceInteractiveReadSnapshot(
                     preparedContent: preparedContent,
                     cacheHit: cached.cacheHit
@@ -4492,6 +6561,21 @@ actor WorkspaceFileContextStore {
     func clearSearchDecodedContentCache() async {
         await searchDecodedContentCache.clear()
         await interactiveReadCache.clear()
+        clearSliceRebaseSources()
+    }
+
+    func readContentPrefix(
+        rootID: UUID,
+        relativePath: String,
+        maximumBytes: Int,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> FileContentPrefix? {
+        let state = try state(for: rootID)
+        return try await state.service.loadContentPrefix(
+            ofRelativePath: StandardizedPath.relative(relativePath),
+            maximumBytes: maximumBytes,
+            workloadClass: workloadClass
+        )
     }
 
     func readContent(
@@ -4550,6 +6634,21 @@ actor WorkspaceFileContextStore {
             )
             throw error
         }
+    }
+
+    func readValidatedContentSnapshot(
+        rootID: UUID,
+        relativePath: String,
+        workloadClass: ContentReadWorkloadClass = .unspecified
+    ) async throws -> ValidatedFileContentSnapshot {
+        let state = try state(for: rootID)
+        let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let fingerprint = try await state.service.contentFingerprint(ofRelativePath: standardizedRelativePath)
+        return try await state.service.loadValidatedContent(
+            ofRelativePath: standardizedRelativePath,
+            expectedFingerprint: fingerprint,
+            workloadClass: workloadClass
+        )
     }
 
     func readContentWithDate(
@@ -4681,6 +6780,83 @@ actor WorkspaceFileContextStore {
             }
         }
         return pendingRootIDs
+    }
+
+    func enqueueMissingCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) -> WorkspaceCodemapRepairResult {
+        let snapshots = codemapSnapshotDictionary()
+        var missingFiles: [WorkspaceFileRecord] = []
+        var seenFileIDs = Set<UUID>()
+
+        for file in files {
+            guard seenFileIDs.insert(file.id).inserted,
+                  isDiscoverableFileID(file.id),
+                  filesByID[file.id] != nil,
+                  snapshots[file.id] == nil
+            else { continue }
+            missingFiles.append(file)
+        }
+
+        var newlyQueuedFiles: [WorkspaceFileRecord] = []
+        for file in missingFiles where pendingCodemapRepairFileIDs.insert(file.id).inserted {
+            newlyQueuedFiles.append(file)
+        }
+
+        if !newlyQueuedFiles.isEmpty {
+            Task.detached(priority: .utility) { [store = self, newlyQueuedFiles] in
+                await store.performEnqueuedCodemapSnapshotRepairs(for: newlyQueuedFiles)
+            }
+        }
+
+        return WorkspaceCodemapRepairResult(
+            snapshotsByFileID: snapshots,
+            pendingFileIDs: Set(missingFiles.map(\.id))
+        )
+    }
+
+    private func performEnqueuedCodemapSnapshotRepairs(
+        for files: [WorkspaceFileRecord]
+    ) async {
+        await ensureCodeScanResultTask()
+        let currentFiles = files.filter { file in
+            pendingCodemapRepairFileIDs.contains(file.id)
+                && isDiscoverableFileID(file.id)
+                && filesByID[file.id] != nil
+                && codemapSnapshotsByFileID[file.id] == nil
+        }
+        let currentFileIDs = Set(currentFiles.map(\.id))
+        guard !currentFiles.isEmpty else {
+            pendingCodemapRepairFileIDs.subtract(files.map(\.id))
+            return
+        }
+
+        do {
+            let loadedRequests = try await codemapScanRequests(for: currentFiles)
+            let stillMissingFileIDs = currentFileIDs.filter { codemapSnapshotsByFileID[$0] == nil }
+            let requests = loadedRequests.filter { stillMissingFileIDs.contains($0.fileID) }
+            guard !requests.isEmpty else {
+                pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+                return
+            }
+            let rootFolderPaths = Array(Set(requests.map(\.rootFolderPath)))
+            let requestResult = await codeScanActor.requestSelfHealingScans(
+                requests,
+                rootFolderPaths: rootFolderPaths,
+                existingScanModificationDatesByFileID: Dictionary(
+                    uniqueKeysWithValues: currentFiles.compactMap { file in
+                        file.modificationDate.map { (file.id, $0) }
+                    }
+                )
+            )
+            let scheduledFileIDs = requestResult.submittedFileIDs.union(requestResult.alreadyScheduledFileIDs)
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs.subtracting(scheduledFileIDs))
+            pendingCodemapRepairFileIDs.subtract(
+                scheduledFileIDs.filter { codemapSnapshotsByFileID[$0] != nil }
+            )
+        } catch {
+            pendingCodemapRepairFileIDs.subtract(currentFileIDs)
+        }
     }
 
     func repairMissingCodemapSnapshots(
@@ -4930,7 +7106,19 @@ actor WorkspaceFileContextStore {
     }
 
     @discardableResult
-    func createFile(rootID: UUID, relativePath: String, content: String) async throws -> WorkspaceFileCatalogMaterializationResult {
+    func createFile(
+        rootID: UUID,
+        relativePath: String,
+        content: String,
+        validating rootScope: WorkspaceLookupRootScope? = nil
+    ) async throws -> WorkspaceFileCatalogMaterializationResult {
+        if let rootScope {
+            guard rootScopeAvailability(rootScope) == .available,
+                  rootsForPathLookup(scope: rootScope).contains(where: { $0.id == rootID })
+            else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
+            }
+        }
         let state = try state(for: rootID)
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
         try await state.service.createFile(atRelativePath: standardizedRelativePath, content: content)
@@ -4940,22 +7128,81 @@ actor WorkspaceFileContextStore {
     @discardableResult
     func editFile(rootID: UUID, relativePath: String, newContent: String) async throws -> WorkspaceFileCatalogMaterializationResult? {
         let state = try state(for: rootID)
+        let expectedLifetimeID = state.lifetimeID
         let standardizedRelativePath = StandardizedPath.relative(relativePath)
+        let deferredPublicationToken: FileSystemDeferredEditPublicationToken
         do {
-            try await state.service.editFile(atRelativePath: standardizedRelativePath, newContent: newContent)
+            guard let token = try await state.service.editFile(
+                atRelativePath: standardizedRelativePath,
+                newContent: newContent,
+                modificationPublicationPolicy: .deferSyntheticModificationToSuccessfulCaller
+            ) else {
+                throw WorkspaceFileContextStoreError.catalogMaterializationFailed(
+                    "store-owned edit completed without a deferred modification publication token"
+                )
+            }
+            deferredPublicationToken = token
         } catch FileSystemError.fileNotFound {
             pruneCatalogFileMissingOnDisk(rootID: rootID, relativePath: standardizedRelativePath, publishDelta: true)
             throw FileSystemError.fileNotFound
         }
-        if let file = file(rootID: rootID, relativePath: standardizedRelativePath) {
-            invalidateSearchContent(file)
-            invalidateCodemapSnapshot(rootID: rootID, relativePath: standardizedRelativePath)
-            if isDiscoverableFileID(file.id) {
-                publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+
+        do {
+            #if DEBUG
+                if let storeEditDeferredPublicationDidRegisterHandler {
+                    await storeEditDeferredPublicationDidRegisterHandler(rootID, standardizedRelativePath)
+                }
+            #endif
+            try Task.checkCancellation()
+            guard isRootLifetimeCurrent(rootID: rootID, expectedLifetimeID: expectedLifetimeID) else {
+                throw WorkspaceFileContextStoreError.rootNotLoaded(rootID)
             }
-            return .materialized(file)
+
+            let result: WorkspaceFileCatalogMaterializationResult?
+            let publishedCanonicalModification: Bool
+            if let file = file(rootID: rootID, relativePath: standardizedRelativePath) {
+                invalidateSearchContent(file)
+                invalidateCodemapSnapshot(rootID: rootID, relativePath: standardizedRelativePath)
+                publishedCanonicalModification = isDiscoverableFileID(file.id)
+                if publishedCanonicalModification {
+                    publishAppliedIndexEvent(root: state.root, modifiedFileIDs: [file.id])
+                    #if DEBUG
+                        MCPApplyEditsRebaseProbeRecorder.recordStoreModification(
+                            rootID: rootID,
+                            fileID: file.id,
+                            generation: appliedIndexGenerationsByRootID[rootID] ?? 0
+                        )
+                    #endif
+                }
+                result = .materialized(file)
+            } else {
+                let materialization = try await materializeCatalogFileAfterDiskWrite(
+                    rootID: rootID,
+                    relativePath: standardizedRelativePath
+                )
+                result = materialization
+                switch materialization {
+                case let .materialized(file):
+                    publishedCanonicalModification = isDiscoverableFileID(file.id)
+                case .ineligible:
+                    publishedCanonicalModification = false
+                }
+            }
+
+            await state.service.resolveDeferredEditPublication(
+                deferredPublicationToken,
+                resolution: publishedCanonicalModification
+                    ? .callerPublishedCanonicalModification
+                    : .publishSyntheticFallback
+            )
+            return result
+        } catch {
+            await state.service.resolveDeferredEditPublication(
+                deferredPublicationToken,
+                resolution: .publishSyntheticFallback
+            )
+            throw error
         }
-        return try await materializeCatalogFileAfterDiskWrite(rootID: rootID, relativePath: standardizedRelativePath)
     }
 
     func moveFile(rootID: UUID, from oldRelativePath: String, to newRelativePath: String) async throws {
@@ -5337,6 +7584,136 @@ actor WorkspaceFileContextStore {
         case .eligible:
             return try .materialized(materializeCatalogRegularFile(rootID: rootID, relativePath: standardizedRelativePath, managedOnly: false))
         }
+    }
+
+    func ingressPublishedGitArtifacts(
+        _ request: WorkspacePublishedGitArtifactIngressRequest
+    ) async -> WorkspacePublishedGitArtifactIngressResult {
+        func staleRootResult() -> WorkspacePublishedGitArtifactIngressResult {
+            WorkspacePublishedGitArtifactIngressResult(outcomes: request.artifacts.map {
+                WorkspacePublishedGitArtifactIngressOutcome(artifact: $0, status: .staleRoot)
+            })
+        }
+
+        guard let initialState = exactRootState(
+            expectedRoot: request.root,
+            expectedKind: .workspaceGitData
+        ) else {
+            return staleRootResult()
+        }
+        let expectedBatchLifetimeID = initialState.lifetimeID
+
+        var outcomes: [WorkspacePublishedGitArtifactIngressOutcome] = []
+        var seenAbsolutePaths = Set<String>()
+
+        func append(
+            _ artifact: GitDiffPublishedArtifact,
+            _ status: WorkspacePublishedGitArtifactIngressOutcomeStatus
+        ) {
+            outcomes.append(WorkspacePublishedGitArtifactIngressOutcome(
+                artifact: artifact,
+                status: status
+            ))
+        }
+
+        for artifact in request.artifacts {
+            let relativePath = artifact.gitDataRelativePath
+            guard GitDiffArtifactPathPolicy.isSafeRelativeArtifactPath(relativePath) else {
+                append(artifact, .invalidRelativePath)
+                continue
+            }
+
+            let absolutePath = artifact.absolutePath
+            guard absolutePath.hasPrefix("/"),
+                  !StandardizedPath.containsNUL(absolutePath),
+                  StandardizedPath.isDescendant(absolutePath, of: request.root.standardizedFullPath),
+                  absolutePath != request.root.standardizedFullPath
+            else {
+                append(artifact, .outsideExpectedRoot)
+                continue
+            }
+
+            let reconstructedPath = StandardizedPath.join(
+                standardizedRoot: request.root.standardizedFullPath,
+                standardizedRelativePath: relativePath
+            )
+            guard reconstructedPath == absolutePath else {
+                append(artifact, .outsideExpectedRoot)
+                continue
+            }
+
+            guard seenAbsolutePaths.insert(absolutePath).inserted else {
+                append(artifact, .duplicateOf(path: absolutePath))
+                continue
+            }
+
+            guard let state = exactRootState(
+                expectedRoot: request.root,
+                expectedKind: .workspaceGitData
+            ), state.lifetimeID == expectedBatchLifetimeID else {
+                return staleRootResult()
+            }
+            let eligibility = await state.service.registerExplicitlyManagedRegularFile(
+                relativePath: relativePath
+            )
+            #if DEBUG
+                if let publishedGitArtifactIngressDidRegisterHandler {
+                    await publishedGitArtifactIngressDidRegisterHandler(request.root.id, relativePath)
+                }
+            #endif
+
+            guard let revalidatedState = exactRootState(
+                expectedRoot: request.root,
+                expectedKind: .workspaceGitData
+            ), revalidatedState.lifetimeID == expectedBatchLifetimeID else {
+                return staleRootResult()
+            }
+
+            let managedOnly: Bool
+            switch eligibility {
+            case .eligible:
+                managedOnly = false
+            case .ineligible(.ignored):
+                managedOnly = true
+            case .ineligible(.missingOrDirectory):
+                pruneCatalogFileMissingOnDisk(
+                    rootID: request.root.id,
+                    relativePath: relativePath,
+                    publishDelta: true
+                )
+                append(artifact, .missingOnDisk)
+                continue
+            case let .ineligible(reason):
+                append(artifact, .ineligible(reason: reason))
+                continue
+            }
+
+            do {
+                let record = try materializeCatalogRegularFile(
+                    rootID: request.root.id,
+                    relativePath: relativePath,
+                    managedOnly: managedOnly
+                )
+                append(artifact, .cataloged(record: record))
+            } catch {
+                if !regularFileAppearsPresentOnDisk(
+                    root: revalidatedState.root,
+                    relativePath: relativePath
+                ) {
+                    append(artifact, .missingOnDisk)
+                } else {
+                    append(artifact, .materializationFailed(reason: error.localizedDescription))
+                }
+            }
+        }
+
+        guard let finalState = exactRootState(
+            expectedRoot: request.root,
+            expectedKind: .workspaceGitData
+        ), finalState.lifetimeID == expectedBatchLifetimeID else {
+            return staleRootResult()
+        }
+        return WorkspacePublishedGitArtifactIngressResult(outcomes: outcomes)
     }
 
     private func explicitDiskLookupCandidates(
@@ -5742,7 +8119,19 @@ actor WorkspaceFileContextStore {
     }
 
     func lookupPath(_ request: WorkspacePathLookupRequest) async -> WorkspacePathLookupResult? {
-        await lookupPath(request, rootRefs: rootRefs(scope: request.rootScope))
+        let normalizedPath = normalizeUserInputPath(request.userPath)
+        guard !normalizedPath.isEmpty else { return nil }
+
+        let selectedFileFullPaths = request.selectedFileFullPaths
+        let staticData = buildStaticSnapshot(scope: request.rootScope)
+        guard let match = await pathMatchWorker.locate(
+            userPath: normalizedPath,
+            profile: request.profile,
+            staticData: staticData,
+            selectedFileFullPaths: selectedFileFullPaths,
+            selectionSig: selectionSignature(for: selectedFileFullPaths)
+        ) else { return nil }
+        return lookupResult(input: request.userPath, match: match)
     }
 
     func lookupPath(
@@ -5849,6 +8238,13 @@ actor WorkspaceFileContextStore {
         return nil
     }
 
+    func lookupDiscoverablePath(rootID: UUID, relativePath: String) -> WorkspacePathLookupResult? {
+        guard let result = lookupPath(rootID: rootID, relativePath: relativePath),
+              isDiscoverableLookupResult(result)
+        else { return nil }
+        return result
+    }
+
     func lookupDiscoverableCatalogPathForExactAbsoluteSearchScope(
         _ userPath: String,
         rootScope: WorkspaceLookupRootScope
@@ -5873,6 +8269,262 @@ actor WorkspaceFileContextStore {
         rootsForPathLookup(scope: scope).map {
             WorkspaceRootRef(id: $0.id, name: $0.name, fullPath: $0.standardizedFullPath)
         }
+    }
+
+    /// Returns one already-loaded root by exact path and kind without consulting a lookup scope.
+    /// This is intentionally not a discovery API: it never loads, enumerates, or aliases roots.
+    func exactRootRef(path: String, kind: WorkspaceRootKind) -> WorkspaceRootRef? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed),
+              trimmed.hasPrefix("/")
+        else { return nil }
+
+        let standardizedPath = StandardizedPath.absolute(trimmed)
+        guard let rootID = rootIDsByStandardizedPath[standardizedPath],
+              let state = rootStatesByID[rootID],
+              state.root.kind == kind,
+              state.root.standardizedFullPath == standardizedPath
+        else { return nil }
+
+        return WorkspaceRootRef(
+            id: state.root.id,
+            name: state.root.name,
+            fullPath: state.root.standardizedFullPath
+        )
+    }
+
+    /// Resolves one Context Builder selection candidate against an exact Agent-owned
+    /// session root. This route never consults another root, aliases, general lookup, or
+    /// raw filesystem fallback.
+    func resolveContextBuilderSelectionCandidate(
+        path rawPath: String,
+        authorization: WorkspaceSessionRootAuthorization,
+        folderPolicy: SelectedGitDiffFolderPolicy
+    ) async throws -> WorkspaceAuthorizedSelectionCandidateResolution {
+        try Task.checkCancellation()
+        if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+            return .staleAuthority(mismatch)
+        }
+
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed)
+        else {
+            return .blockedOrAmbiguous(.invalidPath)
+        }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else {
+            return .blockedOrAmbiguous(.invalidPath)
+        }
+        let standardizedPath = StandardizedPath.absolute(expanded)
+        let selectsAuthorizedRoot = standardizedPath == authorization.root.standardizedFullPath
+        guard selectsAuthorizedRoot
+            || StandardizedPath.isDescendant(
+                standardizedPath,
+                of: authorization.root.standardizedFullPath
+            )
+        else {
+            return .blockedOrAmbiguous(.outsideAuthorizedRoot)
+        }
+
+        if selectsAuthorizedRoot {
+            let expandsFolders = switch folderPolicy {
+            case .filesOnly: false
+            case .expandFolders: true
+            }
+            guard expandsFolders,
+                  let folder = rootFolderRecord(rootID: authorization.root.id)
+            else {
+                return .noCandidate
+            }
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            return .resolved(files: descendantFiles(in: folder.id), route: .catalogFolder)
+        }
+
+        let relativePath = relativePath(
+            for: standardizedPath,
+            rootPath: authorization.root.standardizedFullPath
+        )
+        guard !relativePath.isEmpty,
+              relativePath != "..",
+              !relativePath.hasPrefix("../")
+        else {
+            return .blockedOrAmbiguous(.outsideAuthorizedRoot)
+        }
+        guard let state = rootStatesByID[authorization.root.id] else {
+            return .staleAuthority(.rootID)
+        }
+
+        let eligibility = await state.service.catalogRegularFileEligibility(
+            relativePath: relativePath
+        )
+        #if DEBUG
+            if let contextBuilderSelectionCandidateEligibilityDidResolveHandler {
+                await contextBuilderSelectionCandidateEligibilityDidResolveHandler(authorization.root.id)
+            }
+        #endif
+        try Task.checkCancellation()
+        if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+            return .staleAuthority(mismatch)
+        }
+
+        switch eligibility {
+        case .eligible, .ineligible(.ignored):
+            if let record = file(rootID: authorization.root.id, relativePath: relativePath),
+               record.rootID == authorization.root.id,
+               record.standardizedFullPath == standardizedPath
+            {
+                return .resolved(files: [record], route: .catalogFile)
+            }
+
+            let registered = await state.service.registerExplicitlyManagedRegularFile(
+                relativePath: relativePath
+            )
+            try Task.checkCancellation()
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            let managedOnly: Bool
+            switch registered {
+            case .eligible:
+                managedOnly = false
+            case .ineligible(.ignored):
+                managedOnly = true
+            case .ineligible(.missingOrDirectory):
+                return .noCandidate
+            case let .ineligible(reason):
+                return .blockedOrAmbiguous(
+                    contextBuilderSelectionCandidateBlock(for: reason)
+                )
+            }
+            do {
+                let record = try materializeCatalogRegularFile(
+                    rootID: authorization.root.id,
+                    relativePath: relativePath,
+                    managedOnly: managedOnly
+                )
+                if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                    return .staleAuthority(mismatch)
+                }
+                return .resolved(files: [record], route: .materializedFile)
+            } catch {
+                return .blockedOrAmbiguous(.materializationFailed)
+            }
+
+        case .ineligible(.missingOrDirectory):
+            let expandsFolders = switch folderPolicy {
+            case .filesOnly: false
+            case .expandFolders: true
+            }
+            guard expandsFolders,
+                  let folder = folder(rootID: authorization.root.id, relativePath: relativePath),
+                  isDiscoverableFolderID(folder.id)
+            else {
+                return .noCandidate
+            }
+            if let mismatch = sessionRootAuthorizationMismatch(authorization) {
+                return .staleAuthority(mismatch)
+            }
+            return .resolved(files: descendantFiles(in: folder.id), route: .catalogFolder)
+
+        case let .ineligible(reason):
+            return .blockedOrAmbiguous(
+                contextBuilderSelectionCandidateBlock(for: reason)
+            )
+        }
+    }
+
+    private func contextBuilderSelectionCandidateBlock(
+        for reason: CatalogRegularFileIneligibilityReason
+    ) -> WorkspaceAuthorizedSelectionCandidateBlock {
+        switch reason {
+        case .invalidRelativePath:
+            .invalidPath
+        case .outsideRoot:
+            .outsideAuthorizedRoot
+        case .symbolicLink:
+            .symbolicLink
+        case .symlinkComponent:
+            .symlinkComponent
+        case .outsideCanonicalRoot:
+            .outsideCanonicalRoot
+        case .nonRegularFile:
+            .nonRegularFile
+        case .missingOrDirectory, .ignored:
+            .materializationFailed
+        }
+    }
+
+    /// Returns one exact catalog record under a previously frozen root identity.
+    /// Missing records remain missing; this never materializes an ignored or on-disk file.
+    func exactCatalogFile(
+        absolutePath: String,
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) -> WorkspaceFileRecord? {
+        guard let state = exactRootState(expectedRoot: expectedRoot, expectedKind: expectedKind) else {
+            return nil
+        }
+
+        let trimmed = absolutePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !StandardizedPath.containsNUL(trimmed),
+              trimmed.hasPrefix("/")
+        else { return nil }
+
+        let standardizedPath = StandardizedPath.absolute(trimmed)
+        guard StandardizedPath.isDescendant(standardizedPath, of: state.root.standardizedFullPath),
+              standardizedPath != state.root.standardizedFullPath
+        else { return nil }
+
+        let relativePath = relativePath(for: standardizedPath, rootPath: state.root.standardizedFullPath)
+        guard let record = file(rootID: state.root.id, relativePath: relativePath),
+              record.rootID == state.root.id,
+              record.standardizedFullPath == standardizedPath
+        else { return nil }
+        return record
+    }
+
+    /// Reads one exact, already-cataloged record and revalidates its root lifetime after the await.
+    /// No raw absolute-path or filesystem fallback is permitted.
+    func readExactCatalogFile(
+        _ file: WorkspaceFileRecord,
+        expectedRoot: WorkspaceRootRef
+    ) async -> String? {
+        guard let state = exactRootState(expectedRoot: expectedRoot, expectedKind: .workspaceGitData),
+              file.rootID == state.root.id,
+              let current = self.file(rootID: state.root.id, relativePath: file.standardizedRelativePath),
+              current.id == file.id,
+              current.standardizedFullPath == file.standardizedFullPath
+        else { return nil }
+
+        let expectedLifetimeID = state.lifetimeID
+        let content = try? await state.service.loadContent(ofRelativePath: file.standardizedRelativePath)
+
+        guard let currentState = rootStatesByID[expectedRoot.id],
+              currentState.lifetimeID == expectedLifetimeID,
+              currentState.root.standardizedFullPath == expectedRoot.standardizedFullPath,
+              currentState.root.kind == .workspaceGitData,
+              let revalidated = self.file(rootID: expectedRoot.id, relativePath: file.standardizedRelativePath),
+              revalidated.id == file.id,
+              revalidated.standardizedFullPath == file.standardizedFullPath
+        else { return nil }
+        return content
+    }
+
+    private func exactRootState(
+        expectedRoot: WorkspaceRootRef,
+        expectedKind: WorkspaceRootKind
+    ) -> RootState? {
+        guard let state = rootStatesByID[expectedRoot.id],
+              state.root.id == expectedRoot.id,
+              state.root.standardizedFullPath == expectedRoot.standardizedFullPath,
+              state.root.kind == expectedKind
+        else { return nil }
+        return state
     }
 
     func displayRootRefsSnapshot() -> WorkspaceDisplayRootRefsSnapshot {
@@ -6157,12 +8809,35 @@ actor WorkspaceFileContextStore {
     }
 
     private func buildStaticSnapshot(scope: WorkspaceLookupRootScope) -> StaticPathMatchData {
-        buildStaticSnapshot(scope: scope, rootRefs: rootRefs(scope: scope))
+        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
+        if var cached = staticPathMatchSnapshotsByScope[scope],
+           cached.snapshot.cacheIdentity == cacheIdentity
+        {
+            cached.lastAccessSequence = nextStaticPathMatchSnapshotAccessSequenceValue()
+            staticPathMatchSnapshotsByScope[scope] = cached
+            return cached.snapshot
+        }
+        let snapshot = buildStaticSnapshot(
+            rootRefs: rootRefs(scope: scope),
+            cacheIdentity: cacheIdentity
+        )
+        cacheStaticPathMatchSnapshot(snapshot, scope: scope)
+        return snapshot
     }
 
     private func buildStaticSnapshot(
         scope: WorkspaceLookupRootScope,
         rootRefs roots: [WorkspaceRootRef]
+    ) -> StaticPathMatchData {
+        buildStaticSnapshot(
+            rootRefs: roots,
+            cacheIdentity: pathMatchCacheIdentity(scope: scope, rootRefs: roots)
+        )
+    }
+
+    private func buildStaticSnapshot(
+        rootRefs roots: [WorkspaceRootRef],
+        cacheIdentity: PathMatchCacheIdentity
     ) -> StaticPathMatchData {
         let snapshotState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild)
         defer { EditFlowPerf.end(EditFlowPerf.Stage.ReadFile.pathLookupStaticSnapshotBuild, snapshotState) }
@@ -6208,8 +8883,6 @@ actor WorkspaceFileContextStore {
                 displayName: folder.name
             ) as FolderRecord
         }
-        let cacheIdentity = pathMatchCacheIdentity(scope: scope)
-        pathMatchSnapshotIdentitiesByScope[scope] = cacheIdentity
         return StaticPathMatchData(
             filesByFullPath: fileRecords,
             foldersByFullPath: folderRecords,
@@ -6219,6 +8892,34 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func cacheStaticPathMatchSnapshot(
+        _ snapshot: StaticPathMatchData,
+        scope: WorkspaceLookupRootScope
+    ) {
+        if staticPathMatchSnapshotsByScope[scope] == nil,
+           staticPathMatchSnapshotsByScope.count >= Self.maxCachedStaticPathMatchSnapshotScopes,
+           let eviction = staticPathMatchSnapshotsByScope.min(by: {
+               $0.value.lastAccessSequence < $1.value.lastAccessSequence
+           })
+        {
+            staticPathMatchSnapshotsByScope.removeValue(forKey: eviction.key)
+            if pathMatchSnapshotIdentitiesByScope[eviction.key] == eviction.value.snapshot.cacheIdentity {
+                pathMatchSnapshotIdentitiesByScope.removeValue(forKey: eviction.key)
+            }
+            invalidatePathMatchCache(snapshotIdentities: [eviction.value.snapshot.cacheIdentity])
+        }
+        pathMatchSnapshotIdentitiesByScope[scope] = snapshot.cacheIdentity
+        staticPathMatchSnapshotsByScope[scope] = StaticPathMatchSnapshotCacheEntry(
+            snapshot: snapshot,
+            lastAccessSequence: nextStaticPathMatchSnapshotAccessSequenceValue()
+        )
+    }
+
+    private func nextStaticPathMatchSnapshotAccessSequenceValue() -> UInt64 {
+        nextStaticPathMatchSnapshotAccessSequence &+= 1
+        return nextStaticPathMatchSnapshotAccessSequence
+    }
+
     private func pathMatchCacheIdentity(scope: WorkspaceLookupRootScope) -> PathMatchCacheIdentity {
         PathMatchCacheIdentity(
             scopeID: scopeDiscriminator(scope),
@@ -6226,8 +8927,50 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    private func pathMatchCacheIdentity(
+        scope: WorkspaceLookupRootScope,
+        rootRefs roots: [WorkspaceRootRef]
+    ) -> PathMatchCacheIdentity {
+        var hasher = Hasher()
+        hasher.combine("explicitRootRefs")
+        hasher.combine(scopeDiscriminator(scope))
+        for root in roots {
+            hasher.combine(root.id)
+            hasher.combine(root.standardizedFullPath)
+            hasher.combine(rootStatesByID[root.id]?.lifetimeID)
+            hasher.combine(catalogGenerationsByRootID[root.id] ?? 0)
+        }
+        return PathMatchCacheIdentity(
+            scopeID: scopeDiscriminator(scope),
+            snapshotID: UInt64(bitPattern: Int64(hasher.finalize()))
+        )
+    }
+
+    #if DEBUG
+        func staticPathMatchSnapshotCacheCountForTesting() -> Int {
+            staticPathMatchSnapshotsByScope.count
+        }
+
+        func searchCatalogSnapshotCacheCountForTesting() -> Int {
+            searchCatalogSnapshotsByScope.count
+        }
+
+        func sessionCatalogGenerationForTesting(scope: WorkspaceLookupRootScope) -> UInt64? {
+            sessionCatalogGenerationStatesByScope[scope]?.generation
+        }
+    #endif
+
     private func scopedSnapshotGeneration(scope: WorkspaceLookupRootScope) -> UInt64 {
-        let validationToken = searchCatalogSnapshotValidationToken(scope: scope)
+        scopedSnapshotGeneration(
+            scope: scope,
+            validationToken: searchCatalogSnapshotValidationToken(scope: scope)
+        )
+    }
+
+    private func scopedSnapshotGeneration(
+        scope: WorkspaceLookupRootScope,
+        validationToken: SearchCatalogSnapshotValidationToken
+    ) -> UInt64 {
         switch validationToken {
         case let .staticScope(generation):
             return generation
@@ -6251,12 +8994,34 @@ actor WorkspaceFileContextStore {
         scope: WorkspaceLookupRootScope
     ) -> SearchCatalogSnapshotValidationToken {
         switch scope {
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded:
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData:
             let generation = (catalogGenerationsByScope[scope] ?? 0) &* 3 &+ scopeDiscriminator(scope)
             return .staticScope(generation: generation)
         case let .sessionBoundWorkspace(logicalRootPaths, physicalRootPaths):
             let normalizedLogicalRootPaths = normalizedSessionSelectorPaths(logicalRootPaths).sorted()
             let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths).sorted()
+            let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
+                guard let state = rootStatesByID[root.id] else { return nil }
+                return SearchCatalogRootDependency(
+                    canonicalIdentity: root.standardizedFullPath,
+                    rootID: root.id,
+                    lifetimeID: state.lifetimeID,
+                    generation: catalogGenerationsByRootID[root.id] ?? 0
+                )
+            }.sorted {
+                if $0.canonicalIdentity == $1.canonicalIdentity {
+                    return $0.rootID.uuidString < $1.rootID.uuidString
+                }
+                return $0.canonicalIdentity < $1.canonicalIdentity
+            }
+            return .sessionBound(
+                logicalRootPaths: normalizedLogicalRootPaths,
+                physicalRootPaths: normalizedPhysicalRootPaths,
+                dependencies: dependencies
+            )
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let normalizedLogicalRootPaths = canonicalRoots.map(\.standardizedFullPath).sorted()
+            let normalizedPhysicalRootPaths = physicalRoots.map(\.standardizedFullPath).sorted()
             let dependencies = rootsForPathLookup(scope: scope).compactMap { root -> SearchCatalogRootDependency? in
                 guard let state = rootStatesByID[root.id] else { return nil }
                 return SearchCatalogRootDependency(
@@ -6282,6 +9047,7 @@ actor WorkspaceFileContextStore {
     private func cacheSearchCatalogSnapshot(
         _ snapshot: WorkspaceSearchCatalogSnapshot,
         validationToken: SearchCatalogSnapshotValidationToken,
+        capability: WorkspaceSearchCatalogAccessRequirement,
         scope: WorkspaceLookupRootScope
     ) {
         if searchCatalogSnapshotsByScope[scope] == nil,
@@ -6299,6 +9065,7 @@ actor WorkspaceFileContextStore {
         }
         searchCatalogSnapshotsByScope[scope] = SearchCatalogSnapshotCacheEntry(
             validationToken: validationToken,
+            capability: capability,
             snapshot: snapshot,
             lastAccessSequence: nextSearchCatalogAccessSequence()
         )
@@ -6317,11 +9084,19 @@ actor WorkspaceFileContextStore {
             return 1
         case .allLoaded:
             return 2
+        case .allLoadedExcludingGitData:
+            return 3
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             var hasher = Hasher()
             hasher.combine("sessionBoundWorkspace")
             hasher.combine(normalizedSessionSelectorPaths(canonicalRootPaths).sorted())
             hasher.combine(normalizedSessionSelectorPaths(physicalRootPaths).sorted())
+            return UInt64(bitPattern: Int64(hasher.finalize()))
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            var hasher = Hasher()
+            hasher.combine("validatedSessionBoundWorkspace")
+            hasher.combine(canonicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
+            hasher.combine(physicalRoots.sorted { $0.id.uuidString < $1.id.uuidString })
             return UInt64(bitPattern: Int64(hasher.finalize()))
         }
     }
@@ -6349,7 +9124,8 @@ actor WorkspaceFileContextStore {
     private static let catalogGenerationScopes: [WorkspaceLookupRootScope] = [
         .visibleWorkspace,
         .visibleWorkspacePlusGitData,
-        .allLoaded
+        .allLoaded,
+        .allLoadedExcludingGitData
     ]
 
     private func scopeIncludesAnyRootKind(_ scope: WorkspaceLookupRootScope, _ kinds: Set<WorkspaceRootKind>) -> Bool {
@@ -6360,7 +9136,9 @@ actor WorkspaceFileContextStore {
             kinds.contains(.primaryWorkspace) || kinds.contains(.workspaceGitData)
         case .allLoaded:
             true
-        case .sessionBoundWorkspace:
+        case .allLoadedExcludingGitData:
+            kinds.contains { $0 != .workspaceGitData }
+        case .sessionBoundWorkspace, .validatedSessionBoundWorkspace:
             kinds.contains(.primaryWorkspace) || kinds.contains(.sessionWorktree)
         }
     }
@@ -6378,6 +9156,8 @@ actor WorkspaceFileContextStore {
             return allRoots.filter { $0.kind == .primaryWorkspace || $0.kind == .workspaceGitData }
         case .allLoaded:
             return allRoots
+        case .allLoadedExcludingGitData:
+            return allRoots.filter { $0.kind != .workspaceGitData }
         case let .sessionBoundWorkspace(canonicalRootPaths, physicalRootPaths):
             let normalizedCanonicalRootPaths = normalizedSessionSelectorPaths(canonicalRootPaths)
             let normalizedPhysicalRootPaths = normalizedSessionSelectorPaths(physicalRootPaths)
@@ -6387,6 +9167,19 @@ actor WorkspaceFileContextStore {
                     normalizedCanonicalRootPaths.contains(root.standardizedFullPath)
                 case .sessionWorktree:
                     normalizedPhysicalRootPaths.contains(root.standardizedFullPath)
+                case .workspaceGitData, .supplementalSystem:
+                    false
+                }
+            }
+        case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
+            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
+            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            return allRoots.filter { root in
+                switch root.kind {
+                case .primaryWorkspace:
+                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
+                case .sessionWorktree:
+                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
                 case .workspaceGitData, .supplementalSystem:
                     false
                 }
@@ -6466,6 +9259,133 @@ actor WorkspaceFileContextStore {
             relativePath: current.standardizedRelativePath,
             publishDelta: true
         )
+    }
+
+    private func retainSliceRebaseSource(
+        content: String?,
+        modificationDate: Date,
+        file: WorkspaceFileRecord,
+        rootLifetimeID: UUID
+    ) {
+        guard let content else { return }
+        let byteCost = content.utf8.count
+        guard byteCost <= Self.maxSliceRebaseSourceEntryBytes,
+              let state = rootStatesByID[file.rootID],
+              state.lifetimeID == rootLifetimeID,
+              self.file(rootID: file.rootID, relativePath: file.standardizedRelativePath)?.id == file.id
+        else { return }
+        let key = SliceRebaseSourceCacheKey(
+            rootID: file.rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath
+        )
+        if let previous = sliceRebaseSourceEntries.removeValue(forKey: key) {
+            sliceRebaseSourceEstimatedBytes -= previous.byteCost
+        }
+        sliceRebaseSourceAccessOrdinal &+= 1
+        let snapshot = WorkspaceSliceRebaseSourceSnapshot(
+            rootID: file.rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath,
+            fullPath: file.standardizedFullPath,
+            text: content,
+            modificationTime: modificationDate.timeIntervalSince1970
+        )
+        sliceRebaseSourceEntries[key] = SliceRebaseSourceCacheEntry(
+            snapshot: snapshot,
+            byteCost: byteCost,
+            accessOrdinal: sliceRebaseSourceAccessOrdinal
+        )
+        sliceRebaseSourceEstimatedBytes += byteCost
+        trimSliceRebaseSourcesIfNeeded()
+    }
+
+    private func takeSliceRebaseSource(
+        rootID: UUID,
+        rootLifetimeID: UUID,
+        file: WorkspaceFileRecord
+    ) -> WorkspaceSliceRebaseSourceSnapshot? {
+        let key = SliceRebaseSourceCacheKey(
+            rootID: rootID,
+            rootLifetimeID: rootLifetimeID,
+            fileID: file.id,
+            relativePath: file.standardizedRelativePath
+        )
+        guard let entry = sliceRebaseSourceEntries.removeValue(forKey: key) else { return nil }
+        sliceRebaseSourceEstimatedBytes -= entry.byteCost
+        guard entry.snapshot.fullPath == file.standardizedFullPath else { return nil }
+        if let recordTime = file.modificationDate?.timeIntervalSince1970,
+           abs(recordTime - entry.snapshot.modificationTime) > 0.001
+        {
+            return nil
+        }
+        return entry.snapshot
+    }
+
+    private func trimSliceRebaseSourcesIfNeeded() {
+        while sliceRebaseSourceEntries.count > Self.maxSliceRebaseSourceEntryCount
+            || sliceRebaseSourceEstimatedBytes > Self.maxSliceRebaseSourceTotalBytes
+        {
+            guard let oldest = sliceRebaseSourceEntries.min(by: { $0.value.accessOrdinal < $1.value.accessOrdinal }) else {
+                break
+            }
+            sliceRebaseSourceEstimatedBytes -= oldest.value.byteCost
+            sliceRebaseSourceEntries.removeValue(forKey: oldest.key)
+        }
+    }
+
+    private func clearSliceRebaseSources() {
+        sliceRebaseSourceEntries.removeAll(keepingCapacity: true)
+        sliceRebaseSourceEstimatedBytes = 0
+    }
+
+    private func removeSliceRebaseSources(
+        rootID: UUID,
+        rootLifetimeID: UUID? = nil,
+        fileID: UUID? = nil
+    ) {
+        let keys = sliceRebaseSourceEntries.keys.filter { key in
+            guard key.rootID == rootID else { return false }
+            if let rootLifetimeID, key.rootLifetimeID != rootLifetimeID { return false }
+            if let fileID, key.fileID != fileID { return false }
+            return true
+        }
+        for key in keys {
+            if let removed = sliceRebaseSourceEntries.removeValue(forKey: key) {
+                sliceRebaseSourceEstimatedBytes -= removed.byteCost
+            }
+        }
+    }
+
+    func sliceRebasePathState(fullPath rawFullPath: String) -> WorkspaceSliceRebasePathState? {
+        let fullPath = StandardizedPath.absolute(rawFullPath)
+        guard let root = rootStatesByID.values
+            .map(\.root)
+            .filter({ fullPath == $0.standardizedFullPath || fullPath.hasPrefix($0.standardizedFullPath + "/") })
+            .max(by: { $0.standardizedFullPath.count < $1.standardizedFullPath.count }),
+            let state = rootStatesByID[root.id]
+        else { return nil }
+        return WorkspaceSliceRebasePathState(
+            rootID: root.id,
+            rootLifetimeID: state.lifetimeID,
+            rootKind: root.kind,
+            appliedIndexGeneration: appliedIndexGenerationsByRootID[root.id] ?? 0
+        )
+    }
+
+    func sliceRebaseFileIsCurrent(
+        rootID: UUID,
+        rootLifetimeID: UUID,
+        fileID: UUID,
+        relativePath: String,
+        fullPath: String
+    ) -> Bool {
+        guard let state = rootStatesByID[rootID], state.lifetimeID == rootLifetimeID,
+              let current = file(rootID: rootID, relativePath: relativePath)
+        else { return false }
+        return current.id == fileID && current.standardizedFullPath == StandardizedPath.absolute(fullPath)
     }
 
     private func invalidateSearchContent(_ file: WorkspaceFileRecord) {
@@ -6576,6 +9496,9 @@ actor WorkspaceFileContextStore {
         pathMatchSnapshotIdentitiesByScope = pathMatchSnapshotIdentitiesByScope.filter { scope, identity in
             identity == pathMatchCacheIdentity(scope: scope)
         }
+        staticPathMatchSnapshotsByScope = staticPathMatchSnapshotsByScope.filter { scope, entry in
+            entry.snapshot.cacheIdentity == pathMatchCacheIdentity(scope: scope)
+        }
         invalidatePathMatchCache(snapshotIdentities: stalePathMatchIdentities)
     }
 
@@ -6684,11 +9607,34 @@ actor WorkspaceFileContextStore {
         let modifiedFileIDs = modifiedFileIDs.filter(isDiscoverableFileID)
         let modifiedFolderIDs = modifiedFolderIDs.filter(isDiscoverableFolderID)
         guard requiresFullResync || !upsertedFiles.isEmpty || !upsertedFolders.isEmpty || !removedFileIDs.isEmpty || !removedFolderIDs.isEmpty || !removedFilePaths.isEmpty || !removedFolderPaths.isEmpty || !modifiedFileIDs.isEmpty || !modifiedFolderIDs.isEmpty else { return }
+        let rootLifetimeID = rootStatesByID[root.id]?.lifetimeID
+        let modifiedFileSourceSnapshotsByID: [UUID: WorkspaceSliceRebaseSourceSnapshot] = Dictionary(
+            uniqueKeysWithValues: modifiedFileIDs.compactMap { fileID -> (UUID, WorkspaceSliceRebaseSourceSnapshot)? in
+                guard let rootLifetimeID,
+                      let file = filesByID[fileID],
+                      let snapshot = takeSliceRebaseSource(
+                          rootID: root.id,
+                          rootLifetimeID: rootLifetimeID,
+                          file: file
+                      )
+                else { return nil }
+                return (fileID, snapshot)
+            }
+        )
         let generation = nextAppliedIndexGeneration(forRootID: root.id)
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordAppliedIndexModification(
+                rootID: root.id,
+                fileIDs: modifiedFileIDs,
+                generation: generation
+            )
+        #endif
         yieldAppliedIndexEvent(WorkspaceAppliedIndexBatchEvent(
             rootID: root.id,
             rootPath: root.standardizedFullPath,
             generation: generation,
+            rootLifetimeID: rootLifetimeID,
+            modifiedFileSourceSnapshotsByID: modifiedFileSourceSnapshotsByID,
             upsertedFiles: upsertedFiles.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
             upsertedFolders: upsertedFolders.sorted { $0.standardizedRelativePath < $1.standardizedRelativePath },
             removedFileIDs: removedFileIDs,
@@ -6730,10 +9676,12 @@ actor WorkspaceFileContextStore {
         guard let fileID = state.fileIDsByRelativePath.removeValue(forKey: key),
               let file = filesByID.removeValue(forKey: fileID)
         else { return nil }
+        removeSliceRebaseSources(rootID: file.rootID, fileID: fileID)
         invalidateSearchContent(file)
         searchContentInvalidationEpochsByFileID.removeValue(forKey: fileID)
         fileIDsByStandardizedFullPath.removeValue(forKey: file.standardizedFullPath)
         managedOnlyFileIDs.remove(fileID)
+        pendingCodemapRepairFileIDs.remove(fileID)
         if codemapSnapshotsByFileID.removeValue(forKey: fileID) != nil {
             invalidateAllCodemapFileAPIsCache()
         }
@@ -6800,6 +9748,7 @@ actor WorkspaceFileContextStore {
 
     private func invalidateAllCodemapFileAPIsCache() {
         cachedCodemapFileAPIAggregate = nil
+        cachedCodemapFileAPIAggregatesByScope.removeAll(keepingCapacity: true)
     }
 
     private func isDiscoverableFileID(_ fileID: UUID) -> Bool {
@@ -6850,7 +9799,8 @@ actor WorkspaceFileContextStore {
         }
     }
 
-    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) {
+    private func applyCodeScanResults(_ results: [CodeScanActor.ScanResult]) async {
+        pendingCodemapRepairFileIDs.subtract(results.map(\.fileID))
         var snapshotsByRootID: [UUID: [WorkspaceCodemapSnapshot]] = [:]
         for result in results {
             guard isDiscoverableFileID(result.fileID),
@@ -6884,6 +9834,7 @@ actor WorkspaceFileContextStore {
                 snapshots: snapshots.sorted { $0.relativePath < $1.relativePath }
             ))
         }
+        await codeScanActor.acknowledgeScanResults(fileIDs: results.map(\.fileID))
     }
 
     private func removeAllCodemapSnapshots() {
@@ -6958,6 +9909,7 @@ actor WorkspaceFileContextStore {
         rootStandardizedPath: String,
         state: RootState,
         visited: inout Set<UUID>,
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         explicitlyIncludedManagedOnlyFileIDs: Set<UUID> = [],
         explicitlyIncludedManagedOnlyFolderIDs: Set<UUID> = []
     ) -> FileTreeFolderSnapshot? {
@@ -6980,6 +9932,7 @@ actor WorkspaceFileContextStore {
                 rootStandardizedPath: rootStandardizedPath,
                 state: state,
                 visited: &visited,
+                codemapSnapshotBundle: codemapSnapshotBundle,
                 explicitlyIncludedManagedOnlyFileIDs: explicitlyIncludedManagedOnlyFileIDs,
                 explicitlyIncludedManagedOnlyFolderIDs: explicitlyIncludedManagedOnlyFolderIDs
             ) {
@@ -6991,7 +9944,7 @@ actor WorkspaceFileContextStore {
                 id: file.id,
                 name: file.name,
                 fileExtension: (file.name as NSString).pathExtension.isEmpty ? nil : (file.name as NSString).pathExtension,
-                hasCodeMap: codemapSnapshotsByFileID[file.id]?.fullPath == file.standardizedFullPath && codemapSnapshotsByFileID[file.id]?.fileAPI != nil
+                hasCodeMap: codemapSnapshotBundle.hasRenderableCodemap(for: file)
             )))
         }
 

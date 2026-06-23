@@ -122,6 +122,14 @@ These files are intentionally compiled as app-integrated diagnostics and live un
 
 No top-level `Sources/RepoPrompt/Notifications` exception remains; app-wide notification-name extensions now live under `Sources/RepoPrompt/App/Notifications`.
 
+## Generated IDE artifacts
+
+The generated Xcode workspace lives under `.build/xcode` and is not part of the
+source layout or a second target graph. `Package.swift` continues to own source,
+target, dependency, and test-resource membership. Edit the generator and
+workflow wrapper under `Scripts`, then regenerate; never edit or track generated
+workspace files. See [`xcode-workspace.md`](xcode-workspace.md).
+
 ## Guardrails
 
 Run the source-layout guardrails before or after source-layout-sensitive changes:

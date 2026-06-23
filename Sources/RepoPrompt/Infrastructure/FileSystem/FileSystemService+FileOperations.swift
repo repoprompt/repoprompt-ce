@@ -390,6 +390,18 @@ extension FileSystemService {
     }
 
     func editFile(atRelativePath relativePath: String, newContent: String) async throws {
+        _ = try await editFile(
+            atRelativePath: relativePath,
+            newContent: newContent,
+            modificationPublicationPolicy: .publishSyntheticModification
+        )
+    }
+
+    func editFile(
+        atRelativePath relativePath: String,
+        newContent: String,
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
+    ) async throws -> FileSystemDeferredEditPublicationToken? {
         try Task.checkCancellation()
         let target = try mutationTarget(forRelativePath: relativePath)
         let fullPath = target.url.path
@@ -427,7 +439,8 @@ extension FileSystemService {
                 await self?.reconcileEditedFile(
                     mutationID: mutation.id,
                     relativePath: target.relativePath,
-                    encoding: encoding
+                    encoding: encoding,
+                    modificationPublicationPolicy: modificationPublicationPolicy
                 )
             } catch {
                 await self?.completeMutationWaiter(
@@ -437,12 +450,20 @@ extension FileSystemService {
             }
         }
         try await awaitUncancellableMutation(mutation.id)
+        guard modificationPublicationPolicy == .deferSyntheticModificationToSuccessfulCaller,
+              deferredEditPublicationsByMutationID[mutation.id] != nil
+        else { return nil }
+        return FileSystemDeferredEditPublicationToken(
+            serviceToken: diagnosticRootToken,
+            mutationID: mutation.id
+        )
     }
 
     private func reconcileEditedFile(
         mutationID: UUID,
         relativePath: String,
-        encoding: String.Encoding
+        encoding: String.Encoding,
+        modificationPublicationPolicy: FileSystemEditModificationPublicationPolicy
     ) async {
         switch await catalogRegularFileEligibility(relativePath: relativePath) {
         case .eligible, .ineligible(.ignored):
@@ -458,8 +479,40 @@ extension FileSystemService {
         visitedPaths.insert(relativePath)
         visitedItems[relativePath] = false
         let modificationDate = try? await getFileModificationDate(atRelativePath: relativePath)
-        publishFileSystemDeltas([.fileModified(relativePath, modificationDate)], source: .syntheticMutation)
+        let deferredPublication = FileSystemDeferredEditPublication(
+            relativePath: relativePath,
+            modificationDate: modificationDate
+        )
+        switch modificationPublicationPolicy {
+        case .publishSyntheticModification:
+            publishDeferredEditPublication(deferredPublication)
+        case .deferSyntheticModificationToSuccessfulCaller:
+            guard mutationWaiters[mutationID] != nil else {
+                publishDeferredEditPublication(deferredPublication)
+                return
+            }
+            deferredEditPublicationsByMutationID[mutationID] = deferredPublication
+        }
         completeMutationWaiter(mutationID)
+    }
+
+    func resolveDeferredEditPublication(
+        _ token: FileSystemDeferredEditPublicationToken,
+        resolution: FileSystemDeferredEditPublicationResolution
+    ) {
+        guard token.serviceToken == diagnosticRootToken,
+              let publication = deferredEditPublicationsByMutationID.removeValue(forKey: token.mutationID)
+        else { return }
+        if resolution == .publishSyntheticFallback {
+            publishDeferredEditPublication(publication)
+        }
+    }
+
+    private func publishDeferredEditPublication(_ publication: FileSystemDeferredEditPublication) {
+        publishFileSystemDeltas(
+            [.fileModified(publication.relativePath, publication.modificationDate)],
+            source: .syntheticMutation
+        )
     }
 
     func checkFilePermissions(atRelativePath relativePath: String) -> Bool {

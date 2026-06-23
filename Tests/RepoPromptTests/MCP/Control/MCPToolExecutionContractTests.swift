@@ -7,6 +7,7 @@ import XCTest
 final class MCPToolExecutionContractTests: XCTestCase {
     func testCentralTimeoutPolicyMatchesProductContract() {
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolExecutionDeadlineSeconds, 30)
+        XCTAssertEqual(MCPTimeoutPolicy.workspaceFreshnessWaitTimeoutSeconds, 30)
         XCTAssertEqual(MCPTimeoutPolicy.workspaceSwitchToolExecutionDeadlineSeconds, 120)
         XCTAssertEqual(MCPTimeoutPolicy.boundedToolCancellationCleanupGraceSeconds, 5)
         XCTAssertEqual(MCPTimeoutPolicy.responseSendDeadlineSeconds, 30)
@@ -18,87 +19,99 @@ final class MCPToolExecutionContractTests: XCTestCase {
         XCTAssertEqual(MCPTimeoutPolicy.worktreeMergeApprovalTimeoutSeconds, 600)
     }
 
-    func testCatalogCoversEveryAdvertisedGlobalAndWindowToolExactlyOnce() {
-        XCTAssertEqual(
-            MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
-            MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames
-        )
-        XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 26)
-        XCTAssertEqual(
-            Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
-            MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count
-        )
-        XCTAssertEqual(
-            Set(MCPToolExecutionContractCatalog.contracts.keys),
-            Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames)
-        )
-        XCTAssertEqual(
-            MCPGlobalToolName.orderedToolNames,
-            ["app_settings", "bind_context", "manage_workspaces"]
-        )
-    }
-
-    func testBoundedCatalogContainsOnlyComputationalAndLocalOperations() {
-        XCTAssertEqual(names(for: .bounded), [
-            MCPGlobalToolName.appSettings,
-            MCPWindowToolName.manageSelection,
-            MCPWindowToolName.fileActions,
-            MCPWindowToolName.getCodeStructure,
-            MCPWindowToolName.getFileTree,
-            MCPWindowToolName.readFile,
-            MCPWindowToolName.workspaceContext,
-            MCPWindowToolName.prompt,
-            MCPWindowToolName.agentManage,
-            MCPWindowToolName.shareThoughts,
-            MCPWindowToolName.setStatus
-        ])
-
-        for toolName in names(for: .bounded) {
-            guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
-                return XCTFail("Expected bounded contract for \(toolName)")
-            }
-            XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline, toolName)
-            XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, toolName)
+    func testAdvertisedToolCatalogMatchesExecutionContractClassificationMatrix() {
+        do {
+            let caseLabel = "testCatalogCoversEveryAdvertisedGlobalAndWindowToolExactlyOnce"
+            XCTAssertEqual(
+                MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
+                MCPGlobalToolName.orderedToolNames + MCPWindowToolGroup.orderedToolNames,
+                caseLabel
+            )
+            XCTAssertEqual(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count, 26, caseLabel)
+            XCTAssertEqual(
+                Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames).count,
+                MCPToolExecutionContractCatalog.orderedAdvertisedToolNames.count,
+                caseLabel
+            )
+            XCTAssertEqual(
+                Set(MCPToolExecutionContractCatalog.contracts.keys),
+                Set(MCPToolExecutionContractCatalog.orderedAdvertisedToolNames),
+                caseLabel
+            )
+            XCTAssertEqual(
+                MCPGlobalToolName.orderedToolNames,
+                ["app_settings", "bind_context", "manage_workspaces"],
+                caseLabel
+            )
         }
-    }
 
-    func testSearchOracleAndContextBuilderUseLongSynchronousExemption() {
-        XCTAssertEqual(names(for: .longSynchronousCancellable), [
-            MCPWindowToolName.search,
-            MCPWindowToolName.oracleUtils,
-            MCPWindowToolName.askOracle,
-            MCPWindowToolName.oracleSend,
-            MCPWindowToolName.oracleChatLog,
-            MCPWindowToolName.contextBuilder
-        ])
-        assertNoWatchdogDeadline(for: names(for: .longSynchronousCancellable))
-    }
+        do {
+            let caseLabel = "testBoundedCatalogContainsOnlyComputationalAndLocalOperations"
+            XCTAssertEqual(names(for: .bounded), [
+                MCPGlobalToolName.appSettings,
+                MCPWindowToolName.manageSelection,
+                MCPWindowToolName.fileActions,
+                MCPWindowToolName.getCodeStructure,
+                MCPWindowToolName.getFileTree,
+                MCPWindowToolName.readFile,
+                MCPWindowToolName.workspaceContext,
+                MCPWindowToolName.prompt,
+                MCPWindowToolName.agentManage,
+                MCPWindowToolName.shareThoughts,
+                MCPWindowToolName.setStatus
+            ], caseLabel)
 
-    func testAgentRunAndExploreUseLifecycleManagedExemption() {
-        XCTAssertEqual(names(for: .lifecycleManagedCancellable), [
-            MCPWindowToolName.agentExplore,
-            MCPWindowToolName.agentRun
-        ])
-        assertNoWatchdogDeadline(for: names(for: .lifecycleManagedCancellable))
-    }
+            for toolName in names(for: .bounded) {
+                guard case let .bounded(deadline, cancellationGrace) = MCPToolExecutionContractCatalog.contract(for: toolName) else {
+                    return XCTFail(caseLabel + ": Expected bounded contract for \(toolName)")
+                }
+                XCTAssertEqual(deadline, MCPTimeoutPolicy.boundedToolExecutionDeadline, caseLabel + ": " + toolName)
+                XCTAssertEqual(cancellationGrace, MCPTimeoutPolicy.boundedToolCancellationCleanupGrace, caseLabel + ": " + toolName)
+            }
+        }
 
-    func testInteractiveToolsUseInteractiveCancellableExemption() {
-        XCTAssertEqual(names(for: .interactiveCancellable), [
-            MCPWindowToolName.applyEdits,
-            MCPWindowToolName.askUser,
-            MCPWindowToolName.waitForNextInstruction
-        ])
-        assertNoWatchdogDeadline(for: names(for: .interactiveCancellable))
-    }
+        do {
+            let caseLabel = "testSearchOracleAndContextBuilderUseLongSynchronousExemption"
+            XCTAssertEqual(names(for: .longSynchronousCancellable), [
+                MCPWindowToolName.search,
+                MCPWindowToolName.oracleUtils,
+                MCPWindowToolName.askOracle,
+                MCPWindowToolName.oracleSend,
+                MCPWindowToolName.oracleChatLog,
+                MCPWindowToolName.contextBuilder
+            ], caseLabel)
+            assertNoWatchdogDeadline(for: names(for: .longSynchronousCancellable), label: caseLabel)
+        }
 
-    func testWorkspaceAndVCSLifecycleToolsUseWorkspaceCancellableExemption() {
-        XCTAssertEqual(names(for: .workspaceLifecycleCancellable), [
-            MCPGlobalToolName.bindContext,
-            MCPGlobalToolName.manageWorkspaces,
-            MCPWindowToolName.git,
-            MCPWindowToolName.manageWorktree
-        ])
-        assertNoWatchdogDeadline(for: names(for: .workspaceLifecycleCancellable))
+        do {
+            let caseLabel = "testAgentRunAndExploreUseLifecycleManagedExemption"
+            XCTAssertEqual(names(for: .lifecycleManagedCancellable), [
+                MCPWindowToolName.agentExplore,
+                MCPWindowToolName.agentRun
+            ], caseLabel)
+            assertNoWatchdogDeadline(for: names(for: .lifecycleManagedCancellable), label: caseLabel)
+        }
+
+        do {
+            let caseLabel = "testInteractiveToolsUseInteractiveCancellableExemption"
+            XCTAssertEqual(names(for: .interactiveCancellable), [
+                MCPWindowToolName.applyEdits,
+                MCPWindowToolName.askUser,
+                MCPWindowToolName.waitForNextInstruction
+            ], caseLabel)
+            assertNoWatchdogDeadline(for: names(for: .interactiveCancellable), label: caseLabel)
+        }
+
+        do {
+            let caseLabel = "testWorkspaceAndVCSLifecycleToolsUseWorkspaceCancellableExemption"
+            XCTAssertEqual(names(for: .workspaceLifecycleCancellable), [
+                MCPGlobalToolName.bindContext,
+                MCPGlobalToolName.manageWorkspaces,
+                MCPWindowToolName.git,
+                MCPWindowToolName.manageWorktree
+            ], caseLabel)
+            assertNoWatchdogDeadline(for: names(for: .workspaceLifecycleCancellable), label: caseLabel)
+        }
     }
 
     func testManageWorkspacesUsesBoundedContractOnlyForSwitchProducingArguments() {
@@ -174,10 +187,15 @@ final class MCPToolExecutionContractTests: XCTestCase {
         }
     }
 
-    private func assertNoWatchdogDeadline(for toolNames: [String]) {
+    private func assertNoWatchdogDeadline(
+        for toolNames: [String],
+        label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         XCTAssertTrue(toolNames.allSatisfy {
             let contract = MCPToolExecutionContractCatalog.contract(for: $0)
             return contract?.deadline == nil && contract?.cancellationGrace == nil
-        })
+        }, label, file: file, line: line)
     }
 }

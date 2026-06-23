@@ -73,6 +73,13 @@ actor FileSystemService {
             requiresFullResync: requiresFullResync,
             deltas: deltas
         )
+        #if DEBUG
+            MCPApplyEditsRebaseProbeRecorder.recordServicePublication(
+                rootToken: diagnosticRootToken,
+                source: source,
+                deltas: deltas
+            )
+        #endif
         #if DEBUG || EDIT_FLOW_PERF
             let publicationCorrelation = EditFlowPerf.makeLifecycleCorrelationIfActive()
             EditFlowPerf.lifecycleEvent(
@@ -153,6 +160,7 @@ actor FileSystemService {
 
     /// Request waiters are actor-owned and may be cancelled independently from detached filesystem I/O.
     var mutationWaiters: [UUID: FileSystemMutationWaiter] = [:]
+    var deferredEditPublicationsByMutationID: [UUID: FileSystemDeferredEditPublication] = [:]
 
     /// Tracks paths we know about, to detect additions/removals
     var visitedPaths = Set<String>()
@@ -363,6 +371,10 @@ actor FileSystemService {
 
         func pendingMutationWaiterCountForTesting() -> Int {
             mutationWaiters.count
+        }
+
+        func pendingDeferredEditPublicationCountForTesting() -> Int {
+            deferredEditPublicationsByMutationID.count
         }
 
         /// Test-only initializer that allows injecting initial state

@@ -37,56 +37,17 @@ func isAutoExpandableEditToolResult(_ item: AgentChatItem) -> Bool {
     return toolName == "apply_edits" || toolName == "apply_patch" || toolName == "edit"
 }
 
-struct AgentOracleOpenContext {
-    let windowID: Int
-    let tabID: UUID?
-    let chatID: String?
-
-    init(windowID: Int, tabID: UUID?, chatID: String? = nil) {
-        self.windowID = windowID
-        self.tabID = tabID
-        self.chatID = chatID
-    }
-}
-
 enum AgentOracleToolRouting {
-    static func stringValue(from json: String?, keys: [String]) -> String? {
-        guard let json else { return nil }
-        let trimmed = json.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        guard let data = trimmed.data(using: .utf8),
-              let object = try? JSONSerialization.jsonObject(with: data, options: [])
-        else {
-            return nil
-        }
-        return stringValue(from: object, keys: keys)
-    }
-
-    private static func stringValue(from value: Any, keys: [String]) -> String? {
-        if let dictionary = value as? [String: Any] {
-            for key in keys {
-                if let string = dictionary[key] as? String {
-                    let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { return trimmed }
-                }
-                if let uuid = dictionary[key] as? UUID {
-                    return uuid.uuidString
-                }
-                if let number = dictionary[key] as? NSNumber {
-                    let text = number.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !text.isEmpty { return text }
-                }
-            }
-            for nested in dictionary.values {
-                if let match = stringValue(from: nested, keys: keys) { return match }
-            }
-        }
-        if let array = value as? [Any] {
-            for element in array {
-                if let match = stringValue(from: element, keys: keys) { return match }
-            }
-        }
-        return nil
+    static func operationPopoverUserInfo(
+        openContext: AgentOracleOpenContext?,
+        chatID: String?,
+        tabID: UUID? = nil
+    ) -> [AnyHashable: Any]? {
+        AgentOraclePopoverRoute(
+            openContext: openContext,
+            chatID: chatID,
+            tabID: tabID
+        )?.notificationUserInfo
     }
 }
 
@@ -765,6 +726,20 @@ private enum ToolCardSubtitleBuilder {
     }
 }
 
+func oracleToolCallPopoverUserInfo(
+    item: AgentChatItem,
+    openContext: AgentOracleOpenContext?
+) -> [AnyHashable: Any]? {
+    guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
+          toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send"
+    else { return nil }
+    let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromSerializedJSON: item.toolArgsJSON)
+    return AgentOracleToolRouting.operationPopoverUserInfo(
+        openContext: openContext,
+        chatID: chatID
+    )
+}
+
 enum ToolCallCardStateResolver {
     static func status(for item: AgentChatItem) -> ToolCardStatus {
         if item.toolResultJSON != nil || item.toolIsError != nil {
@@ -816,19 +791,11 @@ struct ToolCallCard: View {
     }
 
     private var onTap: (() -> Void)? {
-        guard let toolName = normalizedToolCardName(item.toolName)?.lowercased(),
-              toolName == "chat_send" || toolName == "ask_oracle" || toolName == "oracle_send",
-              let oracleOpenContext else { return nil }
+        guard let userInfo = oracleToolCallPopoverUserInfo(
+            item: item,
+            openContext: oracleOpenContext
+        ) else { return nil }
         return {
-            var userInfo: [AnyHashable: Any] = ["windowID": oracleOpenContext.windowID]
-            if let tabID = oracleOpenContext.tabID {
-                userInfo["tabID"] = tabID
-            }
-            if let chatID = AgentOracleToolRouting.stringValue(from: item.toolArgsJSON, keys: ["chat_id", "chatID"])
-                ?? oracleOpenContext.chatID
-            {
-                userInfo["chatID"] = chatID
-            }
             NotificationCenter.default.post(name: .showAgentOraclePopover, object: nil, userInfo: userInfo)
         }
     }

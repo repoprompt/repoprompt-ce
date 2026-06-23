@@ -42,17 +42,6 @@ enum PromptPackagingService {
         """
     }
 
-    private enum GitDiffArtifact {
-        static let rootFolderName = "_git_data"
-
-        static func isDiffArtifactPath(_ fullPath: String) -> Bool {
-            guard fullPath.contains("/\(rootFolderName)/") else { return false }
-            let lower = fullPath.lowercased()
-            guard lower.hasSuffix(".diff") || lower.hasSuffix(".patch") else { return false }
-            return lower.contains("/diff/") || lower.contains("/diffs/")
-        }
-    }
-
     static func partitionPromptEntriesForGitDiff(
         _ entries: [PromptFileEntry]
     ) -> (diffEntries: [PromptFileEntry], codeEntries: [PromptFileEntry]) {
@@ -63,7 +52,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if entry.role == .authorizedGitDiffArtifact {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -214,7 +203,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if entry.role == .authorizedGitDiffArtifact {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -227,6 +216,7 @@ enum PromptPackagingService {
         fromDiffEntries diffEntries: [ResolvedPromptFileEntry]
     ) -> String? {
         let rawParts = generateRawFileTexts(diffEntries)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         return rawParts.isEmpty ? nil : rawParts.joined(separator: "\n\n")
     }
 
@@ -243,6 +233,19 @@ enum PromptPackagingService {
     ) async -> String? {
         if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
             return selected
+        }
+        return await fallback()
+    }
+
+    /// Preserves the selected-artifact-first lazy boundary while retaining structured fallback
+    /// details for diagnostics and tests. The fallback is never evaluated when a readable selected
+    /// patch is present.
+    static func resolveGitDiffResolution(
+        fromDiffEntries diffEntries: [ResolvedPromptFileEntry],
+        fallback: @Sendable () async -> PromptGitDiffResolution
+    ) async -> PromptGitDiffResolution {
+        if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
+            return .selectedArtifact(selected)
         }
         return await fallback()
     }
@@ -287,21 +290,32 @@ enum PromptPackagingService {
     static func generateFileContents(
         _ files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay = .full,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> [String] {
-        let (_, contentBlocks) = generatePartitionedFileBlocks(files, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let (_, contentBlocks) = generatePartitionedFileBlocks(files, filePathDisplay: filePathDisplay, codemapSnapshotBundle: codemapSnapshotBundle, displayPathResolver: displayPathResolver)
         return contentBlocks
+    }
+
+    static func combinedFileMapContent(
+        fileTreeContent: String?,
+        codemapBlocks: [String]
+    ) -> String? {
+        let codemapContent = codemapBlocks.filter { !$0.isEmpty }.joined(separator: "\n\n")
+        let combined = [fileTreeContent ?? "", codemapContent]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+        return combined.isEmpty ? nil : combined
     }
 
     static func generatePartitionedFileBlocks(
         _ files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> (codemapBlocks: [String], contentBlocks: [String]) {
         let (_, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let detailed = generateFileBlocksDetailed(files: codeEntries, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let detailed = generateFileBlocksDetailed(files: codeEntries, filePathDisplay: filePathDisplay, codemapSnapshotBundle: codemapSnapshotBundle, displayPathResolver: displayPathResolver)
         var codemapBlocks: [String] = []
         var contentBlocks: [String] = []
 
@@ -320,7 +334,7 @@ enum PromptPackagingService {
     static func generateFileBlocksDetailed(
         files: [ResolvedPromptFileEntry],
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         displayPathResolver: ((ResolvedPromptFileEntry) -> String?)? = nil
     ) -> [ResolvedPromptFileBlockRecord] {
         var blocks: [ResolvedPromptFileBlockRecord] = []
@@ -334,11 +348,10 @@ enum PromptPackagingService {
                 ?? selectedPath(for: entry, filePathDisplay: filePathDisplay, hasMultipleRoots: hasMultipleRoots)
 
             if entry.isCodemap {
-                if let api = codemapSnapshots[file.id]?.fileAPI {
-                    let description = api.getFullAPIDescription(displayPath: selectedPath)
-                    blocks.append(ResolvedPromptFileBlockRecord(entry: entry, file: file, text: description, isCodemap: true))
-                    continue
+                if let rendered = codemapSnapshotBundle.renderedCodemap(for: file, displayPath: selectedPath) {
+                    blocks.append(ResolvedPromptFileBlockRecord(entry: entry, file: file, text: rendered.text, isCodemap: true))
                 }
+                continue
             }
 
             guard let content = entry.loadedContent else { continue }
@@ -453,15 +466,10 @@ enum PromptPackagingService {
         let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
         let (codemapBlocks, contentBlocks) = await generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay)
 
-        // File Map Snippet - CRITICAL: Check for codemaps OR tree
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+        if let combinedMap = combinedFileMapContent(
+            fileTreeContent: fileTreeContent,
+            codemapBlocks: codemapBlocks
+        ) {
             snippets[.fileMap] = """
             <file_map>
             \(combinedMap)
@@ -565,15 +573,10 @@ enum PromptPackagingService {
         let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
         let (codemapBlocks, contentBlocks) = await generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay)
 
-        // File Map Snippet - CRITICAL: Check for codemaps OR tree
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+        if let combinedMap = combinedFileMapContent(
+            fileTreeContent: fileTreeContent,
+            codemapBlocks: codemapBlocks
+        ) {
             snippets[.fileMap] = """
             <file_map>
             \(combinedMap)
@@ -662,7 +665,7 @@ enum PromptPackagingService {
         includeFiles: Bool,
         includeUserPrompt: Bool,
         filePathDisplay: FilePathDisplay,
-        codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = [:],
+        codemapSnapshotBundle: WorkspaceCodemapSnapshotBundle,
         includeDatetimeInUserInstructions: Bool = false,
         promptSectionsOrder: [PromptSection],
         disabledPromptSections: Set<PromptSection>,
@@ -673,16 +676,12 @@ enum PromptPackagingService {
         var snippets: [PromptSection: String] = [:]
 
         let (diffEntries, codeEntries) = partitionPromptEntriesForGitDiff(files)
-        let (codemapBlocks, contentBlocks) = generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay, codemapSnapshots: codemapSnapshots, displayPathResolver: displayPathResolver)
+        let (codemapBlocks, contentBlocks) = generatePartitionedFileBlocks(codeEntries, filePathDisplay: filePathDisplay, codemapSnapshotBundle: codemapSnapshotBundle, displayPathResolver: displayPathResolver)
 
-        let codemapJoined = codemapBlocks.joined(separator: "\n\n")
-        let hasTree = fileTreeContent != nil && !fileTreeContent!.isEmpty
-        let hasCodemaps = !codemapJoined.isEmpty
-
-        if hasTree || hasCodemaps {
-            let combinedMap = [fileTreeContent ?? "", codemapJoined]
-                .filter { !$0.isEmpty }
-                .joined(separator: "\n\n")
+        if let combinedMap = combinedFileMapContent(
+            fileTreeContent: fileTreeContent,
+            codemapBlocks: codemapBlocks
+        ) {
             snippets[.fileMap] = """
             <file_map>
             \(combinedMap)

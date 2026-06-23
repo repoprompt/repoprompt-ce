@@ -15,6 +15,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows.map(\.name), ["A", "B", "C"])
         XCTAssertEqual(rows.map(\.fullPath), ["/tmp/A", "/tmp/B", "/tmp/C"])
         XCTAssertEqual(rows.map(\.isPrimary), [true, false, false])
+        XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [rootA.id])
         XCTAssertEqual(rows.map(\.canMoveUp), [false, true, true])
         XCTAssertEqual(rows.map(\.canMoveDown), [true, true, false])
         XCTAssertEqual(rows.map(\.standardizedFullPath), [rootA.standardizedFullPath, rootB.standardizedFullPath, rootC.standardizedFullPath])
@@ -38,6 +39,27 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
                 canMoveDown: false
             )
         ])
+        XCTAssertTrue(rows.filter(\.isPrimary).isEmpty)
+    }
+
+    func testRowsDoNotMarkPrimaryWhenWorkspaceHasNoRoots() {
+        let rows = AgentWorkspaceRootsSidebarStore.rows(from: [])
+
+        XCTAssertTrue(rows.isEmpty)
+        XCTAssertEqual(rows.filter(\.isPrimary).count, 0)
+    }
+
+    func testRowsMarkExactlyFirstRootAsPrimaryAcrossMultiRootCounts() {
+        for rootCount in 2 ... 5 {
+            let projections = (0 ..< rootCount).map { index in
+                makeProjection(name: "Root\(index)", path: "/tmp/Root\(index)")
+            }
+
+            let rows = AgentWorkspaceRootsSidebarStore.rows(from: projections)
+
+            XCTAssertEqual(rows.filter(\.isPrimary).map(\.id), [projections[0].id])
+            XCTAssertEqual(rows.dropFirst().filter(\.isPrimary).count, 0)
+        }
     }
 
     func testRowsAttachGitContextByStandardizedRootPathWithoutChangingOrder() {
@@ -55,6 +77,86 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(rows[1].gitContext, contextB)
         XCTAssertEqual(rows[1].gitContext?.breadcrumbText, "Repo / B / feature/b")
         XCTAssertTrue(rows[1].gitContext?.isMain == true)
+    }
+
+    // MARK: - Root context actions
+
+    func testRootContextActionCopiesRawBranchInsteadOfDisplayText() {
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: "feature/full-branch-name",
+            head: "1234567890abcdef1234567890abcdef12345678"
+        )
+
+        XCTAssertEqual(
+            AgentWorkspaceRootContextValues.rootCheckout(for: context),
+            .branch("feature/full-branch-name")
+        )
+    }
+
+    func testRootContextActionCopiesFullRawHeadInsteadOfDecoratedShortHead() {
+        let fullHead = "abcdef1234567890abcdef1234567890abcdef12"
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: nil,
+            head: fullHead,
+            isDetached: true
+        )
+
+        XCTAssertEqual(context.branchDisplayText, "detached @ abcdef1")
+        XCTAssertEqual(
+            AgentWorkspaceRootContextValues.rootCheckout(for: context),
+            .head(fullHead)
+        )
+    }
+
+    func testRootContextActionOmitsCheckoutWithoutRawBranchOrHead() {
+        let context = makeGitContext(
+            repository: "Repo",
+            worktree: "repo",
+            branch: nil,
+            head: nil
+        )
+
+        XCTAssertNil(AgentWorkspaceRootContextValues.rootCheckout(for: context))
+    }
+
+    func testWorktreeContextActionsUsePersistedRawValues() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(
+                worktreeName: "  wt-raw  ",
+                branch: "  feature/raw  ",
+                worktreeRootPath: "  /tmp/Repo-wt  "
+            ),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: true
+        )
+
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreePath(for: indicator), "/tmp/Repo-wt")
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreeName(for: indicator), "wt-raw")
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreeBranch(for: indicator), "feature/raw")
+    }
+
+    func testUnavailableWorktreeContextActionPreservesTrimmedRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  /tmp/Repo-missing  \n"),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: false
+        )
+
+        XCTAssertEqual(AgentWorkspaceRootContextValues.worktreePath(for: indicator), "/tmp/Repo-missing")
+    }
+
+    func testUnavailableWorktreeContextActionOmitsBlankRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  \n\t  "),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#123456"),
+            isAvailable: false
+        )
+
+        XCTAssertNil(AgentWorkspaceRootContextValues.worktreePath(for: indicator))
     }
 
     // MARK: - Worktree indicators (Item 10)
@@ -126,6 +228,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         XCTAssertEqual(indicator.markerStyle, .ring)
         XCTAssertTrue(indicator.isAvailable)
         XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertTrue(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     func testIndicatorMakeFallsBackToResolvedIdentityForMissingOrInvalidFields() {
@@ -173,7 +277,11 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
     }
 
     func testIndicatorUnavailableSurfacesStaleStateInTooltipAndAccessibility() {
-        let summary = makeSummary(visualLabel: "feature-x", visualColorHex: "#112233")
+        let summary = makeSummary(
+            visualLabel: "feature-x",
+            visualColorHex: "#112233",
+            worktreeRootPath: "  /tmp/Repo-missing  \n"
+        )
         let identity = WorktreeVisualIdentity(colorHex: "#112233")
 
         let indicator = AgentWorktreeIndicator.make(
@@ -183,16 +291,31 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         )
 
         XCTAssertFalse(indicator.isAvailable)
+        XCTAssertEqual(indicator.capsuleText, "WT feature-x")
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertEqual(indicator.missingWorktreePath, "/tmp/Repo-missing")
         XCTAssertTrue(indicator.tooltipText.contains("unavailable"))
         XCTAssertTrue(indicator.tooltipText.contains("feature-x"))
         XCTAssertTrue(indicator.accessibilityText.contains("unavailable"))
+    }
+
+    func testUnavailableIndicatorOmitsBlankRecoveryPath() {
+        let indicator = AgentWorktreeIndicator.make(
+            summary: makeSummary(worktreeRootPath: "  \n\t  "),
+            resolvedIdentity: WorktreeVisualIdentity(colorHex: "#112233"),
+            isAvailable: false
+        )
+
+        XCTAssertFalse(indicator.allowsCompactCapsule)
+        XCTAssertNil(indicator.missingWorktreePath)
     }
 
     private func makeSummary(
         visualLabel: String? = "feature-x",
         visualColorHex: String? = "#123456",
         worktreeName: String? = "wt-name",
-        branch: String? = "main"
+        branch: String? = "main",
+        worktreeRootPath: String = "/tmp/Repo-wt"
     ) -> AgentSessionWorktreeBindingSummary {
         AgentSessionWorktreeBindingSummary(
             id: "binding-1",
@@ -201,7 +324,7 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             logicalRootPath: "/tmp/Repo",
             logicalRootName: "Repo",
             worktreeID: "wt_0123456789abcdef",
-            worktreeRootPath: "/tmp/Repo-wt",
+            worktreeRootPath: worktreeRootPath,
             worktreeName: worktreeName,
             branch: branch,
             visualLabel: visualLabel,
@@ -214,6 +337,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
         repository: String,
         worktree: String,
         branch: String?,
+        head: String? = "1234567890abcdef",
+        isDetached: Bool = false,
         isMain: Bool = true
     ) -> GitWorktreeContextSummary {
         GitWorktreeContextSummary(
@@ -225,8 +350,8 @@ final class AgentWorkspaceRootsSidebarStoreTests: XCTestCase {
             worktreeName: worktree,
             isMain: isMain,
             branch: branch,
-            head: "1234567890abcdef",
-            isDetached: false
+            head: head,
+            isDetached: isDetached
         )
     }
 

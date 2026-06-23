@@ -657,6 +657,68 @@ final class WorkspaceSelectionCoordinatorTests: XCTestCase {
         XCTAssertEqual(changes.last, .init(tabID: inactiveTabID, selection: next, source: .mcpTabContext))
     }
 
+    func testAtomicArtifactTransformMergesIntoLatestCanonicalSelection() async throws {
+        let sourcePath = "/tmp/source.swift"
+        let concurrentPath = "/tmp/concurrent.swift"
+        let mapPath = "/tmp/workspace/_git_data/repos/repo/snapshot/MAP.txt"
+        let patchPath = "/tmp/workspace/_git_data/repos/repo/snapshot/diff/all.patch"
+        let initial = StoredSelection(
+            selectedPaths: [sourcePath],
+            autoCodemapPaths: [mapPath, "/tmp/dependency.swift"],
+            slices: [sourcePath: [LineRange(start: 2, end: 6)]],
+            codemapAutoEnabled: false
+        )
+        let harness = CoordinatorHarness(initialSelection: initial)
+        let coordinator = WorkspaceSelectionCoordinator(workspaceManager: harness.manager, store: harness.store)
+
+        let concurrent = StoredSelection(
+            selectedPaths: [sourcePath, concurrentPath],
+            autoCodemapPaths: initial.autoCodemapPaths,
+            slices: initial.slices,
+            codemapAutoEnabled: initial.codemapAutoEnabled
+        )
+        _ = await coordinator.persistSelection(
+            concurrent,
+            for: harness.identity,
+            source: .runtimeMutation,
+            mirrorToUIIfActive: false
+        )
+
+        let candidates = [
+            GitDiffPublishedArtifact(
+                kind: .map,
+                absolutePath: mapPath,
+                gitDataRelativePath: "repos/repo/snapshot/MAP.txt",
+                clientAlias: "_git_data/repos/repo/snapshot/MAP.txt",
+                selectionDisposition: .primaryAutoSelect
+            ),
+            GitDiffPublishedArtifact(
+                kind: .allPatch,
+                absolutePath: patchPath,
+                gitDataRelativePath: "repos/repo/snapshot/diff/all.patch",
+                clientAlias: "_git_data/repos/repo/snapshot/diff/all.patch",
+                selectionDisposition: .primaryAutoSelect
+            )
+        ]
+        let transactionValue = await coordinator.transformSelection(
+            for: harness.identity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: false
+        ) { latest in
+            WorkspaceGitDiffArtifactSelectionService()
+                .mergePrimaryArtifacts(existing: latest, candidates: candidates)
+                .selection
+        }
+        let transaction = try XCTUnwrap(transactionValue)
+
+        XCTAssertEqual(transaction.before, concurrent)
+        XCTAssertEqual(transaction.after.selectedPaths, [sourcePath, concurrentPath, mapPath, patchPath])
+        XCTAssertEqual(transaction.after.slices, initial.slices)
+        XCTAssertEqual(transaction.after.autoCodemapPaths, ["/tmp/dependency.swift"])
+        XCTAssertFalse(transaction.after.codemapAutoEnabled)
+        XCTAssertEqual(harness.manager.composeTab(for: harness.identity)?.selection, transaction.after)
+    }
+
     func testSelectionSnapshotForInactiveTabDoesNotFlushActiveUI() {
         let initial = StoredSelection(selectedPaths: ["/tmp/active.swift"])
         let inactiveTabID = UUID()

@@ -7,6 +7,26 @@ import OSLog
 actor HeadlessAgentConnectionGate {
     static let shared = HeadlessAgentConnectionGate()
 
+    struct Snapshot {
+        let activeConnectionID: UUID?
+        let queueDepth: Int
+    }
+
+    struct AcquisitionResult {
+        let acquired: Bool
+        let activeConnectionIDAtStart: UUID?
+        let queueDepthAtStart: Int
+        let queueDepthAtAcquire: Int
+        let waitDurationMS: Double
+    }
+
+    struct ReleaseResult {
+        let released: Bool
+        let activeConnectionIDBeforeRelease: UUID?
+        let queueDepthBeforeRelease: Int
+        let resumedWaiter: Bool
+    }
+
     private var activeConnectionID: UUID?
     private struct WaitingContinuation {
         let id: UUID
@@ -48,8 +68,12 @@ actor HeadlessAgentConnectionGate {
     ///
     /// IMPORTANT: This method re-checks ownership after every suspension so that a resumed waiter
     /// cannot overwrite a gate acquisition by a task that arrived between resume and re-entry.
-    /// Returns false if the task was cancelled before acquisition completed.
-    func acquire(_ gateID: UUID) async -> Bool {
+    /// Returns diagnostics used by the MCP bootstrap history/perf surfaces.
+    func acquireWithDiagnostics(_ gateID: UUID) async -> AcquisitionResult {
+        let startUptime = ProcessInfo.processInfo.systemUptime
+        let activeConnectionIDAtStart = activeConnectionID
+        let queueDepthAtStart = waitingContinuations.count
+
         while let currentConnectionID = activeConnectionID {
             log.info("Gate busy; waiting to acquire (gateID=\(gateID.uuidString), current=\(currentConnectionID.uuidString))")
             let waiterID = UUID()
@@ -63,12 +87,38 @@ actor HeadlessAgentConnectionGate {
                     Task { await self.cancelWaitingContinuation(with: waiterID) }
                 }
             )
-            if Task.isCancelled { return false }
+            if Task.isCancelled {
+                return AcquisitionResult(
+                    acquired: false,
+                    activeConnectionIDAtStart: activeConnectionIDAtStart,
+                    queueDepthAtStart: queueDepthAtStart,
+                    queueDepthAtAcquire: waitingContinuations.count,
+                    waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
+                )
+            }
         }
-        if Task.isCancelled { return false }
+        if Task.isCancelled {
+            return AcquisitionResult(
+                acquired: false,
+                activeConnectionIDAtStart: activeConnectionIDAtStart,
+                queueDepthAtStart: queueDepthAtStart,
+                queueDepthAtAcquire: waitingContinuations.count,
+                waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
+            )
+        }
         activeConnectionID = gateID
         log.info("Gate acquired atomically (gateID=\(gateID.uuidString))")
-        return true
+        return AcquisitionResult(
+            acquired: true,
+            activeConnectionIDAtStart: activeConnectionIDAtStart,
+            queueDepthAtStart: queueDepthAtStart,
+            queueDepthAtAcquire: waitingContinuations.count,
+            waitDurationMS: (ProcessInfo.processInfo.systemUptime - startUptime) * 1000
+        )
+    }
+
+    func acquire(_ gateID: UUID) async -> Bool {
+        await acquireWithDiagnostics(gateID).acquired
     }
 
     /// Mark an agent as beginning connection
@@ -77,22 +127,42 @@ actor HeadlessAgentConnectionGate {
         log.info("Gate begin (gateID=\(gateID.uuidString))")
     }
 
-    func completeConnectionReturningStatus(_ gateID: UUID) -> Bool {
+    func completeConnectionReturningDiagnostics(_ gateID: UUID) -> ReleaseResult {
+        let activeConnectionIDBeforeRelease = activeConnectionID
+        let queueDepthBeforeRelease = waitingContinuations.count
         guard activeConnectionID == gateID else {
             let currentConnectionID = activeConnectionID?.uuidString ?? "nil"
             log.info("Gate release no-op (gateID=\(gateID.uuidString), current=\(currentConnectionID))")
-            return false
+            return ReleaseResult(
+                released: false,
+                activeConnectionIDBeforeRelease: activeConnectionIDBeforeRelease,
+                queueDepthBeforeRelease: queueDepthBeforeRelease,
+                resumedWaiter: false
+            )
         }
         activeConnectionID = nil
         log.info("Gate released (gateID=\(gateID.uuidString))")
 
         // Resume ONE waiting agent (FIFO)
+        let resumedWaiter: Bool
         if !waitingContinuations.isEmpty {
             let next = waitingContinuations.removeFirst()
             log.info("Resuming waiting gate permit (id=\(next.id.uuidString))")
             next.continuation.resume()
+            resumedWaiter = true
+        } else {
+            resumedWaiter = false
         }
-        return true
+        return ReleaseResult(
+            released: true,
+            activeConnectionIDBeforeRelease: activeConnectionIDBeforeRelease,
+            queueDepthBeforeRelease: queueDepthBeforeRelease,
+            resumedWaiter: resumedWaiter
+        )
+    }
+
+    func completeConnectionReturningStatus(_ gateID: UUID) -> Bool {
+        completeConnectionReturningDiagnostics(gateID).released
     }
 
     /// Signal that an agent connection completed, unblocking next agent.
@@ -104,6 +174,14 @@ actor HeadlessAgentConnectionGate {
 
     func completeIfActive(_ gateID: UUID) -> Bool {
         completeConnectionReturningStatus(gateID)
+    }
+
+    func completeIfActiveWithDiagnostics(_ gateID: UUID) -> ReleaseResult {
+        completeConnectionReturningDiagnostics(gateID)
+    }
+
+    func snapshot() -> Snapshot {
+        Snapshot(activeConnectionID: activeConnectionID, queueDepth: waitingContinuations.count)
     }
 
     @discardableResult
@@ -176,6 +254,14 @@ extension HeadlessAgentConnectionGate {
         await HeadlessAgentConnectionGate.shared.acquire(gateID)
     }
 
+    static func acquireWithDiagnostics(_ gateID: UUID) async -> AcquisitionResult {
+        await HeadlessAgentConnectionGate.shared.acquireWithDiagnostics(gateID)
+    }
+
+    static func snapshot() async -> Snapshot {
+        await HeadlessAgentConnectionGate.shared.snapshot()
+    }
+
     /// Signal that an agent connection completed
     static func completeConnection(_ gateID: UUID) async {
         await HeadlessAgentConnectionGate.shared.completeConnection(gateID)
@@ -188,6 +274,10 @@ extension HeadlessAgentConnectionGate {
 
     static func completeIfActive(_ gateID: UUID) async -> Bool {
         await HeadlessAgentConnectionGate.shared.completeIfActive(gateID)
+    }
+
+    static func completeIfActiveWithDiagnostics(_ gateID: UUID) async -> ReleaseResult {
+        await HeadlessAgentConnectionGate.shared.completeIfActiveWithDiagnostics(gateID)
     }
 
     static func withPermit<T>(

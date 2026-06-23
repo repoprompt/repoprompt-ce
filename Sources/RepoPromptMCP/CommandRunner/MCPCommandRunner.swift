@@ -231,11 +231,11 @@ actor MCPCommandRunner {
             return
 
         case .all:
-            let tools = try await session.refreshTools()
+            let tools = try await session.cachedToolsOrRefresh()
             await printFilteredToolList(tools, groupFilter: nil)
 
         case let .groups(groups):
-            let allTools = try await session.refreshTools()
+            let allTools = try await session.cachedToolsOrRefresh()
             let filtered = ToolGroupCatalog.filter(tools: allTools, groups: groups)
             let groupNames = groups.map(\.rawValue)
             await printFilteredToolList(filtered, groupFilter: groupNames)
@@ -288,7 +288,7 @@ actor MCPCommandRunner {
     }
 
     private func printToolsSchemaJSON(mode: ToolListMode) async throws {
-        let allTools = try await session.refreshTools()
+        let allTools = try await session.cachedToolsOrRefresh()
         let tools: [MCP.Tool] = switch mode {
         case .groupNames:
             // Not meaningful for JSON schema output; emit all tools
@@ -312,7 +312,7 @@ actor MCPCommandRunner {
     private func describeTool(_ name: String) async throws {
         // Resolve alias to actual tool name
         let resolvedName = MCPCommandParser.resolveToolAlias(name)
-        let tools = try await session.refreshTools()
+        let tools = try await session.cachedToolsOrRefresh()
         guard let tool = tools.first(where: { $0.name == resolvedName }) else {
             if resolvedName != name {
                 await output("Tool '\(name)' (resolved to '\(resolvedName)') not found. Run 'tools' to see available tools.", isError: true)

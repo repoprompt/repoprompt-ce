@@ -109,7 +109,11 @@ enum MCPAgentRoleDefaultsService {
     ) -> Bool {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
         let recommendationAvailability = defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
-        let recommended = AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendationAvailability)
+        let recommended = resolvedRecommendedSelection(
+            for: role,
+            recommendedAvailability: recommendationAvailability,
+            fallbackAvailability: availability
+        )
         let selectionID = AgentModelSelectionID(agentRaw: selection.agent.rawValue, modelRaw: selection.modelRaw)
         var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
 
@@ -163,7 +167,11 @@ enum MCPAgentRoleDefaultsService {
         codexDynamicModels: [CodexAppServerClient.RemoteModel]?
     ) -> RoleDefaultResolution? {
         guard let taskLabel = AgentModelCatalog.taskLabel(for: kind) else { return nil }
-        guard let recommended = AgentModelCatalog.resolveTaskLabelKind(kind, availability: recommendedAvailability) else {
+        guard let recommended = resolvedRecommendedSelection(
+            for: kind,
+            recommendedAvailability: recommendedAvailability,
+            fallbackAvailability: availability
+        ) else {
             return nil
         }
 
@@ -209,5 +217,16 @@ enum MCPAgentRoleDefaultsService {
             hasCustomOverride: hasCustomOverride,
             overrideUnavailable: overrideUnavailable
         )
+    }
+
+    private static func resolvedRecommendedSelection(
+        for role: AgentModelCatalog.TaskLabelKind,
+        recommendedAvailability: AgentModelCatalog.AvailabilityContext,
+        fallbackAvailability: AgentModelCatalog.AvailabilityContext
+    ) -> AgentModelCatalog.NormalizedAgentSelection? {
+        // Recommendation filters pick the preferred default when possible, but they should not hide
+        // role rows when the app still has selectable agents outside the filtered recommendation set.
+        AgentModelCatalog.resolveTaskLabelKind(role, availability: recommendedAvailability)
+            ?? AgentModelCatalog.resolveTaskLabelKind(role, availability: fallbackAvailability)
     }
 }

@@ -7,45 +7,6 @@ actor AgentToolTracker {
     private var trackedRunID: UUID?
     private var hasUnregistered = false
 
-    /// Registers a tool-call observer for a discovery run (by runID).
-    /// Observer registration happens BEFORE waiting for connection, ensuring it's ready
-    /// when tools are called, even during connection handovers.
-    func start(
-        runID: UUID,
-        clientNameHint: String?,
-        connectionTimeoutSeconds: TimeInterval = 10.0,
-        fallbackTimeoutSeconds: TimeInterval = 5.0,
-        keepObserversOnTimeout: Bool = true,
-        onTool: @escaping @Sendable (String) -> Void
-    ) async {
-        let manager = ServerNetworkManager.shared
-
-        // Register observer FIRST, keyed by runID (survives connection handovers)
-        await manager.registerToolCallObserver(for: runID, observer: onTool)
-        trackedRunID = runID
-        hasUnregistered = false
-
-        // Wait for connection (with cancellation checks)
-        guard !Task.isCancelled else {
-            await unregisterObserverOnce(for: runID, manager: manager)
-            return
-        }
-
-        var resolvedID: UUID?
-        if let hint = clientNameHint {
-            resolvedID = await manager.waitForNewConnection(clientName: hint, timeout: connectionTimeoutSeconds)
-        }
-        if !Task.isCancelled, resolvedID == nil {
-            resolvedID = await manager.waitForNewConnection(clientName: nil, timeout: fallbackTimeoutSeconds)
-        }
-
-        if Task.isCancelled {
-            await unregisterObserverOnce(for: runID, manager: manager)
-        } else if resolvedID == nil, !keepObserversOnTimeout {
-            await unregisterObserverOnce(for: runID, manager: manager)
-        }
-    }
-
     /// Registers an enhanced tool event observer that receives args on call and result on completion.
     func registerEnhancedObserver(
         runID: UUID,
@@ -143,6 +104,106 @@ actor AgentToolTracker {
     }
 }
 
+/// Accepts transcript-facing tool events synchronously and delivers them in FIFO order.
+///
+/// MCP observer callbacks enqueue here before their first suspension, so tool dispatch and
+/// completion response paths never wait for main-actor transcript/UI work. Each controller
+/// owns one mailbox, which preserves call-before-completion ordering for that tab while
+/// retaining at most one drain task.
+final class AgentToolEventDeliveryMailbox: @unchecked Sendable {
+    typealias Operation = @Sendable () async -> Void
+
+    private let lock = NSLock()
+    private var queuedOperations: [Operation] = []
+    private var queuedOperationHead = 0
+    private var nextDrainToken: UInt64 = 0
+    private var activeDrainToken: UInt64?
+    private var idleContinuations: [CheckedContinuation<Void, Never>] = []
+
+    func enqueue(_ operation: @escaping Operation) {
+        lock.lock()
+        queuedOperations.append(operation)
+        scheduleDrainIfNeeded()
+        lock.unlock()
+    }
+
+    func waitUntilIdle() async {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            guard activeDrainToken != nil || queuedOperationHead < queuedOperations.count else {
+                lock.unlock()
+                continuation.resume()
+                return
+            }
+            idleContinuations.append(continuation)
+            lock.unlock()
+        }
+    }
+
+    #if DEBUG
+        func queuedOperationCountForTesting() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return queuedOperations.count - queuedOperationHead
+        }
+    #endif
+
+    private func scheduleDrainIfNeeded() {
+        guard activeDrainToken == nil, queuedOperationHead < queuedOperations.count else { return }
+        nextDrainToken &+= 1
+        let token = nextDrainToken
+        activeDrainToken = token
+        Task { [weak self] in
+            await self?.drain(token: token)
+        }
+    }
+
+    private func takeNextOperation(token: UInt64) -> Operation? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeDrainToken == token, queuedOperationHead < queuedOperations.count else {
+            return nil
+        }
+        let operation = queuedOperations[queuedOperationHead]
+        queuedOperationHead += 1
+        if queuedOperationHead == queuedOperations.count {
+            queuedOperations.removeAll(keepingCapacity: true)
+            queuedOperationHead = 0
+        } else if queuedOperationHead >= 64, queuedOperationHead * 2 >= queuedOperations.count {
+            queuedOperations.removeFirst(queuedOperationHead)
+            queuedOperationHead = 0
+        }
+        return operation
+    }
+
+    private func drain(token: UInt64) async {
+        while let operation = takeNextOperation(token: token) {
+            await operation()
+        }
+        drainDidFinish(token: token)
+    }
+
+    private func drainDidFinish(token: UInt64) {
+        lock.lock()
+        guard activeDrainToken == token else {
+            lock.unlock()
+            return
+        }
+        activeDrainToken = nil
+        scheduleDrainIfNeeded()
+        guard activeDrainToken == nil, queuedOperationHead == queuedOperations.count else {
+            lock.unlock()
+            return
+        }
+        let continuations = idleContinuations
+        idleContinuations.removeAll(keepingCapacity: true)
+        lock.unlock()
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+}
+
 // SEARCH-HELPER: AgentToolTrackingController, TrackerLifecycle, TrackerBinding, ToolTracking
 /// Shared lifecycle shim for MCP tool tracking across all provider runtimes.
 ///
@@ -151,7 +212,7 @@ actor AgentToolTracker {
 /// keeps one instance per tab (via `[UUID: AgentToolTrackingController]` dictionary).
 ///
 /// Starting tracking for the same `runID` is a no-op. Starting for a different `runID`
-/// cancels the prior task and re-registers. Callbacks are suppressed if the `trackedRunID`
+/// serializes teardown of the prior registration before re-registering. Callbacks are suppressed if the `trackedRunID`
 /// has changed by delivery time (stale-delivery protection).
 ///
 /// Related:
@@ -161,6 +222,7 @@ actor AgentToolTracker {
 /// - ACPIntegratedAgentModeRunner: /RepoPrompt/Services/AgentMode/Runners/ACPIntegratedAgentModeRunner.swift
 final class AgentToolTrackingController {
     private let tracker = AgentToolTracker()
+    private let eventDeliveryMailbox = AgentToolEventDeliveryMailbox()
     private var trackingTask: Task<Void, Never>?
     private var registrationTask: Task<Void, Never>?
     private var registrationRunID: UUID?
@@ -172,7 +234,7 @@ final class AgentToolTrackingController {
     /// Start tracking MCP tool events for a run, delivering callbacks on the main actor.
     ///
     /// - If `runID` matches the current tracked run, this is a no-op.
-    /// - If a different run is tracked, the prior task is cancelled and the tracker re-registered.
+    /// - If a different run is tracked, prior teardown is serialized before registration.
     /// - Stale callbacks (where `trackedRunID` has changed) are silently dropped.
     @MainActor func startTracking(
         runID: UUID,
@@ -191,23 +253,25 @@ final class AgentToolTrackingController {
         let generation = trackingGeneration
         let previousRegistrationTask = registrationTask
         let previousRunID = registrationRunID ?? trackedRunID
-        previousRegistrationTask?.cancel()
         trackingTask?.cancel()
         trackingTask = nil
-        registrationTask = nil
-        registrationRunID = nil
+        registrationRunID = runID
         trackedRunID = runID
 
-        let registrationTask = Task { [tracker, previousRegistrationTask, previousRunID] in
+        let registrationTask = Task { [weak self, tracker, eventDeliveryMailbox, previousRegistrationTask, previousRunID] in
             if let previousRegistrationTask {
                 await previousRegistrationTask.value
             }
-            guard !Task.isCancelled else { return }
             await tracker.stop(ifTracking: previousRunID)
-            guard !Task.isCancelled else { return }
+            await eventDeliveryMailbox.waitUntilIdle()
+            let shouldRegister = await MainActor.run { [weak self] in
+                guard let self else { return false }
+                return trackedRunID == runID && trackingGeneration == generation
+            }
+            guard shouldRegister else { return }
             await tracker.registerEnhancedObserver(
                 runID: runID,
-                onCalled: { [weak self] invocationID, toolName, args in
+                onCalled: { [weak self, eventDeliveryMailbox] invocationID, toolName, args in
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -215,39 +279,45 @@ final class AgentToolTrackingController {
                             EditFlowPerf.Dimensions(toolName: toolName, observerType: "event_call", runID: runID.uuidString)
                         )
                     #endif
-                    #if DEBUG
-                        let bodyDurationMicroseconds = await MainActor.run { [weak self] in
-                            let enteredAt = DispatchTime.now().uptimeNanoseconds
+                    MCPToolObserverAttributionContext.record(
+                        correlationPath: "deferred_transcript_fifo",
+                        scannedItemCount: 0
+                    )
+                    eventDeliveryMailbox.enqueue { [weak self] in
+                        #if DEBUG
+                            let bodyDurationMicroseconds = await MainActor.run { [weak self] in
+                                let enteredAt = DispatchTime.now().uptimeNanoseconds
+                                EditFlowPerf.lifecycleEvent(
+                                    EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                    EditFlowPerf.Dimensions(
+                                        toolName: toolName,
+                                        observerType: "event_call",
+                                        queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                        runID: runID.uuidString
+                                    )
+                                )
+                                guard let self, shouldDeliverCallback(for: runID) else { return 0 }
+                                onCalled(invocationID, toolName, args)
+                                return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
+                            }
                             EditFlowPerf.lifecycleEvent(
-                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
                                 EditFlowPerf.Dimensions(
                                     toolName: toolName,
                                     observerType: "event_call",
-                                    queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                    durationMicroseconds: bodyDurationMicroseconds,
                                     runID: runID.uuidString
                                 )
                             )
-                            guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                            onCalled(invocationID, toolName, args)
-                            return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
-                        }
-                        EditFlowPerf.lifecycleEvent(
-                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
-                            EditFlowPerf.Dimensions(
-                                toolName: toolName,
-                                observerType: "event_call",
-                                durationMicroseconds: bodyDurationMicroseconds,
-                                runID: runID.uuidString
-                            )
-                        )
-                    #else
-                        await MainActor.run { [weak self] in
-                            guard let self, shouldDeliverCallback(for: runID) else { return }
-                            onCalled(invocationID, toolName, args)
-                        }
-                    #endif
+                        #else
+                            await MainActor.run { [weak self] in
+                                guard let self, shouldDeliverCallback(for: runID) else { return }
+                                onCalled(invocationID, toolName, args)
+                            }
+                        #endif
+                    }
                 },
-                onCompleted: { [weak self] invocationID, toolName, args, resultJSON, isError in
+                onCompleted: { [weak self, eventDeliveryMailbox] invocationID, toolName, args, resultJSON, isError in
                     #if DEBUG
                         let scheduledAt = DispatchTime.now().uptimeNanoseconds
                         EditFlowPerf.lifecycleEvent(
@@ -255,38 +325,44 @@ final class AgentToolTrackingController {
                             EditFlowPerf.Dimensions(toolName: toolName, observerType: "event_completion", runID: runID.uuidString)
                         )
                     #endif
-                    #if DEBUG
-                        let bodyDurationMicroseconds = await MainActor.run { [weak self] in
-                            let enteredAt = DispatchTime.now().uptimeNanoseconds
+                    MCPToolObserverAttributionContext.record(
+                        correlationPath: "deferred_transcript_fifo",
+                        scannedItemCount: 0
+                    )
+                    eventDeliveryMailbox.enqueue { [weak self] in
+                        #if DEBUG
+                            let bodyDurationMicroseconds = await MainActor.run { [weak self] in
+                                let enteredAt = DispatchTime.now().uptimeNanoseconds
+                                EditFlowPerf.lifecycleEvent(
+                                    EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                    EditFlowPerf.Dimensions(
+                                        toolName: toolName,
+                                        observerType: "event_completion",
+                                        queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                        runID: runID.uuidString
+                                    )
+                                )
+                                guard let self, shouldDeliverCallback(for: runID) else { return 0 }
+                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                                return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
+                            }
                             EditFlowPerf.lifecycleEvent(
-                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorEntered,
+                                EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
                                 EditFlowPerf.Dimensions(
                                     toolName: toolName,
                                     observerType: "event_completion",
-                                    queueDelayMicroseconds: Int((enteredAt - scheduledAt) / 1000),
+                                    durationMicroseconds: bodyDurationMicroseconds,
+                                    resultBytes: resultJSON.utf8.count,
                                     runID: runID.uuidString
                                 )
                             )
-                            guard let self, shouldDeliverCallback(for: runID) else { return 0 }
-                            onCompleted(invocationID, toolName, args, resultJSON, isError)
-                            return Int((DispatchTime.now().uptimeNanoseconds - enteredAt) / 1000)
-                        }
-                        EditFlowPerf.lifecycleEvent(
-                            EditFlowPerf.Lifecycle.MCPToolCall.mainActorExited,
-                            EditFlowPerf.Dimensions(
-                                toolName: toolName,
-                                observerType: "event_completion",
-                                durationMicroseconds: bodyDurationMicroseconds,
-                                resultBytes: resultJSON.utf8.count,
-                                runID: runID.uuidString
-                            )
-                        )
-                    #else
-                        await MainActor.run { [weak self] in
-                            guard let self, shouldDeliverCallback(for: runID) else { return }
-                            onCompleted(invocationID, toolName, args, resultJSON, isError)
-                        }
-                    #endif
+                        #else
+                            await MainActor.run { [weak self] in
+                                guard let self, shouldDeliverCallback(for: runID) else { return }
+                                onCompleted(invocationID, toolName, args, resultJSON, isError)
+                            }
+                        #endif
+                    }
                 }
             )
         }
@@ -368,29 +444,35 @@ final class AgentToolTrackingController {
         trackingGeneration &+= 1
         let stopGeneration = trackingGeneration
         let stoppedRunID = registrationRunID ?? trackedRunID
-        let registrationToCancel = registrationTask
+        let previousRegistrationTask = registrationTask
         let trackingToCancel = trackingTask
         trackedRunID = nil
-        registrationToCancel?.cancel()
+        registrationRunID = nil
         trackingToCancel?.cancel()
+        trackingTask = nil
 
-        if let registrationToCancel {
-            await registrationToCancel.value
+        let stopTask = Task { [tracker, eventDeliveryMailbox, previousRegistrationTask, trackingToCancel, stoppedRunID] in
+            if let previousRegistrationTask {
+                await previousRegistrationTask.value
+            }
+            if let trackingToCancel {
+                await trackingToCancel.value
+            }
+            await tracker.stop(ifTracking: stoppedRunID)
+            await eventDeliveryMailbox.waitUntilIdle()
         }
-        if let trackingToCancel {
-            await trackingToCancel.value
-        }
+        registrationTask = stopTask
+        await stopTask.value
 
         guard trackingGeneration == stopGeneration, trackedRunID == nil else { return }
-        if registrationTask != nil {
-            registrationTask = nil
-            registrationRunID = nil
-        }
-        if trackingTask != nil {
-            trackingTask = nil
-        }
-        await tracker.stop(ifTracking: stoppedRunID)
+        registrationTask = nil
     }
+
+    #if DEBUG
+        func waitForPendingEventDeliveriesForTesting() async {
+            await eventDeliveryMailbox.waitUntilIdle()
+        }
+    #endif
 
     // MARK: - Helpers
 

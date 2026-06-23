@@ -66,6 +66,26 @@ enum FileSystemDeltaPublicationSource: String {
     case recoveryFullResync
 }
 
+enum FileSystemEditModificationPublicationPolicy: Equatable {
+    case publishSyntheticModification
+    case deferSyntheticModificationToSuccessfulCaller
+}
+
+struct FileSystemDeferredEditPublicationToken: Equatable {
+    let serviceToken: UUID
+    let mutationID: UUID
+}
+
+enum FileSystemDeferredEditPublicationResolution: Equatable {
+    case callerPublishedCanonicalModification
+    case publishSyntheticFallback
+}
+
+struct FileSystemDeferredEditPublication {
+    let relativePath: String
+    let modificationDate: Date?
+}
+
 struct FileSystemDeltaPublication {
     let servicePublicationSequence: UInt64
     let source: FileSystemDeltaPublicationSource
@@ -172,6 +192,7 @@ enum ContentReadWorkloadClass: String {
     case contentSearch
     case codemap
     case encodingDetection
+    case promptAccounting
     case unspecified
 }
 

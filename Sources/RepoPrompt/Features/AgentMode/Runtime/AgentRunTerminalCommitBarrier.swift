@@ -10,6 +10,7 @@ struct AgentRunTerminalCommitRevision: Equatable {
     let commitID: UUID
     let ownership: AgentRunOwnership
     let terminalState: AgentSessionRunState
+    let expectedRunID: UUID?
     let sourceItemsRevision: Int
     let assistantDeltaFlushGeneration: UInt64
     let providerDrainGeneration: UInt64
@@ -172,6 +173,7 @@ final class AgentRunTerminalCommitBarrier {
             recordRejection("provider_buffers_pending", request: request)
             return nil
         }
+        let terminalTurnID = session.items.last(where: { $0.kind == .user })?.id
 
         session.terminalCommitInProgress = true
         recordTerminalBarrierState(true, request: request)
@@ -260,6 +262,13 @@ final class AgentRunTerminalCommitBarrier {
         _ = session.endRunAttempt(ifCurrent: request.ownership, source: request.source)
         hooks.setAgentRunActive(session.tabID, false)
         hooks.prepareTerminalPublication(session)
+        if let runID = request.expectedRunID, let terminalTurnID {
+            AgentModeProcessRunIdentity.retainProcessRunID(
+                runID,
+                inTranscriptTurnID: terminalTurnID,
+                for: session
+            )
+        }
 
         let successorKind: AgentRunEpochTransitionKind? = if queuedInstruction != nil {
             .relatedFollowUp
@@ -270,13 +279,15 @@ final class AgentRunTerminalCommitBarrier {
             commitID: UUID(),
             ownership: request.ownership,
             terminalState: request.terminalState,
+            expectedRunID: request.expectedRunID,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: request.providerDrainGeneration,
             mcpPublicationEnvelope: hooks.makeTerminalPublicationEnvelope(
                 session,
                 request.ownership,
-                request.terminalState
+                request.terminalState,
+                request.expectedRunID
             ),
             successorKind: successorKind,
             providerSuccessorID: providerSuccessor?.id

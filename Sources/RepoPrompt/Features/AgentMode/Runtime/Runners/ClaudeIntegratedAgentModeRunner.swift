@@ -110,10 +110,16 @@ final class ClaudeIntegratedAgentModeRunner {
                     runID: runID
                 )
 
+                let providerName = session.selectedAgent.rawValue
+                await lease.providerInitializationStarted(provider: providerName)
                 let sent = await self.claudeCoordinator.sendClaudeNativeMessage(
                     session: session,
                     text: initialMessageForRun,
                     attachments: attachments
+                )
+                await lease.providerInitializationCompleted(
+                    provider: providerName,
+                    outcome: sent ? "ready" : (Task.isCancelled ? "cancelled" : "failed")
                 )
                 self.hooks.recordPendingHandoffSendOutcome(session, sent)
                 guard sent else {

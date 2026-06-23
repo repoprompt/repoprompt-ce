@@ -70,7 +70,10 @@ enum AgentModel: String, CaseIterable, Codable {
     case claudeHaiku45 = "claude-haiku-4-5"
 
     // Claude Code GLM aliases
+    case glm45Air = "glm-4.5-air"
     case glm47 = "glm-4.7"
+    case glm52 = "glm-5.2"
+    case glm52_1m = "glm-5.2[1m]"
     case glm5Turbo = "glm-5-turbo"
     case glm5 = "glm-5.1"
 
@@ -118,7 +121,10 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeOpus46: "Opus 4.6"
         case .claudeOpus45: "Opus 4.5"
         case .claudeHaiku45: "Haiku 4.5"
+        case .glm45Air: "GLM 4.5 Air"
         case .glm47: "GLM 4.7"
+        case .glm52: "GLM 5.2"
+        case .glm52_1m: "GLM 5.2 (1M)"
         case .glm5Turbo: "GLM 5 Turbo"
         case .glm5: "GLM 5.1"
         case .kimiCode: "Kimi Code"
@@ -162,9 +168,12 @@ enum AgentModel: String, CaseIterable, Codable {
         case .claudeOpus46: "Pinned Claude Opus 4.6. Opus-tier capability for complex reasoning and architecture."
         case .claudeOpus45: "Pinned Claude Opus 4.5. Opus-tier capability for complex reasoning and architecture."
         case .claudeHaiku45: "Pinned Claude Haiku 4.5. Fast and lightweight for quick edits and exploration."
+        case .glm45Air: "GLM 4.5 Air via Z.ai. Fast and lightweight, good for exploration."
         case .glm47: "GLM tier via Z.ai. Fast and lightweight, good for exploration."
+        case .glm52: "GLM 5.2 tier via Z.ai. Latest GLM tier, good for complex tasks."
+        case .glm52_1m: "GLM 5.2 via Z.ai with 1M context. Best for large codebases and tasks requiring extensive context."
         case .glm5Turbo: "GLM tier via Z.ai. Balanced, good for general work."
-        case .glm5: "GLM 5.1 tier via Z.ai. Strongest GLM tier, good for complex tasks."
+        case .glm5: "GLM 5.1 tier via Z.ai. Strongest legacy GLM tier, good for complex tasks."
         case .kimiCode: "Kimi Code backend. RepoPrompt does not pass a model flag."
         case .customClaudeCompatible: "Custom Claude-compatible backend. RepoPrompt does not pass a model flag when configured for no-model behavior."
         case .cursorAuto: "Let Cursor choose the best model automatically. Built-in fallback for Cursor ACP runs when dynamic model metadata is unavailable."
@@ -439,7 +448,7 @@ enum AgentModel: String, CaseIterable, Codable {
     /// Returns `nil` for models where the context window is unknown or unverified.
     var contextWindowTokens: Int? {
         switch self {
-        case .claudeFable5, .claudeOpus1m:
+        case .claudeFable5, .claudeOpus1m, .glm52_1m:
             1_000_000
         case .claudeSonnet, .claudeOpus, .claudeHaiku,
              .claudeSonnet46, .claudeSonnet45,

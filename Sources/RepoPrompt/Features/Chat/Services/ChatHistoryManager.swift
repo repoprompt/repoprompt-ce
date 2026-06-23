@@ -42,6 +42,12 @@ struct ChatSessionStubLoadBatchResult {
     }
 }
 
+enum ChatSessionLookupResult {
+    case notFound
+    case unique(ChatSession)
+    case ambiguous
+}
+
 /// Chat history limit options
 public enum ChatHistoryLimit: Int, CaseIterable {
     case fifty = 50
@@ -359,11 +365,25 @@ actor ChatDataService {
         id rawID: String,
         composeTabID: UUID? = nil
     ) async throws -> ChatSession? {
+        switch try await findSessionResult(for: workspace, id: rawID, composeTabID: composeTabID) {
+        case .notFound, .ambiguous:
+            nil
+        case let .unique(session):
+            session
+        }
+    }
+
+    func findSessionResult(
+        for workspace: WorkspaceModel,
+        id rawID: String,
+        composeTabID: UUID? = nil
+    ) async throws -> ChatSessionLookupResult {
         let trimmedID = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedID.isEmpty else { return nil }
+        guard !trimmedID.isEmpty else { return .notFound }
 
         let targetUUID = UUID(uuidString: trimmedID)
         let files = try await listChatSessions(for: workspace)
+        var matchingFileURL: URL?
 
         for fileURL in files {
             do {
@@ -371,15 +391,21 @@ actor ChatDataService {
                 if let composeTabID, stub.composeTabID != composeTabID {
                     continue
                 }
-                let matchesID = stub.shortID == trimmedID || (targetUUID.map { stub.id == $0 } ?? false)
+                let matchesID = if let targetUUID {
+                    stub.id == targetUUID
+                } else {
+                    stub.shortID == trimmedID
+                }
                 guard matchesID else { continue }
-                return try await loadChatSession(from: fileURL)
+                guard matchingFileURL == nil else { return .ambiguous }
+                matchingFileURL = fileURL
             } catch {
                 continue
             }
         }
 
-        return nil
+        guard let matchingFileURL else { return .notFound }
+        return try await .unique(loadChatSession(from: matchingFileURL))
     }
 
     /// Load the most recent chat session, optionally restricted to a specific compose tab.

@@ -3,33 +3,37 @@ import RepoPromptShared
 import XCTest
 
 final class JSONRPCBridgeLedgerTests: XCTestCase {
-    func testSameTypedIDCanBeActiveInOppositeDirections() async throws {
-        let ledger = try await makeLedger()
-        try await forward(request(id: "1", method: "tools/list"), .clientToServer, ledger)
-        try await forward(request(id: "1", method: "sampling/createMessage"), .serverToClient, ledger)
+    func testRequestIDNamespacesDistinguishDirectionAndJSONType() async throws {
+        do {
+            let caseLabel = "testSameTypedIDCanBeActiveInOppositeDirections"
+            let ledger = try await makeLedger()
+            try await forward(request(id: "1", method: "tools/list"), .clientToServer, ledger)
+            try await forward(request(id: "1", method: "sampling/createMessage"), .serverToClient, ledger)
 
-        var snapshot = await ledger.snapshot()
-        XCTAssertEqual(snapshot.activeRequestCount, 2)
+            var snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.activeRequestCount, 2, caseLabel)
 
-        try await forward(response(id: "1"), .serverToClient, ledger)
-        try await forward(response(id: "1"), .clientToServer, ledger)
+            try await forward(response(id: "1"), .serverToClient, ledger)
+            try await forward(response(id: "1"), .clientToServer, ledger)
 
-        snapshot = await ledger.snapshot()
-        XCTAssertEqual(snapshot.activeRequestCount, 0)
-        XCTAssertEqual(snapshot.recentCompletionCount, 2)
-    }
+            snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.activeRequestCount, 0, caseLabel)
+            XCTAssertEqual(snapshot.recentCompletionCount, 2, caseLabel)
+        }
 
-    func testNumericAndStringIDsRemainDistinct() async throws {
-        let ledger = try await makeLedger()
-        try await forward(request(id: "7", method: "ping"), .clientToServer, ledger)
-        try await forward(request(id: #""7""#, method: "ping"), .clientToServer, ledger)
-        let activeAfterRequests = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeAfterRequests, 2)
+        do {
+            let caseLabel = "testNumericAndStringIDsRemainDistinct"
+            let ledger = try await makeLedger()
+            try await forward(request(id: "7", method: "ping"), .clientToServer, ledger)
+            try await forward(request(id: #""7""#, method: "ping"), .clientToServer, ledger)
+            let activeAfterRequests = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeAfterRequests, 2, caseLabel)
 
-        try await forward(response(id: "7"), .serverToClient, ledger)
-        try await forward(response(id: #""7""#), .serverToClient, ledger)
-        let activeAfterResponses = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeAfterResponses, 0)
+            try await forward(response(id: "7"), .serverToClient, ledger)
+            try await forward(response(id: #""7""#), .serverToClient, ledger)
+            let activeAfterResponses = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeAfterResponses, 0, caseLabel)
+        }
     }
 
     func testImmediateResponseCanCommitBeforeRequestWriteCommit() async throws {
@@ -53,91 +57,103 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertEqual(snapshot.pendingTransactionCount, 0)
     }
 
-    func testMixedBatchIsOneTransactionalReservation() async throws {
-        let ledger = try await makeLedger()
-        try await forward(request(id: "9", method: "sampling/createMessage"), .serverToClient, ledger)
-
-        let batch = line(#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":9,"result":{}}]"#)
-        let prepared = try await ledger.prepare(frame: batch, direction: .clientToServer)
-        XCTAssertEqual(prepared.messages.map(\.kind), [.request, .notification, .response])
-        try await ledger.commit(prepared)
-
-        let snapshot = await ledger.snapshot()
-        XCTAssertEqual(snapshot.activeRequestCount, 1)
-        XCTAssertEqual(snapshot.recentCompletionCount, 1)
-    }
-
-    func testBatchValidationFailureDoesNotPartiallyReserveIDs() async throws {
-        let ledger = try await makeLedger()
-        let batch = line(#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#)
-
+    func testBatchReservationsAreTransactionalAndRejectPartialDuplicateReservation() async throws {
         do {
-            _ = try await ledger.prepare(frame: batch, direction: .clientToServer)
-            XCTFail("Expected duplicate ID failure")
-        } catch let error as JSONRPCBridgeLedgerError {
-            XCTAssertEqual(error, .duplicateActiveID(.clientToServer, .number(1)))
+            let caseLabel = "testMixedBatchIsOneTransactionalReservation"
+            let ledger = try await makeLedger()
+            try await forward(request(id: "9", method: "sampling/createMessage"), .serverToClient, ledger)
+
+            let batch = line(#"[{"jsonrpc":"2.0","id":1,"method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"},{"jsonrpc":"2.0","id":9,"result":{}}]"#)
+            let prepared = try await ledger.prepare(frame: batch, direction: .clientToServer)
+            XCTAssertEqual(prepared.messages.map(\.kind), [.request, .notification, .response], caseLabel)
+            try await ledger.commit(prepared)
+
+            let snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.activeRequestCount, 1, caseLabel)
+            XCTAssertEqual(snapshot.recentCompletionCount, 1, caseLabel)
         }
 
-        let snapshot = await ledger.snapshot()
-        XCTAssertEqual(snapshot.activeRequestCount, 0)
-        XCTAssertEqual(snapshot.pendingTransactionCount, 0)
-        XCTAssertEqual(snapshot.terminalReason, "duplicate_active_id")
-    }
-
-    func testMalformedClientJSONIsForwardedAndNullErrorResponseIsAccepted() async throws {
-        let ledger = try await makeLedger()
-        let malformed = line(#"{"jsonrpc":"2.0","id":1,"method":"ping""#)
-        let prepared = try await ledger.prepare(frame: malformed, direction: .clientToServer)
-        XCTAssertEqual(prepared.messages.map(\.kind), [.invalidClientMessage])
-        try await ledger.commit(prepared)
-
-        let nullError = line(#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#)
-        try await forward(nullError, .serverToClient, ledger)
-        let activeAfterResponses = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeAfterResponses, 0)
-    }
-
-    func testInvalidClientObjectWithExtractableIDIsCorrelated() async throws {
-        let ledger = try await makeLedger()
-        try await forward(line(#"{"jsonrpc":"2.0","id":"bad","params":{}}"#), .clientToServer, ledger)
-        let activeCount = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeCount, 1)
-
-        try await forward(response(id: #""bad""#), .serverToClient, ledger)
-        let activeAfterResponses = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeAfterResponses, 0)
-    }
-
-    func testSemanticallyInvalidBackendEnvelopesFailClosed() async throws {
-        let invalidFrames = [
-            line(#"{"id":1,"result":{}}"#),
-            line(#"{"jsonrpc":"1.0","id":1,"result":{}}"#),
-            line(#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"bad"}}"#),
-            line(#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#),
-            line(#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
-        ]
-
-        for frame in invalidFrames {
+        do {
+            let caseLabel = "testBatchValidationFailureDoesNotPartiallyReserveIDs"
             let ledger = try await makeLedger()
+            let batch = line(#"[{"jsonrpc":"2.0","id":1,"method":"ping"},{"jsonrpc":"2.0","id":1,"method":"tools/list"}]"#)
+
             do {
-                _ = try await ledger.prepare(frame: frame, direction: .serverToClient)
-                XCTFail("Expected semantic backend validation failure")
+                _ = try await ledger.prepare(frame: batch, direction: .clientToServer)
+                XCTFail(caseLabel + ": Expected duplicate ID failure")
             } catch let error as JSONRPCBridgeLedgerError {
-                XCTAssertEqual(error, .malformedBackendFrame)
+                XCTAssertEqual(error, .duplicateActiveID(.clientToServer, .number(1)), caseLabel)
+            }
+
+            let snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.activeRequestCount, 0, caseLabel)
+            XCTAssertEqual(snapshot.pendingTransactionCount, 0, caseLabel)
+            XCTAssertEqual(snapshot.terminalReason, "duplicate_active_id", caseLabel)
+        }
+    }
+
+    func testInvalidClientFramesRemainForwardableAndCorrelatable() async throws {
+        do {
+            let caseLabel = "testMalformedClientJSONIsForwardedAndNullErrorResponseIsAccepted"
+            let ledger = try await makeLedger()
+            let malformed = line(#"{"jsonrpc":"2.0","id":1,"method":"ping""#)
+            let prepared = try await ledger.prepare(frame: malformed, direction: .clientToServer)
+            XCTAssertEqual(prepared.messages.map(\.kind), [.invalidClientMessage], caseLabel)
+            try await ledger.commit(prepared)
+
+            let nullError = line(#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"Parse error"}}"#)
+            try await forward(nullError, .serverToClient, ledger)
+            let activeAfterResponses = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeAfterResponses, 0, caseLabel)
+        }
+
+        do {
+            let caseLabel = "testInvalidClientObjectWithExtractableIDIsCorrelated"
+            let ledger = try await makeLedger()
+            try await forward(line(#"{"jsonrpc":"2.0","id":"bad","params":{}}"#), .clientToServer, ledger)
+            let activeCount = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeCount, 1, caseLabel)
+
+            try await forward(response(id: #""bad""#), .serverToClient, ledger)
+            let activeAfterResponses = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeAfterResponses, 0, caseLabel)
+        }
+    }
+
+    func testInvalidBackendFramesFailClosedAcrossSemanticAndMalformedShapes() async throws {
+        do {
+            let caseLabel = "testSemanticallyInvalidBackendEnvelopesFailClosed"
+            let invalidFrames = [
+                line(#"{"id":1,"result":{}}"#),
+                line(#"{"jsonrpc":"1.0","id":1,"result":{}}"#),
+                line(#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"bad"}}"#),
+                line(#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#),
+                line(#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
+            ]
+
+            for frame in invalidFrames {
+                let ledger = try await makeLedger()
+                do {
+                    _ = try await ledger.prepare(frame: frame, direction: .serverToClient)
+                    XCTFail(caseLabel + ": Expected semantic backend validation failure")
+                } catch let error as JSONRPCBridgeLedgerError {
+                    XCTAssertEqual(error, .malformedBackendFrame, caseLabel)
+                }
             }
         }
-    }
 
-    func testMalformedBackendFrameFailsClosed() async throws {
-        let ledger = try await makeLedger()
         do {
-            _ = try await ledger.prepare(frame: line("not-json"), direction: .serverToClient)
-            XCTFail("Expected malformed backend failure")
-        } catch let error as JSONRPCBridgeLedgerError {
-            XCTAssertEqual(error, .malformedBackendFrame)
+            let caseLabel = "testMalformedBackendFrameFailsClosed"
+            let ledger = try await makeLedger()
+            do {
+                _ = try await ledger.prepare(frame: line("not-json"), direction: .serverToClient)
+                XCTFail(caseLabel + ": Expected malformed backend failure")
+            } catch let error as JSONRPCBridgeLedgerError {
+                XCTAssertEqual(error, .malformedBackendFrame, caseLabel)
+            }
+            let terminalReason = await ledger.snapshot().terminalReason
+            XCTAssertEqual(terminalReason, "malformed_backend_frame", caseLabel)
         }
-        let terminalReason = await ledger.snapshot().terminalReason
-        XCTAssertEqual(terminalReason, "malformed_backend_frame")
     }
 
     func testCancellationCreatesBoundedTombstoneAndLateResponseIsDiscarded() async throws {
@@ -184,18 +200,31 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertEqual(snapshot.cancellationTombstoneCount, 1)
     }
 
-    func testCancelledIDCanBeReusedAfterTombstoneExpiry() async throws {
-        let ledger = try await makeLedger(configuration: .init(cancellationTombstoneTTL: 10))
-        try await forward(request(id: "8", method: "ping"), .clientToServer, ledger, now: 100)
-        try await forward(cancellation(id: "8"), .clientToServer, ledger, now: 101)
-        let prepared = try await ledger.prepare(
-            frame: request(id: "8", method: "tools/list"),
-            direction: .clientToServer,
-            now: 112
-        )
-        try await ledger.commit(prepared, now: 112)
-        let activeRequestCount = await ledger.snapshot(now: 112).activeRequestCount
-        XCTAssertEqual(activeRequestCount, 1)
+    func testRequestIDsBecomeReusableAfterNormalCompletionOrCancellationExpiry() async throws {
+        do {
+            let caseLabel = "testCancelledIDCanBeReusedAfterTombstoneExpiry"
+            let ledger = try await makeLedger(configuration: .init(cancellationTombstoneTTL: 10))
+            try await forward(request(id: "8", method: "ping"), .clientToServer, ledger, now: 100)
+            try await forward(cancellation(id: "8"), .clientToServer, ledger, now: 101)
+            let prepared = try await ledger.prepare(
+                frame: request(id: "8", method: "tools/list"),
+                direction: .clientToServer,
+                now: 112
+            )
+            try await ledger.commit(prepared, now: 112)
+            let activeRequestCount = await ledger.snapshot(now: 112).activeRequestCount
+            XCTAssertEqual(activeRequestCount, 1, caseLabel)
+        }
+
+        do {
+            let caseLabel = "testNormalCompletionAllowsImmediateIDReuse"
+            let ledger = try await makeLedger()
+            try await forward(request(id: "12", method: "ping"), .clientToServer, ledger)
+            try await forward(response(id: "12"), .serverToClient, ledger)
+            try await forward(request(id: "12", method: "tools/list"), .clientToServer, ledger)
+            let activeCount = await ledger.snapshot().activeRequestCount
+            XCTAssertEqual(activeCount, 1, caseLabel)
+        }
     }
 
     func testResponsePreparedBeforeCancellationCommitWinsRace() async throws {
@@ -210,15 +239,6 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         let snapshot = await ledger.snapshot()
         XCTAssertEqual(snapshot.activeRequestCount, 0)
         XCTAssertEqual(snapshot.cancellationTombstoneCount, 0)
-    }
-
-    func testNormalCompletionAllowsImmediateIDReuse() async throws {
-        let ledger = try await makeLedger()
-        try await forward(request(id: "12", method: "ping"), .clientToServer, ledger)
-        try await forward(response(id: "12"), .serverToClient, ledger)
-        try await forward(request(id: "12", method: "tools/list"), .clientToServer, ledger)
-        let activeCount = await ledger.snapshot().activeRequestCount
-        XCTAssertEqual(activeCount, 1)
     }
 
     func testDuplicateActiveIDIsTerminal() async throws {

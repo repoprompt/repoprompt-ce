@@ -196,7 +196,10 @@ struct AIModelDropdown: View {
             let entries = grouped[backendID] ?? []
             let sortedModels = entries
                 .sorted { lhs, rhs in
-                    compatibleClaudeBackendOptionRank(lhs.1.requestedModelRaw) < compatibleClaudeBackendOptionRank(rhs.1.requestedModelRaw)
+                    let lhsRank = compatibleClaudeBackendOptionRank(lhs.1.requestedModelRaw)
+                    let rhsRank = compatibleClaudeBackendOptionRank(rhs.1.requestedModelRaw)
+                    if lhsRank != rhsRank { return lhsRank < rhsRank }
+                    return lhs.1.optionDisplayName.localizedCaseInsensitiveCompare(rhs.1.optionDisplayName) == .orderedAscending
                 }
                 .map(\.0)
             sections.append(ClaudeCodeTopLevelMenu(
@@ -238,33 +241,21 @@ struct AIModelDropdown: View {
     private func compatibleClaudeBackendOptionDisplayName(
         for descriptor: ClaudeCodeAIModelCatalog.CompatibleBackendModelDescriptor
     ) -> String {
-        let config = ClaudeCodeCompatibleBackendStore.shared.config(for: descriptor.backendID).normalized
-        switch config.modelBehavior {
-        case .noModel:
-            return descriptor.optionDisplayName
-        case let .claudeSlotMapping(mapping):
-            let normalized = mapping.normalized
-            let backendModelID: String? = switch descriptor.requestedModelRaw {
-            case .some(AgentModel.claudeHaiku.rawValue):
-                normalized.haiku
-            case .some(AgentModel.claudeOpus.rawValue):
-                normalized.opus
-            case .some(AgentModel.claudeSonnet.rawValue), nil:
-                normalized.sonnet
-            default:
-                nil
-            }
-            guard let backendModelID, !backendModelID.isEmpty else { return descriptor.optionDisplayName }
-            return AgentModel(rawValue: backendModelID)?.displayName ?? backendModelID
-        }
+        descriptor.optionDisplayName
     }
 
     private func compatibleClaudeBackendOptionRank(_ rawModel: String?) -> Int {
         switch rawModel {
-        case .some(AgentModel.claudeHaiku.rawValue): 0
-        case .some(AgentModel.claudeSonnet.rawValue): 1
-        case .some(AgentModel.claudeOpus.rawValue): 2
-        default: 0
+        case .some(AgentModel.claudeHaiku.rawValue): return 0
+        case .some(AgentModel.claudeSonnet.rawValue): return 1
+        case .some(AgentModel.claudeOpus.rawValue): return 2
+        case let .some(raw):
+            if let index = ClaudeCompatibleProviderRuntimeBridge.directSelectableGLMModelRawValues.firstIndex(of: raw) {
+                return 10 + index
+            }
+            return 99
+        case nil:
+            return 99
         }
     }
 

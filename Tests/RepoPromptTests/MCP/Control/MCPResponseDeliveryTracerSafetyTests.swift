@@ -33,82 +33,90 @@ final class MCPResponseDeliveryTracerSafetyTests: XCTestCase {
         XCTAssertEqual(received, payload)
     }
 
-    func testNonBlockingWriterRestoresBlockingAndSIGPIPEFlagsAfterSuccessfulWrite() throws {
-        var pipe = try makePipe()
-        let duplicateWriteFD = dup(pipe.writeFD)
-        guard duplicateWriteFD >= 0 else {
-            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    func testNonBlockingWriterRestoresDescriptorFlagsAcrossSuccessAndFullPipeFailure() throws {
+        do {
+            let caseLabel = "testNonBlockingWriterRestoresBlockingAndSIGPIPEFlagsAfterSuccessfulWrite"
+            var pipe = try makePipe()
+            let duplicateWriteFD = dup(pipe.writeFD)
+            guard duplicateWriteFD >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            defer {
+                closeIfOpen(duplicateWriteFD)
+                closeIfOpen(pipe.readFD)
+                closeIfOpen(pipe.writeFD)
+            }
+
+            let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
+            let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
+            XCTAssertFalse(originalNonBlocking, caseLabel)
+
+            let payload = Data("diagnostic\n".utf8)
+            XCTAssertTrue(BestEffortStderrWriter.writeNonBlocking(payload, to: pipe.writeFD), caseLabel)
+            XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking, caseLabel)
+            XCTAssertEqual(try descriptorIsNonBlocking(duplicateWriteFD), originalNonBlocking, caseLabel)
+            XCTAssertEqual(try descriptorNoSIGPIPE(pipe.writeFD), originalNoSIGPIPE, caseLabel)
+
+            var buffer = [UInt8](repeating: 0, count: payload.count)
+            XCTAssertEqual(read(pipe.readFD, &buffer, buffer.count), payload.count, caseLabel)
+            XCTAssertEqual(Data(buffer), payload, caseLabel)
         }
-        defer {
-            closeIfOpen(duplicateWriteFD)
-            closeIfOpen(pipe.readFD)
-            closeIfOpen(pipe.writeFD)
+
+        do {
+            let caseLabel = "testNonBlockingWriterRestoresFlagsWhenPipeIsFull"
+            var pipe = try makePipe()
+            defer {
+                closeIfOpen(pipe.readFD)
+                closeIfOpen(pipe.writeFD)
+            }
+
+            let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
+            let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
+            XCTAssertFalse(originalNonBlocking, caseLabel)
+            try fillPipeToCapacity(pipe.writeFD)
+            XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking, caseLabel)
+
+            let writeFD = pipe.writeFD
+            let writeQueue = DispatchQueue(label: "tracer-safety-test-full-pipe-writer")
+            let writeDone = DispatchGroup()
+            nonisolated(unsafe) var writeResult: Bool?
+            writeDone.enter()
+            writeQueue.async {
+                writeResult = BestEffortStderrWriter.writeNonBlocking(
+                    Data("dropped\n".utf8),
+                    to: writeFD
+                )
+                writeDone.leave()
+            }
+
+            let completed = writeDone.wait(timeout: .now() + 1) == .success
+            if !completed {
+                closeIfOpen(pipe.readFD)
+                pipe.readFD = -1
+                writeDone.wait()
+            }
+            XCTAssertTrue(completed, caseLabel + ": Nonblocking diagnostic write hung on a full unread pipe")
+            XCTAssertEqual(writeResult, false, caseLabel)
+            XCTAssertEqual(try descriptorIsNonBlocking(writeFD), originalNonBlocking, caseLabel)
+            XCTAssertEqual(try descriptorNoSIGPIPE(writeFD), originalNoSIGPIPE, caseLabel)
         }
-
-        let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
-        let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
-        XCTAssertFalse(originalNonBlocking)
-
-        let payload = Data("diagnostic\n".utf8)
-        XCTAssertTrue(BestEffortStderrWriter.writeNonBlocking(payload, to: pipe.writeFD))
-        XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking)
-        XCTAssertEqual(try descriptorIsNonBlocking(duplicateWriteFD), originalNonBlocking)
-        XCTAssertEqual(try descriptorNoSIGPIPE(pipe.writeFD), originalNoSIGPIPE)
-
-        var buffer = [UInt8](repeating: 0, count: payload.count)
-        XCTAssertEqual(read(pipe.readFD, &buffer, buffer.count), payload.count)
-        XCTAssertEqual(Data(buffer), payload)
     }
 
-    func testNonBlockingWriterRestoresFlagsWhenPipeIsFull() throws {
-        var pipe = try makePipe()
-        defer {
-            closeIfOpen(pipe.readFD)
-            closeIfOpen(pipe.writeFD)
+    func testWriterDropsUndeliverableDataForBrokenAndClosedDescriptors() throws {
+        do {
+            let caseLabel = "testWriterDropsDataOnBrokenPipeWithoutRaising"
+            let writeFD = try makeBrokenPipeWriteEnd()
+            defer { close(writeFD) }
+            XCTAssertFalse(BestEffortStderrWriter.write(Data("dropped\n".utf8), to: writeFD), caseLabel)
         }
 
-        let originalNonBlocking = try descriptorIsNonBlocking(pipe.writeFD)
-        let originalNoSIGPIPE = try descriptorNoSIGPIPE(pipe.writeFD)
-        XCTAssertFalse(originalNonBlocking)
-        try fillPipeToCapacity(pipe.writeFD)
-        XCTAssertEqual(try descriptorIsNonBlocking(pipe.writeFD), originalNonBlocking)
-
-        let writeFD = pipe.writeFD
-        let writeQueue = DispatchQueue(label: "tracer-safety-test-full-pipe-writer")
-        let writeDone = DispatchGroup()
-        nonisolated(unsafe) var writeResult: Bool?
-        writeDone.enter()
-        writeQueue.async {
-            writeResult = BestEffortStderrWriter.writeNonBlocking(
-                Data("dropped\n".utf8),
-                to: writeFD
-            )
-            writeDone.leave()
+        do {
+            let caseLabel = "testWriterDropsDataOnClosedDescriptorWithoutRaising"
+            let pipe = try makePipe()
+            close(pipe.readFD)
+            close(pipe.writeFD)
+            XCTAssertFalse(BestEffortStderrWriter.write(Data("dropped\n".utf8), to: pipe.writeFD), caseLabel)
         }
-
-        let completed = writeDone.wait(timeout: .now() + 1) == .success
-        if !completed {
-            closeIfOpen(pipe.readFD)
-            pipe.readFD = -1
-            writeDone.wait()
-        }
-        XCTAssertTrue(completed, "Nonblocking diagnostic write hung on a full unread pipe")
-        XCTAssertEqual(writeResult, false)
-        XCTAssertEqual(try descriptorIsNonBlocking(writeFD), originalNonBlocking)
-        XCTAssertEqual(try descriptorNoSIGPIPE(writeFD), originalNoSIGPIPE)
-    }
-
-    func testWriterDropsDataOnBrokenPipeWithoutRaising() throws {
-        let writeFD = try makeBrokenPipeWriteEnd()
-        defer { close(writeFD) }
-        XCTAssertFalse(BestEffortStderrWriter.write(Data("dropped\n".utf8), to: writeFD))
-    }
-
-    func testWriterDropsDataOnClosedDescriptorWithoutRaising() throws {
-        let pipe = try makePipe()
-        close(pipe.readFD)
-        close(pipe.writeFD)
-        XCTAssertFalse(BestEffortStderrWriter.write(Data("dropped\n".utf8), to: pipe.writeFD))
     }
 
     func testTerminalEmitWithBrokenStderrSinkDoesNotAbort() throws {

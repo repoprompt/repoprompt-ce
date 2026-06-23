@@ -44,6 +44,9 @@ actor CodexModelPollingService {
     private var pollingTask: Task<Void, Never>?
     private var inFlightRefresh: Task<Void, Never>?
     private var continuations: [UUID: AsyncStream<Snapshot>.Continuation] = [:]
+    #if DEBUG
+        private var testSubscriberCountObservers: [UUID: AsyncStream<Int>.Continuation] = [:]
+    #endif
     private var latest: Snapshot?
     private var isShutdown = false
     private var isStoppingClientForIdle = false
@@ -69,6 +72,17 @@ actor CodexModelPollingService {
         func test_subscriberCount() -> Int {
             continuations.count
         }
+
+        func test_subscriberCountUpdates() -> AsyncStream<Int> {
+            let id = UUID()
+            let (stream, continuation) = AsyncStream<Int>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            testSubscriberCountObservers[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeTestSubscriberCountObserver(id) }
+            }
+            continuation.yield(continuations.count)
+            return stream
+        }
     #endif
 
     /// Subscribe to model snapshot updates.
@@ -85,6 +99,9 @@ actor CodexModelPollingService {
         let id = UUID()
         let (stream, continuation) = AsyncStream<Snapshot>.makeStream(bufferingPolicy: .bufferingNewest(1))
         continuations[id] = continuation
+        #if DEBUG
+            publishTestSubscriberCount()
+        #endif
 
         // Yield latest immediately so UI populates without waiting for the first tick.
         if let latest {
@@ -120,6 +137,9 @@ actor CodexModelPollingService {
         if finishSubscribers {
             let activeContinuations = continuations
             continuations.removeAll()
+            #if DEBUG
+                publishTestSubscriberCount()
+            #endif
             for continuation in activeContinuations.values {
                 continuation.finish()
             }
@@ -170,8 +190,23 @@ actor CodexModelPollingService {
 
     private func removeSubscriber(_ id: UUID) async {
         continuations.removeValue(forKey: id)
+        #if DEBUG
+            publishTestSubscriberCount()
+        #endif
         await stopPollingIfIdle()
     }
+
+    #if DEBUG
+        private func publishTestSubscriberCount() {
+            for continuation in testSubscriberCountObservers.values {
+                continuation.yield(continuations.count)
+            }
+        }
+
+        private func removeTestSubscriberCountObserver(_ id: UUID) {
+            testSubscriberCountObservers.removeValue(forKey: id)
+        }
+    #endif
 
     private func performRefresh() async {
         guard !isShutdown else { return }

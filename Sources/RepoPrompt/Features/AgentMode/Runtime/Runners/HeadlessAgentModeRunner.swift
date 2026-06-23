@@ -168,8 +168,12 @@ final class HeadlessAgentModeRunner {
         attachmentReservationID: UUID?,
         lease: MCPBootstrapLease
     ) async {
+        var providerInitializationCompleted = false
         do {
+            await lease.providerInitializationStarted(provider: session.selectedAgent.rawValue)
             let stream = try await provider.streamAgentMessage(initialMessage, runID: runID)
+            providerInitializationCompleted = true
+            await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "ready")
             hooks.recordPendingHandoffSendOutcome(session, true)
             hooks.stageConsumedAttachmentFilesForDeferredCleanup(attachments, session)
             hooks.markAttachmentsConsumed(session, attachmentReservationID)
@@ -209,6 +213,9 @@ final class HeadlessAgentModeRunner {
                 }
             ))
         } catch is CancellationError {
+            if !providerInitializationCompleted {
+                await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "cancelled")
+            }
             hooks.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,
@@ -228,6 +235,9 @@ final class HeadlessAgentModeRunner {
                 }
             ))
         } catch {
+            if !providerInitializationCompleted {
+                await lease.providerInitializationCompleted(provider: session.selectedAgent.rawValue, outcome: "failed")
+            }
             hooks.recordPendingHandoffSendOutcome(session, false)
             await terminalCommitBarrier.commit(.init(
                 session: session,

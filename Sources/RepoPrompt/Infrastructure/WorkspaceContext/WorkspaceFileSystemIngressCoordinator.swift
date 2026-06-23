@@ -172,6 +172,21 @@ final class WorkspaceFileSystemIngressCoordinator: @unchecked Sendable {
         state.isOpen = false
     }
 
+    @discardableResult
+    func closePublisherIngress(_ subscription: Subscription) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        guard let state = rootStatesByID[subscription.rootID],
+              state.isOpen,
+              state.generation == subscription.generation
+        else { return false }
+        nextSubscriptionGeneration &+= 1
+        state.generation = nextSubscriptionGeneration
+        state.isOpen = false
+        return true
+    }
+
     func isPublisherIngressOpen(_ subscription: Subscription) -> Bool {
         lock.lock()
         defer { lock.unlock() }

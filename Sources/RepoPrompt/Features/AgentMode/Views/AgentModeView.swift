@@ -2544,6 +2544,7 @@ struct AgentModeChatDetailView: View {
                 .id(block.id)
         }
         .environment(\.agentMessageRuntimeFooterByItemID, transcriptSnapshot.runtimeFooterByItemID)
+        .messageTimestampEnvironment()
     }
 
     @ViewBuilder
@@ -2694,10 +2695,12 @@ struct AgentModeChatDetailView: View {
         let showCancel = showRunScopedToolCancel(for: item, in: block)
         let cancelAction = showCancel ? cancelActiveToolsAction : nil
         let ownerTabID = transcriptSnapshot.presentation.tabID ?? transcriptSnapshot.currentTabID ?? currentTabID
+        let ownerWorkspaceID = oracleViewModel.workspaceManager.activeWorkspaceID
         return AgentMessageBubble(
             item: item,
             isMostRecentEditBubble: item.id == renderContext.mostRecentEditID,
             windowID: windowID,
+            currentWorkspaceID: ownerWorkspaceID,
             currentTabID: ownerTabID,
             suppressAskUserTranscriptUI: renderContext.isContextBuilderQuestionActive,
             contextBuilderContext: .init(
@@ -2705,7 +2708,11 @@ struct AgentModeChatDetailView: View {
                 contextBuilderAgentVM: contextBuilderAgentVM,
                 activeContextBuilderCallItemID: renderContext.activeContextBuilderCallID,
                 activeContextBuilderResultItemID: renderContext.activeContextBuilderResultID,
-                oracleOpenContext: .init(windowID: windowID, tabID: ownerTabID),
+                oracleOpenContext: .init(
+                    windowID: windowID,
+                    workspaceID: ownerWorkspaceID,
+                    tabID: ownerTabID
+                ),
                 showRunScopedToolCancel: showCancel,
                 cancelActiveToolsAction: cancelAction
             ),

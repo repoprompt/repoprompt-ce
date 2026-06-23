@@ -166,7 +166,6 @@ extension AgentModeViewModel {
             sessions: Array(sessions.values),
             currentTabID: currentTabID,
             codexCoordinator: codexCoordinator,
-            claudeCoordinator: claudeCoordinator,
             scheduleSave: { [weak self] tabID in
                 self?.scheduleSave(for: tabID)
             },

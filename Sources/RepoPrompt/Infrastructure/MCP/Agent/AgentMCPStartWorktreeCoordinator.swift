@@ -170,7 +170,14 @@ struct AgentMCPStartWorktreeCoordinator {
                         standardizedPath($0.logicalRootPath) == standardizedPath(context.logicalRoot.standardizedFullPath)
                     }
                 )
-                _ = try agentModeVM.applyWorktreeBinding(binding, toSessionID: targetSessionID)
+                var desiredBindings = agentModeVM.worktreeBindings(forAgentSessionID: targetSessionID)
+                    .filter { standardizedPath($0.logicalRootPath) != standardizedPath(context.logicalRoot.standardizedFullPath) }
+                desiredBindings.append(binding)
+                _ = try await agentModeVM.transitionWorktreeBindings(
+                    desiredBindings,
+                    forSessionID: targetSessionID,
+                    intent: .initialSend
+                )
             } catch {
                 throw preparationError(error)
             }
@@ -222,21 +229,27 @@ struct AgentMCPStartWorktreeCoordinator {
         sessionID: UUID,
         targetWindow: WindowState
     ) async throws {
+        let store = targetWindow.promptManager.workspaceFileContextStore
+        let physicalRootPaths = Set(bindings.map {
+            standardizedPath($0.worktreeRootPath)
+        })
+        let bindingFingerprint = AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings)
+        let alreadyInstalled = await store.installedSessionWorktreeRoots(
+            ownerID: sessionID,
+            bindingFingerprint: bindingFingerprint,
+            physicalRootPaths: physicalRootPaths
+        )
+        if let alreadyInstalled {
+            _ = await store.initializeCodemapsForSessionWorktreeRoots(rootIDs: alreadyInstalled.map(\.id))
+            return
+        }
+
         let projection = await targetWindow.mcpServer.materializeWorkspaceBindingProjection(
             sessionID: sessionID,
             bindings: bindings
         )
-        guard let projection, !projection.isEmpty else {
+        guard let projection, !projection.isEmpty, projection.isFullyMaterialized else {
             throw MCPError.invalidParams("Failed to materialize the bound worktree root for \(operationName).")
-        }
-        let loadedRoots = await targetWindow.promptManager.workspaceFileContextStore.rootRefs(scope: projection.lookupRootScope)
-        let loadedPaths = Set(loadedRoots.map { standardizedPath($0.standardizedFullPath) })
-        let missing = projection.physicalRootRefs.filter {
-            !loadedPaths.contains(standardizedPath($0.standardizedFullPath))
-        }
-        guard missing.isEmpty else {
-            let paths = missing.map(\.standardizedFullPath).joined(separator: ", ")
-            throw MCPError.invalidParams("Failed to load bound worktree root(s) for \(operationName): \(paths)")
         }
     }
 

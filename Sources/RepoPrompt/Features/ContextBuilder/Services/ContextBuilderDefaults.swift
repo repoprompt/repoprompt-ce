@@ -41,6 +41,9 @@ enum ContextBuilderDefaults {
     /// Keeps the one-shot routing policy alive through the routing deadline, with a five-second margin.
     static let mcpBootstrapConnectionTTL = TimeInterval((mcpRoutingTimeoutMilliseconds / 1000) + 5)
 
+    /// Bounded handoff after response-drain failure while orderly peer-EOF teardown publishes final context ownership.
+    static let peerEOFDetachmentHandoffTimeoutSeconds: TimeInterval = 10
+
     // MARK: - Plan Generation
 
     /// Whether to auto-generate a plan after Context Builder completes

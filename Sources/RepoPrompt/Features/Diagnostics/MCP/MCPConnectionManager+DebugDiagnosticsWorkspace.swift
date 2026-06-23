@@ -537,8 +537,12 @@ import MCP
                 "visibleWorkspacePlusGitData"
             case .allLoaded:
                 "allLoaded"
+            case .allLoadedExcludingGitData:
+                "allLoadedExcludingGitData"
             case .sessionBoundWorkspace:
                 "sessionBoundWorkspace"
+            case .validatedSessionBoundWorkspace:
+                "validatedSessionBoundWorkspace"
             }
         }
 

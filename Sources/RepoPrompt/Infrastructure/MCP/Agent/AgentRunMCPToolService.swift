@@ -169,8 +169,14 @@ struct AgentRunMCPToolService {
         _ modelRaw: String?,
         _ reasoningEffortRaw: String?,
         _ taskLabelKind: AgentModelCatalog.TaskLabelKind?,
-        _ workflow: AgentWorkflowDefinition?
+        _ workflow: AgentWorkflowDefinition?,
+        _ expectedParentSessionID: UUID?,
+        _ oracleReviewSource: AgentRunOracleReviewSource?
     ) async throws -> AgentExternalMCPRunStarter.StartOutcome
+    typealias ResolveOracleReviewLaunchSource = @MainActor (
+        _ metadata: RequestMetadata,
+        _ targetWindow: WindowState
+    ) async throws -> ResolvedAgentRunOracleReviewLaunchSource
 
     static let defaultWaitTimeoutSeconds = MCPTimeoutPolicy.agentLifecycleDefaultWaitSeconds
     static let defaultStartTaskLabelKind: AgentModelCatalog.TaskLabelKind = .pair
@@ -206,7 +212,11 @@ struct AgentRunMCPToolService {
     let captureRequestMetadata: () async -> RequestMetadata
     let requireTargetWindow: () throws -> WindowState
     let resolveRequestedTabID: (_ args: [String: Value]) throws -> UUID?
-    let resolveSpawnSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
+    let resolveSpawnParentSourceTabID: (_ metadata: RequestMetadata) async -> UUID?
+    var resolveOracleReviewLaunchSource: ResolveOracleReviewLaunchSource = { _, _ in
+        throw MCPError.internalError("agent_run.start Oracle launch-source resolution is not configured.")
+    }
+
     var validateSpawnRouting: (_ metadata: RequestMetadata, _ sourceTabID: UUID?) async throws -> Void = { _, _ in }
     let resolveSpawnParentSessionID: (_ metadata: RequestMetadata, _ targetWindow: WindowState) async -> UUID?
     var resolveSpawnParentSessionIDFromSourceTabID: ((_ sourceTabID: UUID, _ targetWindow: WindowState) async -> UUID?)?
@@ -274,33 +284,33 @@ struct AgentRunMCPToolService {
         }
 
         let agentModeVM = targetWindow.agentModeViewModel
-        let sourceTabID = await resolveSpawnSourceTabID(metadata)
+        let parentSourceTabID = await resolveSpawnParentSourceTabID(metadata)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartResolvedSource", tabID: sourceTabID, fields: [
+            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartResolvedSource", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "clientName": metadata.clientName ?? "nil",
                 "windowID": metadata.windowID.map(String.init) ?? "nil",
-                "sourceTabID": sourceTabID?.uuidString ?? "nil",
+                "parentSourceTabID": parentSourceTabID?.uuidString ?? "nil",
                 "inheritWorktreeBindings": String(worktreeStartRequest.inheritParentWorktreeBindings),
                 "workflowID": workflow?.id ?? "nil",
                 "workflowName": workflow?.displayName ?? "nil"
             ])
         #endif
-        try await validateSpawnRouting(metadata, sourceTabID)
-        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: sourceTabID)
-        let spawnParentSessionID: UUID? = if let sourceTabID,
+        try await validateSpawnRouting(metadata, parentSourceTabID)
+        try agentModeVM.mcpValidateAgentRunSpawnAllowed(sourceTabID: parentSourceTabID)
+        let spawnParentSessionID: UUID? = if let parentSourceTabID,
                                              let resolveSpawnParentSessionIDFromSourceTabID
         {
-            await resolveSpawnParentSessionIDFromSourceTabID(sourceTabID, targetWindow)
+            await resolveSpawnParentSessionIDFromSourceTabID(parentSourceTabID, targetWindow)
         } else {
             await resolveSpawnParentSessionID(metadata, targetWindow)
         }
         let resolvedTabID = try resolveRequestedTabID(args)
         #if DEBUG
-            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartParentResolved", tabID: sourceTabID, fields: [
+            AgentModePerfDiagnostics.event("mcp.routing.agentRunStartParentResolved", tabID: parentSourceTabID, fields: [
                 "connectionID": metadata.connectionID?.uuidString ?? "nil",
                 "windowID": metadata.windowID.map(String.init) ?? "nil",
-                "sourceTabID": sourceTabID?.uuidString ?? "nil",
+                "parentSourceTabID": parentSourceTabID?.uuidString ?? "nil",
                 "parentSessionID": spawnParentSessionID?.uuidString ?? "nil",
                 "inheritWorktreeBindings": String(worktreeStartRequest.inheritParentWorktreeBindings),
                 "requestedTabID": resolvedTabID?.uuidString ?? "nil"
@@ -309,8 +319,21 @@ struct AgentRunMCPToolService {
         // A non-nil spawn source is only returned for a routed Agent Mode invocation.
         // Never degrade such a nested start into an orphan when its validated
         // parent Agent session has disappeared or cannot be recovered.
-        if sourceTabID != nil, spawnParentSessionID == nil {
+        if parentSourceTabID != nil, spawnParentSessionID == nil {
             throw MCPError.invalidParams("agent_run.start was routed from an Agent Mode run, but RepoPrompt could not resolve its parent Agent session. Refusing to create an unparented run; reconnect the agent MCP client or retry after the source session is active.")
+        }
+
+        // Freeze the source before model validation or target creation. Later selection/worktree
+        // mutations must not alter the child run's delegated review packaging.
+        let oracleLaunchSource = try await resolveOracleReviewLaunchSource(metadata, targetWindow)
+        if let parentSourceTabID {
+            guard oracleLaunchSource.snapshot.tabID == parentSourceTabID,
+                  oracleLaunchSource.source.sourceAgentSessionID == spawnParentSessionID
+            else {
+                throw MCPError.invalidParams(
+                    "agent_run.start conversation-parent routing does not match its immutable Oracle packaging source. Refusing to create the child run."
+                )
+            }
         }
 
         // Compute the default task label before target creation. Omitted `model_id`
@@ -367,7 +390,9 @@ struct AgentRunMCPToolService {
                 selection.modelRaw,
                 nil,
                 selection.taskLabelKind,
-                workflow
+                workflow,
+                spawnParentSessionID,
+                oracleLaunchSource.source
             )
         } catch {
             let decoratedError = startWorktreeCoordinator.providerStartError(
@@ -1552,6 +1577,7 @@ struct AgentRunMCPToolService {
         }
         let session = object["session"]?.objectValue
         let agent = object["agent"]?.objectValue
+        let runID = object["run_id"]?.stringValue.flatMap(UUID.init(uuidString:))
         let interaction = object["interaction"]?.objectValue.flatMap(interaction(from:))
         let updatedAt = object["updated_at"]?.stringValue.flatMap(Self.timestampFormatter.date(from:)) ?? Date()
         let tabID = (session?["context_id"] ?? session?["tab_id"])?.stringValue.flatMap(UUID.init(uuidString:))
@@ -1561,6 +1587,7 @@ struct AgentRunMCPToolService {
         let activeWorktreeMerges = activeWorktreeMerges(from: object)
         return AgentRunMCPSnapshot(
             sessionID: sessionID,
+            runID: runID,
             tabID: tabID,
             sessionName: session?["name"]?.stringValue,
             agentRaw: agent?["id"]?.stringValue,

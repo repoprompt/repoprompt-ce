@@ -79,6 +79,7 @@ struct AgentRuntimeSidebarView: View {
             }
         }
         .frame(minWidth: 300, idealWidth: 320, maxWidth: 360, maxHeight: .infinity)
+        .messageTimestampEnvironment()
         .onChange(of: currentTabID) { _, _ in
             selectedOracleSessionID = nil
             selectLatestOracleSessionIfNeeded()

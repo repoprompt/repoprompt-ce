@@ -101,6 +101,127 @@ private final class MCPInitializationSettlementState: @unchecked Sendable {
     }
 }
 
+private final class CancellationDeliveryCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var delivered: Bool?
+    private var continuation: CheckedContinuation<Bool, Never>?
+
+    func install(_ continuation: CheckedContinuation<Bool, Never>) {
+        lock.lock()
+        if let delivered {
+            lock.unlock()
+            continuation.resume(returning: delivered)
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+    }
+
+    func resolve(delivered: Bool) {
+        lock.lock()
+        guard self.delivered == nil else {
+            lock.unlock()
+            return
+        }
+        self.delivered = delivered
+        let continuation = continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: delivered)
+    }
+}
+
+private final class ToolCatalogSharedTaskState<Value: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+    private var waiters: [UUID: CheckedContinuation<Value, Error>] = [:]
+    private var cancelledWaiterIDs: Set<UUID> = []
+
+    func install(
+        waiterID: UUID,
+        continuation: CheckedContinuation<Value, Error>
+    ) {
+        lock.lock()
+        if let result {
+            lock.unlock()
+            continuation.resume(with: result)
+            return
+        }
+        if cancelledWaiterIDs.remove(waiterID) != nil {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        waiters[waiterID] = continuation
+        lock.unlock()
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard self.result == nil else {
+            lock.unlock()
+            return
+        }
+        self.result = result
+        let waiters = Array(waiters.values)
+        self.waiters.removeAll()
+        cancelledWaiterIDs.removeAll()
+        lock.unlock()
+        for waiter in waiters {
+            waiter.resume(with: result)
+        }
+    }
+
+    func cancel(waiterID: UUID) {
+        lock.lock()
+        guard result == nil else {
+            lock.unlock()
+            return
+        }
+        let continuation = waiters.removeValue(forKey: waiterID)
+        if continuation == nil {
+            cancelledWaiterIDs.insert(waiterID)
+        }
+        lock.unlock()
+        continuation?.resume(throwing: CancellationError())
+    }
+}
+
+private final class ToolCatalogSharedTask<Value: Sendable>: @unchecked Sendable {
+    private let state: ToolCatalogSharedTaskState<Value>
+    private let task: Task<Value, Error>
+
+    init(operation: @escaping @Sendable () async throws -> Value) {
+        let state = ToolCatalogSharedTaskState<Value>()
+        self.state = state
+        task = Task {
+            do {
+                let value = try await operation()
+                state.resolve(.success(value))
+                return value
+            } catch {
+                state.resolve(.failure(error))
+                throw error
+            }
+        }
+    }
+
+    func value() async throws -> Value {
+        let waiterID = UUID()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                state.install(waiterID: waiterID, continuation: continuation)
+            }
+        } onCancel: {
+            state.cancel(waiterID: waiterID)
+        }
+    }
+
+    func cancel() {
+        task.cancel()
+    }
+}
+
 private final class ToolCallSettlementState: @unchecked Sendable {
     enum Outcome {
         case pending
@@ -110,40 +231,99 @@ private final class ToolCallSettlementState: @unchecked Sendable {
     }
 
     private let lock = NSLock()
+    private struct CancellationDelivery {
+        let task: Task<Void, Never>
+        let completion: CancellationDeliveryCompletion
+    }
+
     private var outcome: Outcome = .pending
-    private var cancellationDeliveryTask: Task<Void, Never>?
+    private var responseResult: Result<CallTool.Result, Error>?
+    private var outcomeContinuation: CheckedContinuation<Outcome, Never>?
+    private var cancellationDelivery: CancellationDelivery?
 
     func claim(
         _ candidate: Outcome,
         deliverCancellation: @escaping @Sendable () async -> Void
     ) -> Bool {
         lock.lock()
-        defer { lock.unlock() }
-        guard case .pending = outcome else { return false }
-        outcome = candidate
-        cancellationDeliveryTask = Task.detached {
-            await deliverCancellation()
+        guard case .pending = outcome else {
+            lock.unlock()
+            return false
         }
+        outcome = candidate
+        let completion = CancellationDeliveryCompletion()
+        let task = Task.detached {
+            await deliverCancellation()
+            completion.resolve(delivered: true)
+        }
+        cancellationDelivery = CancellationDelivery(task: task, completion: completion)
+        let continuation = outcomeContinuation
+        outcomeContinuation = nil
+        lock.unlock()
+        continuation?.resume(returning: candidate)
         return true
     }
 
-    func finish() -> Outcome {
+    func complete(with result: Result<CallTool.Result, Error>) {
         lock.lock()
-        defer { lock.unlock() }
-        if case .pending = outcome {
-            outcome = .completed
+        guard case .pending = outcome else {
+            lock.unlock()
+            return
         }
-        return outcome
+        outcome = .completed
+        responseResult = result
+        let continuation = outcomeContinuation
+        outcomeContinuation = nil
+        lock.unlock()
+        continuation?.resume(returning: .completed)
     }
 
-    func waitForCancellationDelivery() async {
-        await cancellationDeliveryTaskSnapshot()?.value
+    func waitForOutcome() async -> Outcome {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            guard case .pending = outcome else {
+                let outcome = outcome
+                lock.unlock()
+                continuation.resume(returning: outcome)
+                return
+            }
+            outcomeContinuation = continuation
+            lock.unlock()
+        }
     }
 
-    private func cancellationDeliveryTaskSnapshot() -> Task<Void, Never>? {
+    func completedResult() -> Result<CallTool.Result, Error>? {
         lock.lock()
         defer { lock.unlock() }
-        return cancellationDeliveryTask
+        return responseResult
+    }
+
+    func waitForCancellationDelivery(
+        timeoutNanoseconds: UInt64,
+        timeoutSleep: @escaping @Sendable (UInt64) async throws -> Void
+    ) async -> Bool {
+        guard let cancellationDelivery = cancellationDeliverySnapshot() else { return true }
+        let timeoutTask = Task {
+            do {
+                try await timeoutSleep(timeoutNanoseconds)
+                cancellationDelivery.completion.resolve(delivered: false)
+            } catch {}
+        }
+        let delivered = await withCheckedContinuation { continuation in
+            cancellationDelivery.completion.install(continuation)
+        }
+        timeoutTask.cancel()
+        await timeoutTask.value
+        if !delivered {
+            cancellationDelivery.task.cancel()
+        }
+        return delivered
+    }
+
+    private func cancellationDeliverySnapshot() -> CancellationDelivery? {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancellationDelivery
     }
 }
 
@@ -155,25 +335,46 @@ private struct RegisteredToolCall {
     }
 }
 
+private struct ToolListRefreshFlight {
+    let id: UUID
+    let catalogEpoch: UInt64
+    let invalidationGeneration: UInt64
+    let request: ToolCatalogSharedTask<(tools: [MCP.Tool], nextCursor: String?)>
+}
+
 /// Manages an interactive MCP client session with the RepoPrompt app.
 actor InteractiveMCPClientSession {
     typealias TimeoutSleep = @Sendable (UInt64) async throws -> Void
+    #if DEBUG
+        typealias CancellationDeliveryOverride = @Sendable (MCP.Client, ID, String) async -> Void
+    #endif
+
+    static let cancellationDeliveryDrainTimeoutNanoseconds: UInt64 = 2_000_000_000
 
     private let sessionToken: String
     private let clientName: String
     private let logger: Logger
     private let timeoutSleep: TimeoutSleep
+    private let cancellationDeliveryDrainSleep: TimeoutSleep
+    private let cancellationDeliveryDrainTimeoutNanoseconds: UInt64
 
     private var client: MCP.Client?
     private var transport: (any Transport)?
     private var requestSendBarrier: MCPRequestSendBarrier?
+    private var pendingToolCallResponseTasks: [UUID: Task<Void, Never>] = [:]
     private var cachedTools: [MCP.Tool] = []
     private var toolListFetched = false
+    private var toolCatalogEpoch: UInt64 = 0
+    private var toolListInvalidationGeneration: UInt64 = 0
+    private var toolListRefreshFlight: ToolListRefreshFlight?
     private var defaultToolCallTimeout: ToolCallTimeoutPolicy = .default
     private(set) var toolsDirty = false
+    private(set) var toolsChangeNoticePending = false
 
     #if DEBUG
         private let requestSendWillStart: (@Sendable () async -> Void)?
+        private let toolListRefreshWillAwait: (@Sendable () async -> Void)?
+        private let cancellationDeliveryOverride: CancellationDeliveryOverride?
     #endif
 
     /// Server info from initialization
@@ -201,8 +402,14 @@ actor InteractiveMCPClientSession {
         timeoutSleep = { nanoseconds in
             try await Task.sleep(nanoseconds: nanoseconds)
         }
+        cancellationDeliveryDrainSleep = { nanoseconds in
+            try await Task.sleep(nanoseconds: nanoseconds)
+        }
+        cancellationDeliveryDrainTimeoutNanoseconds = Self.cancellationDeliveryDrainTimeoutNanoseconds
         #if DEBUG
             requestSendWillStart = nil
+            toolListRefreshWillAwait = nil
+            cancellationDeliveryOverride = nil
         #endif
     }
 
@@ -211,7 +418,13 @@ actor InteractiveMCPClientSession {
             connectedClientForTesting client: MCP.Client,
             requestSendBarrier: MCPRequestSendBarrier,
             requestSendWillStart: (@Sendable () async -> Void)? = nil,
+            toolListRefreshWillAwait: (@Sendable () async -> Void)? = nil,
+            cancellationDeliveryOverride: CancellationDeliveryOverride? = nil,
             timeoutSleep: @escaping TimeoutSleep = { nanoseconds in
+                try await Task.sleep(nanoseconds: nanoseconds)
+            },
+            cancellationDeliveryDrainTimeoutNanoseconds: UInt64 = InteractiveMCPClientSession.cancellationDeliveryDrainTimeoutNanoseconds,
+            cancellationDeliveryDrainSleep: @escaping TimeoutSleep = { nanoseconds in
                 try await Task.sleep(nanoseconds: nanoseconds)
             }
         ) {
@@ -221,9 +434,13 @@ actor InteractiveMCPClientSession {
                 SwiftLogNoOpLogHandler()
             }
             self.timeoutSleep = timeoutSleep
+            self.cancellationDeliveryDrainSleep = cancellationDeliveryDrainSleep
+            self.cancellationDeliveryDrainTimeoutNanoseconds = cancellationDeliveryDrainTimeoutNanoseconds
             self.client = client
             self.requestSendBarrier = requestSendBarrier
             self.requestSendWillStart = requestSendWillStart
+            self.toolListRefreshWillAwait = toolListRefreshWillAwait
+            self.cancellationDeliveryOverride = cancellationDeliveryOverride
         }
     #endif
 
@@ -232,9 +449,7 @@ actor InteractiveMCPClientSession {
     /// Connects to the RepoPrompt app via bootstrap socket and initializes MCP.
     func connect(fetchInitialTools: Bool = true) async throws {
         logger.debug("InteractiveMCPClientSession connecting...")
-        cachedTools = []
-        toolListFetched = false
-        toolsDirty = false
+        resetToolCatalogForConnectionBoundary()
 
         // Perform bootstrap handshake and get connected FD
         let connectedFD = try await performBootstrapHandshake()
@@ -306,9 +521,7 @@ actor InteractiveMCPClientSession {
             self.client = nil
             self.transport = nil
             self.requestSendBarrier = nil
-            cachedTools = []
-            toolListFetched = false
-            toolsDirty = false
+            resetToolCatalogForConnectionBoundary()
             serverName = nil
             serverVersion = nil
             throw error
@@ -383,36 +596,122 @@ actor InteractiveMCPClientSession {
     func disconnect() async {
         await client?.disconnect()
         await transport?.disconnect()
+        let responseTasks = Array(pendingToolCallResponseTasks.values)
+        pendingToolCallResponseTasks.removeAll()
+        for task in responseTasks {
+            task.cancel()
+            await task.value
+        }
         client = nil
         transport = nil
         requestSendBarrier = nil
+        resetToolCatalogForConnectionBoundary()
+        logger.debug("Disconnected from MCP server")
+    }
+
+    private func resetToolCatalogForConnectionBoundary() {
+        toolCatalogEpoch &+= 1
+        toolListRefreshFlight?.request.cancel()
+        toolListRefreshFlight = nil
         cachedTools = []
         toolListFetched = false
         toolsDirty = false
-        logger.debug("Disconnected from MCP server")
+        toolsChangeNoticePending = false
     }
 
     // MARK: - Tools
 
-    /// Refreshes the tool list from the server.
+    /// Refreshes the tool list from the server. Concurrent callers coalesce onto one
+    /// connection-scoped request so every caller observes the same successful catalog.
     @discardableResult
     func refreshTools() async throws -> [MCP.Tool] {
-        guard let client else {
-            throw InteractiveSessionError.notConnected
+        while true {
+            guard let client else {
+                throw InteractiveSessionError.notConnected
+            }
+
+            let flight: ToolListRefreshFlight
+            if let current = toolListRefreshFlight,
+               current.catalogEpoch == toolCatalogEpoch
+            {
+                flight = current
+            } else {
+                let created = ToolListRefreshFlight(
+                    id: UUID(),
+                    catalogEpoch: toolCatalogEpoch,
+                    invalidationGeneration: toolListInvalidationGeneration,
+                    request: ToolCatalogSharedTask {
+                        try await client.listTools()
+                    }
+                )
+                toolListRefreshFlight = created
+                flight = created
+            }
+
+            #if DEBUG
+                if let toolListRefreshWillAwait {
+                    await toolListRefreshWillAwait()
+                }
+            #endif
+
+            do {
+                let result = try await flight.request.value()
+                guard flight.catalogEpoch == toolCatalogEpoch else {
+                    clearToolListRefreshFlight(matching: flight.id)
+                    if toolListFetched, !toolsDirty {
+                        return cachedTools
+                    }
+                    logger.debug("Retrying tool list refresh after connection epoch changed")
+                    continue
+                }
+                guard flight.invalidationGeneration == toolListInvalidationGeneration else {
+                    clearToolListRefreshFlight(matching: flight.id)
+                    logger.debug("Retrying tool list refresh after concurrent invalidation")
+                    continue
+                }
+
+                clearToolListRefreshFlight(matching: flight.id)
+                cachedTools = result.tools
+                toolListFetched = true
+                toolsDirty = false
+                toolsChangeNoticePending = false
+
+                logger.debug("Refreshed tools: \(cachedTools.count) available")
+                return cachedTools
+            } catch {
+                if error is CancellationError, Task.isCancelled {
+                    throw error
+                }
+                clearToolListRefreshFlight(matching: flight.id)
+                if flight.catalogEpoch != toolCatalogEpoch {
+                    if toolListFetched, !toolsDirty {
+                        return cachedTools
+                    }
+                    logger.debug("Retrying failed tool list refresh on the current connection epoch")
+                    continue
+                }
+                throw error
+            }
         }
+    }
 
-        let result = try await client.listTools()
-        cachedTools = result.tools
-        toolListFetched = true
-        toolsDirty = false
-
-        logger.debug("Refreshed tools: \(cachedTools.count) available")
-        return cachedTools
+    private func clearToolListRefreshFlight(matching id: UUID) {
+        guard toolListRefreshFlight?.id == id else { return }
+        toolListRefreshFlight = nil
     }
 
     /// Returns the cached tool list.
     func tools() -> [MCP.Tool] {
         cachedTools
+    }
+
+    /// Returns the cached tool catalog unless it has never been fetched or the server marked it dirty.
+    @discardableResult
+    func cachedToolsOrRefresh() async throws -> [MCP.Tool] {
+        guard toolListFetched, !toolsDirty else {
+            return try await refreshTools()
+        }
+        return cachedTools
     }
 
     /// Returns a specific tool by name.
@@ -422,13 +721,15 @@ actor InteractiveMCPClientSession {
 
     /// Marks the tool list as potentially stale.
     private func markToolsDirty() {
+        toolListInvalidationGeneration &+= 1
         toolsDirty = true
+        toolsChangeNoticePending = true
         logger.debug("Tool list marked dirty (server sent notification)")
     }
 
-    /// Clears the dirty flag after user acknowledges.
+    /// Clears only the one-shot user notice after acknowledgement; the catalog stays dirty until refreshed.
     func acknowledgeToolsChanged() {
-        toolsDirty = false
+        toolsChangeNoticePending = false
     }
 
     // MARK: - Raw JSON Mode
@@ -514,6 +815,7 @@ actor InteractiveMCPClientSession {
                 await requestSendWillStart()
             }
         #endif
+        try Task.checkCancellation()
         let request = CallTool.request(.init(name: name, arguments: arguments))
         await requestSendBarrier.register(requestID: request.id)
         do {
@@ -533,6 +835,19 @@ actor InteractiveMCPClientSession {
         timeoutSeconds: TimeInterval?
     ) async throws -> CallTool.Result {
         let settlement = ToolCallSettlementState()
+        let responseTaskID = UUID()
+        let responseTask = Task.detached { [weak self] in
+            let result: Result<CallTool.Result, Error>
+            do {
+                result = try await .success(registeredCall.context.value)
+            } catch {
+                result = .failure(error)
+            }
+            settlement.complete(with: result)
+            await self?.removeToolCallResponseTask(responseTaskID)
+        }
+        pendingToolCallResponseTasks[responseTaskID] = responseTask
+
         let timeoutTask = timeoutSeconds.map { seconds in
             Task { [timeoutSleep] in
                 do {
@@ -540,9 +855,10 @@ actor InteractiveMCPClientSession {
                 } catch {
                     return
                 }
-                _ = settlement.claim(.timedOut) {
-                    try? await client.cancelRequest(
-                        registeredCall.requestID,
+                _ = settlement.claim(.timedOut) { [weak self] in
+                    await self?.deliverCancellation(
+                        client: client,
+                        requestID: registeredCall.requestID,
                         reason: "CLI tool call timed out after \(seconds) seconds"
                     )
                 }
@@ -550,51 +866,30 @@ actor InteractiveMCPClientSession {
         }
         defer { timeoutTask?.cancel() }
 
-        do {
-            let result = try await withTaskCancellationHandler {
-                try await registeredCall.context.value
-            } onCancel: {
-                _ = settlement.claim(.callerCancelled) {
-                    try? await client.cancelRequest(
-                        registeredCall.requestID,
-                        reason: "CLI caller cancelled tool request"
-                    )
-                }
-            }
-            let outcome = settlement.finish()
-            await settlement.waitForCancellationDelivery()
-            return try Self.resolveToolCallSettlement(
-                outcome,
-                result: result,
-                toolName: toolName,
-                timeoutSeconds: timeoutSeconds
-            )
-        } catch {
-            let outcome = settlement.finish()
-            await settlement.waitForCancellationDelivery()
-            switch outcome {
-            case .timedOut:
-                throw InteractiveSessionError.toolCallTimeout(
-                    toolName: toolName,
-                    seconds: timeoutSeconds ?? 0
+        let outcome = await withTaskCancellationHandler {
+            await settlement.waitForOutcome()
+        } onCancel: {
+            _ = settlement.claim(.callerCancelled) { [weak self] in
+                await self?.deliverCancellation(
+                    client: client,
+                    requestID: registeredCall.requestID,
+                    reason: "CLI caller cancelled tool request"
                 )
-            case .callerCancelled:
-                throw CancellationError()
-            case .pending, .completed:
-                throw error
             }
         }
-    }
+        await waitForCancellationDeliveryIfNeeded(
+            settlement: settlement,
+            outcome: outcome,
+            requestID: registeredCall.requestID,
+            toolName: toolName
+        )
 
-    private static func resolveToolCallSettlement(
-        _ outcome: ToolCallSettlementState.Outcome,
-        result: CallTool.Result,
-        toolName: String,
-        timeoutSeconds: TimeInterval?
-    ) throws -> CallTool.Result {
         switch outcome {
         case .completed:
-            result
+            guard let result = settlement.completedResult() else {
+                throw InteractiveSessionError.cancelled
+            }
+            return try result.get()
         case .timedOut:
             throw InteractiveSessionError.toolCallTimeout(
                 toolName: toolName,
@@ -603,7 +898,46 @@ actor InteractiveMCPClientSession {
         case .callerCancelled:
             throw CancellationError()
         case .pending:
-            result
+            preconditionFailure("Tool-call outcome waiter resumed before settlement")
+        }
+    }
+
+    private func removeToolCallResponseTask(_ id: UUID) {
+        pendingToolCallResponseTasks.removeValue(forKey: id)
+    }
+
+    private func deliverCancellation(
+        client: MCP.Client,
+        requestID: ID,
+        reason: String
+    ) async {
+        #if DEBUG
+            if let cancellationDeliveryOverride {
+                await cancellationDeliveryOverride(client, requestID, reason)
+                return
+            }
+        #endif
+        try? await client.cancelRequest(requestID, reason: reason)
+    }
+
+    private func waitForCancellationDeliveryIfNeeded(
+        settlement: ToolCallSettlementState,
+        outcome: ToolCallSettlementState.Outcome,
+        requestID: ID,
+        toolName: String
+    ) async {
+        switch outcome {
+        case .timedOut, .callerCancelled:
+            break
+        case .pending, .completed:
+            return
+        }
+        let delivered = await settlement.waitForCancellationDelivery(
+            timeoutNanoseconds: cancellationDeliveryDrainTimeoutNanoseconds,
+            timeoutSleep: cancellationDeliveryDrainSleep
+        )
+        if !delivered {
+            logger.warning("Timed out draining cancellation for tool \(toolName), request \(String(describing: requestID))")
         }
     }
 
@@ -694,6 +1028,20 @@ actor InteractiveMCPClientSession {
             arguments: [String: Value] = [:]
         ) -> TimeInterval? {
             resolvedTimeout(policy, toolName: toolName, arguments: arguments)
+        }
+
+        func test_markToolsDirty() {
+            markToolsDirty()
+        }
+
+        func test_replaceConnectedClient(
+            _ client: MCP.Client,
+            requestSendBarrier: MCPRequestSendBarrier
+        ) {
+            self.client = client
+            transport = nil
+            self.requestSendBarrier = requestSendBarrier
+            resetToolCatalogForConnectionBoundary()
         }
     #endif
 
@@ -1043,18 +1391,27 @@ actor InteractiveMCPClientSession {
         var payload = jsonData
         payload.append(UInt8(ascii: "\n"))
 
-        var totalWritten = 0
-        while totalWritten < payload.count {
-            let written = payload.withUnsafeBytes { buf in
-                let ptr = buf.baseAddress!.advanced(by: totalWritten)
-                return Darwin.write(fd, ptr, payload.count - totalWritten)
-            }
-
-            if written < 0 {
-                if errno == EAGAIN || errno == EINTR { continue }
+        do {
+            try NonBlockingFDWriter.writeAll(
+                payload,
+                to: fd,
+                stallTimeout: MCPBootstrapTiming.initialRequestWriteTimeout
+            )
+        } catch let error as NonBlockingFDWriteError {
+            switch error {
+            case .cancelled:
+                throw InteractiveSessionError.cancelled
+            case let .fcntlFailed(errno):
+                throw InteractiveSessionError.descriptorConfigurationFailed(errno: errno)
+            case let .pollFailed(errno):
+                throw InteractiveSessionError.pollFailed(errno: errno)
+            case .localTimeout:
+                throw InteractiveSessionError.writeFailed(errno: ETIMEDOUT)
+            case .brokenPipe:
+                throw InteractiveSessionError.writeFailed(errno: EPIPE)
+            case let .writeFailed(errno, _, _):
                 throw InteractiveSessionError.writeFailed(errno: errno)
             }
-            totalWritten += written
         }
     }
 

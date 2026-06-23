@@ -45,6 +45,14 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
             } else {
                 selectedModelRaw.flatMap(AgentModel.init(rawValue:))
             }
+            if let selectedAgent,
+               let compatibleContextWindow = ClaudeCompatibleModelCatalogAdapter.contextWindowTokens(
+                   forRequestedModelRaw: selectedModelRaw,
+                   agentKind: selectedAgent
+               )
+            {
+                return compatibleContextWindow
+            }
             if let modelContextWindow = model?.contextWindowTokens {
                 return modelContextWindow
             }

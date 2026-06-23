@@ -226,6 +226,25 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
             persistedSelection.slices["/repo/project/Sources/Sliced.swift"],
             [LineRange(start: 3, end: 9)]
         )
+
+        let mixedAliasSelection = StoredSelection(
+            selectedPaths: [
+                "/repo/project/Sources/Sliced.swift",
+                "/tmp/worktrees/project-agent/Sources/Sliced.swift"
+            ],
+            slices: [
+                "/repo/project/Sources/Sliced.swift": [LineRange(start: 1, end: 20)],
+                "/tmp/worktrees/project-agent/Sources/Sliced.swift": [LineRange(start: 5, end: 25)]
+            ]
+        )
+        XCTAssertEqual(
+            projection.logicalizeSelection(mixedAliasSelection).slices["/repo/project/Sources/Sliced.swift"],
+            [LineRange(start: 1, end: 25)]
+        )
+        XCTAssertEqual(
+            projection.physicalizeSelection(mixedAliasSelection).slices["/tmp/worktrees/project-agent/Sources/Sliced.swift"],
+            [LineRange(start: 1, end: 25)]
+        )
     }
 
     func testMaterializerFailsClosedWhenPhysicalRootCannotBeLoaded() async throws {
@@ -249,31 +268,38 @@ final class WorkspaceRootBindingProjectionTests: XCTestCase {
         )
         let binding = Self.binding(logicalRoot: logicalRoot, physicalRoot: physicalRoot, worktreeID: "missing")
 
+        let sessionID = UUID()
         let materializedProjection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-            sessionID: UUID(),
+            sessionID: sessionID,
             bindings: [binding]
         )
-        let projection = try XCTUnwrap(materializedProjection)
-        let lookupContext = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
-        let physicalSelection = lookupContext.physicalizeSelection(StoredSelection(
-            selectedPaths: ["Sources/App.swift"],
-            codemapAutoEnabled: false
-        ))
-        let physicalPath = try XCTUnwrap(physicalSelection.selectedPaths.first)
-
-        let boundLookup = await store.lookupPath(physicalPath, profile: .uiAssisted, rootScope: lookupContext.rootScope)
         let visibleLookup = await store.lookupPath("Sources/App.swift", profile: .uiAssisted, rootScope: .visibleWorkspace)
-        let scopedRoots = await store.rootRefs(scope: lookupContext.rootScope)
-        let availability = await store.rootScopeAvailability(lookupContext.rootScope)
+        let ownership = await store.sessionWorktreeOwnershipDebugSnapshotForTesting()
 
-        XCTAssertEqual(physicalPath, unloadablePhysicalRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path)
-        XCTAssertNil(boundLookup)
-        XCTAssertNotNil(visibleLookup)
-        XCTAssertFalse(scopedRoots.contains { $0.standardizedFullPath == logicalRoot.standardizedFullPath })
-        XCTAssertEqual(
-            availability,
-            .sessionWorktreeUnavailable(missingPhysicalRootPaths: [unloadablePhysicalRoot.standardizedFileURL.path])
+        let failClosedProjection = try XCTUnwrap(materializedProjection)
+        let scopedLookup = await store.lookupPath(
+            "Sources/App.swift",
+            profile: .uiAssisted,
+            rootScope: failClosedProjection.lookupRootScope
         )
+        let scopeAvailability = await store.rootScopeAvailability(failClosedProjection.lookupRootScope)
+        let catalogAccess = await store.searchCatalogAccess(rootScope: failClosedProjection.lookupRootScope)
+        XCTAssertEqual(failClosedProjection.physicalRootPaths, Set([unloadablePhysicalRoot.standardizedFileURL.path]))
+        XCTAssertFalse(failClosedProjection.isFullyMaterialized)
+        XCTAssertEqual(
+            failClosedProjection.lookupRootScope,
+            .validatedSessionBoundWorkspace(canonicalRoots: [], physicalRoots: [])
+        )
+        XCTAssertEqual(scopeAvailability, .sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
+        XCTAssertEqual(
+            catalogAccess,
+            .unavailable(.sessionWorktreeUnavailable(missingPhysicalRootPaths: []))
+        )
+        XCTAssertNotNil(visibleLookup)
+        XCTAssertNil(scopedLookup)
+        XCTAssertEqual(ownership.installedOwnerCount, 0)
+        XCTAssertEqual(ownership.provisionalOwnerCount, 0)
+        XCTAssertEqual(ownership.rootClaimCount, 0)
     }
 
     func testMaterializerInitializesSessionWorktreeCodemapsIdempotently() async throws {

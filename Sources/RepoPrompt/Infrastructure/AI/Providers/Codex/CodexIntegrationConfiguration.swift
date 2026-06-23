@@ -6,12 +6,12 @@ import RepoPromptShared
 /// This namespace owns Codex CLI config.toml parsing/mutation, RepoPrompt MCP
 /// installation/repair, and Codex runtime override construction.
 enum CodexIntegrationConfiguration {
-    static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV4"
+    static let toolTimeoutDefaultsKey = "CodexToolTimeoutMigratedV5"
     // Codex applies this timeout to every tool on the MCP server. Preserve the existing
     // multi-hour budget because Oracle and Context Builder remain synchronous and have no
     // per-tool timeout exemption.
     static let desiredToolTimeoutSeconds = MCPTimeoutPolicy.codexServerActiveTimeoutSeconds
-    static let desiredSupportsParallelToolCalls = false
+    static let desiredSupportsParallelToolCalls = true
     static let desiredToolOutputTokenLimit = 25000
 
     private static let tomlBareKeyCharacters = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
@@ -284,8 +284,8 @@ enum CodexIntegrationConfiguration {
         }
     }
 
-    /// Ensures existing Codex CLI configs include the RepoPrompt MCP policy required by V4:
-    /// the preserved 10,000-active-second server timeout and disabled parallel tool calls.
+    /// Ensures existing Codex CLI configs include the RepoPrompt MCP policy required by V5:
+    /// the preserved 10,000-active-second server timeout and enabled parallel tool calls.
     ///
     /// Codex has no per-tool timeout exemption, so lowering this server-wide value would also
     /// truncate synchronous Oracle and Context Builder operations that can legitimately run for hours.

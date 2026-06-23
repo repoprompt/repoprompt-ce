@@ -124,6 +124,20 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                 availableTabIDs: availableTabIDs
             )
 
+            #if DEBUG
+                let probeRequestIdentity = MCPRequestTimelineContext.current
+                    ?? MCPApplyEditsRebaseProbeRecorder.latestApplyEditsRequestIdentity(
+                        connectionID: metadata.connectionID
+                    )
+                MCPApplyEditsRebaseProbeRecorder.recordApplyEditsInvocation(
+                    connectionID: metadata.connectionID,
+                    workspaceID: resolvedContext.snapshot.workspaceID,
+                    tabID: resolvedContext.snapshot.tabID,
+                    physicalPath: effectivePath,
+                    requestIdentity: probeRequestIdentity
+                )
+            #endif
+
             let approvalScope: ApplyEditsApprovalScope? = if runPurpose == .agentModeRun, let tabID {
                 ApplyEditsApprovalScope(windowID: dependencies.windowID, tabID: tabID)
             } else {
@@ -176,6 +190,17 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                         )
                     }
                     let persistedResult = previewResult.withFileMetadata(created: !preview.exists, overwritten: false)
+                    #if DEBUG
+                        MCPApplyEditsRebaseProbeRecorder.recordApplyEditsOutcome(
+                            connectionID: metadata.connectionID,
+                            workspaceID: resolvedContext.snapshot.workspaceID,
+                            tabID: resolvedContext.snapshot.tabID,
+                            physicalPath: effectivePath,
+                            requestIdentity: probeRequestIdentity,
+                            editsApplied: persistedResult.editsApplied,
+                            outcome: "success"
+                        )
+                    #endif
                     return editSummary(
                         from: persistedResult,
                         path: displayPath,
@@ -229,6 +254,17 @@ final class MCPApplyEditsToolProvider: MCPWindowToolProviding {
                     EditFlowPerf.Dimensions(outcome: "skipped", appliedCount: result.editsApplied)
                 )
             }
+            #if DEBUG
+                MCPApplyEditsRebaseProbeRecorder.recordApplyEditsOutcome(
+                    connectionID: metadata.connectionID,
+                    workspaceID: resolvedContext.snapshot.workspaceID,
+                    tabID: resolvedContext.snapshot.tabID,
+                    physicalPath: effectivePath,
+                    requestIdentity: probeRequestIdentity,
+                    editsApplied: result.editsApplied,
+                    outcome: "success"
+                )
+            #endif
             return editSummary(from: result, path: displayPath)
         } catch let error as FileManagerError {
             throw await dependencies.mapFileManagerErrorToMCP(error, MCPWindowToolName.applyEdits, requestPath)

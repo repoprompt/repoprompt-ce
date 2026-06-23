@@ -128,6 +128,22 @@ extension AgentContextExportRow {
     }
 }
 
+enum AgentContextPreviewContentPolicy {
+    static let maximumBytes = 256_000
+    static let maximumCharacters = 200_000
+
+    static func boundedPreviewText(_ text: String, wasTruncated: Bool = false) -> String {
+        let exceedsCharacterLimit = text.count > maximumCharacters
+        guard wasTruncated || exceedsCharacterLimit else { return text }
+        let preview = exceedsCharacterLimit ? String(text.prefix(maximumCharacters)) : text
+        return """
+        \(preview)
+
+        … Preview truncated to avoid retaining large file content. Copy the file content for the full text.
+        """
+    }
+}
+
 struct AgentContextClipboardRequest {
     let cfg: PromptContextResolved
     let source: AgentContextExportSource
@@ -141,7 +157,7 @@ struct AgentContextClipboardRequest {
     let promptSectionsOrder: [PromptSection]
     let disabledPromptSections: Set<PromptSection>
     let duplicateUserInstructionsAtTop: Bool
-    let selectedGitDiffProvider: ([String]) async -> String
+    let reviewGitContext: FrozenPromptGitReviewContext
     let completeGitDiffProvider: () async -> String
 }
 
@@ -221,6 +237,7 @@ enum AgentContextExportResolver {
 
     static func buildClipboardContent(_ request: AgentContextClipboardRequest) async -> String {
         let cfg = request.cfg
+        let coordinator = AutomaticReviewGitDiffCoordinator()
         let preAssembly = await PromptContextPreAssemblyService.resolve(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
@@ -233,8 +250,9 @@ enum AgentContextExportResolver {
                 selectedGitDiffFolderPolicy: .filesOnly,
                 selectedGitDiffLookupProfile: .mcpSelection,
                 selectedGitDiffArtifactPolicy: .respectGitInclusion,
-                selectedGitDiffProvider: { paths in
-                    await request.selectedGitDiffProvider(paths)
+                reviewGitContext: request.reviewGitContext,
+                selectedGitDiffProvider: { automaticRequest in
+                    await coordinator.resolve(automaticRequest)
                 },
                 completeGitDiffProvider: {
                     await request.completeGitDiffProvider()
@@ -252,7 +270,7 @@ enum AgentContextExportResolver {
             includeFiles: cfg.includeFiles,
             includeUserPrompt: cfg.includeUserPrompt,
             filePathDisplay: request.filePathDisplay,
-            codemapSnapshots: preAssembly.codemapSnapshots,
+            codemapSnapshotBundle: preAssembly.codemapSnapshotBundle,
             includeDatetimeInUserInstructions: request.includeDatetimeInUserInstructions,
             promptSectionsOrder: request.promptSectionsOrder,
             disabledPromptSections: request.disabledPromptSections,
@@ -272,17 +290,33 @@ enum AgentContextExportResolver {
         case .codemap:
             let snapshots = await store.codemapSnapshotDictionary()
             let text = snapshots[row.id.fileID]?.fileAPI?.getFullAPIDescription(displayPath: row.displayPath)
-            return text?.isEmpty == false ? text : nil
+            guard let text, !text.isEmpty else { return nil }
+            return purpose == .preview ? AgentContextPreviewContentPolicy.boundedPreviewText(text) : text
         case .full:
+            if purpose == .preview {
+                guard let prefix = try? await store.readContentPrefix(
+                    rootID: row.rootID,
+                    relativePath: row.relativePath,
+                    maximumBytes: AgentContextPreviewContentPolicy.maximumBytes
+                ) else {
+                    return nil
+                }
+                return AgentContextPreviewContentPolicy.boundedPreviewText(
+                    prefix.content,
+                    wasTruncated: prefix.truncated
+                )
+            }
             return try? await store.readContent(rootID: row.rootID, relativePath: row.relativePath)
         case .slices:
             guard let content = try? await store.readContent(rootID: row.rootID, relativePath: row.relativePath) else {
                 return nil
             }
-            guard purpose == .copy, let ranges = row.lineRanges, !ranges.isEmpty else {
-                return content
+            let renderedContent: String = if let ranges = row.lineRanges, !ranges.isEmpty {
+                SliceAssemblyBuilder.build(from: content, ranges: ranges).combinedText
+            } else {
+                content
             }
-            return SliceAssemblyBuilder.build(from: content, ranges: ranges).combinedText
+            return purpose == .preview ? AgentContextPreviewContentPolicy.boundedPreviewText(renderedContent) : renderedContent
         }
     }
 

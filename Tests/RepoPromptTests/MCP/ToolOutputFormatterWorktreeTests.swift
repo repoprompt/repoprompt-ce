@@ -4,41 +4,45 @@ import XCTest
 
 @MainActor
 final class ToolOutputFormatterWorktreeTests: XCTestCase {
-    func testGitWorktreeWarningRecommendsMainSelectorsOnlyWhenMainRootIsKnown() {
-        let warning = MCPGitToolProvider.worktreeWarning(from: .init(
-            isWorktree: true,
-            worktreeName: "feature",
-            worktreeRoot: "/tmp/repo-feature",
-            commonGitDir: "/tmp/repo/.git",
-            mainWorktreeRoot: "/tmp/repo",
-            worktreeBranch: "feature/demo",
-            mainBranch: "main",
-            worktreeHead: "abcdef1",
-            mainHead: "1234567"
-        ))
+    func testGitWorktreeWarningsChooseMainSelectorsOrFullPathGuidance() {
+        do {
+            let caseLabel = "testGitWorktreeWarningRecommendsMainSelectorsOnlyWhenMainRootIsKnown"
+            let warning = MCPGitToolProvider.worktreeWarning(from: .init(
+                isWorktree: true,
+                worktreeName: "feature",
+                worktreeRoot: "/tmp/repo-feature",
+                commonGitDir: "/tmp/repo/.git",
+                mainWorktreeRoot: "/tmp/repo",
+                worktreeBranch: "feature/demo",
+                mainBranch: "main",
+                worktreeHead: "abcdef1",
+                mainHead: "1234567"
+            ))
 
-        XCTAssertTrue(warning?.contains("repo_root=\"@main\"") == true)
-        XCTAssertTrue(warning?.contains("repo_root=\"@main:<branch>\"") == true)
-        XCTAssertFalse(warning?.contains("could not be resolved") == true)
-    }
+            XCTAssertTrue(warning?.contains("repo_root=\"@main\"") == true, caseLabel)
+            XCTAssertTrue(warning?.contains("repo_root=\"@main:<branch>\"") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("could not be resolved") == true, caseLabel)
+        }
 
-    func testGitWorktreeWarningUsesFullPathGuidanceWhenMainRootIsUnknown() {
-        let warning = MCPGitToolProvider.worktreeWarning(from: .init(
-            isWorktree: true,
-            worktreeName: "feature",
-            worktreeRoot: "/tmp/repo-feature",
-            commonGitDir: "/tmp/external-git-dir",
-            mainWorktreeRoot: nil,
-            worktreeBranch: "feature/demo",
-            mainBranch: nil,
-            worktreeHead: "abcdef1",
-            mainHead: nil
-        ))
+        do {
+            let caseLabel = "testGitWorktreeWarningUsesFullPathGuidanceWhenMainRootIsUnknown"
+            let warning = MCPGitToolProvider.worktreeWarning(from: .init(
+                isWorktree: true,
+                worktreeName: "feature",
+                worktreeRoot: "/tmp/repo-feature",
+                commonGitDir: "/tmp/external-git-dir",
+                mainWorktreeRoot: nil,
+                worktreeBranch: "feature/demo",
+                mainBranch: nil,
+                worktreeHead: "abcdef1",
+                mainHead: nil
+            ))
 
-        XCTAssertTrue(warning?.contains("primary checkout path could not be resolved") == true)
-        XCTAssertTrue(warning?.contains("full path as repo_root") == true)
-        XCTAssertFalse(warning?.contains("repo_root=\"@main\"") == true)
-        XCTAssertFalse(warning?.contains("repo_root=\"@main:<branch>\"") == true)
+            XCTAssertTrue(warning?.contains("primary checkout path could not be resolved") == true, caseLabel)
+            XCTAssertTrue(warning?.contains("full path as repo_root") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("repo_root=\"@main\"") == true, caseLabel)
+            XCTAssertFalse(warning?.contains("repo_root=\"@main:<branch>\"") == true, caseLabel)
+        }
     }
 
     func testCreateOutputIncludesUsefulNextStepCommands() throws {
@@ -303,6 +307,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                     op: "start",
                     status: "running",
                     sessionID: "session-available",
+                    runID: "11111111-1111-1111-1111-111111111111",
                     session: Session(name: "Available feature agent"),
                     worktreeBindings: [
                         WorktreeBinding(
@@ -318,7 +323,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                         )
                     ]
                 ),
-                ["- Worktree: **Feature WT**", "branch `feature/available`", "`wt_test`", "path `/tmp/repo-feature`", "#3366FF"]
+                ["- Run ID: `11111111-1111-1111-1111-111111111111`", "- Worktree: **Feature WT**", "branch `feature/available`", "`wt_test`", "path `/tmp/repo-feature`", "#3366FF"]
             ),
             (
                 "unavailable",
@@ -326,6 +331,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                     op: "start",
                     status: "failed",
                     sessionID: "session-unavailable",
+                    runID: "22222222-2222-2222-2222-222222222222",
                     session: Session(name: "Feature agent"),
                     worktreeBindings: [
                         WorktreeBinding(
@@ -341,7 +347,7 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
                         )
                     ]
                 ),
-                ["- Worktree: **demo**", "branch `feature/demo`", "`wt_missing`", "path `/tmp/repo-missing`", "⚠️ unavailable"]
+                ["- Run ID: `22222222-2222-2222-2222-222222222222`", "- Worktree: **demo**", "branch `feature/demo`", "`wt_missing`", "path `/tmp/repo-missing`", "⚠️ unavailable"]
             )
         ]
 
@@ -528,12 +534,14 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         let op: String
         let status: String
         let sessionID: String
+        let runID: String
         let session: Session
         let worktreeBindings: [WorktreeBinding]
 
         private enum CodingKeys: String, CodingKey {
             case op, status, session
             case sessionID = "session_id"
+            case runID = "run_id"
             case worktreeBindings = "worktree_bindings"
         }
     }

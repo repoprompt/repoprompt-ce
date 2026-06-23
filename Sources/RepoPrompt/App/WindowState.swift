@@ -332,6 +332,7 @@ class WindowState: ObservableObject {
                 codexModelPollingService: codexModelPollingService
             )
         }
+
     #endif
 
     private init(
@@ -383,6 +384,11 @@ class WindowState: ObservableObject {
 
         // Set up additional actions
         setupSendPromptAction()
+        #if DEBUG
+            if AppLaunchConfiguration.current.forcesMCPAutoStart {
+                setupMCPAutoStart()
+            }
+        #endif
 
         // Set up workspace switch listener to sync settings and validate prompts
         workspaceManager.addWorkspaceDidSwitchListener(label: "windowState") { [weak self] workspace in
@@ -1294,6 +1300,9 @@ class WindowState: ObservableObject {
     // MARK: - Teardown
 
     func tearDown() async {
+        beginClose()
+        await promptManager.gitViewModel.shutdownForWindowClose()
+
         let isAppTermination = WindowStatesManager.shared.isTerminating
         #if DEBUG
             agentChatStressHarness?.pause()
@@ -1319,6 +1328,9 @@ class WindowState: ObservableObject {
 
         // Stop the local MCP server
         await mcpServer.stopServer()
+
+        // Release per-window codemap work before the closed window can contend with later windows.
+        await workspaceFilesViewModel.cancelAllScans()
 
         // Cancel any ongoing AI query
         aiQueriesService.cancelQuery()

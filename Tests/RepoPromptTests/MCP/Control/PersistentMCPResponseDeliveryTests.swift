@@ -6,6 +6,48 @@ import RepoPromptShared
 import XCTest
 
 final class PersistentMCPResponseDeliveryTests: XCTestCase {
+    func testResponseDeliveryDrainWaitsForMatchingResponseWrite() async {
+        let gate = MCPTransportResponseDeliveryGate()
+        gate.recordAcceptedClientFrame(request(id: 808))
+        XCTAssertEqual(gate.snapshot().pendingRequestCount, 1)
+
+        let waitTask = Task {
+            await gate.waitUntilDrained()
+        }
+        for _ in 0 ..< 100 where gate.snapshot().waiterCount == 0 {
+            await Task.yield()
+        }
+        XCTAssertEqual(gate.snapshot().waiterCount, 1)
+
+        gate.recordDeliveredServerFrame(response(id: 909))
+        XCTAssertEqual(gate.snapshot().pendingRequestCount, 1)
+        XCTAssertEqual(gate.snapshot().waiterCount, 1)
+
+        gate.recordDeliveredServerFrame(response(id: 808))
+        let didDrain = await waitTask.value
+        XCTAssertTrue(didDrain)
+        XCTAssertEqual(gate.snapshot().pendingRequestCount, 0)
+        XCTAssertEqual(gate.snapshot().waiterCount, 0)
+    }
+
+    func testResponseDeliveryDrainFailsWhenTransportClosesWithOutstandingRequest() async {
+        let gate = MCPTransportResponseDeliveryGate()
+        gate.recordAcceptedClientFrame(request(id: 818))
+
+        let waitTask = Task {
+            await gate.waitUntilDrained()
+        }
+        for _ in 0 ..< 100 where gate.snapshot().waiterCount == 0 {
+            await Task.yield()
+        }
+        XCTAssertEqual(gate.snapshot().waiterCount, 1)
+
+        gate.close()
+        let didDrain = await waitTask.value
+        XCTAssertFalse(didDrain)
+        XCTAssertTrue(gate.snapshot().isTerminal)
+    }
+
     func testProxyHalfCloseDrainsResponseAfterFormerGraceCheckpoint() async throws {
         var sockets = [Int32](repeating: -1, count: 2)
         var stdinPipe = [Int32](repeating: -1, count: 2)

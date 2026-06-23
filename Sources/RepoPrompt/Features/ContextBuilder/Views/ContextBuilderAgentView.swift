@@ -58,6 +58,7 @@ struct ContextBuilderAgentView: View {
                 currentRunSection
             }
         }
+        .messageTimestampEnvironment()
         .onAppear {
             viewModel.refreshActiveSessionBindings()
         }

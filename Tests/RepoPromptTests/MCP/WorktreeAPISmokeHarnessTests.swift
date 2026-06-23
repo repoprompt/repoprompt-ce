@@ -1,3 +1,4 @@
+import CoreServices
 import Foundation
 import MCP
 @testable import RepoPrompt
@@ -122,6 +123,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
         let manageSelection = try await Self.windowTool(named: MCPWindowToolName.manageSelection, in: window)
         let readFile = try await Self.windowTool(named: MCPWindowToolName.readFile, in: window)
+        let fileSearch = try await Self.windowTool(named: MCPWindowToolName.search, in: window)
         let createValue = try await manageWorktree([
             "op": .string("create"),
             "branch": .string("feature/selection-\(fixture.suffix)"),
@@ -148,6 +150,81 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
             "worktree_id": .string(worktreeID),
             "session_id": .string(sessionID.uuidString)
         ])
+        addTeardownBlock {
+            await window.workspaceFileContextStore.releaseSessionWorktreeOwnership(ownerID: sessionID)
+        }
+
+        let maybeProjection = await window.mcpServer.materializeWorkspaceBindingProjection(
+            sessionID: sessionID,
+            bindings: window.agentModeViewModel.worktreeBindings(forAgentSessionID: sessionID)
+        )
+        let projection = try XCTUnwrap(maybeProjection)
+        let physicalRootID = try XCTUnwrap(projection.physicalRootRefs.first?.id)
+        let searchCreatedFile = URL(fileURLWithPath: worktreePath).appendingPathComponent("SearchCreated.swift")
+        let searchNeedle = "SEARCH_CREATED_CONTEXT_NEEDLE_\(fixture.suffix)"
+        try [
+            "line 1", "line 2", "line 3", "line 4", searchNeedle,
+            "line 6", "line 7", "line 8", "line 9"
+        ].joined(separator: "\n").appending("\n").write(
+            to: searchCreatedFile,
+            atomically: false,
+            encoding: .utf8
+        )
+        let acceptedCreate = try await window.workspaceFileContextStore.acceptWatcherPayloadForTesting(
+            rootID: physicalRootID,
+            events: [(
+                absolutePath: searchCreatedFile.path,
+                flags: FSEventStreamEventFlags(
+                    kFSEventStreamEventFlagItemCreated | kFSEventStreamEventFlagItemIsFile
+                ),
+                eventId: 9_000_000_000_000_000_000
+            )]
+        )
+        XCTAssertNotNil(acceptedCreate)
+        _ = await window.workspaceFileContextStore.awaitAppliedIngress(rootScope: projection.lookupRootScope)
+        let createdLookup = await window.workspaceFileContextStore.lookupPath(
+            searchCreatedFile.path,
+            profile: .mcpRead,
+            rootScope: projection.lookupRootScope
+        )
+        XCTAssertNotNil(createdLookup)
+
+        let searchConnectionID = UUID()
+        let searchRunID = UUID()
+        try window.mcpServer.bindTabForConnection(
+            connectionID: searchConnectionID,
+            clientName: AgentProviderKind.codexMCPClientID,
+            tabID: tabID,
+            workspaceID: workspaceID,
+            windowID: window.windowID,
+            runID: searchRunID,
+            explicitlyBound: false
+        )
+        await ServerNetworkManager.shared.setRunPurpose(.agentModeRun, for: searchConnectionID)
+        defer {
+            window.mcpServer.removeTabContext(
+                forConnectionID: searchConnectionID,
+                clientName: AgentProviderKind.codexMCPClientID,
+                windowID: window.windowID,
+                runID: searchRunID
+            )
+            Task { await ServerNetworkManager.shared.setRunPurpose(.unknown, for: searchConnectionID) }
+        }
+        _ = try await ServerNetworkManager.withConnectionID(searchConnectionID) {
+            try await manageSelection(["op": .string("clear")])
+        }
+        let searchValue = try await ServerNetworkManager.withConnectionID(searchConnectionID) {
+            try await fileSearch([
+                "pattern": .string(searchNeedle),
+                "mode": .string("content"),
+                "regex": .bool(false),
+                "context_lines": .int(2),
+                "filter": .object(["paths": .array([.string("SearchCreated.swift")])])
+            ])
+        }
+        let formattedSearch = try Self.onlyText(ToolOutputFormatter.formatSearch(value: searchValue))
+        XCTAssertTrue(formattedSearch.contains(searchNeedle), formattedSearch)
+        XCTAssertTrue(formattedSearch.contains("SearchCreated.swift"), formattedSearch)
 
         let staleConnectionID = UUID()
         try window.mcpServer.bindTabForConnection(
@@ -393,6 +470,7 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                     beforeProcessingProviderEvent: nil,
                     providerEventDisposition: nil,
                     teardownCompleted: nil,
+                    allowSyntheticRoutingWithoutFinalContext: true,
                     runMCPFollowUp: { mode, _, _ in
                         let chatID = UUID()
                         return ChatSendReply(
@@ -639,18 +717,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     }
 
     private static func makeAgentRunService(window: WindowState, targetTabID: UUID) -> AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "worktree-api-smoke", windowID: window.windowID)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in targetTabID },
-            resolveSpawnSourceTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
@@ -677,6 +755,35 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 return AgentExternalMCPRunStarter.StartOutcome(snapshot: snapshot, delivery: .startedRun)
             }
         )
+        service.resolveOracleReviewLaunchSource = { _, targetWindow in
+            let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+            let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                route: .explicitTabContext,
+                windowID: targetWindow.windowID,
+                workspaceID: workspace.id,
+                tabID: targetTabID,
+                selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                    workspaceID: workspace.id,
+                    tabID: targetTabID
+                ),
+                promptText: "",
+                selection: StoredSelection(),
+                sourceAgentSessionID: nil,
+                routedRunID: nil
+            )
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: snapshot,
+                source: .unavailable(.init(
+                    delegationID: UUID(),
+                    sourceTabID: targetTabID,
+                    workspaceID: workspace.id,
+                    sourceAgentSessionID: nil,
+                    sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Synthetic smoke-service fixture")
+                ))
+            )
+        }
+        return service
     }
 
     private static func makeWindow(

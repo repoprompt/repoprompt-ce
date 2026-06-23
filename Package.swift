@@ -1,5 +1,8 @@
 // swift-tools-version: 6.2
+import Foundation
 import PackageDescription
+
+let packageRoot = URL(fileURLWithPath: #filePath).deletingLastPathComponent().path
 
 let package = Package(
     name: "RepoPromptCE",
@@ -80,7 +83,7 @@ let package = Package(
                 .define("DEBUG", .when(configuration: .debug)),
                 .enableUpcomingFeature("BareSlashRegexLiterals"),
                 .unsafeFlags([
-                    "-import-objc-header", "Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
+                    "-import-objc-header", "\(packageRoot)/Sources/RepoPrompt/Support/RepoPrompt-Bridging-Header.h",
                     "-disable-bridging-pch"
                 ])
             ]

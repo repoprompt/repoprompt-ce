@@ -1,6 +1,6 @@
 ---
 name: rpce-merge-pr-batch
-description: "Safely process an explicitly ordered batch of RepoPrompt CE pull requests end to end: preserve a dirty original checkout, isolate each PR in an external disposable worktree, use window- and context-scoped production rp-cli Agent Mode review, repair and validate, require exact-head hosted checks, merge with merge commits, and clean up. Optionally verify or install a final cloud artifact only when separately requested. Use when an authorized maintainer asks to integrate and merge one or more ordered RepoPrompt CE PRs. Do not use for review-only triage, release-only work, or deployment-only work."
+description: "Safely process an explicitly ordered batch of RepoPrompt CE pull requests end to end: preserve a dirty original checkout, isolate each PR in an external disposable worktree, use window- and context-scoped CE rpce-cli Agent Mode review, repair and validate, require exact-head hosted checks, merge with merge commits, and clean up. Optionally verify or install a final cloud artifact only when separately requested. Use when an authorized maintainer asks to integrate and merge one or more ordered RepoPrompt CE PRs. Do not use for review-only triage, release-only work, or deployment-only work."
 ---
 
 # Merge RepoPrompt CE PR Batch
@@ -14,9 +14,9 @@ Process PRs sequentially. Every verified merge becomes the base for the next PR.
 3. Confirm the ordered PR list, maintainer authority to merge it, and separately requested terminal actions such as branch deletion or artifact installation.
 4. Treat authorization to process and normally merge the batch as distinct from destructive approval. Obtain explicit approval immediately before every force-push, history rewrite, admin bypass, local or remote branch/fork deletion, visible-app stop, app replacement, launch/relaunch, or other GitHub-visible destructive mutation. Do not cache or bundle approval for a later action.
 5. For RepoPrompt Agent Mode reviews:
-   - Use only production `rp-cli`; do not use `rpce-cli`, `rpce-cli-debug`, or another CE app CLI for review orchestration.
+   - Use the CE-specific `rpce-cli` surface (`rpce-cli-debug` for the local debug checkout); do not use the deprecated non-CE `rp-cli` app for review orchestration.
    - Use a fresh user-approved window and a dedicated workspace/compose context rooted at the disposable worktree.
-   - Record `window_id`, the dedicated compose tab selector, and canonical `context_id`. Pass `-w <window_id> -t <tab>` on every `rp-cli` Agent Mode invocation and include `"_windowID": <window_id>` in every JSON payload. Include both `window_id` and `_windowID` for workspace operations that support them.
+   - Record `window_id`, the dedicated compose tab selector, and canonical `context_id`. Pass `-w <window_id> -t <tab>` on every `rpce-cli` Agent Mode invocation and include `"_windowID": <window_id>` in every JSON payload. Include both `window_id` and `_windowID` for workspace operations that support them.
    - Discover or create the dedicated context with `bind_context`, then fail closed unless its canonical `context_id` resolves in the approved window and its root set is exactly the single expected disposable worktree.
    - Before each `agent_run start`, repeat that root check.
    - Record every session ID and poll, wait, respond, or cancel until each session is terminal before cleanup.

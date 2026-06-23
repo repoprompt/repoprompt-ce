@@ -50,6 +50,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: firstOwnership,
             terminalState: .completed,
+            expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,
@@ -150,19 +151,58 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             startPending: true
         )
         await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+        let previousRunID = UUID()
+        let runID = UUID()
+        let currentTurnID = UUID()
+        session.transcript = AgentTranscript(turns: [
+            AgentTranscriptTurn(
+                responseSpans: [AgentTranscriptProviderResponseSpan(runID: previousRunID, startedAt: Date())],
+                startedAt: Date()
+            ),
+            AgentTranscriptTurn(
+                id: currentTurnID,
+                responseSpans: [AgentTranscriptProviderResponseSpan(startedAt: Date())],
+                startedAt: Date()
+            )
+        ])
+        session.runID = runID
         let ownership = session.beginRunAttempt(source: "test.canonical")
         session.runState = .completed
         session.mcpFollowUpRunPending = true
 
         let projected = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(projected.status, .running)
+        XCTAssertEqual(projected.runID, runID)
+
+        session.runID = nil
+        let queuedProjection = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(queuedProjection.status, .running)
+        XCTAssertNil(queuedProjection.runID)
+
         let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
             for: session,
             ownership: ownership,
-            terminalState: .completed
+            terminalState: .completed,
+            providerRunID: runID
         ))
-        XCTAssertEqual(projected.status, .running)
         XCTAssertEqual(envelope.snapshot.status, .completed)
+        XCTAssertEqual(envelope.snapshot.runID, runID)
         XCTAssertEqual(envelope.epoch, ownership.turnEpoch)
+
+        XCTAssertTrue(AgentModeProcessRunIdentity.retainProcessRunID(
+            runID,
+            inTranscriptTurnID: currentTurnID,
+            for: session
+        ))
+        XCTAssertFalse(AgentModeProcessRunIdentity.retainProcessRunID(
+            previousRunID,
+            inTranscriptTurnID: currentTurnID,
+            for: session
+        ))
+        session.mcpFollowUpRunPending = false
+        let completed = try XCTUnwrap(viewModel.mcpSnapshot(for: session))
+        XCTAssertEqual(completed.status, .completed)
+        XCTAssertEqual(completed.runID, runID)
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
@@ -411,6 +451,7 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
             commitID: UUID(),
             ownership: ownership,
             terminalState: .completed,
+            expectedRunID: nil,
             sourceItemsRevision: session.sourceItemsRevision,
             assistantDeltaFlushGeneration: session.assistantDeltaFlushGeneration,
             providerDrainGeneration: session.providerTerminalDrainGeneration,

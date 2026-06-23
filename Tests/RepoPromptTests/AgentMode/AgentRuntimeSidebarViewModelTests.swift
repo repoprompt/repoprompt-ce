@@ -144,6 +144,78 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
     }
 
+    func testGLMSlotSelectionsUseBackendContextWindowFallback() {
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCodeGLM,
+            selectedModelRaw: "sonnet"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCodeGLM,
+            selectedModelRaw: "sonnet:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCodeGLM,
+            selectedModelRaw: "opus:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .claudeCodeGLM,
+            selectedModelRaw: "haiku"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+    }
+
+    func testCustomSlotMappingUsesBackendContextWindowFallback() {
+        let restore = installTemporaryCustomSlotMapping()
+        defer { restore() }
+
+        let store = AgentRuntimeMetricsUIStore()
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .customClaudeCompatible,
+            selectedModelRaw: "sonnet:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 1_000_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .customClaudeCompatible,
+            selectedModelRaw: "haiku"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(),
+            codexUsage: nil,
+            liveSelectedFileCount: nil,
+            selectedAgent: .kimiCode,
+            selectedModelRaw: "kimi-code:xhigh"
+        )
+        XCTAssertEqual(store.runtimeVM.snapshot.effectiveContextWindowTokens, 200_000)
+    }
+
     func testProviderReportedContextWindowWinsOverModelFallback() {
         let store = AgentRuntimeMetricsUIStore()
         store.update(
@@ -182,6 +254,42 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
             selectedModelRaw: "claude-fable-5:xhigh"
         )
         XCTAssertEqual(viewModel.snapshot.effectiveContextWindowTokens, 1_000_000)
+    }
+
+    private func installTemporaryCustomSlotMapping() -> () -> Void {
+        let defaults = UserDefaults.standard
+        let store = ClaudeCodeCompatibleBackendStore.shared
+        let configsKey = ClaudeCodeCompatibleBackendStore.configsDefaultsKey
+        let configuredKey = store.configuredDefaultsKey(for: .custom)
+        let previousConfigs = defaults.data(forKey: configsKey)
+        let previousConfigured = defaults.object(forKey: configuredKey)
+
+        store.saveConfig(ClaudeCodeCompatibleBackendConfig(
+            id: .custom,
+            isEnabled: true,
+            displayName: "CC Custom GLM",
+            baseURL: "https://example.test/anthropic",
+            auth: .anthropicAPIKey,
+            modelBehavior: .claudeSlotMapping(.init(
+                haiku: "custom-fast",
+                sonnet: "glm-5.2[1m]",
+                opus: "glm-5.2"
+            ))
+        ))
+        _ = store.setConfigured(true, for: .custom)
+
+        return {
+            if let previousConfigs {
+                defaults.set(previousConfigs, forKey: configsKey)
+            } else {
+                defaults.removeObject(forKey: configsKey)
+            }
+            if let previousConfigured {
+                defaults.set(previousConfigured, forKey: configuredKey)
+            } else {
+                defaults.removeObject(forKey: configuredKey)
+            }
+        }
     }
 
     private func makeManageSelectionItem(fileCount: Int, timestamp: Date = Date()) throws -> AgentChatItem {

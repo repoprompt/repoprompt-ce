@@ -173,11 +173,13 @@ enum ClaudeCompatibleProviderRuntimeBridge {
 
     static func backendEnvironment(
         config: ClaudeCodeCompatibleBackendConfig,
-        apiKey: String
+        apiKey: String,
+        selectedBackendModelID: String? = nil
     ) -> [String: String] {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleBackendEnvironmentBuilder.environment(
             config: pluginBackendConfig(from: config),
-            apiKey: apiKey
+            apiKey: apiKey,
+            selectedBackendModelID: selectedBackendModelID
         )
     }
 
@@ -328,6 +330,16 @@ enum ClaudeCompatibleProviderRuntimeBridge {
         )
     }
 
+    static func supportsGLMXHighEffort(backendModelID: String?) -> Bool {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportsXHighEffort(backendModelID)
+    }
+
+    static func contextWindowTokens(forGLMBackendModelID backendModelID: String?) -> Int? {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.contextWindowTokens(
+            forBackendModelID: backendModelID
+        )
+    }
+
     static var glmDefaultModelRawValue: String {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.defaultModelRawValue
     }
@@ -354,6 +366,18 @@ enum ClaudeCompatibleProviderRuntimeBridge {
 
     static var glmSupportedModelRawValues: [String] {
         RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.supportedModelRawValues
+    }
+
+    static var directSelectableGLMModelRawValues: [String] {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMModelRawValues
+    }
+
+    static func isDirectSelectableGLMModel(_ rawModel: String?) -> Bool {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.isDirectSelectableGLMModel(rawModel)
+    }
+
+    static func directSelectableGLMSlotRawValue(for rawModel: String?) -> String? {
+        RepoPromptClaudeCompatibleProvider.ClaudeCompatibleModelNormalizer.directSelectableGLMSlotRawValue(for: rawModel)
     }
 
     private static func pluginRuntimeMode(for toolContext: MCPIntegrationHelper.CLIToolContext) -> ClaudeCompatiblePluginRuntimeMode {

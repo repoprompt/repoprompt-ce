@@ -65,6 +65,11 @@ enum CursorACPEventNormalizer {
         }
         if let rawOutput = payload["rawOutput"] {
             result["rawOutput"] = rawOutput
+            if let rawOutputObject = rawOutput as? [String: Any],
+               let chatID = AgentOracleAuthoritativeChatIDPolicy.extract(fromRootObject: rawOutputObject)
+            {
+                result["chat_id"] = chatID
+            }
         }
         if let content = payload["content"] {
             result["content"] = content

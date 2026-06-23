@@ -365,8 +365,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
     private func validateLiveSession(_ sessionID: UUID, in targetWindow: WindowState) throws {
         let agentModeVM = targetWindow.agentModeViewModel
-        let bindings = agentModeVM.worktreeBindings(forAgentSessionID: sessionID)
-        _ = try agentModeVM.replaceWorktreeBindings(bindings, forSessionID: sessionID)
+        try agentModeVM.requireLiveAgentSession(sessionID)
     }
 
     private func resolveBindingSessionID(args: [String: Value]) async throws -> UUID {

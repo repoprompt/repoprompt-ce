@@ -63,7 +63,7 @@ extension MCPBootstrapLease {
 
         return { leaseSpec in
             guard let clientName = leaseSpec.clientName else { return }
-            await ServerNetworkManager.shared.clearClientConnectionPolicy(
+            await ServerNetworkManager.shared.revokeClientConnectionPolicy(
                 for: clientName,
                 windowID: leaseSpec.windowID,
                 runID: leaseSpec.runID

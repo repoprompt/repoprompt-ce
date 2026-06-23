@@ -190,6 +190,7 @@ public enum AIModel: Equatable, Hashable {
     case groqKimi
 
     // Z.AI Models
+    case zaiGLM52
     case zaiGLM5
     case zaiGLM5_0
     case zaiGLM5Turbo
@@ -370,6 +371,7 @@ public enum AIModel: Equatable, Hashable {
         ModelInfo(model: .groqKimi, rawValue: "moonshotai/kimi-k2-instruct", actualName: nil, displayName: "groq/Kimi K2", provider: ProviderIndex.groq),
 
         // Z.AI Models
+        ModelInfo(model: .zaiGLM52, rawValue: "glm-5.2", actualName: nil, displayName: "Z.AI GLM-5.2", provider: ProviderIndex.zAI),
         ModelInfo(model: .zaiGLM5, rawValue: "glm-5.1", actualName: nil, displayName: "Z.AI GLM-5.1", provider: ProviderIndex.zAI),
         ModelInfo(model: .zaiGLM5_0, rawValue: "glm-5", actualName: nil, displayName: "Z.AI GLM-5", provider: ProviderIndex.zAI),
         ModelInfo(model: .zaiGLM5Turbo, rawValue: "glm-5-turbo", actualName: nil, displayName: "Z.AI GLM-5-Turbo", provider: ProviderIndex.zAI),
@@ -712,6 +714,7 @@ public enum AIModel: Equatable, Hashable {
         .geminiPro25, .openrouterGeminiPro25,
         .deepseekReasoner,
         .grok40709, // Add new Grok 4 model
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -740,6 +743,7 @@ public enum AIModel: Equatable, Hashable {
         .geminiPro25, .openrouterGeminiPro25,
         .deepseekReasoner,
         .grok40709, // Add new Grok 4 model
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -767,6 +771,7 @@ public enum AIModel: Equatable, Hashable {
         .gpt41,
         .deepseekReasoner,
         .grok40709, // Add new Grok 4 model
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -790,6 +795,7 @@ public enum AIModel: Equatable, Hashable {
         .deepseekChat, .openrouterDeepseekChat,
         .gpt41,
         .deepseekReasoner,
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -818,6 +824,7 @@ public enum AIModel: Equatable, Hashable {
         .geminiProLatest, .openrouterGeminiPro,
         .geminiPro25, .openrouterGeminiPro25,
         .geminiFlash25,
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -839,6 +846,7 @@ public enum AIModel: Equatable, Hashable {
         // fallback: everything else
         .deepseekChat, .openrouterDeepseekChat,
         .gpt41,
+        .zaiGLM52,
         .zaiGLM5,
         .zaiGLM5_0,
         .zaiGLM5Turbo,
@@ -1123,6 +1131,8 @@ public enum AIModel: Equatable, Hashable {
         switch lowercasedRawValue {
         case "gemini-3-pro-preview":
             return .gemini3p1ProPreview
+        case "glm-5.2":
+            return .zaiGLM52
         case "glm-5":
             return .zaiGLM5_0
         default:
@@ -1960,6 +1970,7 @@ public enum AIModel: Equatable, Hashable {
         case grok4FastReasoning
         case grok4FastNonReasoning
         case groqKimi
+        case zaiGLM52
         case zaiGLM5
         case zaiGLM5_0
         case zaiGLM5Turbo
@@ -2183,6 +2194,8 @@ public enum AIModel: Equatable, Hashable {
             .staticCase(.grok4FastNonReasoning)
         case .groqKimi:
             .staticCase(.groqKimi)
+        case .zaiGLM52:
+            .staticCase(.zaiGLM52)
         case .zaiGLM5:
             .staticCase(.zaiGLM5)
         case .zaiGLM5_0:

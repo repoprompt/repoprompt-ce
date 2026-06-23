@@ -38,9 +38,9 @@ enum ClaudeCodeCompatibleBackendID: String, CaseIterable, Codable, Hashable {
                 auth: .anthropicAuthToken,
                 modelBehavior: .claudeSlotMapping(
                     ClaudeCodeCompatibleBackendConfig.ClaudeSlotMapping(
-                        haiku: "glm-4.7",
-                        sonnet: "glm-5-turbo",
-                        opus: "glm-5.1"
+                        haiku: "glm-4.5-air",
+                        sonnet: "glm-5.2[1m]",
+                        opus: "glm-5.2[1m]"
                     )
                 )
             )
