@@ -21,6 +21,8 @@ struct CodeMapArtifactStorePolicy: Equatable {
     let maximumQuarantineEpochCount: Int
     let maximumMetadataRecordByteCount: Int
     let maximumGCStepBudget: Int
+    let maximumActiveLeaseCount: Int
+    let maximumActiveLeaseBytes: UInt64
     let containerPolicy: CodeMapArtifactContainerPolicy
 
     init(
@@ -42,6 +44,8 @@ struct CodeMapArtifactStorePolicy: Equatable {
         maximumQuarantineEpochCount: Int = 4096,
         maximumMetadataRecordByteCount: Int = 64 * 1024,
         maximumGCStepBudget: Int = 4096,
+        maximumActiveLeaseCount: Int = 128,
+        maximumActiveLeaseBytes: UInt64 = 512 * 1024 * 1024,
         containerPolicy: CodeMapArtifactContainerPolicy = .default
     ) {
         precondition(residentPositiveEntryLimit >= 0)
@@ -56,6 +60,8 @@ struct CodeMapArtifactStorePolicy: Equatable {
         precondition(maximumMetadataRecordByteCount > 0)
         precondition(maximumMaintenanceWriteByteCount >= UInt64(maximumMetadataRecordByteCount) * 2)
         precondition(maximumGCStepBudget > 0)
+        precondition(maximumActiveLeaseCount > 0)
+        precondition(maximumActiveLeaseBytes > 0)
         self.residentPositiveEntryLimit = residentPositiveEntryLimit
         self.residentPositiveByteLimit = residentPositiveByteLimit
         self.residentNegativeEntryLimit = residentNegativeEntryLimit
@@ -74,11 +80,13 @@ struct CodeMapArtifactStorePolicy: Equatable {
         self.maximumQuarantineEpochCount = maximumQuarantineEpochCount
         self.maximumMetadataRecordByteCount = maximumMetadataRecordByteCount
         self.maximumGCStepBudget = maximumGCStepBudget
+        self.maximumActiveLeaseCount = maximumActiveLeaseCount
+        self.maximumActiveLeaseBytes = maximumActiveLeaseBytes
         self.containerPolicy = containerPolicy
     }
 }
 
-struct CodeMapArtifactStoreClock: @unchecked Sendable {
+struct CodeMapArtifactStoreClock {
     private let nowProvider: @Sendable () -> UInt64
 
     static let system = CodeMapArtifactStoreClock {
@@ -94,28 +102,49 @@ struct CodeMapArtifactStoreClock: @unchecked Sendable {
     }
 }
 
+struct CodeMapArtifactLeaseHooks {
+    static let none = CodeMapArtifactLeaseHooks()
+
+    let beforeDescriptorOpen: @Sendable () throws -> Void
+    let afterDescriptorOpen: @Sendable () -> Void
+
+    init(
+        beforeDescriptorOpen: @escaping @Sendable () throws -> Void = {},
+        afterDescriptorOpen: @escaping @Sendable () -> Void = {}
+    ) {
+        self.beforeDescriptorOpen = beforeDescriptorOpen
+        self.afterDescriptorOpen = afterDescriptorOpen
+    }
+}
+
 enum CodeMapArtifactHitSource: Equatable {
     case memory
     case disk
 }
 
-final class CodeMapArtifactHandle: @unchecked Sendable {
+final class CodeMapArtifactHandle: Sendable {
     let key: CodeMapArtifactKey
     let outcome: CodeMapSyntaxArtifactOutcome
     let payloadByteCount: UInt64
     let containerByteCount: UInt64
     let estimatedResidentByteCount: UInt64
+    fileprivate let storeIdentity: UUID
 
-    fileprivate init(key: CodeMapArtifactKey, verified: CodeMapArtifactVerifiedFile) {
+    fileprivate init(
+        key: CodeMapArtifactKey,
+        verified: CodeMapArtifactVerifiedFile,
+        storeIdentity: UUID
+    ) {
         self.key = key
         outcome = verified.outcome
         payloadByteCount = UInt64(verified.payloadByteCount)
         containerByteCount = UInt64(verified.containerByteCount)
         estimatedResidentByteCount = UInt64(verified.containerByteCount)
+        self.storeIdentity = storeIdentity
     }
 }
 
-enum CodeMapArtifactLookupResult: @unchecked Sendable {
+enum CodeMapArtifactLookupResult {
     case miss
     case hit(source: CodeMapArtifactHitSource, handle: CodeMapArtifactHandle)
 }
@@ -137,6 +166,7 @@ struct CodeMapArtifactStoreAccounting: Equatable {
     let residentNegativeCount: Int
     let residentNegativeBytes: UInt64
     let activeLeaseCount: Int
+    let activeLeaseBytes: UInt64
     let pendingAccessTouchCount: Int
     let corruptMetadataCount: Int
     let corruptPayloadCount: Int
@@ -217,12 +247,145 @@ struct CodeMapArtifactReconciliationProgress: Equatable {
     }
 }
 
+enum CodeMapArtifactLeaseBusyReason: Equatable {
+    case activeLeaseCountLimit
+    case activeLeaseByteLimit
+    case catalogLock
+    case fileDescriptorLimit
+}
+
+enum CodeMapArtifactLeaseError: Error, Equatable {
+    case busy(CodeMapArtifactLeaseBusyReason)
+    case foreignHandle
+    case artifactMissing
+    case artifactCorrupt
+    case artifactChanged
+    case accountingOverflow
+}
+
+struct CodeMapArtifactLeaseReservation: Equatable {
+    let token: UUID
+    let scope: UUID
+    let digest: String
+    let byteCount: UInt64
+}
+
+/// All mutable admission state is protected by `lock`. Reservations are made
+/// before any descriptor is opened and are released exactly once by the lease's
+/// synchronous claim path, including deinitialization.
+final class CodeMapArtifactLeaseAdmission: @unchecked Sendable {
+    private struct ScopedDigest: Hashable {
+        let scope: UUID
+        let digest: String
+    }
+
+    static let processWide = CodeMapArtifactLeaseAdmission(
+        maximumCount: CodeMapArtifactStorePolicy.default.maximumActiveLeaseCount,
+        maximumBytes: CodeMapArtifactStorePolicy.default.maximumActiveLeaseBytes
+    )
+
+    struct Snapshot: Equatable {
+        let activeCount: Int
+        let activeBytes: UInt64
+    }
+
+    private let lock = NSLock()
+    private let maximumCount: Int
+    private let maximumBytes: UInt64
+    private var reservations: [UUID: CodeMapArtifactLeaseReservation] = [:]
+    private var countByDigest: [ScopedDigest: Int] = [:]
+    private var activeBytes: UInt64 = 0
+    private var accountingFailedClosed = false
+
+    init(maximumCount: Int, maximumBytes: UInt64) {
+        self.maximumCount = maximumCount
+        self.maximumBytes = maximumBytes
+    }
+
+    func reserve(
+        scope: UUID,
+        digest: String,
+        byteCount: UInt64
+    ) throws -> CodeMapArtifactLeaseReservation {
+        try lock.withLock {
+            guard !accountingFailedClosed else {
+                throw CodeMapArtifactLeaseError.accountingOverflow
+            }
+            guard reservations.count < maximumCount else {
+                throw CodeMapArtifactLeaseError.busy(.activeLeaseCountLimit)
+            }
+            let (nextBytes, byteOverflow) = activeBytes.addingReportingOverflow(byteCount)
+            guard !byteOverflow, nextBytes <= maximumBytes else {
+                throw CodeMapArtifactLeaseError.busy(.activeLeaseByteLimit)
+            }
+            let scopedDigest = ScopedDigest(scope: scope, digest: digest)
+            let currentDigestCount = countByDigest[scopedDigest, default: 0]
+            let (nextDigestCount, countOverflow) = currentDigestCount.addingReportingOverflow(1)
+            guard !countOverflow else {
+                accountingFailedClosed = true
+                throw CodeMapArtifactLeaseError.accountingOverflow
+            }
+            let reservation = CodeMapArtifactLeaseReservation(
+                token: UUID(),
+                scope: scope,
+                digest: digest,
+                byteCount: byteCount
+            )
+            guard reservations[reservation.token] == nil else {
+                accountingFailedClosed = true
+                throw CodeMapArtifactLeaseError.accountingOverflow
+            }
+            reservations[reservation.token] = reservation
+            countByDigest[scopedDigest] = nextDigestCount
+            activeBytes = nextBytes
+            return reservation
+        }
+    }
+
+    func release(_ reservation: CodeMapArtifactLeaseReservation) {
+        lock.withLock {
+            guard reservations.removeValue(forKey: reservation.token) == reservation else { return }
+            guard activeBytes >= reservation.byteCount,
+                  let currentDigestCount = countByDigest[
+                      ScopedDigest(scope: reservation.scope, digest: reservation.digest)
+                  ],
+                  currentDigestCount > 0
+            else {
+                accountingFailedClosed = true
+                activeBytes = maximumBytes
+                return
+            }
+            activeBytes -= reservation.byteCount
+            let scopedDigest = ScopedDigest(scope: reservation.scope, digest: reservation.digest)
+            if currentDigestCount == 1 {
+                countByDigest.removeValue(forKey: scopedDigest)
+            } else {
+                countByDigest[scopedDigest] = currentDigestCount - 1
+            }
+        }
+    }
+
+    func containsLease(scope: UUID, digest: String) -> Bool {
+        lock.withLock { countByDigest[ScopedDigest(scope: scope, digest: digest), default: 0] > 0 }
+    }
+
+    func snapshot() -> Snapshot {
+        lock.withLock {
+            Snapshot(
+                activeCount: reservations.count,
+                activeBytes: accountingFailedClosed ? maximumBytes : activeBytes
+            )
+        }
+    }
+}
+
+/// Mutable ownership is confined to `state` and every close/deinit races through
+/// the same lock-protected claim, which returns each descriptor/reservation once.
 final class CodeMapArtifactLease: @unchecked Sendable {
     private struct State {
         var diskLease: CodeMapArtifactDiskLease?
-        var store: CodeMapArtifactStore?
-        var token: UUID?
-        var key: CodeMapArtifactKey?
+        var admission: CodeMapArtifactLeaseAdmission?
+        var reservation: CodeMapArtifactLeaseReservation?
     }
 
     let handle: CodeMapArtifactHandle
@@ -232,41 +395,40 @@ final class CodeMapArtifactLease: @unchecked Sendable {
     fileprivate init(
         handle: CodeMapArtifactHandle,
         diskLease: CodeMapArtifactDiskLease,
-        store: CodeMapArtifactStore,
-        token: UUID
+        admission: CodeMapArtifactLeaseAdmission,
+        reservation: CodeMapArtifactLeaseReservation
     ) {
         self.handle = handle
-        state = State(diskLease: diskLease, store: store, token: token, key: handle.key)
+        state = State(diskLease: diskLease, admission: admission, reservation: reservation)
     }
 
     func close() async {
-        let claimed = claim()
-        guard let claimed else { return }
-        await claimed.store.releaseLease(token: claimed.token, key: claimed.key)
+        closeSynchronously()
+    }
+
+    func closeSynchronously() {
+        guard let claimed = claim() else { return }
         claimed.diskLease.close()
+        claimed.admission.release(claimed.reservation)
     }
 
     deinit {
-        guard let claimed = claim() else { return }
-        claimed.diskLease.close()
-        Task { await claimed.store.releaseLease(token: claimed.token, key: claimed.key) }
+        closeSynchronously()
     }
 
     private func claim() -> (
         diskLease: CodeMapArtifactDiskLease,
-        store: CodeMapArtifactStore,
-        token: UUID,
-        key: CodeMapArtifactKey
+        admission: CodeMapArtifactLeaseAdmission,
+        reservation: CodeMapArtifactLeaseReservation
     )? {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let diskLease = state.diskLease,
-              let store = state.store,
-              let token = state.token,
-              let key = state.key
-        else { return nil }
-        state = State()
-        return (diskLease, store, token, key)
+        lock.withLock {
+            guard let diskLease = state.diskLease,
+                  let admission = state.admission,
+                  let reservation = state.reservation
+            else { return nil }
+            state = State()
+            return (diskLease, admission, reservation)
+        }
     }
 }
 
@@ -449,6 +611,9 @@ actor CodeMapArtifactStore {
 
     private let policy: CodeMapArtifactStorePolicy
     private let clock: CodeMapArtifactStoreClock
+    private let storeIdentity = UUID()
+    private let leaseAdmission: CodeMapArtifactLeaseAdmission
+    private let leaseHooks: CodeMapArtifactLeaseHooks
     private let fileStore: CodeMapArtifactFileStore
     private let catalog: CodeMapArtifactCatalog
     private var records: [String: CodeMapArtifactCatalogRecord] = [:]
@@ -459,8 +624,6 @@ actor CodeMapArtifactStore {
     private var pendingTouchSet: Set<String> = []
     private var pendingTouchOrder: [String] = []
     private var pendingTouchOffset = 0
-    private var activeLeaseTokens: [UUID: String] = [:]
-    private var leaseCountByDigest: [String: Int] = [:]
     private var nextAccessSequence: UInt64 = 1
     private var nextMaintenanceCycle: UInt64 = 1
     private var maintenanceCycle: MaintenanceCycle?
@@ -490,10 +653,14 @@ actor CodeMapArtifactStore {
         rootURL: URL,
         policy: CodeMapArtifactStorePolicy = .default,
         clock: CodeMapArtifactStoreClock = .system,
-        removalHooks: CodeMapSecureFileRemovalHooks? = nil
+        removalHooks: CodeMapSecureFileRemovalHooks? = nil,
+        leaseAdmission: CodeMapArtifactLeaseAdmission = .processWide,
+        leaseHooks: CodeMapArtifactLeaseHooks = .none
     ) throws {
         self.policy = policy
         self.clock = clock
+        self.leaseAdmission = leaseAdmission
+        self.leaseHooks = leaseHooks
         fileStore = try CodeMapArtifactFileStore(
             rootURL: rootURL,
             containerPolicy: policy.containerPolicy,
@@ -527,7 +694,7 @@ actor CodeMapArtifactStore {
                     fileStore: fileStore,
                     epochSeconds: now
                 ) == .completed {
-                    reconciliation.corruptPayloadCount += 1
+                    incrementSaturating(&reconciliation.corruptPayloadCount)
                 }
             case .missing, .corrupt:
                 if try catalog.quarantineOrphanArtifact(
@@ -535,7 +702,7 @@ actor CodeMapArtifactStore {
                     fileStore: fileStore,
                     epochSeconds: now
                 ) == .completed {
-                    reconciliation.corruptPayloadCount += 1
+                    incrementSaturating(&reconciliation.corruptPayloadCount)
                 }
             }
             removeRecord(digest: digest, localMutation: true)
@@ -545,7 +712,7 @@ actor CodeMapArtifactStore {
         case .miss:
             if case let .record(record) = try catalog.liveRecord(key: key, quarantineCorruptionAt: now) {
                 if try catalog.quarantineMissingPayload(expectedRecord: record, epochSeconds: now) == .completed {
-                    reconciliation.missingPayloadCount += 1
+                    incrementSaturating(&reconciliation.missingPayloadCount)
                 }
             }
             removeRecord(digest: digest, localMutation: true)
@@ -565,11 +732,15 @@ actor CodeMapArtifactStore {
                 }
                 let repaired = makeRecord(key: key, verified: verified, now: now)
                 record = try catalog.writeLiveRecord(repaired)
-                reconciliation.repairedOrphanArtifactCount += 1
+                incrementSaturating(&reconciliation.repairedOrphanArtifactCount)
                 quarantineInventoryComplete = false
             }
             setRecord(record, localMutation: true)
-            let handle = CodeMapArtifactHandle(key: key, verified: verified)
+            let handle = CodeMapArtifactHandle(
+                key: key,
+                verified: verified,
+                storeIdentity: storeIdentity
+            )
             cache(handle)
             touch(digest: digest)
             return .hit(source: .disk, handle: handle)
@@ -606,7 +777,7 @@ actor CodeMapArtifactStore {
                 )
             }
             removeRecord(digest: digest, localMutation: true)
-            reconciliation.corruptPayloadCount += 1
+            incrementSaturating(&reconciliation.corruptPayloadCount)
             quarantineInventoryComplete = false
         }
 
@@ -637,17 +808,93 @@ actor CodeMapArtifactStore {
             }
         setRecord(result.2, localMutation: true)
         pendingTouchSet.remove(digest)
-        cache(CodeMapArtifactHandle(key: key, verified: result.1))
+        cache(CodeMapArtifactHandle(
+            key: key,
+            verified: result.1,
+            storeIdentity: storeIdentity
+        ))
         return result.0 == .inserted ? .inserted : .alreadyPresent
     }
 
     func lease(handle: CodeMapArtifactHandle) throws -> CodeMapArtifactLease {
-        let diskLease = try catalog.acquireSharedLease(key: handle.key)
-        let token = UUID()
-        let digest = handle.key.storageDigestHex
-        activeLeaseTokens[token] = digest
-        leaseCountByDigest[digest, default: 0] += 1
-        return CodeMapArtifactLease(handle: handle, diskLease: diskLease, store: self, token: token)
+        guard !Task.isCancelled else { throw CancellationError() }
+        guard handle.storeIdentity == storeIdentity else {
+            throw CodeMapArtifactLeaseError.foreignHandle
+        }
+
+        let reservation = try leaseAdmission.reserve(
+            scope: storeIdentity,
+            digest: handle.key.storageDigestHex,
+            byteCount: handle.containerByteCount
+        )
+        do {
+            guard !Task.isCancelled else { throw CancellationError() }
+            try leaseHooks.beforeDescriptorOpen()
+            let diskLease: CodeMapArtifactDiskLease
+            do {
+                diskLease = try catalog.acquireSharedLease(key: handle.key)
+            } catch let error as CodeMapArtifactCatalogError
+                where error == .ioFailure(operation: "lease-busy", code: EWOULDBLOCK)
+            {
+                throw CodeMapArtifactLeaseError.busy(.catalogLock)
+            }
+            do {
+                leaseHooks.afterDescriptorOpen()
+                guard !Task.isCancelled else { throw CancellationError() }
+                try validateLeasePresence(handle: handle)
+                guard !Task.isCancelled else { throw CancellationError() }
+                return CodeMapArtifactLease(
+                    handle: handle,
+                    diskLease: diskLease,
+                    admission: leaseAdmission,
+                    reservation: reservation
+                )
+            } catch {
+                diskLease.close()
+                throw error
+            }
+        } catch {
+            leaseAdmission.release(reservation)
+            throw mapLeaseAcquisitionError(error)
+        }
+    }
+
+    private func mapLeaseAcquisitionError(_ error: Error) -> Error {
+        let code: Int32? = switch error {
+        case let CodeMapArtifactCatalogError.ioFailure(_, code): code
+        case let CodeMapArtifactFileStoreError.ioFailure(_, code): code
+        default: nil
+        }
+        guard code == EMFILE || code == ENFILE else { return error }
+        return CodeMapArtifactLeaseError.busy(.fileDescriptorLimit)
+    }
+
+    private func validateLeasePresence(handle: CodeMapArtifactHandle) throws {
+        let verified: CodeMapArtifactVerifiedFile
+        switch try fileStore.readVerified(key: handle.key, quarantineCorruption: false) {
+        case .miss:
+            throw CodeMapArtifactLeaseError.artifactMissing
+        case .corrupt:
+            throw CodeMapArtifactLeaseError.artifactCorrupt
+        case let .hit(current):
+            verified = current
+        }
+        guard verified.outcome == handle.outcome,
+              UInt64(verified.payloadByteCount) == handle.payloadByteCount,
+              UInt64(verified.containerByteCount) == handle.containerByteCount
+        else {
+            throw CodeMapArtifactLeaseError.artifactChanged
+        }
+        switch try catalog.liveRecord(key: handle.key, quarantineCorruptionAt: clock.nowEpochSeconds()) {
+        case .missing:
+            throw CodeMapArtifactLeaseError.artifactMissing
+        case .corrupt:
+            throw CodeMapArtifactLeaseError.artifactCorrupt
+        case let .record(record):
+            guard recordMatches(record, key: handle.key, verified: verified) else {
+                throw CodeMapArtifactLeaseError.artifactChanged
+            }
+        }
     }
 
     @discardableResult
@@ -675,7 +922,8 @@ actor CodeMapArtifactStore {
     }
 
     func accounting() -> CodeMapArtifactStoreAccounting {
-        CodeMapArtifactStoreAccounting(
+        let leaseAccounting = leaseAdmission.snapshot()
+        return CodeMapArtifactStoreAccounting(
             livePositiveCount: livePositiveCount,
             livePositiveBytes: livePositiveBytes,
             liveNegativeCount: liveNegativeCount,
@@ -683,10 +931,15 @@ actor CodeMapArtifactStore {
             quarantinedCount: reconciliation.scan.quarantineRecordCount,
             quarantinedBytes: reconciliation.scan.quarantineContainerBytes,
             residentPositiveCount: residentPositive.count,
-            residentPositiveBytes: residentPositive.values.reduce(0) { $0 + $1.handle.estimatedResidentByteCount },
+            residentPositiveBytes: residentPositive.values.reduce(UInt64(0)) {
+                addingSaturating($0, $1.handle.estimatedResidentByteCount)
+            },
             residentNegativeCount: residentNegative.count,
-            residentNegativeBytes: residentNegative.values.reduce(0) { $0 + $1.handle.estimatedResidentByteCount },
-            activeLeaseCount: activeLeaseTokens.count,
+            residentNegativeBytes: residentNegative.values.reduce(UInt64(0)) {
+                addingSaturating($0, $1.handle.estimatedResidentByteCount)
+            },
+            activeLeaseCount: leaseAccounting.activeCount,
+            activeLeaseBytes: leaseAccounting.activeBytes,
             pendingAccessTouchCount: pendingTouchSet.count,
             corruptMetadataCount: reconciliation.scan.corruptMetadataCount,
             corruptPayloadCount: reconciliation.corruptPayloadCount,
@@ -695,8 +948,10 @@ actor CodeMapArtifactStore {
             observedOrphanArtifactCount: reconciliation.scan.orphanArtifactCount,
             ignoredTemporaryCount: reconciliation.scan.ignoredTemporaryCount,
             removedTemporaryCount: reconciliation.scan.removedTemporaryCount,
-            retainedPrivateDeletionCount: retainedLivePrivateDeletionCount +
-                retainedQuarantinePrivateDeletionCount,
+            retainedPrivateDeletionCount: addingSaturating(
+                retainedLivePrivateDeletionCount,
+                retainedQuarantinePrivateDeletionCount
+            ),
             retainedPrivateDeletionBytes: addingSaturating(
                 retainedLivePrivateDeletionBytes,
                 retainedQuarantinePrivateDeletionBytes
@@ -731,14 +986,6 @@ actor CodeMapArtifactStore {
 
     func runGC(stepBudget: Int) throws -> CodeMapArtifactGCProgress {
         try advanceMaintenance(stepBudget: stepBudget, collect: true)
-    }
-
-    fileprivate func releaseLease(token: UUID, key: CodeMapArtifactKey) {
-        let digest = key.storageDigestHex
-        guard activeLeaseTokens.removeValue(forKey: token) == digest else { return }
-        let next = leaseCountByDigest[digest, default: 0] - 1
-        if next > 0 { leaseCountByDigest[digest] = next }
-        else { leaseCountByDigest.removeValue(forKey: digest) }
     }
 
     private func advanceMaintenance(stepBudget: Int, collect: Bool) throws -> CodeMapArtifactGCProgress {
@@ -819,14 +1066,14 @@ actor CodeMapArtifactStore {
                         cycle.reconciliation.candidateOrder.append(record.digest)
                         nextAccessSequence = max(nextAccessSequence, successor(record.lastAccessSequence))
                     case let .corruptLiveMetadata(_, _, _, writtenBytes):
-                        reconciliation.scan.corruptMetadataCount += 1
+                        incrementSaturating(&reconciliation.scan.corruptMetadataCount)
                         quarantineInventoryComplete = false
-                        progress.tombstones += 1
+                        incrementSaturating(&progress.tombstones)
                         writeBytesRemaining = subtractingFloor(writeBytesRemaining, writtenBytes)
                         progress.writtenBytes = addingSaturating(progress.writtenBytes, writtenBytes)
                     case let .temporary(removed):
-                        reconciliation.scan.ignoredTemporaryCount += 1
-                        if removed { reconciliation.scan.removedTemporaryCount += 1 }
+                        incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
+                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -903,8 +1150,8 @@ actor CodeMapArtifactStore {
                             metrics.writtenByteCount
                         )
                     case let .temporary(removed):
-                        reconciliation.scan.ignoredTemporaryCount += 1
-                        if removed { reconciliation.scan.removedTemporaryCount += 1 }
+                        incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
+                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1012,7 +1259,7 @@ actor CodeMapArtifactStore {
                 let digest = cycle.reconciliation.selectionOrder[cycle.selectionOffset]
                 cycle.selectionOffset += 1
                 if let record = records[digest] { cycle.heap.insert(record) }
-                progress.selected += 1
+                incrementSaturating(&progress.selected)
                 charge(&cycle, &remaining, &progress)
 
             case .quarantine:
@@ -1029,7 +1276,7 @@ actor CodeMapArtifactStore {
                        now: cycle.now,
                        privateDeletionBytes: privateDeletionBytes
                    ),
-                   leaseCountByDigest[next.digest, default: 0] == 0
+                   !leaseAdmission.containsLease(scope: storeIdentity, digest: next.digest)
                 {
                     guard writeBytesRemaining >= UInt64(policy.maximumMetadataRecordByteCount) else {
                         break maintenanceLoop
@@ -1059,8 +1306,8 @@ actor CodeMapArtifactStore {
                           privateDeletionBytes: privateDeletionBytes
                       )
                 else { continue }
-                guard leaseCountByDigest[digest, default: 0] == 0 else {
-                    progress.leased += 1
+                guard !leaseAdmission.containsLease(scope: storeIdentity, digest: digest) else {
+                    incrementSaturating(&progress.leased)
                     continue
                 }
                 let reason = collectionReason(
@@ -1080,9 +1327,12 @@ actor CodeMapArtifactStore {
                         quarantineMetadataBytes
                     )
                     progress.readBytes = addingSaturating(progress.readBytes, quarantineMetadataBytes)
-                    progress.quarantined += 1
-                    progress.quarantinedBytes += expected.containerByteCount
-                    progress.tombstones += 1
+                    incrementSaturating(&progress.quarantined)
+                    progress.quarantinedBytes = addingSaturating(
+                        progress.quarantinedBytes,
+                        expected.containerByteCount
+                    )
+                    incrementSaturating(&progress.tombstones)
                     let written = try CodeMapArtifactCatalog.tombstoneByteCount(
                         epochSeconds: cycle.now,
                         record: expected,
@@ -1107,14 +1357,14 @@ actor CodeMapArtifactStore {
                         progress.readBytes,
                         quarantineVerificationBytes
                     )
-                    progress.leased += 1
+                    incrementSaturating(&progress.leased)
                 case .missingOrChanged:
                     metadataBytesRemaining = subtractingFloor(
                         metadataBytesRemaining,
                         quarantineMetadataBytes
                     )
                     progress.readBytes = addingSaturating(progress.readBytes, quarantineMetadataBytes)
-                    progress.changed += 1
+                    incrementSaturating(&progress.changed)
                 }
 
             case .quarantineCatalog:
@@ -1155,7 +1405,7 @@ actor CodeMapArtifactStore {
                     case let .quarantineTombstone(candidate, metadataBytes, _, writtenBytes):
                         writeBytesRemaining = subtractingFloor(writeBytesRemaining, writtenBytes)
                         progress.writtenBytes = addingSaturating(progress.writtenBytes, writtenBytes)
-                        cycle.quarantineCount += 1
+                        incrementSaturating(&cycle.quarantineCount)
                         cycle.quarantineBytes = addingSaturating(cycle.quarantineBytes, metadataBytes)
                         if let artifactName = candidate.artifactName {
                             cycle.expectedQuarantineArtifacts.insert(quarantineIdentity(
@@ -1172,10 +1422,10 @@ actor CodeMapArtifactStore {
                             cycle.phase = .selectSweep
                         }
                     case .corruptQuarantineMetadata:
-                        reconciliation.scan.quarantineOrphanCount += 1
+                        incrementSaturating(&reconciliation.scan.quarantineOrphanCount)
                     case let .temporary(removed):
-                        reconciliation.scan.ignoredTemporaryCount += 1
-                        if removed { reconciliation.scan.removedTemporaryCount += 1 }
+                        incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
+                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1197,7 +1447,7 @@ actor CodeMapArtifactStore {
                 }
                 cycle.pendingSweepSelection = nil
                 cycle.sweepHeap.insert(pending)
-                progress.selected += 1
+                incrementSaturating(&progress.selected)
                 charge(&cycle, &remaining, &progress)
                 cycle.phase = .quarantineCatalog
 
@@ -1212,7 +1462,10 @@ actor CodeMapArtifactStore {
                     reconciliation.scan.quarantineRecordCount = cycle.quarantineCount
                     reconciliation.scan.quarantineContainerBytes = cycle.quarantineBytes
                     reconciliation.scan.quarantineOrphanCount =
-                        cycle.recoveredQuarantineOrphanCount + cycle.expectedQuarantineArtifacts.count
+                        addingSaturating(
+                            cycle.recoveredQuarantineOrphanCount,
+                            cycle.expectedQuarantineArtifacts.count
+                        )
                     quarantineInventoryComplete = true
                     finishPrivateDeletionAccounting(cycle)
                     maintenanceCycle = nil
@@ -1222,9 +1475,12 @@ actor CodeMapArtifactStore {
                 progress.readBytes = addingSaturating(progress.readBytes, pending.metadataByteCount)
                 switch try catalog.sweep(pending.candidate) {
                 case .completed:
-                    progress.swept += 1
+                    incrementSaturating(&progress.swept)
                     progress.sweptDigests.append(pending.candidate.tombstone.digest)
-                    progress.sweptBytes += pending.candidate.tombstone.containerByteCount
+                    progress.sweptBytes = addingSaturating(
+                        progress.sweptBytes,
+                        pending.candidate.tombstone.containerByteCount
+                    )
                     cycle.quarantineCount = max(0, cycle.quarantineCount - 1)
                     var removedBytes = pending.metadataByteCount
                     if let artifactName = pending.candidate.artifactName {
@@ -1245,9 +1501,9 @@ actor CodeMapArtifactStore {
                 case .leased:
                     metadataBytesRemaining = addingSaturating(metadataBytesRemaining, pending.metadataByteCount)
                     progress.readBytes = subtractingFloor(progress.readBytes, pending.metadataByteCount)
-                    progress.leased += 1
+                    incrementSaturating(&progress.leased)
                 case .missingOrChanged:
-                    progress.changed += 1
+                    incrementSaturating(&progress.changed)
                 }
                 charge(&cycle, &remaining, &progress)
 
@@ -1269,7 +1525,10 @@ actor CodeMapArtifactStore {
                     reconciliation.scan.quarantineRecordCount = cycle.quarantineCount
                     reconciliation.scan.quarantineContainerBytes = cycle.quarantineBytes
                     reconciliation.scan.quarantineOrphanCount =
-                        cycle.recoveredQuarantineOrphanCount + cycle.expectedQuarantineArtifacts.count
+                        addingSaturating(
+                            cycle.recoveredQuarantineOrphanCount,
+                            cycle.expectedQuarantineArtifacts.count
+                        )
                     quarantineInventoryComplete = true
                     finishPrivateDeletionAccounting(cycle)
                     maintenanceCycle = nil
@@ -1302,8 +1561,8 @@ actor CodeMapArtifactStore {
                             cycle.phase = .repairQuarantine
                         }
                     case let .temporary(removed):
-                        reconciliation.scan.ignoredTemporaryCount += 1
-                        if removed { reconciliation.scan.removedTemporaryCount += 1 }
+                        incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
+                        if removed { incrementSaturating(&reconciliation.scan.removedTemporaryCount) }
                     case let .privateDeletion(removed, storedByteCount):
                         recordPrivateDeletion(
                             removed: removed,
@@ -1343,10 +1602,10 @@ actor CodeMapArtifactStore {
                     metadataBytesRemaining = subtractingFloor(metadataBytesRemaining, readBytes)
                     progress.writtenBytes = addingSaturating(progress.writtenBytes, writtenBytes)
                     progress.readBytes = addingSaturating(progress.readBytes, readBytes)
-                    cycle.quarantineCount += 1
+                    incrementSaturating(&cycle.quarantineCount)
                     cycle.quarantineBytes = addingSaturating(cycle.quarantineBytes, metadataBytes)
-                    progress.tombstones += 1
-                    cycle.recoveredQuarantineOrphanCount += 1
+                    incrementSaturating(&progress.tombstones)
+                    incrementSaturating(&cycle.recoveredQuarantineOrphanCount)
                 case let .existing(metadataByteCount):
                     metadataBytesRemaining = subtractingFloor(
                         metadataBytesRemaining,
@@ -1356,14 +1615,14 @@ actor CodeMapArtifactStore {
                         progress.readBytes,
                         UInt64(metadataByteCount)
                     )
-                    cycle.quarantineCount += 1
+                    incrementSaturating(&cycle.quarantineCount)
                     cycle.quarantineBytes = addingSaturating(
                         cycle.quarantineBytes,
                         UInt64(metadataByteCount)
                     )
                 case .leased:
-                    progress.leased += 1
-                    cycle.recoveredQuarantineOrphanCount += 1
+                    incrementSaturating(&progress.leased)
+                    incrementSaturating(&cycle.recoveredQuarantineOrphanCount)
                 case .missingOrChanged:
                     let identity = quarantineIdentity(
                         epoch: pending.epochSeconds,
@@ -1373,7 +1632,7 @@ actor CodeMapArtifactStore {
                     cycle.quarantineBytes = subtractingFloor(cycle.quarantineBytes, pending.byteCount)
                     cycle.quarantineArtifactBytes.removeValue(forKey: identity)
                     cycle.presentQuarantineArtifacts.remove(identity)
-                    progress.changed += 1
+                    incrementSaturating(&progress.changed)
                 }
                 charge(&cycle, &remaining, &progress)
                 cycle.phase = .quarantineArtifacts
@@ -1433,8 +1692,8 @@ actor CodeMapArtifactStore {
                     epochSeconds: cycle.now
                 )
                 if mutation == .completed {
-                    reconciliation.corruptPayloadCount += 1
-                    progress.tombstones += 1
+                    incrementSaturating(&reconciliation.corruptPayloadCount)
+                    incrementSaturating(&progress.tombstones)
                     metrics.writtenByteCount = try CodeMapArtifactCatalog.tombstoneByteCount(
                         epochSeconds: cycle.now,
                         record: expected,
@@ -1450,8 +1709,8 @@ actor CodeMapArtifactStore {
                 fileStore: fileStore,
                 epochSeconds: cycle.now
             ) == .completed {
-                reconciliation.corruptPayloadCount += 1
-                progress.tombstones += 1
+                incrementSaturating(&reconciliation.corruptPayloadCount)
+                incrementSaturating(&progress.tombstones)
                 metrics.writtenByteCount = try CodeMapArtifactCatalog.tombstoneByteCount(
                     epochSeconds: cycle.now,
                     record: nil,
@@ -1477,7 +1736,7 @@ actor CodeMapArtifactStore {
                         epochSeconds: cycle.now
                     )
                     if mutation == .completed {
-                        progress.tombstones += 1
+                        incrementSaturating(&progress.tombstones)
                         metrics.writtenByteCount = try CodeMapArtifactCatalog.tombstoneByteCount(
                             epochSeconds: cycle.now,
                             record: expected,
@@ -1492,7 +1751,7 @@ actor CodeMapArtifactStore {
                         return metrics
                     }
                 } else {
-                    reconciliation.scan.orphanArtifactCount += 1
+                    incrementSaturating(&reconciliation.scan.orphanArtifactCount)
                 }
                 let repaired = try catalog.writeLiveRecord(makeRecord(key: key, verified: file, now: cycle.now))
                 metrics.metadataReadByteCount = addingSaturating(
@@ -1505,8 +1764,8 @@ actor CodeMapArtifactStore {
                 )
                 installReconciled(repaired, cycle: &cycle)
                 cycle.reconciliation.candidates.removeValue(forKey: candidate.digest)
-                reconciliation.repairedOrphanArtifactCount += 1
-                progress.repaired += 1
+                incrementSaturating(&reconciliation.repairedOrphanArtifactCount)
+                incrementSaturating(&progress.repaired)
                 quarantineInventoryComplete = false
             }
         }
@@ -1531,8 +1790,8 @@ actor CodeMapArtifactStore {
             metrics.metadataReadByteCount = try UInt64(CodeMapArtifactCatalog.encodeRecord(record).count)
             let mutation = try catalog.quarantineMissingPayload(expectedRecord: record, epochSeconds: cycle.now)
             if mutation == .completed {
-                reconciliation.missingPayloadCount += 1
-                progress.tombstones += 1
+                incrementSaturating(&reconciliation.missingPayloadCount)
+                incrementSaturating(&progress.tombstones)
                 metrics.writtenByteCount = try CodeMapArtifactCatalog.tombstoneByteCount(
                     epochSeconds: cycle.now,
                     record: record,
@@ -1555,8 +1814,8 @@ actor CodeMapArtifactStore {
                 epochSeconds: cycle.now
             )
             if mutation == .completed {
-                reconciliation.corruptPayloadCount += 1
-                progress.tombstones += 1
+                incrementSaturating(&reconciliation.corruptPayloadCount)
+                incrementSaturating(&progress.tombstones)
                 metrics.writtenByteCount = try CodeMapArtifactCatalog.tombstoneByteCount(
                     epochSeconds: cycle.now,
                     record: record,
@@ -1602,9 +1861,9 @@ actor CodeMapArtifactStore {
                     UInt64(CodeMapArtifactCatalog.encodeRecord(repaired).count)
                 )
                 installReconciled(repaired, cycle: &cycle)
-                reconciliation.repairedOrphanArtifactCount += 1
-                progress.repaired += 1
-                progress.tombstones += 1
+                incrementSaturating(&reconciliation.repairedOrphanArtifactCount)
+                incrementSaturating(&progress.repaired)
+                incrementSaturating(&progress.tombstones)
                 quarantineInventoryComplete = false
             }
         }
@@ -1673,10 +1932,10 @@ actor CodeMapArtifactStore {
 
     private func addAccounting(_ record: CodeMapArtifactCatalogRecord) {
         if record.outcomeClass == .positive {
-            livePositiveCount += 1
+            incrementSaturating(&livePositiveCount)
             livePositiveBytes = addingSaturating(livePositiveBytes, record.containerByteCount)
         } else {
-            liveNegativeCount += 1
+            incrementSaturating(&liveNegativeCount)
             liveNegativeBytes = addingSaturating(liveNegativeBytes, record.containerByteCount)
         }
     }
@@ -1730,23 +1989,23 @@ actor CodeMapArtifactStore {
         quarantine: Bool,
         cycle: inout MaintenanceCycle
     ) {
-        reconciliation.scan.ignoredTemporaryCount += 1
+        incrementSaturating(&reconciliation.scan.ignoredTemporaryCount)
         guard let storedByteCount else { return }
         if removed {
-            reconciliation.scan.removedTemporaryCount += 1
-            reconciliation.scan.recoveredPrivateDeletionCount += 1
+            incrementSaturating(&reconciliation.scan.removedTemporaryCount)
+            incrementSaturating(&reconciliation.scan.recoveredPrivateDeletionCount)
             reconciliation.scan.recoveredPrivateDeletionBytes = addingSaturating(
                 reconciliation.scan.recoveredPrivateDeletionBytes,
                 storedByteCount
             )
         } else if quarantine {
-            cycle.retainedQuarantinePrivateDeletionCount += 1
+            incrementSaturating(&cycle.retainedQuarantinePrivateDeletionCount)
             cycle.retainedQuarantinePrivateDeletionBytes = addingSaturating(
                 cycle.retainedQuarantinePrivateDeletionBytes,
                 storedByteCount
             )
         } else {
-            cycle.retainedLivePrivateDeletionCount += 1
+            incrementSaturating(&cycle.retainedLivePrivateDeletionCount)
             cycle.retainedLivePrivateDeletionBytes = addingSaturating(
                 cycle.retainedLivePrivateDeletionBytes,
                 storedByteCount
@@ -1833,7 +2092,9 @@ actor CodeMapArtifactStore {
         byteLimit: UInt64
     ) {
         while entries.count > countLimit ||
-            entries.values.reduce(UInt64(0), { $0 + $1.handle.estimatedResidentByteCount }) > byteLimit
+            entries.values.reduce(UInt64(0), {
+                addingSaturating($0, $1.handle.estimatedResidentByteCount)
+            }) > byteLimit
         {
             guard let victim = entries.min(by: {
                 ($0.value.accessSequence, $0.key) < ($1.value.accessSequence, $1.key)
@@ -1910,8 +2171,8 @@ actor CodeMapArtifactStore {
         _ progress: inout CallProgress
     ) {
         remaining -= 1
-        cycle.workSequence += 1
-        progress.examined += 1
+        cycle.workSequence = addingSaturating(cycle.workSequence, 1)
+        incrementSaturating(&progress.examined)
     }
 
     private func chargeVisit(
@@ -1931,7 +2192,7 @@ actor CodeMapArtifactStore {
         progress: inout CallProgress
     ) {
         charge(&cycle, &remaining, &progress)
-        progress.visited += 1
+        incrementSaturating(&progress.visited)
     }
 
     private func makeProgress(
@@ -1961,6 +2222,15 @@ actor CodeMapArtifactStore {
 
     private func quarantineIdentity(epoch: UInt64, shard: String, name: String) -> String {
         "\(epoch)/\(shard)/\(name)"
+    }
+
+    private func incrementSaturating(_ value: inout Int) {
+        value = addingSaturating(value, 1)
+    }
+
+    private func addingSaturating(_ lhs: Int, _ rhs: Int) -> Int {
+        let (result, overflow) = lhs.addingReportingOverflow(rhs)
+        return overflow ? Int.max : result
     }
 
     private func addingSaturating(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {

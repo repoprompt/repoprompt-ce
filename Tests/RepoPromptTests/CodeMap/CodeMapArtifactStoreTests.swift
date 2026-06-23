@@ -227,6 +227,7 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         let lease = try await owner.lease(handle: handle)
         var ownerAccounting = await owner.accounting()
         XCTAssertEqual(ownerAccounting.activeLeaseCount, 1)
+        XCTAssertEqual(ownerAccounting.activeLeaseBytes, handle.containerByteCount)
 
         let collector = try CodeMapArtifactStore(rootURL: root, policy: policy, clock: clock.storeClock)
         let blocked = try await drainGC(collector, stepBudget: 8)
@@ -242,9 +243,477 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         await lease.close()
         ownerAccounting = await owner.accounting()
         XCTAssertEqual(ownerAccounting.activeLeaseCount, 0)
+        XCTAssertEqual(ownerAccounting.activeLeaseBytes, 0)
         let collected = try await drainGC(collector, stepBudget: 2)
         XCTAssertEqual(collected.reduce(0) { $0 + $1.quarantinedCount }, 1)
         try await assertMiss(CodeMapArtifactStore(rootURL: root, policy: policy, clock: clock.storeClock), key: key)
+    }
+
+    func testLeaseAdmissionRejectsForeignHandleBeforeOpeningDescriptor() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = try makeKey("foreign-lease-handle")
+        let issuer = try CodeMapArtifactStore(rootURL: root)
+        _ = try await issuer.insert(
+            key: key,
+            deterministicOutcome: .ready(makeArtifact(name: "Foreign"))
+        )
+        let foreignHandle = try await requireHit(issuer, key: key, source: .memory)
+        try FileManager.default.removeItem(at: leaseURL(root: root, key: key))
+        let receiver = try CodeMapArtifactStore(rootURL: root)
+        let receiverHandle = try await requireHit(receiver, key: key, source: .disk)
+
+        do {
+            _ = try await receiver.lease(handle: foreignHandle)
+            XCTFail("A foreign-store handle must not acquire a lease.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .foreignHandle)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaseURL(root: root, key: key).path))
+        var accounting = await receiver.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+
+        let lease = try await receiver.lease(handle: receiverHandle)
+        XCTAssertEqual(lease.handle.key, key)
+        await lease.close()
+        accounting = await receiver.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+    }
+
+    func testLeaseAdmissionBoundsCountAndBytesBeforeDescriptorsAndRecovers() async throws {
+        let countRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: countRoot) }
+        let countPolicy = makePolicy(
+            maximumActiveLeaseCount: 1,
+            maximumActiveLeaseBytes: .max
+        )
+        let countAdmission = CodeMapArtifactLeaseAdmission(
+            maximumCount: countPolicy.maximumActiveLeaseCount,
+            maximumBytes: countPolicy.maximumActiveLeaseBytes
+        )
+        let countStore = try CodeMapArtifactStore(
+            rootURL: countRoot,
+            policy: countPolicy,
+            leaseAdmission: countAdmission
+        )
+        let firstKey = try makeKey("lease-count-first")
+        let secondKey = try makeKey("lease-count-second")
+        _ = try await countStore.insert(
+            key: firstKey,
+            deterministicOutcome: .ready(makeArtifact(name: "First"))
+        )
+        _ = try await countStore.insert(
+            key: secondKey,
+            deterministicOutcome: .ready(makeArtifact(name: "Second"))
+        )
+        let firstHandle = try await requireHit(countStore, key: firstKey, source: .memory)
+        let secondHandle = try await requireHit(countStore, key: secondKey, source: .memory)
+        try FileManager.default.removeItem(at: leaseURL(root: countRoot, key: firstKey))
+        try FileManager.default.removeItem(at: leaseURL(root: countRoot, key: secondKey))
+        let firstLease = try await countStore.lease(handle: firstHandle)
+        do {
+            _ = try await countStore.lease(handle: secondHandle)
+            XCTFail("The count bound must reject before opening a second descriptor.")
+        } catch {
+            XCTAssertEqual(
+                error as? CodeMapArtifactLeaseError,
+                .busy(.activeLeaseCountLimit)
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaseURL(root: countRoot, key: secondKey).path))
+        var accounting = await countStore.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 1)
+        XCTAssertEqual(accounting.activeLeaseBytes, firstHandle.containerByteCount)
+        await firstLease.close()
+        let recovered = try await countStore.lease(handle: secondHandle)
+        await recovered.close()
+        accounting = await countStore.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+
+        let byteRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: byteRoot) }
+        let byteKey = try makeKey("lease-byte-bound")
+        let writer = try CodeMapArtifactStore(rootURL: byteRoot)
+        _ = try await writer.insert(
+            key: byteKey,
+            deterministicOutcome: .ready(makeArtifact(name: "Bytes"))
+        )
+        let writerHandle = try await requireHit(writer, key: byteKey, source: .memory)
+        XCTAssertGreaterThan(writerHandle.containerByteCount, 1)
+        try FileManager.default.removeItem(at: leaseURL(root: byteRoot, key: byteKey))
+        let limitedPolicy = makePolicy(
+            maximumActiveLeaseCount: 2,
+            maximumActiveLeaseBytes: writerHandle.containerByteCount - 1
+        )
+        let limited = try CodeMapArtifactStore(
+            rootURL: byteRoot,
+            policy: limitedPolicy,
+            leaseAdmission: CodeMapArtifactLeaseAdmission(
+                maximumCount: limitedPolicy.maximumActiveLeaseCount,
+                maximumBytes: limitedPolicy.maximumActiveLeaseBytes
+            )
+        )
+        let limitedHandle = try await requireHit(limited, key: byteKey, source: .disk)
+        do {
+            _ = try await limited.lease(handle: limitedHandle)
+            XCTFail("The byte bound must reject before opening a descriptor.")
+        } catch {
+            XCTAssertEqual(
+                error as? CodeMapArtifactLeaseError,
+                .busy(.activeLeaseByteLimit)
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leaseURL(root: byteRoot, key: byteKey).path))
+        accounting = await limited.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+
+        let exactPolicy = makePolicy(
+            maximumActiveLeaseCount: 1,
+            maximumActiveLeaseBytes: writerHandle.containerByteCount
+        )
+        let exact = try CodeMapArtifactStore(
+            rootURL: byteRoot,
+            policy: exactPolicy,
+            leaseAdmission: CodeMapArtifactLeaseAdmission(
+                maximumCount: exactPolicy.maximumActiveLeaseCount,
+                maximumBytes: exactPolicy.maximumActiveLeaseBytes
+            )
+        )
+        let exactHandle = try await requireHit(exact, key: byteKey, source: .disk)
+        let exactLease = try await exact.lease(handle: exactHandle)
+        var exactAccounting = await exact.accounting()
+        XCTAssertEqual(exactAccounting.activeLeaseBytes, writerHandle.containerByteCount)
+        await exactLease.close()
+        exactAccounting = await exact.accounting()
+        XCTAssertEqual(exactAccounting.activeLeaseBytes, 0)
+    }
+
+    func testLeaseAcquisitionRejectsLateGCAndCorruptionWithoutFakeLease() async throws {
+        let collectedRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: collectedRoot) }
+        let collectionPolicy = makePolicy(
+            residentPositiveEntryLimit: 0,
+            residentPositiveByteLimit: 0,
+            softQuotaBytes: 0,
+            hardQuotaBytes: 1,
+            unreferencedGraceSeconds: 0
+        )
+        let collectedKey = try makeKey("lease-after-gc")
+        let owner = try CodeMapArtifactStore(rootURL: collectedRoot, policy: collectionPolicy)
+        _ = try await owner.insert(
+            key: collectedKey,
+            deterministicOutcome: .ready(makeArtifact(name: "Collected"))
+        )
+        let staleHandle = try await requireHit(owner, key: collectedKey, source: .disk)
+        let collector = try CodeMapArtifactStore(rootURL: collectedRoot, policy: collectionPolicy)
+        let collection = try await drainGC(collector, stepBudget: 2)
+        XCTAssertEqual(collection.reduce(0) { $0 + $1.quarantinedCount }, 1)
+        do {
+            _ = try await owner.lease(handle: staleHandle)
+            XCTFail("A handle whose payload was collected must not produce a lease.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .artifactMissing)
+        }
+        var accounting = await owner.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+
+        let corruptRoot = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: corruptRoot) }
+        let corruptKey = try makeKey("lease-corruption")
+        let corruptStore = try CodeMapArtifactStore(rootURL: corruptRoot)
+        _ = try await corruptStore.insert(
+            key: corruptKey,
+            deterministicOutcome: .ready(makeArtifact(name: "Corrupt"))
+        )
+        let corruptHandle = try await requireHit(corruptStore, key: corruptKey, source: .memory)
+        try Data("corrupt payload".utf8).write(to: artifactURL(root: corruptRoot, key: corruptKey))
+        XCTAssertEqual(chmod(artifactURL(root: corruptRoot, key: corruptKey).path, 0o600), 0)
+        do {
+            _ = try await corruptStore.lease(handle: corruptHandle)
+            XCTFail("A corrupt payload must not produce a lease.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .artifactCorrupt)
+        }
+        accounting = await corruptStore.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+    }
+
+    func testLeaseAdmissionIsBoundedUnderHighConcurrencyCancellationAndRecovery() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let policy = makePolicy(
+            maximumActiveLeaseCount: 4,
+            maximumActiveLeaseBytes: .max
+        )
+        let store = try CodeMapArtifactStore(
+            rootURL: root,
+            policy: policy,
+            leaseAdmission: CodeMapArtifactLeaseAdmission(
+                maximumCount: policy.maximumActiveLeaseCount,
+                maximumBytes: policy.maximumActiveLeaseBytes
+            )
+        )
+        let key = try makeKey("concurrent-lease-admission")
+        _ = try await store.insert(
+            key: key,
+            deterministicOutcome: .ready(makeArtifact(name: "Concurrent"))
+        )
+        let handle = try await requireHit(store, key: key, source: .memory)
+
+        let attempts = await withTaskGroup(
+            of: CodeMapLeaseAttempt.self,
+            returning: [CodeMapLeaseAttempt].self
+        ) { group in
+            for _ in 0 ..< 64 {
+                group.addTask {
+                    do {
+                        return try await .acquired(store.lease(handle: handle))
+                    } catch let error as CodeMapArtifactLeaseError {
+                        return .rejected(error)
+                    } catch {
+                        return .unexpected
+                    }
+                }
+            }
+            var values: [CodeMapLeaseAttempt] = []
+            for await value in group {
+                values.append(value)
+            }
+            return values
+        }
+        let leases = attempts.compactMap { attempt -> CodeMapArtifactLease? in
+            guard case let .acquired(lease) = attempt else { return nil }
+            return lease
+        }
+        let rejections = attempts.compactMap { attempt -> CodeMapArtifactLeaseError? in
+            guard case let .rejected(error) = attempt else { return nil }
+            return error
+        }
+        XCTAssertEqual(leases.count, 4)
+        XCTAssertEqual(rejections.count, 60)
+        XCTAssertTrue(rejections.allSatisfy { $0 == .busy(.activeLeaseCountLimit) })
+        XCTAssertFalse(attempts.contains { if case .unexpected = $0 { true } else { false } })
+        var accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 4)
+        XCTAssertEqual(accounting.activeLeaseBytes, handle.containerByteCount * 4)
+
+        let cancelled = Task {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            return try await store.lease(handle: handle)
+        }
+        cancelled.cancel()
+        do {
+            _ = try await cancelled.value
+            XCTFail("A cancelled request must not retain an admission reservation.")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 4)
+
+        await withTaskGroup(of: Void.self) { group in
+            for lease in leases {
+                group.addTask { await lease.close() }
+                group.addTask { await lease.close() }
+            }
+        }
+        accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+
+        var deinitLease: CodeMapArtifactLease? = try await store.lease(handle: handle)
+        XCTAssertNotNil(deinitLease)
+        accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 1)
+        deinitLease = nil
+        accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+    }
+
+    func testProcessWideAndInjectedMultiStoreAdmissionAggregateFDsAndRecover() async throws {
+        let productionRootA = try makeSecureRoot()
+        let productionRootB = try makeSecureRoot()
+        defer {
+            try? FileManager.default.removeItem(at: productionRootA)
+            try? FileManager.default.removeItem(at: productionRootB)
+        }
+        let productionA = try CodeMapArtifactStore(rootURL: productionRootA)
+        let productionB = try CodeMapArtifactStore(rootURL: productionRootB)
+        let productionKeyA = try makeKey("process-wide-production-admission-a")
+        let productionKeyB = try makeKey("process-wide-production-admission-b")
+        _ = try await productionA.insert(key: productionKeyA, deterministicOutcome: .readyNoSymbols)
+        _ = try await productionB.insert(key: productionKeyB, deterministicOutcome: .readyNoSymbols)
+        let productionHandleA = try await requireHit(productionA, key: productionKeyA, source: .memory)
+        let productionHandleB = try await requireHit(productionB, key: productionKeyB, source: .memory)
+        let productionLimit = CodeMapArtifactStorePolicy.default.maximumActiveLeaseCount
+        XCTAssertGreaterThan(productionLimit, 0)
+        XCTAssertLessThanOrEqual(productionLimit, 256)
+        var productionLeases: [CodeMapArtifactLease] = []
+        for index in 0 ..< productionLimit {
+            let lease: CodeMapArtifactLease = if index.isMultiple(of: 2) {
+                try await productionA.lease(handle: productionHandleA)
+            } else {
+                try await productionB.lease(handle: productionHandleB)
+            }
+            productionLeases.append(lease)
+        }
+        var productionAccounting = await productionB.accounting()
+        XCTAssertEqual(productionAccounting.activeLeaseCount, productionLimit)
+        do {
+            _ = try await productionA.lease(handle: productionHandleA)
+            XCTFail("The production controller must cap aggregate descriptors across stores.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .busy(.activeLeaseCountLimit))
+        }
+        await productionLeases.removeLast().close()
+        try await productionLeases.append(productionB.lease(handle: productionHandleB))
+        for lease in productionLeases {
+            await lease.close()
+        }
+        productionAccounting = await productionB.accounting()
+        XCTAssertEqual(productionAccounting.activeLeaseCount, 0)
+        XCTAssertEqual(productionAccounting.activeLeaseBytes, 0)
+
+        let rootA = try makeSecureRoot()
+        let rootB = try makeSecureRoot()
+        defer {
+            try? FileManager.default.removeItem(at: rootA)
+            try? FileManager.default.removeItem(at: rootB)
+        }
+        let admission = CodeMapArtifactLeaseAdmission(maximumCount: 2, maximumBytes: .max)
+        let storeA = try CodeMapArtifactStore(rootURL: rootA, leaseAdmission: admission)
+        let storeB = try CodeMapArtifactStore(rootURL: rootB, leaseAdmission: admission)
+        let firstKey = try makeKey("aggregate-first")
+        let secondKey = try makeKey("aggregate-second")
+        let thirdKey = try makeKey("aggregate-third")
+        _ = try await storeA.insert(key: firstKey, deterministicOutcome: .readyNoSymbols)
+        _ = try await storeB.insert(key: secondKey, deterministicOutcome: .readyNoSymbols)
+        _ = try await storeA.insert(key: thirdKey, deterministicOutcome: .readyNoSymbols)
+        let firstHandle = try await requireHit(storeA, key: firstKey, source: .memory)
+        let secondHandle = try await requireHit(storeB, key: secondKey, source: .memory)
+        let thirdHandle = try await requireHit(storeA, key: thirdKey, source: .memory)
+        let firstLease = try await storeA.lease(handle: firstHandle)
+        let secondLease = try await storeB.lease(handle: secondHandle)
+        do {
+            _ = try await storeA.lease(handle: thirdHandle)
+            XCTFail("The shared controller must cap aggregate descriptors across stores.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .busy(.activeLeaseCountLimit))
+        }
+        var accountingA = await storeA.accounting()
+        var accountingB = await storeB.accounting()
+        XCTAssertEqual(accountingA.activeLeaseCount, 2)
+        XCTAssertEqual(accountingB.activeLeaseCount, 2)
+        XCTAssertEqual(
+            accountingA.activeLeaseBytes,
+            firstHandle.containerByteCount + secondHandle.containerByteCount
+        )
+        XCTAssertEqual(accountingB.activeLeaseBytes, accountingA.activeLeaseBytes)
+
+        await secondLease.close()
+        let recovered = try await storeA.lease(handle: thirdHandle)
+        accountingA = await storeA.accounting()
+        XCTAssertEqual(accountingA.activeLeaseCount, 2)
+        await firstLease.close()
+        await recovered.close()
+        accountingB = await storeB.accounting()
+        XCTAssertEqual(accountingB.activeLeaseCount, 0)
+        XCTAssertEqual(accountingB.activeLeaseBytes, 0)
+    }
+
+    func testDescriptorExhaustionAndCancellationAfterOpenReleaseAdmission() async throws {
+        for code in [EMFILE, ENFILE] {
+            let root = try makeSecureRoot()
+            defer { try? FileManager.default.removeItem(at: root) }
+            let admission = CodeMapArtifactLeaseAdmission(maximumCount: 1, maximumBytes: .max)
+            let store = try CodeMapArtifactStore(
+                rootURL: root,
+                leaseAdmission: admission,
+                leaseHooks: CodeMapArtifactLeaseHooks(beforeDescriptorOpen: {
+                    throw CodeMapArtifactCatalogError.ioFailure(operation: "test-fd-limit", code: code)
+                })
+            )
+            let key = try makeKey("fd-limit-\(code)")
+            _ = try await store.insert(key: key, deterministicOutcome: .readyNoSymbols)
+            let handle = try await requireHit(store, key: key, source: .memory)
+            do {
+                _ = try await store.lease(handle: handle)
+                XCTFail("Descriptor exhaustion must map to typed backpressure.")
+            } catch {
+                XCTAssertEqual(error as? CodeMapArtifactLeaseError, .busy(.fileDescriptorLimit))
+            }
+            let accounting = await store.accounting()
+            XCTAssertEqual(accounting.activeLeaseCount, 0)
+            XCTAssertEqual(accounting.activeLeaseBytes, 0)
+        }
+
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let gate = LeaseAfterOpenGate()
+        let admission = CodeMapArtifactLeaseAdmission(maximumCount: 1, maximumBytes: .max)
+        let store = try CodeMapArtifactStore(
+            rootURL: root,
+            leaseAdmission: admission,
+            leaseHooks: CodeMapArtifactLeaseHooks(afterDescriptorOpen: { gate.pauseFirstOpen() })
+        )
+        let key = try makeKey("cancel-after-open")
+        _ = try await store.insert(key: key, deterministicOutcome: .readyNoSymbols)
+        let handle = try await requireHit(store, key: key, source: .memory)
+        let task = Task { try await store.lease(handle: handle) }
+        XCTAssertEqual(gate.opened.wait(timeout: .now() + 2), .success)
+        task.cancel()
+        gate.resume.signal()
+        do {
+            _ = try await task.value
+            XCTFail("Cancellation after descriptor open must not publish a lease.")
+        } catch {
+            XCTAssertTrue(error is CancellationError)
+        }
+        var accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+        let recovered = try await store.lease(handle: handle)
+        await recovered.close()
+        accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
+    }
+
+    func testLeaseRejectsSameSizeStructurallyValidPayloadMutationAsChanged() async throws {
+        let root = try makeSecureRoot()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let key = try makeKey("same-size-valid-mutation")
+        let originalOutcome = CodeMapSyntaxArtifactOutcome.parseFailed(.parserReturnedNilTree)
+        let replacementOutcome = CodeMapSyntaxArtifactOutcome.parseFailed(.parserReturnedNilRoot)
+        let store = try CodeMapArtifactStore(rootURL: root)
+        _ = try await store.insert(key: key, deterministicOutcome: originalOutcome)
+        let staleHandle = try await requireHit(store, key: key, source: .memory)
+        let originalBytes = try Data(contentsOf: artifactURL(root: root, key: key))
+        let replacementBytes = try CodeMapArtifactContainer.encode(key: key, outcome: replacementOutcome)
+        XCTAssertEqual(replacementBytes.count, originalBytes.count)
+        XCTAssertNotEqual(replacementBytes, originalBytes)
+        try replacementBytes.write(to: artifactURL(root: root, key: key))
+        XCTAssertEqual(chmod(artifactURL(root: root, key: key).path, 0o600), 0)
+
+        let verifier = try CodeMapArtifactStore(rootURL: root)
+        let current = try await requireHit(verifier, key: key, source: .disk)
+        XCTAssertEqual(current.outcome, replacementOutcome)
+        do {
+            _ = try await store.lease(handle: staleHandle)
+            XCTFail("A same-size valid replacement must not match the stale handle.")
+        } catch {
+            XCTAssertEqual(error as? CodeMapArtifactLeaseError, .artifactChanged)
+        }
+        let accounting = await store.accounting()
+        XCTAssertEqual(accounting.activeLeaseCount, 0)
+        XCTAssertEqual(accounting.activeLeaseBytes, 0)
     }
 
     func testRestartRepairsMissingAndCorruptSidecarsAndReconcilesMissingPayloadAndTemps() async throws {
@@ -914,15 +1383,14 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         let metadata = metadataURL(root: root, key: key)
         let admittedByteCount = try UInt64(Data(contentsOf: metadata).count)
         let replacement = Data(repeating: 0xA5, count: Int(admittedByteCount) + 4096)
-        var replacementCount = 0
+        let replacementHook = MetadataReplacementHook(
+            expectedName: "\(key.storageDigestHex).meta",
+            expectedAdmittedByteCount: admittedByteCount,
+            replacement: replacement,
+            metadataURL: metadata
+        )
         let hooks = CodeMapArtifactCatalogScanHooks(afterMetadataAdmission: { _, name, admitted in
-            guard name == "\(key.storageDigestHex).meta" else { return }
-            XCTAssertEqual(admitted, admittedByteCount)
-            replacementCount += 1
-            try replacement.write(to: metadata, options: .atomic)
-            guard chmod(metadata.path, 0o600) == 0 else {
-                throw CodeMapArtifactCatalogError.ioFailure(operation: "test-mode", code: errno)
-            }
+            try replacementHook.replace(name: name, admittedByteCount: admitted)
         })
         let catalog = try CodeMapArtifactCatalog(rootURL: root, policy: .default, scanHooks: hooks)
         let scan = try catalog.beginScan(.liveCatalog)
@@ -944,7 +1412,7 @@ final class CodeMapArtifactStoreTests: XCTestCase {
             }
         }
 
-        XCTAssertEqual(replacementCount, 1)
+        XCTAssertEqual(replacementHook.replacementCount, 1)
         XCTAssertEqual(observedVisit?.readByteCount, admittedByteCount)
         XCTAssertLessThanOrEqual(try XCTUnwrap(observedVisit?.readByteCount), admittedByteCount)
         XCTAssertGreaterThan(UInt64(replacement.count), admittedByteCount)
@@ -1166,6 +1634,8 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         maximumArtifactReconciliationByteCount: UInt64 = 128 * 1024 * 1024,
         maximumMaintenanceWriteByteCount: UInt64 = 8 * 1024 * 1024,
         maximumGCStepBudget: Int = 4096,
+        maximumActiveLeaseCount: Int = 16384,
+        maximumActiveLeaseBytes: UInt64 = 1024 * 1024 * 1024,
         containerPolicy: CodeMapArtifactContainerPolicy = .default
     ) -> CodeMapArtifactStorePolicy {
         CodeMapArtifactStorePolicy(
@@ -1185,6 +1655,8 @@ final class CodeMapArtifactStoreTests: XCTestCase {
             maximumArtifactReconciliationByteCount: maximumArtifactReconciliationByteCount,
             maximumMaintenanceWriteByteCount: maximumMaintenanceWriteByteCount,
             maximumGCStepBudget: maximumGCStepBudget,
+            maximumActiveLeaseCount: maximumActiveLeaseCount,
+            maximumActiveLeaseBytes: maximumActiveLeaseBytes,
             containerPolicy: containerPolicy
         )
     }
@@ -1316,6 +1788,10 @@ final class CodeMapArtifactStoreTests: XCTestCase {
         root.appendingPathComponent("CodeMapArtifacts/v1/catalog/\(key.shard)/\(key.storageDigestHex).meta")
     }
 
+    private func leaseURL(root: URL, key: CodeMapArtifactKey) -> URL {
+        root.appendingPathComponent("CodeMapArtifacts/v1/leases/\(key.shard)/\(key.storageDigestHex).lock")
+    }
+
     private static func writeSecureFile(
         parentDescriptor: Int32,
         name: String,
@@ -1369,6 +1845,68 @@ final class CodeMapArtifactStoreTests: XCTestCase {
             return url
         }.sorted { $0.path < $1.path }
     }
+}
+
+/// The lock protects the replacement counter while immutable fixture data is
+/// safely captured by the catalog's checked `@Sendable` hook.
+private final class MetadataReplacementHook: @unchecked Sendable {
+    private let expectedName: String
+    private let expectedAdmittedByteCount: UInt64
+    private let replacement: Data
+    private let metadataURL: URL
+    private let lock = NSLock()
+    private var count = 0
+
+    var replacementCount: Int {
+        lock.withLock { count }
+    }
+
+    init(
+        expectedName: String,
+        expectedAdmittedByteCount: UInt64,
+        replacement: Data,
+        metadataURL: URL
+    ) {
+        self.expectedName = expectedName
+        self.expectedAdmittedByteCount = expectedAdmittedByteCount
+        self.replacement = replacement
+        self.metadataURL = metadataURL
+    }
+
+    func replace(name: String, admittedByteCount: UInt64) throws {
+        guard name == expectedName else { return }
+        XCTAssertEqual(admittedByteCount, expectedAdmittedByteCount)
+        lock.withLock { count += 1 }
+        try replacement.write(to: metadataURL, options: .atomic)
+        guard chmod(metadataURL.path, 0o600) == 0 else {
+            throw CodeMapArtifactCatalogError.ioFailure(operation: "test-mode", code: errno)
+        }
+    }
+}
+
+/// The lock protects the one-shot branch; semaphores make the post-open
+/// cancellation point deterministic without sharing mutable state unsafely.
+private final class LeaseAfterOpenGate: @unchecked Sendable {
+    let opened = DispatchSemaphore(value: 0)
+    let resume = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var isFirst = true
+
+    func pauseFirstOpen() {
+        let shouldPause = lock.withLock {
+            defer { isFirst = false }
+            return isFirst
+        }
+        guard shouldPause else { return }
+        opened.signal()
+        resume.wait()
+    }
+}
+
+private enum CodeMapLeaseAttempt {
+    case acquired(CodeMapArtifactLease)
+    case rejected(CodeMapArtifactLeaseError)
+    case unexpected
 }
 
 private final class TestClock: @unchecked Sendable {

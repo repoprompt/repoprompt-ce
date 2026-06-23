@@ -183,6 +183,10 @@ struct WorkspaceCodemapArtifactCompletion: Equatable {
     let outcome: CodeMapSyntaxArtifactOutcome
     fileprivate let cleanBlobAssociation: VerifiedGitBlobCodeMapLocatorAssociation?
 
+    var verifiedCleanAssociation: VerifiedGitBlobCodeMapLocatorAssociation? {
+        cleanBlobAssociation
+    }
+
     private init(
         token: WorkspaceCodemapArtifactRequestToken,
         artifactKey: CodeMapArtifactKey,

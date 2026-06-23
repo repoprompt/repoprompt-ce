@@ -72,10 +72,10 @@ enum CodeMapArtifactCatalogScanNamespace: Equatable {
     case quarantineArtifacts
 }
 
-struct CodeMapArtifactCatalogScanHooks: @unchecked Sendable {
-    let afterMetadataAdmission: ((Int32, String, UInt64) throws -> Void)?
+struct CodeMapArtifactCatalogScanHooks {
+    let afterMetadataAdmission: (@Sendable (Int32, String, UInt64) throws -> Void)?
 
-    init(afterMetadataAdmission: ((Int32, String, UInt64) throws -> Void)? = nil) {
+    init(afterMetadataAdmission: (@Sendable (Int32, String, UInt64) throws -> Void)? = nil) {
         self.afterMetadataAdmission = afterMetadataAdmission
     }
 }
@@ -265,8 +265,9 @@ enum CodeMapArtifactCatalogMutationResult: Equatable {
     case leased
 }
 
-/// A descriptor-backed shared inter-process lease. `close()` is explicit and
-/// idempotent; `deinit` exists only as a last-resort safety net.
+/// `descriptor` is the only mutable field and every read/claim is serialized by
+/// `lock`. A descriptor-backed shared inter-process lease closes synchronously;
+/// `deinit` exists only as a last-resort safety net.
 final class CodeMapArtifactDiskLease: @unchecked Sendable {
     private let lock = NSLock()
     private var descriptor: Int32?
@@ -753,8 +754,14 @@ struct CodeMapArtifactCatalog {
     func acquireSharedLease(key: CodeMapArtifactKey) throws -> CodeMapArtifactDiskLease {
         let descriptor = try openLeaseDescriptor(key: key)
         do {
-            while flock(descriptor, LOCK_SH) != 0 {
-                guard errno == EINTR else { throw Self.ioError("lease-shared-lock") }
+            guard flock(descriptor, LOCK_SH | LOCK_NB) == 0 else {
+                if errno == EWOULDBLOCK {
+                    throw CodeMapArtifactCatalogError.ioFailure(
+                        operation: "lease-busy",
+                        code: EWOULDBLOCK
+                    )
+                }
+                throw Self.ioError("lease-shared-lock")
             }
             try validateLeaseDescriptor(descriptor, key: key)
             return CodeMapArtifactDiskLease(descriptor: descriptor)
