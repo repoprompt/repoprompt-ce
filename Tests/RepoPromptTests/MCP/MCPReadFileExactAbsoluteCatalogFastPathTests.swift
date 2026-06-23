@@ -198,6 +198,44 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
             }
             XCTAssertEqual(file.displayPath, "~/.agents/skills/example/SKILL.md", caseLabel)
         }
+
+        do {
+            let caseLabel = "testSymlinkedExternalSupportPathRemainsFallbackOnly"
+            let root = try makeTemporaryRoot(name: "SymlinkFallbackWorkspace")
+            try write("visible", to: root.appendingPathComponent("Visible.swift"))
+            let home = try makeTemporaryRoot(name: "SymlinkFallbackHome")
+            let realSkillsRoot = try makeTemporaryRoot(name: "SymlinkFallbackSkills")
+            let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: nominalSkillsRoot.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+            let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+            try write("symlinked skill body", to: realSkillFile)
+            let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+            let store = WorkspaceFileContextStore()
+            _ = try await store.loadRoot(path: root.path)
+            let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+            let externalShortcutHit = await service.resolveExactWorkspaceCatalogHit(
+                nominalSkillFile.path,
+                rootScope: .visibleWorkspace
+            )
+            XCTAssertNil(externalShortcutHit, caseLabel)
+            let readable = await service.resolveReadableFile(
+                nominalSkillFile.path,
+                profile: .mcpRead,
+                rootScope: .visibleWorkspace
+            )
+            guard case let .external(file) = readable else {
+                return XCTFail(caseLabel + ": Expected symlinked support file to resolve through external fallback")
+            }
+            XCTAssertEqual(file.absolutePath, realSkillFile.path, caseLabel)
+            let content = try await service.readAlwaysReadableExternalFile(file)
+            XCTAssertEqual(content, "symlinked skill body", caseLabel)
+        }
     }
 
     func testNonMatchedLookupOutcomesCannotShortCircuit() async throws {
@@ -329,6 +367,14 @@ final class MCPReadFileExactAbsoluteCatalogFastPathTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
     }
 
     private func source(_ relativePath: String) throws -> String {
