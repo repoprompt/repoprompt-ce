@@ -2783,6 +2783,9 @@ final class AgentModeViewModel: ObservableObject {
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
+        if session.runState.isActive {
+            await cancelAgentRun(tabID: session.tabID)
+        }
         await cleanupACPStateForDeletedSession(session)
         session.agentTask?.cancel()
         session.agentTask = nil

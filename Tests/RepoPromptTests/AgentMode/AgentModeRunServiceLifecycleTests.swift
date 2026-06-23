@@ -661,9 +661,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         await fixture.host.prepareForWindowClose()
 
         XCTAssertNil(fixture.session.acpController)
-        try await waitUntil("Window close should terminate retained ACP process") {
-            !Self.processIsRunning(fixture.processID)
-        }
+        try await waitUntilProcessExits(fixture.processID, "Window close should terminate retained ACP process")
         XCTAssertFalse(Self.processIsRunning(fixture.processID))
         let remainsReusable = await fixture.controller.hasReusableSession
         XCTAssertFalse(remainsReusable)
@@ -686,9 +684,10 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
 
             XCTAssertNil(fixture.session.acpController, name)
             XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
-            try await waitUntil("Compose tab \(name) should terminate retained ACP process") {
-                !Self.processIsRunning(fixture.processID)
-            }
+            try await waitUntilProcessExits(
+                fixture.processID,
+                "Compose tab \(name) should terminate retained ACP process"
+            )
             XCTAssertFalse(Self.processIsRunning(fixture.processID), name)
             let remainsReusable = await fixture.controller.hasReusableSession
             XCTAssertFalse(remainsReusable, name)
@@ -1936,6 +1935,14 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
                 if await gate.resume(with: .failure(error)), cancelOperationOnTimeout {
                     operationTask.cancel()
                 }
+            }
+        }
+    }
+
+    private func waitUntilProcessExits(_ processID: pid_t, _ message: String) async throws {
+        try await withLifecycleTimeout(message, cancelOperationOnTimeout: false) {
+            while Self.processIsRunning(processID) {
+                try await Task.sleep(nanoseconds: 10_000_000)
             }
         }
     }
