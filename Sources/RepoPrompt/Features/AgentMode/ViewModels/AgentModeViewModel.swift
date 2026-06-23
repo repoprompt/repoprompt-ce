@@ -2779,6 +2779,7 @@ final class AgentModeViewModel: ObservableObject {
         await teardownApplyEditsApprovalSessionSync(for: session, cleanupScope: true)
         cancelPendingInstruction(for: session)
         await teardownMCPControl(for: session, cleanupSessionStore: true)
+        await cleanupACPStateForDeletedSession(session)
         session.agentTask?.cancel()
         session.agentTask = nil
         let provider = session.provider
@@ -10525,6 +10526,9 @@ final class AgentModeViewModel: ObservableObject {
                     await cancelAgentRun(tabID: tabID)
                 }
 
+                // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
+                // Release retained ACP runtimes before that controller handle can become unreachable.
+                await cleanupACPStateForDeletedSession(session)
                 await codexCoordinator.shutdownCodexSession(session)
                 await claudeCoordinator.shutdownClaudeSession(session)
 
