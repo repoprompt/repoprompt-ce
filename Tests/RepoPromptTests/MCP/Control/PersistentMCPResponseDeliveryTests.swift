@@ -54,27 +54,130 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         let batchedSafeRequest = line(#"[{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}]"#)
         let safeToolCall = line(#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"README.md"}}}"#)
         let safeMethodRequest = line(#"{"jsonrpc":"2.0","id":4,"method":"tools/list","params":{}}"#)
+        let unsafeWorkspaceExport = line(#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"workspace_context","arguments":{"op":"export","path":"context.txt"}}}"#)
+        let safeWorkspaceSnapshot = line(#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"workspace_context","arguments":{"op":"snapshot","include":["tokens"]}}}"#)
 
         await replayState.recordForwardedClientFrame(unsafeToolCall)
         await replayState.recordForwardedClientFrame(batchedSafeRequest)
+        await replayState.recordForwardedClientFrame(unsafeWorkspaceExport)
         var frames = await replayState.replayFrames()
         XCTAssertEqual(frames, [])
 
         await replayState.recordForwardedClientFrame(safeToolCall)
         await replayState.recordForwardedClientFrame(safeMethodRequest)
+        await replayState.recordForwardedClientFrame(safeWorkspaceSnapshot)
         frames = await replayState.replayFrames()
-        XCTAssertEqual(frames.count, 2)
+        XCTAssertEqual(frames.count, 3)
         Self.assertJSONLineEqual(frames[0], safeToolCall)
         Self.assertJSONLineEqual(frames[1], safeMethodRequest)
+        Self.assertJSONLineEqual(frames[2], safeWorkspaceSnapshot)
 
         await replayState.recordForwardedClientFrame(line(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":3}}"#))
         frames = await replayState.replayFrames()
-        XCTAssertEqual(frames.count, 1)
+        XCTAssertEqual(frames.count, 2)
         Self.assertJSONLineEqual(frames[0], safeMethodRequest)
+        Self.assertJSONLineEqual(frames[1], safeWorkspaceSnapshot)
 
         await replayState.recordDeliveredServerFrame(line(#"{"jsonrpc":"2.0","id":4,"result":{"tools":[]}}"#))
         frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], safeWorkspaceSnapshot)
+
+        await replayState.recordDeliveredServerFrame(line(#"{"jsonrpc":"2.0","id":6,"result":{"prompt_tokens":0}}"#))
+        frames = await replayState.replayFrames()
         XCTAssertEqual(frames, [])
+    }
+
+    func testOutstandingReplayStateIgnoresClientResponseForAppOriginatedIDCollision() async {
+        let replayState = MCPOutstandingRequestReplayState()
+        let hostRequest = line(#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"README.md"}}}"#)
+        let clientResponseToAppRequestWithSameID = line(#"{"jsonrpc":"2.0","id":7,"result":{"roots":[]}}"#)
+        let serverResponseToHostRequest = line(#"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"ok"}]}}"#)
+
+        await replayState.recordForwardedClientFrame(hostRequest)
+        var frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], hostRequest)
+
+        await replayState.recordForwardedClientFrame(clientResponseToAppRequestWithSameID)
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], hostRequest)
+
+        await replayState.recordDeliveredServerFrame(serverResponseToHostRequest)
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+    }
+
+    func testOutstandingReplayStateUsesStrictJSONRPCIDs() async {
+        let replayState = MCPOutstandingRequestReplayState()
+        let invalidFractionalRequest = line(#"{"jsonrpc":"2.0","id":7.5,"method":"tools/list","params":{}}"#)
+        let hostRequest = line(#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{}}"#)
+
+        await replayState.recordForwardedClientFrame(invalidFractionalRequest)
+        var frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+
+        await replayState.recordForwardedClientFrame(hostRequest)
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], hostRequest)
+
+        await replayState.recordForwardedClientFrame(line(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7.5}}"#))
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], hostRequest)
+
+        await replayState.recordForwardedClientFrame(line(#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#))
+        frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+    }
+
+    func testOutstandingReplayStateDoesNotReaddStaleRequestWhenResponseCommitsFirst() async throws {
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        let replayState = MCPOutstandingRequestReplayState()
+        let requestFrame = line(#"{"jsonrpc":"2.0","id":8,"method":"tools/list","params":{}}"#)
+        let responseFrame = line(#"{"jsonrpc":"2.0","id":8,"result":{"tools":[]}}"#)
+
+        let preparedRequest = try await ledger.prepare(frame: requestFrame, direction: .clientToServer)
+        let recordedRequest = await replayState.recordPreparedClientRequestFrame(requestFrame, prepared: preparedRequest)
+        XCTAssertTrue(recordedRequest)
+
+        let preparedResponse = try await ledger.prepare(frame: responseFrame, direction: .serverToClient)
+        try await ledger.commit(preparedResponse)
+        await replayState.recordDeliveredServerFrame(responseFrame, prepared: preparedResponse)
+        try await ledger.commit(preparedRequest)
+
+        let frames = await replayState.replayFrames()
+        XCTAssertEqual(frames, [])
+    }
+
+    func testOutstandingReplayStateRemovesResponsesByRequestOrdinalWhenIDIsReused() async throws {
+        let ledger = JSONRPCBridgeLedger()
+        _ = try await ledger.beginConnection()
+        let replayState = MCPOutstandingRequestReplayState()
+        let oldRequest = line(#"{"jsonrpc":"2.0","id":9,"method":"tools/list","params":{}}"#)
+        let oldResponse = line(#"{"jsonrpc":"2.0","id":9,"result":{"tools":[]}}"#)
+        let newRequest = line(#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"README.md"}}}"#)
+
+        let preparedOldRequest = try await ledger.prepare(frame: oldRequest, direction: .clientToServer)
+        let recordedOldRequest = await replayState.recordPreparedClientRequestFrame(oldRequest, prepared: preparedOldRequest)
+        XCTAssertTrue(recordedOldRequest)
+        try await ledger.commit(preparedOldRequest)
+
+        let preparedOldResponse = try await ledger.prepare(frame: oldResponse, direction: .serverToClient)
+        try await ledger.commit(preparedOldResponse)
+
+        let preparedNewRequest = try await ledger.prepare(frame: newRequest, direction: .clientToServer)
+        let recordedNewRequest = await replayState.recordPreparedClientRequestFrame(newRequest, prepared: preparedNewRequest)
+        XCTAssertTrue(recordedNewRequest)
+        try await ledger.commit(preparedNewRequest)
+
+        await replayState.recordDeliveredServerFrame(oldResponse, prepared: preparedOldResponse)
+        let frames = await replayState.replayFrames()
+        XCTAssertEqual(frames.count, 1)
+        Self.assertJSONLineEqual(frames[0], newRequest)
     }
 
     func testTerminateControlNotificationSurfacesAsServerTermination() async throws {

@@ -36,6 +36,21 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
         }
         return nil
     }
+
+    public static func parseJSONValue(_ value: Any?) -> JSONRPCBridgeID? {
+        guard let value else { return nil }
+        if value is NSNull { return .null }
+        if let value = value as? String { return .string(value) }
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        let double = number.doubleValue
+        let integer = number.int64Value
+        guard double.isFinite, double == Double(integer) else { return nil }
+        return .number(integer)
+    }
 }
 
 public enum JSONRPCBridgeReplayPolicy {
@@ -60,7 +75,11 @@ public enum JSONRPCBridgeReplayPolicy {
         "workspace_context"
     ]
 
-    public static func isReplayableClientRequest(method: String?, tool: String?) -> Bool {
+    public static func isReplayableClientRequest(
+        method: String?,
+        tool: String?,
+        toolArguments: [String: Any]? = nil
+    ) -> Bool {
         guard let method else { return false }
         if replayableMethods.contains(method) {
             return true
@@ -68,7 +87,21 @@ public enum JSONRPCBridgeReplayPolicy {
         guard method == "tools/call", let tool else {
             return false
         }
+        if tool == "workspace_context" {
+            return isReplayableWorkspaceContext(arguments: toolArguments)
+        }
         return replayableToolCalls.contains(tool)
+    }
+
+    private static func isReplayableWorkspaceContext(arguments: [String: Any]?) -> Bool {
+        guard let rawOperation = arguments?["op"] else {
+            return true
+        }
+        guard let operation = rawOperation as? String else {
+            return false
+        }
+        let normalized = operation.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.isEmpty || normalized == "snapshot"
     }
 }
 
@@ -609,7 +642,7 @@ public actor JSONRPCBridgeLedger {
 
     private struct ParsedMessage {
         enum Kind {
-            case request(id: JSONRPCBridgeID, method: String?, tool: String?)
+            case request(id: JSONRPCBridgeID, method: String?, tool: String?, toolArguments: [String: Any]?)
             case response(id: JSONRPCBridgeID)
             case notification(method: String?, cancellationID: JSONRPCBridgeID?)
             case invalidClientMessage(id: JSONRPCBridgeID?)
@@ -686,7 +719,7 @@ public actor JSONRPCBridgeLedger {
 
         for (messageIndex, parsedMessage) in parsed.enumerated() {
             switch parsedMessage.kind {
-            case let .request(id, method, tool):
+            case let .request(id, method, tool, toolArguments):
                 guard id != .null else {
                     messages.append(JSONRPCBridgeMessageMetadata(
                         kind: .invalidClientMessage,
@@ -714,7 +747,11 @@ public actor JSONRPCBridgeLedger {
                     ordinal: simulatedNextOrdinal,
                     isReplayable: direction == .clientToServer
                         && !frameIsBatch
-                        && JSONRPCBridgeReplayPolicy.isReplayableClientRequest(method: method, tool: tool)
+                        && JSONRPCBridgeReplayPolicy.isReplayableClientRequest(
+                            method: method,
+                            tool: tool,
+                            toolArguments: toolArguments
+                        )
                 )
                 if let existingState = simulatedActive[key] {
                     guard case let .responseInDelivery(
@@ -1262,6 +1299,7 @@ public actor JSONRPCBridgeLedger {
 
             let hasID = dictionary.keys.contains("id")
             let id = hasID ? parseID(dictionary["id"]) : nil
+            let hasMethod = dictionary.keys.contains("method")
             let method = dictionary["method"] as? String
             let hasResult = dictionary.keys.contains("result")
             let hasError = dictionary.keys.contains("error")
@@ -1271,6 +1309,7 @@ public actor JSONRPCBridgeLedger {
                     dictionary,
                     hasID: hasID,
                     id: id,
+                    hasMethod: hasMethod,
                     method: method,
                     hasResult: hasResult,
                     hasError: hasError
@@ -1291,8 +1330,14 @@ public actor JSONRPCBridgeLedger {
 
             if let method {
                 let tool = extractTool(from: dictionary, method: method)
+                let toolArguments = extractToolArguments(from: dictionary, method: method)
                 if let id, id != .null {
-                    messages.append(ParsedMessage(kind: .request(id: id, method: method, tool: tool)))
+                    messages.append(ParsedMessage(kind: .request(
+                        id: id,
+                        method: method,
+                        tool: tool,
+                        toolArguments: toolArguments
+                    )))
                 } else if hasID {
                     if direction == .clientToServer {
                         messages.append(ParsedMessage(kind: .invalidClientMessage(id: id)))
@@ -1333,24 +1378,14 @@ public actor JSONRPCBridgeLedger {
     }
 
     private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {
-        guard let value else { return nil }
-        if value is NSNull { return .null }
-        if let value = value as? String { return .string(value) }
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
-        else {
-            return nil
-        }
-        let double = number.doubleValue
-        let integer = number.int64Value
-        guard double.isFinite, double == Double(integer) else { return nil }
-        return .number(integer)
+        JSONRPCBridgeID.parseJSONValue(value)
     }
 
     private static func validateBackendEnvelope(
         _ dictionary: [String: Any],
         hasID: Bool,
         id: JSONRPCBridgeID?,
+        hasMethod: Bool,
         method: String?,
         hasResult: Bool,
         hasError: Bool
@@ -1365,7 +1400,7 @@ public actor JSONRPCBridgeLedger {
             throw JSONRPCBridgeLedgerError.malformedBackendFrame
         }
         if hasResult || hasError {
-            guard method == nil,
+            guard !hasMethod,
                   hasID,
                   id != nil,
                   hasResult != hasError
@@ -1426,6 +1461,15 @@ public actor JSONRPCBridgeLedger {
         return params["name"] as? String
     }
 
+    private static func extractToolArguments(from dictionary: [String: Any], method: String) -> [String: Any]? {
+        guard method == "tools/call",
+              let params = dictionary["params"] as? [String: Any]
+        else {
+            return nil
+        }
+        return params["arguments"] as? [String: Any]
+    }
+
     private static func cancellationID(from dictionary: [String: Any]) -> JSONRPCBridgeID? {
         guard let params = dictionary["params"] as? [String: Any] else { return nil }
         return parseID(params["requestId"] ?? params["id"])
@@ -1474,18 +1518,7 @@ public enum JSONRPCBridgeFrameInspector {
     }
 
     private static func parseID(_ value: Any?) -> JSONRPCBridgeID? {
-        guard let value else { return nil }
-        if value is NSNull { return .null }
-        if let value = value as? String { return .string(value) }
-        guard let number = value as? NSNumber,
-              CFGetTypeID(number) != CFBooleanGetTypeID()
-        else {
-            return nil
-        }
-        let double = number.doubleValue
-        let integer = number.int64Value
-        guard double.isFinite, double == Double(integer) else { return nil }
-        return .number(integer)
+        JSONRPCBridgeID.parseJSONValue(value)
     }
 }
 

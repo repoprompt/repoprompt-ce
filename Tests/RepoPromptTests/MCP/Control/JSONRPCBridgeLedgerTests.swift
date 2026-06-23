@@ -128,6 +128,7 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
                 line(#"{"jsonrpc":"1.0","id":1,"result":{}}"#),
                 line(#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"bad"}}"#),
                 line(#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#),
+                line(#"{"jsonrpc":"2.0","id":1,"method":null,"result":{}}"#),
                 line(#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#)
             ]
 
@@ -427,6 +428,60 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         XCTAssertFalse(batchSnapshot.canReconnect)
     }
 
+    func testWorkspaceContextReplayabilityRequiresSnapshotOperation() async throws {
+        let replayableLedger = try await makeLedger()
+        try await forward(
+            toolCall(id: "21", tool: "workspace_context", arguments: #"{}"#),
+            .clientToServer,
+            replayableLedger
+        )
+        try await forward(
+            toolCall(
+                id: "22",
+                tool: "workspace_context",
+                arguments: #"{"op":"snapshot","include":["tokens"]}"#
+            ),
+            .clientToServer,
+            replayableLedger
+        )
+        var snapshot = await replayableLedger.snapshot()
+        XCTAssertEqual(snapshot.activeRequestCount, 2)
+        XCTAssertEqual(snapshot.replayableClientRequestCount, 2)
+        XCTAssertEqual(snapshot.unreplayableActiveRequestCount, 0)
+        let replayableFailureWasTerminal = await replayableLedger.recordConnectionFailure(
+            "workspace_context_snapshot_reset"
+        )
+        XCTAssertFalse(replayableFailureWasTerminal)
+        snapshot = await replayableLedger.snapshot()
+        XCTAssertTrue(snapshot.canReconnect)
+
+        let unsafeCases = [
+            ("export", #"{"op":"export","path":"context.txt"}"#),
+            ("select_preset", #"{"op":"select_preset","preset":"Plan"}"#),
+            ("list_presets", #"{"op":"list_presets"}"#),
+            ("non_string_op", #"{"op":1}"#)
+        ]
+
+        for (label, arguments) in unsafeCases {
+            let ledger = try await makeLedger()
+            try await forward(
+                toolCall(id: "30", tool: "workspace_context", arguments: arguments),
+                .clientToServer,
+                ledger
+            )
+            snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.activeRequestCount, 1, label)
+            XCTAssertEqual(snapshot.replayableClientRequestCount, 0, label)
+            XCTAssertEqual(snapshot.unreplayableActiveRequestCount, 1, label)
+            let reason = "workspace_context_\(label)_reset"
+            let failureWasTerminal = await ledger.recordConnectionFailure(reason)
+            XCTAssertTrue(failureWasTerminal, label)
+            snapshot = await ledger.snapshot()
+            XCTAssertEqual(snapshot.terminalReason, reason, label)
+            XCTAssertFalse(snapshot.canReconnect, label)
+        }
+    }
+
     func testAppOriginatedRequestsAreTombstonedAcrossReconnect() async throws {
         let ledger = try await makeLedger()
         try await forward(request(id: "7", method: "roots/list"), .serverToClient, ledger)
@@ -503,6 +558,11 @@ private extension JSONRPCBridgeLedgerTests {
     func request(id: String, method: String, tool: String? = nil) -> Data {
         let params = tool.map { ",\"params\":{\"name\":\"\($0)\"}" } ?? ""
         return line("{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"\(method)\"\(params)}")
+    }
+
+    func toolCall(id: String, tool: String, arguments: String? = nil) -> Data {
+        let argumentsPart = arguments.map { ",\"arguments\":\($0)" } ?? ""
+        return line("{\"jsonrpc\":\"2.0\",\"id\":\(id),\"method\":\"tools/call\",\"params\":{\"name\":\"\(tool)\"\(argumentsPart)}}")
     }
 
     func response(id: String) -> Data {
