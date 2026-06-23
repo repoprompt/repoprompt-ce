@@ -239,24 +239,26 @@ final class WindowCloseCoordinatorLifecycleTests: XCTestCase {
         _ expectedCount: Int,
         pollingService: CodexModelPollingService
     ) async -> Bool {
-        let reachedExpectedCount = expectation(description: "subscriber count reaches \(expectedCount)")
-        reachedExpectedCount.assertForOverFulfill = false
-        let updates = await pollingService.test_subscriberCountUpdates()
-        let observationTask = Task { @MainActor in
-            var didFulfill = false
-            for await count in updates where count == expectedCount && !didFulfill {
-                didFulfill = true
-                reachedExpectedCount.fulfill()
+        let deadline = Date().addingTimeInterval(fullSuiteAsyncTimeoutSeconds)
+        var matchingSampleCount = 0
+        var latestCount = await pollingService.test_subscriberCount()
+
+        while Date() < deadline {
+            latestCount = await pollingService.test_subscriberCount()
+            if latestCount == expectedCount {
+                matchingSampleCount += 1
+                if matchingSampleCount >= 3 {
+                    return true
+                }
+            } else {
+                matchingSampleCount = 0
             }
+
+            try? await Task.sleep(nanoseconds: 20_000_000)
         }
 
-        await fulfillment(of: [reachedExpectedCount], timeout: fullSuiteAsyncTimeoutSeconds)
-        observationTask.cancel()
-        await observationTask.value
-
-        let actualCount = await pollingService.test_subscriberCount()
-        XCTAssertEqual(actualCount, expectedCount)
-        return actualCount == expectedCount
+        XCTFail("Subscriber count did not stabilize at \(expectedCount); last count was \(latestCount)")
+        return false
     }
 
     private func waitForClientObservation(

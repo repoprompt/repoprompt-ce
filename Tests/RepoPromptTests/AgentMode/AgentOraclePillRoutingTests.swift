@@ -364,6 +364,7 @@ final class AgentOraclePillRoutingTests: XCTestCase {
         if let index = composition.workspaceManager.workspaces.firstIndex(where: { $0.id == workspace.id }) {
             composition.workspaceManager.workspaces[index] = workspace
         }
+        composition.workspaceManager.activeWorkspace = workspace
         composition.oracleViewModel.sessions = []
 
         return Fixture(

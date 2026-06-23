@@ -9763,7 +9763,7 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         guard !targets.isEmpty else { return }
         let cleanupID = UUID()
-        let task = Task(priority: .utility) { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             #if DEBUG
                 defer {
                     self?.test_completeWorkspaceSwitchBackgroundCleanup(cleanupID)
