@@ -7,9 +7,12 @@ final class HeadlessStdioTransportTests: XCTestCase {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let gate = TransportBlockingToolCallGate()
-        let server = HeadlessMCPServer(configurationStore: fixture.store, toolCallOverride: { _, _ in
-            try await gate.run()
-        })
+        let admissionController = makeAdmissionController()
+        let server = HeadlessMCPServer(
+            configurationStore: fixture.store,
+            filesystemAdmissionController: admissionController,
+            toolCallOverride: { _, _ in try await gate.run() }
+        )
         let output = LockedTransportOutput()
         let transport = HeadlessStdioTransport(
             server: server,
@@ -56,7 +59,10 @@ final class HeadlessStdioTransportTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let output = LockedTransportOutput()
         let transport = HeadlessStdioTransport(
-            server: HeadlessMCPServer(configurationStore: fixture.store),
+            server: HeadlessMCPServer(
+                configurationStore: fixture.store,
+                filesystemAdmissionController: makeAdmissionController()
+            ),
             writer: HeadlessStdoutWriter(writeHandler: output.append)
         )
 
@@ -98,9 +104,11 @@ final class HeadlessStdioTransportTests: XCTestCase {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let gate = TransportBlockingToolCallGate()
-        let server = HeadlessMCPServer(configurationStore: fixture.store, toolCallOverride: { _, _ in
-            try await gate.run()
-        })
+        let server = HeadlessMCPServer(
+            configurationStore: fixture.store,
+            filesystemAdmissionController: makeAdmissionController(),
+            toolCallOverride: { _, _ in try await gate.run() }
+        )
         let output = LockedTransportOutput()
         let transport = HeadlessStdioTransport(
             server: server,
@@ -142,9 +150,11 @@ final class HeadlessStdioTransportTests: XCTestCase {
         let fixture = try makeFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }
         let gate = TransportBlockingToolCallGate()
-        let server = HeadlessMCPServer(configurationStore: fixture.store, toolCallOverride: { _, _ in
-            try await gate.run()
-        })
+        let server = HeadlessMCPServer(
+            configurationStore: fixture.store,
+            filesystemAdmissionController: makeAdmissionController(),
+            toolCallOverride: { _, _ in try await gate.run() }
+        )
         let output = LockedTransportOutput()
         let transport = HeadlessStdioTransport(
             server: server,
@@ -180,6 +190,79 @@ final class HeadlessStdioTransportTests: XCTestCase {
         XCTAssertEqual(errorCode(cancelled), -32800)
         let activeRequestCount = await server.activeRequestCountForTesting()
         XCTAssertEqual(activeRequestCount, 0)
+    }
+
+    func testEOFCancelsAndDrainsActiveLightAndQueuedHeavyFilesystemRequests() async throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        let gate = TransportBlockingToolCallGate()
+        let admissionController = makeAdmissionController()
+        let server = HeadlessMCPServer(
+            configurationStore: fixture.store,
+            filesystemAdmissionController: admissionController,
+            toolCallOverride: { _, _ in try await gate.run() }
+        )
+        let output = LockedTransportOutput()
+        let transport = HeadlessStdioTransport(
+            server: server,
+            writer: HeadlessStdoutWriter(writeHandler: output.append)
+        )
+
+        _ = try await transport.receive(line(initializeRequest(id: 40)))
+        _ = try await transport.receive(line(notification("notifications/initialized")))
+        _ = try await transport.receive(line(request(
+            "tools/call",
+            id: 41,
+            params: ["name": "read_file", "arguments": ["path": "Fixture/file.txt"]]
+        )))
+        await gate.waitUntilStarted()
+        _ = try await transport.receive(line(request(
+            "tools/call",
+            id: 42,
+            params: ["name": "file_search", "arguments": ["pattern": "needle"]]
+        )))
+        try await waitForAdmissionSnapshot(
+            .init(activeWeight: 1, activeLeaseCount: 1, waitingWeights: [4]),
+            controller: admissionController
+        )
+
+        let finishCompleted = expectation(description: "EOF drains active and queued weighted requests")
+        Task {
+            await transport.finish()
+            finishCompleted.fulfill()
+        }
+        await fulfillment(of: [finishCompleted], timeout: 1)
+
+        let activeResponse = try await output.waitForResponse(id: 41)
+        let queuedResponse = try await output.waitForResponse(id: 42)
+        XCTAssertEqual(errorCode(activeResponse), -32800)
+        XCTAssertEqual(errorCode(queuedResponse), -32800)
+        XCTAssertEqual(output.responses(id: 41).count, 1)
+        XCTAssertEqual(output.responses(id: 42).count, 1)
+        try await waitForAdmissionSnapshot(
+            .init(activeWeight: 0, activeLeaseCount: 0, waitingWeights: []),
+            controller: admissionController
+        )
+        let activeRequestCount = await server.activeRequestCountForTesting()
+        XCTAssertEqual(activeRequestCount, 0)
+    }
+
+    private func makeAdmissionController() -> HeadlessFilesystemAdmissionController {
+        HeadlessFilesystemAdmissionController(capacity: HeadlessFilesystemAdmissionPolicy.capacity)
+    }
+
+    private func waitForAdmissionSnapshot(
+        _ expected: HeadlessFilesystemAdmissionController.Snapshot,
+        controller: HeadlessFilesystemAdmissionController
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            if await controller.snapshotForTesting() == expected {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for admission snapshot \(expected)")
     }
 
     private func makeFixture(configureAllowedRoot: Bool = false) throws -> (directory: URL, store: HeadlessConfigurationStore) {

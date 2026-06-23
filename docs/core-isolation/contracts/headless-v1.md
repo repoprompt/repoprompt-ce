@@ -3,6 +3,7 @@
 **Frozen:** 2026-06-21
 **Reviewed implementation:** `21b5603f5a333454aee899dd39ff38d860a5b716`
 **Security hardening reference:** `487cd71d892dbc3104689cc42fdb39f6c038e8fb`
+**Post-close B1 filesystem admission hardening:** 2026-06-22
 **Version policy:** [ADR-002](../decisions/ADR-002-headless-version-and-transport-identity.md)
 
 This is the Phase 8 acceptance oracle. Headless v1 is a fenced parallel runtime;
@@ -79,6 +80,17 @@ private state root unless the user explicitly requests state deletion.
   `-32800` / `Request cancelled.`.
 - `get_file_tree`, `get_code_structure`, `read_file`, and `file_search` may run
   concurrently. Other tools are serialized.
+- One Headless-owned controller is shared by every server in the process and
+  bounds aggregate filesystem work with weighted capacity `4`. `file_search`
+  has weight `4`; `get_file_tree`, `get_code_structure`, and `read_file` each
+  have weight `1`.
+- Weighted waiters are admitted in strict FIFO order without bypass. Invalid
+  weights fail. Cancelling a queued request removes its waiter without consuming
+  capacity. If cancellation races with handoff, the granted lease is released
+  before tool execution. Every granted lease releases its weight exactly once.
+- Admission wraps both registered and test-override execution for the four
+  filesystem tools. Ping, initialize/shutdown/notifications, tool listing, and
+  serialized workspace/selection/prompt mutations remain outside this gate.
 - `shutdown` returns JSON `null` and changes the server to shutdown state.
 - Requests after shutdown return `-32600` /
   `Server has shut down and no longer accepts requests.`.
@@ -143,6 +155,9 @@ Unknown message:
   rejected.
 
 ## Resource bounds
+
+The weighted process-wide bound above is additive to, and does not replace or
+pool, these unchanged per-request budgets:
 
 | Area | Bound |
 | --- | --- |

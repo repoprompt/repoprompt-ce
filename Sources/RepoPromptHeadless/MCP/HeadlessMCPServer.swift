@@ -39,6 +39,7 @@ actor HeadlessMCPServer {
     private let configurationStore: HeadlessConfigurationStore
     private let host: HeadlessHost
     private let registry: HeadlessToolRegistry
+    private let filesystemAdmissionController: HeadlessFilesystemAdmissionController
     private let toolCallOverride: ToolCallOverride?
     private var lifecycleState: LifecycleState = .uninitialized
     private var activeRequests: [RequestKey: Task<HeadlessRPCAction, Never>] = [:]
@@ -46,11 +47,13 @@ actor HeadlessMCPServer {
 
     init(
         configurationStore: HeadlessConfigurationStore,
+        filesystemAdmissionController: HeadlessFilesystemAdmissionController = .shared,
         toolCallOverride: ToolCallOverride? = nil
     ) {
         self.configurationStore = configurationStore
         host = HeadlessHost(configurationStore: configurationStore)
         registry = HeadlessToolRegistry(host: host, configurationStore: configurationStore)
+        self.filesystemAdmissionController = filesystemAdmissionController
         self.toolCallOverride = toolCallOverride
     }
 
@@ -260,13 +263,19 @@ actor HeadlessMCPServer {
         arguments: HeadlessJSONObject
     ) -> HeadlessRPCSubmission {
         let previousSerializedTask = Self.runsConcurrently(toolName: name) ? nil : serializedToolTail
-        let task = Task { [weak self, registry, toolCallOverride] in
+        let task = Task { [weak self, registry, filesystemAdmissionController, toolCallOverride] in
             if let previousSerializedTask {
                 await previousSerializedTask.value
             }
             let action: HeadlessRPCAction
             do {
                 try Task.checkCancellation()
+                let admissionLease: HeadlessFilesystemAdmissionController.Lease? = if let weight = HeadlessFilesystemAdmissionPolicy.weight(forToolNamed: name) {
+                    try await filesystemAdmissionController.acquire(weight: weight)
+                } else {
+                    nil
+                }
+                defer { admissionLease?.release() }
                 let result: HeadlessJSONObject = if let toolCallOverride {
                     try await toolCallOverride(name, arguments)
                 } else {
@@ -316,12 +325,7 @@ actor HeadlessMCPServer {
     }
 
     private static func runsConcurrently(toolName: String) -> Bool {
-        switch toolName {
-        case "get_file_tree", "get_code_structure", "read_file", "file_search":
-            true
-        default:
-            false
-        }
+        HeadlessFilesystemAdmissionPolicy.weight(forToolNamed: toolName) != nil
     }
 
     private func initializeResult() -> [String: Any] {

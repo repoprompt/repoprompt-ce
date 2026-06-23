@@ -233,6 +233,65 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
         XCTAssertEqual(activeAfterCancellation, 0)
     }
 
+    func testSharedFilesystemAdmissionAcrossServersKeepsPingResponsiveAndCancelsQueuedRequest() async throws {
+        let controller = HeadlessFilesystemAdmissionController(capacity: HeadlessFilesystemAdmissionPolicy.capacity)
+        let activeGate = BlockingHeadlessToolCallGate()
+        let first = try makeFixture(
+            filesystemAdmissionController: controller,
+            toolCallOverride: { _, _ in try await activeGate.run() }
+        )
+        let queuedCalls = HeadlessToolCallCounter()
+        let second = HeadlessMCPServer(
+            configurationStore: first.store,
+            filesystemAdmissionController: controller,
+            toolCallOverride: { _, _ in await queuedCalls.record() }
+        )
+        try await makeReady(first.server)
+        try await makeReady(second)
+
+        let activeFrame = try request(
+            "tools/call",
+            id: 140,
+            params: ["name": "file_search", "arguments": ["pattern": "needle"]]
+        )
+        let active = Task { await first.server.handle(frame: activeFrame) }
+        await activeGate.waitUntilStarted()
+        let queuedFrame = try request(
+            "tools/call",
+            id: 240,
+            params: ["name": "read_file", "arguments": ["path": "Fixture/file.txt"]]
+        )
+        let queued = Task { await second.handle(frame: queuedFrame) }
+        try await waitForAdmissionSnapshot(
+            .init(activeWeight: 4, activeLeaseCount: 1, waitingWeights: [1]),
+            controller: controller
+        )
+
+        let ping = try await second.handle(frame: request("ping", id: 241))
+        XCTAssertNotNil(try responseObject(ping)["result"] as? [String: Any])
+        _ = try await second.handle(
+            frame: notification("notifications/cancelled", params: ["requestId": 240])
+        )
+        let queuedResponse = await queued.value
+        XCTAssertEqual(try errorCode(queuedResponse), -32800)
+        let queuedCallCount = await queuedCalls.count
+        XCTAssertEqual(queuedCallCount, 0, "A cancelled queued request must never reach its tool call")
+        try await waitForAdmissionSnapshot(
+            .init(activeWeight: 4, activeLeaseCount: 1, waitingWeights: []),
+            controller: controller
+        )
+
+        _ = try await first.server.handle(
+            frame: notification("notifications/cancelled", params: ["requestId": 140])
+        )
+        let activeResponse = await active.value
+        XCTAssertEqual(try errorCode(activeResponse), -32800)
+        try await waitForAdmissionSnapshot(
+            .init(activeWeight: 0, activeLeaseCount: 0, waitingWeights: []),
+            controller: controller
+        )
+    }
+
     func testCancellationAfterCommittedToolResultPreservesSuccessfulResponse() async throws {
         let gate = PostCommitHeadlessToolCallGate()
         let fixture = try makeFixture(toolCallOverride: { _, _ in
@@ -443,6 +502,9 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
 
     private func makeFixture(
         configureAllowedRoot: Bool = false,
+        filesystemAdmissionController: HeadlessFilesystemAdmissionController = HeadlessFilesystemAdmissionController(
+            capacity: HeadlessFilesystemAdmissionPolicy.capacity
+        ),
         toolCallOverride: HeadlessMCPServer.ToolCallOverride? = nil
     ) throws -> Fixture {
         let directory = HeadlessTestTemporaryDirectory.baseURL
@@ -469,8 +531,23 @@ final class HeadlessMCPServerLifecycleTests: XCTestCase {
         }
         return Fixture(store: store, server: HeadlessMCPServer(
             configurationStore: store,
+            filesystemAdmissionController: filesystemAdmissionController,
             toolCallOverride: toolCallOverride
         ))
+    }
+
+    private func waitForAdmissionSnapshot(
+        _ expected: HeadlessFilesystemAdmissionController.Snapshot,
+        controller: HeadlessFilesystemAdmissionController
+    ) async throws {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            if await controller.snapshotForTesting() == expected {
+                return
+            }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTFail("Timed out waiting for admission snapshot \(expected)")
     }
 
     private func waitForActiveRequests(_ expected: Int, server: HeadlessMCPServer) async throws {
@@ -625,5 +702,14 @@ private actor BlockingHeadlessToolCallGate {
         while !started {
             await Task.yield()
         }
+    }
+}
+
+private actor HeadlessToolCallCounter {
+    private(set) var count = 0
+
+    func record() -> HeadlessJSONObject {
+        count += 1
+        return ["executed": true]
     }
 }
