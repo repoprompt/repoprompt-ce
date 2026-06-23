@@ -15508,6 +15508,9 @@ final class AgentModeViewModel: ObservableObject {
         context: RuntimeCleanupContext
     ) async {
         // 1. Cancel async refresh/load tasks.
+        // These clears run unconditionally for every path because the session is
+        // being torn down; they are no-ops on already-cleared sessions and keep
+        // every teardown path consistent without per-path opt-in flags.
         removePendingUIRefresh(for: session.tabID)
         cancelPersistedLoad(for: session)
         session.derivedTranscriptRefreshTask?.cancel()
@@ -15520,6 +15523,7 @@ final class AgentModeViewModel: ObservableObject {
         clearPendingAssistantDelta(session)
 
         // 2. Cancel steering queues.
+        // Same rationale as step 1: universal and idempotent.
         session.claudeSteeringFlushTask?.cancel()
         session.claudeSteeringFlushTask = nil
         session.acpSteeringFlushTask?.cancel()
@@ -15560,6 +15564,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         // 7. Cancel runtime observation tasks.
+        // Universal and idempotent, same rationale as steps 1/2.
         session.agentTask?.cancel()
         session.agentTask = nil
         session.codexEventTask?.cancel()
