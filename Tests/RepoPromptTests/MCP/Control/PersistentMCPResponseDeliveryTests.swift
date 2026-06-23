@@ -211,6 +211,9 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         }
         defer { bridgeTask.cancel() }
 
+        Self.closeIfOpen(stdinPipe[1])
+        stdinPipe[1] = -1
+
         let notification = try XCTUnwrap(
             RepoPromptControlNotification<RepoPromptTerminateParams>.terminate(
                 reason: .toolExecutionWatchdog,
