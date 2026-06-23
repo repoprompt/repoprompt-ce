@@ -838,13 +838,14 @@ actor BootstrapSocketProxy {
             timeout: MCPBootstrapTiming.initialResponseTimeout
         )
 
+        var initialSocketBytes = Data()
         switch response.type {
         case "accepted":
             log.debug("BootstrapSocketProxy: Handshake accepted, starting bridge")
             debugLog("Handshake accepted, starting stdin/stdout bridge")
             if replayInitializationOnStart {
                 let plan = try await Self.requireReplayPlan(from: initializeReplayState)
-                try await Self.replayInitializedSession(plan, socketFD: socketFD)
+                initialSocketBytes = try await Self.replayInitializedSession(plan, socketFD: socketFD)
                 try await Self.replayOutstandingClientRequests(
                     outstandingRequestReplayState.replayFrames(),
                     socketFD: socketFD
@@ -881,7 +882,8 @@ actor BootstrapSocketProxy {
             initializeReplayState: replayState,
             outstandingRequestReplayState: outstandingReplayState,
             bridgeLedger: ledger,
-            faultRule: faultRule
+            faultRule: faultRule,
+            initialSocketBytes: initialSocketBytes
         )
     }
 
@@ -1115,21 +1117,31 @@ extension BootstrapSocketProxy {
         }
     }
 
+    @discardableResult
     static func replayInitializedSession(
         _ plan: MCPInitializeReplayPlan,
         socketFD: Int32,
         timeout: TimeInterval = MCPBootstrapTiming.initialResponseTimeout
-    ) async throws {
+    ) async throws -> Data {
         debugLog("BootstrapSocketProxy: replaying MCP initialize after reconnect")
         try writeToSocket(plan.initializeFrame, socketFD: socketFD)
-        try await readReplayInitializeResponse(
+        guard let expectedResultFingerprint = plan.initializeResultFingerprint else {
+            debugLog("BootstrapSocketProxy: replayed pending MCP initialize; response will be forwarded to host")
+            return Data()
+        }
+        let bufferedServerFrames = try await readReplayInitializeResponse(
             socketFD: socketFD,
             expectedID: plan.initializeRequestID,
-            expectedResultFingerprint: plan.initializeResultFingerprint,
+            expectedResultFingerprint: expectedResultFingerprint,
             timeout: timeout
         )
-        try writeToSocket(plan.initializedFrame, socketFD: socketFD)
-        debugLog("BootstrapSocketProxy: replayed MCP initialized notification after reconnect")
+        if let initializedFrame = plan.initializedFrame {
+            try writeToSocket(initializedFrame, socketFD: socketFD)
+            debugLog("BootstrapSocketProxy: replayed MCP initialized notification after reconnect")
+        } else {
+            debugLog("BootstrapSocketProxy: replayed MCP initialize; waiting for host initialized notification")
+        }
+        return bufferedServerFrames
     }
 
     private static func replayOutstandingClientRequests(
@@ -1148,8 +1160,9 @@ extension BootstrapSocketProxy {
         expectedID: JSONRPCBridgeID,
         expectedResultFingerprint: String,
         timeout: TimeInterval
-    ) async throws {
+    ) async throws -> Data {
         var buffer = Data()
+        var bufferedServerFrames = Data()
         let deadline = Date().addingTimeInterval(timeout)
 
         while Date() < deadline {
@@ -1186,11 +1199,19 @@ extension BootstrapSocketProxy {
             buffer.append(byte)
             if byte == UInt8(ascii: "\n") {
                 let frame = buffer
-                guard let response = MCPInitializeReplayState.jsonObject(from: frame),
-                      let responseID = MCPInitializeReplayState.jsonRPCID(from: response["id"]),
-                      responseID == expectedID
-                else {
+                buffer.removeAll(keepingCapacity: true)
+                guard let response = MCPInitializeReplayState.jsonObject(from: frame) else {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_response_mismatch")
+                }
+                guard response["result"] != nil || response["error"] != nil,
+                      let responseID = MCPInitializeReplayState.jsonRPCID(from: response["id"])
+                else {
+                    bufferedServerFrames.append(frame)
+                    continue
+                }
+                guard responseID == expectedID else {
+                    bufferedServerFrames.append(frame)
+                    continue
                 }
                 guard let result = response["result"],
                       response["error"] == nil
@@ -1200,7 +1221,7 @@ extension BootstrapSocketProxy {
                 guard MCPInitializeReplayState.initializeCompatibilityFingerprint(result) == expectedResultFingerprint else {
                     throw JSONRPCBridgeLedgerError.terminal("mcp_session_resume_initialize_replay_result_mismatch")
                 }
-                return
+                return bufferedServerFrames
             }
         }
 
@@ -1221,7 +1242,8 @@ extension BootstrapSocketProxy {
         drainDeadline: TimeInterval = TimeInterval(MCPTimeoutPolicy.postStdinHalfCloseBridgeDrainDeadlineSeconds),
         drainVisibilityInterval: TimeInterval = 30,
         drainLogDescriptor: Int32 = STDERR_FILENO,
-        onStdinClosed: @escaping @Sendable () async -> Void = {}
+        onStdinClosed: @escaping @Sendable () async -> Void = {},
+        initialSocketBytes: Data = Data()
     ) async throws {
         let drainState = BridgeDrainState(clock: drainClock)
         try await withThrowingTaskGroup(of: BridgeTaskExit.self) { group in
@@ -1249,6 +1271,7 @@ extension BootstrapSocketProxy {
                     bridgeLedger: bridgeLedger,
                     faultRule: faultRule,
                     socketPoller: socketPoller,
+                    initialSocketBytes: initialSocketBytes,
                     drainDeadline: drainDeadline,
                     drainVisibilityInterval: drainVisibilityInterval,
                     drainLogDescriptor: drainLogDescriptor
@@ -1578,12 +1601,13 @@ extension BootstrapSocketProxy {
         bridgeLedger: JSONRPCBridgeLedger,
         faultRule: JSONRPCBridgeFaultRule?,
         socketPoller: BridgeSocketPoller? = nil,
+        initialSocketBytes: Data = Data(),
         drainDeadline: TimeInterval,
         drainVisibilityInterval: TimeInterval,
         drainLogDescriptor: Int32
     ) async throws {
         var buffer = [UInt8](repeating: 0, count: 8192)
-        var pending = Data()
+        var pending = initialSocketBytes
         debugLog("BootstrapSocketProxy: pumpSocketToStdout started")
         let originalStdoutFlags: Int32
         do {
@@ -1599,7 +1623,70 @@ extension BootstrapSocketProxy {
             }
         }
 
+        func forwardCompletePendingFrames() async throws {
+            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
+                let data = Data(pending[...newline])
+                pending = Data(pending[(newline + 1)...])
+                debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
+
+                if let termination = Self.extractTerminateParams(from: data) {
+                    let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
+                    throw SocketProxyError.terminatedByServer(
+                        reason: TerminationReason(rawValue: terminalReason) ?? termination.reason,
+                        message: termination.message
+                    )
+                }
+
+                let prepared = try await JSONRPCBridgeDelivery.forward(
+                    frame: data,
+                    direction: .serverToClient,
+                    ledger: bridgeLedger,
+                    faultRule: faultRule
+                ) { framed in
+                    // Progress notifications are an intentional stderr-only control surface.
+                    // Delivery is best-effort: if the host closed stderr, drop the progress
+                    // line and keep the stdout transport alive rather than raising an ObjC
+                    // exception that would abort the helper mid-ledger-transaction.
+                    if let progressMessage = Self.extractProgressMessage(from: framed) {
+                        let delivered = BestEffortStderrWriter.writeNonBlocking(
+                            Data("[progress] \(progressMessage)\n".utf8)
+                        )
+                        if !delivered {
+                            debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
+                        }
+                        return
+                    }
+                    do {
+                        try NonBlockingFDWriter.writeAll(
+                            framed,
+                            to: stdoutFD,
+                            stallTimeout: stdoutWriteStallTimeout,
+                            pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
+                            setNonBlocking: false
+                        )
+                    } catch let writeError as NonBlockingFDWriteError {
+                        debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance)")
+                        throw mapStdoutWriteError(writeError)
+                    }
+                }
+                if let delivered = prepared.deliveryFrame,
+                   Self.extractProgressMessage(from: delivered) == nil
+                {
+                    MCPResponseDeliveryTracer.emitPreparedFrame(
+                        layer: "proxy_stdout",
+                        phase: "stdout_write_completed",
+                        prepared: prepared,
+                        publicationPending: false,
+                        terminalBarrier: false
+                    )
+                    await initializeReplayState?.recordDeliveredServerFrame(delivered)
+                    await outstandingRequestReplayState?.recordDeliveredServerFrame(delivered, prepared: prepared)
+                }
+            }
+        }
+
         while !Task.isCancelled {
+            try await forwardCompletePendingFrames()
             let readiness: BridgeSocketPollResult
             if let socketPoller {
                 readiness = try await socketPoller(socketFD)
@@ -1673,66 +1760,7 @@ extension BootstrapSocketProxy {
 
             pending.append(contentsOf: buffer[0 ..< bytesRead])
             debugLog("BootstrapSocketProxy: read \(bytesRead) bytes from socket, pending=\(pending.count)")
-
-            while let newline = pending.firstIndex(of: UInt8(ascii: "\n")) {
-                let data = Data(pending[...newline])
-                pending = Data(pending[(newline + 1)...])
-                debugLog("BootstrapSocketProxy: ← stdout bytes=\(data.count) sha256=\(MCPResponseDeliveryTracer.sha256Hex(data))")
-
-                if let termination = Self.extractTerminateParams(from: data) {
-                    let terminalReason = await bridgeLedger.terminalizeConnection(reason: termination.reason.rawValue)
-                    throw SocketProxyError.terminatedByServer(
-                        reason: TerminationReason(rawValue: terminalReason) ?? termination.reason,
-                        message: termination.message
-                    )
-                }
-
-                let prepared = try await JSONRPCBridgeDelivery.forward(
-                    frame: data,
-                    direction: .serverToClient,
-                    ledger: bridgeLedger,
-                    faultRule: faultRule
-                ) { framed in
-                    // Progress notifications are an intentional stderr-only control surface.
-                    // Delivery is best-effort: if the host closed stderr, drop the progress
-                    // line and keep the stdout transport alive rather than raising an ObjC
-                    // exception that would abort the helper mid-ledger-transaction.
-                    if let progressMessage = Self.extractProgressMessage(from: framed) {
-                        let delivered = BestEffortStderrWriter.writeNonBlocking(
-                            Data("[progress] \(progressMessage)\n".utf8)
-                        )
-                        if !delivered {
-                            debugLog("BootstrapSocketProxy: dropped progress output, stderr unavailable")
-                        }
-                        return
-                    }
-                    do {
-                        try NonBlockingFDWriter.writeAll(
-                            framed,
-                            to: stdoutFD,
-                            stallTimeout: stdoutWriteStallTimeout,
-                            pollIntervalMilliseconds: stdoutWritePollIntervalMilliseconds,
-                            setNonBlocking: false
-                        )
-                    } catch let writeError as NonBlockingFDWriteError {
-                        debugLog("BootstrapSocketProxy: stdout bridge write failed provenance=\(writeError.provenance)")
-                        throw mapStdoutWriteError(writeError)
-                    }
-                }
-                if let delivered = prepared.deliveryFrame,
-                   Self.extractProgressMessage(from: delivered) == nil
-                {
-                    MCPResponseDeliveryTracer.emitPreparedFrame(
-                        layer: "proxy_stdout",
-                        phase: "stdout_write_completed",
-                        prepared: prepared,
-                        publicationPending: false,
-                        terminalBarrier: false
-                    )
-                    await initializeReplayState?.recordDeliveredServerFrame(delivered)
-                    await outstandingRequestReplayState?.recordDeliveredServerFrame(delivered, prepared: prepared)
-                }
-            }
+            try await forwardCompletePendingFrames()
 
             if sawHangup {
                 try await handleAppSocketClosed(

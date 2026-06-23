@@ -475,7 +475,8 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         let initializeFrame = line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"resume-test","version":"1"}}}"#)
         let initializeResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"RepoPrompt CE","version":"test"}}}"#)
         let initializedFrame = line(#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
-        let coalescedBackendNotification = line(#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"resume-tail"}}"#)
+        let preResponseBackendNotification = line(#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"resume-before-response"}}"#)
+        let postResponseBackendNotification = line(#"{"jsonrpc":"2.0","method":"notifications/message","params":{"level":"info","data":"resume-after-response"}}"#)
 
         try Self.writeAll(initializeFrame, to: hostFD)
         XCTAssertEqual(try Self.readLine(from: firstAppFD, timeout: 2), initializeFrame)
@@ -522,9 +523,9 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
             )
         }
         XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializeFrame)
-        try Self.writeAll(initializeResponse + coalescedBackendNotification, to: secondAppFD)
+        try Self.writeAll(preResponseBackendNotification + initializeResponse + postResponseBackendNotification, to: secondAppFD)
         XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializedFrame)
-        try await replayTask.value
+        let initialSocketBytes = try await replayTask.value
 
         let secondResult = BridgeTaskResultBox()
         secondBridgeTask = Task {
@@ -536,7 +537,8 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
                     identityCache: ClientIdentityCache(),
                     initializeReplayState: replayState,
                     bridgeLedger: ledger,
-                    faultRule: nil
+                    faultRule: nil,
+                    initialSocketBytes: initialSocketBytes
                 )
                 secondResult.store(.success(()))
             } catch {
@@ -546,7 +548,12 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
 
         XCTAssertEqual(
             try Self.readLine(from: hostFD, timeout: 2),
-            coalescedBackendNotification,
+            preResponseBackendNotification,
+            "Replay must buffer app frames that arrive before the initialize response"
+        )
+        XCTAssertEqual(
+            try Self.readLine(from: hostFD, timeout: 2),
+            postResponseBackendNotification,
             "Replay must not consume app frames coalesced after the initialize response"
         )
 
@@ -566,6 +573,128 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         XCTAssertNil(snapshot.terminalReason)
     }
 
+    func testPendingInitializeResponseReconnectForwardsReplayedResponseToHost() async throws {
+        var firstSockets = [Int32](repeating: -1, count: 2)
+        var secondSockets = [Int32](repeating: -1, count: 2)
+        var hostSockets = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &firstSockets), 0)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &secondSockets), 0)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &hostSockets), 0)
+
+        var firstBridgeTask: Task<Void, Never>?
+        var secondBridgeTask: Task<Void, Never>?
+        defer {
+            firstBridgeTask?.cancel()
+            secondBridgeTask?.cancel()
+            (firstSockets + secondSockets + hostSockets).forEach(Self.closeIfOpen)
+        }
+
+        let ledger = JSONRPCBridgeLedger()
+        let replayState = MCPInitializeReplayState()
+        _ = try await ledger.beginConnection()
+
+        let hostFD = hostSockets[0]
+        let bridgeHostFD = hostSockets[1]
+        let firstBridgeFD = firstSockets[0]
+        let firstAppFD = firstSockets[1]
+        let firstResult = BridgeTaskResultBox()
+        firstBridgeTask = Task {
+            do {
+                try await BootstrapSocketProxy.runBridge(
+                    socketFD: firstBridgeFD,
+                    stdinFD: bridgeHostFD,
+                    stdoutFD: bridgeHostFD,
+                    identityCache: ClientIdentityCache(),
+                    initializeReplayState: replayState,
+                    bridgeLedger: ledger,
+                    faultRule: nil
+                )
+                firstResult.store(.success(()))
+            } catch {
+                firstResult.store(.failure(error))
+            }
+        }
+
+        let initializeFrame = line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"resume-test","version":"1"}}}"#)
+        let initializeResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"RepoPrompt CE","version":"test"}}}"#)
+        let initializedFrame = line(#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
+
+        try Self.writeAll(initializeFrame, to: hostFD)
+        XCTAssertEqual(try Self.readLine(from: firstAppFD, timeout: 2), initializeFrame)
+
+        _ = Darwin.shutdown(firstAppFD, SHUT_RDWR)
+        Self.closeIfOpen(firstSockets[1])
+        firstSockets[1] = -1
+        let firstBridgeCompleted = await firstResult.waitUntilStored(timeout: .seconds(2))
+        XCTAssertTrue(firstBridgeCompleted)
+        guard case let .failure(firstError) = firstResult.load(),
+              let socketError = firstError as? SocketProxyError,
+              case .serverClosed = socketError
+        else {
+            XCTFail("Expected app socket close before initialize response to surface as serverClosed")
+            return
+        }
+
+        let failureWasTerminal = await ledger.recordConnectionFailure("app_socket_closed_before_initialize_response")
+        XCTAssertFalse(failureWasTerminal)
+        var snapshot = await ledger.snapshot()
+        XCTAssertTrue(snapshot.hasForwardedProtocolFrame)
+        XCTAssertTrue(snapshot.canReconnect)
+        XCTAssertEqual(snapshot.activeRequestCount, 1)
+        XCTAssertEqual(snapshot.replayableClientRequestCount, 1)
+        _ = try await ledger.beginConnection()
+
+        let plan: MCPInitializeReplayPlan
+        switch await Self.waitUntilReplayPlanReady(replayState) {
+        case let .success(value):
+            plan = value
+        case let .failure(reason):
+            throw reason
+        }
+        XCTAssertTrue(plan.shouldForwardInitializeResponseToHost)
+
+        let secondBridgeFD = secondSockets[0]
+        let secondAppFD = secondSockets[1]
+        let replayBufferedBytes = try await BootstrapSocketProxy.replayInitializedSession(
+            plan,
+            socketFD: secondBridgeFD,
+            timeout: 2
+        )
+        XCTAssertEqual(replayBufferedBytes, Data())
+        XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializeFrame)
+
+        let secondResult = BridgeTaskResultBox()
+        secondBridgeTask = Task {
+            do {
+                try await BootstrapSocketProxy.runBridge(
+                    socketFD: secondBridgeFD,
+                    stdinFD: bridgeHostFD,
+                    stdoutFD: bridgeHostFD,
+                    identityCache: ClientIdentityCache(),
+                    initializeReplayState: replayState,
+                    bridgeLedger: ledger,
+                    faultRule: nil
+                )
+                secondResult.store(.success(()))
+            } catch {
+                secondResult.store(.failure(error))
+            }
+        }
+
+        try Self.writeAll(initializeResponse, to: secondAppFD)
+        XCTAssertEqual(
+            try Self.readLine(from: hostFD, timeout: 2),
+            initializeResponse,
+            "The replayed initialize response is the host-visible response when the original response was never delivered"
+        )
+        try Self.writeAll(initializedFrame, to: hostFD)
+        XCTAssertEqual(try Self.readLine(from: secondAppFD, timeout: 2), initializedFrame)
+
+        snapshot = await ledger.snapshot()
+        XCTAssertEqual(snapshot.activeRequestCount, 0)
+        XCTAssertNil(snapshot.terminalReason)
+    }
+
     func testInitializeReplayStateReportsUnsupportedResumeReasons() async throws {
         let replayState = MCPInitializeReplayState()
         let missingInitialize = await replayState.replayPlan()
@@ -576,19 +705,17 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
 
         let initializeFrame = line(#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"resume-test"}}}"#)
         await replayState.recordForwardedClientFrame(initializeFrame)
-        let missingInitializeResponse = await replayState.replayPlan()
-        XCTAssertEqual(
-            missingInitializeResponse,
-            .failure(.initializeResponseNotDelivered)
-        )
+        let pendingInitializeResponse = try await (replayState.replayPlan()).get()
+        XCTAssertTrue(pendingInitializeResponse.shouldForwardInitializeResponseToHost)
+        XCTAssertNil(pendingInitializeResponse.initializeResultFingerprint)
+        XCTAssertNil(pendingInitializeResponse.initializedFrame)
 
         let initializeResponse = line(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}"#)
         await replayState.recordDeliveredServerFrame(initializeResponse)
-        let missingInitialized = await replayState.replayPlan()
-        XCTAssertEqual(
-            missingInitialized,
-            .failure(.missingInitializedNotification)
-        )
+        let missingInitialized = try await (replayState.replayPlan()).get()
+        XCTAssertFalse(missingInitialized.shouldForwardInitializeResponseToHost)
+        XCTAssertNotNil(missingInitialized.initializeResultFingerprint)
+        XCTAssertNil(missingInitialized.initializedFrame)
 
         let initializedFrame = line(#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#)
         await replayState.recordForwardedClientFrame(initializedFrame)
@@ -597,6 +724,7 @@ final class PersistentMCPResponseDeliveryTests: XCTestCase {
         XCTAssertEqual(plan.initializeFrame, initializeFrame)
         XCTAssertEqual(plan.initializeRequestID, .number(1))
         XCTAssertEqual(plan.initializedFrame, initializedFrame)
+        XCTAssertFalse(plan.shouldForwardInitializeResponseToHost)
     }
 
     func testActiveClientRequestReconnectReplaysOutstandingRequest() async throws {

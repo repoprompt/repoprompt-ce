@@ -399,6 +399,22 @@ final class JSONRPCBridgeLedgerTests: XCTestCase {
         let completedActiveSnapshot = await activeLedger.snapshot()
         XCTAssertEqual(completedActiveSnapshot.activeRequestCount, 0)
 
+        let activeInitializeLedger = try await makeLedger()
+        try await forward(
+            line(#"{"jsonrpc":"2.0","id":10,"method":"initialize","params":{"clientInfo":{"name":"fixture"}}}"#),
+            .clientToServer,
+            activeInitializeLedger
+        )
+        let activeInitializeFailureWasTerminal = await activeInitializeLedger.recordConnectionFailure(
+            "socket_reset_with_active_initialize"
+        )
+        XCTAssertFalse(activeInitializeFailureWasTerminal)
+        let activeInitializeSnapshot = await activeInitializeLedger.snapshot()
+        XCTAssertEqual(activeInitializeSnapshot.activeRequestCount, 1)
+        XCTAssertEqual(activeInitializeSnapshot.replayableClientRequestCount, 1)
+        XCTAssertTrue(activeInitializeSnapshot.canReconnect)
+        _ = try await activeInitializeLedger.beginConnection()
+
         let unsafeActiveLedger = try await makeLedger()
         try await forward(request(id: "3", method: "tools/call", tool: "apply_edits"), .clientToServer, unsafeActiveLedger)
         let unsafeFailureWasTerminal = await unsafeActiveLedger.recordConnectionFailure(

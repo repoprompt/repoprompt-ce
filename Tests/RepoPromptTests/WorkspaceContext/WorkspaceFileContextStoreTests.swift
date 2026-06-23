@@ -2728,11 +2728,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await followerCompleted.mark()
                 return samples
             }
-            let secondRequestRegistered = await waitForAsyncCondition {
-                let stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
-                return stats.joinCount + stats.successorCount >= 1
+            let joined = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).joinCount == 1
             }
-            XCTAssertTrue(secondRequestRegistered)
+            XCTAssertTrue(joined)
 
             follower.cancel()
             let followerDetached = await waitForAsyncCondition {
@@ -2780,11 +2779,10 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 await joinerCompleted.mark()
                 return samples
             }
-            let secondRequestRegistered = await waitForAsyncCondition {
-                let stats = await store.scopedIngressBarrierStatsForTesting(rootID: rootID)
-                return stats.joinCount + stats.successorCount >= 1
+            let joined = await waitForAsyncCondition {
+                await store.scopedIngressBarrierStatsForTesting(rootID: rootID).joinCount == 1
             }
-            XCTAssertTrue(secondRequestRegistered)
+            XCTAssertTrue(joined)
 
             launcher.cancel()
             let launcherDetached = await waitForAsyncCondition {

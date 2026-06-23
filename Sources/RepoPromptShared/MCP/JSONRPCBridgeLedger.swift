@@ -55,6 +55,7 @@ public enum JSONRPCBridgeID: Hashable, Codable, Sendable, CustomStringConvertibl
 
 public enum JSONRPCBridgeReplayPolicy {
     private static let replayableMethods: Set<String> = [
+        "initialize",
         "ping",
         "tools/list",
         "resources/list",

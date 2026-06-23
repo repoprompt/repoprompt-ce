@@ -4,14 +4,17 @@ import RepoPromptShared
 struct MCPInitializeReplayPlan: Equatable {
     let initializeFrame: Data
     let initializeRequestID: JSONRPCBridgeID
-    let initializeResultFingerprint: String
-    let initializedFrame: Data
+    let initializeResultFingerprint: String?
+    let initializedFrame: Data?
+
+    var shouldForwardInitializeResponseToHost: Bool {
+        initializeResultFingerprint == nil
+    }
 }
 
 enum MCPInitializeReplayUnavailableReason: String, Swift.Error, Equatable {
     case missingInitializeFrame = "mcp_session_resume_unsupported_missing_initialize_frame"
-    case initializeResponseNotDelivered = "mcp_session_resume_unsupported_initialize_response_not_delivered"
-    case missingInitializedNotification = "mcp_session_resume_unsupported_missing_initialized_notification"
+    case missingInitializeResponseFingerprint = "mcp_session_resume_unsupported_missing_initialize_response_fingerprint"
 
     var terminalReason: String {
         rawValue
@@ -73,11 +76,8 @@ actor MCPInitializeReplayState {
         guard let initializeFrame, let initializeRequestID else {
             return .failure(.missingInitializeFrame)
         }
-        guard initializeResponseDeliveredToHost, let initializeResultFingerprint else {
-            return .failure(.initializeResponseNotDelivered)
-        }
-        guard let initializedFrame else {
-            return .failure(.missingInitializedNotification)
+        if initializeResponseDeliveredToHost, initializeResultFingerprint == nil {
+            return .failure(.missingInitializeResponseFingerprint)
         }
 
         return .success(MCPInitializeReplayPlan(

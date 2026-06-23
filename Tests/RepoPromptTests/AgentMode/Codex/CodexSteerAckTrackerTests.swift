@@ -197,9 +197,11 @@ final class CodexSteerAckTrackerTests: XCTestCase {
         )
 
         dispatch.cancel()
-        let cancelledAttemptIDs = session.codexSteerAckTracker.test_cancelOpenAttempts()
+        let attemptCancelledByProductionPath = await waitUntil {
+            !session.codexSteerAckTracker.test_openAttemptIDs.contains(attemptID)
+        }
         XCTAssertTrue(
-            cancelledAttemptIDs.contains(attemptID),
+            attemptCancelledByProductionPath,
             "Expected cancellation to tombstone the MCP dispatch attempt."
         )
         await gate.release()
@@ -222,6 +224,18 @@ final class CodexSteerAckTrackerTests: XCTestCase {
             attemptID: attemptID
         )
         XCTAssertEqual(lateState, .cancelled)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        _ condition: @escaping @MainActor () async -> Bool
+    ) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return await condition()
     }
 
     func testSerialDispatchGatePreservesIssuedOrderAcrossSuspension() async {
