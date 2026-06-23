@@ -15428,8 +15428,11 @@ final class AgentModeViewModel: ObservableObject {
                 teardownMCPControlDeactivateLiveContext: true,
                 teardownApplyEditsApproval: true,
                 cancelPendingInteractions: true,
-                cleanupMCPRunRouting: true,
-                releaseWorktreeOwnership: true,
+                // MCP run routing and worktree ownership are released by the
+                // deleteSession caller and by finalizeDeletedAgentSessionReferences,
+                // so the helper must not duplicate those calls.
+                cleanupMCPRunRouting: false,
+                releaseWorktreeOwnership: false,
                 flushSave: false,
                 removeFromSessions: false,
                 detachedRunID: nil
