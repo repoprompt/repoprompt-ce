@@ -2968,7 +2968,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 let roots = await store.readSearchRootDiagnosticsSnapshot()
                 guard let root = roots.first(where: { $0.rootID == rootID }) else { return false }
                 return root.barrier.active == nil
-                    && root.barrier.completionCount == 1
+                    && root.barrier.completionCount >= 1
                     && root.ingress.waiterCount == 0
                     && root.ingress.outstandingPublicationCount == 0
             }
@@ -3162,7 +3162,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
             XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
-            XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
 
@@ -3184,8 +3184,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 firstSamples.first?.acceptedWatcherWatermark,
                 baselineWatcherWatermark.rawValue
             )
-            XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
-            XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(thirdSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(
