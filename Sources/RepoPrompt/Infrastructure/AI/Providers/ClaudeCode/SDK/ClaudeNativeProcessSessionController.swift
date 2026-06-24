@@ -1640,7 +1640,7 @@ final actor ClaudeNativeProcessSessionController {
             Self.buildSetPermissionModeRequest(permissionMode: permissionMode ?? config.permissionMode)
         }
 
-        /// Build CLI arguments for testing (verifies prompt flags are absent).
+        /// Build CLI arguments for testing.
         func test_buildArguments(
             existingSessionID: String?,
             model: String?
@@ -1893,6 +1893,15 @@ final actor ClaudeNativeProcessSessionController {
         return (stream, continuation)
     }
 
+    /// Non-empty system-prompt suffix that makes the CLI emit its interactive `You are Claude Code…`
+    /// identity preamble instead of the Agent SDK `You are a Claude agent…` form. z.ai (GLM)
+    /// selectively rejects the Agent SDK self-identification under peak load with a misleading 529
+    /// `overloaded` that exhausts the CLI's retry budget and fails the run; the interactive form is
+    /// never shed. Empty/whitespace-only values are ignored by the CLI, so this must be a real token,
+    /// and it deliberately avoids the trigger words ("Claude"/"Anthropic"/"agent"/"SDK") so it cannot
+    /// reintroduce the shedding. See https://github.com/repoprompt/repoprompt-ce/issues/295.
+    private static let glmZAIAppendSystemPrompt = "Running within RepoPrompt CE."
+
     private func buildArguments(
         existingSessionID: String?,
         model: String?
@@ -1905,6 +1914,12 @@ final actor ClaudeNativeProcessSessionController {
         ]
 
         args.append(contentsOf: ["--permission-prompt-tool", "stdio"])
+
+        // GLM/z.ai sheds requests carrying the Agent SDK identity preamble under load (see #295).
+        // Any non-empty --append-system-prompt flips the CLI onto the never-shed "Claude Code" preamble.
+        if config.runtimeVariant == .glm {
+            args.append(contentsOf: ["--append-system-prompt", Self.glmZAIAppendSystemPrompt])
+        }
 
         if let existingSessionID, !existingSessionID.isEmpty {
             args.append(contentsOf: ["--resume", existingSessionID])
