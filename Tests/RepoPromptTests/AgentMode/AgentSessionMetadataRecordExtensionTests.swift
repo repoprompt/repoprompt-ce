@@ -47,7 +47,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             "firstActivityAt": \(now.addingTimeInterval(-60).timeIntervalSinceReferenceDate),
             "lastActivityAt": \(now.addingTimeInterval(-5).timeIntervalSinceReferenceDate),
             "keyPaths": ["src/foo.swift", "src/bar.swift"],
-            "activeDurationSeconds": 42,
+            "coveredTurnDurationSeconds": 42,
             "toolCallCount": 7
         }
         """
@@ -89,7 +89,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             firstActivityAt: now.addingTimeInterval(-120),
             lastActivityAt: now.addingTimeInterval(-10),
             keyPaths: ["a.swift", "b.swift"],
-            activeDurationSeconds: 99,
+            coveredTurnDurationSeconds: 99,
             toolCallCount: 4
         )
 
@@ -658,6 +658,80 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.activeDurationSeconds, 140)
     }
 
+    // MARK: - v5 Duration Primitives (interval merge + threshold derivation)
+
+    func testDurationPrimitives_storeCoveredAndGaps() {
+        // Two non-overlapping turns: [0,200] and [320,520] -> covered 400, gap 120.
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 200)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 320), completedAt: Date(timeIntervalSince1970: 520))
+        ])
+        let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 400)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [120])
+    }
+
+    func testDurationPrimitives_mergesOverlappingNestedAndContiguousIntervals() {
+        // Overlapping, nested, and touching turns collapse to their union without double-counting
+        // or emitting a zero gap. Defect: naive sum-of-durations would double-count overlaps;
+        // the old previousEnd-chaining under-counted nested turns.
+        let cases: [(name: String, first: (TimeInterval, TimeInterval), second: (TimeInterval, TimeInterval), covered: Int, gaps: [Int])] = [
+            ("nested", (0, 100), (20, 30), 100, []),
+            ("partial overlap", (0, 100), (50, 150), 150, []),
+            ("contiguous (touch)", (0, 100), (100, 200), 200, [])
+        ]
+        for c in cases {
+            let session = makeSession(turns: [
+                makeTurn(startedAt: Date(timeIntervalSince1970: c.first.0), completedAt: Date(timeIntervalSince1970: c.first.1)),
+                makeTurn(startedAt: Date(timeIntervalSince1970: c.second.0), completedAt: Date(timeIntervalSince1970: c.second.1))
+            ])
+            let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+            XCTAssertEqual(record.coveredTurnDurationSeconds, c.covered, c.name)
+            XCTAssertEqual(record.interActiveIntervalGapSeconds, c.gaps, c.name)
+        }
+    }
+
+    func testDurationPrimitives_dropsNegativeDurationTurns() {
+        // end < start is dropped, not counted as negative covered time. Only the valid turn remains.
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 100), completedAt: Date(timeIntervalSince1970: 50)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 200), completedAt: Date(timeIntervalSince1970: 300))
+        ])
+        let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 100)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [])
+    }
+
+    func testDurationPrimitives_zeroTurns() {
+        let session = makeSession(turns: [])
+        let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 0)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [])
+        XCTAssertEqual(record.activeDurationSeconds, 0)
+    }
+
+    func testActiveDurationThreshold_variesByThreshold() {
+        // covered 400, gap 120s between merged intervals.
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 200)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 320), completedAt: Date(timeIntervalSince1970: 520))
+        ])
+        let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+        // Threshold 0 min: every positive gap is idle -> covered only.
+        XCTAssertEqual(record.activeDurationSeconds(thresholdMinutes: 0), 400)
+        // Threshold 1 min (60s): 120s gap > 60s -> idle -> covered only.
+        XCTAssertEqual(record.activeDurationSeconds(thresholdMinutes: 1), 400)
+        // Equality boundary: threshold 2 min (120s) == gap -> counts as active -> covered + gap.
+        XCTAssertEqual(record.activeDurationSeconds(thresholdMinutes: 2), 520)
+        // Default threshold (30 min) -> gap active.
+        XCTAssertEqual(record.activeDurationSeconds, 520)
+    }
+
     // MARK: - matchesIndexedSessionMetadata
 
     func testMatchesIndexedSessionMetadataComparesHistoryIndexFields() {
@@ -756,7 +830,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             firstActivityAt: firstActivityAt,
             lastActivityAt: lastActivityAt,
             keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds,
+            coveredTurnDurationSeconds: activeDurationSeconds,
             toolCallCount: toolCallCount
         )
     }

@@ -304,7 +304,7 @@ final class HistorySessionScannerTests: XCTestCase {
             firstActivityAt: savedAt.addingTimeInterval(-300), // 5 min before savedAt
             lastActivityAt: savedAt.addingTimeInterval(-60), // 1 min before savedAt
             keyPaths: [],
-            activeDurationSeconds: 0,
+            coveredTurnDurationSeconds: 0,
             toolCallCount: 0
         )
         try createAgentSessionsIndex(in: ws, records: [record])
@@ -620,7 +620,7 @@ final class HistorySessionScannerTests: XCTestCase {
             observedFileModificationDate: nil,
             lastIndexedAt: savedAt,
             keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds
+            coveredTurnDurationSeconds: activeDurationSeconds
         )
     }
 }

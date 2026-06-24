@@ -1116,6 +1116,70 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 100)
     }
 
+    // MARK: - idle_threshold_minutes
+
+    func testTime_idleThresholdChangesActiveDuration() async throws {
+        // covered 200s with a 100s gap between merged intervals.
+        let r = makeRecord(name: "S1", activeDurationSeconds: 200, gapSeconds: [100])
+        mockScanner.scanResults = [makeScanResult(records: [r])]
+
+        // Threshold 2 min (120s): 100s gap <= 120s -> active -> covered + gap = 300.
+        let inclusive = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 2],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(inclusive["total_active_duration_seconds"] as? Int, 300)
+
+        // Threshold 1 min (60s): 100s gap > 60s -> idle -> covered only = 200.
+        let exclusive = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 1],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(exclusive["total_active_duration_seconds"] as? Int, 200)
+
+        // Threshold 0: every positive gap is idle -> covered only = 200.
+        let zero = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 0],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(zero["total_active_duration_seconds"] as? Int, 200)
+    }
+
+    func testListSessions_idleThresholdApplied() async throws {
+        let r = makeRecord(name: "S1", activeDurationSeconds: 200, gapSeconds: [100])
+        mockScanner.scanResults = [makeScanResult(records: [r])]
+
+        let tight = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "idle_threshold_minutes": 1],
+            scanner: mockScanner
+        )
+        let tightSession = (tight["sessions"] as? [[String: Any]])?.first
+        XCTAssertEqual(tightSession?["active_duration_seconds"] as? Int, 200)
+
+        let loose = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "idle_threshold_minutes": 2],
+            scanner: mockScanner
+        )
+        let looseSession = (loose["sessions"] as? [[String: Any]])?.first
+        XCTAssertEqual(looseSession?["active_duration_seconds"] as? Int, 300)
+    }
+
+    func testTime_idleThresholdOutOfRangeReturnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "idle_threshold_minutes": 2000],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(result["error"] as? String, "idle_threshold_minutes must be between 0 and 1440")
+    }
+
+    func testListSessions_idleThresholdNonIntegerReturnsError() async throws {
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions", "idle_threshold_minutes": 10.5],
+            scanner: mockScanner
+        )
+        XCTAssertEqual(result["error"] as? String, "idle_threshold_minutes must be an integer")
+    }
+
     // MARK: - Snippet Extraction
 
     func testExtractSnippet_shortText() {
@@ -1245,6 +1309,32 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(Set(names), ["Jun12", "Jun13"], "date_to date-only must include the named day")
     }
 
+    // MARK: - resolveIdleThreshold
+
+    func testResolveIdleThreshold_defaultsAndValidation() {
+        // Omitted -> default threshold; valid integers within range accepted with no error.
+        let defaultResult = HistoryMCPToolService.resolveIdleThreshold([:])
+        XCTAssertEqual(defaultResult.threshold, 30)
+        XCTAssertNil(defaultResult.error)
+
+        for valid in [0, 1, 10, 1440] {
+            let result = HistoryMCPToolService.resolveIdleThreshold(["idle_threshold_minutes": valid])
+            XCTAssertEqual(result.threshold, valid, "valid \(valid)")
+            XCTAssertNil(result.error, "valid \(valid)")
+        }
+
+        // Invalid values produce the exact validation message (no clamping, no nil).
+        let invalid: [(Any, String)] = [
+            (1441, "idle_threshold_minutes must be between 0 and 1440"),
+            (-1, "idle_threshold_minutes must be between 0 and 1440"),
+            (10.5, "idle_threshold_minutes must be an integer")
+        ]
+        for c in invalid {
+            let result = HistoryMCPToolService.resolveIdleThreshold(["idle_threshold_minutes": c.0])
+            XCTAssertEqual(result.error, c.1, "value \(c.0)")
+        }
+    }
+
     // MARK: - clampLimit
 
     func testClampLimit_appliesDefaultBoundsAndMaximum() {
@@ -1274,6 +1364,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         agentModelRaw: String? = nil,
         keyPaths: Set<String> = [],
         activeDurationSeconds: Int = 0,
+        gapSeconds: [Int] = [],
         toolCallCount: Int = 0,
         savedAt: Date = Date(timeIntervalSince1970: 1_700_000_000),
         firstActivityAt: Date? = nil,
@@ -1307,7 +1398,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             firstActivityAt: firstActivityAt,
             lastActivityAt: lastActivityAt,
             keyPaths: keyPaths,
-            activeDurationSeconds: activeDurationSeconds,
+            coveredTurnDurationSeconds: activeDurationSeconds,
+            interActiveIntervalGapSeconds: gapSeconds,
             toolCallCount: toolCallCount
         )
     }
