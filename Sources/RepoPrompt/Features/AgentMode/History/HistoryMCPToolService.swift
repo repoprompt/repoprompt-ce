@@ -50,6 +50,9 @@ enum HistoryMCPToolService {
             return errorResponse(message: "Invalid 'sort' value '\(sortRaw)'. Valid values: last_activity, duration, turn_count")
         }
         let limit = clampLimit(args["limit"], default: 30, max: 100)
+        let threshold = resolveIdleThreshold(args)
+        if let error = threshold.error { return errorResponse(message: error) }
+        let idleThresholdMinutes = threshold.threshold
 
         let scanResults = try await scanner.scanAllWorkspaces()
         let filtered = scanner.sessionsMatchingFilters(
@@ -62,7 +65,7 @@ enum HistoryMCPToolService {
             to: dateTo
         )
 
-        let sorted = sortFilteredSessions(filtered, by: sortRaw)
+        let sorted = sortFilteredSessions(filtered, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
         let truncated = sorted.count > limit
         let sliced = Array(sorted.prefix(limit))
 
@@ -75,7 +78,7 @@ enum HistoryMCPToolService {
                 "workspace_name": session.workspaceName,
                 "first_activity_at": dateFormatter.string(from: r.firstActivityAt ?? r.activityDate),
                 "last_activity_at": dateFormatter.string(from: r.lastActivityAt ?? r.savedAt),
-                "active_duration_seconds": r.activeDurationSeconds,
+                "active_duration_seconds": r.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                 "turn_count": r.itemCount,
                 "tool_call_count": r.toolCallCount,
                 "files_touched": Array(r.keyPaths).sorted(),
@@ -318,10 +321,13 @@ enum HistoryMCPToolService {
             )
         }
 
+        let threshold = resolveIdleThreshold(args)
+        if let error = threshold.error { return errorResponse(message: error) }
+        let idleThresholdMinutes = threshold.threshold
         let totalSessions = filtered.count
-        let totalDuration = filtered.reduce(0) { $0 + $1.record.activeDurationSeconds }
+        let totalDuration = filtered.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
 
-        let groups = groupSessions(filtered, by: groupBy, includeDetails: includeDetails)
+        let groups = groupSessions(filtered, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
 
         return [
             "total_sessions": totalSessions,
@@ -335,11 +341,12 @@ enum HistoryMCPToolService {
 
     private static func sortFilteredSessions(
         _ sessions: [HistoryFilteredSessionRecord],
-        by sortRaw: String
+        by sortRaw: String,
+        idleThresholdMinutes: Int
     ) -> [HistoryFilteredSessionRecord] {
         switch sortRaw {
         case "duration":
-            sessions.sorted { $0.record.activeDurationSeconds > $1.record.activeDurationSeconds }
+            sessions.sorted { $0.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) > $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
         case "turn_count":
             sessions.sorted { $0.record.itemCount > $1.record.itemCount }
         case "last_activity":
@@ -356,19 +363,20 @@ enum HistoryMCPToolService {
     private static func groupSessions(
         _ sessions: [HistoryFilteredSessionRecord],
         by groupBy: String,
-        includeDetails: Bool
+        includeDetails: Bool,
+        idleThresholdMinutes: Int
     ) -> [[String: Any]] {
         let calendar = Calendar.current
 
         switch groupBy {
         case "day":
-            return groupByCalendarComponent(sessions, calendar: calendar, component: .day, includeDetails: includeDetails) { date in
+            return groupByCalendarComponent(sessions, calendar: calendar, component: .day, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes) { date in
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withFullDate]
                 return formatter.string(from: date)
             }
         case "week":
-            return groupByCalendarComponent(sessions, calendar: calendar, component: .weekOfYear, includeDetails: includeDetails) { date in
+            return groupByCalendarComponent(sessions, calendar: calendar, component: .weekOfYear, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes) { date in
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withFullDate]
                 // Use the start of the week as the key.
@@ -378,7 +386,7 @@ enum HistoryMCPToolService {
                 return formatter.string(from: weekStart)
             }
         case "month":
-            return groupByCalendarComponent(sessions, calendar: calendar, component: .month, includeDetails: includeDetails) { date in
+            return groupByCalendarComponent(sessions, calendar: calendar, component: .month, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes) { date in
                 let formatter = DateFormatter()
                 formatter.dateFormat = "yyyy-MM"
                 return formatter.string(from: date)
@@ -388,7 +396,7 @@ enum HistoryMCPToolService {
                 var group: [String: Any] = [
                     "key": session.record.id.uuidString,
                     "sessions": 1,
-                    "active_duration_seconds": session.record.activeDurationSeconds,
+                    "active_duration_seconds": session.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                     "turn_count": session.record.itemCount,
                     "tool_call_count": session.record.toolCallCount
                 ]
@@ -396,14 +404,14 @@ enum HistoryMCPToolService {
                     group["details"] = [[
                         "session_id": session.record.id.uuidString,
                         "session_name": session.record.name,
-                        "active_duration_seconds": session.record.activeDurationSeconds,
+                        "active_duration_seconds": session.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                         "turn_count": session.record.itemCount
                     ]]
                 }
                 return group
             }
         case "workspace":
-            return groupByWorkspace(sessions, includeDetails: includeDetails)
+            return groupByWorkspace(sessions, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
         default:
             return []
         }
@@ -414,6 +422,7 @@ enum HistoryMCPToolService {
         calendar: Calendar,
         component: Calendar.Component,
         includeDetails: Bool,
+        idleThresholdMinutes: Int,
         keyFormatter: (Date) -> String
     ) -> [[String: Any]] {
         // Group sessions by the calendar component derived from their activityDate.
@@ -428,7 +437,7 @@ enum HistoryMCPToolService {
 
         return sortedKeys.map { key in
             let sessionsInGroup = grouped[key]!
-            let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds }
+            let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
             let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
             let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
@@ -444,7 +453,7 @@ enum HistoryMCPToolService {
                     [
                         "session_id": s.record.id.uuidString,
                         "session_name": s.record.name,
-                        "active_duration_seconds": s.record.activeDurationSeconds,
+                        "active_duration_seconds": s.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                         "turn_count": s.record.itemCount
                     ]
                 }
@@ -455,7 +464,8 @@ enum HistoryMCPToolService {
 
     private static func groupByWorkspace(
         _ sessions: [HistoryFilteredSessionRecord],
-        includeDetails: Bool
+        includeDetails: Bool,
+        idleThresholdMinutes: Int
     ) -> [[String: Any]] {
         var grouped: [String: [HistoryFilteredSessionRecord]] = [:]
         for session in sessions {
@@ -466,7 +476,7 @@ enum HistoryMCPToolService {
 
         return sortedKeys.map { key in
             let sessionsInGroup = grouped[key]!
-            let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds }
+            let totalDuration = sessionsInGroup.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
             let totalTurns = sessionsInGroup.reduce(0) { $0 + $1.record.itemCount }
             let totalToolCalls = sessionsInGroup.reduce(0) { $0 + $1.record.toolCallCount }
 
@@ -482,7 +492,7 @@ enum HistoryMCPToolService {
                     [
                         "session_id": s.record.id.uuidString,
                         "session_name": s.record.name,
-                        "active_duration_seconds": s.record.activeDurationSeconds,
+                        "active_duration_seconds": s.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes),
                         "turn_count": s.record.itemCount
                     ]
                 }
@@ -562,6 +572,21 @@ enum HistoryMCPToolService {
     static func clampLimit(_ value: Any?, default defaultValue: Int, max maxValue: Int) -> Int {
         guard let intValue = value as? Int else { return defaultValue }
         return max(1, min(intValue, maxValue))
+    }
+
+    /// Resolve `idle_threshold_minutes` to a validated threshold, or an error message.
+    /// Omitted/null uses `AgentSessionMetadataRecord.defaultIdleThresholdMinutes`; out-of-range or
+    /// non-integer values produce a validation error (no clamping).
+    static func resolveIdleThreshold(_ args: [String: Any]) -> (threshold: Int, error: String?) {
+        let defaultThreshold = AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        guard let value = args["idle_threshold_minutes"] else { return (defaultThreshold, nil) }
+        guard let intValue = value as? Int else {
+            return (defaultThreshold, "idle_threshold_minutes must be an integer")
+        }
+        guard (0 ... 1440).contains(intValue) else {
+            return (defaultThreshold, "idle_threshold_minutes must be between 0 and 1440")
+        }
+        return (intValue, nil)
     }
 
     private static func errorResponse(message: String) -> [String: Any] {

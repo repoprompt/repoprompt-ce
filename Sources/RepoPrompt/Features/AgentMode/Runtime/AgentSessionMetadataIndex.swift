@@ -1,7 +1,7 @@
 import Foundation
 
 struct AgentSessionMetadataIndex: Codable, Equatable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
 
     var schemaVersion: Int
     var generatedAt: Date
@@ -68,11 +68,28 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var firstActivityAt: Date?
     var lastActivityAt: Date?
     var keyPaths: Set<String>
-    var activeDurationSeconds: Int
+    var coveredTurnDurationSeconds: Int
+    var interActiveIntervalGapSeconds: [Int]
     var toolCallCount: Int
+
+    /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
+    static let defaultIdleThresholdMinutes = 30
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
+    }
+
+    /// Active duration at the default idle threshold, derived from the stored primitives.
+    var activeDurationSeconds: Int {
+        activeDurationSeconds(thresholdMinutes: Self.defaultIdleThresholdMinutes)
+    }
+
+    /// Active duration at a custom idle threshold (minutes). Gaps greater than the threshold are idle;
+    /// gaps less than or equal are active and merged in.
+    func activeDurationSeconds(thresholdMinutes: Int) -> Int {
+        let thresholdSeconds = thresholdMinutes * 60
+        let activeGaps = interActiveIntervalGapSeconds.reduce(0) { $0 + ($1 <= thresholdSeconds ? $1 : 0) }
+        return coveredTurnDurationSeconds + activeGaps
     }
 
     init(
@@ -102,7 +119,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         firstActivityAt: Date? = nil,
         lastActivityAt: Date? = nil,
         keyPaths: Set<String> = [],
-        activeDurationSeconds: Int = 0,
+        coveredTurnDurationSeconds: Int = 0,
+        interActiveIntervalGapSeconds: [Int] = [],
         toolCallCount: Int = 0
     ) {
         self.id = id
@@ -131,7 +149,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         self.firstActivityAt = firstActivityAt
         self.lastActivityAt = lastActivityAt
         self.keyPaths = keyPaths
-        self.activeDurationSeconds = activeDurationSeconds
+        self.coveredTurnDurationSeconds = coveredTurnDurationSeconds
+        self.interActiveIntervalGapSeconds = interActiveIntervalGapSeconds
         self.toolCallCount = toolCallCount
     }
 
@@ -162,7 +181,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         case firstActivityAt
         case lastActivityAt
         case keyPaths
-        case activeDurationSeconds
+        case coveredTurnDurationSeconds
+        case interActiveIntervalGapSeconds
         case toolCallCount
     }
 
@@ -194,7 +214,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         firstActivityAt = try container.decodeIfPresent(Date.self, forKey: .firstActivityAt)
         lastActivityAt = try container.decodeIfPresent(Date.self, forKey: .lastActivityAt)
         keyPaths = try container.decodeIfPresent(Set<String>.self, forKey: .keyPaths) ?? []
-        activeDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .activeDurationSeconds) ?? 0
+        coveredTurnDurationSeconds = try container.decodeIfPresent(Int.self, forKey: .coveredTurnDurationSeconds) ?? 0
+        interActiveIntervalGapSeconds = try container.decodeIfPresent([Int].self, forKey: .interActiveIntervalGapSeconds) ?? []
         toolCallCount = try container.decodeIfPresent(Int.self, forKey: .toolCallCount) ?? 0
     }
 
@@ -263,7 +284,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             && firstActivityAt == other.firstActivityAt
             && lastActivityAt == other.lastActivityAt
             && keyPaths == other.keyPaths
-            && activeDurationSeconds == other.activeDurationSeconds
+            && coveredTurnDurationSeconds == other.coveredTurnDurationSeconds
+            && interActiveIntervalGapSeconds == other.interActiveIntervalGapSeconds
             && toolCallCount == other.toolCallCount
     }
 
@@ -296,7 +318,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
 
         let turns = session.transcript?.turns ?? []
         let activityBounds = Self.computeActivityBounds(from: turns)
-        let durationSeconds = Self.computeActiveDurationSeconds(from: turns)
+        let durationPrimitives = Self.computeDurationPrimitives(from: turns)
         let computedToolCallCount = Self.computeToolCallCount(from: turns)
 
         return AgentSessionMetadataRecord(
@@ -326,7 +348,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             firstActivityAt: activityBounds.first,
             lastActivityAt: activityBounds.last,
             keyPaths: aggregatedKeyPaths,
-            activeDurationSeconds: durationSeconds,
+            coveredTurnDurationSeconds: durationPrimitives.coveredSeconds,
+            interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount
         )
     }
@@ -371,37 +394,47 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         }
     }
 
-    /// Compute active duration in seconds from transcript turns, excluding idle gaps > 30 minutes.
-    /// Uses `completedAt ?? lastActivityAt ?? startedAt` as the turn end time.
-    /// Falls back to `startedAt` when completion/activity timestamps are unavailable —
-    /// the turn contributes 0 duration but advances `previousEnd` so gap tracking stays accurate.
-    private static func computeActiveDurationSeconds(from turns: [AgentTranscriptTurn]) -> Int {
-        let thirtyMinutes: TimeInterval = 30 * 60
-        var totalSeconds = 0
-        var previousEnd: Date?
-
+    /// Compute threshold-independent duration primitives from transcript turns:
+    /// the union of merged per-turn active intervals (`coveredSeconds`) and the positive gaps
+    /// between those merged intervals (`gapSeconds`). Each interval is
+    /// `[startedAt, completedAt ?? lastActivityAt ?? startedAt]`; intervals with end earlier than
+    /// start are dropped. Intervals are sorted and merged (overlaps collapsed) before measuring,
+    /// so overlapping or nested turns are never double-counted. Zero-duration (point) intervals are
+    /// retained so sessions whose turns carry only `startedAt` still yield gap-based estimates.
+    private static func computeDurationPrimitives(from turns: [AgentTranscriptTurn]) -> (coveredSeconds: Int, gapSeconds: [Int]) {
+        var intervals: [(start: Date, end: Date)] = []
+        intervals.reserveCapacity(turns.count)
         for turn in turns {
             let start = turn.startedAt
             let end = turn.completedAt ?? turn.lastActivityAt ?? start
+            if end >= start { intervals.append((start, end)) }
+        }
+        guard !intervals.isEmpty else { return (0, []) }
 
-            if let prev = previousEnd {
-                let gap = start.timeIntervalSince(prev)
-                if gap > thirtyMinutes {
-                    // Gap exceeds idle threshold; don't count the gap as active time.
-                    totalSeconds += Int(end.timeIntervalSince(start))
-                } else {
-                    // Continuous — count from previous end to this turn's end.
-                    totalSeconds += Int(end.timeIntervalSince(prev))
-                }
-            } else {
-                // First turn with timestamps.
-                totalSeconds += Int(end.timeIntervalSince(start))
-            }
-
-            previousEnd = end
+        intervals.sort { lhs, rhs in
+            lhs.start < rhs.start || (lhs.start == rhs.start && lhs.end < rhs.end)
         }
 
-        return max(0, totalSeconds)
+        var merged: [(start: Date, end: Date)] = [intervals[0]]
+        for interval in intervals.dropFirst() {
+            let lastIndex = merged.count - 1
+            if interval.start > merged[lastIndex].end {
+                merged.append(interval)
+            } else {
+                merged[lastIndex].end = max(merged[lastIndex].end, interval.end)
+            }
+        }
+
+        var coveredSeconds = 0
+        var gapSeconds: [Int] = []
+        for (index, interval) in merged.enumerated() {
+            coveredSeconds += Int(interval.end.timeIntervalSince(interval.start))
+            if index > 0 {
+                let gap = Int(interval.start.timeIntervalSince(merged[index - 1].end))
+                if gap > 0 { gapSeconds.append(gap) }
+            }
+        }
+        return (max(0, coveredSeconds), gapSeconds)
     }
 }
 
