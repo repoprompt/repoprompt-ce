@@ -26,6 +26,8 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
         XCTAssertEqual(record.keyPaths, [])
         XCTAssertEqual(record.activeDurationSeconds, 0)
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 0)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [])
         XCTAssertEqual(record.toolCallCount, 0)
         XCTAssertNil(record.firstActivityAt)
         XCTAssertNil(record.lastActivityAt)
@@ -48,6 +50,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
             "lastActivityAt": \(now.addingTimeInterval(-5).timeIntervalSinceReferenceDate),
             "keyPaths": ["src/foo.swift", "src/bar.swift"],
             "coveredTurnDurationSeconds": 42,
+            "interActiveIntervalGapSeconds": [30, 90],
             "toolCallCount": 7
         }
         """
@@ -55,7 +58,10 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         let record = try JSONDecoder().decode(AgentSessionMetadataRecord.self, from: data)
 
         XCTAssertEqual(record.keyPaths, Set(["src/foo.swift", "src/bar.swift"]))
-        XCTAssertEqual(record.activeDurationSeconds, 42)
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 42)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [30, 90])
+        // Default 30-min threshold merges both gaps in: 42 + 30 + 90.
+        XCTAssertEqual(record.activeDurationSeconds, 162)
         XCTAssertEqual(record.toolCallCount, 7)
         XCTAssertEqual(record.firstActivityAt, now.addingTimeInterval(-60))
         XCTAssertEqual(record.lastActivityAt, now.addingTimeInterval(-5))
@@ -712,6 +718,20 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.coveredTurnDurationSeconds, 0)
         XCTAssertEqual(record.interActiveIntervalGapSeconds, [])
         XCTAssertEqual(record.activeDurationSeconds, 0)
+    }
+
+    func testDurationPrimitives_sortsOutOfOrderTurns() {
+        // Turns arrive non-chronologically; the merge must sort by startedAt before measuring.
+        // Defect: dropping the sort would mis-merge and emit a spurious gap / wrong covered time.
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 320), completedAt: Date(timeIntervalSince1970: 520)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 200))
+        ])
+        let record = AgentSessionMetadataRecord.record(from: session, fileURL: URL(fileURLWithPath: "/tmp/test.json"), observedFileSize: nil, observedFileModificationDate: nil)
+
+        // Same as the in-order case: covered 400, one 120s gap.
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 400)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [120])
     }
 
     func testActiveDurationThreshold_variesByThreshold() {
