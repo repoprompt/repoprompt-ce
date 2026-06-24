@@ -282,6 +282,7 @@ actor ContentReadAsyncLimiter {
         #if DEBUG
             let coldStartCollector = WorkspaceFileSearchDebugContext.coldStartCollector
             let schedulerRequestStart = WorkspaceFileSearchDebugTiming.now()
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
             coldStartCollector?.recordSchedulerRequest(workload: workloadClass.rawValue)
         #endif
         let lifecycleCorrelation = EditFlowPerf.currentLifecycleCorrelation
@@ -320,6 +321,16 @@ actor ContentReadAsyncLimiter {
                 )
             )
         } catch {
+            #if DEBUG
+                if case ContentReadSchedulerError.queueFull = error {
+                    WorktreeStartupInstrumentation.recordBenchmarkContentReadWork(
+                        tag: benchmarkMetricTag,
+                        waitMicroseconds: 0,
+                        executionMicroseconds: 0,
+                        overloaded: true
+                    )
+                }
+            #endif
             EditFlowPerf.end(
                 EditFlowPerf.Stage.FileSystem.contentReadWorkerPermitWait,
                 permitWaitState,
@@ -348,6 +359,15 @@ actor ContentReadAsyncLimiter {
                     cancelled: false,
                     failed: false
                 )
+                WorktreeStartupInstrumentation.recordBenchmarkContentReadWork(
+                    tag: benchmarkMetricTag,
+                    waitMicroseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: schedulerRequestStart,
+                        through: executionStart
+                    ) / 1000,
+                    executionMicroseconds: executionNanoseconds / 1000,
+                    overloaded: false
+                )
                 return result
             } catch {
                 let executionNanoseconds = WorkspaceFileSearchDebugTiming.elapsed(
@@ -360,6 +380,15 @@ actor ContentReadAsyncLimiter {
                     executionNanoseconds: executionNanoseconds,
                     cancelled: error is CancellationError,
                     failed: !(error is CancellationError)
+                )
+                WorktreeStartupInstrumentation.recordBenchmarkContentReadWork(
+                    tag: benchmarkMetricTag,
+                    waitMicroseconds: WorkspaceFileSearchDebugTiming.elapsed(
+                        since: schedulerRequestStart,
+                        through: executionStart
+                    ) / 1000,
+                    executionMicroseconds: executionNanoseconds / 1000,
+                    overloaded: false
                 )
                 throw error
             }

@@ -609,6 +609,9 @@ actor CodeMapArtifactBuildCoordinator {
         var proofInput: CodeMapArtifactBuildInput?
         var locatorLookup: CodeMapArtifactCoordinatorLocatorLookup
         let missKind: WaiterMissKind
+        #if DEBUG
+            let benchmarkMetricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
+        #endif
         let continuation: CheckedContinuation<CodeMapArtifactBuildCoordinatorResult, Error>
     }
 
@@ -1008,19 +1011,36 @@ actor CodeMapArtifactBuildCoordinator {
         case .missing?, .corrupt?, .stale?: input
         case .existing?, nil: nil
         }
-        flight.waiters[id] = Waiter(
-            id: id,
-            ownerID: request.ownerID,
-            priority: request.priority,
-            ordinal: ordinal,
-            joinedExistingFlight: joined,
-            locatorIdentity: locatorIdentity,
-            locatorIntent: locatorIntent,
-            proofInput: proofInput,
-            locatorLookup: effectiveLocatorLookup,
-            missKind: missKind,
-            continuation: continuation
-        )
+        #if DEBUG
+            flight.waiters[id] = Waiter(
+                id: id,
+                ownerID: request.ownerID,
+                priority: request.priority,
+                ordinal: ordinal,
+                joinedExistingFlight: joined,
+                locatorIdentity: locatorIdentity,
+                locatorIntent: locatorIntent,
+                proofInput: proofInput,
+                locatorLookup: effectiveLocatorLookup,
+                missKind: missKind,
+                benchmarkMetricTag: WorktreeStartupInstrumentation.currentBenchmarkMetricTag,
+                continuation: continuation
+            )
+        #else
+            flight.waiters[id] = Waiter(
+                id: id,
+                ownerID: request.ownerID,
+                priority: request.priority,
+                ordinal: ordinal,
+                joinedExistingFlight: joined,
+                locatorIdentity: locatorIdentity,
+                locatorIntent: locatorIntent,
+                proofInput: proofInput,
+                locatorLookup: effectiveLocatorLookup,
+                missKind: missKind,
+                continuation: continuation
+            )
+        #endif
         waiterCount += 1
 
         if joined {
@@ -1422,6 +1442,9 @@ actor CodeMapArtifactBuildCoordinator {
         }
         transition(flight, to: .finishing)
         let waiters = Array(flight.waiters.values)
+        #if DEBUG
+            recordBenchmarkMetrics(waiters: waiters, flight: flight)
+        #endif
         removeFlight(flight, hook: .flightCompleted)
         add(&counters.readyResults, UInt64(waiters.count))
         for waiter in waiters {
@@ -1448,6 +1471,9 @@ actor CodeMapArtifactBuildCoordinator {
     private func completeMisses(_ flight: Flight) {
         transition(flight, to: .finishing)
         let waiters = Array(flight.waiters.values)
+        #if DEBUG
+            recordBenchmarkMetrics(waiters: waiters, flight: flight)
+        #endif
         removeFlight(flight, hook: .flightCompleted)
         add(&counters.misses, UInt64(waiters.count))
         for waiter in waiters {
@@ -1467,11 +1493,32 @@ actor CodeMapArtifactBuildCoordinator {
             increment(&counters.failures)
         }
         let waiters = Array(flight.waiters.values)
+        #if DEBUG
+            recordBenchmarkMetrics(waiters: waiters, flight: flight)
+        #endif
         removeFlight(flight, hook: .flightFailed)
         for waiter in waiters {
             waiter.continuation.resume(throwing: error)
         }
     }
+
+    #if DEBUG
+        private func recordBenchmarkMetrics(waiters: [Waiter], flight: Flight) {
+            let tags = waiters.compactMap(\.benchmarkMetricTag)
+            let uniqueTags = Set(tags)
+            let exact = tags.count == waiters.count && uniqueTags.count == 1
+            var recordedBuild = false
+            for tag in tags {
+                WorktreeStartupInstrumentation.recordBenchmarkCodemapWork(
+                    tag: tag,
+                    durations: exact && !recordedBuild ? flight.durations : nil,
+                    buildPerformed: exact && !recordedBuild && flight.buildPerformed,
+                    exactlyAttributed: exact
+                )
+                recordedBuild = true
+            }
+        }
+    #endif
 
     private func cancelWaiter(id: UUID, key: CodeMapArtifactKey) {
         guard let flight = flights[key], let waiter = flight.waiters.removeValue(forKey: id) else { return }

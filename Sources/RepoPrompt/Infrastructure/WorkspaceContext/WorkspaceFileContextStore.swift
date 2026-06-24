@@ -7755,6 +7755,20 @@ actor WorkspaceFileContextStore {
         enableHierarchicalIgnores: Bool,
         completion: RootLoadFlightCompletion
     ) async throws -> WorkspaceRootRecord {
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+            let benchmarkFilesystemStarted = DispatchTime.now().uptimeNanoseconds
+            defer {
+                let finished = DispatchTime.now().uptimeNanoseconds
+                WorktreeStartupInstrumentation.recordBenchmarkFilesystemWork(
+                    tag: benchmarkMetricTag,
+                    durationMicroseconds: finished >= benchmarkFilesystemStarted
+                        ? (finished - benchmarkFilesystemStarted) / 1000
+                        : 0,
+                    itemCount: 1
+                )
+            }
+        #endif
         if let existingID = rootIDsByStandardizedPath[standardizedPath],
            let existingState = rootStatesByID[existingID]
         {

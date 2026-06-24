@@ -242,6 +242,11 @@ struct AgentRunMCPToolService {
 
     func execute(args: [String: Value]) async throws -> Value {
         let op = normalizedString(args["op"])?.lowercased() ?? "wait"
+        #if DEBUG
+            if op != "start", args["_worktree_startup_benchmark_token"] != nil {
+                throw MCPError.invalidParams("The worktree startup benchmark token is only supported with agent_run op=start.")
+            }
+        #endif
         if op != "start", startWorktreeCoordinator.containsArguments(args) {
             throw MCPError.invalidParams("agent_run worktree arguments are only supported with op=start.")
         }
@@ -267,8 +272,12 @@ struct AgentRunMCPToolService {
         let message = try resolveMessage(args["message"], name: "message")
         let workflow = try resolveWorkflow(args: args)
         let worktreeStartRequest = try startWorktreeCoordinator.parseRequest(args: args)
-        let worktreeStartupCorrelationID = UUID()
-        let worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
+        var worktreeStartupCorrelationID = UUID()
+        var worktreeStartupFlags = WorktreeStartupFeatureFlags.current()
+        var worktreeStartupServingControl = WorktreeStartupServingControl.automatic
+        #if DEBUG
+            var worktreeStartupBenchmarkToken: UUID?
+        #endif
         // start always creates a new session — reject explicit session_id
         if normalizedString(args["session_id"]) != nil {
             throw MCPError.invalidParams("agent_run.start always creates a new session. Use agent_run op=steer with session_id to continue an existing session.")
@@ -349,6 +358,36 @@ struct AgentRunMCPToolService {
             availability: targetWindow.apiSettingsViewModel.agentModeAvailabilityContext
         )
 
+        #if DEBUG
+            if let rawToken = normalizedString(args["_worktree_startup_benchmark_token"]) {
+                guard let token = UUID(uuidString: rawToken) else {
+                    throw MCPError.invalidParams("Invalid worktree startup benchmark token.")
+                }
+                do {
+                    guard case .create = worktreeStartRequest.mode,
+                          worktreeStartRequest.path == nil,
+                          !worktreeStartRequest.allowExternalPath
+                    else {
+                        throw DebugWorktreeStartupBenchmarkError.startIdentityMismatch
+                    }
+                    let preflight = try WorktreeStartupBenchmarkDiagnostics.shared.preflight(token: token)
+                    let scope = preflight.expectedStart.rootIdentity.scope
+                    let actualContextID = metadata.tabContextHint?.tabID
+                        ?? targetWindow.promptManager.activeComposeTabID
+                    guard scope.windowID == targetWindow.windowID,
+                          scope.workspaceID == workspace.id,
+                          scope.contextID == actualContextID
+                    else { throw DebugWorktreeStartupBenchmarkError.invalidScope }
+                    worktreeStartupBenchmarkToken = token
+                    worktreeStartupCorrelationID = preflight.correlationID
+                    worktreeStartupFlags = preflight.flags
+                    worktreeStartupServingControl = preflight.servingControl
+                } catch let error as DebugWorktreeStartupBenchmarkError {
+                    throw MCPError.invalidParams("Worktree startup benchmark token rejected (\(error.code)).")
+                }
+            }
+        #endif
+
         let sessionName = normalizedString(args["session_name"])
         let target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
             tabID: resolvedTabID,
@@ -365,16 +404,42 @@ struct AgentRunMCPToolService {
         let worktreeStartupContext = WorktreeStartupContext(
             agentSessionID: targetSessionID,
             correlationID: worktreeStartupCorrelationID,
-            flags: worktreeStartupFlags
+            flags: worktreeStartupFlags,
+            servingControl: worktreeStartupServingControl
         )
         WorktreeStartupInstrumentation.record(.agentRunStarted, context: worktreeStartupContext)
         do {
-            try await startWorktreeCoordinator.prepare(
-                request: worktreeStartRequest,
-                target: target,
-                targetWindow: targetWindow,
-                startupContext: worktreeStartupContext
-            )
+            #if DEBUG
+                if let worktreeStartupBenchmarkToken {
+                    try await WorktreeStartupBenchmarkDiagnostics.$currentPendingStart.withValue(
+                        DebugWorktreeStartupBenchmarkPendingStart(
+                            token: worktreeStartupBenchmarkToken,
+                            startAttemptID: UUID()
+                        )
+                    ) {
+                        try await startWorktreeCoordinator.prepare(
+                            request: worktreeStartRequest,
+                            target: target,
+                            targetWindow: targetWindow,
+                            startupContext: worktreeStartupContext
+                        )
+                    }
+                } else {
+                    try await startWorktreeCoordinator.prepare(
+                        request: worktreeStartRequest,
+                        target: target,
+                        targetWindow: targetWindow,
+                        startupContext: worktreeStartupContext
+                    )
+                }
+            #else
+                try await startWorktreeCoordinator.prepare(
+                    request: worktreeStartRequest,
+                    target: target,
+                    targetWindow: targetWindow,
+                    startupContext: worktreeStartupContext
+                )
+            #endif
         } catch {
             WorktreeStartupInstrumentation.record(
                 .failed,

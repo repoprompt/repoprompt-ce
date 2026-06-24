@@ -85,6 +85,14 @@ import MCP
                 #else
                     return debugDiagnosticsError(op: op, code: "unavailable", message: "`large_workspace_memory` is only available in DEBUG builds.")
                 #endif
+            #if DEBUG
+                case "worktree_startup_benchmark":
+                    return await debugWorktreeStartupBenchmarkPayload(
+                        op: op,
+                        connectionID: connectionID,
+                        arguments: arguments
+                    )
+            #endif
             case "agent_perf_metrics":
                 #if DEBUG
                     return await debugAgentPerfMetricsPayload(op: op, arguments: arguments)
@@ -400,7 +408,8 @@ import MCP
                     response = await sampler.start(
                         label: (label?.isEmpty == false ? label : nil) ?? "large-workspace-memory",
                         intervalMS: intervalMS,
-                        reset: reset
+                        reset: reset,
+                        benchmarkGate: debugBool(arguments, "benchmark_gate") ?? false
                     )
                 case "mark":
                     guard let mark = debugString(arguments, "mark")?

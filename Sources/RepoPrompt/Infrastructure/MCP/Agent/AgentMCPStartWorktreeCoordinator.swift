@@ -208,13 +208,28 @@ struct AgentMCPStartWorktreeCoordinator {
                 } else {
                     [:]
                 }
-                _ = try await agentModeVM.transitionWorktreeBindings(
-                    desiredBindings,
-                    forSessionID: targetSessionID,
-                    intent: .initialSend,
-                    startupContext: startupContext,
-                    initializationHintsByBindingID: initializationHintsByBindingID
-                )
+                #if DEBUG
+                    let metricTag = startupContext.flatMap {
+                        WorktreeStartupInstrumentation.benchmarkMetricTag(correlationID: $0.correlationID)
+                    }
+                    _ = try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(metricTag) {
+                        try await agentModeVM.transitionWorktreeBindings(
+                            desiredBindings,
+                            forSessionID: targetSessionID,
+                            intent: .initialSend,
+                            startupContext: startupContext,
+                            initializationHintsByBindingID: initializationHintsByBindingID
+                        )
+                    }
+                #else
+                    _ = try await agentModeVM.transitionWorktreeBindings(
+                        desiredBindings,
+                        forSessionID: targetSessionID,
+                        intent: .initialSend,
+                        startupContext: startupContext,
+                        initializationHintsByBindingID: initializationHintsByBindingID
+                    )
+                #endif
             } catch {
                 throw preparationError(error)
             }
@@ -374,6 +389,56 @@ struct AgentMCPStartWorktreeCoordinator {
                 purpose: .agentStart(sessionID: sessionID.uuidString)
             )
         )
+        #if DEBUG
+            var benchmarkMetricTag: WorktreeStartupInstrumentation.BenchmarkMetricTag?
+            if let pending = WorktreeStartupBenchmarkDiagnostics.currentPendingStart {
+                guard request.path == nil, !request.allowExternalPath else {
+                    throw MCPError.invalidParams("Benchmark worktree starts require the default app-managed destination.")
+                }
+                guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: context.repo.rootURL) else {
+                    throw MCPError.invalidParams("Benchmark repository identity could not be resolved.")
+                }
+                let preflight = try WorktreeStartupBenchmarkDiagnostics.shared.preflight(token: pending.token)
+                let repository = GitWorktreeIdentity.repositoryIdentity(
+                    commonGitDir: layout.commonDir,
+                    mainWorktreeRoot: URL(fileURLWithPath: mainRootPath)
+                )
+                let destination = plan.path.standardizedFileURL.path
+                let container = plan.appManagedContainer.standardizedFileURL.path
+                guard destination.hasPrefix(container + "/") else {
+                    throw MCPError.invalidParams("Benchmark worktree destination is not app-managed.")
+                }
+                let validated = DebugWorktreeStartupBenchmarkValidatedStart(
+                    scope: preflight.expectedStart.rootIdentity.scope,
+                    logicalRootID: context.logicalRoot.id,
+                    standardizedLogicalRootPath: context.logicalRoot.standardizedFullPath,
+                    repositoryID: repository.repositoryID,
+                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout),
+                    requestedBranch: request.branch,
+                    requestedBaseRef: request.baseRef,
+                    standardizedDestinationPath: destination,
+                    standardizedAppManagedContainerPath: container,
+                    destinationID: GitWorktreeIdentity.worktreeID(
+                        repositoryID: repository.repositoryID,
+                        gitDir: nil,
+                        isMain: false,
+                        path: plan.path
+                    ),
+                    agentSessionID: sessionID,
+                    startAttemptID: pending.startAttemptID
+                )
+                let consumption = try WorktreeStartupBenchmarkDiagnostics.shared.consume(
+                    token: pending.token,
+                    validatedStart: validated
+                )
+                guard startupContext?.agentSessionID == sessionID,
+                      startupContext?.correlationID == consumption.correlationID
+                else {
+                    throw MCPError.invalidParams("Benchmark start correlation did not match its Agent session.")
+                }
+                benchmarkMetricTag = consumption.metricTag
+            }
+        #endif
         let initializationContext: GitWorktreeInitializationContext? = if let startupContext,
                                                                           startupContext.flags.observeDiffSeededWorktreeStartup
         {
@@ -391,11 +456,21 @@ struct AgentMCPStartWorktreeCoordinator {
         } else {
             nil
         }
-        return try await vcsService.createGitWorktreeWithResult(
-            request: plan.createRequest,
-            at: context.repo.rootURL,
-            initializationContext: initializationContext
-        )
+        #if DEBUG
+            return try await WorktreeStartupInstrumentation.$currentBenchmarkMetricTag.withValue(benchmarkMetricTag) {
+                try await vcsService.createGitWorktreeWithResult(
+                    request: plan.createRequest,
+                    at: context.repo.rootURL,
+                    initializationContext: initializationContext
+                )
+            }
+        #else
+            return try await vcsService.createGitWorktreeWithResult(
+                request: plan.createRequest,
+                at: context.repo.rootURL,
+                initializationContext: initializationContext
+            )
+        #endif
     }
 
     private func repositoryRelativeRootPrefix(

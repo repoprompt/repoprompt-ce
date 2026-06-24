@@ -969,6 +969,14 @@ class GlobalSettingsStore: ObservableObject {
         func setAgentModePerfDiagnosticsOSLogEnabled(_ enabled: Bool) {
             defaults.set(enabled, forKey: "emitAgentModePerfDiagnosticsToOSLog")
         }
+
+        func worktreeStartupBenchmarkDiagnosticsEnabled() -> Bool {
+            defaults.bool(forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
+        }
+
+        func setWorktreeStartupBenchmarkDiagnosticsEnabled(_ enabled: Bool) {
+            defaults.set(enabled, forKey: WorktreeStartupBenchmarkDiagnostics.enabledDefaultsKey)
+        }
     #endif
 
     func restrictMCPAgentDiscoveryToRoleLabels() -> Bool {

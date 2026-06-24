@@ -4270,6 +4270,9 @@ actor GitService {
         commandFamily: GitProcessCommandFamily,
         commandTimeout: Duration
     ) async throws -> (Data, Data, Int32) {
+        #if DEBUG
+            let benchmarkMetricTag = WorktreeStartupInstrumentation.currentBenchmarkMetricTag
+        #endif
         let process = Process()
         let timeoutController = GitProcessTimeoutController()
         let lifecycleController = GitProcessLifecycleController()
@@ -4389,6 +4392,21 @@ actor GitService {
                             outputByteCount: stdoutData.count + stderrData.count,
                             cancelled: lifecycleController.cancellationErrorIfRequested() != nil
                         )
+                        #if DEBUG
+                            WorktreeStartupInstrumentation.recordBenchmarkGitCommand(
+                                tag: benchmarkMetricTag,
+                                family: commandFamily,
+                                priority: admissionPriority,
+                                queueWaitMicroseconds: processQueueWaitMicroseconds,
+                                durationMicroseconds: Int(
+                                    clamping: commandFinishedAt >= commandStartedAt
+                                        ? (commandFinishedAt - commandStartedAt) / 1000
+                                        : 0
+                                ),
+                                outputByteCount: stdoutData.count + stderrData.count,
+                                cancelled: lifecycleController.cancellationErrorIfRequested() != nil
+                            )
+                        #endif
 
                         if timeoutController.didTimeOut {
                             continuation.resume(throwing: GitProcessCaptureError.timedOut)
@@ -4476,6 +4494,21 @@ actor GitService {
                         outputByteCount: 0,
                         cancelled: lifecycleController.cancellationErrorIfRequested() != nil
                     )
+                    #if DEBUG
+                        WorktreeStartupInstrumentation.recordBenchmarkGitCommand(
+                            tag: benchmarkMetricTag,
+                            family: commandFamily,
+                            priority: admissionPriority,
+                            queueWaitMicroseconds: processQueueWaitMicroseconds,
+                            durationMicroseconds: Int(
+                                clamping: commandFinishedAt >= commandStartedAt
+                                    ? (commandFinishedAt - commandStartedAt) / 1000
+                                    : 0
+                            ),
+                            outputByteCount: 0,
+                            cancelled: lifecycleController.cancellationErrorIfRequested() != nil
+                        )
+                    #endif
                     // Ensure handlers and collectors are released when launch fails.
                     timeoutController.cancel()
                     outPipe.fileHandleForReading.readabilityHandler = nil

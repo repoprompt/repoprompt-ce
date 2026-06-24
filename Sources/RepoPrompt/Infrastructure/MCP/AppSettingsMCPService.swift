@@ -893,6 +893,19 @@ private enum AppSettingsMCPRegistry {
                 description: "DEBUG-only toggle for mirroring Agent Mode performance diagnostics to OSLog. Writes UserDefaults key 'emitAgentModePerfDiagnosticsToOSLog'.",
                 read: { .bool($0.agentModePerfDiagnosticsOSLogEnabled()) },
                 write: { try $0.setAgentModePerfDiagnosticsOSLogEnabled(requiredBool(from: $1)) }
+            ),
+            boolSetting(
+                key: "agent_mode.worktree_startup_benchmark_diagnostics_enabled",
+                group: "agent_mode",
+                label: "Worktree Startup Benchmark Diagnostics",
+                description: "DEBUG-only opt-in gate for the scoped worktree startup benchmark diagnostics surface. This setting alone does not alter startup routing.",
+                read: { .bool($0.worktreeStartupBenchmarkDiagnosticsEnabled()) },
+                write: { try $0.setWorktreeStartupBenchmarkDiagnosticsEnabled(requiredBool(from: $1)) },
+                afterWrite: { store, _, _ in
+                    WorktreeStartupBenchmarkDiagnostics.setGateEnabled(
+                        store.worktreeStartupBenchmarkDiagnosticsEnabled()
+                    )
+                }
             )
         ]
     #else

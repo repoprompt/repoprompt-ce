@@ -167,5 +167,175 @@ import XCTest
             XCTAssertEqual(seed.latestProjectedTombstoneCount, 2)
             XCTAssertEqual(seed.fullCrawlFallbackCount, 1)
         }
+
+        func testBenchmarkTokenRejectsCrossRootExternalDestinationAndReplay() throws {
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            defer { WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false) }
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let scope = DebugWorktreeStartupBenchmarkScope(
+                windowID: 91,
+                workspaceID: UUID(),
+                contextID: UUID(),
+                rootID: UUID()
+            )
+            let expected = benchmarkExpectedStart(scope: scope)
+            let control = try diagnostics.setFlags(
+                scope: scope,
+                observe: true,
+                serve: true,
+                forceFullCrawl: false,
+                expiresSeconds: 120
+            )
+            let arm = try diagnostics.arm(
+                expectedStart: expected,
+                controlID: control.controlID,
+                scenario: "clean_same_tree",
+                invocation: 1,
+                ordinal: 1,
+                warmup: false,
+                expiresSeconds: 120
+            )
+            let valid = benchmarkValidatedStart(expected: expected)
+            var wrongRoot = benchmarkValidatedStart(expected: expected)
+            wrongRoot = DebugWorktreeStartupBenchmarkValidatedStart(
+                scope: DebugWorktreeStartupBenchmarkScope(
+                    windowID: scope.windowID,
+                    workspaceID: scope.workspaceID,
+                    contextID: scope.contextID,
+                    rootID: UUID()
+                ),
+                logicalRootID: UUID(),
+                standardizedLogicalRootPath: valid.standardizedLogicalRootPath,
+                repositoryID: valid.repositoryID,
+                repositoryKey: valid.repositoryKey,
+                requestedBranch: valid.requestedBranch,
+                requestedBaseRef: valid.requestedBaseRef,
+                standardizedDestinationPath: valid.standardizedDestinationPath,
+                standardizedAppManagedContainerPath: valid.standardizedAppManagedContainerPath,
+                destinationID: valid.destinationID,
+                agentSessionID: valid.agentSessionID,
+                startAttemptID: valid.startAttemptID
+            )
+            XCTAssertThrowsError(try diagnostics.consume(token: arm.token, validatedStart: wrongRoot))
+
+            let external = DebugWorktreeStartupBenchmarkValidatedStart(
+                scope: valid.scope,
+                logicalRootID: valid.logicalRootID,
+                standardizedLogicalRootPath: valid.standardizedLogicalRootPath,
+                repositoryID: valid.repositoryID,
+                repositoryKey: valid.repositoryKey,
+                requestedBranch: valid.requestedBranch,
+                requestedBaseRef: valid.requestedBaseRef,
+                standardizedDestinationPath: "/tmp/external-worktree",
+                standardizedAppManagedContainerPath: valid.standardizedAppManagedContainerPath,
+                destinationID: valid.destinationID,
+                agentSessionID: valid.agentSessionID,
+                startAttemptID: valid.startAttemptID
+            )
+            XCTAssertThrowsError(try diagnostics.consume(token: arm.token, validatedStart: external))
+            XCTAssertEqual(try diagnostics.consume(token: arm.token, validatedStart: valid).correlationID, arm.correlationID)
+            XCTAssertThrowsError(try diagnostics.consume(token: arm.token, validatedStart: valid))
+        }
+
+        func testDisablingBenchmarkGateImmediatelyRevokesArmedToken() throws {
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(true)
+            let diagnostics = WorktreeStartupBenchmarkDiagnostics.shared
+            let scope = DebugWorktreeStartupBenchmarkScope(windowID: 92, workspaceID: UUID(), contextID: UUID(), rootID: UUID())
+            let expected = benchmarkExpectedStart(scope: scope)
+            let control = try diagnostics.setFlags(scope: scope, observe: true, serve: false, forceFullCrawl: false, expiresSeconds: 120)
+            let arm = try diagnostics.arm(expectedStart: expected, controlID: control.controlID, scenario: "clean_same_tree", invocation: 1, ordinal: 1, warmup: false, expiresSeconds: 120)
+            WorktreeStartupBenchmarkDiagnostics.setGateEnabled(false)
+            XCTAssertThrowsError(try diagnostics.preflight(token: arm.token)) { error in
+                XCTAssertEqual(error as? DebugWorktreeStartupBenchmarkError, .disabled)
+            }
+            XCTAssertThrowsError(try diagnostics.consume(token: arm.token, validatedStart: benchmarkValidatedStart(expected: expected)))
+        }
+
+        func testRoutingProvenanceRejectsForgedWindowAndContext() throws {
+            let connectionID = UUID()
+            let workspaceID = UUID()
+            let contextID = UUID()
+            let provenance = DebugWorktreeStartupBenchmarkRoutingProvenance(
+                connectionID: connectionID,
+                boundWindowID: 7,
+                boundWorkspaceID: workspaceID,
+                boundContextID: contextID
+            )
+            XCTAssertNoThrow(try provenance.authorize(connectionID: connectionID, windowID: 7, hiddenWindowID: 7, workspaceID: workspaceID, contextID: contextID, benchmarkContextID: contextID))
+            XCTAssertThrowsError(try provenance.authorize(connectionID: connectionID, windowID: 8, hiddenWindowID: 7, workspaceID: workspaceID, contextID: contextID, benchmarkContextID: contextID))
+            XCTAssertThrowsError(try provenance.authorize(connectionID: connectionID, windowID: 7, hiddenWindowID: 7, workspaceID: workspaceID, contextID: UUID(), benchmarkContextID: contextID))
+        }
+
+        func testBenchmarkMetricsAreCorrelationIsolatedAndAmbiguousCodemapIsUnavailable() {
+            WorktreeStartupInstrumentation.resetForTesting()
+            let tagA = benchmarkMetricTag(correlationID: UUID())
+            let tagB = benchmarkMetricTag(correlationID: UUID())
+            WorktreeStartupInstrumentation.recordBenchmarkFilesystemWork(tag: tagA, durationMicroseconds: 11, itemCount: 2)
+            WorktreeStartupInstrumentation.recordBenchmarkFilesystemWork(tag: tagB, durationMicroseconds: 99, itemCount: 50)
+            WorktreeStartupInstrumentation.recordBenchmarkContentReadWork(tag: tagA, waitMicroseconds: 3, executionMicroseconds: 7, overloaded: false)
+            WorktreeStartupInstrumentation.recordBenchmarkContentReadWork(tag: tagB, waitMicroseconds: 30, executionMicroseconds: 70, overloaded: false)
+            WorktreeStartupInstrumentation.recordBenchmarkCodemapWork(tag: tagA, durations: nil, buildPerformed: false, exactlyAttributed: false)
+            let snapshot = WorktreeStartupInstrumentation.benchmarkMetricSnapshot(for: tagA)
+            XCTAssertEqual(snapshot.filesystemDurationMicroseconds, 11)
+            XCTAssertEqual(snapshot.filesystemItemCount, 2)
+            XCTAssertEqual(snapshot.contentReadWaitMicroseconds, 3)
+            XCTAssertEqual(snapshot.contentReadExecutionMicroseconds, 7)
+            XCTAssertEqual(snapshot.codemapAttribution, .unavailable)
+        }
+
+        private func benchmarkExpectedStart(
+            scope: DebugWorktreeStartupBenchmarkScope
+        ) -> DebugWorktreeStartupBenchmarkExpectedStart {
+            let root = "/benchmark/root-\(scope.rootID.uuidString)"
+            let layout = GitRepositoryLayout(
+                workTreeRoot: URL(fileURLWithPath: root),
+                dotGitPath: URL(fileURLWithPath: root + "/.git"),
+                gitDir: URL(fileURLWithPath: root + "/.git"),
+                commonDir: URL(fileURLWithPath: root + "/.git"),
+                isWorktree: false
+            )
+            let repository = GitWorktreeIdentity.repositoryIdentity(commonGitDir: layout.commonDir, mainWorktreeRoot: layout.workTreeRoot)
+            return DebugWorktreeStartupBenchmarkExpectedStart(
+                rootIdentity: DebugWorktreeStartupBenchmarkRootIdentity(
+                    scope: scope,
+                    standardizedLogicalRootPath: root,
+                    repositoryID: repository.repositoryID,
+                    repositoryKey: GitWorkspaceAuthorityRepositoryKey(layout: layout)
+                ),
+                requestedBranch: "bench",
+                requestedBaseRef: "HEAD"
+            )
+        }
+
+        private func benchmarkValidatedStart(
+            expected: DebugWorktreeStartupBenchmarkExpectedStart
+        ) -> DebugWorktreeStartupBenchmarkValidatedStart {
+            let container = "/benchmark/.repoprompt-worktrees/root"
+            return DebugWorktreeStartupBenchmarkValidatedStart(
+                scope: expected.rootIdentity.scope,
+                logicalRootID: expected.rootIdentity.scope.rootID,
+                standardizedLogicalRootPath: expected.rootIdentity.standardizedLogicalRootPath,
+                repositoryID: expected.rootIdentity.repositoryID,
+                repositoryKey: expected.rootIdentity.repositoryKey,
+                requestedBranch: expected.requestedBranch,
+                requestedBaseRef: expected.requestedBaseRef,
+                standardizedDestinationPath: container + "/agent-session",
+                standardizedAppManagedContainerPath: container,
+                destinationID: "wt-test",
+                agentSessionID: UUID(),
+                startAttemptID: UUID()
+            )
+        }
+
+        private func benchmarkMetricTag(correlationID: UUID) -> WorktreeStartupInstrumentation.BenchmarkMetricTag {
+            WorktreeStartupInstrumentation.BenchmarkMetricTag(
+                correlationID: correlationID,
+                contextID: UUID(),
+                agentSessionID: UUID(),
+                logicalRootID: UUID(),
+                repositoryID: "repo",
+                destinationID: "worktree"
+            )
+        }
     }
 #endif
