@@ -1640,7 +1640,7 @@ final actor ClaudeNativeProcessSessionController {
             Self.buildSetPermissionModeRequest(permissionMode: permissionMode ?? config.permissionMode)
         }
 
-        /// Build CLI arguments for testing.
+        /// Build CLI arguments for testing (verifies prompt flags are absent).
         func test_buildArguments(
             existingSessionID: String?,
             model: String?
