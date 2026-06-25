@@ -4375,12 +4375,13 @@ final class AgentModeViewModel: ObservableObject {
 
     private func prepareTerminalPublication(for session: TabSession) {
         removePendingUIRefresh(for: session.tabID)
-        guard session.tabID == currentTabID,
-              canBuildOrPublishActiveTranscriptBindings(for: session)
-        else {
-            return
+        withActiveUISyncSuppressed {
+            catchUpDerivedTranscriptIfNeeded(
+                for: session,
+                reason: .liveMutation,
+                publishActivePresentation: false
+            )
         }
-        catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
     }
 
     private func makeTerminalPublicationEnvelope(
@@ -7026,12 +7027,10 @@ final class AgentModeViewModel: ObservableObject {
         return promptManager == nil
     }
 
-    /// Shared ownership predicate for work that may build or publish active transcript bindings.
+    /// Canonical ownership predicate for synchronizing a session's derived transcript.
     ///
-    /// A session is active-owned when it is the current tab for this view model/window.
-    /// Headless/test harness contexts without a prompt manager may also keep publishing the
-    /// already-owned transcript presentation, preserving the existing publication fallback.
-    func canBuildOrPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
+    /// Unlike active presentation ownership, this intentionally permits background sessions.
+    private func canSynchronizeDerivedTranscript(for session: TabSession) -> Bool {
         guard sessions[session.tabID] === session,
               !session.bindingTransitionInProgress,
               session.hasLoadedPersistedState
@@ -7050,6 +7049,16 @@ final class AgentModeViewModel: ObservableObject {
                 return false
             }
         }
+        return true
+    }
+
+    /// Shared ownership predicate for work that may build or publish active transcript bindings.
+    ///
+    /// A session is active-owned when it is the current tab for this view model/window.
+    /// Headless/test harness contexts without a prompt manager may also keep publishing the
+    /// already-owned transcript presentation, preserving the existing publication fallback.
+    func canBuildOrPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
+        guard canSynchronizeDerivedTranscript(for: session) else { return false }
         if currentTabID == session.tabID {
             return true
         }
@@ -8201,7 +8210,8 @@ final class AgentModeViewModel: ObservableObject {
 
     func refreshDerivedTranscriptState(
         for session: TabSession,
-        reason: DerivedTranscriptRefreshReason = .manualRefresh
+        reason: DerivedTranscriptRefreshReason = .manualRefresh,
+        publishActivePresentation: Bool = true
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
@@ -8549,7 +8559,7 @@ final class AgentModeViewModel: ObservableObject {
                 sourceItemCount: session.items.count
             )
         )
-        if canBuildOrPublishActiveTranscriptBindings(for: session) {
+        if publishActivePresentation, canBuildOrPublishActiveTranscriptBindings(for: session) {
             let publishSignpost = EditFlowPerf.begin(
                 EditFlowPerf.Stage.Transcript.publish,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
@@ -8687,12 +8697,13 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func catchUpDerivedTranscriptForActiveBindingIfNeeded(
+    private func catchUpDerivedTranscriptIfNeeded(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason,
-        validateProjectionIntegrity: Bool = false
+        validateProjectionIntegrity: Bool = false,
+        publishActivePresentation: Bool = true
     ) -> Bool {
-        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return false }
+        guard canSynchronizeDerivedTranscript(for: session) else { return false }
         guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return false }
         let projectionProtection = transcriptProjectionProtection(
             for: session,
@@ -8711,8 +8722,26 @@ final class AgentModeViewModel: ObservableObject {
         session.derivedTranscriptRefreshTask = nil
         let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
         session.pendingDerivedTranscriptRefreshReason = nil
-        refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        refreshDerivedTranscriptState(
+            for: session,
+            reason: scheduledReason,
+            publishActivePresentation: publishActivePresentation
+        )
         return true
+    }
+
+    @discardableResult
+    private func catchUpDerivedTranscriptForActiveBindingIfNeeded(
+        for session: TabSession,
+        reason: DerivedTranscriptRefreshReason,
+        validateProjectionIntegrity: Bool = false
+    ) -> Bool {
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return false }
+        return catchUpDerivedTranscriptIfNeeded(
+            for: session,
+            reason: reason,
+            validateProjectionIntegrity: validateProjectionIntegrity
+        )
     }
 
     private func derivedTranscriptProjectionLooksStale(for session: TabSession) -> Bool {
@@ -15239,7 +15268,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Status-aware assistant preview: active runs only show text from the current turn,
-    /// terminal runs show the latest text from the full transcript.
+    /// terminal runs show the logical trailing response from the latest turn.
     private func mcpResolvedAssistantPreview(session: TabSession, status: AgentRunMCPSnapshot.Status) -> String? {
         switch status {
         case .expired:
@@ -15261,8 +15290,21 @@ final class AgentModeViewModel: ObservableObject {
             }
             return AgentTranscriptIO.latestAssistantPreviewText(in: lastTurn)
         case .completed, .failed, .cancelled:
-            return latestAssistantPreviewText(in: session)
-                ?? session.items.reversed().first(where: { $0.hasDisplayableAssistantBody })?.text
+            let transcriptPreview = session.transcript.turns.last.flatMap {
+                AgentTranscriptIO.terminalAssistantResponseText(in: $0)
+            }
+            let sourcePreview = AgentTranscriptIO.terminalAssistantResponseText(from: session.items)
+            let projectionProtection = transcriptProjectionProtection(
+                for: session,
+                transcript: session.transcript
+            )
+            if canReuseDerivedTranscriptForSave(
+                for: session,
+                projectionProtection: projectionProtection
+            ) {
+                return transcriptPreview ?? sourcePreview
+            }
+            return session.items.isEmpty ? transcriptPreview : sourcePreview
         }
     }
 

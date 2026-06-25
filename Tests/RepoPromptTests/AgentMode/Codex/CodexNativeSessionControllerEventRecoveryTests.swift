@@ -5,6 +5,173 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testLegacyAssistantCompleteWithoutPriorDeltaEmitsFullText() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "complete response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteIdenticalToCanonicalDeltaEmitsNothingAdditional() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "complete response")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "complete response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteTopLevelEventIDDoesNotResetCanonicalItemBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: "complete response"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(
+                turnID: "turn-1",
+                eventID: "0",
+                message: "complete response"
+            )
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteStrictPrefixRecoversOnlySuffixAndIsIdempotent() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "answer")
+        )
+        for _ in 0 ..< 2 {
+            await controller.test_handleNotification(
+                method: "codex/event/agent_message",
+                params: legacyAssistantCompleteParams(turnID: "turn-1", message: "answer.")
+            )
+        }
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["answer", "."])
+        XCTAssertEqual(deltas.joined(), "answer.")
+    }
+
+    func testLegacyAssistantCompleteRecoversUTF8SuffixAcrossGraphemeBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        let streamedPrefix = "👨"
+        let completeMessage = "👨‍👩‍👧"
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: streamedPrefix)
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: completeMessage)
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas.joined(), completeMessage)
+        XCTAssertEqual(Array(deltas.joined().utf8), Array(completeMessage.utf8))
+        XCTAssertEqual(deltas.count, 2)
+    }
+
+    func testAssistantCompleteReconciliationResetsAtCanonicalItemBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: "Checking"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "Checking")
+        )
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-2",
+                delta: "Result"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "Result.")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["Checking", "Result", "."])
+    }
+
+    func testLegacyAssistantCompleteNonPrefixMismatchDoesNotEmitUnprovenBytes() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "trusted prefix")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "different response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["trusted prefix"])
+    }
+
+    func testAssistantCompleteReconciliationIsIsolatedAndResetsWhenTurnCompletes() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "turn one")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-2", message: "turn two")
+        )
+        await controller.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-1", status: "completed")
+        )
+        await controller.test_handleNotification(
+            method: "turn/started",
+            params: turnLifecycleParams(turnID: "turn-1")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "reused turn fresh text")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["turn one", "turn two", "reused turn fresh text"])
+    }
+
     func testStructuredErrorNotificationRetainsRetryMetadataAndScope() throws {
         let retrying = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
             "threadId": "thread-1",
@@ -735,6 +902,75 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             windowID: 1,
             workspacePath: nil
         )
+    }
+
+    private func makeControllerWithThread(turnID: String) -> CodexNativeSessionController {
+        let controller = makeController()
+        controller.test_installThreadState(
+            threadID: "thread-active",
+            authoritativeTurnID: turnID,
+            routingTurnID: turnID
+        )
+        return controller
+    }
+
+    private func assistantDeltaParams(
+        turnID: String,
+        itemID: String? = nil,
+        delta: String
+    ) -> [String: CodexJSONValue] {
+        var params: [String: CodexJSONValue] = [
+            "threadId": .string("thread-active"),
+            "turnId": .string(turnID),
+            "delta": .string(delta)
+        ]
+        if let itemID {
+            params["itemId"] = .string(itemID)
+        }
+        return params
+    }
+
+    private func legacyAssistantCompleteParams(
+        turnID: String,
+        eventID: String? = nil,
+        message: String
+    ) -> [String: CodexJSONValue] {
+        var params: [String: CodexJSONValue] = [
+            "threadId": .string("thread-active"),
+            "turnId": .string(turnID),
+            "msg": .object([
+                "type": .string("agent_message"),
+                "message": .string(message)
+            ])
+        ]
+        if let eventID {
+            params["id"] = .string(eventID)
+        }
+        return params
+    }
+
+    private func turnLifecycleParams(turnID: String, status: String? = nil) -> [String: CodexJSONValue] {
+        var turn: [String: CodexJSONValue] = ["id": .string(turnID)]
+        if let status {
+            turn["status"] = .string(status)
+        }
+        return [
+            "threadId": .string("thread-active"),
+            "turn": .object(turn)
+        ]
+    }
+
+    private func finishAndReadAssistantDeltas(
+        from controller: CodexNativeSessionController
+    ) async -> [String] {
+        await controller.shutdown()
+        var deltas: [String] = []
+        for await event in controller.events {
+            if case let .assistantDelta(delta) = event {
+                deltas.append(delta)
+            }
+        }
+        return deltas
     }
 
     private func toolParams(item: [String: Any]) -> [String: Any] {

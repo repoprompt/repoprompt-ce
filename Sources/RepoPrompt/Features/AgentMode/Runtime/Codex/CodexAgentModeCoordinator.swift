@@ -4767,7 +4767,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     #endif
 
     private func flushPendingAssistantDelta(_ session: AgentModeViewModel.TabSession) {
-        guard Self.flushPendingAssistantDeltaState(session) else { return }
+        guard !session.pendingAssistantDelta.isEmpty || session.assistantDeltaFlushTask != nil else { return }
+        guard Self.flushPendingAssistantDeltaState(session) else {
+            Self.clearPendingAssistantDeltaState(session)
+            return
+        }
         session.assistantDeltaFlushGeneration &+= 1
         viewModel?.requestAssistantPresentationRefresh(
             session: session,
@@ -5008,6 +5012,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
+    private func drainCodexTerminalOutput(
+        _ session: AgentModeViewModel.TabSession,
+        turnStatus: CodexNativeSessionController.TurnStatus
+    ) {
+        flushCommandExecutionRunningUpdates(session: session)
+        flushPendingAssistantDelta(session)
+        finalizeStreamingItems(in: session)
+        finalizePendingToolCalls(in: session, turnStatus: turnStatus)
+        finalizeLingeringRunningBashResults(in: session, turnStatus: turnStatus)
+        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
+        session.providerTerminalDrainGeneration &+= 1
+    }
+
     private func finalizeCodexRun(
         _ session: AgentModeViewModel.TabSession,
         turnStatus: CodexNativeSessionController.TurnStatus,
@@ -5023,12 +5040,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         let expectedRunID = session.runID
-        flushCommandExecutionRunningUpdates(session: session)
-        finalizeStreamingItems(in: session)
-        finalizePendingToolCalls(in: session, turnStatus: turnStatus)
-        finalizeLingeringRunningBashResults(in: session, turnStatus: turnStatus)
-        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
-        session.providerTerminalDrainGeneration &+= 1
+        drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
         clearCodexRecoveryAttempt(for: session.runID)
         clearCodexAuthRecoveryAttempt(for: session.runID)
@@ -7682,22 +7694,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func drainCodexTerminalBuffersForCancellation(_ session: AgentModeViewModel.TabSession) {
         guard session.selectedAgent == .codexExec else { return }
-        flushCommandExecutionRunningUpdates(session: session)
-        finalizeStreamingItems(in: session)
-        finalizePendingToolCalls(in: session, turnStatus: .interrupted)
-        finalizeLingeringRunningBashResults(in: session, turnStatus: .interrupted)
-        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
+        drainCodexTerminalOutput(session, turnStatus: .interrupted)
         abandonCodexFallbackQueue(
             session: session,
             reason: "Codex queued follow-up was cancelled with the active run."
         )
         resetTrackedCodexTurns(session)
-        session.providerTerminalDrainGeneration &+= 1
     }
 
     func codexTerminalBuffersAreDrained(_ session: AgentModeViewModel.TabSession) -> Bool {
         session.pendingCommandRunningByKey.isEmpty
             && session.pendingCommandRunningFlushTask == nil
+            && session.pendingAssistantDelta.isEmpty
+            && session.assistantDeltaFlushTask == nil
     }
 
     struct CodexCancellationTarget {

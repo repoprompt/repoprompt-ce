@@ -760,6 +760,81 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
+    func testCodexCancellationCoalescesBufferedAssistantTailBeforeTerminalSeal() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleNoopCodexController(recorder: recorder)
+        var publishedRevision: AgentRunTerminalCommitRevision?
+        let harness = makeHarness(
+            recorder: recorder,
+            codexController: controller,
+            publishTerminalCommit: { _, revision in
+                publishedRevision = revision
+                recorder.record("commit:\(revision.commitID.uuidString)")
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .codexExec
+        session.runState = .running
+        session.runID = UUID()
+        session.beginRunAttempt(source: "test.codexBufferedCancellation")
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.codexController = controller
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+        let commandInvocationID = UUID()
+        session.appendItem(.toolResult(
+            name: "bash",
+            invocationID: commandInvocationID,
+            argsJSON: "{}",
+            resultJSON: #"{"status":"completed"}"#,
+            isError: false,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+
+        harness.host.test_codexCoordinator.test_enqueueAssistantDelta("answer", session: session)
+        harness.host.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        let streamingPrefix = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(streamingPrefix.kind, .assistant)
+        XCTAssertEqual(streamingPrefix.text, "answer")
+        XCTAssertTrue(streamingPrefix.isStreaming)
+
+        harness.host.test_codexCoordinator.test_enqueueAssistantDelta(".", session: session)
+        XCTAssertEqual(session.pendingAssistantDelta, ".")
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        session.pendingCommandRunningByKey["terminal-test"] = .init(
+            invocationID: commandInvocationID,
+            processID: nil,
+            appendedOutput: nil,
+            sealsAssistantBoundary: false
+        )
+        session.pendingCommandRunningFlushTask = Task {}
+        XCTAssertFalse(harness.host.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await harness.service.cancelRun(
+            tabID: session.tabID,
+            session: session,
+            completion: .terminalPublished
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer."])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(session.pendingCommandRunningByKey.isEmpty)
+        XCTAssertNil(session.pendingCommandRunningFlushTask)
+        XCTAssertTrue(harness.host.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(publishedRevision)
+        XCTAssertEqual(session.runState, .cancelled)
+        XCTAssertEqual(revision.terminalState, .cancelled)
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
+        XCTAssertEqual(session.lastTerminalCommitRevision, revision)
+    }
+
     func testDuplicateTerminalBarrierInvocationRetriesUnresolvedPublicationWithoutRecommitting() async throws {
         let recorder = LifecycleRecorder()
         var publicationAttempts = 0

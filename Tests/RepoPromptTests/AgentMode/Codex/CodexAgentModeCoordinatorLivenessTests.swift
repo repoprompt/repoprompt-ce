@@ -145,6 +145,103 @@ final class CodexAgentModeCoordinatorLivenessTests: XCTestCase {
         XCTAssertEqual(session.items.last?.text, "fatal provider error")
     }
 
+    func testTurnCompletionCoalescesBufferedAssistantTailBeforeTerminalSeal() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+        let commandInvocationID = UUID()
+        session.appendItem(.toolResult(
+            name: "bash",
+            invocationID: commandInvocationID,
+            argsJSON: "{}",
+            resultJSON: #"{"status":"completed"}"#,
+            isError: false,
+            sequenceIndex: session.nextSequenceIndex
+        ))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("answer"),
+            session: session
+        )
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+
+        let streamingPrefix = try XCTUnwrap(session.items.last)
+        XCTAssertEqual(streamingPrefix.kind, .assistant)
+        XCTAssertEqual(streamingPrefix.text, "answer")
+        XCTAssertTrue(streamingPrefix.isStreaming)
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .assistantDelta("."),
+            session: session
+        )
+        XCTAssertEqual(session.pendingAssistantDelta, ".")
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        session.pendingCommandRunningByKey["terminal-test"] = .init(
+            invocationID: commandInvocationID,
+            processID: nil,
+            appendedOutput: nil,
+            sealsAssistantBoundary: false
+        )
+        session.pendingCommandRunningFlushTask = Task {}
+        XCTAssertFalse(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer."])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(session.pendingCommandRunningByKey.isEmpty)
+        XCTAssertNil(session.pendingCommandRunningFlushTask)
+        XCTAssertTrue(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.runState, .completed)
+        XCTAssertEqual(revision.terminalState, .completed)
+        XCTAssertEqual(revision.sourceItemsRevision, session.sourceItemsRevision)
+        XCTAssertEqual(revision.assistantDeltaFlushGeneration, session.assistantDeltaFlushGeneration)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
+    }
+
+    func testTurnCompletionClearsEmptyScheduledAssistantFlushBeforeBarrier() async throws {
+        let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
+        let viewModel = makeViewModel(controller: controller)
+        let session = preparedCodexSession(in: viewModel, controller: controller)
+        let baselineDrainGeneration = session.providerTerminalDrainGeneration
+        session.appendItem(.user("question", sequenceIndex: session.nextSequenceIndex))
+
+        viewModel.test_codexCoordinator.test_enqueueAssistantDelta("answer", session: session)
+        viewModel.test_codexCoordinator.test_flushPendingAssistantDelta(session)
+        viewModel.test_codexCoordinator.test_enqueueAssistantDelta("", session: session)
+
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNotNil(session.assistantDeltaFlushTask)
+        XCTAssertFalse(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        await viewModel.test_codexCoordinator.test_handleCodexNativeEvent(
+            .turnCompleted(turnID: "turn", status: .completed),
+            session: session
+        )
+
+        let assistantItems = session.items.filter { $0.kind == .assistant }
+        XCTAssertEqual(assistantItems.map(\.text), ["answer"])
+        XCTAssertEqual(assistantItems.map(\.isStreaming), [false])
+        XCTAssertTrue(session.pendingAssistantDelta.isEmpty)
+        XCTAssertNil(session.assistantDeltaFlushTask)
+        XCTAssertTrue(viewModel.test_codexCoordinator.codexTerminalBuffersAreDrained(session))
+
+        let revision = try XCTUnwrap(session.lastTerminalCommitRevision)
+        XCTAssertEqual(session.providerTerminalDrainGeneration, baselineDrainGeneration + 1)
+        XCTAssertEqual(revision.providerDrainGeneration, session.providerTerminalDrainGeneration)
+    }
+
     func testStaleStructuredScopeIsIgnored() async {
         let controller = LivenessFakeCodexController(snapshot: .active(activeFlags: []))
         let viewModel = makeViewModel(controller: controller)

@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct CodexTurnStartReceipt: Equatable {
     let provisionalSubmissionID: String
@@ -106,6 +107,11 @@ protocol CodexSessionControlling: AnyObject {
 }
 
 final class CodexNativeSessionController {
+    private static let logger = Logger(
+        subsystem: "com.repoprompt.agents",
+        category: "CodexNativeSessionController"
+    )
+
     private static func logCodexDebug(_ message: @autoclosure () -> String) {
         #if DEBUG
             guard UserDefaults.standard.bool(forKey: "enableCodexDebugLogging") else { return }
@@ -154,6 +160,11 @@ final class CodexNativeSessionController {
         let itemID: String?
         let groupID: String?
         let index: Int?
+    }
+
+    private struct AssistantEmittedTextState {
+        var itemID: String?
+        var text: String
     }
 
     private struct FileChangeStreamState {
@@ -481,7 +492,7 @@ final class CodexNativeSessionController {
     private var activeTurnIDsWithObservedActivity: Set<String> = []
     private var pendingLifecycleAuthorityReconciliation: LifecycleAuthorityReconciliationLineage?
     private var lifecycleAuthorityObservations: [LifecycleAuthorityObservation] = []
-    private var assistantDeltaSeenTurnIDs: Set<String> = []
+    private var assistantEmittedTextByTurnID: [String: AssistantEmittedTextState] = [:]
     private var fileChangeStateByItemID: [String: FileChangeStreamState] = [:]
     /// Item IDs whose fileChange lifecycle has reached terminal (completed) state.
     /// Used to suppress late output deltas that arrive after completion.
@@ -1587,6 +1598,7 @@ final class CodexNativeSessionController {
         notificationTask = nil
         serverRequestTask?.cancel()
         serverRequestTask = nil
+        assistantEmittedTextByTurnID.removeAll(keepingCapacity: false)
         fileChangeStateByItemID.removeAll(keepingCapacity: false)
         terminalFileChangeItemIDs.removeAll(keepingCapacity: false)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: false)
@@ -1606,7 +1618,7 @@ final class CodexNativeSessionController {
         activeTurnIDs = Set(snapshot.activeTurnIDs)
         activeTurnOrder = snapshot.activeTurnIDs
         activeTurnIDsWithObservedActivity = Set(snapshot.activeTurnIDs)
-        assistantDeltaSeenTurnIDs.removeAll(keepingCapacity: true)
+        assistantEmittedTextByTurnID.removeAll(keepingCapacity: true)
         fileChangeStateByItemID.removeAll(keepingCapacity: true)
         terminalFileChangeItemIDs.removeAll(keepingCapacity: true)
         commandExecutionMirrorStateByItemID.removeAll(keepingCapacity: true)
@@ -1989,7 +2001,7 @@ final class CodexNativeSessionController {
         activeTurnIDs.remove(trimmed)
         activeTurnOrder.removeAll(where: { $0 == trimmed })
         activeTurnIDsWithObservedActivity.remove(trimmed)
-        assistantDeltaSeenTurnIDs.remove(trimmed)
+        assistantEmittedTextByTurnID.removeValue(forKey: trimmed)
         if routingCurrentTurnID == trimmed {
             routingCurrentTurnID = activeTurnOrder.last(where: { activeTurnIDsWithObservedActivity.contains($0) })
         }
@@ -2170,17 +2182,64 @@ final class CodexNativeSessionController {
         case "item/agentMessage/delta":
             if let delta = params["delta"] as? String {
                 if let turnID = Self.notificationTurnID(from: params) {
-                    assistantDeltaSeenTurnIDs.insert(turnID)
+                    let itemID = Self.notificationItemID(from: params)
+                    var state = assistantEmittedTextByTurnID[turnID]
+                        ?? AssistantEmittedTextState(itemID: itemID, text: "")
+                    if let previousItemID = state.itemID,
+                       let itemID,
+                       previousItemID != itemID
+                    {
+                        state = AssistantEmittedTextState(itemID: itemID, text: delta)
+                    } else {
+                        state.itemID = state.itemID ?? itemID
+                        state.text.append(delta)
+                    }
+                    assistantEmittedTextByTurnID[turnID] = state
                 }
                 await emit(.assistantDelta(delta))
             }
         case "codex/event/agent_message":
             if let message = Self.assistantMessageText(from: params), !message.isEmpty {
                 if let turnID = Self.notificationTurnID(from: params) {
-                    if assistantDeltaSeenTurnIDs.contains(turnID) {
+                    let itemID = Self.notificationItemID(
+                        from: params,
+                        includeTopLevelIDFallback: false
+                    )
+                    var state = assistantEmittedTextByTurnID[turnID]
+                        ?? AssistantEmittedTextState(itemID: itemID, text: "")
+                    if let previousItemID = state.itemID,
+                       let itemID,
+                       previousItemID != itemID
+                    {
+                        state = AssistantEmittedTextState(itemID: itemID, text: "")
+                    } else {
+                        state.itemID = state.itemID ?? itemID
+                    }
+                    let emittedText = state.text
+                    let emittedUTF8 = emittedText.utf8
+                    let completeUTF8 = message.utf8
+                    if completeUTF8.elementsEqual(emittedUTF8) {
                         break
                     }
-                    assistantDeltaSeenTurnIDs.insert(turnID)
+                    if !emittedText.isEmpty {
+                        guard completeUTF8.starts(with: emittedUTF8) else {
+                            // A non-prefix complete message cannot prove which bytes are new.
+                            // Preserve already-emitted output and diagnose without logging content.
+                            Self.logger.warning(
+                                "assistant complete-message mismatch turnID=\(turnID, privacy: .public) itemScoped=\(state.itemID != nil) emittedUTF8Length=\(emittedUTF8.count) completeUTF8Length=\(completeUTF8.count) action=ignored_non_prefix"
+                            )
+                            break
+                        }
+                        let suffix = String(decoding: completeUTF8.dropFirst(emittedUTF8.count), as: UTF8.self)
+                        state.text = message
+                        assistantEmittedTextByTurnID[turnID] = state
+                        if !suffix.isEmpty {
+                            await emit(.assistantDelta(suffix))
+                        }
+                        break
+                    }
+                    state.text = message
+                    assistantEmittedTextByTurnID[turnID] = state
                 }
                 await emit(.assistantDelta(message))
             }
@@ -2714,7 +2773,10 @@ final class CodexNativeSessionController {
         return firstString(in: params, keys: ["id"])
     }
 
-    private static func notificationItemID(from params: [String: Any]) -> String? {
+    private static func notificationItemID(
+        from params: [String: Any],
+        includeTopLevelIDFallback: Bool = true
+    ) -> String? {
         let itemIDKeys = ["id", "itemId", "item_id", "itemID", "callId", "call_id", "invocationId", "invocation_id"]
         if let item = params["item"] as? [String: Any],
            let itemID = firstString(in: item, keys: itemIDKeys)
@@ -2743,7 +2805,7 @@ final class CodexNativeSessionController {
         if let itemID = stringScalarValue(from: params["item"]) {
             return itemID
         }
-        return stringScalarValue(from: params["id"])
+        return includeTopLevelIDFallback ? stringScalarValue(from: params["id"]) : nil
     }
 
     private static func assistantMessageText(from params: [String: Any]) -> String? {
@@ -2864,6 +2926,7 @@ final class CodexNativeSessionController {
             activeTurnOrder = [authoritativeTurnID, routingTurnID].compactMap(\.self)
             pendingLifecycleAuthorityReconciliation = nil
             lifecycleAuthorityObservations.removeAll()
+            assistantEmittedTextByTurnID.removeAll(keepingCapacity: true)
         }
 
         func test_handleNotification(
