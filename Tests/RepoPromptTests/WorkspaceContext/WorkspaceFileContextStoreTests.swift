@@ -5741,6 +5741,56 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
     }
 
+    func testWorkspaceReadableFileServiceResolvesSymlinkedAlwaysReadableExternalFilesAndRejectsEscapes() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableSymlinkHome")
+        let realSkillsRoot = try makeTemporaryRoot(name: "ReadableSymlinkSkills")
+        let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: nominalSkillsRoot.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+
+        let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+        try write("symlinked skill body", to: realSkillFile)
+        let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+        let nominalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalSkillFile.path),
+            "nominal symlink-root support path should resolve as external"
+        )
+        XCTAssertEqual(nominalResolved.absolutePath, realSkillFile.path)
+        let nominalContent = try await service.readAlwaysReadableExternalFile(nominalResolved)
+        XCTAssertEqual(nominalContent, "symlinked skill body")
+
+        let canonicalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: realSkillFile.path),
+            "canonical support-root symlink target path should resolve as external"
+        )
+        XCTAssertEqual(canonicalResolved.absolutePath, realSkillFile.path)
+        let canonicalContent = try await service.readAlwaysReadableExternalFile(canonicalResolved)
+        XCTAssertEqual(canonicalContent, "symlinked skill body")
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableSymlinkOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("secret.md")
+        try write("outside", to: outsideFile)
+        let nestedEscape = realSkillsRoot.appendingPathComponent("example/escape", isDirectory: true)
+        try createDirectorySymlinkOrSkip(at: nestedEscape, destination: outsideRoot)
+        let nominalEscapedFile = nominalSkillsRoot.appendingPathComponent("example/escape/secret.md")
+
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalEscapedFile.path),
+            "nested symlink escape from an allowed support root should remain blocked"
+        )
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: outsideFile.path),
+            "canonical outside target should not become always-readable"
+        )
+    }
+
     @MainActor
     func testStoreBackedRootShellProjectionsPreserveIdentityWithoutMaterializingDescendants() async throws {
         do {
@@ -8078,6 +8128,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
     }
 
     private func setDiskModificationDate(_ date: Date, for url: URL) throws {
