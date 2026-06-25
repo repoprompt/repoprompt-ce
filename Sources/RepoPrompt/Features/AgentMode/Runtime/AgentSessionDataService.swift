@@ -1386,7 +1386,7 @@ actor AgentSessionDataService {
             if !FileManager.default.fileExists(atPath: root.path) {
                 try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
             }
-            let folderName = "Workspace-\(workspace.name)-\(workspace.id.uuidString)"
+            let folderName = WorkspaceDirectoryName.directoryName(name: workspace.name, id: workspace.id)
             let workspaceDir = root.appendingPathComponent(folderName)
             if !FileManager.default.fileExists(atPath: workspaceDir.path) {
                 try FileManager.default.createDirectory(at: workspaceDir, withIntermediateDirectories: true)

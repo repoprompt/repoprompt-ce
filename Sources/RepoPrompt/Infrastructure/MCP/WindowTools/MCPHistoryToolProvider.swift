@@ -80,33 +80,22 @@ final class MCPHistoryToolProvider: MCPWindowToolProviding {
                 required: ["op"]
             )
         ) { _, args in
-            let argsDict = Self.anyDictionary(from: args)
-            let response = try await HistoryMCPToolService.execute(args: argsDict, scanner: self.scannerFactory())
-            return try Self.value(from: response)
+            let reply = try await HistoryMCPToolService.execute(args: args, scanner: self.scannerFactory())
+            return try Self.encode(reply)
         }
     }
 
-    // MARK: - Value ↔ [String: Any] Conversion
+    // MARK: - Reply Encoding
 
-    private nonisolated static func anyDictionary(from args: [String: Value]) -> [String: Any] {
-        args.mapValues { rawAny(from: $0) }
-    }
-
-    private nonisolated static func rawAny(from value: Value) -> Any {
-        switch value {
-        case .null: NSNull()
-        case let .bool(b): b
-        case let .int(i): i
-        case let .double(d): d
-        case let .string(s): s
-        case .data: NSNull()
-        case let .array(a): a.map { rawAny(from: $0) }
-        case let .object(o): o.mapValues { rawAny(from: $0) }
+    /// Encode the typed ``HistoryToolReply`` to an MCP `Value` via `Value(dto)`, the
+    /// same path every sibling window-tool provider uses. Replaces the former
+    /// `[String: Any]` → `JSONSerialization` → `JSONDecoder(Value)` bridge.
+    private nonisolated static func encode(_ reply: HistoryToolReply) throws -> Value {
+        switch reply {
+        case let .listSessions(dto): try Value(dto)
+        case let .search(dto): try Value(dto)
+        case let .time(dto): try Value(dto)
+        case let .error(dto): try Value(dto)
         }
-    }
-
-    private nonisolated static func value(from dict: [String: Any]) throws -> Value {
-        let data = try JSONSerialization.data(withJSONObject: dict, options: [.sortedKeys])
-        return try JSONDecoder().decode(Value.self, from: data)
     }
 }

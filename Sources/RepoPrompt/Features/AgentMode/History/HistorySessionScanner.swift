@@ -246,7 +246,7 @@ actor HistorySessionScanner: HistorySessionScanning {
 
     private func scanWorkspace(_ workspaceDir: URL) -> HistoryWorkspaceScanResult {
         let dirName = workspaceDir.lastPathComponent
-        let (workspaceName, workspaceID) = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName)
+        let (workspaceName, workspaceID) = resolveWorkspaceNameAndID(from: workspaceDir, dirName: dirName, fileManager: fileManager)
 
         let agentSessionsDir = workspaceDir.appendingPathComponent("AgentSessions", isDirectory: true)
         guard fileManager.fileExists(atPath: agentSessionsDir.path) else {
@@ -314,11 +314,16 @@ actor HistorySessionScanner: HistorySessionScanning {
     }
 
     /// Resolve workspace name and ID from the directory.
-    /// Tries workspace.json first, then parses the `Workspace-{name}-{uuid}` directory name.
-    private nonisolated func resolveWorkspaceNameAndID(from workspaceDir: URL, dirName: String) -> (name: String, id: UUID?) {
+    /// Tries workspace.json first, then parses the `Workspace-{name}-{uuid}` directory name
+    /// via the shared ``WorkspaceDirectoryName`` parser.
+    private nonisolated func resolveWorkspaceNameAndID(
+        from workspaceDir: URL,
+        dirName: String,
+        fileManager: FileManager
+    ) -> (name: String, id: UUID?) {
         // Try reading workspace.json for the canonical name.
         let workspaceJSON = workspaceDir.appendingPathComponent("workspace.json")
-        if FileManager.default.fileExists(atPath: workspaceJSON.path) {
+        if fileManager.fileExists(atPath: workspaceJSON.path) {
             if let data = try? Data(contentsOf: workspaceJSON, options: .mappedIfSafe),
                let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let name = json["name"] as? String
@@ -329,37 +334,7 @@ actor HistorySessionScanner: HistorySessionScanning {
         }
 
         // Parse directory name: "Workspace-{name}-{uuid}" or fall back to directory name.
-        return parseWorkspaceDirName(dirName)
-    }
-
-    /// Parse a directory name like "Workspace-MyProject-A1B2C3D4-..." into (name, id).
-    /// Falls back to the raw directory name if parsing fails.
-    private nonisolated func parseWorkspaceDirName(_ dirName: String) -> (name: String, id: UUID?) {
-        guard dirName.hasPrefix("Workspace-") else {
-            return (name: dirName, id: nil)
-        }
-
-        let withoutPrefix = String(dirName.dropFirst("Workspace-".count))
-
-        // The UUID is the last hyphen-delimited segment that parses as a UUID.
-        // Workspace names may contain hyphens, so scan from the end.
-        let components = withoutPrefix.components(separatedBy: "-")
-        for i in stride(from: components.count - 1, through: 1, by: -1) {
-            // UUID format: 8-4-4-4-12 = 5 components joined by hyphens
-            let potentialUUID = components[i...].joined(separator: "-")
-            if let uuid = UUID(uuidString: potentialUUID) {
-                let namePart = components[..<i].joined(separator: "-")
-                return (name: namePart.isEmpty ? dirName : namePart, id: uuid)
-            }
-        }
-
-        // Try the last component alone as a simple UUID (no hyphens in name).
-        if let last = components.last, let uuid = UUID(uuidString: last) {
-            let namePart = components.dropLast().joined(separator: "-")
-            return (name: namePart.isEmpty ? dirName : namePart, id: uuid)
-        }
-
-        return (name: withoutPrefix, id: nil)
+        return WorkspaceDirectoryName.parse(dirName)
     }
 
     /// Produce a human-readable description from a DecodingError for error reporting.

@@ -36,57 +36,60 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions", "limit": 10],
             scanner: scanner
         )
-        XCTAssertEqual(listResult["total_sessions"] as? Int, 3)
-        let sessions = try sessionRows(listResult)
+        let listDTO = try listReply(listResult)
+        XCTAssertEqual(listDTO.totalSessions, 3)
+        let sessions = listDTO.sessions
 
-        let toolRow = try XCTUnwrap(row(named: "Raw Tool Execution Session", in: sessions))
-        XCTAssertEqual(toolRow["files_touched"] as? [String], ["src/api/register.ts", "src/logging/log.ts"])
-        XCTAssertEqual(toolRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawToolExecutionFixture.expectedDurationSeconds)
-        XCTAssertEqual(toolRow["tool_call_count"] as? Int, HistoryTestFixture.rawToolExecutionFixture.expectedToolCallCount)
+        let toolRow = try session(sessions, named: "Raw Tool Execution Session")
+        XCTAssertEqual(toolRow.filesTouched, ["src/api/register.ts", "src/logging/log.ts"])
+        XCTAssertEqual(toolRow.activeDurationSeconds, HistoryTestFixture.rawToolExecutionFixture.expectedDurationSeconds)
+        XCTAssertEqual(toolRow.toolCallCount, HistoryTestFixture.rawToolExecutionFixture.expectedToolCallCount)
         assertActivityBounds(
             toolRow,
             first: HistoryTestFixture.rawToolExecutionFixture.expectedFirstActivityAt,
             last: HistoryTestFixture.rawToolExecutionFixture.expectedLastActivityAt
         )
 
-        let startedOnlyRow = try XCTUnwrap(row(named: "Raw StartedAt Only Session", in: sessions))
-        XCTAssertEqual(startedOnlyRow["files_touched"] as? [String], [])
-        XCTAssertEqual(startedOnlyRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawStartedAtOnlyFixture.expectedDurationSeconds)
-        XCTAssertEqual(startedOnlyRow["tool_call_count"] as? Int, 0)
+        let startedOnlyRow = try session(sessions, named: "Raw StartedAt Only Session")
+        XCTAssertEqual(startedOnlyRow.filesTouched, [])
+        XCTAssertEqual(startedOnlyRow.activeDurationSeconds, HistoryTestFixture.rawStartedAtOnlyFixture.expectedDurationSeconds)
+        XCTAssertEqual(startedOnlyRow.toolCallCount, 0)
         assertActivityBounds(
             startedOnlyRow,
             first: HistoryTestFixture.rawStartedAtOnlyFixture.expectedFirstActivityAt,
             last: HistoryTestFixture.rawStartedAtOnlyFixture.expectedLastActivityAt
         )
 
-        let summaryRow = try XCTUnwrap(row(named: "Raw Compacted Summary Session", in: sessions))
-        XCTAssertEqual(summaryRow["files_touched"] as? [String], ["Sources/History/RawSummary.swift"])
-        XCTAssertEqual(summaryRow["active_duration_seconds"] as? Int, HistoryTestFixture.rawCompactedSummaryFixture.expectedDurationSeconds)
-        XCTAssertEqual(summaryRow["tool_call_count"] as? Int, HistoryTestFixture.rawCompactedSummaryFixture.expectedToolCallCount)
+        let summaryRow = try session(sessions, named: "Raw Compacted Summary Session")
+        XCTAssertEqual(summaryRow.filesTouched, ["Sources/History/RawSummary.swift"])
+        XCTAssertEqual(summaryRow.activeDurationSeconds, HistoryTestFixture.rawCompactedSummaryFixture.expectedDurationSeconds)
+        XCTAssertEqual(summaryRow.toolCallCount, HistoryTestFixture.rawCompactedSummaryFixture.expectedToolCallCount)
 
         let activitySearch = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "raw persisted logging"],
             scanner: scanner
         )
-        XCTAssertEqual(activitySearch["total_matches"] as? Int, 1)
-        XCTAssertEqual(try searchRows(activitySearch).first?["source"] as? String, "activity")
+        let activityDTO = try searchReply(activitySearch)
+        XCTAssertEqual(activityDTO.totalMatches, 1)
+        XCTAssertEqual(activityDTO.results.first?.source, "activity")
 
         let summarySearch = try await HistoryMCPToolService.execute(
             args: ["op": "search", "query": "raw summary keyword"],
             scanner: scanner
         )
-        XCTAssertEqual(summarySearch["total_matches"] as? Int, 1)
-        XCTAssertEqual(try searchRows(summarySearch).first?["source"] as? String, "summary")
+        let summarySearchDTO = try searchReply(summarySearch)
+        XCTAssertEqual(summarySearchDTO.totalMatches, 1)
+        XCTAssertEqual(summarySearchDTO.results.first?.source, "summary")
 
         let timeResult = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "workspace"],
             scanner: scanner
         )
-        XCTAssertEqual(timeResult["total_active_duration_seconds"] as? Int, 410)
-        let groups = try groupRows(timeResult)
-        let rawGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "RawFixtureProject" })
-        XCTAssertEqual(rawGroup["sessions"] as? Int, 3)
-        XCTAssertEqual(rawGroup["tool_call_count"] as? Int, 6)
+        let timeDTO = try timeReply(timeResult)
+        XCTAssertEqual(timeDTO.totalActiveDurationSeconds, 410)
+        let rawGroup = try XCTUnwrap(timeDTO.groups.first { $0.key == "RawFixtureProject" })
+        XCTAssertEqual(rawGroup.sessions, 3)
+        XCTAssertEqual(rawGroup.toolCallCount, 6)
     }
 
     func testListSessions_crossWorkspace_readsGeneratedIndexes() async throws {
@@ -109,13 +112,13 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: scanner
         )
+        let dto = try listReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 2)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        let sessions = try sessionRows(result)
-        XCTAssertEqual(Set(sessions.compactMap { $0["workspace_name"] as? String }), ["ProjectAlpha", "ProjectBeta"])
-        XCTAssertEqual(row(named: "Alpha Session", in: sessions)?["session_id"] as? String, alphaSession.id.uuidString)
-        XCTAssertEqual(row(named: "Beta Session", in: sessions)?["session_id"] as? String, betaSession.id.uuidString)
+        XCTAssertEqual(dto.totalSessions, 2)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(Set(dto.sessions.map(\.workspaceName)), ["ProjectAlpha", "ProjectBeta"])
+        XCTAssertEqual(try session(dto.sessions, named: "Alpha Session").sessionID, alphaSession.id.uuidString)
+        XCTAssertEqual(try session(dto.sessions, named: "Beta Session").sessionID, betaSession.id.uuidString)
     }
 
     func testListSessions_workspaceFilterMatchesDirectoryNameWhenMetadataNameDiffers() async throws {
@@ -133,11 +136,12 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions", "workspace": "DirectoryOnlyProject"],
             scanner: scanner
         )
+        let dto = try listReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        let sessions = try sessionRows(result)
-        XCTAssertEqual(sessions.first?["session_name"] as? String, "Directory Filter Match")
-        XCTAssertEqual(sessions.first?["workspace_name"] as? String, "Display Name From Workspace JSON")
+        XCTAssertEqual(dto.totalSessions, 1)
+        let row = try XCTUnwrap(dto.sessions.first)
+        XCTAssertEqual(row.sessionName, "Directory Filter Match")
+        XCTAssertEqual(row.workspaceName, "Display Name From Workspace JSON")
     }
 
     func testListSessions_metadataDerivedFromRealSessionFiles() async throws {
@@ -172,24 +176,24 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions", "limit": 10],
             scanner: scanner
         )
-        let sessions = try sessionRows(result)
+        let sessions = try listReply(result).sessions
 
-        let editedRow = try XCTUnwrap(row(named: "Edited Files", in: sessions))
-        XCTAssertEqual(editedRow["files_touched"] as? [String], ["Sources/Bar.swift", "Sources/Foo.swift"])
-        XCTAssertEqual(editedRow["active_duration_seconds"] as? Int, edited.expectedDurationSeconds)
-        XCTAssertEqual(editedRow["tool_call_count"] as? Int, edited.expectedToolCallCount)
+        let editedRow = try session(sessions, named: "Edited Files")
+        XCTAssertEqual(editedRow.filesTouched, ["Sources/Bar.swift", "Sources/Foo.swift"])
+        XCTAssertEqual(editedRow.activeDurationSeconds, edited.expectedDurationSeconds)
+        XCTAssertEqual(editedRow.toolCallCount, edited.expectedToolCallCount)
         assertActivityBounds(editedRow, first: edited.expectedFirstActivityAt, last: edited.expectedLastActivityAt)
 
-        let compactedRow = try XCTUnwrap(row(named: "Compacted Summary", in: sessions))
-        XCTAssertEqual(compactedRow["files_touched"] as? [String], ["Docs/History.md"])
-        XCTAssertEqual(compactedRow["tool_call_count"] as? Int, compacted.expectedToolCallCount)
+        let compactedRow = try session(sessions, named: "Compacted Summary")
+        XCTAssertEqual(compactedRow.filesTouched, ["Docs/History.md"])
+        XCTAssertEqual(compactedRow.toolCallCount, compacted.expectedToolCallCount)
 
-        let startedOnlyRow = try XCTUnwrap(row(named: "StartedAt Only", in: sessions))
-        XCTAssertEqual(startedOnlyRow["active_duration_seconds"] as? Int, startedOnly.expectedDurationSeconds)
+        let startedOnlyRow = try session(sessions, named: "StartedAt Only")
+        XCTAssertEqual(startedOnlyRow.activeDurationSeconds, startedOnly.expectedDurationSeconds)
         assertActivityBounds(startedOnlyRow, first: startedOnly.expectedFirstActivityAt, last: startedOnly.expectedLastActivityAt)
 
-        let failedRow = try XCTUnwrap(row(named: "Failed Session", in: sessions))
-        XCTAssertEqual(failedRow["last_run_state"] as? String, "failed")
+        let failedRow = try session(sessions, named: "Failed Session")
+        XCTAssertEqual(failedRow.lastRunState, "failed")
     }
 
     func testListSessions_touchedFileFilterUsesIndexedToolExecutionKeyPaths() async throws {
@@ -210,11 +214,12 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions", "touched_file": "Package.swift"],
             scanner: scanner
         )
+        let dto = try listReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        let sessions = try sessionRows(result)
-        XCTAssertEqual(sessions.first?["session_name"] as? String, "Match")
-        XCTAssertEqual(sessions.first?["files_touched"] as? [String], ["Package.swift", "Sources/App.swift"])
+        XCTAssertEqual(dto.totalSessions, 1)
+        let row = try XCTUnwrap(dto.sessions.first)
+        XCTAssertEqual(row.sessionName, "Match")
+        XCTAssertEqual(row.filesTouched, ["Package.swift", "Sources/App.swift"])
     }
 
     func testSearch_matchesActivityAndCompactedSummaryFromSessionFiles() async throws {
@@ -234,11 +239,11 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "search", "query": "database connection pool"],
             scanner: scanner
         )
+        let dto = try searchReply(result)
 
-        XCTAssertEqual(result["total_matches"] as? Int, 2)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        let results = try searchRows(result)
-        XCTAssertEqual(Set(results.compactMap { $0["source"] as? String }), ["activity", "summary"])
+        XCTAssertEqual(dto.totalMatches, 2)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(Set(dto.results.map(\.source)), ["activity", "summary"])
     }
 
     func testSearch_dedupPrefersActivityWhenActivityAndSummaryMatchSameTurn() async throws {
@@ -254,10 +259,10 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "search", "query": "unique_search_term_xyz"],
             scanner: scanner
         )
+        let dto = try searchReply(result)
 
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-        let rows = try searchRows(result)
-        XCTAssertEqual(rows.first?["source"] as? String, "activity")
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results.first?.source, "activity")
     }
 
     func testSearch_snippetExtractionUsesBoundedContext() async throws {
@@ -271,9 +276,9 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "search", "query": "FINDME_KEYWORD_12345"],
             scanner: scanner
         )
+        let dto = try searchReply(result)
 
-        let rows = try searchRows(result)
-        let snippet = try XCTUnwrap(rows.first?["snippet"] as? String)
+        let snippet = try XCTUnwrap(dto.results.first?.snippet)
         XCTAssertTrue(snippet.contains("FINDME_KEYWORD_12345"))
         XCTAssertLessThanOrEqual(snippet.count, 250)
         XCTAssertGreaterThanOrEqual(snippet.count, 100)
@@ -289,10 +294,11 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "search", "query": "this_query_matches_nothing_at_all"],
             scanner: scanner
         )
+        let dto = try searchReply(result)
 
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        XCTAssertEqual(try searchRows(result).count, 0)
+        XCTAssertEqual(dto.totalMatches, 0)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(dto.results.count, 0)
     }
 
     func testTime_groupedByDayAggregatesDurationAndToolCalls() async throws {
@@ -308,22 +314,22 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "time", "group_by": "day"],
             scanner: scanner
         )
+        let dto = try timeReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 3)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 600)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        let groups = try groupRows(result)
-        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(dto.totalSessions, 3)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 600)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(dto.groups.count, 2)
 
-        let day2Group = try XCTUnwrap(groups.first { ($0["key"] as? String)?.hasPrefix("2026-06-09") == true })
-        XCTAssertEqual(day2Group["sessions"] as? Int, 1)
-        XCTAssertEqual(day2Group["active_duration_seconds"] as? Int, 300)
-        XCTAssertEqual(day2Group["tool_call_count"] as? Int, 3)
+        let day2Group = try XCTUnwrap(dto.groups.first { $0.key.hasPrefix("2026-06-09") })
+        XCTAssertEqual(day2Group.sessions, 1)
+        XCTAssertEqual(day2Group.activeDurationSeconds, 300)
+        XCTAssertEqual(day2Group.toolCallCount, 3)
 
-        let day1Group = try XCTUnwrap(groups.first { ($0["key"] as? String)?.hasPrefix("2026-06-08") == true })
-        XCTAssertEqual(day1Group["sessions"] as? Int, 2)
-        XCTAssertEqual(day1Group["active_duration_seconds"] as? Int, 300)
-        XCTAssertEqual(day1Group["tool_call_count"] as? Int, 3)
+        let day1Group = try XCTUnwrap(dto.groups.first { $0.key.hasPrefix("2026-06-08") })
+        XCTAssertEqual(day1Group.sessions, 2)
+        XCTAssertEqual(day1Group.activeDurationSeconds, 300)
+        XCTAssertEqual(day1Group.toolCallCount, 3)
     }
 
     func testTime_groupedByWorkspaceAggregatesGeneratedMetadata() async throws {
@@ -339,20 +345,21 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "time", "group_by": "workspace"],
             scanner: scanner
         )
+        let dto = try timeReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 3)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 700)
-        let groups = try groupRows(result)
+        XCTAssertEqual(dto.totalSessions, 3)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 700)
+        let groups = dto.groups
 
-        let backendGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "Backend" })
-        XCTAssertEqual(backendGroup["sessions"] as? Int, 1)
-        XCTAssertEqual(backendGroup["active_duration_seconds"] as? Int, 400)
-        XCTAssertEqual(backendGroup["tool_call_count"] as? Int, 1)
+        let backendGroup = try XCTUnwrap(groups.first { $0.key == "Backend" })
+        XCTAssertEqual(backendGroup.sessions, 1)
+        XCTAssertEqual(backendGroup.activeDurationSeconds, 400)
+        XCTAssertEqual(backendGroup.toolCallCount, 1)
 
-        let frontendGroup = try XCTUnwrap(groups.first { $0["key"] as? String == "Frontend" })
-        XCTAssertEqual(frontendGroup["sessions"] as? Int, 2)
-        XCTAssertEqual(frontendGroup["active_duration_seconds"] as? Int, 300)
-        XCTAssertEqual(frontendGroup["tool_call_count"] as? Int, 5)
+        let frontendGroup = try XCTUnwrap(groups.first { $0.key == "Frontend" })
+        XCTAssertEqual(frontendGroup.sessions, 2)
+        XCTAssertEqual(frontendGroup.activeDurationSeconds, 300)
+        XCTAssertEqual(frontendGroup.toolCallCount, 5)
     }
 
     func testTime_sessionFilterWithDetails() async throws {
@@ -366,19 +373,20 @@ final class HistoryIntegrationTests: XCTestCase {
                 "op": "time",
                 "group_by": "session",
                 "include_details": true,
-                "session_id": target.id.uuidString
+                "session_id": .string(target.id.uuidString)
             ],
             scanner: scanner
         )
+        let dto = try timeReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 75)
-        let groups = try groupRows(result)
-        XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups.first?["key"] as? String, target.id.uuidString)
-        XCTAssertEqual(groups.first?["tool_call_count"] as? Int, 2)
-        let details = try XCTUnwrap(groups.first?["details"] as? [[String: Any]])
-        XCTAssertEqual(details.first?["session_name"] as? String, "Target")
+        XCTAssertEqual(dto.totalSessions, 1)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 75)
+        XCTAssertEqual(dto.groups.count, 1)
+        let group = try XCTUnwrap(dto.groups.first)
+        XCTAssertEqual(group.key, target.id.uuidString)
+        XCTAssertEqual(group.toolCallCount, 2)
+        let details = try XCTUnwrap(group.details)
+        XCTAssertEqual(details.first?.sessionName, "Target")
     }
 
     func testListSessions_emptyResultSet() async throws {
@@ -388,37 +396,41 @@ final class HistoryIntegrationTests: XCTestCase {
             args: ["op": "list_sessions", "workspace": "NonExistent"],
             scanner: scanner
         )
+        let dto = try listReply(result)
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 0)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        XCTAssertEqual(try sessionRows(result).count, 0)
+        XCTAssertEqual(dto.totalSessions, 0)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(dto.sessions.count, 0)
     }
 
     // MARK: - Helpers
 
-    private func sessionRows(_ result: [String: Any]) throws -> [[String: Any]] {
-        try XCTUnwrap(result["sessions"] as? [[String: Any]])
+    private func listReply(_ reply: HistoryToolReply) throws -> HistoryListSessionsReply {
+        if case let .listSessions(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistoryListSessionsReply?, "expected .listSessions reply, got \(reply)")
     }
 
-    private func searchRows(_ result: [String: Any]) throws -> [[String: Any]] {
-        try XCTUnwrap(result["results"] as? [[String: Any]])
+    private func searchReply(_ reply: HistoryToolReply) throws -> HistorySearchReply {
+        if case let .search(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistorySearchReply?, "expected .search reply, got \(reply)")
     }
 
-    private func groupRows(_ result: [String: Any]) throws -> [[String: Any]] {
-        try XCTUnwrap(result["groups"] as? [[String: Any]])
+    private func timeReply(_ reply: HistoryToolReply) throws -> HistoryTimeReply {
+        if case let .time(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistoryTimeReply?, "expected .time reply, got \(reply)")
     }
 
-    private func row(named name: String, in rows: [[String: Any]]) -> [String: Any]? {
-        rows.first { $0["session_name"] as? String == name }
+    private func session(_ sessions: [HistoryListSessionsReply.SessionDTO], named name: String) throws -> HistoryListSessionsReply.SessionDTO {
+        try XCTUnwrap(sessions.first { $0.sessionName == name }, "no session named \(name)")
     }
 
-    private func assertActivityBounds(_ row: [String: Any], first: Date?, last: Date?) {
+    private func assertActivityBounds(_ session: HistoryListSessionsReply.SessionDTO, first: Date?, last: Date?) {
         let formatter = ISO8601DateFormatter()
         if let first {
-            XCTAssertEqual(row["first_activity_at"] as? String, formatter.string(from: first))
+            XCTAssertEqual(session.firstActivityAt, formatter.string(from: first))
         }
         if let last {
-            XCTAssertEqual(row["last_activity_at"] as? String, formatter.string(from: last))
+            XCTAssertEqual(session.lastActivityAt, formatter.string(from: last))
         }
     }
 

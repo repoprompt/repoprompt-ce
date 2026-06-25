@@ -1,4 +1,5 @@
 import Foundation
+import MCP
 @testable import RepoPrompt
 import XCTest
 
@@ -21,17 +22,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     func testExecute_missingOp_returnsError() async throws {
         let result = try await HistoryMCPToolService.execute(args: [:], scanner: mockScanner)
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'op'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'op'")
     }
 
     func testExecute_emptyOp_returnsError() async throws {
         let result = try await HistoryMCPToolService.execute(args: ["op": ""], scanner: mockScanner)
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'op'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'op'")
     }
 
     func testExecute_unknownOp_returnsError() async throws {
         let result = try await HistoryMCPToolService.execute(args: ["op": "unknown"], scanner: mockScanner)
-        XCTAssertEqual(result["error"] as? String, "Unknown op 'unknown'. Valid ops: list_sessions, search, time")
+        XCTAssertEqual(try errorReply(result), "Unknown op 'unknown'. Valid ops: list_sessions, search, time")
     }
 
     // MARK: - list_sessions
@@ -42,9 +43,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 0)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        XCTAssertEqual((result["sessions"] as? [[String: Any]])?.count, 0)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.totalSessions, 0)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(dto.sessions.count, 0)
     }
 
     func testListSessions_returnsAllFields() async throws {
@@ -55,21 +57,21 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?.count, 1)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.count, 1)
 
-        let session = try XCTUnwrap(sessions?[0])
-        XCTAssertEqual(session["session_id"] as? String, record.id.uuidString)
-        XCTAssertEqual(session["session_name"] as? String, "Test Session")
-        XCTAssertEqual(session["workspace_name"] as? String, "TestWorkspace")
-        XCTAssertEqual(session["agent_kind"] as? String, "claudeCode")
-        XCTAssertEqual(session["agent_model"] as? String, "claude-sonnet-4")
-        XCTAssertEqual(session["active_duration_seconds"] as? Int, 0)
-        XCTAssertEqual(session["turn_count"] as? Int, 1)
-        XCTAssertEqual(session["tool_call_count"] as? Int, 0)
-        XCTAssertEqual(session["had_errors"] as? Bool, false)
-        XCTAssertNotNil(session["first_activity_at"])
-        XCTAssertNotNil(session["last_activity_at"])
+        let session = try XCTUnwrap(dto.sessions.first)
+        XCTAssertEqual(session.sessionID, record.id.uuidString)
+        XCTAssertEqual(session.sessionName, "Test Session")
+        XCTAssertEqual(session.workspaceName, "TestWorkspace")
+        XCTAssertEqual(session.agentKind, "claudeCode")
+        XCTAssertEqual(session.agentModel, "claude-sonnet-4")
+        XCTAssertEqual(session.activeDurationSeconds, 0)
+        XCTAssertEqual(session.turnCount, 1)
+        XCTAssertEqual(session.toolCallCount, 0)
+        XCTAssertEqual(session.hadErrors, false)
+        XCTAssertFalse(session.firstActivityAt.isEmpty)
+        XCTAssertFalse(session.lastActivityAt.isEmpty)
     }
 
     func testListSessions_truncation() async throws {
@@ -80,9 +82,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "limit": 20],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 50)
-        XCTAssertEqual(result["truncated"] as? Bool, true)
-        XCTAssertEqual((result["sessions"] as? [[String: Any]])?.count, 20)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.totalSessions, 50)
+        XCTAssertEqual(dto.truncated, true)
+        XCTAssertEqual(dto.sessions.count, 20)
     }
 
     func testListSessions_defaultLimit() async throws {
@@ -94,9 +97,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 50)
-        XCTAssertEqual(result["truncated"] as? Bool, true)
-        XCTAssertEqual((result["sessions"] as? [[String: Any]])?.count, 30)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.totalSessions, 50)
+        XCTAssertEqual(dto.truncated, true)
+        XCTAssertEqual(dto.sessions.count, 30)
     }
 
     func testListSessions_maxLimit100() async throws {
@@ -107,8 +111,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "limit": 200],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["truncated"] as? Bool, true)
-        XCTAssertEqual((result["sessions"] as? [[String: Any]])?.count, 100)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.truncated, true)
+        XCTAssertEqual(dto.sessions.count, 100)
     }
 
     func testListSessions_sortByDuration() async throws {
@@ -120,9 +125,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "sort": "duration"],
             scanner: mockScanner
         )
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?[0]["session_name"] as? String, "Long")
-        XCTAssertEqual(sessions?[1]["session_name"] as? String, "Short")
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions[0].sessionName, "Long")
+        XCTAssertEqual(dto.sessions[1].sessionName, "Short")
     }
 
     func testListSessions_invalidSort_returnsError() async throws {
@@ -131,7 +136,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "sort": "bogus"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Invalid 'sort' value 'bogus'. Valid values: last_activity, duration, turn_count")
+        XCTAssertEqual(try errorReply(result), "Invalid 'sort' value 'bogus'. Valid values: last_activity, duration, turn_count")
     }
 
     func testListSessions_sortByTurnCount() async throws {
@@ -143,9 +148,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "sort": "turn_count"],
             scanner: mockScanner
         )
-        let sessions = result["sessions"] as? [[String: Any]]
-        XCTAssertEqual(sessions?[0]["session_name"] as? String, "Many")
-        XCTAssertEqual(sessions?[1]["session_name"] as? String, "Few")
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions[0].sessionName, "Many")
+        XCTAssertEqual(dto.sessions[1].sessionName, "Few")
     }
 
     func testListSessions_filesTouched() async throws {
@@ -156,9 +161,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let session = (result["sessions"] as? [[String: Any]])?.first
-        let files = session?["files_touched"] as? [String]
-        XCTAssertEqual(files, ["lib/utils.swift", "src/main.swift"]) // sorted
+        let dto = try listReply(result)
+        let session = try XCTUnwrap(dto.sessions.first)
+        XCTAssertEqual(session.filesTouched, ["lib/utils.swift", "src/main.swift"]) // sorted
     }
 
     func testListSessions_lastRunState() async throws {
@@ -169,8 +174,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let session = (result["sessions"] as? [[String: Any]])?.first
-        XCTAssertEqual(session?["last_run_state"] as? String, "completed")
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.first?.lastRunState, "completed")
     }
 
     func testListSessions_defaultSortsByLastActivityDescending() async throws {
@@ -182,10 +187,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let sessions = result["sessions"] as? [[String: Any]]
+        let dto = try listReply(result)
         // Default sort is last_activity descending — newest first.
-        XCTAssertEqual(sessions?[0]["session_name"] as? String, "New")
-        XCTAssertEqual(sessions?[1]["session_name"] as? String, "Old")
+        XCTAssertEqual(dto.sessions[0].sessionName, "New")
+        XCTAssertEqual(dto.sessions[1].sessionName, "Old")
     }
 
     func testListSessions_timestampsUseIndexedActivityBounds() async throws {
@@ -203,10 +208,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let session = (result["sessions"] as? [[String: Any]])?.first
+        let dto = try listReply(result)
+        let session = try XCTUnwrap(dto.sessions.first)
         let formatter = ISO8601DateFormatter()
-        XCTAssertEqual(session?["first_activity_at"] as? String, formatter.string(from: firstActivity))
-        XCTAssertEqual(session?["last_activity_at"] as? String, formatter.string(from: lastActivity))
+        XCTAssertEqual(session.firstActivityAt, formatter.string(from: firstActivity))
+        XCTAssertEqual(session.lastActivityAt, formatter.string(from: lastActivity))
     }
 
     func testListSessions_toolCallCountFromMetadata() async throws {
@@ -217,8 +223,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let session = (result["sessions"] as? [[String: Any]])?.first
-        XCTAssertEqual(session?["tool_call_count"] as? Int, 7)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.first?.toolCallCount, 7)
     }
 
     func testListSessions_hadErrorsTrue() async throws {
@@ -229,8 +235,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions"],
             scanner: mockScanner
         )
-        let session = (result["sessions"] as? [[String: Any]])?.first
-        XCTAssertEqual(session?["had_errors"] as? Bool, true)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.first?.hadErrors, true)
     }
 
     func testListSessions_passesMetadataFiltersToScanner() async throws {
@@ -250,14 +256,15 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
 
-        XCTAssertEqual(result["total_sessions"] as? Int, 1)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.totalSessions, 1)
         let request = try XCTUnwrap(mockScanner.filterRequests.first)
         XCTAssertEqual(request.workspace, "FilterWorkspace")
         XCTAssertEqual(request.agentKind, "claude")
         XCTAssertEqual(request.model, "sonnet")
         XCTAssertEqual(request.filePath, "Sources/App.swift")
-        XCTAssertEqual(request.from, HistoryMCPToolService.parseDate("2026-06-10T12:00:00Z"))
-        XCTAssertEqual(request.to, HistoryMCPToolService.parseDate("2026-06-11T12:00:00Z"))
+        XCTAssertEqual(request.from, HistoryMCPToolService.parseDateBound("2026-06-10T12:00:00Z", isUpperBound: false))
+        XCTAssertEqual(request.to, HistoryMCPToolService.parseDateBound("2026-06-11T12:00:00Z", isUpperBound: true))
     }
 
     // MARK: - search
@@ -267,7 +274,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'query'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'query'")
     }
 
     func testSearch_emptyQuery_returnsError() async throws {
@@ -275,7 +282,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": ""],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'query'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'query'")
     }
 
     func testSearch_whitespaceOnlyQuery_returnsError() async throws {
@@ -283,7 +290,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "   \t  "],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'query'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'query'")
     }
 
     func testSearch_invalidSource_returnsError() async throws {
@@ -291,7 +298,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "test", "source": "bogus"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Invalid 'source' value 'bogus'. Valid values: activities, summaries, all")
+        XCTAssertEqual(try errorReply(result), "Invalid 'source' value 'bogus'. Valid values: activities, summaries, all")
     }
 
     func testSearch_noMatches() async throws {
@@ -303,9 +310,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "nonexistent"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
-        XCTAssertEqual((result["results"] as? [[String: Any]])?.count, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 0)
+        XCTAssertEqual(dto.truncated, false)
+        XCTAssertEqual(dto.results.count, 0)
     }
 
     func testSearch_matchesActivityText() async throws {
@@ -341,13 +349,12 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "regression test"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
-        XCTAssertEqual(results?[0]["source"] as? String, "activity")
-        XCTAssertEqual(results?[0]["role"] as? String, "assistant")
-        XCTAssertEqual(results?[0]["turn_index"] as? Int, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results.count, 1)
+        XCTAssertEqual(dto.results[0].source, "activity")
+        XCTAssertEqual(dto.results[0].role, "assistant")
+        XCTAssertEqual(dto.results[0].turnIndex, 0)
     }
 
     func testSearch_matchesSummaryText_compactConclusion() async throws {
@@ -379,9 +386,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "rate limiting"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?[0]["source"] as? String, "summary")
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results[0].source, "summary")
     }
 
     func testSearch_matchesConclusionText_beyondCompactTruncation() async throws {
@@ -416,10 +423,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "critical regression test"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?[0]["source"] as? String, "summary")
-        XCTAssertNotNil(results?[0]["snippet"] as? String)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results[0].source, "summary")
+        XCTAssertFalse(dto.results[0].snippet.isEmpty)
     }
 
     func testSearch_dedup_activityTakesPriority() async throws {
@@ -468,9 +475,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "regression test"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?[0]["source"] as? String, "activity")
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results[0].source, "activity")
     }
 
     func testSearch_sourceFilterActivities() async throws {
@@ -501,7 +508,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "rate limiting", "source": "activities"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 0)
     }
 
     func testSearch_sourceFilterSummaries() async throws {
@@ -538,7 +546,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "rate limiting", "source": "summaries"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 0)
     }
 
     func testSearch_truncation() async throws {
@@ -571,9 +580,46 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "unicorn", "limit": 10],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 30)
-        XCTAssertEqual(result["truncated"] as? Bool, true)
-        XCTAssertEqual((result["results"] as? [[String: Any]])?.count, 10)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 30)
+        XCTAssertEqual(dto.truncated, true)
+        XCTAssertEqual(dto.results.count, 10)
+    }
+
+    func testSearch_scanCapBoundsTranscriptsScanned() async throws {
+        // Defect: a broad query must not decode every filtered session transcript.
+        // `limit` caps matches, not work; the scan cap bounds transcripts decoded and
+        // surfaces `scan_truncated` when hit.
+        let records = (0 ..< 250).map { makeRecord(name: "S\($0)") }
+        mockScanner.scanResults = [makeScanResult(records: records)]
+
+        var loadCount = 0
+        mockScanner.transcriptProvider = { _ in
+            loadCount += 1
+            return .empty
+        }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "anything"],
+            scanner: mockScanner
+        )
+        let dto = try searchReply(result)
+        XCTAssertTrue(dto.scanTruncated, "scan_truncated must be set when the scan cap is reached")
+        XCTAssertEqual(loadCount, 200, "should decode at most maxSessionsScanned transcripts")
+    }
+
+    func testSearch_scanCapNotHitWhenFewerSessions() async throws {
+        // Under the cap, scan_truncated is false even if the match limit truncates.
+        let record = makeRecord(name: "S1")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in .empty }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "search", "query": "anything"],
+            scanner: mockScanner
+        )
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.scanTruncated, false)
     }
 
     func testSearch_bySessionID() async throws {
@@ -628,10 +674,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         }
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "search", "query": "unicorn", "session_id": targetID.uuidString],
+            args: ["op": "search", "query": "unicorn", "session_id": .string(targetID.uuidString)],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
         XCTAssertEqual(loadCount, 1, "Should only load transcript for the filtered session")
     }
 
@@ -674,10 +721,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
         // Failed session is skipped; OK session still returns its match.
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
-        XCTAssertEqual(results?[0]["session_name"] as? String, "OKSession")
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
+        XCTAssertEqual(dto.results.count, 1)
+        XCTAssertEqual(dto.results[0].sessionName, "OKSession")
     }
 
     // MARK: - search response fields
@@ -726,9 +773,9 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "rate limiting bug"],
             scanner: mockScanner
         )
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
-        XCTAssertEqual(results?[0]["turn_request_text"] as? String, "Find all rate limiting bugs")
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.results.count, 1)
+        XCTAssertEqual(dto.results[0].turnRequestText, "Find all rate limiting bugs")
     }
 
     func testSearch_turnRequestTextNilWhenNoRequest() async throws {
@@ -765,10 +812,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "dragonfruit"],
             scanner: mockScanner
         )
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?.count, 1)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.results.count, 1)
         // turn_request_text is nil for turns without a user request.
-        XCTAssertEqual(results?[0]["turn_request_text"] as? String, nil)
+        XCTAssertEqual(dto.results[0].turnRequestText, nil)
     }
 
     // MARK: - role mapping
@@ -805,8 +852,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "magic token"],
             scanner: mockScanner
         )
-        let results = result["results"] as? [[String: Any]]
-        XCTAssertEqual(results?[0]["role"] as? String, "tool")
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.results[0].role, "tool")
     }
 
     func testSearch_caseInsensitive() async throws {
@@ -835,7 +882,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "rate limiting"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 1)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 1)
     }
 
     func testSearch_multipleTurnsInSession() async throws {
@@ -866,7 +914,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "dragonfruit"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_matches"] as? Int, 3)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 3)
     }
 
     // MARK: - time
@@ -886,10 +935,11 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
 
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 0)
         let request = try XCTUnwrap(mockScanner.filterRequests.first)
-        XCTAssertEqual(request.from, HistoryMCPToolService.parseDate("2026-01-15T00:00:00Z"))
-        XCTAssertEqual(request.to, HistoryMCPToolService.parseDate("2026-01-20T00:00:00Z"))
+        XCTAssertEqual(request.from, HistoryMCPToolService.parseDateBound("2026-01-15T00:00:00Z", isUpperBound: false))
+        XCTAssertEqual(request.to, HistoryMCPToolService.parseDateBound("2026-01-20T00:00:00Z", isUpperBound: true))
         // search passes nil for agentKind, model, filePath
         XCTAssertNil(request.agentKind)
         XCTAssertNil(request.model)
@@ -910,7 +960,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             scanner: mockScanner
         )
 
-        XCTAssertEqual(result["total_matches"] as? Int, 0)
+        let dto = try searchReply(result)
+        XCTAssertEqual(dto.totalMatches, 0)
         let request = try XCTUnwrap(mockScanner.filterRequests.first)
         XCTAssertEqual(request.workspace, "MyProject")
     }
@@ -920,8 +971,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "search", "query": "test", "session_id": "not-a-uuid"],
             scanner: mockScanner
         )
-        XCTAssertNotNil(result["error"])
-        XCTAssertEqual(result["error"] as? String, "Invalid session_id: expected UUID format")
+        XCTAssertEqual(try errorReply(result), "Invalid session_id: expected UUID format")
     }
 
     func testTime_missingGroupBy_returnsError() async throws {
@@ -929,7 +979,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Missing or empty required parameter 'group_by'")
+        XCTAssertEqual(try errorReply(result), "Missing or empty required parameter 'group_by'")
     }
 
     func testTime_invalidGroupBy_returnsError() async throws {
@@ -937,7 +987,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "year"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "Invalid 'group_by' value 'year'. Valid values: day, week, month, session, workspace")
+        XCTAssertEqual(try errorReply(result), "Invalid 'group_by' value 'year'. Valid values: day, week, month, session, workspace")
     }
 
     func testTime_invalidSessionID_returnsError() async throws {
@@ -945,8 +995,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "day", "session_id": "not-a-uuid"],
             scanner: mockScanner
         )
-        XCTAssertNotNil(result["error"])
-        XCTAssertEqual(result["error"] as? String, "Invalid session_id: expected UUID format")
+        XCTAssertEqual(try errorReply(result), "Invalid session_id: expected UUID format")
     }
 
     func testTime_emptyResults() async throws {
@@ -955,9 +1004,10 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "day"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 0)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 0)
-        XCTAssertEqual((result["groups"] as? [[String: Any]])?.count, 0)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.totalSessions, 0)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 0)
+        XCTAssertEqual(dto.groups.count, 0)
     }
 
     func testTime_groupByDay() async throws {
@@ -972,17 +1022,15 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "day"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 3)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 1300)
-
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertEqual(groups?.count, 2)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.totalSessions, 3)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 1300)
+        XCTAssertEqual(dto.groups.count, 2)
 
         // Find the group with 2 sessions (same day as date1).
-        let twoSessionGroup = groups?.first { $0["sessions"] as? Int == 2 }
-        XCTAssertNotNil(twoSessionGroup)
-        XCTAssertEqual(twoSessionGroup?["active_duration_seconds"] as? Int, 900)
-        XCTAssertEqual(twoSessionGroup?["turn_count"] as? Int, 2) // 1 + 1 itemCount
+        let twoSessionGroup = try XCTUnwrap(dto.groups.first { $0.sessions == 2 })
+        XCTAssertEqual(twoSessionGroup.activeDurationSeconds, 900)
+        XCTAssertEqual(twoSessionGroup.turnCount, 2) // 1 + 1 itemCount
     }
 
     func testTime_groupBySession() async throws {
@@ -994,14 +1042,13 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "session"],
             scanner: mockScanner
         )
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertEqual(groups?.count, 2)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 2)
 
-        let s1Group = groups?.first { ($0["key"] as? String) == r1.id.uuidString }
-        XCTAssertNotNil(s1Group)
-        XCTAssertEqual(s1Group?["sessions"] as? Int, 1)
-        XCTAssertEqual(s1Group?["active_duration_seconds"] as? Int, 100)
-        XCTAssertEqual(s1Group?["turn_count"] as? Int, 3)
+        let s1Group = try XCTUnwrap(dto.groups.first { $0.key == r1.id.uuidString })
+        XCTAssertEqual(s1Group.sessions, 1)
+        XCTAssertEqual(s1Group.activeDurationSeconds, 100)
+        XCTAssertEqual(s1Group.turnCount, 3)
     }
 
     func testTime_groupByWorkspace() async throws {
@@ -1017,13 +1064,12 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "workspace"],
             scanner: mockScanner
         )
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertEqual(groups?.count, 2)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 2)
 
-        let alphaGroup = groups?.first { ($0["key"] as? String) == "Alpha" }
-        XCTAssertNotNil(alphaGroup)
-        XCTAssertEqual(alphaGroup?["sessions"] as? Int, 2)
-        XCTAssertEqual(alphaGroup?["active_duration_seconds"] as? Int, 300)
+        let alphaGroup = try XCTUnwrap(dto.groups.first { $0.key == "Alpha" })
+        XCTAssertEqual(alphaGroup.sessions, 2)
+        XCTAssertEqual(alphaGroup.activeDurationSeconds, 300)
     }
 
     func testTime_includeDetails() async throws {
@@ -1035,14 +1081,13 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "workspace", "include_details": true],
             scanner: mockScanner
         )
-        let groups = result["groups"] as? [[String: Any]]
-        let group = groups?.first
-        let details = group?["details"] as? [[String: Any]]
-        XCTAssertNotNil(details)
-        XCTAssertEqual(details?.count, 2)
+        let dto = try timeReply(result)
+        let group = try XCTUnwrap(dto.groups.first)
+        let details = try XCTUnwrap(group.details)
+        XCTAssertEqual(details.count, 2)
 
-        let detailNames = details?.compactMap { $0["session_name"] as? String }
-        XCTAssertEqual(detailNames?.sorted(), ["S1", "S2"])
+        let detailNames = details.map(\.sessionName)
+        XCTAssertEqual(detailNames.sorted(), ["S1", "S2"])
     }
 
     func testTime_withoutIncludeDetails() async throws {
@@ -1053,8 +1098,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "session"],
             scanner: mockScanner
         )
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertNil(groups?.first?["details"])
+        let dto = try timeReply(result)
+        XCTAssertNil(dto.groups.first?.details)
     }
 
     func testTime_groupByMonth() async throws {
@@ -1069,8 +1114,8 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "month"],
             scanner: mockScanner
         )
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertEqual(groups?.count, 2)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.groups.count, 2)
     }
 
     func testTime_groupByWeek() async throws {
@@ -1087,18 +1132,17 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "week"],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 3)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 600)
-        XCTAssertEqual(result["truncated"] as? Bool, false)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.totalSessions, 3)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 600)
+        XCTAssertEqual(dto.truncated, false)
 
-        let groups = result["groups"] as? [[String: Any]]
-        XCTAssertEqual(groups?.count, 2)
+        XCTAssertEqual(dto.groups.count, 2)
 
         // Find the group with 2 sessions (same week).
-        let twoSessionGroup = groups?.first { $0["sessions"] as? Int == 2 }
-        XCTAssertNotNil(twoSessionGroup)
-        XCTAssertEqual(twoSessionGroup?["active_duration_seconds"] as? Int, 300)
-        XCTAssertEqual(twoSessionGroup?["tool_call_count"] as? Int, 0)
+        let twoSessionGroup = try XCTUnwrap(dto.groups.first { $0.sessions == 2 })
+        XCTAssertEqual(twoSessionGroup.activeDurationSeconds, 300)
+        XCTAssertEqual(twoSessionGroup.toolCallCount, 0)
     }
 
     func testTime_sessionFilter() async throws {
@@ -1109,11 +1153,12 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         mockScanner.scanResults = [makeScanResult(records: [r1, r2])]
 
         let result = try await HistoryMCPToolService.execute(
-            args: ["op": "time", "group_by": "session", "session_id": targetID.uuidString],
+            args: ["op": "time", "group_by": "session", "session_id": .string(targetID.uuidString)],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["total_sessions"] as? Int, 1)
-        XCTAssertEqual(result["total_active_duration_seconds"] as? Int, 100)
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.totalSessions, 1)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 100)
     }
 
     // MARK: - idle_threshold_minutes
@@ -1128,21 +1173,21 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 2],
             scanner: mockScanner
         )
-        XCTAssertEqual(inclusive["total_active_duration_seconds"] as? Int, 300)
+        XCTAssertEqual(try timeReply(inclusive).totalActiveDurationSeconds, 300)
 
         // Threshold 1 min (60s): 100s gap > 60s -> idle -> covered only = 200.
         let exclusive = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 1],
             scanner: mockScanner
         )
-        XCTAssertEqual(exclusive["total_active_duration_seconds"] as? Int, 200)
+        XCTAssertEqual(try timeReply(exclusive).totalActiveDurationSeconds, 200)
 
         // Threshold 0: every positive gap is idle -> covered only = 200.
         let zero = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "session", "idle_threshold_minutes": 0],
             scanner: mockScanner
         )
-        XCTAssertEqual(zero["total_active_duration_seconds"] as? Int, 200)
+        XCTAssertEqual(try timeReply(zero).totalActiveDurationSeconds, 200)
     }
 
     func testListSessions_idleThresholdApplied() async throws {
@@ -1153,15 +1198,13 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "idle_threshold_minutes": 1],
             scanner: mockScanner
         )
-        let tightSession = (tight["sessions"] as? [[String: Any]])?.first
-        XCTAssertEqual(tightSession?["active_duration_seconds"] as? Int, 200)
+        XCTAssertEqual(try listReply(tight).sessions.first?.activeDurationSeconds, 200)
 
         let loose = try await HistoryMCPToolService.execute(
             args: ["op": "list_sessions", "idle_threshold_minutes": 2],
             scanner: mockScanner
         )
-        let looseSession = (loose["sessions"] as? [[String: Any]])?.first
-        XCTAssertEqual(looseSession?["active_duration_seconds"] as? Int, 300)
+        XCTAssertEqual(try listReply(loose).sessions.first?.activeDurationSeconds, 300)
     }
 
     func testTime_idleThresholdOutOfRangeReturnsError() async throws {
@@ -1169,7 +1212,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "time", "group_by": "day", "idle_threshold_minutes": 2000],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "idle_threshold_minutes must be between 0 and 1440")
+        XCTAssertEqual(try errorReply(result), "idle_threshold_minutes must be between 0 and 1440")
     }
 
     func testListSessions_idleThresholdNonIntegerReturnsError() async throws {
@@ -1177,7 +1220,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "idle_threshold_minutes": 10.5],
             scanner: mockScanner
         )
-        XCTAssertEqual(result["error"] as? String, "idle_threshold_minutes must be an integer")
+        XCTAssertEqual(try errorReply(result), "idle_threshold_minutes must be an integer")
     }
 
     // MARK: - Snippet Extraction
@@ -1253,26 +1296,24 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         }
     }
 
-    // MARK: - parseDate
-
-    func testParseDate_acceptsISO8601WithAndWithoutFractionalSeconds() {
-        for value in ["2026-06-10T12:00:00Z", "2026-06-10T12:00:00.123Z"] {
-            XCTAssertNotNil(HistoryMCPToolService.parseDate(value), value)
-        }
-    }
-
-    func testParseDate_returnsNilForMissingOrInvalidValues() {
-        for value in [nil, "", "not-a-date"] as [String?] {
-            XCTAssertNil(HistoryMCPToolService.parseDate(value), value ?? "nil")
-        }
-    }
-
     // MARK: - parseDateBound
 
     private static func utcMidnight(_ iso: String) -> Date {
         let f = ISO8601DateFormatter()
         f.formatOptions = [.withInternetDateTime]
         return f.date(from: iso)!
+    }
+
+    func testParseDateBound_acceptsISO8601WithAndWithoutFractionalSeconds() {
+        for value in ["2026-06-10T12:00:00Z", "2026-06-10T12:00:00.123Z"] {
+            XCTAssertNotNil(HistoryMCPToolService.parseDateBound(value, isUpperBound: false), value)
+        }
+    }
+
+    func testParseDateBound_returnsNilForMissingOrInvalidValues() {
+        for value in [nil, "", "not-a-date"] as [String?] {
+            XCTAssertNil(HistoryMCPToolService.parseDateBound(value, isUpperBound: false), value ?? "nil")
+        }
     }
 
     func testParseDateBound_dateOnlyLowerBoundIsStartOfDay() {
@@ -1305,33 +1346,31 @@ final class HistoryMCPToolServiceTests: XCTestCase {
             args: ["op": "list_sessions", "date_to": "2026-06-13"],
             scanner: mockScanner
         )
-        let names = ((result["sessions"] as? [[String: Any]]) ?? []).compactMap { $0["session_name"] as? String }
+        let dto = try listReply(result)
+        let names = dto.sessions.map(\.sessionName)
         XCTAssertEqual(Set(names), ["Jun12", "Jun13"], "date_to date-only must include the named day")
     }
 
     // MARK: - resolveIdleThreshold
 
-    func testResolveIdleThreshold_defaultsAndValidation() {
-        // Omitted -> default threshold; valid integers within range accepted with no error.
-        let defaultResult = HistoryMCPToolService.resolveIdleThreshold([:])
-        XCTAssertEqual(defaultResult.threshold, 30)
-        XCTAssertNil(defaultResult.error)
+    func testResolveIdleThreshold_defaultsAndValidation() throws {
+        // Omitted -> default threshold.
+        XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 30)
 
+        // Valid integers within range accepted.
         for valid in [0, 1, 10, 1440] {
-            let result = HistoryMCPToolService.resolveIdleThreshold(["idle_threshold_minutes": valid])
-            XCTAssertEqual(result.threshold, valid, "valid \(valid)")
-            XCTAssertNil(result.error, "valid \(valid)")
+            XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(.int(valid)), valid, "valid \(valid)")
         }
 
-        // Invalid values produce the exact validation message (no clamping, no nil).
-        let invalid: [(Any, String)] = [
-            (1441, "idle_threshold_minutes must be between 0 and 1440"),
-            (-1, "idle_threshold_minutes must be between 0 and 1440"),
-            (10.5, "idle_threshold_minutes must be an integer")
-        ]
-        for c in invalid {
-            let result = HistoryMCPToolService.resolveIdleThreshold(["idle_threshold_minutes": c.0])
-            XCTAssertEqual(result.error, c.1, "value \(c.0)")
+        // Invalid values throw the exact validation message (no clamping, no nil).
+        XCTAssertThrowsError(try HistoryMCPToolService.resolveIdleThreshold(.int(1441))) { error in
+            XCTAssertEqual(error.localizedDescription, "idle_threshold_minutes must be between 0 and 1440")
+        }
+        XCTAssertThrowsError(try HistoryMCPToolService.resolveIdleThreshold(.int(-1))) { error in
+            XCTAssertEqual(error.localizedDescription, "idle_threshold_minutes must be between 0 and 1440")
+        }
+        XCTAssertThrowsError(try HistoryMCPToolService.resolveIdleThreshold(.double(10.5))) { error in
+            XCTAssertEqual(error.localizedDescription, "idle_threshold_minutes must be an integer")
         }
     }
 
@@ -1353,6 +1392,28 @@ final class HistoryMCPToolServiceTests: XCTestCase {
                 testCase.label
             )
         }
+    }
+
+    // MARK: - Reply Unwrapping Helpers
+
+    private func listReply(_ reply: HistoryToolReply) throws -> HistoryListSessionsReply {
+        if case let .listSessions(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistoryListSessionsReply?, "expected .listSessions reply, got \(reply)")
+    }
+
+    private func searchReply(_ reply: HistoryToolReply) throws -> HistorySearchReply {
+        if case let .search(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistorySearchReply?, "expected .search reply, got \(reply)")
+    }
+
+    private func timeReply(_ reply: HistoryToolReply) throws -> HistoryTimeReply {
+        if case let .time(dto) = reply { return dto }
+        return try XCTUnwrap(nil as HistoryTimeReply?, "expected .time reply, got \(reply)")
+    }
+
+    private func errorReply(_ reply: HistoryToolReply) throws -> String {
+        if case let .error(dto) = reply { return dto.error }
+        return try XCTUnwrap(nil as String?, "expected .error reply, got \(reply)")
     }
 
     // MARK: - Helpers
