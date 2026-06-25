@@ -814,6 +814,47 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertFalse(base.matchesIndexedSessionMetadata(differentActivityBounds))
     }
 
+    // MARK: - Stub vs Full Session (Rebuild Regression Guard)
+
+    func testRecordFromStubSessionProducesZeroV5Fields() {
+        // Regression guard: loadAgentSessionStub returns transcript=nil. The index rebuild
+        // MUST use full session loading (loadAgentSession) — stubs produce zero v5 duration
+        // fields because the factory sees no transcript turns. See rebuildMetadataIndex in
+        // AgentSessionDataService and the comment there pointing to this test.
+        let stubSession = AgentSession(name: "Stub", transcript: nil, itemCount: 10)
+        let record = AgentSessionMetadataRecord.record(
+            from: stubSession,
+            fileURL: URL(fileURLWithPath: "/tmp/stub.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 0)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [])
+        XCTAssertNil(record.firstActivityAt)
+        XCTAssertNil(record.lastActivityAt)
+        XCTAssertEqual(record.toolCallCount, 0)
+        XCTAssertEqual(record.keyPaths, [])
+    }
+
+    func testRecordFromFullSessionProducesNonZeroV5Fields() {
+        // A full session with transcript turns (timestamps) must produce non-zero v5 fields.
+        // This is what rebuildMetadataIndex gets when using loadAgentSession (full load).
+        let session = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 100)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 200), completedAt: Date(timeIntervalSince1970: 300))
+        ])
+        let record = AgentSessionMetadataRecord.record(
+            from: session,
+            fileURL: URL(fileURLWithPath: "/tmp/full.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertEqual(record.coveredTurnDurationSeconds, 200)
+        XCTAssertEqual(record.interActiveIntervalGapSeconds, [100])
+        XCTAssertNotNil(record.firstActivityAt)
+        XCTAssertNotNil(record.lastActivityAt)
+    }
+
     // MARK: - Helpers
 
     private func makeMinimalRecord(

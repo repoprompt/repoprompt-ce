@@ -688,14 +688,14 @@ actor AgentSessionDataService {
         for fileURL in files {
             let values = metadataResourceValues(for: fileURL)
             do {
-                let stub = try await loadAgentSessionStub(
-                    from: fileURL,
-                    recoverMissingMetadata: false,
-                    persistRecoveredMetadata: false
-                )
+                // Load the FULL session (not a stub) so the factory can compute v5
+                // duration/keyPath/toolCount/activityBounds fields from transcript turns.
+                // Stubs (loadAgentSessionStub) return transcript=nil → zero v5 fields.
+                // See testRecordFromStubSessionProducesZeroV5Fields.
+                let session = try await loadAgentSession(from: fileURL)
                 records.append(
                     AgentSessionMetadataRecord.record(
-                        from: stub,
+                        from: session,
                         fileURL: fileURL,
                         observedFileSize: values.size,
                         observedFileModificationDate: values.modified,
