@@ -1017,6 +1017,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let r2 = makeRecord(name: "S2", activeDurationSeconds: 600, savedAt: date1)
         let r3 = makeRecord(name: "S3", activeDurationSeconds: 400, savedAt: date2)
         mockScanner.scanResults = [makeScanResult(records: [r1, r2, r3])]
+        linkDefaultTranscripts()
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "day"],
@@ -1109,6 +1110,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let r2 = makeRecord(name: "S2", activeDurationSeconds: 200, savedAt: jan)
         let r3 = makeRecord(name: "S3", activeDurationSeconds: 300, savedAt: feb)
         mockScanner.scanResults = [makeScanResult(records: [r1, r2, r3])]
+        linkDefaultTranscripts()
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "month"],
@@ -1127,6 +1129,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         let r2 = makeRecord(name: "S2", activeDurationSeconds: 200, savedAt: week1Day2)
         let r3 = makeRecord(name: "S3", activeDurationSeconds: 300, savedAt: week2Day)
         mockScanner.scanResults = [makeScanResult(records: [r1, r2, r3])]
+        linkDefaultTranscripts()
 
         let result = try await HistoryMCPToolService.execute(
             args: ["op": "time", "group_by": "week"],
@@ -1414,6 +1417,64 @@ final class HistoryMCPToolServiceTests: XCTestCase {
     private func errorReply(_ reply: HistoryToolReply) throws -> String {
         if case let .error(dto) = reply { return dto.error }
         return try XCTUnwrap(nil as String?, "expected .error reply, got \(reply)")
+    }
+
+    // MARK: - Per-Day Attribution
+
+    func testTime_groupByDay_attributedPerDay_noDoubleCounting() async throws {
+        // A session with turns on TWO different days. time group_by:day must produce
+        // TWO groups with per-day durations — no double counting. The overnight gap
+        // (24h) is always idle (> any threshold), so each day only gets its own turns.
+        let day1 = Date(timeIntervalSince1970: 1_700_000_000)
+        let day2 = day1.addingTimeInterval(86400) // next calendar day
+
+        let turn1 = AgentTranscriptTurn(
+            responseSpans: [],
+            startedAt: day1,
+            completedAt: day1.addingTimeInterval(60)
+        )
+        let turn2 = AgentTranscriptTurn(
+            responseSpans: [],
+            startedAt: day2,
+            completedAt: day2.addingTimeInterval(120)
+        )
+        let transcript = AgentTranscript(turns: [turn1, turn2])
+
+        let record = makeRecord(name: "MultiDay")
+        mockScanner.scanResults = [makeScanResult(records: [record])]
+        mockScanner.transcriptProvider = { _ in transcript }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "day", "idle_threshold_minutes": 30],
+            scanner: mockScanner
+        )
+
+        guard case let .time(reply) = result else {
+            return XCTFail("Expected .time reply, got \(result)")
+        }
+        XCTAssertEqual(reply.groups.count, 2, "Should have one group per day")
+        // Groups are sorted descending — day2 first.
+        let groupsByDuration = reply.groups.sorted { $0.activeDurationSeconds < $1.activeDurationSeconds }
+        XCTAssertEqual(groupsByDuration[0].activeDurationSeconds, 60, "Day 1: 60s")
+        XCTAssertEqual(groupsByDuration[1].activeDurationSeconds, 120, "Day 2: 120s")
+        XCTAssertEqual(reply.totalActiveDurationSeconds, 180, "Total: 60+120=180, no overnight gap counted")
+    }
+
+    /// Synthesize a single-turn transcript for each record in scanResults, with duration
+    /// = coveredTurnDurationSeconds on the record's savedAt day. This lets calendar-grouping
+    /// tests (which load transcripts via the per-day attribution path) get non-empty data
+    /// without manually constructing transcripts for every test.
+    private func linkDefaultTranscripts() {
+        let records = mockScanner.scanResults.flatMap(\.records)
+        let recordMap = Dictionary(uniqueKeysWithValues: records.map { ($0.id, $0) })
+        mockScanner.transcriptProvider = { sid in
+            guard let r = recordMap[sid] else { return .empty }
+            let dur = TimeInterval(max(1, r.coveredTurnDurationSeconds))
+            let start = r.firstActivityAt ?? r.savedAt
+            return AgentTranscript(turns: [
+                AgentTranscriptTurn(responseSpans: [], startedAt: start, completedAt: start.addingTimeInterval(dur))
+            ])
+        }
     }
 
     // MARK: - Helpers

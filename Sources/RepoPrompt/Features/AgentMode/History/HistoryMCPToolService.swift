@@ -307,6 +307,21 @@ enum HistoryMCPToolService {
                 to: dateTo
             )
             let idleThresholdMinutes = try resolveIdleThreshold(args["idle_threshold_minutes"])
+
+            // Calendar grouping (day/week/month) uses per-day attribution via transcript
+            // loading — each turn's duration is attributed to the day it occurred, preventing
+            // double counting across day-scoped queries. Session/workspace grouping stays
+            // metadata-only (no per-day splitting needed).
+            if ["day", "week", "month"].contains(groupBy) {
+                return try await executeTimeCalendarGrouped(
+                    filtered,
+                    groupBy: groupBy,
+                    idleThresholdMinutes: idleThresholdMinutes,
+                    includeDetails: includeDetails,
+                    scanner: scanner
+                )
+            }
+
             let totalSessions = filtered.count
             let totalDuration = filtered.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
 
@@ -356,6 +371,142 @@ enum HistoryMCPToolService {
         return matched
     }
 
+    // MARK: - Time: Calendar Grouping (per-day attribution)
+
+    /// For day/week/month grouping, each turn's active duration is attributed to the
+    /// calendar group (day/week/month) in which the turn's `startedAt` falls. This
+    /// prevents double counting: a session active on both Monday and Tuesday contributes
+    /// Monday's turns to Monday's group and Tuesday's turns to Tuesday's group.
+    /// Inter-group gaps (e.g. overnight) are always idle. Transcript loading is required,
+    /// so `maxSessionsScanned` bounds the work.
+    private static func executeTimeCalendarGrouped(
+        _ sessions: [HistoryFilteredSessionRecord],
+        groupBy: String,
+        idleThresholdMinutes: Int,
+        includeDetails: Bool,
+        scanner: HistorySessionScanning
+    ) async throws -> HistoryToolReply {
+        let calendar = Calendar.current
+        let thresholdSeconds = idleThresholdMinutes * 60
+        var sessionsScanned = 0
+        var scanTruncated = false
+
+        var groupKeys: Set<String> = []
+        var groupSessionIDs: [String: Set<UUID>] = [:]
+        var groupDuration: [String: Int] = [:]
+        var groupTurns: [String: Int] = [:]
+        var groupToolCalls: [String: Int] = [:]
+        var sessionNames: [UUID: String] = [:]
+        var detailDuration: [String: [UUID: Int]] = [:]
+        var detailTurns: [String: [UUID: Int]] = [:]
+
+        for session in sessions {
+            if sessionsScanned >= maxSessionsScanned {
+                scanTruncated = true
+                break
+            }
+            sessionsScanned += 1
+
+            let transcript: AgentTranscript
+            do {
+                transcript = try await scanner.loadTranscriptForSearch(
+                    sessionID: session.record.id,
+                    workspaceDir: session.workspaceDir
+                )
+            } catch { continue }
+
+            let sid = session.record.id
+            sessionNames[sid] = session.record.name
+            var prevEnd: Date?
+            var prevGroupKey: String?
+
+            for turn in transcript.turns {
+                let start = turn.startedAt
+                let end = turn.completedAt ?? turn.lastActivityAt ?? start
+                let dayStart = calendar.startOfDay(for: start)
+
+                let key: String
+                switch groupBy {
+                case "day":
+                    key = iso8601DateOnly.string(from: dayStart)
+                case "week":
+                    guard let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: dayStart)) else { continue }
+                    key = iso8601DateOnly.string(from: weekStart)
+                case "month":
+                    let comps = calendar.dateComponents([.year, .month], from: dayStart)
+                    key = String(format: "%d-%02d", comps.year ?? 0, comps.month ?? 0)
+                default: continue
+                }
+
+                let duration = max(0, Int(end.timeIntervalSince(start)))
+                groupKeys.insert(key)
+                groupSessionIDs[key, default: []].insert(sid)
+                groupDuration[key, default: 0] += duration
+                groupTurns[key, default: 0] += 1
+                if let tc = turn.summary?.toolCount, tc > 0 {
+                    groupToolCalls[key, default: 0] += tc
+                } else {
+                    groupToolCalls[key, default: 0] += turn.responseSpans.reduce(0) { $0 + $1.activities.count(where: { $0.toolExecution != nil }) }
+                }
+
+                // Intra-group gap (same group as previous turn → may count as active)
+                if let pk = prevGroupKey, pk == key, let pe = prevEnd {
+                    let gap = Int(start.timeIntervalSince(pe))
+                    if gap > 0, gap <= thresholdSeconds {
+                        groupDuration[key, default: 0] += gap
+                    }
+                }
+
+                if includeDetails {
+                    detailDuration[key, default: [:]][sid, default: 0] += duration
+                    detailTurns[key, default: [:]][sid, default: 0] += 1
+                    if let pk = prevGroupKey, pk == key, let pe = prevEnd {
+                        let gap = Int(start.timeIntervalSince(pe))
+                        if gap > 0, gap <= thresholdSeconds {
+                            detailDuration[key, default: [:]][sid, default: 0] += gap
+                        }
+                    }
+                }
+
+                prevEnd = end
+                prevGroupKey = key
+            }
+        }
+
+        let sortedKeys = groupKeys.sorted().reversed()
+        let groupDTOs: [HistoryTimeReply.GroupDTO] = sortedKeys.map { key in
+            let details: [HistoryTimeReply.GroupDTO.DetailDTO]?
+            if includeDetails {
+                let dd = detailDuration[key] ?? [:]
+                let dt = detailTurns[key] ?? [:]
+                details = dd.keys.sorted().map { sid in
+                    HistoryTimeReply.GroupDTO.DetailDTO(
+                        sessionID: sid.uuidString,
+                        sessionName: sessionNames[sid] ?? "",
+                        activeDurationSeconds: dd[sid] ?? 0,
+                        turnCount: dt[sid] ?? 0
+                    )
+                }
+            } else { details = nil }
+            return HistoryTimeReply.GroupDTO(
+                key: key,
+                sessions: groupSessionIDs[key]?.count ?? 0,
+                activeDurationSeconds: groupDuration[key] ?? 0,
+                turnCount: groupTurns[key] ?? 0,
+                toolCallCount: groupToolCalls[key] ?? 0,
+                details: details
+            )
+        }
+
+        let totalDuration = groupDTOs.reduce(0) { $0 + $1.activeDurationSeconds }
+        return .time(HistoryTimeReply(
+            totalSessions: sessions.count,
+            totalActiveDurationSeconds: totalDuration,
+            truncated: scanTruncated,
+            groups: groupDTOs
+        ))
+    }
+
     // MARK: - Sorting
 
     private static func sortFilteredSessions(
@@ -389,12 +540,12 @@ enum HistoryMCPToolService {
 
         switch groupBy {
         case "day":
-            return buildGroups(sessions, keyProvider: { iso8601DateOnly.string(from: $0.record.activityDate) }, sortKeys: { $0.sort(by: >) }, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
+            return buildGroups(sessions, keyProvider: { iso8601DateOnly.string(from: $0.record.lastActivityAt ?? $0.record.activityDate) }, sortKeys: { $0.sort(by: >) }, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
         case "week":
             return buildGroups(
                 sessions,
                 keyProvider: { session in
-                    let activityDate = session.record.activityDate
+                    let activityDate = session.record.lastActivityAt ?? session.record.activityDate
                     guard let weekStart = calendar.date(from: calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: activityDate)) else {
                         return iso8601DateOnly.string(from: activityDate)
                     }
@@ -408,7 +559,7 @@ enum HistoryMCPToolService {
             return buildGroups(
                 sessions,
                 keyProvider: { session in
-                    let components = calendar.dateComponents([.year, .month], from: session.record.activityDate)
+                    let components = calendar.dateComponents([.year, .month], from: session.record.lastActivityAt ?? session.record.activityDate)
                     return String(format: "%04d-%02d", components.year ?? 0, components.month ?? 0)
                 },
                 sortKeys: { $0.sort(by: >) },

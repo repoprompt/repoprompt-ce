@@ -181,14 +181,14 @@ actor HistorySessionScanner: HistorySessionScanning {
                     guard matchesFile else { continue }
                 }
 
-                // Date range filter — use the same bounds surfaced in the response
-                // (first_activity_at = firstActivityAt ?? activityDate,
-                //  last_activity_at = lastActivityAt ?? savedAt) so filter and display agree.
+                // Date range filter — OVERLAP semantics: a session is included if ANY of its
+                // activity falls within [from, to]. A session started before the range but still
+                // active during it counts (e.g. a chat resumed days later).
                 if let from {
-                    guard (record.firstActivityAt ?? record.activityDate) >= from else { continue }
+                    guard (record.lastActivityAt ?? record.savedAt) >= from else { continue }
                 }
                 if let to {
-                    guard (record.lastActivityAt ?? record.savedAt) <= to else { continue }
+                    guard (record.firstActivityAt ?? record.activityDate) <= to else { continue }
                 }
 
                 results.append(HistoryFilteredSessionRecord(
