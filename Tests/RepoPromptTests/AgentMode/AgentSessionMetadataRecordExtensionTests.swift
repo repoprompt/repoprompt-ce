@@ -817,10 +817,9 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     // MARK: - Stub vs Full Session (Rebuild Regression Guard)
 
     func testRecordFromStubSessionProducesZeroV5Fields() {
-        // Regression guard: loadAgentSessionStub returns transcript=nil. The index rebuild
-        // MUST use full session loading (loadAgentSession) — stubs produce zero v5 duration
-        // fields because the factory sees no transcript turns. See rebuildMetadataIndex in
-        // AgentSessionDataService and the comment there pointing to this test.
+        // By design: loadAgentSessionStub returns transcript=nil, so stub-built records carry
+        // zero v5 fields. rebuildMetadataIndex uses stubs (cheap); the history tool enriches these
+        // on demand (see lacksTranscriptDerivedFields / enrichingTranscriptDerivedFields).
         let stubSession = AgentSession(name: "Stub", transcript: nil, itemCount: 10)
         let record = AgentSessionMetadataRecord.record(
             from: stubSession,
@@ -837,8 +836,8 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
     }
 
     func testRecordFromFullSessionProducesNonZeroV5Fields() {
-        // A full session with transcript turns (timestamps) must produce non-zero v5 fields.
-        // This is what rebuildMetadataIndex gets when using loadAgentSession (full load).
+        // A full session with transcript turns (timestamps) produces non-zero v5 fields.
+        // This is what the save/load path and on-demand enrichment compute from real turns.
         let session = makeSession(turns: [
             makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 100)),
             makeTurn(startedAt: Date(timeIntervalSince1970: 200), completedAt: Date(timeIntervalSince1970: 300))
@@ -853,6 +852,47 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
         XCTAssertEqual(record.interActiveIntervalGapSeconds, [100])
         XCTAssertNotNil(record.firstActivityAt)
         XCTAssertNotNil(record.lastActivityAt)
+    }
+
+    func testLacksTranscriptDerivedFieldsAndOnDemandEnrichmentEquivalence() {
+        // Pins the on-demand contract the history tool depends on:
+        //  - a stub-built record (transcript=nil) lacks all v5 fields and needs enrichment;
+        //  - a fully-indexed record does not;
+        //  - any single populated v5 field is enough to treat a record as indexed;
+        //  - enriching a stub with the session's turns reproduces the factory's v5 exactly.
+        let stubSession = AgentSession(name: "Stub", transcript: nil, itemCount: 1)
+        let stubRecord = AgentSessionMetadataRecord.record(
+            from: stubSession,
+            fileURL: URL(fileURLWithPath: "/tmp/stub.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertTrue(stubRecord.lacksTranscriptDerivedFields, "stub-built record should need enrichment")
+
+        let fullSession = makeSession(turns: [
+            makeTurn(startedAt: Date(timeIntervalSince1970: 0), completedAt: Date(timeIntervalSince1970: 100)),
+            makeTurn(startedAt: Date(timeIntervalSince1970: 200), completedAt: Date(timeIntervalSince1970: 300))
+        ])
+        let fullRecord = AgentSessionMetadataRecord.record(
+            from: fullSession,
+            fileURL: URL(fileURLWithPath: "/tmp/full.json"),
+            observedFileSize: nil,
+            observedFileModificationDate: nil
+        )
+        XCTAssertFalse(fullRecord.lacksTranscriptDerivedFields, "indexed record should not trigger enrichment")
+
+        var partial = stubRecord
+        partial.keyPaths = ["a.swift"]
+        XCTAssertFalse(partial.lacksTranscriptDerivedFields, "any v5 field set ⇒ treated as indexed")
+
+        let enriched = stubRecord.enrichingTranscriptDerivedFields(from: fullSession.transcript?.turns ?? [])
+        XCTAssertEqual(enriched.coveredTurnDurationSeconds, fullRecord.coveredTurnDurationSeconds)
+        XCTAssertEqual(enriched.interActiveIntervalGapSeconds, fullRecord.interActiveIntervalGapSeconds)
+        XCTAssertEqual(enriched.firstActivityAt, fullRecord.firstActivityAt)
+        XCTAssertEqual(enriched.lastActivityAt, fullRecord.lastActivityAt)
+        XCTAssertEqual(enriched.keyPaths, fullRecord.keyPaths)
+        XCTAssertEqual(enriched.toolCallCount, fullRecord.toolCallCount)
+        XCTAssertFalse(enriched.lacksTranscriptDerivedFields, "enriched record is now indexed")
     }
 
     // MARK: - Helpers

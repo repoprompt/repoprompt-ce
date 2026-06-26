@@ -96,6 +96,9 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     /// transcript-less stub during a cheap `rebuildMetadataIndex` pass. The history tool uses this to
     /// decide which records need on-demand enrichment: any populated v5 field implies a real
     /// transcript was already seen (the save/load path), so the record is passed through unchanged.
+    ///
+    /// Maintenance: any new transcript-derived field must be added to this check, or a stub-built
+    /// record carrying it would be misclassified as indexed and silently skip on-demand enrichment.
     var lacksTranscriptDerivedFields: Bool {
         firstActivityAt == nil
             && lastActivityAt == nil
