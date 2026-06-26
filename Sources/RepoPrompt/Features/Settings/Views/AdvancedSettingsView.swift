@@ -33,6 +33,13 @@ struct AdvancedSettingsView: View {
         )
     }
 
+    private var historyIdleThresholdDoubleBinding: Binding<Double> {
+        Binding(
+            get: { Double(globalSettings.historyIdleThresholdMinutes()) },
+            set: { globalSettings.setHistoryIdleThresholdMinutes(Int($0)) }
+        )
+    }
+
     private var enableKeyboardShortcutsBinding: Binding<Bool> {
         Binding(
             get: { globalSettings.enableKeyboardShortcuts() },
@@ -270,21 +277,24 @@ struct AdvancedSettingsView: View {
                 title: "Time Tracking",
                 description: "Controls how the history MCP tool measures active work time."
             ) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Default idle threshold")
-                        Text("Gaps between agent turns longer than this are counted as idle (not active work) when querying time spent. Lower values are stricter — only focused work counts. Higher values include short breaks. Can be overridden per-query via the idle_threshold_minutes parameter.")
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Default idle threshold")
+                    Text("Gaps between agent turns longer than this are counted as idle (not active work) when querying time spent. Lower values are stricter — only focused work counts. Higher values include short breaks. Can be overridden per-query via the idle_threshold_minutes parameter.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack {
+                        Text("0")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+                            .foregroundColor(.secondary)
+                            .frame(width: 25)
+                        Slider(value: historyIdleThresholdDoubleBinding, in: 0 ... 60, step: 1)
+                            .accentColor(.blue)
+                        Text("\(historyIdleThresholdBinding.wrappedValue) min")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 45, alignment: .trailing)
                     }
-                    Spacer()
-                    Stepper(
-                        "\(historyIdleThresholdBinding.wrappedValue) min",
-                        value: historyIdleThresholdBinding,
-                        in: 1 ... 60
-                    )
-                    .frame(width: 130)
                 }
             }
         }

@@ -505,6 +505,7 @@ class GlobalSettingsStore: ObservableObject {
 
     func setHistoryIdleThresholdMinutes(_ minutes: Int, commit: Bool = true) {
         defaults.set(minutes, forKey: "history.idle_threshold_minutes")
+        objectWillChange.send()
     }
 
     func fontScaleBodySize() -> Double {
