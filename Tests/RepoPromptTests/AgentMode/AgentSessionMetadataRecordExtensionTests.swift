@@ -411,7 +411,7 @@ final class AgentSessionMetadataRecordExtensionTests: XCTestCase {
 
         // Gap is exactly 30min → not excluded (only > 30min excluded). Continuous.
         // Turn 1: 60s. Turn 2 continuous from prev end: 1890 - 60 = 1830. Total: 1890.
-        XCTAssertEqual(record.activeDurationSeconds, 1890)
+        XCTAssertEqual(record.activeDurationSeconds(thresholdMinutes: 30), 1890)
     }
 
     func testActiveDurationSkipsTurnsWithoutCompletionTimestamp() {
