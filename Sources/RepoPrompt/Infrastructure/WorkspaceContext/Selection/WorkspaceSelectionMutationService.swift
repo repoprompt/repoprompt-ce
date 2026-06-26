@@ -40,6 +40,11 @@ struct WorkspaceSliceSelectionMutationResult: Equatable {
     let mutated: Bool
 }
 
+enum WorkspacePreResolvedFullFileMutationMode {
+    case add
+    case remove
+}
+
 struct WorkspaceSelectionMutationService {
     let store: WorkspaceFileContextStore
     let codemapsGloballyDisabled: Bool
@@ -146,6 +151,7 @@ struct WorkspaceSelectionMutationService {
         sliceErrors: [String] = [],
         mode: String,
         existing: StoredSelection,
+        hasFullFileArtifactInputs: Bool = false,
         rootScope: WorkspaceLookupRootScope = .visibleWorkspace
     ) async -> WorkspaceBuildSelectionResult {
         if mode == "codemap_only", !sliceInputs.isEmpty {
@@ -187,7 +193,7 @@ struct WorkspaceSelectionMutationService {
             }
         }
 
-        let isSliceScopedSet = mode == "slices" || (paths.isEmpty && !sliceInputs.isEmpty)
+        let isSliceScopedSet = mode == "slices" || (!hasFullFileArtifactInputs && paths.isEmpty && !sliceInputs.isEmpty)
         guard isSliceScopedSet else {
             let replacementSeed = StoredSelection(
                 codemapAutoEnabled: existing.codemapAutoEnabled
@@ -212,6 +218,43 @@ struct WorkspaceSelectionMutationService {
             selection: sliceResult.selection,
             invalidPaths: sliceErrors + sliceResult.invalidPaths,
             codemapUnavailable: []
+        )
+    }
+
+    /// Applies already-authorized exact identities without path lookup, folder expansion, or
+    /// codemap discovery. Git artifact policy remains owned by the MCP boundary.
+    func mutatePreResolvedFullFilePaths(
+        base: StoredSelection,
+        absolutePaths: [String],
+        mode: WorkspacePreResolvedFullFileMutationMode
+    ) -> StoredSelection {
+        var selected = StoredSelectionPathNormalization.standardizedPaths(base.selectedPaths)
+        var codemaps = StoredSelectionPathNormalization.standardizedPaths(base.autoCodemapPaths)
+        var slices = StoredSelectionPathNormalization.standardizedSlices(base.slices)
+        var selectedSet = Set(selected)
+
+        let identities = absolutePaths.compactMap(StoredSelectionPathNormalization.standardizedPath)
+        for identity in identities {
+            switch mode {
+            case .add:
+                if selectedSet.insert(identity).inserted {
+                    selected.append(identity)
+                }
+                codemaps.removeAll { $0 == identity }
+                slices.removeValue(forKey: identity)
+            case .remove:
+                selected.removeAll { $0 == identity }
+                selectedSet.remove(identity)
+                codemaps.removeAll { $0 == identity }
+                slices.removeValue(forKey: identity)
+            }
+        }
+
+        return StoredSelection(
+            selectedPaths: selected,
+            autoCodemapPaths: codemaps,
+            slices: slices,
+            codemapAutoEnabled: base.codemapAutoEnabled
         )
     }
 

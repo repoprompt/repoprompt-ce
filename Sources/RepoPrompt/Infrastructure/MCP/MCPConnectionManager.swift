@@ -73,6 +73,22 @@ public enum MCPRunPurpose: String, Sendable, Codable {
     case unknown // No policy or unspecified
 }
 
+/// Dispatcher-validated provenance for a one-shot hidden `_windowID` tool argument.
+/// This value is request-scoped only and must never be synthesized from sticky,
+/// persisted, or automatically selected window affinity.
+struct MCPExplicitWindowRoutingHint: @unchecked Sendable, Equatable {
+    enum Provenance: Equatable {
+        case hiddenWindowArgument
+    }
+
+    let connectionID: UUID
+    let toolName: String
+    let windowID: Int
+    let windowStateIdentity: ObjectIdentifier
+    let serverViewModelIdentity: ObjectIdentifier
+    let provenance: Provenance
+}
+
 /// ---------------------------------------------------------------------
 /// Shared constants & logger for the connection-layer (ported from iMCP)
 /// ---------------------------------------------------------------------
@@ -2027,6 +2043,32 @@ actor ServerNetworkManager {
     static var currentTabContextHint: MCPServerViewModel.TabContextHint?
     @TaskLocal
     static var currentToolDispatchAuthorization: ToolDispatchAuthorization?
+    @TaskLocal
+    static var currentExplicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
+
+    nonisolated static func explicitWindowRoutingHint(
+        connectionID: UUID,
+        toolName: String,
+        explicitWindowID: Int?,
+        authorization: ToolDispatchAuthorization?
+    ) -> MCPExplicitWindowRoutingHint? {
+        guard let explicitWindowID,
+              let authorization,
+              authorization.connectionID == connectionID,
+              let windowIdentity = authorization.windowIdentity,
+              windowIdentity.windowID == explicitWindowID
+        else {
+            return nil
+        }
+        return MCPExplicitWindowRoutingHint(
+            connectionID: connectionID,
+            toolName: toolName,
+            windowID: explicitWindowID,
+            windowStateIdentity: windowIdentity.windowStateIdentity,
+            serverViewModelIdentity: windowIdentity.serverViewModelIdentity,
+            provenance: .hiddenWindowArgument
+        )
+    }
 
     // ------------------------------------------------------------------
     // MARK: Tool ownership tracking helpers
@@ -5273,7 +5315,7 @@ actor ServerNetworkManager {
                 markSessionKilled: true,
                 markClientUserKilled: true
             )
-        case .runCompleted, .runCancelled, .serverShutdown, .approvalDenied:
+        case .runCompleted, .runCancelled, .serverShutdown, .approvalDenied, .toolExecutionWatchdog:
             // Expected terminations - kill signal but no client cooldown
             TerminationSemantics(
                 writeKillSignal: true,
@@ -11550,6 +11592,12 @@ actor ServerNetworkManager {
                                             resolution: limiterResolution,
                                             windowIdentity: windowDispatchIdentity
                                         )
+                                        let explicitWindowRoutingHint = Self.explicitWindowRoutingHint(
+                                            connectionID: connectionID,
+                                            toolName: toolName,
+                                            explicitWindowID: capturedWindowID,
+                                            authorization: dispatchAuthorization
+                                        )
                                         do {
                                             return try await self.withWindowToolOwnership(
                                                 windowID: ownershipWindowID,
@@ -11560,11 +11608,13 @@ actor ServerNetworkManager {
                                                 recordScope: shouldTrackToolOwnership
                                             ) {
                                                 try await Self.$currentToolDispatchAuthorization.withValue(dispatchAuthorization) {
-                                                    let value = try await EditFlowPerf.measure(
-                                                        EditFlowPerf.Stage.MCPToolCall.dispatch,
-                                                        EditFlowPerf.Dimensions(toolName: toolName)
-                                                    ) {
-                                                        try await dispatchResolvedProvider(resolvedOperation)
+                                                    let value = try await Self.$currentExplicitWindowRoutingHint.withValue(explicitWindowRoutingHint) {
+                                                        try await EditFlowPerf.measure(
+                                                            EditFlowPerf.Stage.MCPToolCall.dispatch,
+                                                            EditFlowPerf.Dimensions(toolName: toolName)
+                                                        ) {
+                                                            try await dispatchResolvedProvider(resolvedOperation)
+                                                        }
                                                     }
                                                     releaseResourceAdmissionLeases(outcome: "provider_success")
                                                     let permitPostDispatchEnvelopeState = EditFlowPerf.begin(

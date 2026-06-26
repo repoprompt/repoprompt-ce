@@ -664,13 +664,17 @@ import RepoPromptShared
                     "roots": snapshot.rootCatalogShards.roots.map { root in
                         [
                             "root_id": root.rootID.uuidString,
+                            "lifetime_id": root.lifetimeID.map { $0.uuidString as Any } ?? NSNull(),
                             "published_topology_generation": root.publishedTopologyGeneration.map { $0 as Any } ?? NSNull(),
                             "live_topology_generations": root.liveTopologyGenerations,
                             "retained_topology_generations": root.retainedTopologyGenerations,
                             "build_count": root.buildCount,
                             "patch_count": root.patchCount,
                             "authoritative_rebuild_count": root.authoritativeRebuildCount,
-                            "fallback_reason_counts": root.fallbackReasonCounts,
+                            "fallback_count": root.fallbackCount,
+                            "fallback_reason_counts": Dictionary(uniqueKeysWithValues: root.fallbackReasonCounts.map {
+                                ($0.key.rawValue, $0.value)
+                            }),
                             "last_applied_index_generation": root.lastAppliedIndexGeneration.map { $0 as Any } ?? NSNull(),
                             "delta_state_dirty": root.deltaStateDirty,
                             "backstop_count": root.backstopCount,

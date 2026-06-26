@@ -205,6 +205,10 @@ actor MCPService: Sendable {
         await ServerNetworkManager.shared.currentConnectionWindowID()
     }
 
+    func currentRequestExplicitWindowRoutingHint() -> MCPExplicitWindowRoutingHint? {
+        ServerNetworkManager.currentExplicitWindowRoutingHint
+    }
+
     // ──────────────────────────────────────────────
     // MARK: - Connection approval bridge
 

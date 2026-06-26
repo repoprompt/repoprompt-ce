@@ -5,6 +5,7 @@ enum WorkspaceLookupRootScope: Hashable {
     case visibleWorkspace
     case visibleWorkspacePlusGitData
     case allLoaded
+    case allLoadedExcludingGitData
     case sessionBoundWorkspace(canonicalRootPaths: Set<String>, physicalRootPaths: Set<String>)
     case validatedSessionBoundWorkspace(
         canonicalRoots: Set<WorkspaceRootRef>,
@@ -172,6 +173,24 @@ final class WorkspaceSearchCatalogGenerationLease: @unchecked Sendable {
     }
 }
 
+enum WorkspaceSearchCatalogAccessRequirement: Equatable {
+    case recordsOnly
+    case recordsAndPathIndexes
+
+    func satisfies(_ requirement: WorkspaceSearchCatalogAccessRequirement) -> Bool {
+        switch (self, requirement) {
+        case (.recordsAndPathIndexes, _), (.recordsOnly, .recordsOnly):
+            true
+        case (.recordsOnly, .recordsAndPathIndexes):
+            false
+        }
+    }
+
+    var requiresPathIndexes: Bool {
+        self == .recordsAndPathIndexes
+    }
+}
+
 struct WorkspaceSearchCatalogSnapshot: Equatable {
     let generation: UInt64
     let rootScope: WorkspaceLookupRootScope
@@ -200,6 +219,19 @@ struct WorkspaceSearchCatalogSnapshot: Equatable {
         self.rootPathIndexes = rootPathIndexes
         self.diagnostics = diagnostics
         self.generationLease = generationLease
+    }
+
+    func recordsOnlyProjection() -> WorkspaceSearchCatalogSnapshot {
+        guard !rootPathIndexes.isEmpty else { return self }
+        return WorkspaceSearchCatalogSnapshot(
+            generation: generation,
+            rootScope: rootScope,
+            roots: roots,
+            files: files,
+            entries: entries,
+            diagnostics: diagnostics,
+            generationLease: generationLease
+        )
     }
 
     static func == (lhs: WorkspaceSearchCatalogSnapshot, rhs: WorkspaceSearchCatalogSnapshot) -> Bool {
@@ -384,6 +416,7 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
     let mode: PromptFileEntryMode
     let loadedContent: String?
     let rootFolderPath: String?
+    let role: ResolvedPromptFileEntryRole
 
     init(
         file: WorkspaceFileRecord,
@@ -391,7 +424,8 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         lineRanges: [LineRange]? = nil,
         mode: PromptFileEntryMode = .fullFile,
         loadedContent: String? = nil,
-        rootFolderPath: String? = nil
+        rootFolderPath: String? = nil,
+        role: ResolvedPromptFileEntryRole = .ordinary
     ) {
         id = ResolvedPromptFileEntryID(fileID: file.id, mode: mode, lineRanges: lineRanges)
         self.file = file
@@ -400,7 +434,13 @@ struct ResolvedPromptFileEntry: Identifiable, Equatable {
         self.mode = mode
         self.loadedContent = loadedContent
         self.rootFolderPath = rootFolderPath
+        self.role = role
     }
+}
+
+enum ResolvedPromptFileEntryRole: Equatable {
+    case ordinary
+    case authorizedGitDiffArtifact
 }
 
 struct ResolvedPromptFileBlockRecord: Equatable {

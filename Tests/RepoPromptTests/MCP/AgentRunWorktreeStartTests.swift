@@ -516,6 +516,405 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(object["worktree_bindings"]?.arrayValue?.count, 1)
     }
 
+    func testCanonicalAgentRunReviewSourceStagesBindsToFreshWorktreeChildAndCleansUp() async throws {
+        let root = try makeTemporaryDirectory(named: "canonical-review-root")
+        let worktree = try makeTemporaryDirectory(named: "canonical-review-child-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Canonical review child",
+            parentSessionID: nil,
+            inheritWorktreeBindings: true
+        )
+        let targetSessionID = try XCTUnwrap(target.sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID,
+            sessionID: targetSessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        let targetBinding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        viewModel.session(for: target.tabID).worktreeBindings = [targetBinding]
+
+        let selectedPath = root.appendingPathComponent("Tracked.txt").path
+        let source = AgentRunOracleReviewSource.captured(.init(
+            sourceTabID: sourceTabID,
+            workspaceID: workspaceID,
+            sourceSelectionRevision: 7,
+            promptText: "frozen canonical prompt",
+            selection: StoredSelection(selectedPaths: [selectedPath]),
+            lookupContext: .visibleWorkspace,
+            reviewGitContext: .automaticOnly(base: "HEAD", workspaceRootPaths: [root.path]),
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            sourceWorktreeBindings: []
+        ))
+        try viewModel.mcpStageAgentRunOracleReviewSource(
+            source,
+            targetTabID: target.tabID,
+            targetSessionID: targetSessionID,
+            expectedParentSessionID: nil
+        )
+
+        let runID = UUID()
+        let delegated = try XCTUnwrap(
+            viewModel.mcpBindPendingAgentRunOracleReviewContext(tabID: target.tabID, runID: runID)
+        )
+        XCTAssertEqual(delegated.targetRunID, runID)
+        XCTAssertEqual(delegated.target.worktreeBindings, [targetBinding])
+        XCTAssertEqual(delegated.capturedSource?.sourceWorktreeBindings, [])
+        XCTAssertEqual(delegated.capturedSource?.promptText, "frozen canonical prompt")
+        XCTAssertEqual(delegated.capturedSource?.exactSelectedIdentities, [selectedPath])
+        XCTAssertEqual(
+            try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+                tabID: target.tabID,
+                workspaceID: workspaceID,
+                sessionID: targetSessionID,
+                runID: runID
+            )?.source.delegationID,
+            source.delegationID
+        )
+        XCTAssertThrowsError(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: target.tabID,
+            workspaceID: workspaceID,
+            sessionID: targetSessionID,
+            runID: UUID()
+        )) { error in
+            XCTAssertEqual(error as? AgentRunOracleReviewUnavailableReason, .pendingContextAlreadyConsumed)
+        }
+
+        await viewModel.mcpDeactivateControlContext(sessionID: targetSessionID, cleanupSessionStore: true)
+        XCTAssertNil(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: target.tabID,
+            workspaceID: workspaceID,
+            sessionID: targetSessionID,
+            runID: runID
+        ))
+    }
+
+    func testExternalStarterStagesFrozenReviewSourceWhenTargetIsSourceTab() async throws {
+        let root = try makeTemporaryDirectory(named: "same-tab-review-root")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: sourceTabID,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Same-tab review child",
+            parentSessionID: nil
+        )
+        let targetSessionID = try XCTUnwrap(target.sessionID)
+        let source = AgentRunOracleReviewSource.captured(.init(
+            sourceTabID: sourceTabID,
+            workspaceID: workspaceID,
+            sourceSelectionRevision: 13,
+            promptText: "frozen before same-tab activation",
+            selection: StoredSelection(selectedPaths: [root.appendingPathComponent("Tracked.txt").path]),
+            lookupContext: .visibleWorkspace,
+            reviewGitContext: .automaticOnly(base: "HEAD", workspaceRootPaths: [root.path]),
+            sourceAgentSessionID: nil,
+            sourceAgentRunID: nil,
+            sourceWorktreeBindings: []
+        ))
+
+        _ = try await AgentExternalMCPRunStarter.start(
+            target: target,
+            message: "Review the frozen source.",
+            metadata: .init(
+                connectionID: nil,
+                clientName: "same-tab-review-test",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            ),
+            bindCurrentRequestToTab: { _, _ in },
+            agentModeVM: viewModel,
+            agentRaw: nil,
+            modelRaw: nil,
+            reasoningEffortRaw: nil,
+            expectedParentSessionID: nil,
+            oracleReviewSource: source,
+            dispatchInstruction: { _, _, _, _, _ in .startedRun }
+        )
+
+        let runID = UUID()
+        let delegated = try XCTUnwrap(
+            viewModel.mcpBindPendingAgentRunOracleReviewContext(tabID: sourceTabID, runID: runID)
+        )
+        XCTAssertEqual(delegated.source.delegationID, source.delegationID)
+        XCTAssertEqual(delegated.capturedSource?.promptText, "frozen before same-tab activation")
+        await viewModel.mcpDeactivateControlContext(
+            sessionID: targetSessionID,
+            cleanupSessionStore: true
+        )
+    }
+
+    func testReviewSourceStagingRejectsParentMutationAfterTargetCreation() async throws {
+        let root = try makeTemporaryDirectory(named: "parent-mutation-review-root")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let expectedParentSessionID = UUID()
+        let target = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Parent mutation child",
+            parentSessionID: expectedParentSessionID
+        )
+        let targetSessionID = try XCTUnwrap(target.sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: target.tabID,
+            sessionID: targetSessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        viewModel.session(for: target.tabID).parentSessionID = UUID()
+        let source = AgentRunOracleReviewSource.captured(.init(
+            sourceTabID: sourceTabID,
+            workspaceID: workspaceID,
+            sourceSelectionRevision: 17,
+            promptText: "parent mutation source",
+            selection: StoredSelection(),
+            lookupContext: .visibleWorkspace,
+            reviewGitContext: .automaticOnly(base: "HEAD", workspaceRootPaths: [root.path]),
+            sourceAgentSessionID: expectedParentSessionID,
+            sourceAgentRunID: nil,
+            sourceWorktreeBindings: []
+        ))
+        try viewModel.mcpStageAgentRunOracleReviewSource(
+            source,
+            targetTabID: target.tabID,
+            targetSessionID: targetSessionID,
+            expectedParentSessionID: expectedParentSessionID
+        )
+        let runID = UUID()
+        let delegated = try XCTUnwrap(
+            viewModel.mcpBindPendingAgentRunOracleReviewContext(
+                tabID: target.tabID,
+                runID: runID
+            )
+        )
+        XCTAssertEqual(delegated.unavailableReason, .parentSessionMismatch)
+
+        XCTAssertThrowsError(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: target.tabID,
+            workspaceID: workspaceID,
+            sessionID: targetSessionID,
+            runID: runID
+        )) { error in
+            XCTAssertEqual(error as? AgentRunOracleReviewUnavailableReason, .targetActivationMismatch)
+        }
+        await viewModel.mcpDeactivateControlContext(
+            sessionID: targetSessionID,
+            cleanupSessionStore: true
+        )
+    }
+
+    func testLinkedWorktreeAgentRunReviewSourceAllowsDifferentFrozenTargetAndRejectsDrift() async throws {
+        let root = try makeTemporaryDirectory(named: "linked-review-root")
+        let worktree = try makeTemporaryDirectory(named: "linked-review-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let parentSessionID = UUID()
+        let binding = makeBinding(logicalRoot: root.path, worktreeRoot: worktree.path)
+        installParentAgentSession(
+            parentSessionID,
+            binding: binding,
+            sourceTabID: sourceTabID,
+            in: window
+        )
+        let sourceRunID = UUID()
+        viewModel.session(for: sourceTabID).runID = sourceRunID
+        let source = AgentRunOracleReviewSource.captured(.init(
+            sourceTabID: sourceTabID,
+            workspaceID: workspaceID,
+            sourceSelectionRevision: 11,
+            promptText: "frozen worktree prompt",
+            selection: StoredSelection(selectedPaths: [worktree.appendingPathComponent("Tracked.txt").path]),
+            lookupContext: .visibleWorkspace,
+            reviewGitContext: .automaticOnly(
+                base: "HEAD",
+                workspaceRootPaths: [root.path],
+                bindings: [binding]
+            ),
+            sourceAgentSessionID: parentSessionID,
+            sourceAgentRunID: sourceRunID,
+            sourceWorktreeBindings: [binding]
+        ))
+
+        let inheritedTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Inherited review child",
+            parentSessionID: parentSessionID,
+            inheritWorktreeBindings: true
+        )
+        let inheritedSessionID = try XCTUnwrap(inheritedTarget.sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: inheritedTarget.tabID,
+            sessionID: inheritedSessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        try viewModel.mcpStageAgentRunOracleReviewSource(
+            source,
+            targetTabID: inheritedTarget.tabID,
+            targetSessionID: inheritedSessionID,
+            expectedParentSessionID: parentSessionID
+        )
+        let runID = UUID()
+        _ = viewModel.mcpBindPendingAgentRunOracleReviewContext(tabID: inheritedTarget.tabID, runID: runID)
+        let delegated = try XCTUnwrap(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: inheritedTarget.tabID,
+            workspaceID: workspaceID,
+            sessionID: inheritedSessionID,
+            runID: runID
+        ))
+        XCTAssertEqual(delegated.capturedSource?.sourceWorktreeBindings, [binding])
+        viewModel.session(for: inheritedTarget.tabID).worktreeBindings = []
+        XCTAssertThrowsError(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: inheritedTarget.tabID,
+            workspaceID: workspaceID,
+            sessionID: inheritedSessionID,
+            runID: runID
+        )) { error in
+            XCTAssertEqual(error as? AgentRunOracleReviewUnavailableReason, .targetBindingMismatch)
+        }
+        await viewModel.mcpDeactivateControlContext(sessionID: inheritedSessionID, cleanupSessionStore: true)
+
+        let mismatchedTarget = try await viewModel.mcpResolveOrCreateSessionTarget(
+            tabID: nil,
+            sessionID: nil,
+            createIfNeeded: true,
+            sessionName: "Mismatched review child",
+            parentSessionID: parentSessionID,
+            inheritWorktreeBindings: false
+        )
+        let mismatchedSessionID = try XCTUnwrap(mismatchedTarget.sessionID)
+        try await viewModel.mcpActivateControlContext(
+            forTabID: mismatchedTarget.tabID,
+            sessionID: mismatchedSessionID,
+            originatingConnectionID: nil,
+            startPending: true
+        )
+        try viewModel.mcpStageAgentRunOracleReviewSource(
+            source,
+            targetTabID: mismatchedTarget.tabID,
+            targetSessionID: mismatchedSessionID,
+            expectedParentSessionID: parentSessionID
+        )
+        let mismatchedRunID = UUID()
+        let unboundDelegated = try XCTUnwrap(viewModel.mcpBindPendingAgentRunOracleReviewContext(
+            tabID: mismatchedTarget.tabID,
+            runID: mismatchedRunID
+        ))
+        XCTAssertEqual(unboundDelegated.capturedSource?.sourceWorktreeBindings, [binding])
+        XCTAssertEqual(unboundDelegated.target.worktreeBindings, [])
+        XCTAssertNotNil(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: mismatchedTarget.tabID,
+            workspaceID: workspaceID,
+            sessionID: mismatchedSessionID,
+            runID: mismatchedRunID
+        ))
+
+        viewModel.session(for: mismatchedTarget.tabID).worktreeBindings = [binding]
+        XCTAssertThrowsError(try viewModel.mcpDelegatedAgentRunOracleReviewContext(
+            tabID: mismatchedTarget.tabID,
+            workspaceID: workspaceID,
+            sessionID: mismatchedSessionID,
+            runID: mismatchedRunID
+        )) { error in
+            XCTAssertEqual(error as? AgentRunOracleReviewUnavailableReason, .targetBindingMismatch)
+        }
+        await viewModel.mcpDeactivateControlContext(sessionID: mismatchedSessionID, cleanupSessionStore: true)
+    }
+
+    func testProductionCapturePreservesBoundStoredSelectionInsteadOfCanonicalUI() async throws {
+        let logicalRoot = try makeTemporaryDirectory(named: "capture-logical-root")
+        let worktreeRoot = try makeTemporaryDirectory(named: "capture-worktree-root")
+        let window = try await makeWindow(root: logicalRoot)
+        let sourceTabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let parentSessionID = UUID()
+        let binding = makeBinding(
+            logicalRoot: logicalRoot.path,
+            worktreeRoot: worktreeRoot.path
+        )
+        installParentAgentSession(
+            parentSessionID,
+            binding: binding,
+            sourceTabID: sourceTabID,
+            in: window
+        )
+
+        let storedSelection = StoredSelection(
+            selectedPaths: [
+                logicalRoot.appendingPathComponent("Sources/Feature.swift").path,
+                logicalRoot.appendingPathComponent(
+                    "Workspace.repoprompt/_git_data/repos/repo/snapshot/diff/all.patch"
+                ).path
+            ],
+            codemapAutoEnabled: false
+        )
+        var composeTab = try XCTUnwrap(window.workspaceManager.composeTab(with: sourceTabID))
+        composeTab.selection = storedSelection
+        composeTab.activeAgentSessionID = parentSessionID
+        window.workspaceManager.updateComposeTab(composeTab, markDirty: false)
+        // The fixture's asynchronous Git-data maintenance may publish one final canonical
+        // selection revision after workspace setup. Freeze only after that launch boundary has
+        // settled; production capture must continue to reject any later revision change.
+        try await Task.sleep(for: .seconds(2))
+        await window.workspaceFilesViewModel.applyStoredSelection(StoredSelection())
+        let divergentUISelection = window.workspaceFilesViewModel.snapshotSelection()
+        XCTAssertTrue(divergentUISelection.selectedPaths.isEmpty)
+        XCTAssertNotEqual(divergentUISelection, storedSelection)
+
+        let workspaceID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.id)
+        let launchSnapshot = AgentRunOracleReviewLaunchSnapshot(
+            route: .explicitTabContext,
+            windowID: window.windowID,
+            workspaceID: workspaceID,
+            tabID: sourceTabID,
+            selectionRevision: window.workspaceManager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: sourceTabID
+            ),
+            promptText: composeTab.promptText,
+            selection: storedSelection,
+            sourceAgentSessionID: parentSessionID,
+            routedRunID: nil
+        )
+        let source = await window.mcpServer.testCaptureAgentRunOracleReviewSource(
+            snapshot: launchSnapshot,
+            targetWindow: window
+        )
+        guard case let .captured(captured) = source else {
+            if case let .unavailable(unavailable) = source {
+                return XCTFail(
+                    "Expected production source capture: \(unavailable.reason.localizedDescription)"
+                )
+            }
+            return XCTFail("Expected production source capture")
+        }
+        XCTAssertEqual(captured.selection, storedSelection)
+        XCTAssertEqual(captured.sourceAgentSessionID, parentSessionID)
+        XCTAssertEqual(captured.sourceWorktreeBindings, [binding])
+        XCTAssertEqual(
+            Set(captured.exactSelectedIdentities),
+            Set(storedSelection.selectedPaths)
+        )
+    }
+
     func testChildSessionWorktreeBindingInheritanceCanBeOptedOut() throws {
         let root = try makeTemporaryDirectory(named: "root")
         let worktree = try makeTemporaryDirectory(named: "worktree")
@@ -2107,7 +2506,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, message, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow in
+            startRun: { target, message, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test explore target did not resolve a session ID.")
                 }
@@ -2179,11 +2578,11 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in nil },
-            resolveSpawnSourceTabID: { _ in sourceTabID },
+            resolveSpawnParentSourceTabID: { _ in sourceTabID },
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Test start target did not resolve a session ID.")
                 }
@@ -2211,6 +2610,38 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
                 return AgentExternalMCPRunStarter.StartOutcome(snapshot: snapshot, delivery: .startedRun)
             }
         )
+        service.resolveOracleReviewLaunchSource = { _, targetWindow in
+            let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+            let packagingTabID = try XCTUnwrap(sourceTabID ?? workspace.activeComposeTabID)
+            let sourceSessionID = targetWindow.agentModeViewModel
+                .session(for: packagingTabID)
+                .activeAgentSessionID
+            let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                route: sourceTabID == nil ? .windowOnlyActiveCompose : .runScoped,
+                windowID: targetWindow.windowID,
+                workspaceID: workspace.id,
+                tabID: packagingTabID,
+                selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                    workspaceID: workspace.id,
+                    tabID: packagingTabID
+                ),
+                promptText: "",
+                selection: StoredSelection(),
+                sourceAgentSessionID: sourceSessionID,
+                routedRunID: nil
+            )
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: snapshot,
+                source: .unavailable(.init(
+                    delegationID: UUID(),
+                    sourceTabID: packagingTabID,
+                    workspaceID: workspace.id,
+                    sourceAgentSessionID: sourceSessionID,
+                    sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Synthetic start-service fixture")
+                ))
+            )
+        }
         service.resolveSpawnParentSessionIDFromSourceTabID = { (sourceTabID: UUID, window: WindowState) async -> UUID? in
             window.agentModeViewModel.mcpSpawnParentSessionID(sourceTabID: sourceTabID)
         }

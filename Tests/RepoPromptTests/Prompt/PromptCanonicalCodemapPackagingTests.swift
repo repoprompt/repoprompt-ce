@@ -275,7 +275,7 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
             bindingProjection: projection
         )
         let prompt = makePrompt(store: store, windowID: -9802)
-        let message = await prompt.buildHeadlessAIMessage(
+        let message = try await prompt.buildHeadlessAIMessage(
             from: HeadlessContextSnapshot(
                 tabID: UUID(),
                 promptText: "Inspect the frozen worktree context.",
@@ -285,7 +285,8 @@ final class PromptCanonicalCodemapPackagingTests: XCTestCase {
                     slices: [logicalSelectedURL.path: [LineRange(start: 2, end: 2)]],
                     codemapAutoEnabled: true
                 ),
-                lookupContext: lookupContext
+                lookupContext: lookupContext,
+                reviewGitContext: .automaticOnly()
             ),
             model: prompt.preferredAIModel,
             mode: .plan

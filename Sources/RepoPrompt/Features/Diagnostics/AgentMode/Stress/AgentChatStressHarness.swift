@@ -1401,7 +1401,7 @@
                 switch event {
                 case .toolCall, .commandExecutionRunning:
                     true
-                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .reasoningDelta, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
+                case .toolResult, .turnStarted, .turnCompleted, .assistantDelta, .canonicalAssistantDelta, .assistantCompleted, .reasoningDelta, .reasoningCompleted, .tokenUsage, .contextCompacted, .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest, .serverRequestIssue, .livenessActivity, .errorNotification, .error, .system:
                     false
                 }
             }

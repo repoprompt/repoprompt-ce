@@ -246,6 +246,7 @@ final class MCPServerViewModel: ObservableObject {
     private let oracleVM: OracleViewModel
     let workspaceManager: WorkspaceManagerViewModel?
     let selectionCoordinator: WorkspaceSelectionCoordinator?
+    let gitArtifactAdvertisementRegistry = MCPGitArtifactAdvertisementRegistry()
     var agentWorktreeBindingStateProvider: (@MainActor (UUID, UUID?) -> AgentSessionWorktreeBindingState)?
     var agentWorktreeBindingStateResolver: (@MainActor (UUID, UUID?) async -> AgentSessionWorktreeBindingState)?
     var fileToolLookupContextCacheByConnectionID: [UUID: FileToolLookupContextCacheEntry] = [:]
@@ -314,7 +315,10 @@ final class MCPServerViewModel: ObservableObject {
     }
 
     private let workspaceSearch: WorkspaceSearchHandler
-    private let ensureGitDataRootLoaded: (WorkspaceModel?, WorkspaceManagerViewModel?) async -> Void
+    private let ensureGitDataRootLoaded: (
+        WorkspaceModel,
+        WorkspaceManagerViewModel
+    ) async throws -> WorkspaceRootRef
 
     struct MCPVirtualTokenSignature: Equatable, Hashable {
         let tabID: UUID
@@ -369,7 +373,13 @@ final class MCPServerViewModel: ObservableObject {
 
     #if DEBUG
         private var oracleChatSendOverrideForTesting: MCPOracleToolService.SendChat?
+        var requestMetadataOverrideForTesting: RequestMetadata?
+        var agentRunDispatchOverrideForTesting: AgentExternalMCPRunStarter.DispatchInstruction?
         private var contextBuilderFollowUpOverrideForTesting: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
+        private var contextBuilderBeforeFinalReviewAuthorizationForTesting:
+            MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?
+        private var contextBuilderDidFinalizeReviewForTesting:
+            MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
         private var contextBuilderSelectionReplyObserverForTesting: ((
             StoredSelection,
             WorkspaceLookupContext?,
@@ -380,10 +390,48 @@ final class MCPServerViewModel: ObservableObject {
             oracleChatSendOverrideForTesting = override
         }
 
+        func setRequestMetadataOverrideForTesting(_ metadata: RequestMetadata?) {
+            requestMetadataOverrideForTesting = metadata
+        }
+
+        func setAgentRunDispatchOverrideForTesting(
+            _ override: AgentExternalMCPRunStarter.DispatchInstruction?
+        ) {
+            agentRunDispatchOverrideForTesting = override
+        }
+
+        func executeAgentRunForTesting(args: [String: Value]) async throws -> Value {
+            try await agentRunToolService.execute(args: args)
+        }
+
+        func executeAskOracleForTesting(args: [String: Value]) async throws -> Value {
+            try await oracleToolService.executeAskOracle(args: args)
+        }
+
+        func setOracleReviewPackagingTraceObserverForTesting(
+            _ observer: OracleReviewPackagingTraceContext.Observer?
+        ) {
+            oracleVM.setOracleReviewPackagingTraceObserverForTesting(observer)
+        }
+
+        func setOraclePostPackagingTransportOverrideForTesting(
+            _ override: OracleViewModel.OraclePostPackagingTransportOverride?
+        ) {
+            oracleVM.setOraclePostPackagingTransportOverrideForTesting(override)
+        }
+
         func setContextBuilderFollowUpOverrideForTesting(
             _ override: MCPWindowToolDependencies.RunMCPPlanOrQuestion?
         ) {
             contextBuilderFollowUpOverrideForTesting = override
+        }
+
+        func setContextBuilderFinalReviewAuthorizationHooksForTesting(
+            before: MCPWindowToolDependencies.BeforeContextBuilderFinalReviewAuthorization?,
+            after: MCPWindowToolDependencies.DidFinalizeContextBuilderReview?
+        ) {
+            contextBuilderBeforeFinalReviewAuthorizationForTesting = before
+            contextBuilderDidFinalizeReviewForTesting = after
         }
 
         func setContextBuilderSelectionReplyObserverForTesting(
@@ -409,6 +457,29 @@ final class MCPServerViewModel: ObservableObject {
                 )
             },
             requireCurrentTabContext: { [self] toolName in try await requireCurrentTabContext(toolName: toolName) },
+            stabilizedVirtualContext: { [self] context in
+                await stabilizedVirtualContext(for: context)
+            },
+            resolveDelegatedReviewPackaging: { [self] tabID, workspaceID, sessionID, runID in
+                let agentModeViewModel = try requireTargetWindow().agentModeViewModel
+                guard let workspaceID, let sessionID, let runID else {
+                    if agentModeViewModel.mcpHasAgentRunOracleReviewContextExpectation(tabID: tabID) {
+                        throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
+                    }
+                    return nil
+                }
+                guard let context = try agentModeViewModel
+                    .mcpDelegatedAgentRunOracleReviewContext(
+                        tabID: tabID,
+                        workspaceID: workspaceID,
+                        sessionID: sessionID,
+                        runID: runID
+                    )
+                else {
+                    return nil
+                }
+                return try OracleViewModel.OracleSendPackagingContext(delegated: context)
+            },
             rebindChatSessionIfNeeded: { [self] metadata, chatIDString in
                 try rebindOracleChatSessionIfNeeded(metadata: metadata, chatIDString: chatIDString)
             },
@@ -455,8 +526,14 @@ final class MCPServerViewModel: ObservableObject {
             resolveRequestedTabID: { [self] args in
                 try resolveRequestedTabIDForAgentControl(args: args)
             },
-            resolveSpawnSourceTabID: { [self] metadata in
-                await resolveSpawnSourceTabIDForAgentSessionCreation(metadata: metadata)
+            resolveSpawnParentSourceTabID: { [self] metadata in
+                await resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: metadata)
+            },
+            resolveOracleReviewLaunchSource: { [self] metadata, targetWindow in
+                try await resolveAgentRunOracleReviewLaunchSource(
+                    metadata: metadata,
+                    targetWindow: targetWindow
+                )
             },
             validateSpawnRouting: { [self] metadata, sourceTabID in
                 try await validateAgentRunStartRouting(metadata: metadata, resolvedSourceTabID: sourceTabID)
@@ -485,7 +562,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow in
+            startRun: { [self] target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, expectedParentSessionID, oracleReviewSource in
                 try await AgentExternalMCPRunStarter.start(
                     target: target,
                     message: message,
@@ -496,11 +573,200 @@ final class MCPServerViewModel: ObservableObject {
                     modelRaw: modelRaw,
                     reasoningEffortRaw: reasoningEffortRaw,
                     taskLabelKind: taskLabelKind,
-                    workflow: workflow
+                    workflow: workflow,
+                    expectedParentSessionID: expectedParentSessionID,
+                    oracleReviewSource: oracleReviewSource,
+                    dispatchInstruction: {
+                        #if DEBUG
+                            self.agentRunDispatchOverrideForTesting
+                        #else
+                            nil
+                        #endif
+                    }()
                 )
             }
         )
     }
+
+    private func resolveAgentRunOracleReviewLaunchSource(
+        metadata: RequestMetadata,
+        targetWindow: WindowState
+    ) async throws -> ResolvedAgentRunOracleReviewLaunchSource {
+        let snapshot = try await resolveAgentRunOracleReviewLaunchSnapshot(
+            metadata: metadata,
+            targetWindow: targetWindow
+        )
+        let source = await captureAgentRunOracleReviewSource(
+            snapshot: snapshot,
+            targetWindow: targetWindow
+        )
+        return ResolvedAgentRunOracleReviewLaunchSource(snapshot: snapshot, source: source)
+    }
+
+    private func captureAgentRunOracleReviewSource(
+        snapshot: AgentRunOracleReviewLaunchSnapshot,
+        targetWindow: WindowState
+    ) async -> AgentRunOracleReviewSource {
+        let manager = targetWindow.workspaceManager
+        let sourceTabID = snapshot.tabID
+        let unavailable: (
+            _ message: String,
+            _ sourceRunID: UUID?
+        ) -> AgentRunOracleReviewSource = { message, sourceRunID in
+            .unavailable(.init(
+                delegationID: UUID(),
+                sourceTabID: sourceTabID,
+                workspaceID: snapshot.workspaceID,
+                sourceAgentSessionID: snapshot.sourceAgentSessionID,
+                sourceAgentRunID: sourceRunID,
+                reason: .sourceCaptureFailed(message)
+            ))
+        }
+
+        guard let initial = manager.collectMCPTabContextComposeSnapshot(
+            tabID: sourceTabID,
+            workspaceID: snapshot.workspaceID,
+            captureActiveUIState: false,
+            flushPendingUISelection: false
+        ) else {
+            return unavailable(
+                "The launching tab disappeared after its immutable review snapshot was resolved.",
+                snapshot.routedRunID
+            )
+        }
+
+        let sourceSessionID = snapshot.sourceAgentSessionID
+        let sourceSession: AgentModeViewModel.TabSession?
+        let bindingState: AgentSessionWorktreeBindingState
+        if let sourceSessionID {
+            let hydrated = await targetWindow.agentModeViewModel.ensureSessionReady(tabID: sourceTabID)
+            guard hydrated.activeAgentSessionID == sourceSessionID,
+                  snapshot.routedRunID == nil || hydrated.runID == snapshot.routedRunID
+            else {
+                return unavailable(
+                    "The launching Agent session changed while its review context was being captured.",
+                    hydrated.runID
+                )
+            }
+            sourceSession = hydrated
+            bindingState = targetWindow.agentModeViewModel.worktreeBindingState(
+                forAgentSessionID: sourceSessionID,
+                tabID: sourceTabID
+            )
+        } else {
+            sourceSession = nil
+            bindingState = .notApplicable
+        }
+
+        guard bindingState != .unhydrated, bindingState != .unavailable else {
+            return unavailable(
+                "The launching Agent session's worktree bindings were unavailable.",
+                sourceSession?.runID
+            )
+        }
+        let bindings = bindingState.bindings ?? []
+        let sourceRunID = sourceSession?.runID
+        guard initial.snapshot.activeAgentSessionID == sourceSessionID,
+              manager.selectionRevisionForMCP(
+                  workspaceID: snapshot.workspaceID,
+                  tabID: sourceTabID
+              ) == snapshot.selectionRevision
+        else {
+            return unavailable(
+                "The launching tab changed after its review selection was frozen.",
+                sourceRunID
+            )
+        }
+
+        do {
+            let lookupContext = try await AgentWorkspaceLookupContextResolver.requiredLookupContext(
+                source: AgentWorkspaceLookupContextSource(
+                    activeAgentSessionID: sourceSessionID,
+                    worktreeBindingState: bindingState
+                ),
+                store: targetWindow.promptManager.workspaceFileContextStore
+            )
+            let reviewGitContext = await targetWindow.promptManager.freezePromptGitReviewContext(
+                workspaceID: snapshot.workspaceID,
+                tabID: sourceTabID,
+                sessionID: sourceSessionID,
+                bindings: bindings,
+                base: "HEAD"
+            )
+            let currentBindingState: AgentSessionWorktreeBindingState = if let sourceSessionID {
+                targetWindow.agentModeViewModel.worktreeBindingState(
+                    forAgentSessionID: sourceSessionID,
+                    tabID: sourceTabID
+                )
+            } else {
+                .notApplicable
+            }
+            guard let latest = manager.collectMCPTabContextComposeSnapshot(
+                tabID: sourceTabID,
+                workspaceID: snapshot.workspaceID,
+                captureActiveUIState: false,
+                flushPendingUISelection: false
+            ) else {
+                return unavailable(
+                    "The launching tab disappeared while its frozen review capability was being created.",
+                    sourceRunID
+                )
+            }
+            guard latest.snapshot.activeAgentSessionID == sourceSessionID else {
+                return unavailable(
+                    "The launching Agent session changed while its frozen review capability was being created.",
+                    sourceRunID
+                )
+            }
+            guard sourceSession?.runID == sourceRunID else {
+                return unavailable(
+                    "The launching Agent run changed while its frozen review capability was being created.",
+                    sourceRunID
+                )
+            }
+            guard currentBindingState == bindingState else {
+                return unavailable(
+                    "The launching Agent worktree binding changed while its frozen review capability was being created.",
+                    sourceRunID
+                )
+            }
+            guard manager.selectionRevisionForMCP(
+                workspaceID: snapshot.workspaceID,
+                tabID: sourceTabID
+            ) == snapshot.selectionRevision else {
+                return unavailable(
+                    "The launching selection changed while its frozen review capability was being created.",
+                    sourceRunID
+                )
+            }
+            return .captured(.init(
+                sourceTabID: sourceTabID,
+                workspaceID: snapshot.workspaceID,
+                sourceSelectionRevision: snapshot.selectionRevision,
+                promptText: snapshot.promptText,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
+                sourceAgentSessionID: sourceSessionID,
+                sourceAgentRunID: sourceRunID,
+                sourceWorktreeBindings: bindings
+            ))
+        } catch {
+            return unavailable(error.localizedDescription, sourceRunID)
+        }
+    }
+
+    #if DEBUG
+        func testCaptureAgentRunOracleReviewSource(
+            snapshot: AgentRunOracleReviewLaunchSnapshot,
+            targetWindow: WindowState
+        ) async -> AgentRunOracleReviewSource {
+            await captureAgentRunOracleReviewSource(
+                snapshot: snapshot,
+                targetWindow: targetWindow
+            )
+        }
+    #endif
 
     private var agentExploreToolService: AgentExploreMCPToolService {
         AgentExploreMCPToolService(
@@ -531,7 +797,7 @@ final class MCPServerViewModel: ObservableObject {
             endAgentRunWait: { [self] token, completion in
                 endAgentRunWaitScope(token, completion: completion)
             },
-            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow in
+            startRun: { target, message, metadata, bindCurrentRequestToTab, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, taskLabelKind, workflow, _, _ in
                 try await AgentExternalMCPRunStarter.start(
                     target: target,
                     message: message,
@@ -822,7 +1088,8 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeRunID: resolution.agentModeRunID,
                 bindCaller: resolution.bindCaller,
                 lookupContext: resolution.lookupContext,
-                workspaceContext: resolution.workspaceContext
+                workspaceContext: resolution.workspaceContext,
+                reviewGitContext: resolution.reviewGitContext
             )
         },
         bindTabForConnection: { [weak self] connectionID, clientName, tabID, workspaceID, windowID in
@@ -835,14 +1102,15 @@ final class MCPServerViewModel: ObservableObject {
                 windowID: windowID
             )
         },
-        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride, lookupContextOverride in
+        buildTabSelectionReply: { [weak self] selection, includeBlocks, display, codeMapUsageOverride, lookupContextOverride, reviewGitContextOverride in
             guard let self else { throw MCPError.internalError("Window deallocated while building context_builder selection reply") }
             let reply = await buildTabSelectionReply(
                 from: selection,
                 includeBlocks: includeBlocks,
                 display: display,
                 codeMapUsageOverride: codeMapUsageOverride,
-                lookupContextOverride: lookupContextOverride
+                lookupContextOverride: lookupContextOverride,
+                reviewGitContextOverride: reviewGitContextOverride
             )
             #if DEBUG
                 contextBuilderSelectionReplyObserverForTesting?(selection, lookupContextOverride, reply)
@@ -869,7 +1137,19 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { throw MCPError.internalError("Window deallocated while writing Oracle export") }
             return try await writeGeneratedOracleExportFile(path: path, content: content, destination: destination)
         },
-        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, progressReporter, activityReporter in
+        beforeContextBuilderFinalReviewAuthorization: { [weak self] in
+            #if DEBUG
+                await self?.contextBuilderBeforeFinalReviewAuthorizationForTesting?()
+            #endif
+        },
+        didFinalizeContextBuilderReview: { [weak self] authorization in
+            #if DEBUG
+                await self?.contextBuilderDidFinalizeReviewForTesting?(authorization)
+            #else
+                _ = authorization
+            #endif
+        },
+        runMCPPlanOrQuestion: { [weak self] contextBuilderVM, tabID, agentModeSessionID, agentModeRunID, mode, prompt, selection, lookupContext, reviewGitContext, finalReviewAuthorization, progressReporter, activityReporter in
             guard let self else { throw MCPError.internalError("Window deallocated while generating context_builder response") }
             #if DEBUG
                 if let override = contextBuilderFollowUpOverrideForTesting {
@@ -882,6 +1162,8 @@ final class MCPServerViewModel: ObservableObject {
                         prompt,
                         selection,
                         lookupContext,
+                        reviewGitContext,
+                        finalReviewAuthorization,
                         progressReporter,
                         activityReporter
                     )
@@ -896,6 +1178,8 @@ final class MCPServerViewModel: ObservableObject {
                 prompt: prompt,
                 selection: selection,
                 lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext,
+                finalReviewAuthorization: finalReviewAuthorization,
                 progressReporter: progressReporter,
                 activityReporter: activityReporter
             )
@@ -908,6 +1192,18 @@ final class MCPServerViewModel: ObservableObject {
         captureRequestMetadata: { [weak self] in
             guard let self else { return MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: nil, windowID: nil) }
             return await captureRequestMetadata()
+        },
+        resolveImplicitContextBuilderGitTarget: { [weak self] metadata in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while resolving the Context Builder Git target")
+            }
+            return try await resolveImplicitContextBuilderGitTarget(metadata: metadata)
+        },
+        validateContextBuilderGitArtifactSelection: { [weak self] metadata, target in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while validating Context Builder Git publication")
+            }
+            try await validateContextBuilderGitArtifactSelection(metadata: metadata, target: target)
         },
         resolveTabContextSnapshot: { [weak self] metadata, toolName, policy in
             guard let self else { throw MCPError.internalError("Window deallocated while resolving tab context") }
@@ -934,15 +1230,35 @@ final class MCPServerViewModel: ObservableObject {
             return await mapFileManagerErrorToMCP(error, action: action, path: path)
         },
         ensureGitDataRootLoaded: { [weak self] workspace, workspaceManager in
-            guard let self else { return }
-            await ensureGitDataRootLoaded(workspace, workspaceManager)
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while loading the Git-data root")
+            }
+            return try await ensureGitDataRootLoaded(workspace, workspaceManager)
         },
         logDebug: { message in
             mcpServerViewModelDebugLog(message)
         },
-        addPrimaryGitDiffArtifactsToSelection: { [weak self] existing, paths in
-            guard let self else { return (existing, []) }
-            return await addPrimaryGitDiffArtifactsToSelection(existing: existing, paths: paths)
+        commitPrimaryGitDiffArtifactsToCurrentTab: { [weak self] toolName, candidates in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while committing Git artifacts")
+            }
+            return try await commitPrimaryGitArtifactsToCurrentTab(
+                toolName: toolName,
+                candidates: candidates
+            )
+        },
+        replaceAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName, artifacts in
+            guard let self else {
+                throw MCPError.internalError("Window deallocated while registering Git artifact aliases")
+            }
+            return try await replaceAdvertisedGitArtifactsForCurrentTab(
+                toolName: toolName,
+                artifacts: artifacts
+            )
+        },
+        invalidateAdvertisedGitArtifactsForCurrentTab: { [weak self] toolName in
+            guard let self else { return }
+            await invalidateAdvertisedGitArtifactsForCurrentTab(toolName: toolName)
         },
         workspaceSearch: workspaceSearch,
         parseManageSelectionInputs: { [weak self] rawPaths, slicesValue in
@@ -959,6 +1275,16 @@ final class MCPServerViewModel: ObservableObject {
             guard let self else { return context.selection }
             return await stabilizedVirtualSelection(for: context)
         },
+        freezePromptGitReviewContext: { [weak self] context in
+            guard let self else { return .automaticOnly(base: "HEAD") }
+            return await promptVM.freezePromptGitReviewContext(
+                workspaceID: context.workspaceID,
+                tabID: context.tabID,
+                sessionID: context.activeAgentSessionID,
+                bindings: context.worktreeBindings,
+                base: "HEAD"
+            )
+        },
         buildCurrentSelectionReply: { [weak self] includeBlocks, display, extraInvalid, viewMode, resolvedContext, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building selection reply") }
             return await buildCurrentSelectionReply(
@@ -970,7 +1296,7 @@ final class MCPServerViewModel: ObservableObject {
                 lookupContext: lookupContext
             )
         },
-        buildSelectionPreviewReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, lookupContext in
+        buildSelectionPreviewReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, lookupContext, virtualContext, reviewGitContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building selection preview") }
             return await buildSelectionPreviewReply(
                 selection: selection,
@@ -979,10 +1305,12 @@ final class MCPServerViewModel: ObservableObject {
                 extraInvalid: extraInvalid,
                 viewMode: viewMode,
                 codeMapUsageOverride: codeMapUsageOverride,
-                lookupContext: lookupContext
+                lookupContext: lookupContext,
+                virtualContext: virtualContext,
+                reviewGitContext: reviewGitContext
             )
         },
-        buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext, lookupContext in
+        buildSelectionMutationReply: { [weak self] selection, includeBlocks, display, extraInvalid, viewMode, codeMapUsageOverride, virtualContext, lookupContext, reviewGitContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building selection mutation reply") }
             return await buildSelectionMutationReply(
                 from: selection,
@@ -992,12 +1320,59 @@ final class MCPServerViewModel: ObservableObject {
                 viewMode: viewMode,
                 codeMapUsageOverride: codeMapUsageOverride,
                 virtualContext: virtualContext,
-                lookupContext: lookupContext
+                lookupContext: lookupContext,
+                reviewGitContext: reviewGitContext
             )
         },
-        buildManageSelectionSetSelection: { [weak self] inputs, mode, existing, lookupRootScope in
+        buildManageSelectionSetSelection: { [weak self] inputs, mode, existing, hasFullFileArtifactInputs, lookupRootScope in
             guard let self else { return MCPServerViewModel.BuildStoredSelectionResult(selection: existing, invalidPaths: [], codemapUnavailable: []) }
-            return await buildManageSelectionSetSelection(from: inputs, mode: mode, existing: existing, lookupRootScope: lookupRootScope)
+            return await buildManageSelectionSetSelection(
+                from: inputs,
+                mode: mode,
+                existing: existing,
+                hasFullFileArtifactInputs: hasFullFileArtifactInputs,
+                lookupRootScope: lookupRootScope
+            )
+        },
+        resolveManageSelectionArtifactInputs: { [weak self] request in
+            guard let self else {
+                return MCPManageSelectionArtifactResolution(
+                    ordinaryPaths: request.paths,
+                    ordinarySliceInputs: request.sliceInputs,
+                    artifacts: [],
+                    invalidDiagnostics: [],
+                    fence: nil
+                )
+            }
+            return await MCPManageSelectionArtifactResolver(
+                store: promptVM.workspaceFileContextStore,
+                registry: gitArtifactAdvertisementRegistry
+            ).resolve(request)
+        },
+        validateManageSelectionArtifactFence: { [weak self] fence in
+            guard let self else { return false }
+            return await validateManageSelectionArtifactFence(fence)
+        },
+        mutatePreResolvedFullFilePaths: { [weak self] base, absolutePaths, mode in
+            guard let self else { return base }
+            return mutatePreResolvedFullFilePaths(
+                base: base,
+                absolutePaths: absolutePaths,
+                mode: mode
+            )
+        },
+        commitManageSelectionArtifactMutation: { [weak self] resolvedContext, metadata, expectedPhysicalSelection, requestedPhysicalSelection, lookupContext, fence in
+            guard let self else {
+                return .unavailable(reason: "window deallocated during selection commit")
+            }
+            return await commitManageSelectionArtifactMutation(
+                resolvedContext: resolvedContext,
+                metadata: metadata,
+                expectedPhysicalSelection: expectedPhysicalSelection,
+                requestedPhysicalSelection: requestedPhysicalSelection,
+                lookupContext: lookupContext,
+                fence: fence
+            )
         },
         addStoredSelectionPaths: { [weak self] existing, paths, rawPaths, mode, lookupRootScope in
             guard let self else { return MCPServerViewModel.AddStoredSelectionResult(selection: existing, invalidPaths: [], resolvedMap: [:], mutated: false, codemapUnavailable: []) }
@@ -1049,6 +1424,17 @@ final class MCPServerViewModel: ObservableObject {
         buildStoreBackedFileTreeResult: { [weak self] mode, maxDepth, startPath, lookupContext in
             guard let self else { throw MCPError.internalError("Window deallocated while building file tree") }
             return try await buildStoreBackedFileTreeResult(mode: mode, maxDepth: maxDepth, startPath: startPath, lookupContext: lookupContext)
+        },
+        readSelectedAuthorizedGitArtifact: { [weak self] requestedPath, resolvedPath, startLine1Based, lineCount, metadata, lookupContext in
+            guard let self else { throw MCPError.internalError("Window deallocated while reading selected Git artifact") }
+            return try await readSelectedAuthorizedGitArtifact(
+                requestedPath: requestedPath,
+                resolvedPath: resolvedPath,
+                startLine1Based: startLine1Based,
+                lineCount: lineCount,
+                metadata: metadata,
+                lookupContext: lookupContext
+            )
         },
         readFile: { [weak self] path, startLine1Based, lineCount, lookupRootScope in
             guard let self else { throw MCPError.internalError("Window deallocated while reading file") }
@@ -1967,7 +2353,10 @@ final class MCPServerViewModel: ObservableObject {
         selectionCoordinator: WorkspaceSelectionCoordinator? = nil,
         windowID: Int,
         workspaceSearch: @escaping WorkspaceSearchHandler,
-        ensureGitDataRootLoaded: @escaping (WorkspaceModel?, WorkspaceManagerViewModel?) async -> Void,
+        ensureGitDataRootLoaded: @escaping (
+            WorkspaceModel,
+            WorkspaceManagerViewModel
+        ) async throws -> WorkspaceRootRef,
         applyEditsApprovalStore: ApplyEditsApprovalStore = .shared
     ) {
         self.service = service
@@ -2003,6 +2392,15 @@ final class MCPServerViewModel: ObservableObject {
                 #if DEBUG || EDIT_FLOW_PERF
                     EditFlowPerf.end(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolSummariesChange, invalidationToolSummariesChangeState)
                 #endif
+            }
+            .store(in: &cancellables)
+
+        workspaceManager.$workspaces
+            .dropFirst()
+            .sink { [weak self] workspaces in
+                self?.gitArtifactAdvertisementRegistry.retainWorkspaces(
+                    Set(workspaces.map(\.id))
+                )
             }
             .store(in: &cancellables)
 
@@ -2991,7 +3389,8 @@ final class MCPServerViewModel: ObservableObject {
         agentModeRunID: UUID?,
         bindCaller: Bool,
         lookupContext: WorkspaceLookupContext,
-        workspaceContext: ContextBuilderWorkspaceContext?
+        workspaceContext: ContextBuilderWorkspaceContext?,
+        reviewGitContext: FrozenPromptGitReviewContext
     ) {
         let purpose: MCPRunPurpose = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
@@ -3032,9 +3431,12 @@ final class MCPServerViewModel: ObservableObject {
                 policy: .requireExplicitOrRunScoped,
                 runPurpose: purpose
             )
-            guard case let .tabContextSnapshot(context, source) = resolution else {
+            guard case let .tabContextSnapshot(resolvedContext, source) = resolution else {
                 throw MCPError.invalidParams("context_builder requires a tab context snapshot.")
             }
+            let context = await targetWindow.mcpServer.stabilizedVirtualContext(
+                for: resolvedContext
+            )
             guard composeTabExists(context.tabID, in: targetWindow) else {
                 throw MCPError.invalidParams("Tab context '\(context.tabID.uuidString)' is not available in window \(targetWindow.windowID).")
             }
@@ -3050,6 +3452,7 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceContext = try await ContextBuilderWorkspaceContext.resolve(
                         from: context,
                         workspaceRepoPaths: workspace.repoPaths,
+                        workspaceDirectoryPath: targetWindow.workspaceManager.workspaceDirectory(for: workspace).path,
                         store: targetWindow.promptManager.workspaceFileContextStore
                     )
                 } catch {
@@ -3067,6 +3470,17 @@ final class MCPServerViewModel: ObservableObject {
                     workspaceID: context.workspaceID
                 )
             }
+            let reviewGitContext = if let workspaceContext {
+                workspaceContext.reviewGitContext
+            } else {
+                await targetWindow.promptManager.freezePromptGitReviewContext(
+                    workspaceID: context.workspaceID,
+                    tabID: context.tabID,
+                    sessionID: context.activeAgentSessionID,
+                    bindings: context.worktreeBindings,
+                    base: "HEAD"
+                )
+            }
             let agentModeSessionID = purpose == .agentModeRun ? context.activeAgentSessionID : nil
             let agentModeRunID = purpose == .agentModeRun ? context.runID : nil
             return (
@@ -3076,7 +3490,8 @@ final class MCPServerViewModel: ObservableObject {
                 agentModeRunID,
                 shouldBindCaller,
                 lookupContext,
-                workspaceContext
+                workspaceContext,
+                reviewGitContext
             )
         } catch {
             if explicitHint != nil || existingBinding != nil || purpose == .agentModeRun {
@@ -3092,6 +3507,11 @@ final class MCPServerViewModel: ObservableObject {
         ) else {
             throw MCPError.internalError("Failed to create compose tab.")
         }
+        let reviewGitContext = await targetWindow.promptManager.freezePromptGitReviewContext(
+            workspaceID: targetWindow.workspaceManager.activeWorkspace?.id,
+            tabID: createdTab.id,
+            base: "HEAD"
+        )
         return (
             createdTab.id,
             targetWindow.workspaceManager.activeWorkspace?.id,
@@ -3099,7 +3519,8 @@ final class MCPServerViewModel: ObservableObject {
             nil,
             true,
             .visibleWorkspace,
-            nil
+            nil,
+            reviewGitContext
         )
     }
 
@@ -4496,7 +4917,7 @@ final class MCPServerViewModel: ObservableObject {
         let scopedRootIDs = Set(roots.map(\.id))
         let requiresScopedRootMembership = switch lookupContext.rootScope {
         case .sessionBoundWorkspace, .validatedSessionBoundWorkspace: true
-        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded: false
+        case .visibleWorkspace, .visibleWorkspacePlusGitData, .allLoaded, .allLoadedExcludingGitData: false
         }
         var codeStructureFiles: [CodeStructureFile] = []
         var seenPaths = Set<String>()
@@ -4641,6 +5062,108 @@ final class MCPServerViewModel: ObservableObject {
     /// Reads a file with optional slicing. Supports 1-based indices and a negative sentinel
     /// for bottom-origin reads (start_line = -N reads the last N lines).
     /// Returns both the content slice and metadata about the shown range.
+    private func readSelectedAuthorizedGitArtifact(
+        requestedPath: String,
+        resolvedPath: String,
+        startLine1Based: Int?,
+        lineCount: Int?,
+        metadata: RequestMetadata,
+        lookupContext: WorkspaceLookupContext
+    ) async throws -> (reply: ToolResultDTOs.ReadFileReply, shouldAutoSelect: Bool)? {
+        guard var resolvedContext = try? resolveTabContextSnapshot(
+            from: metadata,
+            toolName: MCPWindowToolName.readFile,
+            policy: .allowLegacyImplicitRouting
+        ) else { return nil }
+
+        resolvedContext.snapshot = await stabilizedVirtualContext(for: resolvedContext.snapshot)
+        let context = resolvedContext.snapshot
+        let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            sessionID: context.activeAgentSessionID,
+            bindings: context.worktreeBindings,
+            base: "HEAD"
+        )
+        let targetsGitData = isGitDataArtifactRequest(
+            requestedPath,
+            resolvedPath: resolvedPath,
+            capability: reviewGitContext.artifactCapability
+        )
+        guard let capability = reviewGitContext.artifactCapability else {
+            if targetsGitData {
+                throw MCPError.invalidParams(
+                    "Cannot read '\(requestedPath)'. Git-data artifacts must already be selected and authorized."
+                )
+            }
+            return nil
+        }
+
+        let physicalSelection = lookupContext.physicalizeSelection(context.selection)
+        let authorization = await SelectedGitDiffArtifactAuthorizationService().authorize(
+            SelectedGitArtifactAuthorizationRequest(
+                physicalSelection: physicalSelection,
+                capability: capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        )
+        let requestedCandidates = Set([requestedPath, resolvedPath].map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        })
+        guard let entry = authorization.entries.first(where: { entry in
+            let absolutePath = entry.file.standardizedFullPath
+            return requestedCandidates.contains(absolutePath)
+                || authorization.displayAliasesByAbsolutePath[absolutePath]
+                .map(requestedCandidates.contains) == true
+        }),
+            let content = entry.loadedContent,
+            let displayPath = authorization.displayAliasesByAbsolutePath[entry.file.standardizedFullPath]
+        else {
+            if targetsGitData {
+                throw MCPError.invalidParams(
+                    "Cannot read '\(requestedPath)'. Git-data artifacts must already be selected and authorized."
+                )
+            }
+            return nil
+        }
+
+        let preparedContent = await WorkspaceInteractiveReadProcessor.prepareOffActor(content)
+        do {
+            let preparedReply = try await MCPReadFileToolProjection.makeBaseReply(
+                preparedContent: preparedContent,
+                startLine1Based: startLine1Based,
+                lineCount: lineCount,
+                displayPath: displayPath
+            )
+            return (preparedReply.reply, false)
+        } catch WorkspaceInteractiveReadRangeError.limitWithNegativeStart {
+            throw MCPError.invalidParams("limit parameter is not allowed with negative start_line. Use start_line=-N to read the last N lines.")
+        } catch WorkspaceInteractiveReadRangeError.zeroStart {
+            throw MCPError.invalidParams("start_line must be positive (1-based) or negative (tail-like behavior)")
+        }
+    }
+
+    private func isGitDataArtifactRequest(
+        _ requestedPath: String,
+        resolvedPath: String,
+        capability: SelectedGitArtifactCapability?
+    ) -> Bool {
+        let candidates = [requestedPath, resolvedPath].map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if candidates.contains(where: {
+            $0 == "_git_data"
+                || $0.hasPrefix("_git_data/")
+                || $0.contains("/_git_data/")
+        }) {
+            return true
+        }
+        guard let rootPath = capability?.gitDataRoot.standardizedFullPath else { return false }
+        return candidates.contains {
+            $0 == rootPath || StandardizedPath.isDescendant($0, of: rootPath)
+        }
+    }
+
     private func readFile(
         path: String,
         startLine1Based: Int? = nil,

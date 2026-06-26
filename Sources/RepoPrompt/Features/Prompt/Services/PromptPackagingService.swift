@@ -42,17 +42,6 @@ enum PromptPackagingService {
         """
     }
 
-    private enum GitDiffArtifact {
-        static let rootFolderName = "_git_data"
-
-        static func isDiffArtifactPath(_ fullPath: String) -> Bool {
-            guard fullPath.contains("/\(rootFolderName)/") else { return false }
-            let lower = fullPath.lowercased()
-            guard lower.hasSuffix(".diff") || lower.hasSuffix(".patch") else { return false }
-            return lower.contains("/diff/") || lower.contains("/diffs/")
-        }
-    }
-
     static func partitionPromptEntriesForGitDiff(
         _ entries: [PromptFileEntry]
     ) -> (diffEntries: [PromptFileEntry], codeEntries: [PromptFileEntry]) {
@@ -63,7 +52,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if entry.role == .authorizedGitDiffArtifact {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -214,7 +203,7 @@ enum PromptPackagingService {
         codeEntries.reserveCapacity(entries.count)
 
         for entry in entries {
-            if GitDiffArtifact.isDiffArtifactPath(entry.file.fullPath) {
+            if entry.role == .authorizedGitDiffArtifact {
                 diffEntries.append(entry)
             } else {
                 codeEntries.append(entry)
@@ -227,6 +216,7 @@ enum PromptPackagingService {
         fromDiffEntries diffEntries: [ResolvedPromptFileEntry]
     ) -> String? {
         let rawParts = generateRawFileTexts(diffEntries)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         return rawParts.isEmpty ? nil : rawParts.joined(separator: "\n\n")
     }
 
@@ -243,6 +233,19 @@ enum PromptPackagingService {
     ) async -> String? {
         if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
             return selected
+        }
+        return await fallback()
+    }
+
+    /// Preserves the selected-artifact-first lazy boundary while retaining structured fallback
+    /// details for diagnostics and tests. The fallback is never evaluated when a readable selected
+    /// patch is present.
+    static func resolveGitDiffResolution(
+        fromDiffEntries diffEntries: [ResolvedPromptFileEntry],
+        fallback: @Sendable () async -> PromptGitDiffResolution
+    ) async -> PromptGitDiffResolution {
+        if let selected = selectedGitDiffText(fromDiffEntries: diffEntries) {
+            return .selectedArtifact(selected)
         }
         return await fallback()
     }

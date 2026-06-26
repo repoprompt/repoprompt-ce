@@ -57,6 +57,94 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    func testInitializedNotificationOmitsParams() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        _ = try await controller.startOrResume(existing: nil, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        let initialized = try recordedRequest(for: "initialized", at: recordURL)
+        XCTAssertEqual(initialized["hasParams"] as? Bool, false)
+    }
+
+    func testResumeRequiresThreadIDAndIncludesOptionalPath() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "  existing-thread  ",
+            rolloutPath: "/tmp/existing-thread.jsonl",
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        let params = try recordedParams(for: "thread/resume", at: recordURL)
+        XCTAssertEqual(params["threadId"] as? String, "existing-thread")
+        XCTAssertEqual(params["path"] as? String, "/tmp/existing-thread.jsonl")
+    }
+
+    func testResumeWithoutPathSendsRequiredThreadIDOnly() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: "existing-thread",
+            rolloutPath: nil,
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+        await controller.shutdown()
+
+        let params = try recordedParams(for: "thread/resume", at: recordURL)
+        XCTAssertEqual(params["threadId"] as? String, "existing-thread")
+        XCTAssertNil(params["path"])
+    }
+
+    func testPathOnlyResumeFailsLocallyBeforeWritingRequest() async throws {
+        let (controller, recordURL) = try await makeController(options: makeOptions())
+        let existing = CodexNativeSessionController.SessionRef(
+            conversationID: " \n\t ",
+            rolloutPath: "/tmp/path-only.jsonl",
+            model: nil,
+            reasoningEffort: nil
+        )
+
+        do {
+            _ = try await controller.startOrResume(existing: existing, baseInstructions: "Agent")
+            XCTFail("Expected path-only resume to fail")
+        } catch {
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Cannot resume this Codex thread because its saved thread ID is missing. Start a new Codex thread instead."
+            )
+        }
+        await controller.shutdown()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recordURL.path))
+    }
+
+    func testProtocolShapeRejectionsPreserveMessageAndAdviseCLIUpdate() {
+        for method in ["initialize", "thread/resume"] {
+            for code in [-32601, -32602] {
+                let error = CodexAppServerClient.ClientError.requestFailed(
+                    .init(method: method, code: code, message: "server rejected request", data: nil)
+                )
+
+                XCTAssertTrue(error.localizedDescription.hasPrefix("server rejected request"))
+                XCTAssertTrue(error.localizedDescription.contains("Update the installed Codex CLI"))
+                XCTAssertTrue(error.localizedDescription.contains(method))
+            }
+        }
+    }
+
+    func testUnrelatedRequestFailureDoesNotAddCLIUpdateHint() {
+        let error = CodexAppServerClient.ClientError.requestFailed(
+            .init(method: "turn/start", code: -32602, message: "turn rejected", data: nil)
+        )
+
+        XCTAssertEqual(error.localizedDescription, "turn rejected")
+    }
+
     func testSafeManagedMCPOverridesSuppressThirdPartyServers() {
         let repoPromptName = MCPIntegrationHelper.repoPromptMCPServerName
         let entries = [
@@ -129,6 +217,15 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
         )
     }
 
+    private func makeOptions() -> CodexNativeSessionController.Options {
+        .agentModeDefault(
+            forceExperimentalSteering: false,
+            approvalPolicyProvider: { .never },
+            sandboxModeProvider: { .readOnly },
+            approvalReviewerProvider: { .user }
+        )
+    }
+
     private func makeController(
         options: CodexNativeSessionController.Options
     ) async throws -> (CodexNativeSessionController, URL) {
@@ -179,9 +276,10 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
             except Exception:
                 continue
             method = request.get("method")
+            has_params = "params" in request
             params = request.get("params") or {}
             with open(record_path, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps({"method": method, "params": params}) + "\\n")
+                handle.write(json.dumps({"method": method, "hasParams": has_params, "params": params}) + "\\n")
             if "id" not in request:
                 continue
             if method == "thread/start":
@@ -197,13 +295,18 @@ final class CodexNativeSessionControllerGoalConfigTests: XCTestCase {
     }
 
     private func recordedParams(for method: String, at recordURL: URL) throws -> [String: Any] {
+        let request = try recordedRequest(for: method, at: recordURL)
+        return try XCTUnwrap(request["params"] as? [String: Any])
+    }
+
+    private func recordedRequest(for method: String, at recordURL: URL) throws -> [String: Any] {
         let data = try Data(contentsOf: recordURL)
         let text = try XCTUnwrap(String(data: data, encoding: .utf8))
         for line in text.split(whereSeparator: { $0.isNewline }) {
             let lineData = try XCTUnwrap(String(line).data(using: .utf8))
             let object = try XCTUnwrap(JSONSerialization.jsonObject(with: lineData) as? [String: Any])
             if object["method"] as? String == method {
-                return try XCTUnwrap(object["params"] as? [String: Any])
+                return object
             }
         }
         XCTFail("No \(method) request was recorded")

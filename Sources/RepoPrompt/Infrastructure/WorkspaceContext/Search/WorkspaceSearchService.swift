@@ -581,21 +581,21 @@ actor WorkspaceSearchService {
         _ rhs: WorkspaceSearchRootPathIndex.Candidate
     ) -> Bool {
         if lhs.score != rhs.score { return lhs.score > rhs.score }
-        if lhs.tieBreakKey != rhs.tieBreakKey {
-            return lhs.tieBreakKey.utf8.lexicographicallyPrecedes(rhs.tieBreakKey.utf8)
+        switch WorkspaceFileContextStore.compareUTF8Binary(lhs.tieBreakKey, rhs.tieBreakKey) {
+        case .orderedAscending:
+            return true
+        case .orderedDescending:
+            return false
+        case .orderedSame:
+            return entryPrecedes(lhs.entry, rhs.entry)
         }
-        return entryPrecedes(lhs.entry, rhs.entry)
     }
 
     private static func entryPrecedes(
         _ lhs: WorkspaceSearchCatalogEntry,
         _ rhs: WorkspaceSearchCatalogEntry
     ) -> Bool {
-        if lhs.rootPath != rhs.rootPath { return lhs.rootPath < rhs.rootPath }
-        if lhs.standardizedRelativePath != rhs.standardizedRelativePath {
-            return lhs.standardizedRelativePath < rhs.standardizedRelativePath
-        }
-        return lhs.id.uuidString < rhs.id.uuidString
+        WorkspaceFileContextStore.searchCatalogEntryPrecedes(lhs, rhs)
     }
 
     private static func orderEntries(_ entries: [WorkspaceSearchCatalogEntry]) -> [WorkspaceSearchCatalogEntry] {

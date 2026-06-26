@@ -16,6 +16,26 @@ extension MCPServerViewModel {
         let context: TabScopedContext
     }
 
+    struct ContextBuilderCommittedTabSnapshot {
+        let identity: WorkspaceSelectionIdentity
+        let nestedRunID: UUID
+        let tab: ComposeTabState
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
+    struct ContextBuilderTabContextCommitResult {
+        let outcome: ContextBuilderTabContextCommitOutcome
+        let committedTab: ContextBuilderCommittedTabSnapshot?
+    }
+
+    private struct CommittedTabWrite {
+        let identity: WorkspaceSelectionIdentity
+        let tab: ComposeTabState
+        let selectionRevision: UInt64
+        let usedAgentOutputAsPrompt: Bool
+    }
+
     enum ContextBuilderTabContextCommitOutcome: Equatable {
         case committed
         case staleOrNoLongerCurrent
@@ -175,6 +195,8 @@ extension MCPServerViewModel {
         let windowID: Int
         let workspaceID: UUID?
         var promptText: String
+        /// True when terminal commit copied assistant output into an otherwise empty prompt.
+        var usedAgentOutputAsPrompt: Bool
         var selection: StoredSelection
         /// Monotonic canonical selection revision observed when this snapshot last synchronized.
         /// A final commit uses it to avoid overwriting selection persisted by a newer connection.
@@ -198,6 +220,8 @@ extension MCPServerViewModel {
 
         /// Frozen lookup context inherited by nested run-scoped tools.
         var frozenLookupContext: WorkspaceLookupContext?
+        /// Ephemeral Context Builder review repository authority for one exact nested run.
+        var contextBuilderReviewTargetResolution: ContextBuilderReviewTargetResolution?
         /// True if this snapshot was created via explicit `bind_context` / `_tabID` binding.
         /// Explicit bindings should persist even when the bound tab is not the active tab.
         let explicitlyBound: Bool
@@ -210,6 +234,7 @@ extension MCPServerViewModel {
             windowID: Int,
             workspaceID: UUID?,
             promptText: String,
+            usedAgentOutputAsPrompt: Bool = false,
             selection: StoredSelection,
             selectionRevision: UInt64 = 0,
             selectedMetaPromptIDs: [UUID],
@@ -220,6 +245,7 @@ extension MCPServerViewModel {
             worktreeBindings: [AgentSessionWorktreeBinding] = [],
             worktreeBindingState: AgentSessionWorktreeBindingState? = nil,
             frozenLookupContext: WorkspaceLookupContext? = nil,
+            contextBuilderReviewTargetResolution: ContextBuilderReviewTargetResolution? = nil,
             explicitlyBound: Bool,
             readFileAutoSelectionGeneration: UInt64 = 0
         ) {
@@ -227,6 +253,7 @@ extension MCPServerViewModel {
             self.windowID = windowID
             self.workspaceID = workspaceID
             self.promptText = promptText
+            self.usedAgentOutputAsPrompt = usedAgentOutputAsPrompt
             self.selection = selection
             self.selectionRevision = selectionRevision
             self.selectedMetaPromptIDs = selectedMetaPromptIDs
@@ -237,6 +264,7 @@ extension MCPServerViewModel {
             self.worktreeBindingState = worktreeBindingState
                 ?? (activeAgentSessionID == nil ? .notApplicable : .hydrated(worktreeBindings))
             self.frozenLookupContext = frozenLookupContext
+            self.contextBuilderReviewTargetResolution = contextBuilderReviewTargetResolution
             self.explicitlyBound = explicitlyBound
             self.readFileAutoSelectionGeneration = readFileAutoSelectionGeneration
         }
@@ -877,6 +905,7 @@ extension MCPServerViewModel {
     /// Proactively removes all cached tab-context state for a closing tab while preserving window affinity.
     @MainActor
     func purgeClosedTabContext(tabID: UUID) {
+        gitArtifactAdvertisementRegistry.removeTab(tabID: tabID)
         let boundConnections = tabContextByConnectionID.compactMap { connectionID, context in
             context.tabID == tabID ? connectionID : nil
         }
@@ -1395,24 +1424,34 @@ extension MCPServerViewModel {
         /// This is not a sticky connection binding; resolvers validate it against any
         /// existing binding and otherwise use it for this call only.
         let tabContextHint: TabContextHint?
+        /// Dispatcher-validated provenance for a one-shot hidden `_windowID`.
+        /// This is distinct from effective or persisted connection affinity.
+        let explicitWindowRoutingHint: MCPExplicitWindowRoutingHint?
 
         init(
             connectionID: UUID?,
             clientName: String?,
             windowID: Int?,
             runPurpose: MCPRunPurpose? = nil,
-            tabContextHint: TabContextHint? = nil
+            tabContextHint: TabContextHint? = nil,
+            explicitWindowRoutingHint: MCPExplicitWindowRoutingHint? = nil
         ) {
             self.connectionID = connectionID
             self.clientName = clientName
             self.windowID = windowID
             self.runPurpose = runPurpose
             self.tabContextHint = tabContextHint
+            self.explicitWindowRoutingHint = explicitWindowRoutingHint
         }
     }
 
     @MainActor
     func captureRequestMetadata() async -> RequestMetadata {
+        #if DEBUG
+            if let requestMetadataOverrideForTesting {
+                return requestMetadataOverrideForTesting
+            }
+        #endif
         let connectionID = await service.currentRequestConnectionID()
         let runPurpose: MCPRunPurpose? = if let connectionID {
             await ServerNetworkManager.shared.runPurpose(for: connectionID)
@@ -1424,7 +1463,8 @@ extension MCPServerViewModel {
             clientName: service.currentRequestClientName(),
             windowID: service.currentRequestWindowID(),
             runPurpose: runPurpose,
-            tabContextHint: ServerNetworkManager.currentTabContextHint
+            tabContextHint: ServerNetworkManager.currentTabContextHint,
+            explicitWindowRoutingHint: service.currentRequestExplicitWindowRoutingHint()
         )
     }
 
@@ -1433,7 +1473,8 @@ extension MCPServerViewModel {
         from metadata: RequestMetadata,
         explicitHint: TabContextHint? = nil,
         toolName: String = "unknown",
-        policy: TabContextResolutionPolicy
+        policy: TabContextResolutionPolicy,
+        startMirroring: Bool = true
     ) throws -> TabContextResolution {
         try resolveTabContext(
             connectionID: metadata.connectionID,
@@ -1442,13 +1483,25 @@ extension MCPServerViewModel {
             explicitHint: explicitHint ?? metadata.tabContextHint,
             toolName: toolName,
             policy: policy,
-            runPurpose: metadata.runPurpose
+            runPurpose: metadata.runPurpose,
+            startMirroring: startMirroring
         )
     }
 
     struct ResolvedTabContextSnapshot {
         var snapshot: TabContextSnapshot
         let usesActiveTabCompatibility: Bool
+        let source: TabContextSnapshotSource?
+
+        init(
+            snapshot: TabContextSnapshot,
+            usesActiveTabCompatibility: Bool,
+            source: TabContextSnapshotSource? = nil
+        ) {
+            self.snapshot = snapshot
+            self.usesActiveTabCompatibility = usesActiveTabCompatibility
+            self.source = source
+        }
     }
 
     nonisolated static func activeTabCompatibilityFallbackDecision(
@@ -1536,20 +1589,27 @@ extension MCPServerViewModel {
         from metadata: RequestMetadata,
         explicitHint: TabContextHint? = nil,
         toolName: String,
-        policy: TabContextResolutionPolicy
+        policy: TabContextResolutionPolicy,
+        startMirroring: Bool = true
     ) throws -> ResolvedTabContextSnapshot {
         switch try resolveTabContext(
             from: metadata,
             explicitHint: explicitHint,
             toolName: toolName,
-            policy: policy
+            policy: policy,
+            startMirroring: startMirroring
         ) {
-        case let .tabContextSnapshot(snapshot, _):
-            ResolvedTabContextSnapshot(snapshot: snapshot, usesActiveTabCompatibility: false)
+        case let .tabContextSnapshot(snapshot, source):
+            ResolvedTabContextSnapshot(
+                snapshot: snapshot,
+                usesActiveTabCompatibility: false,
+                source: source
+            )
         case .activeTabCompatibility:
             try ResolvedTabContextSnapshot(
                 snapshot: activeTabCompatibilitySnapshot(metadata: metadata, toolName: toolName),
-                usesActiveTabCompatibility: true
+                usesActiveTabCompatibility: true,
+                source: nil
             )
         }
     }
@@ -1573,6 +1633,7 @@ extension MCPServerViewModel {
         merged.activeAgentSessionID = context.activeAgentSessionID
         merged.worktreeBindingState = context.worktreeBindingState
         merged.frozenLookupContext = context.frozenLookupContext
+        merged.contextBuilderReviewTargetResolution = context.contextBuilderReviewTargetResolution
         merged.readFileAutoSelectionGeneration = context.readFileAutoSelectionGeneration
         return merged
     }
@@ -1581,6 +1642,19 @@ extension MCPServerViewModel {
         case persisted
         case unchanged
         case unavailable
+    }
+
+    struct PrimaryGitArtifactCommitResult: Equatable {
+        let selection: StoredSelection
+        let selectionRevision: UInt64
+        let newlyAddedArtifacts: [GitDiffPublishedArtifact]
+        let autoSelectedAliases: [String]
+    }
+
+    enum MCPManageSelectionArtifactCommitResult: Equatable {
+        case committed(selection: StoredSelection, selectionRevision: UInt64)
+        case conflict(reason: String)
+        case unavailable(reason: String)
     }
 
     struct MCPSelectionPersistenceVerification: Equatable {
@@ -2320,31 +2394,49 @@ extension MCPServerViewModel {
         return .visibleWorkspace
     }
 
-    static func spawnSourceTabIDForAgentSessionCreation(
+    static func spawnParentSourceTabIDForAgentSessionCreation(
         purpose: MCPRunPurpose,
         resolvedContext: ResolvedTabContextSnapshot?
     ) -> UUID? {
         guard purpose == .agentModeRun,
               let resolvedContext,
-              !resolvedContext.usesActiveTabCompatibility
+              isExactRunScopedTabContext(resolvedContext)
         else {
             return nil
         }
         return resolvedContext.snapshot.tabID
     }
 
-    static func spawnParentSourceTabIDForAgentSessionCreation(
+    private static func isExactRunScopedTabContext(
+        _ resolvedContext: ResolvedTabContextSnapshot
+    ) -> Bool {
+        guard !resolvedContext.usesActiveTabCompatibility,
+              resolvedContext.snapshot.runID != nil
+        else {
+            return false
+        }
+        switch resolvedContext.source {
+        case .runInstall, .runHandover, .pendingRunScoped:
+            return true
+        case .explicitBinding, .implicitBindingCompatibility, .explicitHint, nil:
+            return false
+        }
+    }
+
+    /// Compatibility wrapper for Agent Explore/Manage call sites that have not yet adopted the
+    /// parent-only name. This resolver must never be used as an Oracle packaging-source resolver.
+    static func spawnSourceTabIDForAgentSessionCreation(
         purpose: MCPRunPurpose,
         resolvedContext: ResolvedTabContextSnapshot?
     ) -> UUID? {
-        spawnSourceTabIDForAgentSessionCreation(
+        spawnParentSourceTabIDForAgentSessionCreation(
             purpose: purpose,
             resolvedContext: resolvedContext
         )
     }
 
     @MainActor
-    func resolveSpawnSourceTabIDForAgentSessionCreation(
+    func resolveSpawnParentSourceTabIDForAgentSessionCreation(
         metadata: RequestMetadata
     ) async -> UUID? {
         var purpose: MCPRunPurpose
@@ -2364,9 +2456,228 @@ extension MCPServerViewModel {
             toolName: "agent_session_spawn_source",
             policy: .allowLegacyImplicitRouting
         )
-        return Self.spawnSourceTabIDForAgentSessionCreation(
+        return Self.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: purpose,
             resolvedContext: resolvedContext
+        )
+    }
+
+    /// Compatibility wrapper for Agent Explore/Manage call sites. Agent Run uses the explicit
+    /// parent-only resolver plus a separate immutable Oracle launch-source resolver.
+    @MainActor
+    func resolveSpawnSourceTabIDForAgentSessionCreation(
+        metadata: RequestMetadata
+    ) async -> UUID? {
+        await resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: metadata)
+    }
+
+    @MainActor
+    private func reconciledAgentRunLaunchPurpose(
+        metadata: RequestMetadata
+    ) async throws -> MCPRunPurpose {
+        var currentPurpose: MCPRunPurpose = .unknown
+        var cachedRunPolicyPurpose: MCPRunPurpose?
+        if let connectionID = metadata.connectionID {
+            let networkManager = ServerNetworkManager.shared
+            currentPurpose = await networkManager.runPurpose(for: connectionID)
+            if currentPurpose == .agentModeRun || currentPurpose == .discoverRun || currentPurpose == .unknown {
+                _ = await networkManager.rehydrateRunTabContextForConnectionIfPossible(connectionID)
+                currentPurpose = await networkManager.runPurpose(for: connectionID)
+            }
+            if let runID = await networkManager.runIDForConnection(connectionID) {
+                cachedRunPolicyPurpose = await networkManager.runPolicyPurpose(for: runID)
+            }
+        }
+
+        let scopedPurposes = [metadata.runPurpose, currentPurpose, cachedRunPolicyPurpose]
+            .compactMap { purpose -> MCPRunPurpose? in
+                guard let purpose, purpose != .unknown else { return nil }
+                return purpose
+            }
+        let distinctPurposes = Set(scopedPurposes.map(\.rawValue))
+        guard distinctPurposes.count <= 1 else {
+            throw MCPError.invalidParams(
+                "agent_run.start observed conflicting run purposes while resolving its launch source. Refusing ambiguous routing."
+            )
+        }
+        return scopedPurposes.first ?? .unknown
+    }
+
+    @MainActor
+    func resolveImplicitContextBuilderGitTarget(
+        metadata: RequestMetadata
+    ) async throws -> ContextBuilderReviewTargetResolution? {
+        let purpose = try await reconciledAgentRunLaunchPurpose(metadata: metadata)
+        guard purpose == .discoverRun else { return nil }
+        let resolved = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: "context_builder nested git target",
+            policy: .requireExplicitOrRunScoped
+        )
+        guard Self.isExactRunScopedTabContext(resolved),
+              resolved.snapshot.activeAgentSessionID != nil
+        else { return nil }
+        guard resolved.snapshot.runID != nil else {
+            return .unavailable(.missingFrozenTarget)
+        }
+        return resolved.snapshot.contextBuilderReviewTargetResolution
+            ?? .unavailable(.missingFrozenTarget)
+    }
+
+    @MainActor
+    func validateContextBuilderGitArtifactSelection(
+        metadata: RequestMetadata,
+        target: ContextBuilderReviewTarget
+    ) async throws {
+        let resolved = try resolveTabContextSnapshot(
+            from: metadata,
+            toolName: "context_builder nested git publication",
+            policy: .requireExplicitOrRunScoped
+        )
+        guard Self.isExactRunScopedTabContext(resolved),
+              let workspaceID = resolved.snapshot.workspaceID,
+              workspaceID == target.workspaceID,
+              resolved.snapshot.tabID == target.tabID,
+              resolved.snapshot.contextBuilderReviewTargetResolution == .available(target),
+              let lookupContext = resolved.snapshot.frozenLookupContext
+        else {
+            throw ContextBuilderReviewTargetUnavailableReason.workspaceOrTabMismatch
+        }
+        let reviewContext = FrozenPromptGitReviewContext(
+            artifactCapability: target.artifactCapability,
+            compareIntent: .uncommittedHEAD,
+            displayContext: target.displayContext
+        )
+        _ = try await ContextBuilderReviewTargetResolver().finalizeSelection(
+            input: ContextBuilderReviewTargetInput(
+                workspaceID: workspaceID,
+                tabID: resolved.snapshot.tabID,
+                selectionRevision: resolved.snapshot.selectionRevision,
+                selection: resolved.snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: reviewContext
+            ),
+            initialResolution: .available(target),
+            store: promptVM.workspaceFileContextStore
+        )
+    }
+
+    /// Resolves and freezes the exact compose tab whose immutable review package will be
+    /// delegated to a child Agent run. This is intentionally separate from conversation-parent
+    /// resolution: a top-level window-only launch has no Agent parent but still has a packaging
+    /// source.
+    @MainActor
+    func resolveAgentRunOracleReviewLaunchSnapshot(
+        metadata: RequestMetadata,
+        targetWindow: WindowState
+    ) async throws -> AgentRunOracleReviewLaunchSnapshot {
+        let purpose = try await reconciledAgentRunLaunchPurpose(metadata: metadata)
+        let binding = metadata.connectionID.map(connectionBindingSnapshot(forConnection:))
+        let explicitWindowRoutingHint = metadata.explicitWindowRoutingHint
+
+        for candidateWindowID in [
+            metadata.windowID,
+            metadata.tabContextHint?.windowID,
+            binding?.windowID,
+            explicitWindowRoutingHint?.windowID
+        ].compactMap(\.self) {
+            guard candidateWindowID == targetWindow.windowID else {
+                throw MCPError.invalidParams(
+                    "agent_run.start launch-source routing conflicts with the target window. Bind or hint the intended window before retrying."
+                )
+            }
+        }
+
+        let hasValidatedExplicitWindowRoute: Bool
+        if let explicitWindowRoutingHint {
+            guard explicitWindowRoutingHint.connectionID == metadata.connectionID,
+                  explicitWindowRoutingHint.toolName == "agent_run",
+                  explicitWindowRoutingHint.provenance == .hiddenWindowArgument,
+                  explicitWindowRoutingHint.windowID == metadata.windowID,
+                  explicitWindowRoutingHint.windowID == targetWindow.windowID,
+                  explicitWindowRoutingHint.windowStateIdentity == ObjectIdentifier(targetWindow),
+                  explicitWindowRoutingHint.serverViewModelIdentity == ObjectIdentifier(targetWindow.mcpServer)
+            else {
+                throw MCPError.invalidParams(
+                    "agent_run.start received an explicit window route that does not match its authorized connection, tool, effective window, or target window."
+                )
+            }
+            hasValidatedExplicitWindowRoute = true
+        } else {
+            hasValidatedExplicitWindowRoute = false
+        }
+
+        let isRunScoped = purpose == .agentModeRun || purpose == .discoverRun
+        let resolved: ResolvedTabContextSnapshot
+        let route: AgentRunOracleReviewLaunchRoute
+        if metadata.tabContextHint != nil || binding?.bindingKind == .tabContext || isRunScoped {
+            resolved = try resolveTabContextSnapshot(
+                from: metadata,
+                toolName: "agent_run.start review source",
+                policy: .requireExplicitOrRunScoped
+            )
+            guard !resolved.usesActiveTabCompatibility else {
+                throw MCPError.invalidParams(
+                    "agent_run.start review packaging requires an exact tab context; active-tab compatibility is not allowed."
+                )
+            }
+            if isRunScoped, !Self.isExactRunScopedTabContext(resolved) {
+                throw MCPError.invalidParams(
+                    "agent_run.start was invoked from a run-scoped connection without an exact run tab. Refusing active-tab fallback."
+                )
+            }
+            route = isRunScoped ? .runScoped : .explicitTabContext
+        } else {
+            guard binding?.bindingKind == .windowOnly || hasValidatedExplicitWindowRoute else {
+                throw MCPError.invalidParams(
+                    "agent_run.start requires either an explicit tab context, an exact run-scoped tab, or a window-only connection bound to the target window."
+                )
+            }
+            guard let workspace = targetWindow.workspaceManager.activeWorkspace,
+                  !workspace.isSystemWorkspace,
+                  let activeComposeTabID = workspace.activeComposeTabID
+            else {
+                throw MCPError.invalidParams(
+                    "agent_run.start could not resolve an active project compose tab for its window-only launch source."
+                )
+            }
+            resolved = try ResolvedTabContextSnapshot(
+                snapshot: makeTabContextSnapshot(
+                    tabID: activeComposeTabID,
+                    workspaceID: workspace.id,
+                    windowID: targetWindow.windowID,
+                    runID: nil,
+                    explicitlyBound: false,
+                    captureActiveUIState: true,
+                    flushActiveSelection: true
+                ),
+                usesActiveTabCompatibility: false,
+                source: nil
+            )
+            route = .windowOnlyActiveCompose
+        }
+
+        guard resolved.snapshot.windowID == targetWindow.windowID,
+              let sourceWorkspaceID = resolved.snapshot.workspaceID,
+              let activeWorkspace = targetWindow.workspaceManager.activeWorkspace,
+              activeWorkspace.id == sourceWorkspaceID,
+              !activeWorkspace.isSystemWorkspace
+        else {
+            throw MCPError.invalidParams(
+                "agent_run.start review source must belong to the target window's active project workspace."
+            )
+        }
+
+        return AgentRunOracleReviewLaunchSnapshot(
+            route: route,
+            windowID: resolved.snapshot.windowID,
+            workspaceID: sourceWorkspaceID,
+            tabID: resolved.snapshot.tabID,
+            selectionRevision: resolved.snapshot.selectionRevision,
+            promptText: resolved.snapshot.promptText,
+            selection: resolved.snapshot.selection,
+            sourceAgentSessionID: resolved.snapshot.activeAgentSessionID,
+            routedRunID: resolved.snapshot.runID
         )
     }
 
@@ -2375,7 +2686,9 @@ extension MCPServerViewModel {
         currentPurpose: MCPRunPurpose,
         cachedRunPolicyPurpose: MCPRunPurpose?
     ) -> Bool {
-        capturedPurpose == .agentModeRun || currentPurpose == .agentModeRun || cachedRunPolicyPurpose == .agentModeRun
+        capturedPurpose == .agentModeRun || capturedPurpose == .discoverRun
+            || currentPurpose == .agentModeRun || currentPurpose == .discoverRun
+            || cachedRunPolicyPurpose == .agentModeRun || cachedRunPolicyPurpose == .discoverRun
     }
 
     @MainActor
@@ -2410,7 +2723,7 @@ extension MCPServerViewModel {
         metadata: RequestMetadata,
         targetWindow: WindowState
     ) async -> UUID? {
-        guard let sourceTabID = await resolveSpawnSourceTabIDForAgentSessionCreation(
+        guard let sourceTabID = await resolveSpawnParentSourceTabIDForAgentSessionCreation(
             metadata: metadata
         ) else {
             return nil
@@ -2510,7 +2823,8 @@ extension MCPServerViewModel {
         explicitHint: TabContextHint? = nil,
         toolName: String = "unknown",
         policy: TabContextResolutionPolicy,
-        runPurpose: MCPRunPurpose? = nil
+        runPurpose: MCPRunPurpose? = nil,
+        startMirroring: Bool = true
     ) throws -> TabContextResolution {
         // Prefer network-provided window ID, but if it's missing and we've
         // already learned the mapping for this connection, use our mapping.
@@ -2546,7 +2860,9 @@ extension MCPServerViewModel {
                         windowIDByConnection[connectionID] = hinted
                     }
                 }
-                beginMirroringForConnection(connectionID, context: bound)
+                if startMirroring {
+                    beginMirroringForConnection(connectionID, context: bound)
+                }
                 tabContextLog("resolveTabContext using bound context connectionID=\(connectionID) runID=\(bound.runID?.uuidString ?? "nil") tab=\(bound.tabID)")
                 let source: TabContextSnapshotSource = {
                     if bound.runID != nil { return .runInstall }
@@ -2691,6 +3007,361 @@ extension MCPServerViewModel {
     func requireCurrentTabContext(toolName: String) async throws -> TabScopedContext {
         let (_, context) = try await contextForCurrentRequest(toolName: toolName)
         return context
+    }
+
+    @MainActor
+    func commitPrimaryGitArtifactsToCurrentTab(
+        toolName: String,
+        candidates: [GitDiffPublishedArtifact]
+    ) async throws -> PrimaryGitArtifactCommitResult {
+        let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        guard let workspaceID = context.workspaceID,
+              let selectionCoordinator
+        else {
+            throw MCPError.internalError("Canonical tab selection is unavailable for Git artifact publication")
+        }
+
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        var mergeResult: WorkspaceGitDiffArtifactSelectionMergeResult?
+        guard let transaction = await selectionCoordinator.transformSelection(
+            for: identity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty
+        ) { latestSelection in
+            let merged = mergePrimaryGitDiffArtifactsIntoSelection(
+                existing: latestSelection,
+                candidates: candidates
+            )
+            mergeResult = merged
+            return merged.selection
+        }, let mergeResult else {
+            throw MCPError.internalError("Canonical tab selection could not commit Git artifacts")
+        }
+
+        guard let canonicalSelection = selectionCoordinator.selectionSnapshot(
+            for: identity,
+            flushPendingUIIfActive: false
+        )?.selection else {
+            throw MCPError.internalError("Canonical Git artifact selection disappeared after commit")
+        }
+        let committedRevision = workspaceManager?.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: context.tabID
+        ) ?? transaction.revision
+        let committedIdentities = Set(canonicalSelection.selectedPaths.compactMap {
+            StoredSelectionPathNormalization.standardizedPath($0)
+        })
+        let verifiedNewlyAdded = mergeResult.newlyAddedArtifacts.filter { artifact in
+            guard let identity = StoredSelectionPathNormalization.standardizedPath(artifact.absolutePath) else {
+                return false
+            }
+            return committedIdentities.contains(identity)
+        }
+        guard verifiedNewlyAdded.count == mergeResult.newlyAddedArtifacts.count else {
+            throw MCPError.internalError("Canonical Git artifact selection verification failed")
+        }
+
+        guard var latest = tabContextByConnectionID[connectionID],
+              latest.tabID == context.tabID,
+              latest.windowID == context.windowID,
+              latest.workspaceID == context.workspaceID,
+              latest.runID == context.runID
+        else {
+            throw MCPError.internalError("Git artifact publication tab context is no longer current")
+        }
+        latest.selection = canonicalSelection
+        latest.selectionRevision = committedRevision
+        tabContextByConnectionID[connectionID] = latest
+
+        return PrimaryGitArtifactCommitResult(
+            selection: canonicalSelection,
+            selectionRevision: committedRevision,
+            newlyAddedArtifacts: verifiedNewlyAdded,
+            autoSelectedAliases: verifiedNewlyAdded.compactMap(\.clientAlias)
+        )
+    }
+
+    @MainActor
+    func replaceAdvertisedGitArtifactsForCurrentTab(
+        toolName: String,
+        artifacts: [GitDiffPublishedArtifact]
+    ) async throws -> MCPGitArtifactAdvertisementSnapshot {
+        let (connectionID, context) = try await contextForCurrentRequest(toolName: toolName)
+        guard let workspaceID = context.workspaceID else {
+            throw MCPError.internalError("Workspace identity is unavailable for Git artifact advertisement")
+        }
+        let reviewContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: workspaceID,
+            tabID: context.tabID,
+            sessionID: context.activeAgentSessionID,
+            bindings: context.worktreeBindings,
+            base: "HEAD"
+        )
+        guard let capability = reviewContext.artifactCapability else {
+            throw MCPError.internalError("Git artifact capability is unavailable for advertisement")
+        }
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        let advertisedArtifacts = artifacts.filter {
+            $0.selectionDisposition == .primaryAutoSelect
+                || $0.selectionDisposition == .advertisedSelectable
+        }
+        let rootPath = capability.gitDataRoot.standardizedFullPath
+        var advertisedPaths: [String] = []
+        var seenPaths = Set<String>()
+        for artifact in advertisedArtifacts {
+            guard let alias = artifact.clientAlias,
+                  alias == "_git_data/\(artifact.gitDataRelativePath)",
+                  alias.hasPrefix("_git_data/"),
+                  GitDiffArtifactPathPolicy.isSafeRelativeArtifactPath(artifact.gitDataRelativePath),
+                  artifact.absolutePath == StandardizedPath.join(
+                      standardizedRoot: rootPath,
+                      standardizedRelativePath: artifact.gitDataRelativePath
+                  )
+            else {
+                gitArtifactAdvertisementRegistry.invalidate(identity: identity)
+                throw MCPError.internalError(
+                    "Git artifact advertisement contains an invalid selectable alias"
+                )
+            }
+            if seenPaths.insert(artifact.absolutePath).inserted {
+                advertisedPaths.append(artifact.absolutePath)
+            }
+        }
+
+        let authorization = await SelectedGitDiffArtifactAuthorizationService().authorizeExactPaths(
+            ExactSelectedGitArtifactAuthorizationRequest(
+                exactAbsolutePaths: advertisedPaths,
+                capability: capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        )
+        let dispositions = authorization.dispositionsByAbsolutePath
+        for artifact in advertisedArtifacts {
+            guard let disposition = dispositions[artifact.absolutePath] else {
+                gitArtifactAdvertisementRegistry.invalidate(identity: identity)
+                throw MCPError.internalError(
+                    "Git artifact advertisement authorization returned no disposition for \(artifact.clientAlias ?? "_git_data/<invalid>")"
+                )
+            }
+            if case .authorized = disposition {
+                continue
+            }
+            let diagnostic: String = if case let .rejected(_, reason) = disposition {
+                reason.diagnosticLabel
+            } else {
+                "artifact was not authorized"
+            }
+            gitArtifactAdvertisementRegistry.invalidate(identity: identity)
+            throw MCPError.internalError(
+                "Git artifact advertisement rejected \(artifact.clientAlias ?? "_git_data/<invalid>"): \(diagnostic)"
+            )
+        }
+
+        let visibleRootsAreCurrent = await SelectedGitDiffArtifactAuthorizationService()
+            .visibleRootCheckoutsAreCurrent(
+                capability: capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        guard visibleRootsAreCurrent,
+              gitArtifactAdvertisementContextIsCurrent(
+                  connectionID: connectionID,
+                  expected: context
+              )
+        else {
+            gitArtifactAdvertisementRegistry.invalidate(identity: identity)
+            throw MCPError.internalError(
+                "Git artifact advertisement context changed during authorization"
+            )
+        }
+
+        return try gitArtifactAdvertisementRegistry.replace(
+            identity: identity,
+            capability: capability,
+            artifacts: artifacts
+        )
+    }
+
+    @MainActor
+    private func gitArtifactAdvertisementContextIsCurrent(
+        connectionID: UUID,
+        expected: TabContextSnapshot
+    ) -> Bool {
+        guard let workspaceID = expected.workspaceID,
+              windowIDByConnection[connectionID] == expected.windowID,
+              let manager = workspaceManager,
+              manager.activeWorkspaceID == workspaceID,
+              let tab = manager.composeTab(with: expected.tabID)
+        else { return false }
+
+        if let latest = tabContextByConnectionID[connectionID] {
+            return latest.tabID == expected.tabID
+                && latest.windowID == expected.windowID
+                && latest.workspaceID == expected.workspaceID
+                && latest.runID == expected.runID
+                && latest.activeAgentSessionID == expected.activeAgentSessionID
+                && latest.worktreeBindingState == expected.worktreeBindingState
+                && latest.selectionRevision == expected.selectionRevision
+        }
+
+        let activeTabID = manager.activeWorkspace?.activeComposeTabID
+            ?? manager.activeWorkspace?.composeTabs.first?.id
+        return activeTabID == expected.tabID
+            && tab.activeAgentSessionID == expected.activeAgentSessionID
+            && manager.selectionRevisionForMCP(
+                workspaceID: workspaceID,
+                tabID: expected.tabID
+            ) == expected.selectionRevision
+    }
+
+    @MainActor
+    func invalidateAdvertisedGitArtifactsForCurrentTab(toolName: String) async {
+        guard let (_, context) = try? await contextForCurrentRequest(toolName: toolName),
+              let workspaceID = context.workspaceID
+        else { return }
+        gitArtifactAdvertisementRegistry.invalidate(
+            identity: WorkspaceSelectionIdentity(
+                workspaceID: workspaceID,
+                tabID: context.tabID
+            )
+        )
+    }
+
+    @MainActor
+    func commitManageSelectionArtifactMutation(
+        resolvedContext: ResolvedTabContextSnapshot,
+        metadata: RequestMetadata,
+        expectedPhysicalSelection: StoredSelection,
+        requestedPhysicalSelection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        fence: MCPManageSelectionArtifactAuthorizationFence
+    ) async -> MCPManageSelectionArtifactCommitResult {
+        let context = resolvedContext.snapshot
+        guard let workspaceID = context.workspaceID,
+              fence.identity == WorkspaceSelectionIdentity(
+                  workspaceID: workspaceID,
+                  tabID: context.tabID
+              ),
+              let selectionCoordinator
+        else {
+            return .unavailable(reason: "canonical tab selection is unavailable")
+        }
+
+        guard fence.capability.workspaceID == workspaceID,
+              fence.capability.creatorTabID == context.tabID,
+              fence.capability.sessionID == context.activeAgentSessionID
+        else {
+            return .conflict(reason: "workspace, tab, or session binding changed")
+        }
+        let currentRoot = await promptVM.workspaceFileContextStore.exactRootRef(
+            path: fence.capability.gitDataRoot.standardizedFullPath,
+            kind: .workspaceGitData
+        )
+        guard currentRoot == fence.capability.gitDataRoot else {
+            if let snapshot = fence.grantSnapshot {
+                gitArtifactAdvertisementRegistry.invalidate(
+                    identity: fence.identity,
+                    generation: snapshot.generation
+                )
+            }
+            return .conflict(reason: "Git-data root was unloaded or reloaded")
+        }
+        let visibleRootsAreCurrent = await SelectedGitDiffArtifactAuthorizationService()
+            .visibleRootCheckoutsAreCurrent(
+                capability: fence.capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        guard visibleRootsAreCurrent else {
+            if let snapshot = fence.grantSnapshot {
+                gitArtifactAdvertisementRegistry.invalidate(
+                    identity: fence.identity,
+                    generation: snapshot.generation
+                )
+            }
+            return .conflict(reason: "visible checkout was unloaded, reloaded, or changed")
+        }
+        if let snapshot = fence.grantSnapshot,
+           !gitArtifactAdvertisementRegistry.isCurrent(snapshot)
+        {
+            return .conflict(reason: "Git artifact advertisement was replaced")
+        }
+
+        if let connectionID = metadata.connectionID {
+            guard let latest = tabContextByConnectionID[connectionID],
+                  latest.tabID == context.tabID,
+                  latest.windowID == context.windowID,
+                  latest.workspaceID == context.workspaceID,
+                  latest.runID == context.runID,
+                  latest.activeAgentSessionID == context.activeAgentSessionID,
+                  latest.worktreeBindingState == context.worktreeBindingState
+            else {
+                return .conflict(reason: "tab routing or checkout binding changed")
+            }
+        }
+
+        let expected = lookupContext.logicalizeSelection(expectedPhysicalSelection)
+        let requested = lookupContext.logicalizeSelection(requestedPhysicalSelection)
+        var matchedExpected = false
+        guard let transaction = await selectionCoordinator.transformSelection(
+            for: fence.identity,
+            source: .mcpTabContext,
+            mirrorToUIIfActive: context.worktreeBindings.isEmpty,
+            { latestSelection in
+                guard latestSelection == expected else { return latestSelection }
+                matchedExpected = true
+                return requested
+            }
+        ) else {
+            return .unavailable(reason: "canonical tab selection could not be committed")
+        }
+        guard matchedExpected else {
+            return .conflict(reason: "canonical selection changed concurrently")
+        }
+        guard let canonicalSelection = selectionCoordinator.selectionSnapshot(
+            for: fence.identity,
+            flushPendingUIIfActive: false
+        )?.selection,
+            canonicalSelection == requested
+        else {
+            return .conflict(reason: "canonical selection verification failed")
+        }
+
+        let revision = workspaceManager?.selectionRevisionForMCP(
+            workspaceID: workspaceID,
+            tabID: context.tabID
+        ) ?? transaction.revision
+        if let connectionID = metadata.connectionID,
+           var latest = tabContextByConnectionID[connectionID],
+           latest.tabID == context.tabID,
+           latest.workspaceID == context.workspaceID,
+           latest.runID == context.runID
+        {
+            latest.selection = canonicalSelection
+            latest.selectionRevision = revision
+            tabContextByConnectionID[connectionID] = latest
+        }
+        return .committed(
+            selection: canonicalSelection,
+            selectionRevision: revision
+        )
+    }
+
+    @MainActor
+    func validateManageSelectionArtifactFence(
+        _ fence: MCPManageSelectionArtifactAuthorizationFence
+    ) async -> Bool {
+        let currentRoot = await promptVM.workspaceFileContextStore.exactRootRef(
+            path: fence.capability.gitDataRoot.standardizedFullPath,
+            kind: .workspaceGitData
+        )
+        guard currentRoot == fence.capability.gitDataRoot else { return false }
+        guard await SelectedGitDiffArtifactAuthorizationService()
+            .visibleRootCheckoutsAreCurrent(
+                capability: fence.capability,
+                store: promptVM.workspaceFileContextStore
+            )
+        else { return false }
+        guard let snapshot = fence.grantSnapshot else { return true }
+        return gitArtifactAdvertisementRegistry.isCurrent(snapshot)
     }
 
     private nonisolated static func resolveLiveConnectionID(
@@ -3237,11 +3908,15 @@ extension MCPServerViewModel {
         expectedRunID: UUID,
         isStillCurrent: @MainActor () -> Bool,
         progressReporter: ContextBuilderMCPProgressReporter? = nil,
-        deferRunMappingCleanupUntilCaller: Bool = false
-    ) async -> ContextBuilderTabContextCommitOutcome {
+        deferRunMappingCleanupUntilCaller: Bool = false,
+        promptFallback: String? = nil
+    ) async -> ContextBuilderTabContextCommitResult {
         guard isStillCurrent(), !Task.isCancelled else {
             discardDetachedContextBuilderTabContext(runID: expectedRunID)
-            return .staleOrNoLongerCurrent
+            return ContextBuilderTabContextCommitResult(
+                outcome: .staleOrNoLongerCurrent,
+                committedTab: nil
+            )
         }
 
         let alreadyFinishedAutoSelection: Bool
@@ -3257,10 +3932,24 @@ extension MCPServerViewModel {
             tabContextByConnectionID[connectionID] = detached.context
             alreadyFinishedAutoSelection = true
         } else {
-            return .missingFinalContext(runID: expectedRunID, connectionID: connectionID)
+            return ContextBuilderTabContextCommitResult(
+                outcome: .missingFinalContext(runID: expectedRunID, connectionID: connectionID),
+                committedTab: nil
+            )
         }
 
-        let committed = await commitAndClearTabContext(
+        if var finalContext = tabContextByConnectionID[connectionID],
+           finalContext.runID == expectedRunID,
+           finalContext.promptText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           let promptFallback,
+           !promptFallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        {
+            finalContext.promptText = promptFallback
+            finalContext.usedAgentOutputAsPrompt = true
+            tabContextByConnectionID[connectionID] = finalContext
+        }
+
+        let committedWrite = await commitAndClearTabContextSnapshot(
             connectionID: connectionID,
             expectedRunID: expectedRunID,
             isStillCurrent: isStillCurrent,
@@ -3276,13 +3965,29 @@ extension MCPServerViewModel {
             detachedContextBuilderTabContextByRunID.removeValue(forKey: expectedRunID)
         }
 
-        if committed {
-            return .committed
+        if let committedWrite {
+            let committedTab = ContextBuilderCommittedTabSnapshot(
+                identity: committedWrite.identity,
+                nestedRunID: expectedRunID,
+                tab: committedWrite.tab,
+                selectionRevision: committedWrite.selectionRevision,
+                usedAgentOutputAsPrompt: committedWrite.usedAgentOutputAsPrompt
+            )
+            return ContextBuilderTabContextCommitResult(
+                outcome: .committed,
+                committedTab: committedTab
+            )
         }
         if !isStillCurrent() || Task.isCancelled {
-            return .staleOrNoLongerCurrent
+            return ContextBuilderTabContextCommitResult(
+                outcome: .staleOrNoLongerCurrent,
+                committedTab: nil
+            )
         }
-        return .failed("Context Builder could not commit its final context for run \(expectedRunID.uuidString).")
+        return ContextBuilderTabContextCommitResult(
+            outcome: .failed("Context Builder could not commit its final context for run \(expectedRunID.uuidString)."),
+            committedTab: nil
+        )
     }
 
     @MainActor
@@ -3295,10 +4000,29 @@ extension MCPServerViewModel {
         deferRunMappingCleanupUntilCaller: Bool = false,
         readFileAutoSelectionAlreadyFinished: Bool = false
     ) async -> Bool {
+        await commitAndClearTabContextSnapshot(
+            connectionID: connectionID,
+            expectedRunID: expectedRunID,
+            isStillCurrent: isStillCurrent,
+            progressReporter: progressReporter,
+            deferRunMappingCleanupUntilCaller: deferRunMappingCleanupUntilCaller,
+            readFileAutoSelectionAlreadyFinished: readFileAutoSelectionAlreadyFinished
+        ) != nil
+    }
+
+    @MainActor
+    private func commitAndClearTabContextSnapshot(
+        connectionID: UUID,
+        expectedRunID: UUID? = nil,
+        isStillCurrent: @MainActor () -> Bool = { true },
+        progressReporter: ContextBuilderMCPProgressReporter? = nil,
+        deferRunMappingCleanupUntilCaller: Bool = false,
+        readFileAutoSelectionAlreadyFinished: Bool = false
+    ) async -> CommittedTabWrite? {
         // Capture the authoritative snapshot on the main actor before the first suspension.
         // Connection cleanup may remove the dictionary entry while draining auto-selection,
         // but it cannot invalidate this locally owned snapshot.
-        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return false }
+        guard let commitOwnedContext = tabContextByConnectionID[connectionID] else { return nil }
 
         // Decide whether we will commit stored UI state for this context.
         // Mismatch or logical cancellation => clear binding only.
@@ -3342,25 +4066,20 @@ extension MCPServerViewModel {
             connectionIDToRunID.removeValue(forKey: connectionID)
         }
 
-        guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return false }
+        guard shouldCommit, isStillCurrent(), !Task.isCancelled else { return nil }
 
         tabContextLog("commitAndClearTabContext committing tab=\(commitOwnedContext.tabID) connectionID=\(connectionID) runID=\(commitOwnedContext.runID?.uuidString ?? "nil")")
 
         // IMPORTANT: Await the commit to ensure tab state is written before caller reads it.
         // The immutable payload remains owned by this run even if transport cleanup proceeds.
         await progressReporter?(.tabContextCommit)
-        let didCommit = await commitTabContext(commitOwnedContext, isStillCurrent: isStillCurrent)
-        guard didCommit, isStillCurrent(), !Task.isCancelled else { return false }
+        guard let committedTab = await commitTabContext(
+            commitOwnedContext,
+            isStillCurrent: isStillCurrent
+        ), isStillCurrent(), !Task.isCancelled else { return nil }
 
-        var discoveredTabName: String?
-        if let manager = workspaceManager,
-           let tab = manager.composeTab(with: commitOwnedContext.tabID)
-        {
-            discoveredTabName = tab.name
-        } else if let tab = promptVM.currentComposeTabs.first(where: { $0.id == commitOwnedContext.tabID }) {
-            discoveredTabName = tab.name
-        }
-        if let tabName = discoveredTabName, !tabName.isEmpty {
+        if !committedTab.tab.name.isEmpty {
+            let tabName = committedTab.tab.name
             NotificationService.shared.notifyContextBuilderComplete(
                 tabName: tabName,
                 fallbackToDockBounce: true
@@ -3368,10 +4087,11 @@ extension MCPServerViewModel {
         }
 
         // End-of-run flush: persist this run's final state to disk (coalesced by DiskWriter)
-        guard let manager = workspaceManager else { return false }
+        guard let manager = workspaceManager else { return nil }
         await progressReporter?(.statePersistence)
         await manager.pollAndSaveStateAsync(source: .mcpTabContextEndOfRun)
-        return isStillCurrent() && !Task.isCancelled
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        return committedTab
     }
 
     #if DEBUG
@@ -3510,11 +4230,11 @@ extension MCPServerViewModel {
     private func commitTabContext(
         _ context: TabScopedContext,
         isStillCurrent: @MainActor () -> Bool = { true }
-    ) async -> Bool {
-        guard isStillCurrent(), !Task.isCancelled else { return false }
+    ) async -> CommittedTabWrite? {
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
         guard let manager = workspaceManager else {
             tabContextLog("[warning] commitTabContext missing workspace manager for windowID \(context.windowID); skipping commit.")
-            return false
+            return nil
         }
         tabContextLog("commitTabContext using workspaceManager \(ObjectIdentifier(manager)) for context.windowID=\(context.windowID) self.windowID=\(windowID)")
         let targetWorkspaceID = context.workspaceID ?? manager.activeWorkspace?.id
@@ -3523,7 +4243,7 @@ extension MCPServerViewModel {
               let tabIndex = manager.workspaces[workspaceIndex].composeTabs.firstIndex(where: { $0.id == context.tabID })
         else {
             tabContextLog("[warning] commitTabContext skipping commit for tab \(context.tabID) – workspace unavailable.")
-            return false
+            return nil
         }
 
         var updatedTab = manager.workspaces[workspaceIndex].composeTabs[tabIndex]
@@ -3539,6 +4259,10 @@ extension MCPServerViewModel {
             updatedTab.selection = context.selection
         }
         updatedTab.promptText = context.promptText
+        if context.usedAgentOutputAsPrompt {
+            updatedTab.contextOverrides.useOverridePrompt = false
+            updatedTab.contextOverrides.overridePromptText = ""
+        }
         updatedTab.selectedMetaPromptIDs = context.selectedMetaPromptIDs
         updatedTab.lastModified = Date()
 
@@ -3551,20 +4275,35 @@ extension MCPServerViewModel {
         }
 
         // 1) Persist to backing store without publishing UI snapshots (prevents tool echo)
-        guard isStillCurrent(), !Task.isCancelled else { return false }
-        _ = manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID)
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        guard manager.updateComposeTabStoredOnly(updatedTab, inWorkspaceID: workspaceID) else { return nil }
+        let identity = WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: context.tabID)
+        guard let storedTab = manager.composeTab(for: identity),
+              storedTab.selection == updatedTab.selection
+        else { return nil }
+        let committedSelectionRevision = manager.selectionRevisionForMCP(
+            workspaceID: identity.workspaceID,
+            tabID: identity.tabID
+        )
+        guard committedSelectionRevision >= context.selectionRevision else { return nil }
+        let committedTab = CommittedTabWrite(
+            identity: identity,
+            tab: storedTab,
+            selectionRevision: committedSelectionRevision,
+            usedAgentOutputAsPrompt: context.usedAgentOutputAsPrompt
+        )
         tabContextLog("commitTabContext stored selection/prompt tab=\(context.tabID) window=\(context.windowID) runID=\(context.runID?.uuidString ?? "nil") workspaceID=\(workspaceID)")
 
         // 2) Apply to live UI ONLY if this tab is the active tab and the run still owns commit.
         guard isActive else {
             tabContextLog("commitTabContext skipping live UI apply (tab not active) tab=\(updatedTab.id)")
-            return true
+            return committedTab
         }
         guard !canonicalSelectionAdvanced else {
             tabContextLog("commitTabContext skipping stale live UI apply tab=\(updatedTab.id)")
-            return true
+            return committedTab
         }
-        guard isStillCurrent(), !Task.isCancelled else { return false }
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
 
         let applyTab = updatedTab
 
@@ -3574,6 +4313,7 @@ extension MCPServerViewModel {
         await manager.applyComposeTabState(applyTab)
         manager.endApplyingTabContext(forTabID: context.tabID)
         tabContextLog("commitTabContext UI applied: tab=\(applyTab.id)")
-        return isStillCurrent() && !Task.isCancelled
+        guard isStillCurrent(), !Task.isCancelled else { return nil }
+        return committedTab
     }
 }

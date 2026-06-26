@@ -2701,6 +2701,44 @@ enum AgentTranscriptIO {
         return nil
     }
 
+    /// Assemble the terminal MCP response from the contiguous trailing assistant run.
+    ///
+    /// This intentionally leaves historical activities and conclusion selection unchanged.
+    static func terminalAssistantResponseText(in turn: AgentTranscriptTurn) -> String? {
+        contiguousTrailingAssistantText(
+            turn.allActivities.map { (kind: $0.itemKind, text: $0.text) }
+        )
+    }
+
+    /// Source-item fallback for terminal MCP snapshots whose derived transcript is missing or stale.
+    static func terminalAssistantResponseText(from items: [AgentChatItem]) -> String? {
+        let orderedItems = items.sorted { lhs, rhs in
+            if lhs.sequenceIndex == rhs.sequenceIndex {
+                return lhs.timestamp < rhs.timestamp
+            }
+            return lhs.sequenceIndex < rhs.sequenceIndex
+        }
+        return contiguousTrailingAssistantText(
+            orderedItems.map { (kind: $0.kind, text: $0.text) }
+        )
+    }
+
+    private static func contiguousTrailingAssistantText(
+        _ fragments: [(kind: AgentChatItemKind, text: String)]
+    ) -> String? {
+        var trailingFragments: [String] = []
+        for fragment in fragments.reversed() {
+            guard fragment.kind == .assistant || fragment.kind == .assistantInline else {
+                break
+            }
+            trailingFragments.append(fragment.text)
+        }
+        guard !trailingFragments.isEmpty else { return nil }
+        let text = trailingFragments.reversed().joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return AgentDisplayableText.hasDisplayableBody(text) ? text : nil
+    }
+
     /// Extract the latest error text from the transcript.
     static func latestErrorText(from transcript: AgentTranscript, latestTurnOnly: Bool) -> String? {
         let turns = latestTurnOnly ? transcript.turns.suffix(1) : transcript.turns[...]

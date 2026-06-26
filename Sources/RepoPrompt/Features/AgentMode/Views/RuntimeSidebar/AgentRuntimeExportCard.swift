@@ -250,6 +250,11 @@ struct AgentExportCard: View {
         let meta = await MainActor.run {
             promptManager.metaInstructions(for: cfg, selectedPromptIDsOverride: source.selectedMetaPromptIDs)
         }
+        let reviewGitContext = await promptManager.freezePromptGitReviewContext(
+            tabID: source.tabID,
+            sessionID: source.activeAgentSessionID,
+            bindings: source.worktreeBindings
+        )
         let request = await MainActor.run {
             AgentContextClipboardRequest(
                 cfg: cfg,
@@ -264,9 +269,7 @@ struct AgentExportCard: View {
                 promptSectionsOrder: promptManager.promptSectionsOrder,
                 disabledPromptSections: promptManager.disabledPromptSections,
                 duplicateUserInstructionsAtTop: promptManager.duplicateUserInstructionsAtTop,
-                selectedGitDiffProvider: { paths in
-                    await promptManager.gitViewModel.getDiffForAbsolutePaths(paths, forceRefreshStatus: true) ?? ""
-                },
+                reviewGitContext: reviewGitContext,
                 completeGitDiffProvider: {
                     await promptManager.gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true) ?? ""
                 }

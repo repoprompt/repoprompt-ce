@@ -155,7 +155,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
                 disabledPromptSections: [],
                 duplicateUserInstructionsAtTop: false,
-                selectedGitDiffProvider: { _ in "unexpected selected diff" },
+                reviewGitContext: .automaticOnly(),
                 completeGitDiffProvider: { "unexpected complete diff" }
             )
         )
@@ -551,7 +551,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 promptSectionsOrder: PromptAssemblyBuilder.defaultSectionOrder,
                 disabledPromptSections: [],
                 duplicateUserInstructionsAtTop: false,
-                selectedGitDiffProvider: { _ in "unexpected selected diff" },
+                reviewGitContext: .automaticOnly(),
                 completeGitDiffProvider: { "base checkout complete diff must not appear" }
             )
         )

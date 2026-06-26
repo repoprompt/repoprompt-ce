@@ -42,6 +42,13 @@ make dev-lint
 ```
 
 Add focused `make dev-test FILTER=<SuiteName>` coverage for behavior changes.
+When changing the Xcode generator, workflow wrapper, or generated scheme
+contracts, also run:
+
+```bash
+make xcode-generator-test
+make xcode-validate
+```
 
 Do not change release metadata, signing identities, bundle IDs, Sparkle keys, or
 release channels unless a maintainer has explicitly requested it.

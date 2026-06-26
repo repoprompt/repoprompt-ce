@@ -717,18 +717,18 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
     }
 
     private static func makeAgentRunService(window: WindowState, targetTabID: UUID) -> AgentRunMCPToolService {
-        AgentRunMCPToolService(
+        var service = AgentRunMCPToolService(
             toolName: MCPWindowToolName.agentRun,
             captureRequestMetadata: {
                 MCPServerViewModel.RequestMetadata(connectionID: nil, clientName: "worktree-api-smoke", windowID: window.windowID)
             },
             requireTargetWindow: { window },
             resolveRequestedTabID: { _ in targetTabID },
-            resolveSpawnSourceTabID: { _ in nil },
+            resolveSpawnParentSourceTabID: { _ in nil },
             resolveSpawnParentSessionID: { _, _ in nil },
             bindCurrentRequestToTab: { _, _ in },
             withHeartbeat: { _, _, _, _, operation in try await operation() },
-            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _ in
+            startRun: { target, _, _, _, agentModeVM, agentRaw, modelRaw, reasoningEffortRaw, _, _, _, _ in
                 guard let sessionID = target.sessionID else {
                     throw MCPError.internalError("Smoke start target did not resolve a session ID.")
                 }
@@ -755,6 +755,35 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
                 return AgentExternalMCPRunStarter.StartOutcome(snapshot: snapshot, delivery: .startedRun)
             }
         )
+        service.resolveOracleReviewLaunchSource = { _, targetWindow in
+            let workspace = try XCTUnwrap(targetWindow.workspaceManager.activeWorkspace)
+            let snapshot = AgentRunOracleReviewLaunchSnapshot(
+                route: .explicitTabContext,
+                windowID: targetWindow.windowID,
+                workspaceID: workspace.id,
+                tabID: targetTabID,
+                selectionRevision: targetWindow.workspaceManager.selectionRevisionForMCP(
+                    workspaceID: workspace.id,
+                    tabID: targetTabID
+                ),
+                promptText: "",
+                selection: StoredSelection(),
+                sourceAgentSessionID: nil,
+                routedRunID: nil
+            )
+            return ResolvedAgentRunOracleReviewLaunchSource(
+                snapshot: snapshot,
+                source: .unavailable(.init(
+                    delegationID: UUID(),
+                    sourceTabID: targetTabID,
+                    workspaceID: workspace.id,
+                    sourceAgentSessionID: nil,
+                    sourceAgentRunID: nil,
+                    reason: .sourceCaptureFailed("Synthetic smoke-service fixture")
+                ))
+            )
+        }
+        return service
     }
 
     private static func makeWindow(

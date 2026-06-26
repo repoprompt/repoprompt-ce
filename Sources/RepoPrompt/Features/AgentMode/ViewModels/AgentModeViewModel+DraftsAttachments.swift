@@ -200,7 +200,7 @@ extension AgentModeViewModel {
             return
         }
         let name = (displayName?.trimmingCharacters(in: .whitespacesAndNewlines)).flatMap { $0.isEmpty ? nil : $0 }
-            ?? URL(fileURLWithPath: normalizedPath).lastPathComponent
+            ?? normalizedPath
         session.pendingTaggedFileAttachments.append(
             AgentTaggedFileAttachment(relativePath: normalizedPath, displayName: name)
         )

@@ -291,6 +291,7 @@ print_matches \
 allowed_tracked_docs=(
   "docs/architecture/provider-plugins.md"
   "docs/architecture/source-layout.md"
+  "docs/architecture/xcode-workspace.md"
   "docs/open-source-readiness.md"
   "docs/releasing.md"
   "docs/testing.md"

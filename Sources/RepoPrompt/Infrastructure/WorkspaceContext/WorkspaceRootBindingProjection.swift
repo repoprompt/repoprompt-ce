@@ -10,6 +10,19 @@ struct WorkspaceRootBindingProjection: Equatable {
         let logicalRoot: WorkspaceRootRef
         let physicalRoot: WorkspaceRootRef
         let binding: AgentSessionWorktreeBinding
+        let sessionRootAuthorization: WorkspaceSessionRootAuthorization?
+
+        init(
+            logicalRoot: WorkspaceRootRef,
+            physicalRoot: WorkspaceRootRef,
+            binding: AgentSessionWorktreeBinding,
+            sessionRootAuthorization: WorkspaceSessionRootAuthorization? = nil
+        ) {
+            self.logicalRoot = logicalRoot
+            self.physicalRoot = physicalRoot
+            self.binding = binding
+            self.sessionRootAuthorization = sessionRootAuthorization
+        }
     }
 
     init(
@@ -165,6 +178,16 @@ struct WorkspaceRootBindingProjection: Equatable {
         return (boundRoot.logicalRoot.standardizedFullPath, StandardizedPath.relative(relative))
     }
 
+    func projectedLogicalPathComponents(forPhysicalPath rawPath: String) -> (root: WorkspaceRootRef, relativePath: String)? {
+        let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
+        guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
+            return nil
+        }
+        let relative = String(standardized.dropFirst(boundRoot.physicalRoot.standardizedFullPath.count))
+            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return (boundRoot.logicalRoot, StandardizedPath.relative(relative))
+    }
+
     func projectedLogicalDisplayPath(forPhysicalPath rawPath: String, display: FilePathDisplay = .relative) -> String? {
         let standardized = StandardizedPath.absolute((rawPath as NSString).expandingTildeInPath)
         guard let boundRoot = boundRoot(containingPhysicalAbsolutePath: standardized) else {
@@ -301,7 +324,7 @@ struct WorkspaceRootBindingProjection: Equatable {
             .max { $0.logicalRoot.standardizedFullPath.count < $1.logicalRoot.standardizedFullPath.count }
     }
 
-    private func boundRoot(containingPhysicalAbsolutePath path: String) -> BoundRoot? {
+    func boundRoot(containingPhysicalAbsolutePath path: String) -> BoundRoot? {
         replacementsByLogicalRootPath.values
             .filter { path == $0.physicalRoot.standardizedFullPath || path.hasPrefix($0.physicalRoot.standardizedFullPath + "/") }
             .max { $0.physicalRoot.standardizedFullPath.count < $1.physicalRoot.standardizedFullPath.count }
@@ -380,7 +403,17 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 name: logicalRoot.name,
                 fullPath: physicalRecord.standardizedPhysicalPath
             )
-            boundRoots.append(.init(logicalRoot: logicalRoot, physicalRoot: physicalRoot, binding: binding))
+            boundRoots.append(.init(
+                logicalRoot: logicalRoot,
+                physicalRoot: physicalRoot,
+                binding: binding,
+                sessionRootAuthorization: WorkspaceSessionRootAuthorization(
+                    sessionID: preparation.sessionID,
+                    ownershipGeneration: preparation.ownership.token.generation,
+                    root: physicalRoot,
+                    lifetimeID: physicalRecord.lifetimeID
+                )
+            ))
         }
         return WorkspaceRootBindingProjection(
             sessionID: preparation.sessionID,
@@ -454,7 +487,8 @@ struct WorkspaceRootBindingProjectionMaterializer {
                     name: logicalRoot.name,
                     fullPath: physicalPath
                 ),
-                binding: binding
+                binding: binding,
+                sessionRootAuthorization: nil
             )
         }
         return WorkspaceRootBindingProjection(

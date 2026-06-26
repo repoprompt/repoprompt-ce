@@ -130,7 +130,8 @@ final class ContextBuilderRunRecord {
     var finalContextConnectionIDForDiagnostics: UUID?
     var restoreConfiguration: (() -> Void)?
 
-    private var continuation: CheckedContinuation<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error>?
+    private(set) var committedTabSnapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot?
+    private var continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>?
     private var provider: HeadlessAgentProvider?
     private(set) var finalContextCommitClaimed = false
     private(set) var terminalOutcome: ContextBuilderRunTerminalOutcome?
@@ -148,7 +149,7 @@ final class ContextBuilderRunRecord {
         agentKind: AgentProviderKind,
         modelRaw: String,
         workspaceContext: ContextBuilderWorkspaceContext? = nil,
-        continuation: CheckedContinuation<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error>? = nil,
+        continuation: CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>? = nil,
         restoreConfiguration: (() -> Void)? = nil,
         progressReporter: ContextBuilderMCPProgressReporter? = nil
     ) {
@@ -203,7 +204,18 @@ final class ContextBuilderRunRecord {
         return true
     }
 
-    func takeContinuation() -> CheckedContinuation<ContextBuilderAgentViewModel.ContextBuilderRunSnapshot, Error>? {
+    func installCommittedTabSnapshot(
+        _ snapshot: MCPServerViewModel.ContextBuilderCommittedTabSnapshot
+    ) -> Bool {
+        guard snapshot.nestedRunID == runID,
+              snapshot.identity.tabID == tabID,
+              committedTabSnapshot == nil
+        else { return false }
+        committedTabSnapshot = snapshot
+        return true
+    }
+
+    func takeContinuation() -> CheckedContinuation<ContextBuilderAgentViewModel.MCPContextBuilderRunCompletion, Error>? {
         defer { continuation = nil }
         return continuation
     }

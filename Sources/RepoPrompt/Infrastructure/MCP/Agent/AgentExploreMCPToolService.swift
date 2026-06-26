@@ -120,7 +120,7 @@ struct AgentExploreMCPToolService {
             captureRequestMetadata: captureRequestMetadata,
             requireTargetWindow: requireTargetWindow,
             resolveRequestedTabID: { _ in nil },
-            resolveSpawnSourceTabID: resolveSpawnSourceTabID,
+            resolveSpawnParentSourceTabID: resolveSpawnSourceTabID,
             resolveSpawnParentSessionID: resolveSpawnParentSessionID,
             bindCurrentRequestToTab: bindCurrentRequestToTab,
             withHeartbeat: withHeartbeat,
@@ -308,6 +308,8 @@ struct AgentExploreMCPToolService {
             context.selection.modelRaw,
             nil,
             .explore,
+            nil,
+            nil,
             nil
         )
     }

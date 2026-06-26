@@ -472,6 +472,15 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
+    private struct AgentRunOracleReviewKey: Hashable {
+        let sessionID: UUID
+        let runID: UUID
+    }
+
+    /// Ephemeral launch snapshots. They are intentionally outside TabSession persistence.
+    private var pendingAgentRunOracleReviewContextsBySessionID: [UUID: PendingAgentRunOracleReviewContext] = [:]
+    private var delegatedAgentRunOracleReviewContextsByKey: [AgentRunOracleReviewKey: DelegatedAgentRunOracleReviewContext] = [:]
+
     @Published private(set) var sessionIndex: [UUID: AgentSessionIndexEntry] = [:] {
         didSet {
             syncSidebarUIState(refresh: true, reason: .sessionIndex)
@@ -2034,6 +2043,9 @@ final class AgentModeViewModel: ObservableObject {
             providerRuntimePermissionResolver: { [providerBindingService] agent, profile in
                 providerBindingService.runtimePermission(for: agent, profile: profile)
             },
+            bindPendingOracleReviewContext: { [weak self] tabID, runID in
+                self?.mcpBindPendingAgentRunOracleReviewContext(tabID: tabID, runID: runID)
+            },
             cancelMCPToolsForRun: { [weak self] runID, reason in
                 self?.cancelActiveToolsForRun(runID: runID, reason: reason)
             },
@@ -2161,11 +2173,18 @@ final class AgentModeViewModel: ObservableObject {
             },
             publishTerminalCommit: { [weak self] session, revision, successorKind in
                 guard let self else { return .rejected(reason: "view_model_deallocated") }
-                return await publishTerminalCommit(
+                let result = await publishTerminalCommit(
                     revision,
                     successorKind: successorKind,
                     for: session
                 )
+                if result.isResolved,
+                   let sessionID = session.activeAgentSessionID,
+                   let runID = revision.expectedRunID
+                {
+                    mcpRemoveAgentRunOracleReviewContext(sessionID: sessionID, runID: runID)
+                }
+                return result
             },
             startFollowUpRun: { [weak self] tabID, initialMessage in
                 Task { [weak self] in
@@ -4356,12 +4375,13 @@ final class AgentModeViewModel: ObservableObject {
 
     private func prepareTerminalPublication(for session: TabSession) {
         removePendingUIRefresh(for: session.tabID)
-        guard session.tabID == currentTabID,
-              canBuildOrPublishActiveTranscriptBindings(for: session)
-        else {
-            return
+        withActiveUISyncSuppressed {
+            catchUpDerivedTranscriptIfNeeded(
+                for: session,
+                reason: .liveMutation,
+                publishActivePresentation: false
+            )
         }
-        catchUpDerivedTranscriptForActiveBindingIfNeeded(for: session, reason: .liveMutation)
     }
 
     private func makeTerminalPublicationEnvelope(
@@ -6033,6 +6053,193 @@ final class AgentModeViewModel: ObservableObject {
         return true
     }
 
+    /// Stages a launching tab's immutable review snapshot for the exact current child activation.
+    /// Source/target provenance failures are retained on the context so non-review Agent work may
+    /// continue, but a later delegated review cannot silently package the child tab instead.
+    func mcpStageAgentRunOracleReviewSource(
+        _ source: AgentRunOracleReviewSource,
+        targetTabID: UUID,
+        targetSessionID: UUID,
+        expectedParentSessionID: UUID?
+    ) throws {
+        guard let session = sessions[targetTabID],
+              session.activeAgentSessionID == targetSessionID,
+              let controlContext = session.mcpControlContext,
+              controlContext.sessionID == targetSessionID
+        else {
+            throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
+        }
+        guard let targetWorkspaceID = workspaceManager?.activeWorkspace?.id else {
+            throw AgentRunOracleReviewUnavailableReason.targetWorkspaceMismatch
+        }
+
+        // Target conversation lineage is independent from packaging-source provenance. A
+        // top-level child may delegate a non-Agent compose tab (or an explicitly targeted Agent
+        // tab) without making that source session its conversation parent.
+        let validationFailure: AgentRunOracleReviewUnavailableReason? = if source.workspaceID != targetWorkspaceID {
+            .targetWorkspaceMismatch
+        } else if session.parentSessionID != expectedParentSessionID {
+            .parentSessionMismatch
+        } else {
+            nil
+        }
+
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: targetSessionID)
+        pendingAgentRunOracleReviewContextsBySessionID[targetSessionID] = PendingAgentRunOracleReviewContext(
+            source: source,
+            target: AgentRunOracleReviewTargetSnapshot(
+                tabID: targetTabID,
+                workspaceID: targetWorkspaceID,
+                agentSessionID: targetSessionID,
+                activationID: controlContext.activationID,
+                expectedParentSessionID: expectedParentSessionID,
+                worktreeBindings: session.worktreeBindings,
+                validationFailure: validationFailure
+            )
+        )
+    }
+
+    /// Promotes a staged launch snapshot to the exact process run before its nested MCP lease is
+    /// installed. Repeated promotion for the same activation/run is idempotent.
+    @discardableResult
+    func mcpBindPendingAgentRunOracleReviewContext(
+        tabID: UUID,
+        runID: UUID
+    ) -> DelegatedAgentRunOracleReviewContext? {
+        guard let session = sessions[tabID],
+              let sessionID = session.activeAgentSessionID,
+              let controlContext = session.mcpControlContext,
+              controlContext.sessionID == sessionID
+        else { return nil }
+
+        let key = AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
+        if let existing = delegatedAgentRunOracleReviewContextsByKey[key],
+           existing.target.tabID == tabID,
+           existing.target.activationID == controlContext.activationID
+        {
+            return existing
+        }
+        guard let pending = pendingAgentRunOracleReviewContextsBySessionID[sessionID] else {
+            return nil
+        }
+
+        var validationFailure = pending.target.validationFailure
+        if pending.target.tabID != tabID
+            || pending.target.activationID != controlContext.activationID
+            || pending.target.agentSessionID != sessionID
+        {
+            validationFailure = .targetActivationMismatch
+        }
+        if delegatedAgentRunOracleReviewContextsByKey.contains(where: {
+            $0.key.sessionID == sessionID && $0.key.runID != runID
+        }) {
+            validationFailure = .pendingContextAlreadyConsumed
+        }
+
+        let target = AgentRunOracleReviewTargetSnapshot(
+            tabID: pending.target.tabID,
+            workspaceID: pending.target.workspaceID,
+            agentSessionID: pending.target.agentSessionID,
+            activationID: pending.target.activationID,
+            expectedParentSessionID: pending.target.expectedParentSessionID,
+            worktreeBindings: pending.target.worktreeBindings,
+            validationFailure: validationFailure
+        )
+        let delegated = DelegatedAgentRunOracleReviewContext(
+            source: pending.source,
+            target: target,
+            targetRunID: runID
+        )
+        pendingAgentRunOracleReviewContextsBySessionID.removeValue(forKey: sessionID)
+        delegatedAgentRunOracleReviewContextsByKey = delegatedAgentRunOracleReviewContextsByKey.filter {
+            $0.key.sessionID != sessionID
+        }
+        delegatedAgentRunOracleReviewContextsByKey[key] = delegated
+        return delegated
+    }
+
+    /// Resolves only an exact child tab/workspace/session/run delegation. A pending, stale, or
+    /// provenance-invalid delegation throws so callers cannot fall back to blank child packaging.
+    func mcpDelegatedAgentRunOracleReviewContext(
+        tabID: UUID,
+        workspaceID: UUID,
+        sessionID: UUID,
+        runID: UUID
+    ) throws -> DelegatedAgentRunOracleReviewContext? {
+        let key = AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
+        guard let delegated = delegatedAgentRunOracleReviewContextsByKey[key] else {
+            if pendingAgentRunOracleReviewContextsBySessionID[sessionID] != nil {
+                throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
+            }
+            if delegatedAgentRunOracleReviewContextsByKey.keys.contains(where: { $0.sessionID == sessionID }) {
+                throw AgentRunOracleReviewUnavailableReason.pendingContextAlreadyConsumed
+            }
+            return nil
+        }
+        guard delegated.target.tabID == tabID,
+              delegated.target.workspaceID == workspaceID,
+              delegated.target.agentSessionID == sessionID,
+              delegated.targetRunID == runID
+        else {
+            throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
+        }
+        guard let session = sessions[tabID],
+              session.activeAgentSessionID == sessionID,
+              session.parentSessionID == delegated.target.expectedParentSessionID,
+              session.mcpControlContext?.sessionID == sessionID,
+              session.mcpControlContext?.activationID == delegated.target.activationID
+        else {
+            throw AgentRunOracleReviewUnavailableReason.targetActivationMismatch
+        }
+        guard Self.agentRunOracleReviewBindingsMatch(
+            source: delegated.target.worktreeBindings,
+            target: session.worktreeBindings
+        ) else {
+            throw AgentRunOracleReviewUnavailableReason.targetBindingMismatch
+        }
+        if let reason = delegated.unavailableReason {
+            throw reason
+        }
+        return delegated
+    }
+
+    func mcpHasAgentRunOracleReviewContextExpectation(tabID: UUID) -> Bool {
+        guard let sessionID = sessions[tabID]?.activeAgentSessionID else { return false }
+        return pendingAgentRunOracleReviewContextsBySessionID[sessionID] != nil
+            || delegatedAgentRunOracleReviewContextsByKey.keys.contains { $0.sessionID == sessionID }
+    }
+
+    func mcpRemoveAgentRunOracleReviewContexts(sessionID: UUID) {
+        pendingAgentRunOracleReviewContextsBySessionID.removeValue(forKey: sessionID)
+        delegatedAgentRunOracleReviewContextsByKey = delegatedAgentRunOracleReviewContextsByKey.filter {
+            $0.key.sessionID != sessionID
+        }
+    }
+
+    func mcpRemoveAgentRunOracleReviewContext(sessionID: UUID, runID: UUID) {
+        delegatedAgentRunOracleReviewContextsByKey.removeValue(
+            forKey: AgentRunOracleReviewKey(sessionID: sessionID, runID: runID)
+        )
+    }
+
+    private static func agentRunOracleReviewBindingsMatch(
+        source: [AgentSessionWorktreeBinding],
+        target: [AgentSessionWorktreeBinding]
+    ) -> Bool {
+        func identities(_ bindings: [AgentSessionWorktreeBinding]) -> [String] {
+            bindings.map { binding in
+                [
+                    binding.repositoryID,
+                    binding.repoKey,
+                    StandardizedPath.absolute((binding.logicalRootPath as NSString).expandingTildeInPath),
+                    binding.worktreeID,
+                    StandardizedPath.absolute((binding.worktreeRootPath as NSString).expandingTildeInPath)
+                ].joined(separator: "\u{1F}")
+            }.sorted()
+        }
+        return identities(source) == identities(target)
+    }
+
     func mcpActivateControlContext(
         forTabID tabID: UUID,
         sessionID: UUID,
@@ -6047,6 +6254,9 @@ final class AgentModeViewModel: ObservableObject {
         else {
             throw MCPError.invalidParams("The requested agent session binding changed before MCP control activation.")
         }
+        // A new control activation owns a new launch lifecycle. Never retain review state from a
+        // prior activation, including direct/source-equals-target starts that do not stage anew.
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
         let existingContext = session.mcpControlContext
         let activationID = UUID()
         if existingContext != nil {
@@ -6140,6 +6350,7 @@ final class AgentModeViewModel: ObservableObject {
             break
         }
         if let sessionID = target.sessionID {
+            mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
             await mcpDeactivateControlContext(
                 sessionID: sessionID,
                 cleanupSessionStore: true
@@ -6158,6 +6369,7 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID,
         cleanupSessionStore: Bool = false
     ) async {
+        mcpRemoveAgentRunOracleReviewContexts(sessionID: sessionID)
         guard let session = mcpControlledSession(sessionID: sessionID),
               let context = session.mcpControlContext,
               context.sessionID == sessionID
@@ -6369,60 +6581,71 @@ final class AgentModeViewModel: ObservableObject {
             codexAttemptID = nil
             signalsDeliveryAfterDispatch = false
         }
-        defer {
-            if Task.isCancelled, let codexAttemptID {
-                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-            }
-        }
 
-        let submission: UserTurnSubmissionResult
-        session.isMCPInstructionDispatchInProgress = true
-        defer {
-            session.isMCPInstructionDispatchInProgress = false
+        let ackCancellationTarget = codexAttemptID.map {
+            (tracker: session.codexSteerAckTracker, attemptID: $0)
         }
-        submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
-            if let nativePreparedTurn {
-                return submitPreparedUserTurn(
+        return try await withTaskCancellationHandler {
+            defer {
+                if Task.isCancelled, let codexAttemptID {
+                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+                }
+            }
+
+            let submission: UserTurnSubmissionResult
+            session.isMCPInstructionDispatchInProgress = true
+            defer {
+                session.isMCPInstructionDispatchInProgress = false
+            }
+            submission = withMCPWorkflowOverride(session: session, workflow: workflow) {
+                if let nativePreparedTurn {
+                    return submitPreparedUserTurn(
+                        tabID: session.tabID,
+                        session: session,
+                        trimmedText: trimmedText,
+                        attachmentsToSend: [],
+                        taggedFilesToSend: [],
+                        activeWorkflow: nativePreparedTurn.bubbleWorkflow,
+                        nativePreparedTurn: nativePreparedTurn,
+                        codexAttemptID: codexAttemptID
+                    )
+                }
+                return submitUserTurn(
+                    text: trimmedText,
                     tabID: session.tabID,
-                    session: session,
-                    trimmedText: trimmedText,
-                    attachmentsToSend: [],
-                    taggedFilesToSend: [],
-                    activeWorkflow: nativePreparedTurn.bubbleWorkflow,
-                    nativePreparedTurn: nativePreparedTurn,
                     codexAttemptID: codexAttemptID
                 )
             }
-            return submitUserTurn(
-                text: trimmedText,
-                tabID: session.tabID,
-                codexAttemptID: codexAttemptID
-            )
-        }
-        switch submission {
-        case .submitted:
-            Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
-            if delivery == .queuedClaudeInterrupt {
-                await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+            switch submission {
+            case .submitted:
+                Self.steeringDebugLog("[AgentRunSteeringWake] mcpDispatch submitted sessionID=\(sessionID) delivery=\(delivery.rawValue) runState=\(session.runState.rawValue) isActiveDispatch=\(delivery.isActiveRunDispatch) runID=\(String(describing: session.runID))")
+                if delivery == .queuedClaudeInterrupt {
+                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                }
+                try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
+                if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
+                    await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+                }
+                if let codexAttemptID {
+                    session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
+                    delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
+                }
+                if signalsDeliveryAfterDispatch {
+                    await signalMCPInstructionDelivered(for: session)
+                }
+                handleObservedMCPStateChange(for: session)
+                return delivery
+            case let .blocked(message):
+                if let codexAttemptID {
+                    session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
+                }
+                throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
             }
-            try await startQueuedProviderSteeringForMCPDispatch(delivery: delivery, session: session)
-            if delivery.isActiveRunDispatch, delivery != .queuedClaudeInterrupt {
-                await wakeMCPWaitersForActiveDispatch(delivery: delivery, session: session, sessionID: sessionID)
+        } onCancel: {
+            guard let ackCancellationTarget else { return }
+            Task { @MainActor in
+                ackCancellationTarget.tracker.cancel(attemptID: ackCancellationTarget.attemptID)
             }
-            if let codexAttemptID {
-                session.codexSteerAckTracker.authorizeDispatch(attemptID: codexAttemptID)
-                delivery = try await awaitCodexSteerAck(session: session, attemptID: codexAttemptID)
-            }
-            if signalsDeliveryAfterDispatch {
-                await signalMCPInstructionDelivered(for: session)
-            }
-            handleObservedMCPStateChange(for: session)
-            return delivery
-        case let .blocked(message):
-            if let codexAttemptID {
-                session.codexSteerAckTracker.cancel(attemptID: codexAttemptID)
-            }
-            throw MCPError.invalidParams(message.isEmpty ? "Unable to deliver the instruction." : message)
         }
     }
 
@@ -6804,12 +7027,10 @@ final class AgentModeViewModel: ObservableObject {
         return promptManager == nil
     }
 
-    /// Shared ownership predicate for work that may build or publish active transcript bindings.
+    /// Canonical ownership predicate for synchronizing a session's derived transcript.
     ///
-    /// A session is active-owned when it is the current tab for this view model/window.
-    /// Headless/test harness contexts without a prompt manager may also keep publishing the
-    /// already-owned transcript presentation, preserving the existing publication fallback.
-    func canBuildOrPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
+    /// Unlike active presentation ownership, this intentionally permits background sessions.
+    private func canSynchronizeDerivedTranscript(for session: TabSession) -> Bool {
         guard sessions[session.tabID] === session,
               !session.bindingTransitionInProgress,
               session.hasLoadedPersistedState
@@ -6828,6 +7049,16 @@ final class AgentModeViewModel: ObservableObject {
                 return false
             }
         }
+        return true
+    }
+
+    /// Shared ownership predicate for work that may build or publish active transcript bindings.
+    ///
+    /// A session is active-owned when it is the current tab for this view model/window.
+    /// Headless/test harness contexts without a prompt manager may also keep publishing the
+    /// already-owned transcript presentation, preserving the existing publication fallback.
+    func canBuildOrPublishActiveTranscriptBindings(for session: TabSession) -> Bool {
+        guard canSynchronizeDerivedTranscript(for: session) else { return false }
         if currentTabID == session.tabID {
             return true
         }
@@ -7979,7 +8210,8 @@ final class AgentModeViewModel: ObservableObject {
 
     func refreshDerivedTranscriptState(
         for session: TabSession,
-        reason: DerivedTranscriptRefreshReason = .manualRefresh
+        reason: DerivedTranscriptRefreshReason = .manualRefresh,
+        publishActivePresentation: Bool = true
     ) {
         session.derivedTranscriptRefreshGeneration &+= 1
         session.derivedTranscriptRefreshTask?.cancel()
@@ -8327,7 +8559,7 @@ final class AgentModeViewModel: ObservableObject {
                 sourceItemCount: session.items.count
             )
         )
-        if canBuildOrPublishActiveTranscriptBindings(for: session) {
+        if publishActivePresentation, canBuildOrPublishActiveTranscriptBindings(for: session) {
             let publishSignpost = EditFlowPerf.begin(
                 EditFlowPerf.Stage.Transcript.publish,
                 EditFlowPerf.Dimensions(lineCount: session.transcriptCanonicalVisibleRowCount)
@@ -8465,12 +8697,13 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     @discardableResult
-    private func catchUpDerivedTranscriptForActiveBindingIfNeeded(
+    private func catchUpDerivedTranscriptIfNeeded(
         for session: TabSession,
         reason: DerivedTranscriptRefreshReason,
-        validateProjectionIntegrity: Bool = false
+        validateProjectionIntegrity: Bool = false,
+        publishActivePresentation: Bool = true
     ) -> Bool {
-        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return false }
+        guard canSynchronizeDerivedTranscript(for: session) else { return false }
         guard !session.items.isEmpty || !session.transcript.turns.isEmpty else { return false }
         let projectionProtection = transcriptProjectionProtection(
             for: session,
@@ -8489,8 +8722,26 @@ final class AgentModeViewModel: ObservableObject {
         session.derivedTranscriptRefreshTask = nil
         let scheduledReason = session.pendingDerivedTranscriptRefreshReason ?? reason
         session.pendingDerivedTranscriptRefreshReason = nil
-        refreshDerivedTranscriptState(for: session, reason: scheduledReason)
+        refreshDerivedTranscriptState(
+            for: session,
+            reason: scheduledReason,
+            publishActivePresentation: publishActivePresentation
+        )
         return true
+    }
+
+    @discardableResult
+    private func catchUpDerivedTranscriptForActiveBindingIfNeeded(
+        for session: TabSession,
+        reason: DerivedTranscriptRefreshReason,
+        validateProjectionIntegrity: Bool = false
+    ) -> Bool {
+        guard canBuildOrPublishActiveTranscriptBindings(for: session) else { return false }
+        return catchUpDerivedTranscriptIfNeeded(
+            for: session,
+            reason: reason,
+            validateProjectionIntegrity: validateProjectionIntegrity
+        )
     }
 
     private func derivedTranscriptProjectionLooksStale(for session: TabSession) -> Bool {
@@ -9541,7 +9792,7 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         guard !targets.isEmpty else { return }
         let cleanupID = UUID()
-        let task = Task(priority: .utility) { @MainActor [weak self] in
+        let task = Task { @MainActor [weak self] in
             #if DEBUG
                 defer {
                     self?.test_completeWorkspaceSwitchBackgroundCleanup(cleanupID)
@@ -12565,7 +12816,9 @@ final class AgentModeViewModel: ObservableObject {
         workspaceEntries.reserveCapacity(min(taggedPaths.count, maxFiles))
         var seenFileIDs = Set<UUID>()
         var seenExternalPaths = Set<String>()
-        let rootsByID = await Dictionary(uniqueKeysWithValues: store.rootRefs(scope: lookupContext.rootScope).map { ($0.id, $0) })
+        let scopedRootRefs = await store.rootRefs(scope: lookupContext.rootScope)
+        let rootsByID = Dictionary(uniqueKeysWithValues: scopedRootRefs.map { ($0.id, $0) })
+        let displayRootRefs = lookupContext.bindingProjection?.visibleLogicalRootRefs ?? scopedRootRefs
 
         for taggedPath in taggedPaths {
             guard orderedFiles.count < maxFiles else { break }
@@ -12603,9 +12856,22 @@ final class AgentModeViewModel: ObservableObject {
             filePathDisplay: .relative,
             codemapSnapshotBundle: .empty,
             displayPathResolver: { entry in
-                lookupContext.bindingProjection?.projectedLogicalDisplayPath(
-                    forPhysicalPath: entry.file.standardizedFullPath,
-                    display: .relative
+                if let projected = lookupContext.bindingProjection?.projectedLogicalPathComponents(
+                    forPhysicalPath: entry.file.standardizedFullPath
+                ) {
+                    return ClientPathFormatter.nonAbsoluteDisplayPath(
+                        root: projected.root,
+                        relativePath: projected.relativePath,
+                        visibleRoots: displayRootRefs
+                    )
+                }
+                guard let root = rootsByID[entry.file.rootID] else {
+                    return entry.file.standardizedRelativePath
+                }
+                return ClientPathFormatter.nonAbsoluteDisplayPath(
+                    root: root,
+                    relativePath: entry.file.standardizedRelativePath,
+                    visibleRoots: displayRootRefs
                 )
             }
         )
@@ -15002,7 +15268,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Status-aware assistant preview: active runs only show text from the current turn,
-    /// terminal runs show the latest text from the full transcript.
+    /// terminal runs show the logical trailing response from the latest turn.
     private func mcpResolvedAssistantPreview(session: TabSession, status: AgentRunMCPSnapshot.Status) -> String? {
         switch status {
         case .expired:
@@ -15024,8 +15290,21 @@ final class AgentModeViewModel: ObservableObject {
             }
             return AgentTranscriptIO.latestAssistantPreviewText(in: lastTurn)
         case .completed, .failed, .cancelled:
-            return latestAssistantPreviewText(in: session)
-                ?? session.items.reversed().first(where: { $0.hasDisplayableAssistantBody })?.text
+            let transcriptPreview = session.transcript.turns.last.flatMap {
+                AgentTranscriptIO.terminalAssistantResponseText(in: $0)
+            }
+            let sourcePreview = AgentTranscriptIO.terminalAssistantResponseText(from: session.items)
+            let projectionProtection = transcriptProjectionProtection(
+                for: session,
+                transcript: session.transcript
+            )
+            if canReuseDerivedTranscriptForSave(
+                for: session,
+                projectionProtection: projectionProtection
+            ) {
+                return transcriptPreview ?? sourcePreview
+            }
+            return session.items.isEmpty ? transcriptPreview : sourcePreview
         }
     }
 

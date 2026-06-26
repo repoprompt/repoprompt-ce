@@ -15,6 +15,9 @@ final class AgentModeRunService {
         let claudeCoordinator: ClaudeAgentModeCoordinator
         let shouldManageCodexTooling: Bool
         let providerRuntimePermissionResolver: (_ agent: AgentProviderKind, _ profile: AgentProviderPermissionProfile) -> AgentProviderRuntimePermissionBinding
+        /// Promotes an immutable launch review snapshot to the exact process run before its MCP
+        /// bootstrap lease can expose nested tools.
+        let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
         let cancelMCPToolsForRun: (_ runID: UUID, _ reason: String) -> Void
         /// Waits until the given runID has zero active MCP tool executions.
         /// Throws `CancellationError` if the calling Task is cancelled.
@@ -210,6 +213,7 @@ final class AgentModeRunService {
         let taskLabelKind = session.mcpControlContext?.taskLabelKind
         let allowsAgentExternalControlTools = session.mcpControlContext != nil && session.parentSessionID == nil
         let makeLease: (_ runID: UUID) -> MCPBootstrapLease = { runID in
+            self.dependencies.bindPendingOracleReviewContext(tabID, runID)
             let leaseSpec = MCPBootstrapLeaseSpec.agentMode(
                 tabID: tabID,
                 runID: runID,

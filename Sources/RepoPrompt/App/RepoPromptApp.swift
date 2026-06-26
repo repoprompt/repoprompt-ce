@@ -129,7 +129,7 @@ struct RepoPromptApp: App {
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified)
         .commands {
-            UpdateMenu()
+            UpdateMenu(sparkleManager: appDelegate.sparkleManager)
 
             // macOS standard "Settings…" (⌘,) menu item
             CommandGroup(replacing: .appSettings) {

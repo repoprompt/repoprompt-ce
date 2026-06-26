@@ -1619,34 +1619,671 @@ final class TabContextRoutingTests: XCTestCase {
         )
     }
 
+    func testExplicitWindowRoutingHintRequiresNormalizedArgumentAndMatchingAuthorization() {
+        let connectionID = UUID()
+        let windowState = NSObject()
+        let serverViewModel = NSObject()
+        let catalogService = NSObject()
+        let connection = NSObject()
+        let identity = ServerNetworkManager.WindowToolDispatchIdentity(
+            windowID: 7,
+            windowStateIdentity: ObjectIdentifier(windowState),
+            serverViewModelIdentity: ObjectIdentifier(serverViewModel),
+            catalogServiceIdentity: ObjectIdentifier(catalogService)
+        )
+        let authorization = ServerNetworkManager.ToolDispatchAuthorization(
+            connectionID: connectionID,
+            connectionIdentity: ObjectIdentifier(connection),
+            lifecycleGeneration: 1,
+            windowIdentity: identity
+        )
+        let explicit = MCPToolArgsNormalizer.normalize(
+            params: ["op": .string("start"), "_windowID": .int(7)],
+            originalToolName: "agent_run",
+            canonicalToolName: "agent_run"
+        )
+
+        let hint = ServerNetworkManager.explicitWindowRoutingHint(
+            connectionID: connectionID,
+            toolName: "agent_run",
+            explicitWindowID: explicit.windowID,
+            authorization: authorization
+        )
+
+        XCTAssertEqual(hint?.connectionID, connectionID)
+        XCTAssertEqual(hint?.toolName, "agent_run")
+        XCTAssertEqual(hint?.windowID, 7)
+        XCTAssertEqual(hint?.windowStateIdentity, ObjectIdentifier(windowState))
+        XCTAssertEqual(hint?.serverViewModelIdentity, ObjectIdentifier(serverViewModel))
+        XCTAssertEqual(hint?.provenance, .hiddenWindowArgument)
+        XCTAssertNil(explicit.payload["_windowID"])
+
+        let autoRouted = MCPToolArgsNormalizer.normalize(
+            params: ["op": .string("start")],
+            originalToolName: "agent_run",
+            canonicalToolName: "agent_run"
+        )
+        XCTAssertNil(ServerNetworkManager.explicitWindowRoutingHint(
+            connectionID: connectionID,
+            toolName: "agent_run",
+            explicitWindowID: autoRouted.windowID,
+            authorization: authorization
+        ))
+        XCTAssertNil(ServerNetworkManager.explicitWindowRoutingHint(
+            connectionID: connectionID,
+            toolName: "agent_run",
+            explicitWindowID: 8,
+            authorization: authorization
+        ))
+        XCTAssertNil(ServerNetworkManager.explicitWindowRoutingHint(
+            connectionID: UUID(),
+            toolName: "agent_run",
+            explicitWindowID: 7,
+            authorization: authorization
+        ))
+    }
+
+    #if DEBUG
+        @MainActor
+        func testRequestMetadataBridgesExplicitWindowHintWithoutInferringFromEffectiveAffinity() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let connectionID = UUID()
+            let hint = MCPExplicitWindowRoutingHint(
+                connectionID: connectionID,
+                toolName: "agent_run",
+                windowID: window.windowID,
+                windowStateIdentity: ObjectIdentifier(window),
+                serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                provenance: .hiddenWindowArgument
+            )
+
+            let explicit = try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.setActiveWindowForCurrentConnection(window.windowID)
+                return await ServerNetworkManager.$currentExplicitWindowRoutingHint.withValue(hint) {
+                    await window.mcpServer.captureRequestMetadata()
+                }
+            }
+            XCTAssertEqual(explicit.windowID, window.windowID)
+            XCTAssertEqual(explicit.explicitWindowRoutingHint, hint)
+
+            let inferred = await ServerNetworkManager.withConnectionID(connectionID) {
+                await window.mcpServer.captureRequestMetadata()
+            }
+            XCTAssertEqual(inferred.windowID, window.windowID)
+            XCTAssertNil(inferred.explicitWindowRoutingHint)
+
+            try await ServerNetworkManager.withConnectionID(connectionID) {
+                try await ServerNetworkManager.shared.clearActiveWindowForCurrentConnection()
+            }
+        }
+    #endif
+
     @MainActor
-    func testSpawnSourceUsesResolvedTabContextSnapshot() {
+    func testSpawnParentSourceUsesOnlyExactAgentRunContext() {
         let context = makeTabContext(runID: UUID(), windowID: 11)
         let resolved = MCPServerViewModel.ResolvedTabContextSnapshot(
             snapshot: context,
-            usesActiveTabCompatibility: false
+            usesActiveTabCompatibility: false,
+            source: .runInstall
         )
         let activeCompatibility = MCPServerViewModel.ResolvedTabContextSnapshot(
             snapshot: context,
             usesActiveTabCompatibility: true
         )
+        let explicitHint = MCPServerViewModel.ResolvedTabContextSnapshot(
+            snapshot: context,
+            usesActiveTabCompatibility: false,
+            source: .explicitHint
+        )
 
         XCTAssertEqual(
-            MCPServerViewModel.spawnSourceTabIDForAgentSessionCreation(
+            MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
                 purpose: .agentModeRun,
                 resolvedContext: resolved
             ),
             context.tabID
         )
-        XCTAssertNil(MCPServerViewModel.spawnSourceTabIDForAgentSessionCreation(
+        XCTAssertNil(MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: .agentModeRun,
             resolvedContext: activeCompatibility
         ))
-        XCTAssertNil(MCPServerViewModel.spawnSourceTabIDForAgentSessionCreation(
+        XCTAssertNil(MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
             purpose: .unknown,
             resolvedContext: resolved
         ))
+        XCTAssertNil(MCPServerViewModel.spawnParentSourceTabIDForAgentSessionCreation(
+            purpose: .agentModeRun,
+            resolvedContext: explicitHint
+        ))
     }
+
+    #if DEBUG
+        @MainActor
+        func testAgentRunWindowOnlyLaunchFreezesExactActiveComposeTabWithoutConversationParent() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let tabID = UUID()
+            let root = try makeTemporaryDirectory(named: "window-only-launch-source")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let selectedFile = root.appendingPathComponent("Source.swift")
+            try "let frozen = true\n".write(to: selectedFile, atomically: true, encoding: .utf8)
+            let selectedPath = selectedFile.path
+            let selection = StoredSelection(
+                selectedPaths: [selectedPath],
+                codemapAutoEnabled: false
+            )
+            await installSelectionWorkspace(
+                in: window,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selection: selection,
+                name: "Window-only launch"
+            )
+            try window.promptManager.loadComposeTabsFromWorkspace(
+                XCTUnwrap(window.workspaceManager.activeWorkspace),
+                syncPromptText: true
+            )
+            _ = try await WorkspaceRootLoadTestSupport.loadRootMatchingCurrentFileSystemSettings(
+                in: window,
+                path: root.path
+            )
+            await window.workspaceFilesViewModel.applyStoredSelection(selection)
+            window.workspaceManager.publishActiveComposeTabSnapshot(
+                commitToMemory: true,
+                touchModified: false
+            )
+            let expectedActiveSelection = window.workspaceFilesViewModel.snapshotSelection()
+            let connectionID = UUID()
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "window-only-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: MCPExplicitWindowRoutingHint(
+                    connectionID: connectionID,
+                    toolName: "agent_run",
+                    windowID: window.windowID,
+                    windowStateIdentity: ObjectIdentifier(window),
+                    serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                    provenance: .hiddenWindowArgument
+                )
+            )
+
+            let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                metadata: metadata,
+                targetWindow: window
+            )
+
+            XCTAssertEqual(snapshot.route, .windowOnlyActiveCompose)
+            XCTAssertEqual(snapshot.windowID, window.windowID)
+            XCTAssertEqual(snapshot.workspaceID, workspaceID)
+            XCTAssertEqual(snapshot.tabID, tabID)
+            XCTAssertEqual(snapshot.selection, expectedActiveSelection)
+            XCTAssertNil(snapshot.sourceAgentSessionID)
+            XCTAssertEqual(
+                window.mcpServer.connectionBindingSnapshot(forConnection: connectionID).bindingKind,
+                .unbound
+            )
+            let parentSourceTabID = await window.mcpServer
+                .resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: metadata)
+            XCTAssertNil(parentSourceTabID)
+        }
+
+        @MainActor
+        func testAgentRunExplicitLaunchSourceIsExactAndDoesNotUseActiveTabCompatibility() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let tabID = UUID()
+            await installSelectionWorkspace(
+                in: window,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selection: StoredSelection(selectedPaths: ["/tmp/explicit-source.swift"], codemapAutoEnabled: false),
+                name: "Explicit launch"
+            )
+            let connectionID = UUID()
+            try window.mcpServer.bindTabForConnection(
+                connectionID: connectionID,
+                clientName: "explicit-agent-run",
+                tabID: tabID,
+                workspaceID: workspaceID,
+                windowID: window.windowID
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "explicit-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            )
+
+            let snapshot = try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                metadata: metadata,
+                targetWindow: window
+            )
+
+            XCTAssertEqual(snapshot.route, .explicitTabContext)
+            XCTAssertEqual(snapshot.tabID, tabID)
+            XCTAssertEqual(snapshot.workspaceID, workspaceID)
+        }
+
+        @MainActor
+        func testAgentRunWindowOnlyLaunchRejectsMissingActiveComposeTabAndRunScopedFallback() async {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let tabID = UUID()
+            await installSelectionWorkspace(
+                in: window,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selection: StoredSelection(),
+                name: "Negative launch"
+            )
+            let connectionID = UUID()
+            let explicitWindowRoutingHint = MCPExplicitWindowRoutingHint(
+                connectionID: connectionID,
+                toolName: "agent_run",
+                windowID: window.windowID,
+                windowStateIdentity: ObjectIdentifier(window),
+                serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                provenance: .hiddenWindowArgument
+            )
+            let runScopedMetadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "run-scoped-window-only-agent-run",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun,
+                explicitWindowRoutingHint: explicitWindowRoutingHint
+            )
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: runScopedMetadata,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("Retry"), String(describing: error))
+            }
+
+            let discoverScopedMetadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "discover-scoped-window-only-agent-run",
+                windowID: window.windowID,
+                runPurpose: .discoverRun,
+                explicitWindowRoutingHint: explicitWindowRoutingHint
+            )
+            await XCTAssertThrowsErrorAsync {
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: discoverScopedMetadata,
+                    targetWindow: window
+                )
+            }
+
+            let hintedRunID = UUID()
+            window.mcpServer.connectionIDToRunID[connectionID] = hintedRunID
+            let hintedRunScopedMetadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "run-scoped-arbitrary-hint-agent-run",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun,
+                tabContextHint: .init(
+                    tabID: tabID,
+                    workspaceID: workspaceID,
+                    windowID: window.windowID
+                ),
+                explicitWindowRoutingHint: explicitWindowRoutingHint
+            )
+            let hintedParent = await window.mcpServer
+                .resolveSpawnParentSourceTabIDForAgentSessionCreation(metadata: hintedRunScopedMetadata)
+            XCTAssertNil(hintedParent)
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: hintedRunScopedMetadata,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("exact run tab"), String(describing: error))
+            }
+            window.mcpServer.connectionIDToRunID.removeValue(forKey: connectionID)
+
+            if let workspaceIndex = window.workspaceManager.workspaces.firstIndex(where: { $0.id == workspaceID }) {
+                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = nil
+            }
+            let topLevelMetadata = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "missing-active-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: explicitWindowRoutingHint
+            )
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: topLevelMetadata,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("active project compose tab"), String(describing: error))
+            }
+        }
+
+        @MainActor
+        func testAgentRunLaunchRejectsExplicitContextWindowConflict() async {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let workspaceID = UUID()
+            let tabID = UUID()
+            await installSelectionWorkspace(
+                in: window,
+                workspaceID: workspaceID,
+                tabID: tabID,
+                selection: StoredSelection(),
+                name: "Window conflict"
+            )
+            let metadata = MCPServerViewModel.RequestMetadata(
+                connectionID: UUID(),
+                clientName: "conflicting-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                tabContextHint: .init(
+                    tabID: tabID,
+                    workspaceID: workspaceID,
+                    windowID: window.windowID + 1
+                )
+            )
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: metadata,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("target window"), String(describing: error))
+            }
+        }
+
+        @MainActor
+        func testAgentRunExplicitWindowLaunchRejectsInferredAndMismatchedRoutes() async {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            let connectionID = UUID()
+
+            let inferredOnly = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "auto-routed-agent-run",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            )
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: inferredOnly,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("requires either"), String(describing: error))
+            }
+
+            func hint(
+                connectionID hintedConnectionID: UUID? = nil,
+                toolName: String = "agent_run",
+                windowID: Int? = nil,
+                windowStateIdentity: ObjectIdentifier? = nil,
+                serverViewModelIdentity: ObjectIdentifier? = nil
+            ) -> MCPExplicitWindowRoutingHint {
+                MCPExplicitWindowRoutingHint(
+                    connectionID: hintedConnectionID ?? connectionID,
+                    toolName: toolName,
+                    windowID: windowID ?? window.windowID,
+                    windowStateIdentity: windowStateIdentity ?? ObjectIdentifier(window),
+                    serverViewModelIdentity: serverViewModelIdentity ?? ObjectIdentifier(window.mcpServer),
+                    provenance: .hiddenWindowArgument
+                )
+            }
+
+            let wrongIdentity = NSObject()
+            let mismatches: [MCPServerViewModel.RequestMetadata] = [
+                .init(
+                    connectionID: connectionID,
+                    clientName: "connection-mismatch-agent-run",
+                    windowID: window.windowID,
+                    runPurpose: .unknown,
+                    explicitWindowRoutingHint: hint(connectionID: UUID())
+                ),
+                .init(
+                    connectionID: connectionID,
+                    clientName: "tool-mismatch-agent-run",
+                    windowID: window.windowID,
+                    runPurpose: .unknown,
+                    explicitWindowRoutingHint: hint(toolName: "read_file")
+                ),
+                .init(
+                    connectionID: connectionID,
+                    clientName: "target-identity-mismatch-agent-run",
+                    windowID: window.windowID,
+                    runPurpose: .unknown,
+                    explicitWindowRoutingHint: hint(
+                        windowStateIdentity: ObjectIdentifier(wrongIdentity)
+                    )
+                ),
+                .init(
+                    connectionID: connectionID,
+                    clientName: "server-identity-mismatch-agent-run",
+                    windowID: window.windowID,
+                    runPurpose: .unknown,
+                    explicitWindowRoutingHint: hint(
+                        serverViewModelIdentity: ObjectIdentifier(wrongIdentity)
+                    )
+                )
+            ]
+            for metadata in mismatches {
+                await XCTAssertThrowsErrorAsync({
+                    try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                        metadata: metadata,
+                        targetWindow: window
+                    )
+                }) { error in
+                    XCTAssertTrue(
+                        String(describing: error).contains("authorized connection"),
+                        String(describing: error)
+                    )
+                }
+            }
+
+            let effectiveWindowMismatch = MCPServerViewModel.RequestMetadata(
+                connectionID: connectionID,
+                clientName: "effective-window-mismatch-agent-run",
+                windowID: window.windowID + 1,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: hint()
+            )
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.resolveAgentRunOracleReviewLaunchSnapshot(
+                    metadata: effectiveWindowMismatch,
+                    targetWindow: window
+                )
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("target window"), String(describing: error))
+            }
+        }
+
+        @MainActor
+        func testAgentRunPublicStartRejectsInvalidLaunchRoutesBeforeDispatch() async throws {
+            let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
+            GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)
+            let window = WindowState()
+            GlobalSettingsStore.shared.setMCPAutoStart(previousAutoStart, commit: false)
+            WindowStatesManager.shared.registerWindowState(window)
+            defer { WindowStatesManager.shared.unregisterWindowState(window) }
+            let root = try makeTemporaryDirectory(named: "public-start-negative-routes")
+            defer { try? FileManager.default.removeItem(at: root.deletingLastPathComponent()) }
+            let workspace = window.workspaceManager.createWorkspace(
+                name: "Public start negative routes",
+                repoPaths: [root.path],
+                ephemeral: true
+            )
+            await window.workspaceManager.switchWorkspace(
+                to: workspace,
+                saveState: false,
+                reason: "agentRunPublicStartNegativeRoutes"
+            )
+            let activeWorkspace = try XCTUnwrap(window.workspaceManager.activeWorkspace)
+            window.promptManager.loadComposeTabsFromWorkspace(activeWorkspace, syncPromptText: true)
+            let activeTabID = try XCTUnwrap(activeWorkspace.activeComposeTabID)
+            let initialTabCount = activeWorkspace.composeTabs.count
+            var dispatchCount = 0
+            window.mcpServer.setAgentRunDispatchOverrideForTesting {
+                _, _, _, _, _ in
+                dispatchCount += 1
+                return .startedRun
+            }
+            defer {
+                window.mcpServer.setAgentRunDispatchOverrideForTesting(nil)
+                window.mcpServer.setRequestMetadataOverrideForTesting(nil)
+            }
+
+            let conflictConnectionID = UUID()
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: conflictConnectionID,
+                clientName: "public-start-window-conflict",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                tabContextHint: .init(
+                    tabID: activeTabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID + 1
+                )
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("conflicting explicit context")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("target window"), String(describing: error))
+            }
+
+            let autoRoutedConnectionID = UUID()
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: autoRoutedConnectionID,
+                clientName: "public-start-auto-routed-only",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("inferred routing must not qualify")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("requires either"), String(describing: error))
+            }
+
+            let mismatchedHintConnectionID = UUID()
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: mismatchedHintConnectionID,
+                clientName: "public-start-mismatched-window-hint",
+                windowID: window.windowID,
+                runPurpose: .unknown,
+                explicitWindowRoutingHint: MCPExplicitWindowRoutingHint(
+                    connectionID: UUID(),
+                    toolName: "agent_run",
+                    windowID: window.windowID,
+                    windowStateIdentity: ObjectIdentifier(window),
+                    serverViewModelIdentity: ObjectIdentifier(window.mcpServer),
+                    provenance: .hiddenWindowArgument
+                )
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("mismatched explicit window provenance")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("authorized connection"), String(describing: error))
+            }
+
+            let runScopedConnectionID = UUID()
+            window.mcpServer.windowIDByConnection[runScopedConnectionID] = window.windowID
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: runScopedConnectionID,
+                clientName: "public-start-missing-run-route",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("missing exact nested route")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("unparented"), String(describing: error))
+            }
+
+            let hintedRunScopedConnectionID = UUID()
+            window.mcpServer.windowIDByConnection[hintedRunScopedConnectionID] = window.windowID
+            window.mcpServer.connectionIDToRunID[hintedRunScopedConnectionID] = UUID()
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: hintedRunScopedConnectionID,
+                clientName: "public-start-arbitrary-run-hint",
+                windowID: window.windowID,
+                runPurpose: .agentModeRun,
+                tabContextHint: .init(
+                    tabID: activeTabID,
+                    workspaceID: activeWorkspace.id,
+                    windowID: window.windowID
+                )
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("arbitrary run-scoped explicit hint")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("unparented"), String(describing: error))
+            }
+
+            if let workspaceIndex = window.workspaceManager.workspaces.firstIndex(where: {
+                $0.id == activeWorkspace.id
+            }) {
+                window.workspaceManager.workspaces[workspaceIndex].activeComposeTabID = nil
+            }
+            let missingActiveConnectionID = UUID()
+            window.mcpServer.windowIDByConnection[missingActiveConnectionID] = window.windowID
+            window.mcpServer.setRequestMetadataOverrideForTesting(.init(
+                connectionID: missingActiveConnectionID,
+                clientName: "public-start-missing-active",
+                windowID: window.windowID,
+                runPurpose: .unknown
+            ))
+            await XCTAssertThrowsErrorAsync({
+                try await window.mcpServer.executeAgentRunForTesting(args: [
+                    "op": .string("start"),
+                    "message": .string("missing active compose tab")
+                ])
+            }) { error in
+                XCTAssertTrue(String(describing: error).contains("active project compose tab"), String(describing: error))
+            }
+
+            XCTAssertEqual(dispatchCount, 0)
+            XCTAssertEqual(
+                window.workspaceManager.workspace(withID: activeWorkspace.id)?.composeTabs.count,
+                initialTabCount
+            )
+            await window.tearDown()
+        }
+    #endif
 
     #if DEBUG
         @MainActor
@@ -1709,7 +2346,7 @@ final class TabContextRoutingTests: XCTestCase {
             currentPurpose: .unknown,
             cachedRunPolicyPurpose: nil
         ))
-        XCTAssertFalse(MCPServerViewModel.shouldRejectAgentRunStartWithoutResolvedSource(
+        XCTAssertTrue(MCPServerViewModel.shouldRejectAgentRunStartWithoutResolvedSource(
             capturedPurpose: nil,
             currentPurpose: .unknown,
             cachedRunPolicyPurpose: .discoverRun

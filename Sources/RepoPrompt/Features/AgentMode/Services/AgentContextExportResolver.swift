@@ -157,7 +157,7 @@ struct AgentContextClipboardRequest {
     let promptSectionsOrder: [PromptSection]
     let disabledPromptSections: Set<PromptSection>
     let duplicateUserInstructionsAtTop: Bool
-    let selectedGitDiffProvider: ([String]) async -> String
+    let reviewGitContext: FrozenPromptGitReviewContext
     let completeGitDiffProvider: () async -> String
 }
 
@@ -237,6 +237,7 @@ enum AgentContextExportResolver {
 
     static func buildClipboardContent(_ request: AgentContextClipboardRequest) async -> String {
         let cfg = request.cfg
+        let coordinator = AutomaticReviewGitDiffCoordinator()
         let preAssembly = await PromptContextPreAssemblyService.resolve(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
@@ -249,8 +250,9 @@ enum AgentContextExportResolver {
                 selectedGitDiffFolderPolicy: .filesOnly,
                 selectedGitDiffLookupProfile: .mcpSelection,
                 selectedGitDiffArtifactPolicy: .respectGitInclusion,
-                selectedGitDiffProvider: { paths in
-                    await request.selectedGitDiffProvider(paths)
+                reviewGitContext: request.reviewGitContext,
+                selectedGitDiffProvider: { automaticRequest in
+                    await coordinator.resolve(automaticRequest)
                 },
                 completeGitDiffProvider: {
                     await request.completeGitDiffProvider()

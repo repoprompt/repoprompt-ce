@@ -351,7 +351,22 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
         }
         try Task.checkCancellation()
         var readResult = try await EditFlowPerf.measure(EditFlowPerf.Stage.ReadFile.providerReadEnvelope) {
-            try await dependencies.readFile(resolvedPath, startLine1Based, limit, lookupContext.rootScope)
+            if let artifact = try await dependencies.readSelectedAuthorizedGitArtifact(
+                path,
+                resolvedPath,
+                startLine1Based,
+                limit,
+                metadata,
+                lookupContext
+            ) {
+                return artifact
+            }
+            return try await dependencies.readFile(
+                resolvedPath,
+                startLine1Based,
+                limit,
+                lookupContext.rootScope
+            )
         }
         try Task.checkCancellation()
         let projectedDisplayPath = readResult.reply.displayPath.map { displayPath in

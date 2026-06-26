@@ -48,6 +48,16 @@ class PromptViewModel: ObservableObject {
     /// Set to true to enable debug logging for settings sync
     static var debugLoggingEnabled = false
 
+    #if DEBUG
+        private var automaticReviewGitDiffProviderOverrideForTesting: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+
+        func setAutomaticReviewGitDiffProviderOverrideForTesting(
+            _ override: ((AutomaticReviewGitDiffRequest) async -> AutomaticReviewGitDiffResult)?
+        ) {
+            automaticReviewGitDiffProviderOverrideForTesting = override
+        }
+    #endif
+
     // MARK: - Type Definitions and Enums
 
     enum PlanActMode: String, CaseIterable, Codable {
@@ -1040,7 +1050,10 @@ class PromptViewModel: ObservableObject {
         )
 
         // Ensure _git_data is visible and refreshed
-        await fileManager.ensureGitDataRootLoaded(workspace: workspace, workspaceManager: workspaceManager)
+        _ = try await fileManager.ensureGitDataRootLoaded(
+            workspace: workspace,
+            workspaceManager: workspaceManager
+        )
         await fileManager.flushPendingDeltas(aggressive: true)
 
         return result
@@ -4842,7 +4855,8 @@ class PromptViewModel: ObservableObject {
         gitInclusionOverride: GitInclusion? = nil,
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
-        lookupContextOverride: WorkspaceLookupContext? = nil
+        lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil
     ) async -> AIMessage {
         // Use pro file edit based on the specified or current chat preset
         let preset = overrideChatPreset ?? currentChatPreset()
@@ -4879,11 +4893,16 @@ class PromptViewModel: ObservableObject {
         // active chat packaging no longer needs FileViewModel selection snapshots.
         let filePathDisplay = filePathDisplayOption
         let temperature = setModelTemperature ? modelTemperature : nil
+        let frozenReviewGitContext = if let reviewGitContextOverride {
+            reviewGitContextOverride
+        } else {
+            await freezePromptGitReviewContext(base: gitBaseOverride ?? gitViewModel.selectedDiffBranch)
+        }
         let preAssembly = await preAssemblePromptContext(
             cfg: activeConfig,
             selection: logicalSelection,
             lookupContext: lookupContext,
-            gitBaseOverride: gitBaseOverride
+            reviewGitContext: frozenReviewGitContext
         )
         let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
@@ -4949,7 +4968,7 @@ class PromptViewModel: ObservableObject {
             return metaInstructionsForChat
         }()
 
-        return PromptPackagingService.buildAIMessage(
+        let message = PromptPackagingService.buildAIMessage(
             systemPrompt: systemPrompt,
             metaInstructions: metaForThisChat,
             fileTree: fileTreeString,
@@ -4961,6 +4980,20 @@ class PromptViewModel: ObservableObject {
             disabledPromptSections: disabledPromptSections,
             duplicateUserInstructionsAtTop: duplicateUserInstructionsAtTop
         )
+        #if DEBUG
+            OracleReviewPackagingDiagnostics.recordPreassembly(
+                mode: effectiveMode,
+                model: overrideModel,
+                chatPreset: preset,
+                config: activeConfig,
+                selectedArtifactPolicy: .includeBeforeGitInclusion,
+                logicalSelection: logicalSelection,
+                preassembly: preAssembly,
+                message: message,
+                disabledPromptSections: disabledPromptSections
+            )
+        #endif
+        return message
     }
 
     func getSystemPrompt() -> String {
@@ -5462,11 +5495,24 @@ extension PromptViewModel {
         selection: StoredSelection,
         lookupContext: WorkspaceLookupContext,
         includeLocalDefinitionsInFileTree: Bool = false,
-        gitBaseOverride: String? = nil
+        reviewGitContext: FrozenPromptGitReviewContext? = nil
     ) async -> PromptContextPreAssemblyResult {
-        let diffBase = gitBaseOverride?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveBase = (diffBase?.isEmpty == false) ? diffBase : nil
+        let frozenReviewContext = if let reviewGitContext {
+            reviewGitContext
+        } else {
+            await freezePromptGitReviewContext(base: gitViewModel.selectedDiffBranch)
+        }
+        let effectiveBase: String? = switch frozenReviewContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
         let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator()
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
         return await PromptContextPreAssemblyService.resolve(
             PromptContextPreAssemblyRequest(
                 cfg: cfg,
@@ -5479,14 +5525,116 @@ extension PromptViewModel {
                 selectedGitDiffFolderPolicy: .expandFolders,
                 selectedGitDiffLookupProfile: .uiAssisted,
                 includeLocalDefinitionsInFileTree: includeLocalDefinitionsInFileTree,
-                selectedGitDiffProvider: { [gitVM] selectedPaths in
-                    await gitVM.getDiffForAbsolutePaths(selectedPaths, vs: effectiveBase, forceRefreshStatus: true)
+                reviewGitContext: frozenReviewContext,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
                 },
                 completeGitDiffProvider: { [gitVM] in
                     await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
                 }
             )
         )
+    }
+
+    func preAssembleStrictPromptContext(
+        cfg: PromptContextResolved,
+        selection: StoredSelection,
+        lookupContext: WorkspaceLookupContext,
+        sourceTabID: UUID,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization
+    ) async throws -> PromptContextPreAssemblyResult {
+        let effectiveBase: String? = switch reviewGitContext.compareIntent {
+        case .uncommittedHEAD:
+            "HEAD"
+        case let .uncommittedMergeBase(symbolicBase):
+            symbolicBase
+        }
+        let gitVM = gitViewModel
+        let coordinator = AutomaticReviewGitDiffCoordinator(
+            dependencies: .live(store: workspaceFileContextStore)
+        )
+        #if DEBUG
+            let automaticReviewGitDiffProviderOverrideForTesting = automaticReviewGitDiffProviderOverrideForTesting
+        #endif
+        return try await PromptContextPreAssemblyService.resolveStrict(
+            PromptContextPreAssemblyRequest(
+                cfg: cfg,
+                selection: selection,
+                store: workspaceFileContextStore,
+                lookupContext: lookupContext,
+                filePathDisplay: filePathDisplayOption,
+                onlyIncludeRootsWithSelectedFiles: onlyIncludeRootsWithSelectedFiles,
+                showCodeMapMarkers: !codeMapsGloballyDisabled,
+                selectedGitDiffFolderPolicy: .expandFolders,
+                selectedGitDiffLookupProfile: .uiAssisted,
+                reviewGitContext: reviewGitContext,
+                sourceTabID: sourceTabID,
+                finalReviewAuthorization: finalReviewAuthorization,
+                selectedGitDiffProvider: { request in
+                    #if DEBUG
+                        if let automaticReviewGitDiffProviderOverrideForTesting {
+                            return await automaticReviewGitDiffProviderOverrideForTesting(request)
+                        }
+                    #endif
+                    return await coordinator.resolve(request)
+                },
+                completeGitDiffProvider: { [gitVM] in
+                    await gitVM.getDiffUsing(inclusionMode: .all, vs: effectiveBase, forceRefreshStatus: true)
+                }
+            )
+        )
+    }
+
+    func freezePromptGitReviewContext(
+        workspaceID: UUID? = nil,
+        tabID: UUID? = nil,
+        sessionID: UUID? = nil,
+        bindings: [AgentSessionWorktreeBinding] = [],
+        base: String? = nil
+    ) async -> FrozenPromptGitReviewContext {
+        let effectiveBase = base ?? gitViewModel.selectedDiffBranch
+        guard let manager = workspaceManager else {
+            return .automaticOnly(base: effectiveBase, bindings: bindings)
+        }
+        guard let workspace = Self.workspaceForFrozenPromptGitReviewContext(
+            requestedWorkspaceID: workspaceID,
+            workspaces: manager.workspaces,
+            activeWorkspace: manager.activeWorkspace
+        ),
+            let creatorTabID = tabID ?? activeComposeTabID
+        else {
+            return .automaticOnly(
+                base: effectiveBase,
+                bindings: bindings
+            )
+        }
+        return await FrozenPromptGitReviewContext.make(
+            workspaceID: workspace.id,
+            workspaceDirectoryPath: manager.workspaceDirectory(for: workspace).path,
+            workspaceRootPaths: workspace.repoPaths,
+            tabID: creatorTabID,
+            sessionID: sessionID,
+            bindings: bindings,
+            base: effectiveBase,
+            store: workspaceFileContextStore
+        )
+    }
+
+    static func workspaceForFrozenPromptGitReviewContext(
+        requestedWorkspaceID: UUID?,
+        workspaces: [WorkspaceModel],
+        activeWorkspace: WorkspaceModel?
+    ) -> WorkspaceModel? {
+        if let requestedWorkspaceID {
+            return workspaces.first { $0.id == requestedWorkspaceID }
+        }
+        return activeWorkspace
     }
 
     /// Builds clipboard content using a resolved configuration without mutating any AppStorage/UI state.

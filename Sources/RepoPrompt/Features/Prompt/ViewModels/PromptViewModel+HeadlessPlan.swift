@@ -26,16 +26,26 @@ struct HeadlessContextSnapshot {
     /// Frozen logical-to-physical workspace projection for this request.
     let lookupContext: WorkspaceLookupContext?
 
+    /// Frozen artifact authority, comparison intent, and logical checkout labels.
+    let reviewGitContext: FrozenPromptGitReviewContext
+
+    /// Exact final Context Builder review authority. Nil for every general prompt route.
+    let finalReviewAuthorization: ContextBuilderFinalReviewAuthorization?
+
     init(
         tabID: UUID,
         promptText: String,
         selection: StoredSelection,
-        lookupContext: WorkspaceLookupContext? = nil
+        lookupContext: WorkspaceLookupContext? = nil,
+        reviewGitContext: FrozenPromptGitReviewContext,
+        finalReviewAuthorization: ContextBuilderFinalReviewAuthorization? = nil
     ) {
         self.tabID = tabID
         self.promptText = promptText
         self.selection = selection
         self.lookupContext = lookupContext
+        self.reviewGitContext = reviewGitContext
+        self.finalReviewAuthorization = finalReviewAuthorization
     }
 }
 
@@ -56,9 +66,8 @@ extension PromptViewModel {
         from snapshot: HeadlessContextSnapshot,
         model: AIModel,
         mode: HeadlessMode = .plan,
-        gitScopeOverride: GitInclusion? = nil,
-        gitBaseOverride: String? = nil
-    ) async -> AIMessage {
+        gitScopeOverride: GitInclusion? = nil
+    ) async throws -> AIMessage {
         let effectiveGitScope = mode == .review ? (gitScopeOverride ?? .selected) : .none
         let headlessConfig = PromptContextResolved(
             includeFiles: true,
@@ -70,12 +79,24 @@ extension PromptViewModel {
             gitInclusion: effectiveGitScope,
             storedPromptIds: []
         )
-        let preAssembly = await preAssemblePromptContext(
-            cfg: headlessConfig,
-            selection: snapshot.selection,
-            lookupContext: snapshot.lookupContext ?? allLoadedWorkspaceLookupContext(),
-            gitBaseOverride: gitBaseOverride
-        )
+        let lookupContext = snapshot.lookupContext ?? allLoadedWorkspaceLookupContext()
+        let preAssembly = if let authorization = snapshot.finalReviewAuthorization {
+            try await preAssembleStrictPromptContext(
+                cfg: headlessConfig,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                sourceTabID: snapshot.tabID,
+                reviewGitContext: snapshot.reviewGitContext,
+                finalReviewAuthorization: authorization
+            )
+        } else {
+            await preAssemblePromptContext(
+                cfg: headlessConfig,
+                selection: snapshot.selection,
+                lookupContext: lookupContext,
+                reviewGitContext: snapshot.reviewGitContext
+            )
+        }
         let (_, codeEntries) = PromptPackagingService.partitionPromptEntriesForGitDiff(preAssembly.entries)
 
         // 2. Generate file contents. Preserve legacy formatting unless an authoritative

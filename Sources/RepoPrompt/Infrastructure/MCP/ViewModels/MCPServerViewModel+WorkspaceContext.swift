@@ -282,6 +282,13 @@ extension MCPServerViewModel {
         let lookupContext = await lookupContext(for: context)
         let effectivePromptText = context.promptText
         let store = promptVM.workspaceFileContextStore
+        let reviewGitContext = await promptVM.freezePromptGitReviewContext(
+            workspaceID: context.workspaceID,
+            tabID: context.tabID,
+            sessionID: context.activeAgentSessionID,
+            bindings: context.worktreeBindings
+        )
+        let coordinator = AutomaticReviewGitDiffCoordinator()
         var effectiveCfg = cfg
         effectiveCfg.codeMapUsage = effectiveMCPCodeMapUsage(cfg.codeMapUsage)
         let preAssembly = await PromptContextPreAssemblyService.resolve(
@@ -296,8 +303,9 @@ extension MCPServerViewModel {
                 selectedGitDiffFolderPolicy: .filesOnly,
                 selectedGitDiffLookupProfile: .mcpSelection,
                 selectedGitDiffArtifactPolicy: .respectGitInclusion,
-                selectedGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] paths in
-                    await gitViewModel.getDiffForAbsolutePaths(paths, forceRefreshStatus: true)
+                reviewGitContext: reviewGitContext,
+                selectedGitDiffProvider: { request in
+                    await coordinator.resolve(request)
                 },
                 completeGitDiffProvider: { [gitViewModel = promptVM.gitViewModel] in
                     await gitViewModel.getDiffUsing(inclusionMode: .all, forceRefreshStatus: true)

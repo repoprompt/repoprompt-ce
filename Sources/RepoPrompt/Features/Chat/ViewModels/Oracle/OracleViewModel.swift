@@ -966,6 +966,33 @@ class OracleViewModel: ObservableObject {
     let aiQueriesService: AIQueriesService
     var promptViewModel: PromptViewModel
 
+    #if DEBUG
+        typealias OraclePostPackagingTransportOverride = @MainActor @Sendable (
+            _ message: AIMessage,
+            _ model: AIModel
+        ) async throws -> (
+            id: ChatStreamID,
+            stream: AsyncThrowingStream<ChatStreamOutput, Error>
+        )
+
+        var oracleReviewPackagingTraceObserverForTesting:
+            OracleReviewPackagingTraceContext.Observer?
+        private var oraclePostPackagingTransportOverrideForTesting:
+            OraclePostPackagingTransportOverride?
+
+        func setOracleReviewPackagingTraceObserverForTesting(
+            _ observer: OracleReviewPackagingTraceContext.Observer?
+        ) {
+            oracleReviewPackagingTraceObserverForTesting = observer
+        }
+
+        func setOraclePostPackagingTransportOverrideForTesting(
+            _ override: OraclePostPackagingTransportOverride?
+        ) {
+            oraclePostPackagingTransportOverrideForTesting = override
+        }
+    #endif
+
     /// Track the active retry task so it can be properly cancelled
     private var activeRetryTask: Task<Void, Error>?
 
@@ -2747,6 +2774,7 @@ class OracleViewModel: ObservableObject {
         gitBaseOverride: String? = nil,
         selectionOverride: StoredSelection? = nil,
         lookupContextOverride: WorkspaceLookupContext? = nil,
+        reviewGitContextOverride: FrozenPromptGitReviewContext? = nil,
         overrideAIMessage: AIMessage? = nil,
         onProgress: ((_ text: String, _ reasoning: String?) -> Void)? = nil
     ) async {
@@ -2883,16 +2911,28 @@ class OracleViewModel: ObservableObject {
                         gitInclusionOverride: gitInclusionOverride,
                         gitBaseOverride: gitBaseOverride,
                         selectionOverride: selectionOverride,
-                        lookupContextOverride: lookupContextOverride
+                        lookupContextOverride: lookupContextOverride,
+                        reviewGitContextOverride: reviewGitContextOverride
                     )
                 }
                 guard await shouldContinueStreaming() else {
                     throw CancellationError()
                 }
-                let (streamID, stream) = try await aiQueriesService.sendPrompt(
-                    aiMessage,
-                    model: model
-                )
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordSubmission(aiMessage)
+                    let (streamID, stream) = if let transportOverride =
+                        oraclePostPackagingTransportOverrideForTesting
+                    {
+                        try await transportOverride(aiMessage, model)
+                    } else {
+                        try await aiQueriesService.sendPrompt(aiMessage, model: model)
+                    }
+                #else
+                    let (streamID, stream) = try await aiQueriesService.sendPrompt(
+                        aiMessage,
+                        model: model
+                    )
+                #endif
 
                 guard await shouldContinueStreaming() else {
                     await aiQueriesService.cancelStream(id: streamID)
@@ -2983,6 +3023,9 @@ class OracleViewModel: ObservableObject {
                     Task { await self.finalizeAIResponse(aiResponseId: aiResponseId, sessionID: targetSessionID, partialBuffer: partialBuffer) }
                 }
             } catch {
+                #if DEBUG
+                    OracleReviewPackagingDiagnostics.recordFailure(error)
+                #endif
                 await MainActor.run {
                     self.clearSessionStreaming(targetSessionID)
                 }

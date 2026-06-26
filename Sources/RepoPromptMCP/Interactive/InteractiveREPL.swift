@@ -83,6 +83,7 @@ actor InteractiveREPL {
         }
 
         if let toolName = options.callTool {
+            await session.setSelectedWindowID(options.initialWindowID)
             try await callToolSingleShot(name: toolName, argsJSON: options.callArgs)
             return
         }

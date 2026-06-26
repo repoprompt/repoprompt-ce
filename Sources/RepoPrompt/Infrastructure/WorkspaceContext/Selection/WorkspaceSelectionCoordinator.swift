@@ -50,6 +50,7 @@ protocol WorkspaceSelectionHost: AnyObject {
     @discardableResult
     func updateComposeTabStoredOnly(_ tab: ComposeTabState, inWorkspaceID workspaceID: UUID) -> Bool
     func updateComposeTabSelectionPresentation(_ selection: StoredSelection, for identity: WorkspaceSelectionIdentity)
+    func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64
     func registerMCPSelectionSourceMutation(
         for identity: WorkspaceSelectionIdentity
     ) -> MCPSelectionPropagationRegistration
@@ -69,6 +70,10 @@ extension WorkspaceSelectionHost {
     }
 
     func updateComposeTabSelectionPresentation(_: StoredSelection, for _: WorkspaceSelectionIdentity) {}
+
+    func committedSelectionRevision(for _: WorkspaceSelectionIdentity) -> UInt64 {
+        0
+    }
 
     func registerMCPSelectionSourceMutation(
         for _: WorkspaceSelectionIdentity
@@ -101,7 +106,11 @@ private extension WorkspaceSelectionHost {
     }
 }
 
-extension WorkspaceManagerViewModel: WorkspaceSelectionHost {}
+extension WorkspaceManagerViewModel: WorkspaceSelectionHost {
+    func committedSelectionRevision(for identity: WorkspaceSelectionIdentity) -> UInt64 {
+        selectionRevisionForMCP(workspaceID: identity.workspaceID, tabID: identity.tabID)
+    }
+}
 
 /// Window-scoped coordinator that makes compose-tab `StoredSelection` the runtime
 /// selection source while the WorkspaceFiles UI adapter still owns checkbox state.
@@ -117,6 +126,13 @@ final class WorkspaceSelectionCoordinator {
         let tabID: UUID?
         let selection: StoredSelection
         let source: Source
+    }
+
+    struct TransactionResult: Equatable {
+        let identity: WorkspaceSelectionIdentity
+        let before: StoredSelection
+        let after: StoredSelection
+        let revision: UInt64
     }
 
     enum Source: String, Equatable {
@@ -405,6 +421,78 @@ final class WorkspaceSelectionCoordinator {
             )
         }
         return selection
+    }
+
+    /// Applies a synchronous transform to the latest canonical tab selection and stores the
+    /// result before any actor suspension. Mirroring and peer propagation happen only after
+    /// the canonical commit, so callers never replace a concurrently advanced selection.
+    @discardableResult
+    func transformSelection(
+        for identity: WorkspaceSelectionIdentity,
+        source: Source = .runtimeMutation,
+        mirrorToUIIfActive: Bool = true,
+        _ transform: (StoredSelection) -> StoredSelection
+    ) async -> TransactionResult? {
+        guard let workspaceManager,
+              let before = workspaceManager.composeTab(for: identity)?.selection
+        else { return nil }
+
+        let after = transform(before)
+        let propagationRegistration = source == .mcpTabContext
+            ? workspaceManager.registerMCPSelectionSourceMutation(for: identity)
+            : nil
+        let isActive = identity == activeSelectionIdentity()
+        let mirrorToUI = isActive && mirrorToUIIfActive
+        let canonicalRevision: UInt64
+        let mirrorRevision: UInt64
+
+        if after == before {
+            canonicalRevision = workspaceManager.committedSelectionRevision(for: identity)
+            mirrorRevision = selectionRevisionByIdentity[identity] ?? recordSelectionRevision(for: identity)
+        } else {
+            guard let persistedRevision = persist(after, for: identity) else { return nil }
+            canonicalRevision = workspaceManager.committedSelectionRevision(for: identity)
+            mirrorRevision = persistedRevision
+        }
+
+        if source.isMCPSelectionSource {
+            updateMCPSelectionPresentation(after, for: identity, workspaceManager: workspaceManager)
+        }
+        if after != before, !mirrorToUI || source.isMCPSelectionSource {
+            changeSubject.send(Change(tabID: identity.tabID, selection: after, source: source))
+        }
+
+        if mirrorToUI, source.isMCPSelectionSource {
+            await enqueueMCPSelectionMirror(
+                after,
+                for: identity,
+                revision: mirrorRevision,
+                peerMutationFence: nil
+            )
+        } else if mirrorToUI, after != before {
+            await applySelectionMirror {
+                changeSubject.send(Change(tabID: identity.tabID, selection: after, source: source))
+            }
+        }
+
+        if let propagationRegistration {
+            await workspaceManager.propagateMCPSelectionToPeerHosts(
+                MCPSelectionPeerPropagation(
+                    identity: identity,
+                    selection: after,
+                    sourceRevision: propagationRegistration.sourceRevision,
+                    peerHostIDs: propagationRegistration.peerHostIDs,
+                    mirrorToUIIfActive: mirrorToUIIfActive
+                )
+            )
+        }
+
+        return TransactionResult(
+            identity: identity,
+            before: before,
+            after: after,
+            revision: canonicalRevision
+        )
     }
 
     @discardableResult

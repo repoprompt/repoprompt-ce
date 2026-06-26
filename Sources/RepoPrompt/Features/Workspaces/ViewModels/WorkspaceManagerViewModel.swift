@@ -3309,13 +3309,21 @@ class WorkspaceManagerViewModel: ObservableObject {
         }
 
         logWorkspaceSwitch("post-switch ensureGitDataRootLoaded BEGIN workspace=\"\(workspace.name)\" reason=\(reason)")
-        await fileManager.ensureGitDataRootLoaded(
-            workspace: workspace,
-            workspaceManager: self,
-            refreshRootFolderStateAfterLoad: false
-        )
-        if Task.isCancelled {
-            outcome = "cancelled"
+        do {
+            _ = try await fileManager.ensureGitDataRootLoaded(
+                workspace: workspace,
+                workspaceManager: self,
+                refreshRootFolderStateAfterLoad: false
+            )
+            if Task.isCancelled {
+                outcome = "cancelled"
+            }
+        } catch {
+            outcome = error is CancellationError ? "cancelled" : "error"
+            logWorkspaceSwitch(
+                "post-switch ensureGitDataRootLoaded FAILED workspace=\"\(workspace.name)\" " +
+                    "reason=\(reason) error=\(error.localizedDescription)"
+            )
         }
         logWorkspaceSwitch("post-switch ensureGitDataRootLoaded END workspace=\"\(workspace.name)\" reason=\(reason) duration=\(String(format: "%.3f", Date().timeIntervalSince(start)))s outcome=\(outcome)")
     }
@@ -6300,13 +6308,22 @@ class WorkspaceManagerViewModel: ObservableObject {
                 let gitDataStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             #endif
             logWorkspaceSwitch("ensureGitDataRootLoaded BEGIN workspace=\"\(workspace.name)\" mode=inline")
-            await fileManager.ensureGitDataRootLoaded(
-                workspace: workspace,
-                workspaceManager: self,
-                refreshRootFolderStateAfterLoad: false
-            )
+            var gitDataOutcome = "success"
+            do {
+                _ = try await fileManager.ensureGitDataRootLoaded(
+                    workspace: workspace,
+                    workspaceManager: self,
+                    refreshRootFolderStateAfterLoad: false
+                )
+            } catch {
+                gitDataOutcome = error is CancellationError ? "cancelled" : "error"
+                logWorkspaceSwitch(
+                    "ensureGitDataRootLoaded FAILED workspace=\"\(workspace.name)\" " +
+                        "mode=inline error=\(error.localizedDescription)"
+                )
+            }
             let gitDataDuration = Date().timeIntervalSince(gitDataStart)
-            logWorkspaceSwitch("ensureGitDataRootLoaded END workspace=\"\(workspace.name)\" mode=inline duration=\(String(format: "%.3f", gitDataDuration))s")
+            logWorkspaceSwitch("ensureGitDataRootLoaded END workspace=\"\(workspace.name)\" mode=inline duration=\(String(format: "%.3f", gitDataDuration))s outcome=\(gitDataOutcome)")
             #if DEBUG
                 WorkspaceRestorePerfLog.event(
                     "workspaceSwitch.gitDataLoad",
@@ -6314,7 +6331,7 @@ class WorkspaceManagerViewModel: ObservableObject {
                         "workspaceID": WorkspaceRestorePerfLog.shortID(workspace.id),
                         "isSystemWorkspace": "\(workspace.isSystemWorkspace)",
                         "mode": "inline",
-                        "outcome": "success",
+                        "outcome": gitDataOutcome,
                         "duration": gitDataStartMS.map { WorkspaceRestorePerfLog.formatElapsedMS(since: $0) } ?? "notMeasured"
                     ]
                 )

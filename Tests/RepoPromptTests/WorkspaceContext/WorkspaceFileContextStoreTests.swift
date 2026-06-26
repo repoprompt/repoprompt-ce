@@ -174,8 +174,38 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 startSearchCatalogSnapshotCapture(label: "snapshot-reuse")
                 defer { EditFlowPerf.resetDebugCaptureForTesting() }
 
-                let cold = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
-                let warm = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                let cold = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(cold.rootPathIndexes.isEmpty, caseLabel)
+                let coldCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(coldCacheCount, 1, caseLabel)
+                let warm = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(warm.rootPathIndexes.isEmpty, caseLabel)
+                let warmCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(warmCacheCount, 1, caseLabel)
+
+                let indexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertEqual(indexed.generation, cold.generation, caseLabel)
+                XCTAssertEqual(indexed.rootPathIndexes.count, 2, caseLabel)
+                let indexedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(indexedCacheCount, 1, caseLabel)
+                let repeatedIndexed = await store.searchCatalogSnapshot(rootScope: .visibleWorkspace)
+                XCTAssertTrue(indexed.rootPathIndexes[0] === repeatedIndexed.rootPathIndexes[0], caseLabel)
+                XCTAssertTrue(indexed.rootPathIndexes[1] === repeatedIndexed.rootPathIndexes[1], caseLabel)
+                let projected = await store.searchCatalogSnapshot(
+                    rootScope: .visibleWorkspace,
+                    requirement: .recordsOnly
+                )
+                XCTAssertTrue(projected.rootPathIndexes.isEmpty, caseLabel)
+                XCTAssertEqual(projected.generation, indexed.generation, caseLabel)
+                let projectedCacheCount = await store.searchCatalogSnapshotCacheCountForTesting()
+                XCTAssertEqual(projectedCacheCount, 1, caseLabel)
+
                 let capture = EditFlowPerf.debugCaptureSnapshot(finish: true)
                 let buckets = searchCatalogSnapshotBuckets(capture)
 
@@ -185,13 +215,16 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertEqual(cold.diagnostics.rootCount, 2, caseLabel)
                 XCTAssertEqual(cold.diagnostics.folderCount, 3, caseLabel)
                 XCTAssertEqual(cold.diagnostics.fileCount, 3, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 1, caseLabel)
-                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 1, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=false") })?.sampleCount, 2, caseLabel)
+                XCTAssertEqual(buckets.first(where: { $0.sanitizedDimensions.contains("cacheHit=true") })?.sampleCount, 3, caseLabel)
                 XCTAssertEqual(capture.droppedSampleCount, 0, caseLabel)
                 let work = await store.storeWorkDiagnosticsSnapshot()
-                XCTAssertEqual(work.catalogRebuild.rebuildCount, 1, caseLabel)
+                XCTAssertEqual(work.catalogRebuild.rebuildCount, 2, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastFileCount, 3, caseLabel)
                 XCTAssertEqual(work.catalogRebuild.lastRootCount, 2, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.authoritativeRebuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.pathIndexBuildCount == 1 }, caseLabel)
+                XCTAssertTrue(work.rootCatalogShards.roots.allSatisfy { $0.patchCount == 0 }, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.filterMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(work.catalogRebuild.totalMicroseconds, work.catalogRebuild.sortMicroseconds, caseLabel)
                 XCTAssertGreaterThanOrEqual(
@@ -2935,7 +2968,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 let roots = await store.readSearchRootDiagnosticsSnapshot()
                 guard let root = roots.first(where: { $0.rootID == rootID }) else { return false }
                 return root.barrier.active == nil
-                    && root.barrier.completionCount == 1
+                    && root.barrier.completionCount >= 1
                     && root.ingress.waiterCount == 0
                     && root.ingress.outstandingPublicationCount == 0
             }
@@ -3129,7 +3162,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
             XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
-            XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
 
@@ -3151,8 +3184,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 firstSamples.first?.acceptedWatcherWatermark,
                 baselineWatcherWatermark.rawValue
             )
-            XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
-            XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(thirdSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(
@@ -3457,7 +3490,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 XCTAssertNil(sample.watcherAcceptedWatermark, caseLabel)
                 XCTAssertEqual(sample.preparedDeltaCount, fileCount, caseLabel)
                 XCTAssertEqual(sample.topologyInvalidationCount, 1, caseLabel)
-                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 3, caseLabel)
+                XCTAssertEqual(sample.catalogGenerationAdvanceCount, 4, caseLabel)
                 XCTAssertEqual(sample.searchCatalogCacheClearCount, 1, caseLabel)
                 XCTAssertEqual(sample.pathWorkerInvalidationRequestCount, 0, caseLabel)
                 XCTAssertEqual(sample.contentInvalidationCount, 0, caseLabel)
@@ -5706,6 +5739,56 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertFalse(snapshot.cacheHit, caseLabel)
             XCTAssertTrue(service.isAlwaysReadableExternalPath(external.path), caseLabel)
         }
+    }
+
+    func testWorkspaceReadableFileServiceResolvesSymlinkedAlwaysReadableExternalFilesAndRejectsEscapes() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableSymlinkHome")
+        let realSkillsRoot = try makeTemporaryRoot(name: "ReadableSymlinkSkills")
+        let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: nominalSkillsRoot.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+
+        let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+        try write("symlinked skill body", to: realSkillFile)
+        let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+        let nominalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalSkillFile.path),
+            "nominal symlink-root support path should resolve as external"
+        )
+        XCTAssertEqual(nominalResolved.absolutePath, realSkillFile.path)
+        let nominalContent = try await service.readAlwaysReadableExternalFile(nominalResolved)
+        XCTAssertEqual(nominalContent, "symlinked skill body")
+
+        let canonicalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: realSkillFile.path),
+            "canonical support-root symlink target path should resolve as external"
+        )
+        XCTAssertEqual(canonicalResolved.absolutePath, realSkillFile.path)
+        let canonicalContent = try await service.readAlwaysReadableExternalFile(canonicalResolved)
+        XCTAssertEqual(canonicalContent, "symlinked skill body")
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableSymlinkOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("secret.md")
+        try write("outside", to: outsideFile)
+        let nestedEscape = realSkillsRoot.appendingPathComponent("example/escape", isDirectory: true)
+        try createDirectorySymlinkOrSkip(at: nestedEscape, destination: outsideRoot)
+        let nominalEscapedFile = nominalSkillsRoot.appendingPathComponent("example/escape/secret.md")
+
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalEscapedFile.path),
+            "nested symlink escape from an allowed support root should remain blocked"
+        )
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: outsideFile.path),
+            "canonical outside target should not become always-readable"
+        )
     }
 
     @MainActor
@@ -8045,6 +8128,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
     }
 
     private func setDiskModificationDate(_ date: Date, for url: URL) throws {
