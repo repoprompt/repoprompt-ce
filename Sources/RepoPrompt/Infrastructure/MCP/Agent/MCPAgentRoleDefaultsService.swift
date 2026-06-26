@@ -98,33 +98,26 @@ enum MCPAgentRoleDefaultsService {
 
     // MARK: - Mutations
 
-    /// Set a user-selected global override for a role.
-    /// If the selection matches the recommended default, the override is removed.
+    /// Set a user-selected global override for a role. An explicit selection is always
+    /// persisted; revert a role to the (recommendation-tracking) default via
+    /// `clearOverride` / `clearAllOverrides`.
     @discardableResult
     static func setSelection(
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind,
-        availability: AgentModelCatalog.AvailabilityContext = .current,
+        availability _: AgentModelCatalog.AvailabilityContext = .current,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> Bool {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared
-        let recommendationAvailability = defaultRecommendedAvailability(from: availability, settingsStore: settingsStore)
-        let recommended = resolvedRecommendedSelection(
-            for: role,
-            recommendedAvailability: recommendationAvailability,
-            fallbackAvailability: availability
-        )
         let selectionID = AgentModelSelectionID(agentRaw: selection.agent.rawValue, modelRaw: selection.modelRaw)
         var overrides = settingsStore.globalMCPAgentRoleOverrides() ?? [:]
-
-        if let rec = recommended, rec == selection {
-            // Matches recommended — remove override
-            overrides.removeValue(forKey: role.rawValue)
-        } else {
-            overrides[role.rawValue] = selectionID.rawValue
-        }
-
-        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides.isEmpty ? nil : overrides, commit: true)
+        // An explicit role pick is a durable choice. Do NOT erase it just because it
+        // currently equals a transient, availability-dependent recommendation — doing so
+        // dropped the override and the role silently drifted to a different model after
+        // restart or availability change. Reverting to the recommended default stays an
+        // explicit action via clearOverride / clearAllOverrides.
+        overrides[role.rawValue] = selectionID.rawValue
+        settingsStore.updateGlobalMCPAgentRoleOverrides(overrides, commit: true)
         return true
     }
 

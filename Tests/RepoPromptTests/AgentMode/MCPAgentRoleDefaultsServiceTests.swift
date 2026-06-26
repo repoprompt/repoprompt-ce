@@ -67,7 +67,12 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         XCTAssertEqual(engineer.effective, engineer.recommended)
     }
 
-    func testSetSelectionClearsOverrideWhenSelectionMatchesFallbackRecommendation() {
+    /// Regression for the sub-agent role "reset after restart" bug: an explicit role pick
+    /// must persist even when it currently equals the (transient, availability-dependent)
+    /// recommendation. Previously setSelection dropped the override on a recommendation
+    /// match, so nothing was stored and the role silently drifted to a different model when
+    /// the recommendation later changed.
+    func testSetSelectionPersistsExplicitPickEvenWhenItMatchesRecommendation() {
         let actualAvailability = AgentModelCatalog.AvailabilityContext(
             claudeCodeAvailable: false,
             codexAvailable: true,
@@ -83,6 +88,7 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
                 modelRaw: AgentModel.claudeOpus.rawValue
             ).rawValue
         ])
+        // This selection equals the fallback recommendation for `.explore` under this availability.
         let selection = AgentModelCatalog.NormalizedAgentSelection(
             agent: .codexExec,
             modelRaw: AgentModel.gpt55CodexLow.rawValue
@@ -95,7 +101,47 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
             settingsStore: store
         )
 
-        XCTAssertNil(store.overrides)
+        let expected = AgentModelSelectionID(
+            agentRaw: selection.agent.rawValue,
+            modelRaw: selection.modelRaw
+        ).rawValue
+        XCTAssertEqual(store.overrides?[AgentModelCatalog.TaskLabelKind.explore.rawValue], expected)
+        XCTAssertEqual(
+            MCPAgentRoleDefaultsService.effectiveNormalizedSelection(
+                for: .explore,
+                availability: actualAvailability,
+                settingsStore: store
+            ),
+            selection
+        )
+    }
+
+    /// Guards the persist-always change: reverting a role to recommendation-tracking stays
+    /// an explicit action via clearOverride.
+    func testClearOverrideStillRevertsRoleToRecommendedTracking() {
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
+        let store = RoleDefaultsStoreStub()
+        MCPAgentRoleDefaultsService.setSelection(
+            AgentModelCatalog.NormalizedAgentSelection(
+                agent: .codexExec,
+                modelRaw: AgentModel.gpt55CodexHigh.rawValue
+            ),
+            for: .engineer,
+            availability: availability,
+            settingsStore: store
+        )
+        XCTAssertNotNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
+
+        MCPAgentRoleDefaultsService.clearOverride(for: .engineer, settingsStore: store)
+        XCTAssertNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
     }
 }
 
