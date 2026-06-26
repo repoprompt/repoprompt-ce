@@ -689,7 +689,7 @@ enum HistoryMCPToolService {
     /// non-integer values throw a validation error (no clamping). Callers map the thrown
     /// error to an error reply.
     static func resolveIdleThreshold(_ value: Value?) throws -> Int {
-        let defaultThreshold = AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        let defaultThreshold = (UserDefaults.standard.object(forKey: "history.idle_threshold_minutes") as? Int) ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
         guard let value else { return defaultThreshold }
         guard let intValue = value.intValue else {
             throw HistoryValidationError(message: "idle_threshold_minutes must be an integer")

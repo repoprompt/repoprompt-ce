@@ -497,6 +497,16 @@ class GlobalSettingsStore: ObservableObject {
         }
     }
 
+    // MARK: - History
+
+    func historyIdleThresholdMinutes() -> Int {
+        (defaults.object(forKey: "history.idle_threshold_minutes") as? Int) ?? 10
+    }
+
+    func setHistoryIdleThresholdMinutes(_ minutes: Int, commit: Bool = true) {
+        defaults.set(minutes, forKey: "history.idle_threshold_minutes")
+    }
+
     func fontScaleBodySize() -> Double {
         guard let rawValue = scalarPreferences.ui?.fontScaleBodySize,
               let preset = FontScalePreset(rawValue: rawValue)

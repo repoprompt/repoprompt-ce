@@ -1358,7 +1358,7 @@ final class HistoryMCPToolServiceTests: XCTestCase {
 
     func testResolveIdleThreshold_defaultsAndValidation() throws {
         // Omitted -> default threshold.
-        XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 30)
+        XCTAssertEqual(try HistoryMCPToolService.resolveIdleThreshold(nil), 10)
 
         // Valid integers within range accepted.
         for valid in [0, 1, 10, 1440] {

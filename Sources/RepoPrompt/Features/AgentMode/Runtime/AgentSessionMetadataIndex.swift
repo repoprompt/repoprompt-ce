@@ -73,7 +73,7 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
     var toolCallCount: Int
 
     /// Default idle threshold in minutes. Gaps between merged active intervals longer than this are idle.
-    static let defaultIdleThresholdMinutes = 30
+    static let defaultIdleThresholdMinutes = 10
 
     var activityDate: Date {
         AgentSessionRestoreSupport.sidebarActivityDate(lastUserMessageAt: lastUserMessageAt, savedAt: savedAt)
