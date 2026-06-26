@@ -72,7 +72,10 @@ enum HistoryMCPToolService {
                 to: dateTo
             )
 
-            let sorted = sortFilteredSessions(filtered, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
+            // Enrich stub-built records (rebuilt without a transcript) on demand before sorting,
+            // so duration/keyPath fields are correct without taxing the shared index rebuild.
+            let enriched = await Self.enrichingStubBuiltSessions(filtered, scanner: scanner)
+            let sorted = sortFilteredSessions(enriched, by: sortRaw, idleThresholdMinutes: idleThresholdMinutes)
             let truncated = sorted.count > limit
             let sliced = Array(sorted.prefix(limit))
 
@@ -325,10 +328,13 @@ enum HistoryMCPToolService {
                 )
             }
 
-            let totalSessions = filtered.count
-            let totalDuration = filtered.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
+            // Non-calendar grouping reads each record's stored active duration; enrich stub-built
+            // records on demand first so durations are correct without taxing the shared rebuild.
+            let enriched = await Self.enrichingStubBuiltSessions(filtered, scanner: scanner)
+            let totalSessions = enriched.count
+            let totalDuration = enriched.reduce(0) { $0 + $1.record.activeDurationSeconds(thresholdMinutes: idleThresholdMinutes) }
 
-            let groups = groupSessions(filtered, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
+            let groups = groupSessions(enriched, by: groupBy, includeDetails: includeDetails, idleThresholdMinutes: idleThresholdMinutes)
 
             return .time(HistoryTimeReply(
                 totalSessions: totalSessions,
@@ -339,6 +345,48 @@ enum HistoryMCPToolService {
         } catch let error as HistoryValidationError {
             return .error(HistoryErrorReply(error: error.message))
         }
+    }
+
+    // MARK: - On-Demand Transcript Enrichment
+
+    /// Enrich index records that were rebuilt from lightweight stubs with their transcript-derived
+    /// v5 fields (duration primitives, keyPaths, toolCount, activity bounds), loaded on demand.
+    ///
+    /// `rebuildMetadataIndex` loads stubs (transcript=nil) so it does not tax the agent-mode sidebar
+    /// and workspace restore; the trade-off is that rebuilt records lack the fields history needs.
+    /// Sessions saved or loaded through normal app use already carry these fields, so this only loads
+    /// a transcript for genuinely stub-built records — those whose transcript-derived fields are all
+    /// absent (`lacksTranscriptDerivedFields`). Any populated v5 field means a real transcript was
+    /// already seen and the record is passed through unchanged. The calendar-grouped `time` op already
+    /// walks transcripts and does not call this. See `AgentSessionMetadataRecord`
+    /// `.enrichingTranscriptDerivedFields(from:)`.
+    private static func enrichingStubBuiltSessions(
+        _ sessions: [HistoryFilteredSessionRecord],
+        scanner: HistorySessionScanning
+    ) async -> [HistoryFilteredSessionRecord] {
+        var enriched: [HistoryFilteredSessionRecord] = []
+        enriched.reserveCapacity(sessions.count)
+        for session in sessions {
+            if !session.record.lacksTranscriptDerivedFields {
+                enriched.append(session)
+                continue
+            }
+            guard let transcript = try? await scanner.loadTranscriptForSearch(
+                sessionID: session.record.id,
+                workspaceDir: session.workspaceDir
+            ) else {
+                enriched.append(session)
+                continue
+            }
+            enriched.append(
+                HistoryFilteredSessionRecord(
+                    record: session.record.enrichingTranscriptDerivedFields(from: transcript.turns),
+                    workspaceName: session.workspaceName,
+                    workspaceDir: session.workspaceDir
+                )
+            )
+        }
+        return enriched
     }
 
     // MARK: - Scoped Session Resolution

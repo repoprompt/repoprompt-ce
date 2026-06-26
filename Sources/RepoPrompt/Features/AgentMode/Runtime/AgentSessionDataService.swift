@@ -688,14 +688,22 @@ actor AgentSessionDataService {
         for fileURL in files {
             let values = metadataResourceValues(for: fileURL)
             do {
-                // Load the FULL session (not a stub) so the factory can compute v5
-                // duration/keyPath/toolCount/activityBounds fields from transcript turns.
-                // Stubs (loadAgentSessionStub) return transcript=nil → zero v5 fields.
-                // See testRecordFromStubSessionProducesZeroV5Fields.
-                let session = try await loadAgentSession(from: fileURL)
+                // Load a lightweight stub (transcript=nil). Transcript-derived v5 fields
+                // (duration primitives, keyPaths, toolCount, activity bounds) are left empty
+                // here and computed on demand by the `history` tool — see
+                // `AgentSessionMetadataRecord.enrichingTranscriptDerivedFields(from:)`. This
+                // keeps the shared index rebuild — which feeds the agent-mode sidebar and
+                // workspace restore — from decoding every full session transcript just to
+                // precompute fields only history consumes. The save/load path still populates
+                // these fields for free for sessions touched through normal app use.
+                let stub = try await loadAgentSessionStub(
+                    from: fileURL,
+                    recoverMissingMetadata: false,
+                    persistRecoveredMetadata: false
+                )
                 records.append(
                     AgentSessionMetadataRecord.record(
-                        from: session,
+                        from: stub,
                         fileURL: fileURL,
                         observedFileSize: values.size,
                         observedFileModificationDate: values.modified,

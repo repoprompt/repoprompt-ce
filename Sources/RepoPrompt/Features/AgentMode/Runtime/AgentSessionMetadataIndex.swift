@@ -92,6 +92,19 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         return coveredTurnDurationSeconds + activeGaps
     }
 
+    /// True when this record carries no transcript-derived fields, i.e. it was built from a
+    /// transcript-less stub during a cheap `rebuildMetadataIndex` pass. The history tool uses this to
+    /// decide which records need on-demand enrichment: any populated v5 field implies a real
+    /// transcript was already seen (the save/load path), so the record is passed through unchanged.
+    var lacksTranscriptDerivedFields: Bool {
+        firstActivityAt == nil
+            && lastActivityAt == nil
+            && coveredTurnDurationSeconds == 0
+            && interActiveIntervalGapSeconds.isEmpty
+            && keyPaths.isEmpty
+            && toolCallCount == 0
+    }
+
     init(
         id: UUID,
         filename: String,
@@ -296,27 +309,8 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
         observedFileModificationDate: Date?,
         lastIndexedAt: Date = Date()
     ) -> AgentSessionMetadataRecord {
-        let aggregatedKeyPaths: Set<String> = {
-            guard let turns = session.transcript?.turns else { return [] }
-            var collected: Set<String> = []
-            for turn in turns {
-                // Prefer summary keyPaths when available (compacted turns).
-                if let summaryPaths = turn.summary?.keyPaths, !summaryPaths.isEmpty {
-                    collected.formUnion(summaryPaths)
-                    continue
-                }
-                // Fall back to walking tool executions in response span activities.
-                for span in turn.responseSpans {
-                    for activity in span.activities {
-                        guard let exec = activity.toolExecution else { continue }
-                        collected.formUnion(exec.keyPaths)
-                    }
-                }
-            }
-            return collected
-        }()
-
         let turns = session.transcript?.turns ?? []
+        let aggregatedKeyPaths = Self.computeKeyPaths(from: turns)
         let activityBounds = Self.computeActivityBounds(from: turns)
         let durationPrimitives = Self.computeDurationPrimitives(from: turns)
         let computedToolCallCount = Self.computeToolCallCount(from: turns)
@@ -352,6 +346,45 @@ struct AgentSessionMetadataRecord: Codable, Equatable, Identifiable {
             interActiveIntervalGapSeconds: durationPrimitives.gapSeconds,
             toolCallCount: computedToolCallCount
         )
+    }
+
+    /// Aggregate file key paths across turns: prefers compacted summary `keyPaths`, falling back to
+    /// walking tool executions in response-span activities. Shared by the index factory and the
+    /// history tool's on-demand enrichment so key-path extraction has one definition.
+    private static func computeKeyPaths(from turns: [AgentTranscriptTurn]) -> Set<String> {
+        var collected: Set<String> = []
+        for turn in turns {
+            if let summaryPaths = turn.summary?.keyPaths, !summaryPaths.isEmpty {
+                collected.formUnion(summaryPaths)
+                continue
+            }
+            for span in turn.responseSpans {
+                for activity in span.activities {
+                    guard let exec = activity.toolExecution else { continue }
+                    collected.formUnion(exec.keyPaths)
+                }
+            }
+        }
+        return collected
+    }
+
+    /// Return a copy with the transcript-derived v5 fields (activity bounds, keyPaths, toolCount,
+    /// duration primitives) recomputed from `turns`. The `history` tool calls this to enrich index
+    /// records that were rebuilt from lightweight stubs (`firstActivityAt == nil`) on demand, so the
+    /// shared `rebuildMetadataIndex` path — which feeds the agent-mode sidebar and workspace restore —
+    /// never decodes full session transcripts just to precompute fields only history consumes. Records
+    /// already fully indexed (via the save/load path) need not call this.
+    func enrichingTranscriptDerivedFields(from turns: [AgentTranscriptTurn]) -> AgentSessionMetadataRecord {
+        var copy = self
+        let bounds = Self.computeActivityBounds(from: turns)
+        let primitives = Self.computeDurationPrimitives(from: turns)
+        copy.firstActivityAt = bounds.first
+        copy.lastActivityAt = bounds.last
+        copy.keyPaths = Self.computeKeyPaths(from: turns)
+        copy.coveredTurnDurationSeconds = primitives.coveredSeconds
+        copy.interActiveIntervalGapSeconds = primitives.gapSeconds
+        copy.toolCallCount = Self.computeToolCallCount(from: turns)
+        return copy
     }
 
     /// Compute first and last activity timestamps from transcript turns.

@@ -130,6 +130,79 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.sessions[1].sessionName, "Short")
     }
 
+    // MARK: - On-demand enrichment (stub-built records)
+
+    /// A record rebuilt from a lightweight stub carries no transcript-derived fields.
+    /// `list_sessions` must enrich it on demand via the scanner so duration / files_touched /
+    /// tool_call_count reflect the transcript — guards the regression where stub-rebuilt
+    /// sessions reported zero for everything.
+    func testListSessions_enrichesStubBuiltRecordOnDemand() async throws {
+        let stub = makeRecord(name: "Rebuilt") // defaults → lacksTranscriptDerivedFields == true
+        mockScanner.scanResults = [makeScanResult(records: [stub])]
+
+        let turn = AgentTranscriptTurn(
+            summary: AgentTranscriptTurnSummary(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: nil,
+                middleSummaryText: nil,
+                toolCount: 3,
+                notableToolNames: [],
+                keyPaths: ["src/main.swift"],
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 100)
+        )
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "list_sessions"],
+            scanner: mockScanner
+        )
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.count, 1)
+        XCTAssertEqual(dto.sessions[0].activeDurationSeconds, 100)
+        XCTAssertEqual(dto.sessions[0].toolCallCount, 3)
+        XCTAssertEqual(dto.sessions[0].filesTouched, ["src/main.swift"])
+    }
+
+    /// Non-calendar `time` grouping reads each record's stored duration; stub-built records must be
+    /// enriched on demand so they contribute their real duration instead of zero.
+    func testTime_groupBySession_enrichesStubBuiltRecordOnDemand() async throws {
+        let stub = makeRecord(name: "Rebuilt")
+        mockScanner.scanResults = [makeScanResult(records: [stub])]
+
+        let turn = AgentTranscriptTurn(
+            summary: AgentTranscriptTurnSummary(
+                requestText: nil,
+                conclusionText: nil,
+                compactConclusionText: nil,
+                middleSummaryText: nil,
+                toolCount: 2,
+                notableToolNames: [],
+                keyPaths: [],
+                compactedActivityCount: 0,
+                hadWarning: false,
+                hadError: false
+            ),
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 100)
+        )
+        mockScanner.transcriptProvider = { _ in AgentTranscript(turns: [turn]) }
+
+        let result = try await HistoryMCPToolService.execute(
+            args: ["op": "time", "group_by": "session"],
+            scanner: mockScanner
+        )
+        let dto = try timeReply(result)
+        XCTAssertEqual(dto.totalActiveDurationSeconds, 100)
+        XCTAssertEqual(dto.groups.count, 1)
+        XCTAssertEqual(dto.groups[0].activeDurationSeconds, 100)
+    }
+
     func testListSessions_invalidSort_returnsError() async throws {
         mockScanner.scanResults = []
         let result = try await HistoryMCPToolService.execute(
