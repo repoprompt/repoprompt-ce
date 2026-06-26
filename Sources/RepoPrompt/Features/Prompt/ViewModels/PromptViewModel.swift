@@ -376,7 +376,12 @@ class PromptViewModel: ObservableObject {
         if _preferredModel != rawValue {
             _preferredModel = rawValue
         }
-        if shouldSync, _planningModel != rawValue {
+        // Mirror the store-level Oracle guard in memory too: a blank/whitespace chat model
+        // (pickDiffCapableFallback's empty branch) must not blank the in-memory Oracle, or the
+        // Oracle dropdown briefly shows empty until the next settings sync re-reads it.
+        if shouldSync, !rawValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           _planningModel != rawValue
+        {
             _planningModel = rawValue
         }
         settingsManager.setPreferredComposeModelRaw(rawValue, commit: true, reason: reason, honorSync: shouldSync)

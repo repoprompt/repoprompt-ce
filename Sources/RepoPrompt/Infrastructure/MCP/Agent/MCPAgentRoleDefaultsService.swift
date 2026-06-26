@@ -105,7 +105,6 @@ enum MCPAgentRoleDefaultsService {
     static func setSelection(
         _ selection: AgentModelCatalog.NormalizedAgentSelection,
         for role: AgentModelCatalog.TaskLabelKind,
-        availability _: AgentModelCatalog.AvailabilityContext = .current,
         settingsStore: (any MCPAgentRoleDefaultsStoring)? = nil
     ) -> Bool {
         let settingsStore = settingsStore ?? GlobalSettingsStore.shared

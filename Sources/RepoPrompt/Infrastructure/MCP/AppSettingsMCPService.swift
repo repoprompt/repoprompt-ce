@@ -1278,8 +1278,10 @@ private enum AppSettingsMCPRegistry {
     /// - sync disabled
     /// - sibling already holds the same value (avoids spurious disk writes and
     ///   ensures a single notification fires per MCP write)
-    /// A null write (clear) is mirrored as a null on the sibling to keep behavior
-    /// symmetric with the toggle-driven UI path.
+    /// A real model write is mirrored to the sibling. A null/blank clear of the chat model is
+    /// NOT mirrored into the Oracle `models.planning_model` (which is never auto-healed) —
+    /// matching the GUI sync guard; clearing the Oracle stays an explicit
+    /// `models.planning_model = null` write. A null clear of planning still mirrors to compose.
     @MainActor
     private static func postModelRawDidWrite(
         store: GlobalSettingsStore,

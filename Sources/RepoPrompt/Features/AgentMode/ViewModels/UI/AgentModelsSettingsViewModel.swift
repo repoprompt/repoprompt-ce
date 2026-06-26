@@ -274,7 +274,6 @@ final class AgentModelsSettingsViewModel: ObservableObject {
         _ = MCPAgentRoleDefaultsService.setSelection(
             selection,
             for: role,
-            availability: availability,
             settingsStore: settingsStore
         )
         postAgentRoleDefaultsChanged()

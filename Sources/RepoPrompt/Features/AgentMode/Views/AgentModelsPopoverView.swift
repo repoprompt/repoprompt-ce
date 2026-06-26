@@ -356,8 +356,7 @@ struct AgentModelsPopoverView: View {
                 )
                 _ = MCPAgentRoleDefaultsService.setSelection(
                     selection,
-                    for: resolution.role,
-                    availability: availability
+                    for: resolution.role
                 )
                 bumpRoleDefaults()
             }

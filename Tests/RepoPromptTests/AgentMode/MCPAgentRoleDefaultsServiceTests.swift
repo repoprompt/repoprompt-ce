@@ -97,7 +97,6 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
         MCPAgentRoleDefaultsService.setSelection(
             selection,
             for: .explore,
-            availability: actualAvailability,
             settingsStore: store
         )
 
@@ -119,15 +118,6 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
     /// Guards the persist-always change: reverting a role to recommendation-tracking stays
     /// an explicit action via clearOverride.
     func testClearOverrideStillRevertsRoleToRecommendedTracking() {
-        let availability = AgentModelCatalog.AvailabilityContext(
-            claudeCodeAvailable: false,
-            codexAvailable: true,
-            openCodeAvailable: false,
-            cursorAvailable: false,
-            zaiConfigured: false,
-            kimiConfigured: false,
-            customClaudeCompatibleConfigured: false
-        )
         let store = RoleDefaultsStoreStub()
         MCPAgentRoleDefaultsService.setSelection(
             AgentModelCatalog.NormalizedAgentSelection(
@@ -135,7 +125,6 @@ final class MCPAgentRoleDefaultsServiceTests: XCTestCase {
                 modelRaw: AgentModel.gpt55CodexHigh.rawValue
             ),
             for: .engineer,
-            availability: availability,
             settingsStore: store
         )
         XCTAssertNotNil(store.overrides?[AgentModelCatalog.TaskLabelKind.engineer.rawValue])
