@@ -653,9 +653,17 @@ class GlobalSettingsStore: ObservableObject {
         let oldPreferred = scalarPreferences.modelSelection?.preferredComposeModel
         let oldPlanning = scalarPreferences.modelSelection?.planningModel
         let shouldMirror = honorSync && resolvedSyncChatModelWithOracleFromCurrentPreferences()
+        // Never let a blank chat model blank the Oracle. An empty/nil preferred value is
+        // produced by transient fallbacks (e.g. PromptViewModel.pickDiffCapableFallback when
+        // the model list is unhydrated); mirroring it would wipe the global Oracle planningModel
+        // — which is deliberately never auto-healed — and persist the blank across relaunch.
+        // Only mirror real model selections; the chat model can re-heal itself, the Oracle cannot.
+        // Treat whitespace-only as blank too — these raw values can arrive from the MCP/app_settings
+        // API, not just picker-backed AIModel.rawValue.
+        let shouldMirrorModel = shouldMirror && (raw?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
         updateModelSelectionScalar(commit: commit) { settings in
             settings.preferredComposeModel = raw
-            if shouldMirror {
+            if shouldMirrorModel {
                 settings.planningModel = raw
             }
         }
@@ -669,7 +677,7 @@ class GlobalSettingsStore: ObservableObject {
             line: line,
             function: function
         )
-        if shouldMirror, oldPlanning != raw {
+        if shouldMirrorModel, oldPlanning != raw {
             recordSettingsWriteDiagnostic(
                 key: "planningModelRaw",
                 oldValue: oldPlanning,

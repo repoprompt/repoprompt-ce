@@ -2048,7 +2048,17 @@ public class APISettingsViewModel: ObservableObject {
                 )
             } else {
                 let replacement = availableModels.first(where: { !condition($0) })?.rawValue
-                if settingsStore.syncChatModelWithOracle(), planningRaw.isEmpty || planningModel.map(condition) == true {
+                // Only re-point the Oracle when there is a real replacement model. When
+                // `replacement` is nil (no other available model — e.g. the removed provider
+                // was the only one), preserve the existing Oracle planningModel instead of
+                // blanking it to nil: the Oracle is never auto-healed, so a nil write here
+                // would persist as "Oracle reset to nothing". The strict MCP oracle path
+                // already surfaces an explicit "not available" error for the stale value.
+                if let replacement,
+                   !replacement.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   settingsStore.syncChatModelWithOracle(),
+                   planningRaw.isEmpty || planningModel.map(condition) == true
+                {
                     settingsStore.setPlanningModelRaw(
                         replacement,
                         reason: "api_settings.provider_reset.planning.\(reasonSuffix)",

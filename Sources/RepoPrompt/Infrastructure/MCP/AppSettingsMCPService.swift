@@ -1309,7 +1309,14 @@ private enum AppSettingsMCPRegistry {
             if siblingCurrent != newValue {
                 switch siblingKey {
                 case "models.planning_model":
-                    store.setPlanningModelRaw(newValue, reason: "app_settings.models.sync_sibling")
+                    // Symmetric with the GUI sync fix (GlobalSettingsStore.setPreferredComposeModelRaw):
+                    // a blank/nil chat model must NOT be mirrored into the Oracle planningModel,
+                    // which is deliberately never auto-healed and would otherwise persist as
+                    // "Oracle reset to nothing". Clearing the Oracle stays an explicit
+                    // `app_settings models.planning_model = null` action, not a sync side effect.
+                    if let newValue, !newValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        store.setPlanningModelRaw(newValue, reason: "app_settings.models.sync_sibling")
+                    }
                 case "models.preferred_compose_model":
                     store.setPreferredComposeModelRaw(newValue, reason: "app_settings.models.sync_sibling")
                 default:
