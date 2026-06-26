@@ -203,6 +203,26 @@ final class HistoryMCPToolServiceTests: XCTestCase {
         XCTAssertEqual(dto.groups[0].activeDurationSeconds, 100)
     }
 
+    /// Fully-indexed records (saved/loaded through the app) already carry v5 fields, so list_sessions
+    /// must NOT load their transcripts — on-demand enrichment is only for stub-built records. Guards
+    /// the steady-state perf property: normal queries over indexed sessions do no transcript I/O.
+    func testListSessions_doesNotLoadTranscriptsForIndexedRecords() async throws {
+        let indexed = makeRecord(name: "Indexed", keyPaths: ["a.swift"], activeDurationSeconds: 250, toolCallCount: 4)
+        mockScanner.scanResults = [makeScanResult(records: [indexed, indexed, indexed])]
+
+        var loads = 0
+        mockScanner.transcriptProvider = { _ in
+            loads += 1
+            return .empty
+        }
+
+        let result = try await HistoryMCPToolService.execute(args: ["op": "list_sessions"], scanner: mockScanner)
+        let dto = try listReply(result)
+        XCTAssertEqual(dto.sessions.count, 3)
+        XCTAssertEqual(dto.sessions[0].activeDurationSeconds, 250)
+        XCTAssertEqual(loads, 0, "indexed records must not trigger transcript loads")
+    }
+
     func testListSessions_invalidSort_returnsError() async throws {
         mockScanner.scanResults = []
         let result = try await HistoryMCPToolService.execute(
