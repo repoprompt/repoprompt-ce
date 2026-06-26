@@ -212,7 +212,7 @@ The search operation prioritizes `conclusionText` (the full, non-truncated concl
 ### Known gaps (v1)
 
 - Secret sanitization in search snippets deferred to v2 (`MCPResponseSanitizationPolicy` does not exist). Snippets may expose tool args containing secrets. Risk is bounded (session data is local).
-- `file_edits` and `knowledge` ops deferred (see `docs/spec/history-query-tools-extensions.md`).
+- `file_edits` and `knowledge` ops deferred to a future spec (kept as a local backlog doc, not shipped).
 - `request_previews` omitted from `list_sessions` response.
 - `files_touched` depends on persisted summary key paths or persisted `toolExecution.keyPaths`; older sanitized sessions whose tool args were stripped before key path extraction may still have empty file lists.
 - `had_errors` maps to `hasUnknownConversationContent` (semantically broader than "had errors").
