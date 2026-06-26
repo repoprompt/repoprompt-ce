@@ -4,6 +4,8 @@ import XCTest
 
 @MainActor
 final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
+    private let fullSuiteAsyncTimeoutNanoseconds: UInt64 = 30_000_000_000
+
     func testWorkspaceSwitchClearsForegroundBeforeSlowProviderDisposeCompletes() async throws {
         let provider = BlockingHeadlessProvider()
         let viewModel = makeViewModel()
@@ -17,14 +19,14 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         await viewModel.handleWorkspaceSwitch(nil)
 
         XCTAssertTrue(viewModel.sessions.isEmpty)
-        try await provider.waitUntilDisposeIsSuspended()
+        try await provider.waitUntilDisposeIsSuspended(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let startedBeforeRelease = await provider.isDisposeStarted()
         let finishedBeforeRelease = await provider.isDisposeFinished()
         XCTAssertTrue(startedBeforeRelease)
         XCTAssertFalse(finishedBeforeRelease)
 
         await provider.releaseDispose()
-        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let finishedAfterDrain = await provider.isDisposeFinished()
         XCTAssertTrue(finishedAfterDrain)
     }
@@ -59,7 +61,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         XCTAssertEqual(ownership.installedOwnerCount, 0)
         XCTAssertEqual(ownership.provisionalOwnerCount, 0)
         XCTAssertEqual(ownership.rootClaimCount, 0)
-        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
     }
 
     func testWorkspaceSwitchBackgroundCleanupUsesCapturedRunIDAfterForegroundSessionsAreCleared() async throws {
@@ -83,7 +85,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         await viewModel.handleWorkspaceSwitch(nil)
 
         XCTAssertTrue(viewModel.sessions.isEmpty)
-        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let routingCleaned = await routing.contains(runID: oldRunID, reason: "workspace_switch")
         XCTAssertTrue(routingCleaned)
         XCTAssertTrue(cancelled.containsSync(runID: oldRunID, reason: "workspace_switch"))
@@ -110,7 +112,7 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         newSession.mcpControlContext = makeMCPControlContext(sessionID: mcpSessionID)
         viewModel.test_setMCPControlledTabIDs([tabID])
 
-        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let routingCleaned = await routing.contains(runID: oldRunID, reason: "workspace_switch")
         XCTAssertTrue(routingCleaned)
         XCTAssertEqual(newSession.mcpControlContext?.sessionID, mcpSessionID)
@@ -136,14 +138,14 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
         newSession.runID = newRunID
         newSession.runState = .running
 
-        try await provider.waitUntilDisposeIsSuspended()
+        try await provider.waitUntilDisposeIsSuspended(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let startedBeforeRelease = await provider.isDisposeStarted()
         let finishedBeforeRelease = await provider.isDisposeFinished()
         XCTAssertTrue(startedBeforeRelease)
         XCTAssertFalse(finishedBeforeRelease)
 
         await provider.releaseDispose()
-        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup()
+        try await viewModel.test_drainWorkspaceSwitchBackgroundCleanup(timeoutNanoseconds: fullSuiteAsyncTimeoutNanoseconds)
         let finishedAfterDrain = await provider.isDisposeFinished()
         XCTAssertTrue(finishedAfterDrain)
 

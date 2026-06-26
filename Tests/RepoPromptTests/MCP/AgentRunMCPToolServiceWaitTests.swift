@@ -316,6 +316,85 @@ final class AgentRunMCPToolServiceWaitTests: XCTestCase {
         XCTAssertEqual(completions[0].pendingSessionIDs, [second.sessionID])
     }
 
+    func testParkedWaitPollAndLaterWaitUseStoredTerminalSnapshot() async throws {
+        let window = makeWindow()
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let liveSnapshots = LiveSnapshots()
+        let recorder = WaitScopeRecorder()
+        let viewModel = makeViewModel(windowID: window.windowID)
+        let fixture = try await installRunningSession(
+            in: viewModel,
+            liveSnapshots: liveSnapshots
+        )
+        defer { Task { await AgentRunSessionStore.cleanup(registration: fixture.registration) } }
+        let service = makeService(
+            window: window,
+            viewModel: viewModel,
+            liveSnapshots: liveSnapshots,
+            recorder: recorder
+        )
+        let sentinel = "complete-terminal-sentinel."
+        let liveRunning = makeSnapshot(
+            sessionID: fixture.sessionID,
+            status: .running,
+            latestAssistantPreview: "live-running-sentinel"
+        )
+        await liveSnapshots.set(liveRunning)
+
+        let preterminalPoll = try await service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.sessionID.uuidString)
+        ])
+        XCTAssertEqual(
+            preterminalPoll.objectValue?["assistant_text"]?.stringValue,
+            "live-running-sentinel"
+        )
+
+        let firstWait = Task { @MainActor in
+            try await service.execute(args: [
+                "op": .string("wait"),
+                "session_id": .string(fixture.sessionID.uuidString),
+                "timeout": .double(2)
+            ])
+        }
+        try await waitForWaiter(registration: fixture.registration)
+
+        let terminal = makeSnapshot(
+            sessionID: fixture.sessionID,
+            status: .completed,
+            latestAssistantPreview: sentinel
+        )
+        _ = await AgentRunSessionStore.publishTerminal(
+            .init(epoch: fixture.epoch, snapshot: terminal),
+            registration: fixture.registration,
+            commitID: UUID(),
+            successorKind: nil
+        )
+
+        let firstValue = try await firstWait.value
+        XCTAssertEqual(firstValue.objectValue?["assistant_text"]?.stringValue, sentinel)
+
+        let pollValue = try await service.execute(args: [
+            "op": .string("poll"),
+            "session_id": .string(fixture.sessionID.uuidString)
+        ])
+        XCTAssertEqual(pollValue.objectValue?["assistant_text"]?.stringValue, sentinel)
+
+        let laterWaitValue = try await service.execute(args: [
+            "op": .string("wait"),
+            "session_id": .string(fixture.sessionID.uuidString),
+            "timeout": .double(2)
+        ])
+        XCTAssertEqual(
+            laterWaitValue.objectValue?["assistant_text"]?.stringValue,
+            sentinel
+        )
+        XCTAssertEqual(
+            laterWaitValue.objectValue?["status"]?.stringValue,
+            AgentRunMCPSnapshot.Status.completed.rawValue
+        )
+    }
+
     private func makeWindow() -> WindowState {
         let previousAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
         GlobalSettingsStore.shared.setMCPAutoStart(false, commit: false)

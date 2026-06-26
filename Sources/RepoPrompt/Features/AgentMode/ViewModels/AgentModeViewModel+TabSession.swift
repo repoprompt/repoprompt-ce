@@ -507,6 +507,8 @@ extension AgentModeViewModel {
         var activeReasoningItemID: UUID?
         var reasoningItemIDsByGroupID: [String: UUID] = [:]
         var pendingAssistantDelta: String = ""
+        var pendingCodexAssistantScope: CodexNativeSessionController.ItemScope?
+        var codexAssistantRowIDByScope: [CodexNativeSessionController.ItemScope: UUID] = [:]
         var assistantDeltaFlushTask: Task<Void, Never>?
         var assistantDeltaTaskGeneration: UInt64 = 0
         var assistantDeltaFlushGeneration: UInt64 = 0

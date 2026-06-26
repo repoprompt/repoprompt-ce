@@ -7,13 +7,12 @@
 
 import SwiftUI
 
-/// Slimmed Advanced Settings page. Controls are grouped into two sections
-/// ("File System" and "AI Behavior") for progressive-disclosure-friendly
-/// browsing. URL scheme details live in the docs site, which is the
-/// canonical reference.
+/// Slimmed Advanced Settings page. Controls are grouped into focused sections
+/// for progressive-disclosure-friendly browsing.
 ///
 /// SEARCH-HELPER: Advanced Settings, File System, AI Behavior, Code Maps,
-/// gitignore, symlinks, saved prompts, datetime instructions
+/// URL Opener, URL scheme, deep links, gitignore, symlinks, saved prompts,
+/// datetime instructions
 ///
 /// Related:
 /// - Keyboard Shortcuts: /RepoPrompt/Views/Settings/KeyboardShortcutsSettingsView.swift
@@ -31,6 +30,10 @@ struct AdvancedSettingsView: View {
             get: { globalSettings.enableKeyboardShortcuts() },
             set: { globalSettings.setEnableKeyboardShortcuts($0) }
         )
+    }
+
+    private var canonicalURLPrefix: String {
+        "\(AppDeepLinkURLScheme.canonical)://"
     }
 
     private var respectGitignoreBinding: Binding<Bool> {
@@ -117,6 +120,11 @@ struct AdvancedSettingsView: View {
                 Divider()
                     .padding(.horizontal, -16)
 
+                urlOpenerSection
+
+                Divider()
+                    .padding(.horizontal, -16)
+
                 savedPromptsSection
 
                 Spacer()
@@ -134,7 +142,7 @@ struct AdvancedSettingsView: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            Text("File system, AI behavior, and saved-prompts utilities. Use sparingly — most daily settings live in the sections above.")
+            Text("File system, AI behavior, URL opener, and saved-prompts utilities. Use sparingly — most daily settings live in the sections above.")
                 .font(.subheadline)
                 .foregroundColor(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -268,6 +276,74 @@ struct AdvancedSettingsView: View {
             }
             .buttonStyle(CustomButtonStyle())
             .hoverTooltip("Opens the Keyboard Shortcuts settings tab for this window.")
+        }
+    }
+
+    // MARK: - URL Opener
+
+    private var urlOpenerSection: some View {
+        SettingSection(
+            title: "URL Opener",
+            description: "Use RepoPrompt CE links to open folders, select files, seed prompt text, and focus windows from external tools."
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Canonical scheme: \(AppDeepLinkURLScheme.canonical)://")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                    .textSelection(.enabled)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    urlExampleRow(
+                        title: "Open a folder",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project"
+                    )
+                    urlExampleRow(
+                        title: "Select files and prompt text",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project?files=Sources/App.swift,README.md&prompt=Review%20the%20selected%20files"
+                    )
+                    urlExampleRow(
+                        title: "Focus or create an ephemeral workspace",
+                        value: "\(canonicalURLPrefix)open//Users/example/Project?workspace=Review&focus=true&ephemeral=true"
+                    )
+                    urlExampleRow(
+                        title: "Create a saved prompt",
+                        value: "\(canonicalURLPrefix)prompt?title=Review&content=Review%20the%20current%20selection&focus=true"
+                    )
+                }
+
+                Text("Supported opener parameters: workspace, files, prompt, focus, ephemeral, and persist. Use \(canonicalURLPrefix) for external links.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private func urlExampleRow(title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+
+            HStack(alignment: .top, spacing: 8) {
+                Text(value)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .cornerRadius(6)
+
+                Button("Copy") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(value, forType: .string)
+                }
+                .buttonStyle(CustomButtonStyle())
+                .hoverTooltip("Copy this URL example.")
+            }
         }
     }
 

@@ -96,6 +96,15 @@ actor CodexAppServerClient {
         let code: Int?
         let message: String
         let data: CodexJSONValue?
+
+        var userFacingMessage: String {
+            guard ["initialize", "thread/resume"].contains(method),
+                  code == -32601 || code == -32602
+            else {
+                return message
+            }
+            return "\(message) Update the installed Codex CLI and try again; it rejected RepoPrompt's required \(method) request shape."
+        }
     }
 
     struct RemoteReasoningEffort: Hashable {
@@ -169,7 +178,7 @@ actor CodexAppServerClient {
             case .jsonDecodeFailed:
                 "Failed to decode Codex app-server JSON response."
             case let .requestFailed(failure):
-                failure.message
+                failure.userFacingMessage
             case let .executableUnavailable(message):
                 message
             case let .transportWriteFailed(message, _):
@@ -814,7 +823,7 @@ actor CodexAppServerClient {
                 "capabilities": capabilities
             ]
         )
-        try notify(method: "initialized", params: [:])
+        try notify(method: "initialized", params: nil)
         isInitialized = true
     }
 

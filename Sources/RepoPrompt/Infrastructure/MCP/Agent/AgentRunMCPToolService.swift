@@ -1766,16 +1766,25 @@ struct AgentRunMCPToolService {
         registration suppliedRegistration: AgentRunSessionStore.Registration? = nil,
         agentModeVM: AgentModeViewModel
     ) async -> AgentRunMCPSnapshot {
+        let registration = suppliedRegistration ?? agentModeVM.mcpRegistration(sessionID: sessionID)
+        let storedSnapshot: AgentRunMCPSnapshot? = if let registration {
+            await AgentRunSessionStore.snapshot(for: registration)
+        } else {
+            nil
+        }
+        if let storedSnapshot, storedSnapshot.status.isTerminal {
+            return storedSnapshot
+        }
         if let providedSnapshot = await currentSnapshotProvider?(sessionID, agentModeVM) {
             return providedSnapshot
         }
-        guard let registration = suppliedRegistration ?? agentModeVM.mcpRegistration(sessionID: sessionID) else {
+        guard let registration else {
             return .expired(sessionID: sessionID)
         }
         if let liveSnapshot = agentModeVM.mcpSnapshot(registration: registration) {
             return liveSnapshot
         }
-        if let storedSnapshot = await AgentRunSessionStore.snapshot(for: registration) {
+        if let storedSnapshot {
             return storedSnapshot
         }
         return .expired(sessionID: sessionID)

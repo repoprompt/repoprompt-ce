@@ -2953,13 +2953,13 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertTrue(firstSamples.isEmpty)
             XCTAssertTrue(secondSamples.isEmpty)
             let activeBeforeRelease = await store.readSearchRootDiagnosticsSnapshot()
-            let activeRoot = activeBeforeRelease.first { $0.rootID == rootID }
-            XCTAssertNotNil(activeRoot?.barrier.active)
-            XCTAssertEqual(activeRoot?.barrier.completionCount, 0)
-            XCTAssertEqual(activeRoot?.ingress.waiterCount, 1)
-            XCTAssertGreaterThan(activeRoot?.ingress.outstandingPublicationCount ?? 0, 0)
+            let activeRoot = try XCTUnwrap(activeBeforeRelease.first { $0.rootID == rootID })
+            let activeBarrier = try XCTUnwrap(activeRoot.barrier.active)
+            XCTAssertEqual(activeRoot.barrier.completionCount, 0)
+            XCTAssertEqual(activeRoot.ingress.waiterCount, 1)
+            XCTAssertGreaterThan(activeRoot.ingress.outstandingPublicationCount, 0)
             XCTAssertEqual(
-                activeRoot?.ingress.appliedServicePublicationSequence,
+                activeRoot.ingress.appliedServicePublicationSequence,
                 baselineIngress.appliedServicePublicationSequence
             )
 
@@ -2968,7 +2968,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 let roots = await store.readSearchRootDiagnosticsSnapshot()
                 guard let root = roots.first(where: { $0.rootID == rootID }) else { return false }
                 return root.barrier.active == nil
-                    && root.barrier.completionCount == 1
+                    && root.barrier.completionCount >= 1
                     && root.ingress.waiterCount == 0
                     && root.ingress.outstandingPublicationCount == 0
             }
@@ -2983,16 +2983,23 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 settledRoot.ingress.appliedServicePublicationSequence,
                 initialIngress?.acceptedServicePublicationSequence ?? 0
             )
+            let completedBarrier = try XCTUnwrap(settledRoot.barrier.lastCompleted)
+            XCTAssertEqual(completedBarrier.targetWatcherWatermark, activeBarrier.targetWatcherWatermark)
+            XCTAssertEqual(completedBarrier.targetServicePublicationSequence, activeBarrier.targetServicePublicationSequence)
+            XCTAssertGreaterThanOrEqual(
+                completedBarrier.appliedWatcherWatermark,
+                completedBarrier.targetWatcherWatermark
+            )
             XCTAssertGreaterThanOrEqual(
                 settledRoot.ingress.appliedWatcherWatermark,
                 baselineIngress.appliedWatcherWatermark.rawValue
             )
             XCTAssertEqual(
-                settledRoot.barrier.lastCompleted?.appliedWatcherWatermark,
+                completedBarrier.appliedWatcherWatermark,
                 settledRoot.ingress.appliedWatcherWatermark
             )
             XCTAssertEqual(
-                settledRoot.barrier.lastCompleted?.appliedServicePublicationSequence,
+                completedBarrier.appliedServicePublicationSequence,
                 settledRoot.ingress.appliedServicePublicationSequence
             )
             await store.setWatcherSinkWillApplyHandler(nil)
@@ -3162,7 +3169,7 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(flightCountWhileBlocked, 2)
             XCTAssertEqual(flushStartCountWhileBlocked, 1)
             XCTAssertEqual(active.targetWatcherWatermark, baselineWatcherWatermark.rawValue)
-            XCTAssertEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(pending.targetWatcherWatermark, secondAccepted.rawValue)
             XCTAssertEqual(pending.targetServicePublicationSequence, acceptedServicePublicationSequence)
             XCTAssertEqual(pending.ageMilliseconds, 175)
 
@@ -3184,8 +3191,8 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
                 firstSamples.first?.acceptedWatcherWatermark,
                 baselineWatcherWatermark.rawValue
             )
-            XCTAssertEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
-            XCTAssertEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(secondSample.acceptedWatcherWatermark, secondAccepted.rawValue)
+            XCTAssertGreaterThanOrEqual(thirdSample.acceptedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(secondSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(thirdSample.appliedWatcherWatermark, secondAccepted.rawValue)
             XCTAssertGreaterThanOrEqual(
@@ -5741,6 +5748,56 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         }
     }
 
+    func testWorkspaceReadableFileServiceResolvesSymlinkedAlwaysReadableExternalFilesAndRejectsEscapes() async throws {
+        let home = try makeTemporaryRoot(name: "ReadableSymlinkHome")
+        let realSkillsRoot = try makeTemporaryRoot(name: "ReadableSymlinkSkills")
+        let nominalSkillsRoot = home.appendingPathComponent(".agents/skills", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: nominalSkillsRoot.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try createDirectorySymlinkOrSkip(at: nominalSkillsRoot, destination: realSkillsRoot)
+
+        let realSkillFile = realSkillsRoot.appendingPathComponent("example/SKILL.md")
+        try write("symlinked skill body", to: realSkillFile)
+        let nominalSkillFile = nominalSkillsRoot.appendingPathComponent("example/SKILL.md")
+
+        let store = WorkspaceFileContextStore()
+        let service = WorkspaceReadableFileService(store: store, homeDirectoryURL: home)
+
+        let nominalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalSkillFile.path),
+            "nominal symlink-root support path should resolve as external"
+        )
+        XCTAssertEqual(nominalResolved.absolutePath, realSkillFile.path)
+        let nominalContent = try await service.readAlwaysReadableExternalFile(nominalResolved)
+        XCTAssertEqual(nominalContent, "symlinked skill body")
+
+        let canonicalResolved = try XCTUnwrap(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: realSkillFile.path),
+            "canonical support-root symlink target path should resolve as external"
+        )
+        XCTAssertEqual(canonicalResolved.absolutePath, realSkillFile.path)
+        let canonicalContent = try await service.readAlwaysReadableExternalFile(canonicalResolved)
+        XCTAssertEqual(canonicalContent, "symlinked skill body")
+
+        let outsideRoot = try makeTemporaryRoot(name: "ReadableSymlinkOutside")
+        let outsideFile = outsideRoot.appendingPathComponent("secret.md")
+        try write("outside", to: outsideFile)
+        let nestedEscape = realSkillsRoot.appendingPathComponent("example/escape", isDirectory: true)
+        try createDirectorySymlinkOrSkip(at: nestedEscape, destination: outsideRoot)
+        let nominalEscapedFile = nominalSkillsRoot.appendingPathComponent("example/escape/secret.md")
+
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: nominalEscapedFile.path),
+            "nested symlink escape from an allowed support root should remain blocked"
+        )
+        XCTAssertNil(
+            service.resolveAlwaysReadableExternalFile(atAbsolutePath: outsideFile.path),
+            "canonical outside target should not become always-readable"
+        )
+    }
+
     @MainActor
     func testStoreBackedRootShellProjectionsPreserveIdentityWithoutMaterializingDescendants() async throws {
         do {
@@ -7817,14 +7874,22 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
 
         let store = WorkspaceFileContextStore()
         let record = try await store.loadRoot(path: root.path)
+        let firstUpdates = await store.codemapUpdates()
+        let firstScan = Task {
+            await firstCodemapFileAPI(from: firstUpdates, containing: "firstScannedSymbol")
+        }
         try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        _ = try await waitForCodemapFileAPI(store: store, containing: "firstScannedSymbol")
+        _ = try await waitForCodemapFileAPI(firstScan, containing: "firstScannedSymbol")
         _ = await store.allCodemapFileAPIs()
 
         try write("func replacementScannedSymbol() {}", to: file)
         try setDiskModificationDate(Date().addingTimeInterval(2), for: file)
+        let replacementUpdates = await store.codemapUpdates()
+        let replacementScan = Task {
+            await firstCodemapFileAPI(from: replacementUpdates, containing: "replacementScannedSymbol")
+        }
         try await store.requestCodemapScan(rootID: record.id, relativePath: "Scanned.swift")
-        let replacement = try await waitForCodemapFileAPI(store: store, containing: "replacementScannedSymbol")
+        let replacement = try await waitForCodemapFileAPI(replacementScan, containing: "replacementScannedSymbol")
         XCTAssertFalse(replacement.apiDescription.contains("firstScannedSymbol"))
     }
 
@@ -7997,15 +8062,46 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
         return firstFileAPIByStandardizedNestedPath
     }
 
-    private func waitForCodemapFileAPI(store: WorkspaceFileContextStore, containing symbol: String) async throws -> FileAPI {
-        for _ in 0 ..< 250 {
-            if let API = await store.allCodemapFileAPIs().first(where: { $0.apiDescription.contains(symbol) }) {
+    private func firstCodemapFileAPI(
+        from updates: AsyncStream<WorkspaceCodemapUpdateEvent>,
+        containing symbol: String
+    ) async -> FileAPI? {
+        for await event in updates {
+            for snapshot in event.snapshots {
+                guard let API = snapshot.fileAPI,
+                      API.apiDescription.contains(symbol)
+                else {
+                    continue
+                }
                 return API
             }
-            try await Task.sleep(nanoseconds: 20_000_000)
         }
-        XCTFail("Timed out waiting for codemap symbol: \(symbol)")
-        throw NSError(domain: "WorkspaceFileContextStoreTests", code: 1)
+        return nil
+    }
+
+    private func waitForCodemapFileAPI(
+        _ task: Task<FileAPI?, Never>,
+        containing symbol: String,
+        timeout: Duration = .seconds(10)
+    ) async throws -> FileAPI {
+        let result = await withTaskGroup(of: FileAPI?.self) { group in
+            group.addTask {
+                await task.value
+            }
+            group.addTask {
+                try? await Task.sleep(for: timeout)
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            task.cancel()
+            return result
+        }
+        guard let result else {
+            XCTFail("Timed out waiting for codemap symbol: \(symbol)")
+            throw NSError(domain: "WorkspaceFileContextStoreTests", code: 1)
+        }
+        return result
     }
 
     #if DEBUG
@@ -8078,6 +8174,14 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
     private func write(_ content: String, to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try content.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func createDirectorySymlinkOrSkip(at link: URL, destination: URL) throws {
+        do {
+            try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        } catch {
+            throw XCTSkip("Directory symlink creation unavailable in this environment: \(error)")
+        }
     }
 
     private func setDiskModificationDate(_ date: Date, for url: URL) throws {

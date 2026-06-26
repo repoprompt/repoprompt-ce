@@ -24,7 +24,7 @@ final class AppDeepLinkRouter {
         case let .route(.legacyURL(legacyURL)):
             routeLegacyURL(legacyURL, preferredWindow: preferredLegacyWindow)
         case let .route(.agentSession(route)):
-            await routeAgentSession(route)
+            await routeAgentSession(route, sourceURL: url)
         case .invalidScopedRoute:
             NSApp.activate(ignoringOtherApps: true)
         case .unsupported:
@@ -51,7 +51,7 @@ final class AppDeepLinkRouter {
             NSApp.activate(ignoringOtherApps: true)
             return
         }
-        await routeAgentSession(route)
+        await routeAgentSession(route, sourceURL: nil)
     }
 
     private func routeLegacyURL(_ url: URL, preferredWindow: WindowState?) {
@@ -77,9 +77,17 @@ final class AppDeepLinkRouter {
         }
     }
 
-    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute) async {
-        NSApp.activate(ignoringOtherApps: true)
+    private func routeAgentSession(_ route: AgentSessionDeepLinkRoute, sourceURL: URL?) async {
         let liveWindows = windowStatesManager.allWindows.filter { !$0.isClosing }
+        if let app = NSApp {
+            app.activate(ignoringOtherApps: true)
+        }
+        guard !liveWindows.isEmpty else {
+            if let sourceURL {
+                windowStatesManager.pendingURLs.append(sourceURL)
+            }
+            return
+        }
         var attemptedWindowIDs = Set<Int>()
 
         for candidate in Self.agentSessionPreferredExistingWindows(for: route, in: liveWindows) {

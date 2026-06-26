@@ -149,12 +149,16 @@ final class MCPResponseDeliveryTracerSafetyTests: XCTestCase {
         )
         try await ledger.commit(prepared)
 
-        // Protocol-active connection failure emits a terminal trace event;
-        // with a broken sink it must return instead of crashing the process.
-        let isTerminal = await ledger.recordConnectionFailure("host_disconnected")
-        XCTAssertTrue(isTerminal)
+        // A replayable host-originated request keeps app-side connection
+        // failure retryable; with a broken sink, tracing must still return
+        // instead of crashing the process.
+        let isTerminal = await ledger.recordConnectionFailure("app_socket_closed")
+        XCTAssertFalse(isTerminal)
         let snapshot = await ledger.snapshot()
-        XCTAssertEqual(snapshot.terminalReason, "host_disconnected")
+        XCTAssertNil(snapshot.terminalReason)
+        XCTAssertEqual(snapshot.activeRequestCount, 1)
+        XCTAssertEqual(snapshot.replayableClientRequestCount, 1)
+        XCTAssertTrue(snapshot.canReconnect)
     }
 
     func testProgressWriteFailureDoesNotBypassLedgerAccounting() async throws {

@@ -3196,6 +3196,32 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     }
                     if !snapshot.hasActiveTurn {
                         logCodex("[AgentModeVM][CodexWatchdog] stall probe found no active turn for tab \(session.tabID)")
+                        let activeTurnID = session.codexAuthoritativeActiveTurn?.turnID
+                        if let failure = await probeController.pendingTurnFailure(
+                            turnID: activeTurnID
+                        ) {
+                            if await attemptManagedCodexAuthRecovery(
+                                for: session,
+                                issue: nil,
+                                message: failure.message,
+                                sourceController: probeController
+                            ) {
+                                return .skipped
+                            }
+                            await finalizeCodexRun(
+                                session,
+                                turnStatus: .failed,
+                                reason: "stall-watchdog-explicit-error",
+                                errorMessage: failure.message,
+                                notifyOnCompleted: false,
+                                deleteDeferredFilesWhenFailureHasNoInFlight: true
+                            )
+                            await probeController.acknowledgePendingTurnFailure(
+                                turnID: activeTurnID,
+                                failure: failure
+                            )
+                            return .skipped
+                        }
                         appendCodexStallWatchdogWarningIfNeeded(to: session, reason: "probe-no-active-turn")
                         return .skipped
                     }
@@ -4702,8 +4728,34 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         }
     }
 
-    private func enqueueAssistantDelta(_ delta: String, session: AgentModeViewModel.TabSession) {
+    private func enqueueAssistantDelta(
+        _ delta: String,
+        scope explicitScope: CodexNativeSessionController.ItemScope? = nil,
+        session: AgentModeViewModel.TabSession
+    ) {
+        let effectiveScope = explicitScope ?? session.pendingCodexAssistantScope
+        if let pendingScope = session.pendingCodexAssistantScope,
+           let effectiveScope,
+           pendingScope != effectiveScope
+        {
+            sealAssistantBoundary(session)
+        } else if explicitScope != nil,
+                  session.pendingCodexAssistantScope == nil,
+                  !session.pendingAssistantDelta.isEmpty
+                  || session.items.last.map({ $0.kind == .assistant && $0.isStreaming }) == true
+        {
+            sealAssistantBoundary(session)
+        }
+        if let effectiveScope {
+            session.pendingCodexAssistantScope = effectiveScope
+        }
         let existingAssistantText: String = {
+            if let effectiveScope,
+               let rowID = session.codexAssistantRowIDByScope[effectiveScope],
+               let row = session.items.first(where: { $0.id == rowID })
+            {
+                return row.text
+            }
             guard let lastItem = session.items.last, lastItem.kind == .assistant, lastItem.isStreaming else {
                 return ""
             }
@@ -4747,13 +4799,15 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private static func flushPendingAssistantDeltaState(_ session: AgentModeViewModel.TabSession) -> Bool {
         guard !session.pendingAssistantDelta.isEmpty else { return false }
         let delta = session.pendingAssistantDelta
+        let scope = session.pendingCodexAssistantScope
         clearPendingAssistantDeltaState(session)
-        applyAssistantDelta(delta, session: session)
+        applyAssistantDelta(delta, scope: scope, session: session)
         return true
     }
 
     private func clearPendingAssistantDelta(_ session: AgentModeViewModel.TabSession) {
         Self.clearPendingAssistantDeltaState(session)
+        session.pendingCodexAssistantScope = nil
     }
 
     #if DEBUG
@@ -4767,7 +4821,11 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     #endif
 
     private func flushPendingAssistantDelta(_ session: AgentModeViewModel.TabSession) {
-        guard Self.flushPendingAssistantDeltaState(session) else { return }
+        guard !session.pendingAssistantDelta.isEmpty || session.assistantDeltaFlushTask != nil else { return }
+        guard Self.flushPendingAssistantDeltaState(session) else {
+            Self.clearPendingAssistantDeltaState(session)
+            return
+        }
         session.assistantDeltaFlushGeneration &+= 1
         viewModel?.requestAssistantPresentationRefresh(
             session: session,
@@ -4788,6 +4846,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private func sealAssistantBoundary(_ session: AgentModeViewModel.TabSession) {
         let didFlush = Self.flushPendingAssistantDeltaState(session)
         let didSeal = Self.endActiveAssistantSegmentState(session)
+        session.pendingCodexAssistantScope = nil
         guard didFlush || didSeal else { return }
         session.assistantDeltaFlushGeneration &+= 1
         viewModel?.requestAssistantPresentationRefresh(
@@ -4797,20 +4856,107 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         )
     }
 
-    private static func applyAssistantDelta(_ delta: String, session: AgentModeViewModel.TabSession) {
-        if let lastItem = session.items.last, lastItem.kind == .assistant, lastItem.isStreaming {
-            session.updateLastItem { item in
+    private static func applyAssistantDelta(
+        _ delta: String,
+        scope: CodexNativeSessionController.ItemScope?,
+        session: AgentModeViewModel.TabSession
+    ) {
+        let targetIndex: Int? = {
+            if let scope,
+               let rowID = session.codexAssistantRowIDByScope[scope],
+               let index = session.items.firstIndex(where: { $0.id == rowID })
+            {
+                return index
+            }
+            guard let index = session.items.indices.last,
+                  session.items[index].kind == .assistant,
+                  session.items[index].isStreaming
+            else {
+                return nil
+            }
+            return index
+        }()
+        if let targetIndex {
+            session.mutateItem(at: targetIndex) { item in
                 item.text += CodexProviderHelpers.normalizedAssistantDeltaForAppend(
                     existingText: item.text,
                     delta: delta
                 )
+            }
+            if let scope {
+                session.codexAssistantRowIDByScope[scope] = session.items[targetIndex].id
             }
         } else {
             guard AgentDisplayableText.hasDisplayableBody(delta) else { return }
             var assistantItem = AgentChatItem.assistant(delta, sequenceIndex: session.nextSequenceIndex)
             assistantItem.isStreaming = true
             session.appendItem(assistantItem)
+            if let scope {
+                session.codexAssistantRowIDByScope[scope] = assistantItem.id
+            }
         }
+    }
+
+    private func reconcileAssistantCompletion(
+        _ payload: CodexNativeSessionController.AssistantCompletionPayload,
+        session: AgentModeViewModel.TabSession
+    ) {
+        if session.pendingCodexAssistantScope == payload.scope {
+            flushPendingAssistantDelta(session)
+            session.pendingCodexAssistantScope = nil
+        } else if !session.pendingAssistantDelta.isEmpty
+            || session.assistantDeltaFlushTask != nil
+            || session.items.last.map({ $0.kind == .assistant && $0.isStreaming }) == true
+        {
+            sealAssistantBoundary(session)
+        }
+
+        var didChange = false
+        if let rowID = session.codexAssistantRowIDByScope[payload.scope],
+           let index = session.items.firstIndex(where: { $0.id == rowID })
+        {
+            if !AgentDisplayableText.hasDisplayableBody(payload.text) {
+                _ = session.removeItem(at: index)
+                session.codexAssistantRowIDByScope.removeValue(forKey: payload.scope)
+                didChange = true
+            } else {
+                let existingText = session.items[index].text
+                let existingUTF8 = existingText.utf8
+                let completedUTF8 = payload.text.utf8
+                var reconciledText = existingText
+                if !completedUTF8.elementsEqual(existingUTF8) {
+                    if completedUTF8.starts(with: existingUTF8) {
+                        reconciledText += String(decoding: completedUTF8.dropFirst(existingUTF8.count), as: UTF8.self)
+                    } else {
+                        reconciledText = payload.text
+                    }
+                }
+                if reconciledText != existingText || session.items[index].isStreaming {
+                    session.mutateItem(at: index) { item in
+                        item.text = reconciledText
+                        item.isStreaming = false
+                    }
+                    didChange = true
+                }
+            }
+        } else if AgentDisplayableText.hasDisplayableBody(payload.text) {
+            var assistantItem = AgentChatItem.assistant(
+                payload.text,
+                sequenceIndex: session.nextSequenceIndex
+            )
+            assistantItem.isStreaming = false
+            session.appendItem(assistantItem)
+            session.codexAssistantRowIDByScope[payload.scope] = assistantItem.id
+            didChange = true
+        }
+
+        guard didChange else { return }
+        session.assistantDeltaFlushGeneration &+= 1
+        viewModel?.requestAssistantPresentationRefresh(
+            session: session,
+            sourceItemsRevision: session.sourceItemsRevision,
+            flushGeneration: session.assistantDeltaFlushGeneration
+        )
     }
 
     private func setRunningStatus(
@@ -4990,6 +5136,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             segment.statusTitle = nil
         }
         session.codexReasoningSegmentsByKey[key] = segment
+        let didUpdateTranscript = upsertReasoningTranscript(for: key, session: session)
         if let title = segment.statusTitle {
             setRunningStatus(title, source: .reasoning, session: session, urgent: true)
         } else if let previousStatusTitle,
@@ -4997,6 +5144,136 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                   session.runningStatusText == previousStatusTitle
         {
             setRunningStatus(nil, source: nil, session: session, urgent: true)
+        }
+        if didUpdateTranscript {
+            viewModel?.requestUIRefresh(tabID: session.tabID)
+        }
+    }
+
+    private static func insertTranscriptItem(
+        _ item: AgentChatItem,
+        at index: Int,
+        session: AgentModeViewModel.TabSession
+    ) {
+        var insertedItem = item
+        session.mutateItemsBatch { items in
+            let insertionIndex = min(max(index, 0), items.count)
+            guard insertionIndex < items.count else {
+                insertedItem.sequenceIndex = session.nextSequenceIndex
+                items.append(insertedItem)
+                return
+            }
+            let insertionSequence = items[insertionIndex].sequenceIndex
+            for shiftedIndex in insertionIndex ..< items.count {
+                items[shiftedIndex].sequenceIndex += 1
+            }
+            insertedItem.sequenceIndex = insertionSequence
+            items.insert(insertedItem, at: insertionIndex)
+        }
+    }
+
+    private func reconcileReasoningCompletion(
+        _ payload: CodexNativeSessionController.ReasoningCompletionPayload,
+        session: AgentModeViewModel.TabSession
+    ) {
+        let itemID = payload.scope.itemID
+        let keyPrefix = "reasoning:\(itemID):"
+        let count = max(payload.summary.count, payload.content.count)
+        let authoritativeKeys = Set((0 ..< count).map { "\(keyPrefix)\($0)" })
+        let existingKeys = session.codexReasoningSegmentsByKey.keys.filter {
+            $0 == itemID || $0 == "reasoning:\(itemID)" || $0.hasPrefix(keyPrefix)
+        }
+        var didChange = false
+        for key in existingKeys where !authoritativeKeys.contains(key) {
+            if let rowID = session.codexReasoningSegmentsByKey[key]?.transcriptItemID,
+               let index = session.items.firstIndex(where: { $0.id == rowID })
+            {
+                _ = session.removeItem(at: index)
+                didChange = true
+            }
+            session.codexReasoningSegmentsByKey.removeValue(forKey: key)
+        }
+
+        var latestStatusTitle: String?
+        for index in 0 ..< count {
+            let key = "\(keyPrefix)\(index)"
+            let summary = index < payload.summary.count
+                ? ReasoningTextFormatter.normalize(payload.summary[index])
+                : ""
+            let content = index < payload.content.count ? payload.content[index] : ""
+            var segment = session.codexReasoningSegmentsByKey[key] ?? .init()
+            let previousRowID = segment.transcriptItemID
+            segment.summaryMarkdown = summary
+            segment.bodyMarkdown = content
+            if let title = Self.latestReasoningSummaryTitle(from: summary),
+               Self.shouldUseReasoningSummaryAsStatus(title)
+            {
+                segment.statusTitle = title
+                latestStatusTitle = title
+            } else {
+                segment.statusTitle = nil
+            }
+            session.codexReasoningSegmentsByKey[key] = segment
+
+            guard let markdown = Self.renderedReasoningMarkdown(for: segment) else {
+                if let previousRowID,
+                   let rowIndex = session.items.firstIndex(where: { $0.id == previousRowID })
+                {
+                    _ = session.removeItem(at: rowIndex)
+                    segment.transcriptItemID = nil
+                    session.codexReasoningSegmentsByKey[key] = segment
+                    didChange = true
+                }
+                continue
+            }
+            if let previousRowID,
+               let rowIndex = session.items.firstIndex(where: { $0.id == previousRowID })
+            {
+                if session.items[rowIndex].text != markdown || session.items[rowIndex].isStreaming {
+                    session.mutateItem(at: rowIndex) { item in
+                        item.text = markdown
+                        item.isStreaming = false
+                    }
+                    didChange = true
+                }
+            } else {
+                var thinkingItem = AgentChatItem.thinking(
+                    markdown,
+                    sequenceIndex: session.nextSequenceIndex
+                )
+                thinkingItem.isStreaming = false
+                let higherRowIndex = ((index + 1) ..< count).compactMap { higherIndex -> Int? in
+                    let higherKey = "\(keyPrefix)\(higherIndex)"
+                    guard let rowID = session.codexReasoningSegmentsByKey[higherKey]?.transcriptItemID else {
+                        return nil
+                    }
+                    return session.items.firstIndex(where: { $0.id == rowID })
+                }.min()
+                let lowerRowIndex = (0 ..< index).reversed().compactMap { lowerIndex -> Int? in
+                    let lowerKey = "\(keyPrefix)\(lowerIndex)"
+                    guard let rowID = session.codexReasoningSegmentsByKey[lowerKey]?.transcriptItemID else {
+                        return nil
+                    }
+                    return session.items.firstIndex(where: { $0.id == rowID })
+                }.first
+                if let insertionIndex = higherRowIndex ?? lowerRowIndex.map({ $0 + 1 }) {
+                    Self.insertTranscriptItem(thinkingItem, at: insertionIndex, session: session)
+                } else {
+                    session.appendItem(thinkingItem)
+                }
+                segment.transcriptItemID = thinkingItem.id
+                session.codexReasoningSegmentsByKey[key] = segment
+                didChange = true
+            }
+        }
+
+        if let latestStatusTitle {
+            setRunningStatus(latestStatusTitle, source: .reasoning, session: session, urgent: true)
+        } else if session.runningStatusSource == .reasoning {
+            setRunningStatus(nil, source: nil, session: session, urgent: true)
+        }
+        if didChange {
+            viewModel?.requestUIRefresh(tabID: session.tabID)
         }
     }
 
@@ -5006,6 +5283,19 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 items[index].isStreaming = false
             }
         }
+    }
+
+    private func drainCodexTerminalOutput(
+        _ session: AgentModeViewModel.TabSession,
+        turnStatus: CodexNativeSessionController.TurnStatus
+    ) {
+        flushCommandExecutionRunningUpdates(session: session)
+        flushPendingAssistantDelta(session)
+        finalizeStreamingItems(in: session)
+        finalizePendingToolCalls(in: session, turnStatus: turnStatus)
+        finalizeLingeringRunningBashResults(in: session, turnStatus: turnStatus)
+        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
+        session.providerTerminalDrainGeneration &+= 1
     }
 
     private func finalizeCodexRun(
@@ -5023,12 +5313,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             return
         }
         let expectedRunID = session.runID
-        flushCommandExecutionRunningUpdates(session: session)
-        finalizeStreamingItems(in: session)
-        finalizePendingToolCalls(in: session, turnStatus: turnStatus)
-        finalizeLingeringRunningBashResults(in: session, turnStatus: turnStatus)
-        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
-        session.providerTerminalDrainGeneration &+= 1
+        drainCodexTerminalOutput(session, turnStatus: turnStatus)
 
         clearCodexRecoveryAttempt(for: session.runID)
         clearCodexAuthRecoveryAttempt(for: session.runID)
@@ -5040,6 +5325,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
+        session.pendingCodexAssistantScope = nil
+        session.codexAssistantRowIDByScope.removeAll()
         clearCodexPendingInteractions(in: session)
 
         let terminalState: AgentSessionRunState = switch turnStatus {
@@ -5118,6 +5405,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session: AgentModeViewModel.TabSession
     ) -> Bool {
         let scope: (threadID: String?, turnID: String?, itemID: String?)? = switch event {
+        case let .canonicalAssistantDelta(_, itemScope):
+            (nil, itemScope.turnID, itemScope.itemID)
+        case let .assistantCompleted(payload):
+            (nil, payload.scope.turnID, payload.scope.itemID)
+        case let .reasoningDelta(payload) where payload.scope != nil:
+            (nil, payload.scope?.turnID, payload.scope?.itemID)
+        case let .reasoningCompleted(payload):
+            (nil, payload.scope.turnID, payload.scope.itemID)
         case let .livenessActivity(activity):
             (activity.threadID, activity.turnID, activity.itemID)
         case let .errorNotification(notification):
@@ -5245,10 +5540,28 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             clearCodexPendingAuthRetryTurn(session)
             enqueueAssistantDelta(delta, session: session)
             return
+        case let .canonicalAssistantDelta(text, scope):
+            guard session.runState.isActive else { return }
+            guard !text.isEmpty else { return }
+            clearCodexPendingAuthRetryTurn(session)
+            enqueueAssistantDelta(text, scope: scope, session: session)
+            return
+        case let .assistantCompleted(payload):
+            guard session.runState.isActive else { return }
+            clearCodexPendingAuthRetryTurn(session)
+            reconcileAssistantCompletion(payload, session: session)
+            return
         case let .reasoningDelta(payload):
             guard session.runState.isActive else { return }
             clearCodexPendingAuthRetryTurn(session)
+            sealAssistantBoundary(session)
             applyReasoningDelta(payload, session: session)
+            return
+        case let .reasoningCompleted(payload):
+            guard session.runState.isActive else { return }
+            clearCodexPendingAuthRetryTurn(session)
+            sealAssistantBoundary(session)
+            reconcileReasoningCompletion(payload, session: session)
             return
         case let .tokenUsage(usage):
             guard session.runState.isActive else { return }
@@ -5467,9 +5780,9 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             // Resolve matching transcript item across all match paths.
             let matchedIndex: Int? = {
                 if let invocationID,
-                   let idx = session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
+                   let index = session.items.lastIndex(where: { $0.toolInvocationID == invocationID })
                 {
-                    return idx
+                    return index
                 }
                 if let idx = CodexNativeSessionController.matchingBashToolResultIndex(
                     in: session.items,
@@ -5480,10 +5793,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 ) {
                     return idx
                 }
-                if let idx = session.items.lastIndex(where: { $0.kind == .toolCall && $0.toolName == toolName }) {
-                    return idx
-                }
-                return nil
+                guard invocationID == nil else { return nil }
+                return session.items.lastIndex(where: {
+                    $0.kind == .toolCall
+                        && $0.toolInvocationID == nil
+                        && $0.toolName == toolName
+                })
             }()
             // Prevent apply_patch terminal → running regression across all match paths.
             if let matchedIndex, Self.shouldIgnoreApplyPatchRunningRegression(
@@ -5563,11 +5878,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             session.runState = .running
             viewModel?.setAgentRunActive(session.tabID, isActive: true)
             viewModel?.requestUIRefresh(tabID: session.tabID, urgent: true)
-        case let .turnCompleted(turnID, status):
+        case let .turnCompleted(turnID, status, failure):
             guard let completion = correlatedCodexTurnKindForCompletion(
                 turnID: turnID,
                 session: session
             ) else {
+                return
+            }
+            let failureMessage = status == .failed
+                ? (failure?.message ?? "Codex turn failed.")
+                : nil
+            if let failureMessage,
+               await attemptManagedCodexAuthRecovery(
+                   for: session,
+                   issue: nil,
+                   message: failureMessage,
+                   sourceController: sourceController
+               )
+            {
                 return
             }
             let turnKind = completion.turnKind
@@ -5591,6 +5919,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                     session,
                     turnStatus: status,
                     reason: "compact-turn-completed-\(status)",
+                    errorMessage: failureMessage,
                     providerSuccessor: providerSuccessor
                 )
                 AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] compact turnCompleted turnID=\(turnID ?? "nil") status=\(status) runState=\(session.runState)")
@@ -5602,6 +5931,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
                 session,
                 turnStatus: status,
                 reason: "turn-completed-\(status)",
+                errorMessage: failureMessage,
                 providerSuccessor: providerSuccessor
             )
             AgentModeViewModel.logCodexDebug("[AgentModeVM][CodexUI] turnCompleted turnID=\(turnID ?? "nil") status=\(status) items=\(session.items.count) runState=\(session.runState)")
@@ -7109,7 +7439,10 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         private func codexEventMetricKind(_ event: CodexNativeSessionController.Event) -> String {
             switch event {
             case .assistantDelta: "assistantDelta"
+            case .canonicalAssistantDelta: "canonicalAssistantDelta"
+            case .assistantCompleted: "assistantCompleted"
             case .reasoningDelta: "reasoningDelta"
+            case .reasoningCompleted: "reasoningCompleted"
             case .tokenUsage: "tokenUsage"
             case .approvalRequest: "approvalRequest"
             case .permissionsRequest: "permissionsRequest"
@@ -7134,8 +7467,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         switch event {
         case let .assistantDelta(delta):
             "assistantDelta chars=\(delta.count)"
+        case let .canonicalAssistantDelta(text, scope):
+            "canonicalAssistantDelta chars=\(text.count) turnID=\(scope.turnID) itemID=\(scope.itemID)"
+        case let .assistantCompleted(payload):
+            "assistantCompleted chars=\(payload.text.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
         case let .reasoningDelta(payload):
             "reasoningDelta kind=\(payload.kind) chars=\(payload.text.count) itemID=\(payload.itemID ?? "nil") groupID=\(payload.groupID ?? "nil")"
+        case let .reasoningCompleted(payload):
+            "reasoningCompleted summary=\(payload.summary.count) content=\(payload.content.count) turnID=\(payload.scope.turnID) itemID=\(payload.scope.itemID)"
         case let .tokenUsage(usage):
             "tokenUsage modelContextWindow=\(usage.modelContextWindow.map(String.init(describing:)) ?? "nil") lastTotalTokens=\(usage.lastTotalTokens.map(String.init(describing:)) ?? "nil") totalTotalTokens=\(usage.totalTotalTokens.map(String.init(describing:)) ?? "nil")"
         case let .approvalRequest(request):
@@ -7156,8 +7495,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
             "commandExecutionRunning invocationID=\(update.invocationID?.uuidString ?? "nil") processID=\(update.processID ?? "nil") outputChars=\(update.appendedOutput?.count ?? 0)"
         case let .turnStarted(turnID):
             "turnStarted turnID=\(turnID ?? "nil")"
-        case let .turnCompleted(turnID, status):
-            "turnCompleted turnID=\(turnID ?? "nil") status=\(status)"
+        case let .turnCompleted(turnID, status, failure):
+            "turnCompleted turnID=\(turnID ?? "nil") status=\(status) failure=\(failure != nil)"
         case let .contextCompacted(turnID):
             "contextCompacted turnID=\(turnID ?? "nil")"
         case let .livenessActivity(activity):
@@ -7643,6 +7982,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         session.activeReasoningItemID = nil
         session.reasoningItemIDsByGroupID.removeAll()
         session.codexReasoningSegmentsByKey.removeAll()
+        session.pendingCodexAssistantScope = nil
+        session.codexAssistantRowIDByScope.removeAll()
         session.runningStatusSource = nil
         session.pendingCommandRunningFlushTask?.cancel()
         session.pendingCommandRunningFlushTask = nil
@@ -7682,22 +8023,24 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func drainCodexTerminalBuffersForCancellation(_ session: AgentModeViewModel.TabSession) {
         guard session.selectedAgent == .codexExec else { return }
-        flushCommandExecutionRunningUpdates(session: session)
-        finalizeStreamingItems(in: session)
-        finalizePendingToolCalls(in: session, turnStatus: .interrupted)
-        finalizeLingeringRunningBashResults(in: session, turnStatus: .interrupted)
-        reconcilePersistedCodexCommandStatusIfNeeded(session: session, force: true)
+        drainCodexTerminalOutput(session, turnStatus: .interrupted)
         abandonCodexFallbackQueue(
             session: session,
             reason: "Codex queued follow-up was cancelled with the active run."
         )
         resetTrackedCodexTurns(session)
-        session.providerTerminalDrainGeneration &+= 1
+        session.activeReasoningItemID = nil
+        session.reasoningItemIDsByGroupID.removeAll()
+        session.codexReasoningSegmentsByKey.removeAll()
+        session.pendingCodexAssistantScope = nil
+        session.codexAssistantRowIDByScope.removeAll()
     }
 
     func codexTerminalBuffersAreDrained(_ session: AgentModeViewModel.TabSession) -> Bool {
         session.pendingCommandRunningByKey.isEmpty
             && session.pendingCommandRunningFlushTask == nil
+            && session.pendingAssistantDelta.isEmpty
+            && session.assistantDeltaFlushTask == nil
     }
 
     struct CodexCancellationTarget {

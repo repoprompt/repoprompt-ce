@@ -5,6 +5,636 @@ import XCTest
 final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
     private static let webSearchAliases = ["search", "web_search", "web_search_request", "google_web_search", "search_web"]
 
+    func testLegacyAssistantCompleteWithoutPriorDeltaEmitsFullText() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "complete response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteIdenticalToCanonicalDeltaEmitsNothingAdditional() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "complete response")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "complete response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteTopLevelEventIDDoesNotResetCanonicalItemBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: "complete response"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(
+                turnID: "turn-1",
+                eventID: "0",
+                message: "complete response"
+            )
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["complete response"])
+    }
+
+    func testLegacyAssistantCompleteStrictPrefixRecoversOnlySuffixAndIsIdempotent() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "answer")
+        )
+        for _ in 0 ..< 2 {
+            await controller.test_handleNotification(
+                method: "codex/event/agent_message",
+                params: legacyAssistantCompleteParams(turnID: "turn-1", message: "answer.")
+            )
+        }
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["answer", "."])
+        XCTAssertEqual(deltas.joined(), "answer.")
+    }
+
+    func testLegacyAssistantCompleteRecoversUTF8SuffixAcrossGraphemeBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        let streamedPrefix = "👨"
+        let completeMessage = "👨‍👩‍👧"
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: streamedPrefix)
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: completeMessage)
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas.joined(), completeMessage)
+        XCTAssertEqual(Array(deltas.joined().utf8), Array(completeMessage.utf8))
+        XCTAssertEqual(deltas.count, 2)
+    }
+
+    func testAssistantCompleteReconciliationResetsAtCanonicalItemBoundary() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: "Checking"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "Checking")
+        )
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-2",
+                delta: "Result"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "Result.")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["Checking", "Result", "."])
+    }
+
+    func testLegacyAssistantCompleteNonPrefixMismatchDoesNotEmitUnprovenBytes() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "trusted prefix")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "different response")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["trusted prefix"])
+    }
+
+    func testAssistantCompleteReconciliationIsIsolatedAndResetsWhenTurnCompletes() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(turnID: "turn-1", delta: "turn one")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-2", message: "turn two")
+        )
+        await controller.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-1", status: "completed")
+        )
+        await controller.test_handleNotification(
+            method: "turn/started",
+            params: turnLifecycleParams(turnID: "turn-1")
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "reused turn fresh text")
+        )
+
+        let deltas = await finishAndReadAssistantDeltas(from: controller)
+        XCTAssertEqual(deltas, ["turn one", "turn two", "reused turn fresh text"])
+    }
+
+    func testCanonicalAssistantCompletionWithoutDeltaEmitsAuthoritativeSnapshot() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                type: "agentMessage",
+                fields: ["text": .string("complete response")]
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        let completions = events.compactMap { event -> CodexNativeSessionController.AssistantCompletionPayload? in
+            guard case let .assistantCompleted(payload) = event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.text, "complete response")
+        XCTAssertEqual(completions.first?.scope, .init(turnID: "turn-1", itemID: "assistant-item-1"))
+    }
+
+    func testCanonicalAssistantCompletionIsDeduplicatedSuppressesLegacyMirrorAndRejectsLateDelta() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        let completion = canonicalCompletedItemParams(
+            turnID: "turn-1",
+            itemID: "assistant-item-1",
+            type: "agentMessage",
+            fields: ["text": .string("authoritative response")]
+        )
+
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: "draft"
+            )
+        )
+        await controller.test_handleNotification(method: "item/completed", params: completion)
+        await controller.test_handleNotification(method: "item/completed", params: completion)
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(turnID: "turn-1", message: "authoritative response")
+        )
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: assistantDeltaParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                delta: " late"
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .canonicalAssistantDelta = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertEqual(events.count(where: {
+            if case .assistantCompleted = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertFalse(events.contains {
+            if case .assistantDelta = $0 { return true }
+            return false
+        })
+    }
+
+    func testCanonicalAssistantCompletionSuppressesOnlyMatchingScopedLegacyMirror() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                type: "agentMessage",
+                fields: ["text": .string("canonical first")]
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                message: "canonical first"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-2",
+                message: "legacy second"
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .assistantCompleted = $0 { return true }
+            return false
+        }), 1)
+        let scopedLegacyDeltas = events.compactMap { event -> (String, CodexNativeSessionController.ItemScope)? in
+            guard case let .canonicalAssistantDelta(text, scope) = event else { return nil }
+            return (text, scope)
+        }
+        XCTAssertEqual(scopedLegacyDeltas.map(\.0), ["legacy second"])
+        XCTAssertEqual(
+            scopedLegacyDeltas.map(\.1),
+            [.init(turnID: "turn-1", itemID: "assistant-item-2")]
+        )
+    }
+
+    func testScopedLegacyAssistantBeforeCanonicalCompletionUsesSameItemScope() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "codex/event/agent_message",
+            params: legacyAssistantCompleteParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                message: "draft"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "assistant-item-1",
+                type: "agentMessage",
+                fields: ["text": .string("final")]
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        let scopes = events.compactMap { event -> CodexNativeSessionController.ItemScope? in
+            switch event {
+            case let .canonicalAssistantDelta(_, scope):
+                scope
+            case let .assistantCompleted(payload):
+                payload.scope
+            default:
+                nil
+            }
+        }
+        XCTAssertEqual(
+            scopes,
+            [
+                .init(turnID: "turn-1", itemID: "assistant-item-1"),
+                .init(turnID: "turn-1", itemID: "assistant-item-1")
+            ]
+        )
+        XCTAssertFalse(events.contains {
+            if case .assistantDelta = $0 { return true }
+            return false
+        })
+    }
+
+    func testCanonicalReasoningCompletionIsAuthoritativeAndRejectsLateDelta() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/reasoning/summaryTextDelta",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "itemId": .string("reasoning-item-1"),
+                "summaryIndex": .number(0),
+                "delta": .string("Draft")
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "reasoning-item-1",
+                type: "reasoning",
+                fields: [
+                    "summary": .array([.string("Final summary")]),
+                    "content": .array([.string("Final body")])
+                ]
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/reasoning/textDelta",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "itemId": .string("reasoning-item-1"),
+                "contentIndex": .number(0),
+                "delta": .string(" late")
+            ]
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .reasoningDelta = $0 { return true }
+            return false
+        }), 1)
+        let completions = events.compactMap { event -> CodexNativeSessionController.ReasoningCompletionPayload? in
+            guard case let .reasoningCompleted(payload) = event else { return nil }
+            return payload
+        }
+        XCTAssertEqual(completions.count, 1)
+        XCTAssertEqual(completions.first?.summary, ["Final summary"])
+        XCTAssertEqual(completions.first?.content, ["Final body"])
+    }
+
+    func testCanonicalMCPToolLifecycleCoversSuccessFailureAndResultOnly() async throws {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/started",
+            params: canonicalMCPItemParams(
+                turnID: "turn-1",
+                itemID: "mcp-success",
+                status: "inProgress",
+                arguments: ["query": .string("docs")]
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalMCPItemParams(
+                turnID: "turn-1",
+                itemID: "mcp-success",
+                status: "completed",
+                arguments: ["query": .string("docs")],
+                result: .object(["content": .string("found")])
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalMCPItemParams(
+                turnID: "turn-1",
+                itemID: "mcp-failure",
+                status: "failed",
+                arguments: [:],
+                error: .object(["message": .string("boom")])
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalMCPItemParams(
+                turnID: "turn-1",
+                itemID: "mcp-result-only",
+                status: "completed",
+                arguments: ["path": .string("README.md")],
+                result: .object(["ok": .bool(true)])
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        let calls = events.compactMap { event -> (String, UUID?)? in
+            guard case let .toolCall(name, invocationID, _) = event else { return nil }
+            return (name, invocationID)
+        }
+        let results = events.compactMap { event -> (String, UUID?, String, Bool?)? in
+            guard case let .toolResult(name, invocationID, _, resultJSON, isError) = event else { return nil }
+            return (name, invocationID, resultJSON, isError)
+        }
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(results.count, 3)
+        XCTAssertEqual(calls.first?.0, "lookup")
+        XCTAssertEqual(results[0].0, "lookup")
+        XCTAssertEqual(results[0].1, calls.first?.1)
+        XCTAssertEqual(results[0].3, false)
+        XCTAssertEqual(try XCTUnwrap(jsonObject(from: results[0].2))["content"] as? String, "found")
+        XCTAssertEqual(results[1].3, true)
+        XCTAssertEqual(
+            try XCTUnwrap(jsonObject(from: results[1].2))["message"] as? String,
+            "boom"
+        )
+        XCTAssertEqual(results[2].3, false)
+        XCTAssertEqual(try XCTUnwrap(jsonObject(from: results[2].2))["ok"] as? Bool, true)
+        XCTAssertFalse(events.contains(where: { event in
+            switch event {
+            case .approvalRequest, .permissionsRequest, .requestUserInput, .mcpElicitationRequest:
+                true
+            default:
+                false
+            }
+        }))
+    }
+
+    func testCanonicalAndDeprecatedContextCompactionDeduplicate() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "compaction-item-1",
+                type: "contextCompaction"
+            )
+        )
+        await controller.test_handleNotification(
+            method: "thread/compacted",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1")
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-1",
+                itemID: "compaction-item-1b",
+                type: "contextCompaction"
+            )
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .contextCompacted = $0 { return true }
+            return false
+        }), 2)
+
+        let reverseController = makeControllerWithThread(turnID: "turn-2")
+        await reverseController.test_handleNotification(
+            method: "thread/compacted",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-2")
+            ]
+        )
+        await reverseController.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-2",
+                itemID: "compaction-item-2",
+                type: "contextCompaction"
+            )
+        )
+        await reverseController.test_handleNotification(
+            method: "item/completed",
+            params: canonicalCompletedItemParams(
+                turnID: "turn-2",
+                itemID: "compaction-item-2b",
+                type: "contextCompaction"
+            )
+        )
+        let reverseEvents = await finishAndReadEvents(from: reverseController)
+        XCTAssertEqual(reverseEvents.count(where: {
+            if case .contextCompacted = $0 { return true }
+            return false
+        }), 2)
+    }
+
+    func testExactLegacyMCPPathsRemainWhileSyntheticLifecycleAliasesAreIgnored() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        let legacyParams: [String: CodexJSONValue] = [
+            "threadId": .string("thread-active"),
+            "turnId": .string("turn-1"),
+            "msg": .object([
+                "call_id": .string("legacy-mcp-1"),
+                "invocation": .object([
+                    "server": .string("third-party"),
+                    "tool": .string("lookup"),
+                    "arguments": .object(["query": .string("docs")])
+                ])
+            ])
+        ]
+        await controller.test_handleNotification(
+            method: "codex/event/mcp_tool_call_begin",
+            params: legacyParams
+        )
+        var legacyCompletionParams = legacyParams
+        legacyCompletionParams["msg"] = .object([
+            "call_id": .string("legacy-mcp-1"),
+            "invocation": .object([
+                "server": .string("third-party"),
+                "tool": .string("lookup"),
+                "arguments": .object(["query": .string("docs")])
+            ]),
+            "result": .object(["ok": .bool(true)])
+        ])
+        await controller.test_handleNotification(
+            method: "codex/event/mcp_tool_call_end",
+            params: legacyCompletionParams
+        )
+        await controller.test_handleNotification(
+            method: "item/agentMessage/delta",
+            params: [
+                "thread_id": .string("thread-active"),
+                "turn_id": .string("turn-1"),
+                "item_id": .string("snake-payload-item"),
+                "delta": .string("payload aliases retained")
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "codex/event/item_commandExecution_started",
+            params: canonicalCompletedItemParams(
+                turnID: "stale-turn",
+                itemID: "synthetic-command",
+                type: "commandExecution",
+                fields: ["command": .string("echo ignored")]
+            )
+        )
+        await controller.test_handleNotification(
+            method: "item/command_execution/output_delta",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "itemId": .string("synthetic-command"),
+                "delta": .string("ignored")
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "thread/token_usage/updated",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1")
+            ]
+        )
+        for method in [
+            "item/mcp_tool_call/progress",
+            "command/exec/output_delta",
+            "process/output_delta",
+            "deprecation_notice",
+            "server_request/resolved"
+        ] {
+            await controller.test_handleNotification(
+                method: method,
+                params: [
+                    "threadId": .string("thread-active"),
+                    "turnId": .string("stale-turn"),
+                    "itemId": .string("synthetic-progress")
+                ]
+            )
+        }
+        XCTAssertEqual(controller.test_routingCurrentTurnID, "turn-1")
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertEqual(events.count(where: {
+            if case .toolCall = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertEqual(events.count(where: {
+            if case .toolResult = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertEqual(events.count(where: {
+            if case .canonicalAssistantDelta = $0 { return true }
+            return false
+        }), 1)
+        XCTAssertFalse(events.contains {
+            if case .commandExecutionRunning = $0 { return true }
+            return false
+        })
+        XCTAssertFalse(events.contains {
+            if case .tokenUsage = $0 { return true }
+            return false
+        })
+        XCTAssertFalse(events.contains {
+            if case .livenessActivity = $0 { return true }
+            return false
+        })
+        XCTAssertTrue(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("item/started"))
+        XCTAssertTrue(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("item/completed"))
+        XCTAssertFalse(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("codex/event/item_commandExecution_started"))
+        XCTAssertFalse(CodexNativeSessionController.test_isItemLifecycleNotificationMethod("item_command_execution_completed"))
+    }
+
     func testStructuredErrorNotificationRetainsRetryMetadataAndScope() throws {
         let retrying = try XCTUnwrap(CodexNativeSessionController.test_parseErrorNotification(from: [
             "threadId": "thread-1",
@@ -45,6 +675,235 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             "message": "retrying from legacy text"
         ]))
         XCTAssertNil(missingMetadata.willRetry)
+    }
+
+    func testStructuredFailedCompletionPrefersTurnErrorOverCachedNotification() async throws {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "error": .object([
+                    "message": .string("cached async error"),
+                    "willRetry": .bool(false)
+                ])
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "turn/completed",
+            params: [
+                "threadId": .string("thread-active"),
+                "turn": .object([
+                    "id": .string("turn-1"),
+                    "status": .string("failed"),
+                    "error": .object([
+                        "message": .string("authoritative turn error"),
+                        "codexErrorInfo": .string("quotaExceeded"),
+                        "additionalDetails": .object([
+                            "requestId": .string("request-1")
+                        ])
+                    ])
+                ])
+            ]
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        XCTAssertFalse(events.contains {
+            if case .errorNotification = $0 { return true }
+            return false
+        })
+        let completions: [(
+            String?,
+            CodexNativeSessionController.TurnStatus,
+            CodexNativeSessionController.TurnFailure?
+        )] = events.compactMap { event in
+            guard case let .turnCompleted(turnID, status, failure) = event else { return nil }
+            return (turnID, status, failure)
+        }
+        let completion = try XCTUnwrap(completions.first)
+        XCTAssertEqual(completion.0, "turn-1")
+        XCTAssertEqual(completion.1, .failed)
+        XCTAssertEqual(completion.2?.message, "authoritative turn error")
+        XCTAssertEqual(completion.2?.codexErrorInfo, "quotaExceeded")
+        XCTAssertEqual(completion.2?.additionalDetails, #"{"requestId":"request-1"}"#)
+    }
+
+    func testStructuredFailedCompletionUsesCachedThenGenericFallback() async throws {
+        let cachedController = makeControllerWithThread(turnID: "turn-1")
+        await cachedController.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "message": .string("cached terminal error"),
+                "willRetry": .bool(false)
+            ]
+        )
+        await cachedController.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-1", status: "failed")
+        )
+        let cachedEvents = await finishAndReadEvents(from: cachedController)
+        let cachedFailure = try XCTUnwrap(cachedEvents.compactMap { event -> CodexNativeSessionController.TurnFailure? in
+            guard case let .turnCompleted(_, .failed, failure) = event else { return nil }
+            return failure
+        }.first)
+        XCTAssertEqual(cachedFailure.message, "cached terminal error")
+
+        let genericController = makeControllerWithThread(turnID: "turn-2")
+        await genericController.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-2", status: "failed")
+        )
+        let genericEvents = await finishAndReadEvents(from: genericController)
+        let genericFailure = try XCTUnwrap(genericEvents.compactMap { event -> CodexNativeSessionController.TurnFailure? in
+            guard case let .turnCompleted(_, .failed, failure) = event else { return nil }
+            return failure
+        }.first)
+        XCTAssertEqual(genericFailure.message, "Codex turn failed.")
+    }
+
+    func testRetryingMissingMetadataStaleAndContradictoryErrorsPreserveCurrentBehavior() async {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "message": .string("retrying"),
+                "willRetry": .bool(true)
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "message": .string("legacy immediate")
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("stale-turn"),
+                "message": .string("stale terminal"),
+                "willRetry": .bool(false)
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "message": .string("contradictory terminal"),
+                "willRetry": .bool(false)
+            ]
+        )
+        await controller.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-1", status: "completed")
+        )
+
+        let events = await finishAndReadEvents(from: controller)
+        let notifications = events.compactMap { event -> CodexNativeSessionController.ErrorNotification? in
+            guard case let .errorNotification(notification) = event else { return nil }
+            return notification
+        }
+        XCTAssertEqual(notifications.map(\.message), ["retrying", "legacy immediate"])
+        XCTAssertEqual(notifications.first?.willRetry, true)
+        XCTAssertNil(notifications.last?.willRetry)
+        XCTAssertTrue(events.contains {
+            guard case let .turnCompleted(_, status, failure) = $0 else { return false }
+            return status == .completed && failure == nil
+        })
+    }
+
+    func testTransportLossFlushesCachedActiveTurnErrorBeforeGenericClosure() async throws {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "message": .string("explicit terminal error"),
+                "willRetry": .bool(false)
+            ]
+        )
+        await controller.test_simulateTransportStreamEnded(source: "test")
+
+        let events = await finishAndReadEvents(from: controller)
+        let failedCompletionIndex = try XCTUnwrap(events.firstIndex {
+            guard case let .turnCompleted("turn-1", .failed, failure) = $0 else {
+                return false
+            }
+            return failure?.message == "explicit terminal error"
+        })
+        let transportIndex = try XCTUnwrap(events.firstIndex {
+            guard case let .error(message) = $0 else { return false }
+            return message.localizedCaseInsensitiveContains("transport closed")
+        })
+        XCTAssertLessThan(failedCompletionIndex, transportIndex)
+        XCTAssertEqual(events.count(where: {
+            if case .turnCompleted(_, .failed, _) = $0 { return true }
+            return false
+        }), 1)
+    }
+
+    func testRoutingOnlyTransportLossFlushesAcceptedCachedError() async throws {
+        let controller = makeControllerWithThread(turnID: "initial-turn")
+        controller.test_installThreadState(
+            threadID: "thread-active",
+            authoritativeTurnID: nil,
+            routingTurnID: "routing-turn"
+        )
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("routing-turn"),
+                "message": .string("routing-only explicit error"),
+                "willRetry": .bool(false)
+            ]
+        )
+        await controller.test_simulateTransportStreamEnded(source: "test-routing")
+
+        let events = await finishAndReadEvents(from: controller)
+        let failure = try XCTUnwrap(events.compactMap { event -> CodexNativeSessionController.TurnFailure? in
+            guard case let .turnCompleted("routing-turn", .failed, failure) = event else {
+                return nil
+            }
+            return failure
+        }.first)
+        XCTAssertEqual(failure.message, "routing-only explicit error")
+    }
+
+    func testPendingFailurePeekIsNonDestructiveForDelayedCompletion() async throws {
+        let controller = makeControllerWithThread(turnID: "turn-1")
+        await controller.test_handleNotification(
+            method: "error",
+            params: [
+                "threadId": .string("thread-active"),
+                "turnId": .string("turn-1"),
+                "message": .string("preserved explicit error"),
+                "willRetry": .bool(false)
+            ]
+        )
+
+        let peekedFailure = await controller.pendingTurnFailure(turnID: nil)
+        XCTAssertEqual(peekedFailure?.message, "preserved explicit error")
+
+        await controller.test_handleNotification(
+            method: "turn/completed",
+            params: turnLifecycleParams(turnID: "turn-1", status: "failed")
+        )
+        let events = await finishAndReadEvents(from: controller)
+        let completedFailure = try XCTUnwrap(events.compactMap { event -> CodexNativeSessionController.TurnFailure? in
+            guard case let .turnCompleted("turn-1", .failed, failure) = event else {
+                return nil
+            }
+            return failure
+        }.first)
+        XCTAssertEqual(completedFailure.message, "preserved explicit error")
     }
 
     func testProgressOnlyNotificationsRetainLivenessCategoryScopeAndActiveFlags() throws {
@@ -734,6 +1593,139 @@ final class CodexNativeSessionControllerEventRecoveryTests: XCTestCase {
             tabID: UUID(),
             windowID: 1,
             workspacePath: nil
+        )
+    }
+
+    private func makeControllerWithThread(turnID: String) -> CodexNativeSessionController {
+        let controller = makeController()
+        controller.test_installThreadState(
+            threadID: "thread-active",
+            authoritativeTurnID: turnID,
+            routingTurnID: turnID
+        )
+        return controller
+    }
+
+    private func assistantDeltaParams(
+        turnID: String,
+        itemID: String? = "assistant-item-1",
+        delta: String
+    ) -> [String: CodexJSONValue] {
+        var params: [String: CodexJSONValue] = [
+            "threadId": .string("thread-active"),
+            "turnId": .string(turnID),
+            "delta": .string(delta)
+        ]
+        if let itemID {
+            params["itemId"] = .string(itemID)
+        }
+        return params
+    }
+
+    private func legacyAssistantCompleteParams(
+        turnID: String,
+        eventID: String? = nil,
+        itemID: String? = nil,
+        message: String
+    ) -> [String: CodexJSONValue] {
+        var params: [String: CodexJSONValue] = [
+            "threadId": .string("thread-active"),
+            "turnId": .string(turnID),
+            "msg": .object([
+                "type": .string("agent_message"),
+                "message": .string(message)
+            ])
+        ]
+        if let eventID {
+            params["id"] = .string(eventID)
+        }
+        if let itemID {
+            params["itemId"] = .string(itemID)
+        }
+        return params
+    }
+
+    private func turnLifecycleParams(turnID: String, status: String? = nil) -> [String: CodexJSONValue] {
+        var turn: [String: CodexJSONValue] = ["id": .string(turnID)]
+        if let status {
+            turn["status"] = .string(status)
+        }
+        return [
+            "threadId": .string("thread-active"),
+            "turn": .object(turn)
+        ]
+    }
+
+    private func finishAndReadAssistantDeltas(
+        from controller: CodexNativeSessionController
+    ) async -> [String] {
+        let events = await finishAndReadEvents(from: controller)
+        return events.compactMap { event in
+            switch event {
+            case let .assistantDelta(delta):
+                delta
+            case let .canonicalAssistantDelta(text, _):
+                text
+            default:
+                nil
+            }
+        }
+    }
+
+    private func finishAndReadEvents(
+        from controller: CodexNativeSessionController
+    ) async -> [CodexNativeSessionController.Event] {
+        await controller.shutdown()
+        var events: [CodexNativeSessionController.Event] = []
+        for await event in controller.events {
+            events.append(event)
+        }
+        return events
+    }
+
+    private func canonicalCompletedItemParams(
+        turnID: String,
+        itemID: String,
+        type: String,
+        fields: [String: CodexJSONValue] = [:]
+    ) -> [String: CodexJSONValue] {
+        var item: [String: CodexJSONValue] = [
+            "id": .string(itemID),
+            "type": .string(type)
+        ]
+        item.merge(fields) { _, new in new }
+        return [
+            "threadId": .string("thread-active"),
+            "turnId": .string(turnID),
+            "item": .object(item)
+        ]
+    }
+
+    private func canonicalMCPItemParams(
+        turnID: String,
+        itemID: String,
+        status: String,
+        arguments: [String: CodexJSONValue],
+        result: CodexJSONValue? = nil,
+        error: CodexJSONValue? = nil
+    ) -> [String: CodexJSONValue] {
+        var fields: [String: CodexJSONValue] = [
+            "server": .string("third-party"),
+            "tool": .string("lookup"),
+            "status": .string(status),
+            "arguments": .object(arguments)
+        ]
+        if let result {
+            fields["result"] = result
+        }
+        if let error {
+            fields["error"] = error
+        }
+        return canonicalCompletedItemParams(
+            turnID: turnID,
+            itemID: itemID,
+            type: "mcpToolCall",
+            fields: fields
         )
     }
 

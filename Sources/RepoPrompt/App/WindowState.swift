@@ -1022,12 +1022,12 @@ class WindowState: ObservableObject {
 
     func handleIncomingURL(_ url: URL) {
         guard let comps = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              comps.scheme == "repoprompt"
+              AppDeepLinkURLScheme.isSupported(comps.scheme)
         else {
             return
         }
 
-        // Check for prompt:// URLs first
+        // Check for prompt opener URLs first
         if comps.host?.lowercased() == "prompt" {
             let title = comps.queryItems?.first(where: { $0.name == "title" })?.value?
                 .removingPercentEncoding?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Untitled Prompt"
@@ -1066,7 +1066,7 @@ class WindowState: ObservableObject {
             return // ← we handled the prompt command
         }
 
-        // Require host == "open" to match repoprompt://open/~/MyProject
+        // Require host == "open" to match canonical repoprompt-ce://open/~/MyProject links
         guard let host = comps.host?.lowercased(), host == "open" else {
             return
         }

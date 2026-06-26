@@ -889,8 +889,14 @@ actor GitService {
         result[path] = text
     }
 
+    private struct PatchHeaderPaths {
+        let oldPath: String
+        let newPath: String
+        let prefixes: Set<String>
+    }
+
     private static func canonicalPath(forUnifiedDiffBlock block: [String]) -> String? {
-        var headerPaths: (oldPath: String, newPath: String)?
+        var headerPaths: PatchHeaderPaths?
         var renameToPath: String?
         var copyToPath: String?
         var plusPath: String?
@@ -910,11 +916,15 @@ actor GitService {
                 continue
             }
             if line.hasPrefix("+++ ") {
-                plusPath = parseGitPathRemainder(String(line.dropFirst("+++ ".count))).flatMap(normalizePatchHeaderPath(_:))
+                plusPath = parseGitPathRemainder(String(line.dropFirst("+++ ".count))).flatMap {
+                    normalizePatchHeaderPath($0, stripping: headerPaths?.prefixes)
+                }
                 continue
             }
             if line.hasPrefix("--- ") {
-                minusPath = parseGitPathRemainder(String(line.dropFirst("--- ".count))).flatMap(normalizePatchHeaderPath(_:))
+                minusPath = parseGitPathRemainder(String(line.dropFirst("--- ".count))).flatMap {
+                    normalizePatchHeaderPath($0, stripping: headerPaths?.prefixes)
+                }
                 continue
             }
             if line.hasPrefix("@@") {
@@ -925,18 +935,19 @@ actor GitService {
         return renameToPath ?? copyToPath ?? plusPath ?? minusPath ?? headerPaths?.newPath ?? headerPaths?.oldPath
     }
 
-    private static func parseDiffGitHeaderPaths(_ line: String) -> (oldPath: String, newPath: String)? {
+    private static func parseDiffGitHeaderPaths(_ line: String) -> PatchHeaderPaths? {
         let prefix = "diff --git "
         guard line.hasPrefix(prefix) else { return nil }
         let remainder = String(line.dropFirst(prefix.count))
         let tokens = parseDiffGitTokens(remainder)
+        let prefixes = patchHeaderPrefixes(oldRawPath: tokens.first, newRawPath: tokens.dropFirst().first)
         guard tokens.count >= 2,
-              let oldPath = normalizePatchHeaderPath(tokens[0]),
-              let newPath = normalizePatchHeaderPath(tokens[1])
+              let oldPath = normalizePatchHeaderPath(tokens[0], stripping: prefixes),
+              let newPath = normalizePatchHeaderPath(tokens[1], stripping: prefixes)
         else {
             return nil
         }
-        return (oldPath, newPath)
+        return PatchHeaderPaths(oldPath: oldPath, newPath: newPath, prefixes: prefixes)
     }
 
     private static func parseGitPathRemainder(_ raw: String) -> String? {
@@ -948,13 +959,49 @@ actor GitService {
         return trimmed
     }
 
-    private static func normalizePatchHeaderPath(_ rawPath: String) -> String? {
-        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, trimmed != "/dev/null" else { return nil }
-        if trimmed.hasPrefix("a/") || trimmed.hasPrefix("b/") {
-            return String(trimmed.dropFirst(2))
+    private static func normalizePatchHeaderPath(_ rawPath: String, stripping prefixes: Set<String>? = nil) -> String? {
+        var normalized = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty, normalized != "/dev/null" else { return nil }
+        let prefixes = prefixes ?? defaultPatchHeaderPrefixes
+        if prefixes.contains(String(normalized.prefix(2))) {
+            normalized = String(normalized.dropFirst(2))
         }
-        return trimmed
+        if normalized.hasPrefix("./") {
+            normalized = String(normalized.dropFirst(2))
+        }
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static let defaultPatchHeaderPrefixes: Set<String> = ["a/", "b/"]
+
+    private static let knownPatchHeaderPrefixPairs: [(old: String, new: String)] = [
+        ("a/", "b/"),
+        ("c/", "w/"),
+        ("i/", "w/"),
+        ("o/", "w/"),
+        ("1/", "2/")
+    ]
+
+    private static func patchHeaderPrefixes(oldRawPath: String?, newRawPath: String?) -> Set<String> {
+        guard let oldRawPath,
+              let newRawPath,
+              let oldPrefix = patchHeaderPrefix(in: oldRawPath),
+              let newPrefix = patchHeaderPrefix(in: newRawPath),
+              knownPatchHeaderPrefixPairs.contains(where: { $0.old == oldPrefix && $0.new == newPrefix })
+        else {
+            return defaultPatchHeaderPrefixes
+        }
+        return [oldPrefix, newPrefix]
+    }
+
+    private static func patchHeaderPrefix(in rawPath: String) -> String? {
+        let trimmed = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 2 else { return nil }
+        let prefix = String(trimmed.prefix(2))
+        guard knownPatchHeaderPrefixPairs.contains(where: { $0.old == prefix || $0.new == prefix }) else {
+            return nil
+        }
+        return prefix
     }
 
     private static func parseDiffGitTokens(_ input: String) -> [String] {
@@ -1095,8 +1142,12 @@ actor GitService {
                 || text.hasPrefix("Binary files ")
             else { return text }
             return text
+                .replacingOccurrences(of: "1/./", with: "a/")
+                .replacingOccurrences(of: "2/./", with: "b/")
                 .replacingOccurrences(of: "a/./", with: "a/")
                 .replacingOccurrences(of: "b/./", with: "b/")
+                .replacingOccurrences(of: "\"1/./", with: "\"a/")
+                .replacingOccurrences(of: "\"2/./", with: "\"b/")
                 .replacingOccurrences(of: "\"a/./", with: "\"a/")
                 .replacingOccurrences(of: "\"b/./", with: "\"b/")
         }.joined(separator: "\n")
