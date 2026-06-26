@@ -9,6 +9,9 @@ import MCP
 /// `Value(dto)`, matching the sibling window-tool providers — no `[String: Any]`
 /// bridge is involved.
 enum HistoryMCPToolService {
+    /// UserDefaults key shared with GlobalSettingsStore.setHistoryIdleThresholdMinutes.
+    static let idleThresholdSettingsKey = "history.idle_threshold_minutes"
+
     // MARK: - Public Entry Point
 
     /// Execute a `history` tool operation.
@@ -689,7 +692,7 @@ enum HistoryMCPToolService {
     /// non-integer values throw a validation error (no clamping). Callers map the thrown
     /// error to an error reply.
     static func resolveIdleThreshold(_ value: Value?) throws -> Int {
-        let defaultThreshold = (UserDefaults.standard.object(forKey: "history.idle_threshold_minutes") as? Int) ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
+        let defaultThreshold = (UserDefaults.standard.object(forKey: Self.idleThresholdSettingsKey) as? Int) ?? AgentSessionMetadataRecord.defaultIdleThresholdMinutes
         guard let value else { return defaultThreshold }
         guard let intValue = value.intValue else {
             throw HistoryValidationError(message: "idle_threshold_minutes must be an integer")

@@ -500,11 +500,11 @@ class GlobalSettingsStore: ObservableObject {
     // MARK: - History
 
     func historyIdleThresholdMinutes() -> Int {
-        (defaults.object(forKey: "history.idle_threshold_minutes") as? Int) ?? 10
+        (defaults.object(forKey: HistoryMCPToolService.idleThresholdSettingsKey) as? Int) ?? 10
     }
 
     func setHistoryIdleThresholdMinutes(_ minutes: Int, commit: Bool = true) {
-        defaults.set(minutes, forKey: "history.idle_threshold_minutes")
+        defaults.set(minutes, forKey: HistoryMCPToolService.idleThresholdSettingsKey)
         objectWillChange.send()
     }
 
