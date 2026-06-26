@@ -15,7 +15,7 @@ import XCTest
                     MCPToolExecutionContractCatalog.orderedAdvertisedToolNames,
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.entries.count, 26, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.entries.count, 27, caseLabel)
                 XCTAssertEqual(
                     Set(MCPToolDurationInventory.entries.map(\.toolName)).count,
                     MCPToolDurationInventory.entries.count,
@@ -80,7 +80,7 @@ import XCTest
                     ],
                     caseLabel
                 )
-                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 11, caseLabel)
+                XCTAssertEqual(MCPToolDurationInventory.boundedToolNames.count, 12, caseLabel)
                 XCTAssertTrue(
                     MCPToolDurationInventory.entries.allSatisfy {
                         !$0.expectedActiveDuration.isEmpty
@@ -214,7 +214,7 @@ import XCTest
                     caseLabel
                 )
                 let tools = try XCTUnwrap(payload["tools"] as? [[String: Any]], caseLabel)
-                XCTAssertEqual(tools.count, 26, caseLabel)
+                XCTAssertEqual(tools.count, 27, caseLabel)
                 let manageWorkspaces = try XCTUnwrap(tools.first {
                     $0["tool"] as? String == MCPGlobalToolName.manageWorkspaces
                 }, caseLabel)
