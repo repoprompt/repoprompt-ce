@@ -15,7 +15,7 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
 
         let sessionID = try XCTUnwrap(route.sessionID)
         let legacyAgentRoute = try XCTUnwrap(URL(string: "repoprompt://agent/session?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)&session_id=\(sessionID.uuidString)&window_id=7"))
-        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyAgentRoute), .unsupported)
+        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyAgentRoute), .route(.agentSession(route)))
 
         let missingWorkspace = try XCTUnwrap(URL(string: "repoprompt-ce://agent/session?tab_id=\(route.tabID.uuidString)"))
         let malformedSession = try XCTUnwrap(URL(string: "repoprompt-ce://agent/session?workspace_id=\(route.workspaceID.uuidString)&tab_id=\(route.tabID.uuidString)&session_id=not-a-uuid"))
@@ -26,10 +26,11 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         XCTAssertEqual(AppDeepLinkRoute.parse(url: unsupportedAgentPath), .invalidScopedRoute)
     }
 
-    func testCEOnlySchemeRoutesLegacyOpeners() throws {
+    func testCanonicalAndLegacySchemesRouteOpeners() throws {
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("repoprompt-ce"))
         XCTAssertTrue(AppDeepLinkURLScheme.isSupported("REPOPROMPT-CE"))
-        XCTAssertFalse(AppDeepLinkURLScheme.isSupported("repoprompt"))
+        XCTAssertTrue(AppDeepLinkURLScheme.isSupported("repoprompt"))
+        XCTAssertTrue(AppDeepLinkURLScheme.isSupported("REPOPROMPT"))
         XCTAssertFalse(AppDeepLinkURLScheme.isSupported("https"))
         XCTAssertFalse(AppDeepLinkURLScheme.isSupported(nil))
 
@@ -40,9 +41,9 @@ final class AppPlatformUtilityRecoveryTests: XCTestCase {
         let unsupportedScheme = try XCTUnwrap(URL(string: "https://open//Users/example/Project"))
 
         XCTAssertEqual(AppDeepLinkRoute.parse(url: ceOpen), .route(.legacyURL(ceOpen)))
-        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyOpen), .unsupported)
+        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyOpen), .route(.legacyURL(legacyOpen)))
         XCTAssertEqual(AppDeepLinkRoute.parse(url: cePrompt), .route(.legacyURL(cePrompt)))
-        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyPrompt), .unsupported)
+        XCTAssertEqual(AppDeepLinkRoute.parse(url: legacyPrompt), .route(.legacyURL(legacyPrompt)))
         XCTAssertEqual(AppDeepLinkRoute.parse(url: unsupportedScheme), .unsupported)
     }
 

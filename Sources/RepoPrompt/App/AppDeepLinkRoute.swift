@@ -2,9 +2,15 @@ import Foundation
 
 enum AppDeepLinkURLScheme {
     static let canonical = "repoprompt-ce"
+    static let legacy = "repoprompt"
 
     static func isSupported(_ scheme: String?) -> Bool {
-        scheme?.lowercased() == canonical
+        switch scheme?.lowercased() {
+        case canonical, legacy:
+            true
+        default:
+            false
+        }
     }
 }
 
