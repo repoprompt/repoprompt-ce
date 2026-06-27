@@ -114,6 +114,45 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testManageWorktreeListExcludesStalePrunableWorktrees() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+
+        // Create a real linked worktree, then delete its checkout directory. Git keeps the admin
+        // record under .git/worktrees/<name> but now reports the worktree prunable ("gitdir file
+        // points to a non-existent location"). The tool must not list a stale worktree, otherwise
+        // a model could select it and bind a session to an empty/partial tree.
+        let createValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/stale-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let createdWorktree = try Self.worktreeObject(createValue, key: "created_worktree")
+        let stalePath = try XCTUnwrap(createdWorktree["path"]?.stringValue)
+        let staleID = try XCTUnwrap(createdWorktree["worktree_id"]?.stringValue)
+        try FileManager.default.removeItem(at: URL(fileURLWithPath: stalePath))
+
+        let listValue = try await manageWorktree(["op": .string("list")])
+        let listObject = try XCTUnwrap(listValue.objectValue)
+        let listed = listObject["worktrees"]?.arrayValue ?? []
+        let listedIDs = listed.compactMap { $0.objectValue?["worktree_id"]?.stringValue }
+        let listedPaths = listed.compactMap { $0.objectValue?["path"]?.stringValue }
+
+        XCTAssertFalse(listedIDs.contains(staleID), "stale worktree id should be omitted: \(listedIDs)")
+        XCTAssertFalse(listedPaths.contains(stalePath), "stale worktree path should be omitted: \(listedPaths)")
+        XCTAssertFalse(listed.isEmpty, "the main worktree should still be listed")
+
+        let warning = listObject["warning"]?.stringValue ?? ""
+        XCTAssertTrue(
+            warning.lowercased().contains("prunable") || warning.lowercased().contains("stale"),
+            "expected an omitted-prunable warning, got: \(warning)"
+        )
+    }
+
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }

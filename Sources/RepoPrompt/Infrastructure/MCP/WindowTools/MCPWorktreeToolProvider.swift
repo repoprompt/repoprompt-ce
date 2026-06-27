@@ -143,18 +143,34 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
 
     private func executeList(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let context = try await resolveRepositoryContext(args: args)
-        let worktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
+        let allWorktrees = try await vcsService.listGitWorktrees(at: context.repo.rootURL)
+        // Stale (git-prunable) worktrees have a gitdir pointing to a non-existent location and are
+        // not usable checkouts. Exclude them so a model never discovers/selects one; binding to a
+        // stale worktree would crawl and search an empty or partial tree. They remain visible to
+        // `git worktree list`/`prune` outside the tool.
+        let worktrees = allWorktrees.filter { !$0.isPrunable }
+        let omittedPrunableCount = allWorktrees.count - worktrees.count
         let includeStatus = parseBool(args["include_status"]) ?? false
         let persistVisuals = parseBool(args["persist_visuals"]) ?? false
         let dtos = try await worktrees.asyncMap { worktree in
             try await worktreeDTO(worktree, includeStatus: includeStatus, persistVisuals: persistVisuals)
         }
+        let warning: String? = if dtos.isEmpty {
+            "No worktrees found for repository."
+        } else if omittedPrunableCount > 0 {
+            "Omitted \(omittedPrunableCount) stale (prunable) worktree(s); run `git worktree prune` to remove them."
+        } else {
+            nil
+        }
         return await ToolResultDTOs.ManageWorktreeReplyDTO(
             op: "list",
-            repository: repositoryDTO(from: worktrees.first?.repository, fallback: context.repo),
+            repository: repositoryDTO(
+                from: worktrees.first?.repository ?? allWorktrees.first?.repository,
+                fallback: context.repo
+            ),
             worktrees: dtos,
             graph: graphDTOIfRequested(args: args, repoURL: context.repo.rootURL),
-            warning: dtos.isEmpty ? "No worktrees found for repository." : nil
+            warning: warning
         )
     }
 
