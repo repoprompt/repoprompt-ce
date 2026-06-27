@@ -640,6 +640,87 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         }
     }
 
+    func testOpenCodeEmptySuccessfulPromptEmitsAssistantVisibleDiagnostic() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: ["ACP_EMPTY_PROMPT": "1"]
+        )
+        let collectedEvents = LockedACPStreamResults()
+        let events = await fixture.controller.currentEventsStream()
+        let eventTask = Task {
+            for await event in events {
+                switch event {
+                case let .stream(result):
+                    collectedEvents.append(result)
+                case .terminal:
+                    collectedEvents.markTerminal()
+                    return
+                case .approvalRequested, .approvalCancelled:
+                    continue
+                }
+            }
+        }
+        defer { eventTask.cancel() }
+
+        _ = try await fixture.controller.bootstrap()
+        try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
+        try await waitUntil("OpenCode empty prompt terminal event") {
+            collectedEvents.didSeeTerminal
+        }
+        let results = collectedEvents.values
+        await fixture.controller.shutdown()
+
+        let diagnostic = try XCTUnwrap(results.first { $0.type == "final_content" }?.text)
+        XCTAssertTrue(diagnostic.contains("OpenCode ACP completed with stopReason=end_turn"))
+        XCTAssertTrue(diagnostic.contains("emitted no assistant content or reasoning chunks"))
+        XCTAssertTrue(diagnostic.contains("input=0, output=0, total=0"))
+        XCTAssertNil(results.first { $0.type == "error" && $0.text?.contains("OpenCode ACP completed") == true })
+
+        let stop = try XCTUnwrap(results.first { $0.type == "message_stop" })
+        XCTAssertEqual(stop.promptTokens, 0)
+        XCTAssertEqual(stop.completionTokens, 0)
+        XCTAssertEqual(stop.stopReason, "end_turn")
+    }
+
+    func testOpenCodeEmptySuccessfulPromptIncludesPromptTimeStderrError() async throws {
+        let fixture = try makeFixture(
+            shape: "modern",
+            extraEnvironment: [
+                "ACP_EMPTY_PROMPT": "1",
+                "ACP_EMPTY_PROMPT_STDERR": #"timestamp=2026-06-27T15:45:21.351Z level=ERROR run=82912cb3 message="stream error" providerID=zai-coding-plan modelID=glm-5.2 error.error="AI_APICallError: Authentication Failed""#
+            ]
+        )
+        let collectedEvents = LockedACPStreamResults()
+        let events = await fixture.controller.currentEventsStream()
+        let eventTask = Task {
+            for await event in events {
+                switch event {
+                case let .stream(result):
+                    collectedEvents.append(result)
+                case .terminal:
+                    collectedEvents.markTerminal()
+                    return
+                case .approvalRequested, .approvalCancelled:
+                    continue
+                }
+            }
+        }
+        defer { eventTask.cancel() }
+
+        _ = try await fixture.controller.bootstrap()
+        try await fixture.controller.prompt(AgentMessage(userMessage: "Say hello"))
+        try await waitUntil("OpenCode empty prompt terminal event") {
+            collectedEvents.didSeeTerminal
+        }
+        let results = collectedEvents.values
+        await fixture.controller.shutdown()
+
+        let diagnostic = try XCTUnwrap(results.first { $0.type == "final_content" }?.text)
+        XCTAssertTrue(diagnostic.contains("OpenCode ACP completed with stopReason=end_turn"))
+        XCTAssertTrue(diagnostic.contains("OpenCode stderr reported: Authentication Failed."))
+        XCTAssertTrue(diagnostic.contains("RepoPrompt did not receive model text to render."))
+    }
+
     func testTransportTerminationDrainsPromptSettlementWaiters() async throws {
         #if DEBUG
             for termination in TransportTerminationKind.allCases {
@@ -1331,6 +1412,12 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
             elif method == "session/prompt":
                 if os.environ.get("ACP_HANG_PROMPT") == "1":
                     continue
+                if os.environ.get("ACP_EMPTY_PROMPT") == "1":
+                    stderr_line = os.environ.get("ACP_EMPTY_PROMPT_STDERR")
+                    if stderr_line:
+                        print(stderr_line, file=sys.stderr, flush=True)
+                    respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 0, "outputTokens": 0, "totalTokens": 0}})
+                    continue
                 respond(request.get("id"), {"stopReason": "end_turn", "usage": {"inputTokens": 1, "outputTokens": 1}})
             else:
                 respond(request.get("id"), {})
@@ -1338,6 +1425,36 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         try script.write(to: scriptURL, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
         return scriptURL
+    }
+}
+
+private final class LockedACPStreamResults: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [AIStreamResult] = []
+    private var terminal = false
+
+    var values: [AIStreamResult] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
+    }
+
+    var didSeeTerminal: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return terminal
+    }
+
+    func append(_ value: AIStreamResult) {
+        lock.lock()
+        storage.append(value)
+        lock.unlock()
+    }
+
+    func markTerminal() {
+        lock.lock()
+        terminal = true
+        lock.unlock()
     }
 }
 
