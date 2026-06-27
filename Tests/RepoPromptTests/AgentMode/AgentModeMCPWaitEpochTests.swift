@@ -536,6 +536,49 @@ final class AgentModeMCPWaitEpochTests: XCTestCase {
         await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
     }
 
+    func testFinalContentDiagnosticPublishesAsTerminalAssistantTextForMCPWait() async throws {
+        #if DEBUG
+            let viewModel = makeViewModel()
+            let sessionID = UUID()
+            let session = await viewModel.ensureSessionReady(tabID: UUID())
+            _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+            try await viewModel.mcpActivateControlContext(
+                forTabID: session.tabID,
+                sessionID: sessionID,
+                originatingConnectionID: nil,
+                startPending: true
+            )
+            await viewModel.prepareMCPWaitTrackingForRunStart(session: session)
+            let runID = UUID()
+            session.selectedAgent = .openCode
+            session.runID = runID
+            session.runState = .running
+            let ownership = session.beginRunAttempt(source: "test.finalContentDiagnostic")
+            let runAttemptID = try XCTUnwrap(session.activeRunAttemptID)
+            let diagnostic = "OpenCode ACP completed with stopReason=end_turn but emitted no assistant content or reasoning chunks."
+
+            await viewModel.test_handleStreamResult(
+                AIStreamResult(type: "final_content", text: diagnostic),
+                session: session,
+                runID: runID,
+                runAttemptID: runAttemptID
+            )
+            viewModel.refreshDerivedTranscriptState(for: session)
+            session.runState = .completed
+
+            let envelope = try XCTUnwrap(viewModel.test_makeTerminalPublicationEnvelope(
+                for: session,
+                ownership: ownership,
+                terminalState: .completed
+            ))
+            XCTAssertEqual(envelope.snapshot.latestAssistantPreview, diagnostic)
+            XCTAssertEqual(envelope.snapshot.asObject()["assistant_text"]?.stringValue, diagnostic)
+            await viewModel.mcpDeactivateControlContext(sessionID: sessionID, cleanupSessionStore: true)
+        #else
+            throw XCTSkip("Stream-result test hook is DEBUG-only.")
+        #endif
+    }
+
     func testStaleTranscriptDoesNotOverrideAuthoritativeSourceWithoutAssistantTail() async throws {
         let viewModel = makeViewModel()
         let sessionID = UUID()

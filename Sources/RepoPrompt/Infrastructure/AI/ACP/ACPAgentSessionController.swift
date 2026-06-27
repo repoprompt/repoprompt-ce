@@ -254,6 +254,7 @@ actor ACPAgentSessionController {
     private var pendingRequests: [String: PendingRequest] = [:]
     private var pendingPermissionRequests: [String: PendingPermissionRequest] = [:]
     private var activePromptTurnID: UUID?
+    private var activePromptOpenCodeStderrError: String?
     #if DEBUG
         private var activePromptSessionUpdateCounts: [String: Int] = [:]
         private var activePromptNormalizedStreamCount = 0
@@ -618,7 +619,7 @@ actor ACPAgentSessionController {
                     )
                 }
             #endif
-            emit(.stream(AIStreamResult(type: "error", text: diagnosticMessage)))
+            emit(.stream(AIStreamResult(type: "final_content", text: diagnosticMessage)))
         }
         emit(.stream(messageStopResult(from: response, sessionID: sessionID, stopReason: stopReason)))
         emitTerminal(
@@ -1082,6 +1083,7 @@ actor ACPAgentSessionController {
             else { return }
             stderrLineCount += 1
             lastStderrPreview = Self.truncatedDiagnosticPreview(text)
+            recordActivePromptStderrLine(text)
             diagnose(.stderrLine(text))
             emit(.stream(AIStreamResult(type: "system", text: text)))
         }
@@ -2954,6 +2956,7 @@ actor ACPAgentSessionController {
             activePromptSessionUpdateCounts = [:]
             activePromptNormalizedStreamCount = 0
         #endif
+        activePromptOpenCodeStderrError = nil
         activePromptNormalizedContentCount = 0
         activePromptNormalizedReasoningCount = 0
     }
@@ -3041,15 +3044,18 @@ actor ACPAgentSessionController {
         let outputTokens = intValue(usage?["outputTokens"]) ?? 0
         let totalTokens = intValue(usage?["totalTokens"]) ?? 0
         let stopDescription = stopReason?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? stopReason! : "unknown"
+        let stderrDescription = activePromptOpenCodeStderrError.map {
+            " OpenCode stderr reported: \($0)."
+        } ?? ""
         #if DEBUG
             let updateCounts = activePromptSessionUpdateCounts
                 .sorted { $0.key < $1.key }
                 .map { "\($0.key)=\($0.value)" }
                 .joined(separator: ", ")
             let updateDescription = updateCounts.isEmpty ? "none" : updateCounts
-            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens); raw session updates during the prompt: \(updateDescription). RepoPrompt did not receive model text to render."
+            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens); raw session updates during the prompt: \(updateDescription).\(stderrDescription) RepoPrompt did not receive model text to render."
         #else
-            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens). RepoPrompt did not receive model text to render."
+            return "OpenCode ACP completed with stopReason=\(stopDescription) but emitted no assistant content or reasoning chunks. Prompt usage was input=\(inputTokens), output=\(outputTokens), total=\(totalTokens).\(stderrDescription) RepoPrompt did not receive model text to render."
         #endif
     }
 
@@ -3100,6 +3106,79 @@ actor ACPAgentSessionController {
                 break
             }
         }
+    }
+
+    private func recordActivePromptStderrLine(_ line: String) {
+        guard activePromptTurnID != nil,
+              provider.providerID == .openCode
+        else {
+            return
+        }
+
+        let lowercased = line.lowercased()
+        guard lowercased.contains("level=error")
+            || lowercased.contains("stream error")
+            || lowercased.contains("ai_apicallerror")
+        else {
+            return
+        }
+
+        activePromptOpenCodeStderrError = Self.truncatedDiagnosticPreview(
+            Self.openCodeProviderErrorSummary(from: line),
+            limit: 360
+        )
+    }
+
+    private static func openCodeProviderErrorSummary(from stderrLine: String) -> String {
+        for key in ["error.error", "error"] {
+            if let value = shellStyleKeyValue(key, in: stderrLine) {
+                return cleanOpenCodeProviderError(value)
+            }
+        }
+        return truncatedDiagnosticPreview(stderrLine, limit: 360)
+    }
+
+    private static func cleanOpenCodeProviderError(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefixes = [
+            "AI_APICallError:",
+            "APICallError:"
+        ]
+        for prefix in prefixes where trimmed.hasPrefix(prefix) {
+            return trimmed.dropFirst(prefix.count)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return trimmed
+    }
+
+    private static func shellStyleKeyValue(_ key: String, in line: String) -> String? {
+        guard let keyRange = line.range(of: "\(key)=") else { return nil }
+        var index = keyRange.upperBound
+        guard index < line.endIndex else { return nil }
+        if line[index] == "\"" {
+            line.formIndex(after: &index)
+            var value = ""
+            var escaped = false
+            while index < line.endIndex {
+                let character = line[index]
+                line.formIndex(after: &index)
+                if escaped {
+                    value.append(character)
+                    escaped = false
+                } else if character == "\\" {
+                    escaped = true
+                } else if character == "\"" {
+                    return value
+                } else {
+                    value.append(character)
+                }
+            }
+            return value.isEmpty ? nil : value
+        }
+
+        let end = line[index...].firstIndex(where: { $0 == " " || $0 == "\t" }) ?? line.endIndex
+        let value = line[index ..< end].trimmingCharacters(in: .whitespacesAndNewlines)
+        return value.isEmpty ? nil : value
     }
 
     #if DEBUG
