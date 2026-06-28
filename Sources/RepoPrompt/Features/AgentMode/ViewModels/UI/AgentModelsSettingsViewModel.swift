@@ -324,7 +324,9 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     func setBuiltinChatModel(raw: String) {
         updateSelectedProfile(reason: "agent_models.builtin_chat_model") { profile in
             profile.preferredComposeModelRaw = raw
-            if profile.syncChatModelWithOracle {
+            if profile.syncChatModelWithOracle,
+               !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
                 profile.planningModelRaw = raw
             }
         }

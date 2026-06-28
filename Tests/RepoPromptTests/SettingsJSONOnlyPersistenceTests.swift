@@ -604,6 +604,58 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertEqual(viewModel.currentBuiltinChatModelName, AIModel.gpt54Pro.displayName)
     }
 
+    func testAgentModelsViewModelBlankBuiltinChatDoesNotMirrorToOracleWhenSynced() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -405, store: store)
+        let blankRaw = " \n\t "
+
+        store.setGlobalAgentModelsProfile(
+            AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                syncChatModelWithOracle: true
+            ),
+            contextBuilderWriteIntent: .preserveExistingOwnership
+        )
+        let globalViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        globalViewModel.setBuiltinChatModel(raw: blankRaw)
+
+        XCTAssertEqual(store.globalAgentModelsProfile().planningModelRaw, AIModel.gpt54Pro.rawValue)
+
+        let workspaceID = UUID()
+        store.setWorkspaceAgentModelsProfile(
+            workspaceID: workspaceID,
+            profile: AgentModelsSettingsProfile(
+                planningModelRaw: AIModel.gpt54Pro.rawValue,
+                preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+                syncChatModelWithOracle: true
+            )
+        )
+        let workspaceViewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: makeAPISettingsViewModel(),
+            workspaceID: workspaceID,
+            workspaceName: "Scoped blank guard",
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        workspaceViewModel.setBuiltinChatModel(raw: blankRaw)
+
+        XCTAssertEqual(
+            store.workspaceAgentModelsProfile(for: workspaceID)?.planningModelRaw,
+            AIModel.gpt54Pro.rawValue
+        )
+    }
+
     func testAgentModelsGlobalProfileRoundTripsExistingFieldsWithOneSaveAndNotification() throws {
         let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
             globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
