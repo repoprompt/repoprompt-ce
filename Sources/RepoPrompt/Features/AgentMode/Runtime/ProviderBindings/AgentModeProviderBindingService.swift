@@ -211,7 +211,7 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
-            case .cursor:
+            case .cursor, .grok:
                 let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
                 guard session.runState.isActive, let controller = session.acpController else { continue }
                 Task { @MainActor in

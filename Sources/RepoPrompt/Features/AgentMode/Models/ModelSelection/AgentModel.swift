@@ -85,6 +85,11 @@ enum AgentModel: String, CaseIterable, Codable {
     case cursorAuto = "auto"
     case cursorComposer2 = "composer-2"
 
+    // Grok Build models (xAI). Selected at launch via `-m` and switchable at runtime
+    // via the x.ai `session/set_model` request; context windows verified from grok modelState.
+    case grokBuild = "grok-build"
+    case grokComposer25Fast = "grok-composer-2.5-fast"
+
     /// Default (no model specified)
     case defaultModel = "default"
 
@@ -131,6 +136,8 @@ enum AgentModel: String, CaseIterable, Codable {
         case .customClaudeCompatible: "CC Custom"
         case .cursorAuto: "Auto"
         case .cursorComposer2: "Composer 2"
+        case .grokBuild: "Grok Build"
+        case .grokComposer25Fast: "Composer 2.5 Fast"
         case .defaultModel: "Default"
         }
     }
@@ -178,6 +185,8 @@ enum AgentModel: String, CaseIterable, Codable {
         case .customClaudeCompatible: "Custom Claude-compatible backend. RepoPrompt does not pass a model flag when configured for no-model behavior."
         case .cursorAuto: "Let Cursor choose the best model automatically. Built-in fallback for Cursor ACP runs when dynamic model metadata is unavailable."
         case .cursorComposer2: "Cursor's Composer 2 model. Available when Cursor exposes it through ACP model metadata."
+        case .grokBuild: "xAI's Grok Build coding model (512K context). Strong at deep coding and planning; selected per Grok session."
+        case .grokComposer25Fast: "Grok's Composer 2.5 Fast model (Cursor-derived, 200K context). Grok's default fast coding model."
         case .defaultModel: "Use the agent's default model. Good starting point when unsure."
         }
     }
@@ -225,6 +234,8 @@ enum AgentModel: String, CaseIterable, Codable {
             [.defaultModel]
         case .cursor:
             [.cursorAuto, .cursorComposer2]
+        case .grokBuild:
+            [.grokComposer25Fast, .grokBuild]
         case .claudeCodeGLM:
             [.claudeHaiku, .claudeSonnet, .claudeOpus]
         case .kimiCode:
@@ -454,6 +465,10 @@ enum AgentModel: String, CaseIterable, Codable {
              .claudeSonnet46, .claudeSonnet45,
              .claudeOpus47, .claudeOpus46, .claudeOpus45,
              .claudeHaiku45:
+            200_000
+        case .grokBuild:
+            512_000
+        case .grokComposer25Fast:
             200_000
         default:
             nil

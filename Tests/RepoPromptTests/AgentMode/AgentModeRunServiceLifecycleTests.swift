@@ -533,6 +533,49 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertEqual(session.runState, .completed)
     }
 
+    func testGrokACPSubmitsInitialPromptWithDeferredMCPRouting() async throws {
+        let recorder = LifecycleRecorder()
+        let workspace = try makeTemporaryDirectory()
+        let recordURL = workspace.appendingPathComponent("grok-deferred-routing.jsonl")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .grok,
+            commandPath: scriptURL.path,
+            environment: ["ACP_RECORD_PATH": recordURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .grokBuild)
+                recorder.record("factory:acp-provider")
+                return provider
+            }
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .grokBuild
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Grok prompt",
+            initialMessageForRun: "Grok prompt",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("Grok ACP deferred routing run") {
+            await session.agentTask?.value
+        }
+
+        let methods = recordedOpenCodeFlowRequests(at: recordURL).map(\.method)
+        XCTAssertTrue(methods.contains("session/new"))
+        XCTAssertTrue(methods.contains("session/prompt"))
+        XCTAssertFalse(session.items.contains { $0.text.contains("MCP routing did not complete") })
+        XCTAssertEqual(session.runState, .completed)
+    }
+
     func testCursorACPReusedSessionInstallsDeferredPolicyForFollowUpPrompt() async throws {
         let recorder = LifecycleRecorder()
         let workspace = try makeTemporaryDirectory()

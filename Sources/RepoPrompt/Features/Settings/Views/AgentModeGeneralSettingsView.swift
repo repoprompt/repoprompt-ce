@@ -235,6 +235,7 @@ struct AgentModeGeneralSettingsView: View {
         case .codex: apiSettingsVM.isCodexConnected
         case .openCode: apiSettingsVM.isOpenCodeConnected
         case .cursor: apiSettingsVM.isCursorConnected
+        case .grok: apiSettingsVM.isGrokCLIConnected
         }
     }
 

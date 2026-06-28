@@ -299,6 +299,9 @@ public class APISettingsViewModel: ObservableObject {
     @Published var cursorError: String? = nil
     @Published private(set) var availableCursorModelOptions: [AgentModelOption] = []
     private var cursorLogCollector: CLIProcessLogCollector?
+    // Grok Build CLI / ACP
+    @Published var isGrokCLIConnected: Bool = UserDefaults.standard.bool(forKey: "GrokCLIConnected")
+    @Published var grokCLIError: String? = nil
 
     /// CLI connection flags are persisted configuration hints, not proof that the provider is
     /// usable in the current process. Context Builder restoration waits for this validation pass
@@ -378,6 +381,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isCodexConnected,
             openCodeAvailable: isOpenCodeConnected,
             cursorAvailable: isCursorConnected,
+            grokAvailable: isGrokCLIConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -408,6 +412,7 @@ public class APISettingsViewModel: ObservableObject {
             $isCodexConnected.map { _ in () }.eraseToAnyPublisher(),
             $isOpenCodeConnected.map { _ in () }.eraseToAnyPublisher(),
             $isCursorConnected.map { _ in () }.eraseToAnyPublisher(),
+            $isGrokCLIConnected.map { _ in () }.eraseToAnyPublisher(),
             $claudeCodeCLIStatus.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendConfigs.map { _ in () }.eraseToAnyPublisher(),
             $compatibleBackendSecretPresence.map { _ in () }.eraseToAnyPublisher()
@@ -428,6 +433,7 @@ public class APISettingsViewModel: ObservableObject {
             codexAvailable: isVerifiedContextBuilderProvider(.codexExec) && isCodexConnected,
             openCodeAvailable: isVerifiedContextBuilderProvider(.openCode) && isOpenCodeConnected,
             cursorAvailable: isVerifiedContextBuilderProvider(.cursor) && isCursorConnected,
+            grokAvailable: isVerifiedContextBuilderProvider(.grokBuild) && isGrokCLIConnected,
             zaiConfigured: compatibleBackendIsActive(.glmZAI),
             kimiConfigured: compatibleBackendIsActive(.kimi),
             customClaudeCompatibleConfigured: compatibleBackendIsActive(.custom)
@@ -480,6 +486,8 @@ public class APISettingsViewModel: ObservableObject {
             isOpenCodeConnected
         case .cursor:
             isCursorConnected
+        case .grokBuild:
+            isGrokCLIConnected
         case .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             false
         }
@@ -3447,6 +3455,61 @@ public class APISettingsViewModel: ObservableObject {
         if clearModels {
             availableCursorModelOptions = []
         }
+    }
+
+    // MARK: - Grok Build CLI / ACP
+
+    func testGrokCLIConnection() async throws -> Bool {
+        await CLIEnvironmentCache.shared.invalidate()
+        do {
+            let support = try await GrokACPLaunchResolver().probeSupport(for: GrokAgentConfig())
+            guard support == .supported else {
+                throw AIProviderError.invalidConfiguration(
+                    detail: support.reason ?? "Grok Build CLI ACP preflight failed."
+                )
+            }
+            isGrokCLIConnected = true
+            setContextBuilderProviderVerified(.grokBuild, verified: true)
+            grokCLIError = nil
+            UserDefaults.standard.set(true, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            return true
+        } catch {
+            isGrokCLIConnected = false
+            setContextBuilderProviderVerified(.grokBuild, verified: false)
+            grokCLIError = friendlyGrokCLIMessage(for: error)
+            UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+            await updateAvailableModels()
+            throw error
+        }
+    }
+
+    func disconnectGrokCLI() {
+        isGrokCLIConnected = false
+        setContextBuilderProviderVerified(.grokBuild, verified: false)
+        grokCLIError = nil
+        UserDefaults.standard.set(false, forKey: "GrokCLIConnected")
+        Task { await updateAvailableModels() }
+    }
+
+    private func friendlyGrokCLIMessage(for error: Error) -> String {
+        if let providerError = error as? AIProviderError,
+           case let .invalidConfiguration(detail) = providerError
+        {
+            return detail
+        }
+        let message = error.localizedDescription
+        let lowered = message.lowercased()
+        if lowered.contains("not installed") || lowered.contains("no such file") || lowered.contains("command not found") || lowered.contains("not found") {
+            return "Grok Build CLI was not found. Install Grok Build and ensure `grok` is available on PATH."
+        }
+        if lowered.contains("permission denied") {
+            return "Permission denied. Ensure the `grok` executable is accessible."
+        }
+        if lowered.contains("login") || lowered.contains("unauthorized") || lowered.contains("not authenticated") {
+            return "Grok Build CLI is not authenticated. Complete Grok login in your terminal and try again."
+        }
+        return message
     }
 
     func isCustomModelEnabled(_ modelName: String) -> Bool {

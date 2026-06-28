@@ -368,6 +368,11 @@ struct CLIProvidersSettingsView: View {
             return level.autoApprovesACPToolPermissions
                 ? "ACP auto-approve: on"
                 : "ACP auto-approve: off"
+        case .grok:
+            let level = GrokAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
+            return level.autoApprovesACPToolPermissions
+                ? "ACP auto-approve: on"
+                : "ACP auto-approve: off"
         }
     }
 
@@ -434,7 +439,7 @@ struct CLIProvidersSettingsView: View {
             } else {
                 permissionControlsUnavailableRow()
             }
-        case .openCode, .cursor:
+        case .openCode, .cursor, .grok:
             EmptyView()
         }
     }

@@ -9,6 +9,7 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
     case claude
     case openCode
     case cursor
+    case grok
 
     var secureStorageAccount: SecureStorageAccount {
         switch self {
@@ -22,6 +23,8 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
             .agentPermissionOpenCodeDocument
         case .cursor:
             .agentPermissionCursorDocument
+        case .grok:
+            .agentPermissionGrokDocument
         }
     }
 
@@ -280,6 +283,32 @@ struct SecureCursorPermissionDocument: Codable, Equatable {
     }
 }
 
+struct SecureGrokPermissionDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var updatedAt: Date
+    var permissionLevelRaw: String?
+
+    init(
+        schemaVersion: Int = currentSchemaVersion,
+        updatedAt: Date = Date(),
+        permissionLevelRaw: String? = GrokAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.permissionLevelRaw = permissionLevelRaw
+    }
+
+    static func failClosedDocument(now: Date = Date()) -> SecureGrokPermissionDocument {
+        SecureGrokPermissionDocument(updatedAt: now)
+    }
+
+    func permissionLevel() -> GrokAgentToolPreferences.PermissionLevel {
+        GrokAgentToolPreferences.PermissionLevel.from(rawValue: permissionLevelRaw)
+    }
+}
+
 final class AgentPermissionSecureStore {
     static let shared = AgentPermissionSecureStore(secureStrings: SecureKeysService())
 
@@ -295,6 +324,7 @@ final class AgentPermissionSecureStore {
     private var claudeCache: SecureClaudePermissionDocument?
     private var openCodeCache: SecureOpenCodePermissionDocument?
     private var cursorCache: SecureCursorPermissionDocument?
+    private var grokCache: SecureGrokPermissionDocument?
     private var diagnosticsByDomain: [AgentPermissionSecureDomain: AgentPermissionStorageDiagnostic] = [:]
     private let permissionDecisionAccessMode: KeychainAccessMode = .nonInteractive(reason: .permissionDecision)
 
@@ -342,6 +372,7 @@ final class AgentPermissionSecureStore {
             claudeCache = nil
             openCodeCache = nil
             cursorCache = nil
+            grokCache = nil
         }
     }
 
@@ -379,6 +410,10 @@ final class AgentPermissionSecureStore {
             var cursor = SecureCursorPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeCursor(&cursor)
             record(.cursor, resetLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects))
+
+            var grok = SecureGrokPermissionDocument.failClosedDocument(now: resetDate)
+            _ = normalizeGrok(&grok)
+            record(.grok, resetLocked(grok, domain: .grok, cache: &grokCache, deferred: &effects))
 
             return AgentPermissionStorageResetResult(
                 succeededDomains: succeededDomains,
@@ -424,6 +459,12 @@ final class AgentPermissionSecureStore {
     func cursorPermissions() -> SecureCursorPermissionDocument {
         withLockAndDeferredSideEffects { effects in
             loadCursorPermissionsLocked(deferred: &effects)
+        }
+    }
+
+    func grokPermissions() -> SecureGrokPermissionDocument {
+        withLockAndDeferredSideEffects { effects in
+            loadGrokPermissionsLocked(deferred: &effects)
         }
     }
 
@@ -485,6 +526,17 @@ final class AgentPermissionSecureStore {
     }
 
     @discardableResult
+    func updateGrokPermissions(_ mutation: (inout SecureGrokPermissionDocument) -> Void) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            var document = loadGrokPermissionsLocked(deferred: &effects)
+            mutation(&document)
+            normalizeGrok(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .grok, cache: &grokCache, deferred: &effects)
+        }
+    }
+
+    @discardableResult
     func setCodexPermissionLevel(_ level: CodexAgentToolPreferences.PermissionLevel) -> Bool {
         updateCodexPermissions { document in
             document.approvalPolicyRaw = level.approvalPolicy.persistedValue
@@ -510,6 +562,13 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func setCursorPermissionLevel(_ level: CursorAgentToolPreferences.PermissionLevel) -> Bool {
         updateCursorPermissions { document in
+            document.permissionLevelRaw = level.rawValue
+        }
+    }
+
+    @discardableResult
+    func setGrokPermissionLevel(_ level: GrokAgentToolPreferences.PermissionLevel) -> Bool {
+        updateGrokPermissions { document in
             document.permissionLevelRaw = level.rawValue
         }
     }
@@ -563,6 +622,16 @@ final class AgentPermissionSecureStore {
             cache: &cursorCache,
             failClosedDocument: SecureCursorPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeCursor,
+            deferred: &effects
+        )
+    }
+
+    private func loadGrokPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureGrokPermissionDocument {
+        loadLocked(
+            domain: .grok,
+            cache: &grokCache,
+            failClosedDocument: SecureGrokPermissionDocument.failClosedDocument(now: now()),
+            normalize: normalizeGrok,
             deferred: &effects
         )
     }
@@ -887,6 +956,21 @@ final class AgentPermissionSecureStore {
         return changed
     }
 
+    @discardableResult
+    private func normalizeGrok(_ document: inout SecureGrokPermissionDocument) -> Bool {
+        var changed = false
+        if document.schemaVersion != SecureGrokPermissionDocument.currentSchemaVersion {
+            document.schemaVersion = SecureGrokPermissionDocument.currentSchemaVersion
+            changed = true
+        }
+        let level = GrokAgentToolPreferences.PermissionLevel.from(rawValue: document.permissionLevelRaw)
+        if document.permissionLevelRaw != level.rawValue {
+            document.permissionLevelRaw = level.rawValue
+            changed = true
+        }
+        return changed
+    }
+
     // MARK: - Helpers
 
     private func supportedSchemaVersion(of document: some Any) -> Int {
@@ -901,6 +985,8 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.currentSchemaVersion
         case _ as SecureCursorPermissionDocument:
             SecureCursorPermissionDocument.currentSchemaVersion
+        case _ as SecureGrokPermissionDocument:
+            SecureGrokPermissionDocument.currentSchemaVersion
         default:
             1
         }
@@ -917,6 +1003,8 @@ final class AgentPermissionSecureStore {
         case let value as SecureOpenCodePermissionDocument:
             value.schemaVersion
         case let value as SecureCursorPermissionDocument:
+            value.schemaVersion
+        case let value as SecureGrokPermissionDocument:
             value.schemaVersion
         default:
             1
@@ -935,6 +1023,8 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.failClosedDocument(now: now())
         case .cursor:
             SecureCursorPermissionDocument.failClosedDocument(now: now())
+        case .grok:
+            SecureGrokPermissionDocument.failClosedDocument(now: now())
         }
     }
 

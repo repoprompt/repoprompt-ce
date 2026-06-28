@@ -4011,7 +4011,7 @@ final class AgentModeViewModel: ObservableObject {
                     modelContextWindow: session.codexContextUsage?.modelContextWindow
                 )
             }
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .grokBuild:
             break
         }
         session.contextUsageSnapshot = ContextUsageSnapshot.fromAgentContextUsage(
@@ -12647,7 +12647,7 @@ final class AgentModeViewModel: ObservableObject {
     ) -> String {
         guard !attachments.isEmpty else { return text }
         switch agent {
-        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor:
+        case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .openCode, .cursor, .grokBuild:
             return renderAtPathAttachmentMessage(text: text, attachments: attachments)
         case .codexExec:
             return text

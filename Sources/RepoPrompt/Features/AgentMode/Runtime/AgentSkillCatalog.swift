@@ -423,8 +423,8 @@ final class AgentSkillCatalog {
                 precedenceRank: 7
             )
 
-        case .codexExec, .openCode, .cursor:
-            // Codex, OpenCode, and Cursor continue to share only the generic `.agents` namespace.
+        case .codexExec, .openCode, .cursor, .grokBuild:
+            // Codex, OpenCode, Cursor, and Grok continue to share only the generic `.agents` namespace.
             appendWorkspaceRoots(
                 relativeRoot: ".agents/skills",
                 source: .workspaceAgentsSkills,

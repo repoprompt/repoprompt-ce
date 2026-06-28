@@ -18,6 +18,9 @@ final class AgentACPModelRegistry {
         _ snapshot: ACPDiscoveredSessionModels,
         for providerID: ACPProviderID
     ) -> Bool {
+        guard providerID != .grok else {
+            return false
+        }
         guard let providerRecord = ACPDynamicModelStore.canonicalProviderRecord(
             from: snapshot,
             providerID: providerID

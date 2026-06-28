@@ -15,6 +15,7 @@ enum CLILaunchProfiles {
         "~/.opencode/bin"
     ]
     static let cursorProviderSpecificPaths: [String] = []
+    static let grokProviderSpecificPaths: [String] = []
 
     /// Preserve the committed Codex hint order exactly: shell/package-manager
     /// fallbacks first, then Codex.app resources. System bins are intentionally not
@@ -58,6 +59,12 @@ enum CLILaunchProfiles {
         commandName: "cursor-agent",
         preferredBasenames: ["cursor-agent"],
         supplementalSearchPaths: nativeDefaultsSupplemented(with: cursorProviderSpecificPaths)
+    )
+
+    static let grok = CLILaunchProfile(
+        commandName: "grok",
+        preferredBasenames: ["grok"],
+        supplementalSearchPaths: nativeDefaultsSupplemented(with: grokProviderSpecificPaths)
     )
 
     static func nativeDefaultsSupplemented(with providerSpecificPaths: [String]) -> [String] {
