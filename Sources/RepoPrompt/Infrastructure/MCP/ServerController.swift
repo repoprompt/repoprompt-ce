@@ -148,6 +148,23 @@ final actor ServerController: ObservableObject {
                     log.warning("RepoPrompt CLI name matched but executable path verification failed for connectionID=\(connectionID)")
                 }
 
+                // Agent Mode connections from the app's own executable-verified bundled
+                // repoprompt-mcp are inherently trusted: the app itself launched the agent run
+                // (expected-PID owned / pending agent-mode policy). ACP agents proxy their own MCP
+                // client name (e.g. Grok's "grok-shell-RepoPromptCE"), which is not a "RepoPrompt
+                // CLI" name, so the bundled-CLI path above does not catch them. Auto-approve here so
+                // the injected RepoPrompt MCP server connects without a manual prompt. External MCP
+                // clients have no active agent-mode policy/affinity and fall through to approval.
+                if await isBundledRepoPromptCLIConnection(connectionID: connectionID),
+                   await networkManager.isAgentModeAdmissionTarget(connectionID: connectionID, clientName: client.name)
+                {
+                    serverControllerDebugLog("Auto-approving agent-mode bundled-CLI connection '\(client.name)'")
+                    if let service = await mcpService {
+                        await service.clientConnectedSuccessfully(name: client.name)
+                    }
+                    return true
+                }
+
                 // Per-client auto-approve when whitelisted. RepoPrompt CLI names are handled
                 // above and intentionally never bypass executable verification through this list.
                 if !isRepoCLI, await isClientAlwaysAllowed(clientID: client.name) {

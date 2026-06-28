@@ -1142,6 +1142,14 @@ actor ACPAgentSessionController {
                 return
             }
             diagnose(.unmatchedResponse(id: id.displayValue, line: rawLine))
+            if provider.providerID == .grok {
+                // Grok emits unsolicited, response-shaped events (e.g. id "skills-reload" when it
+                // reloads project skills/hooks) that do not correspond to any client request. Per
+                // JSON-RPC a peer ignores responses it cannot correlate; dropping the stray message
+                // is correct and must not terminate the active turn.
+                log("Ignoring unsolicited unmatched ACP response id \(id.displayValue) from Grok Build")
+                return
+            }
             handleProtocolViolation("Received unmatched ACP response id \(id.displayValue).")
         }
 
@@ -1512,13 +1520,52 @@ actor ACPAgentSessionController {
         #if DEBUG
             captureRawACPEvent(kind: "jsonrpc.outbound", payload: payload)
         #endif
-        let data = try JSONSerialization.data(withJSONObject: payload, options: [])
+        let serialized = try JSONSerialization.data(withJSONObject: payload, options: [])
+        // Foundation's JSONSerialization always escapes forward slashes as `\/`. That is valid
+        // JSON, but strict zero-copy parsers reject the escape in borrowed string fields: Grok's
+        // ACP `method` deserializer fails with "expected a borrowed string" and silently drops the
+        // message, so every `session/*` request (session/new, session/prompt, ...) is lost and the
+        // turn hangs. Emitting unescaped slashes is semantically identical and accepted by every
+        // ACP agent, so normalize before writing to the agent's stdin.
+        let data = Self.unescapingJSONForwardSlashes(serialized)
         var frame = data
         frame.append(0x0A)
         if let line = String(data: data, encoding: .utf8) {
             diagnose(.outboundJSON(line))
         }
         try FDWriteSupport.writeAll(frame, to: stdinDescriptor)
+    }
+
+    /// Rewrites `\/` to `/` in already-serialized JSON without touching any other escape
+    /// sequence. Foundation always escapes forward slashes; some strict agent parsers reject the
+    /// escape in borrowed string fields. Unescaping is semantically identical and universally
+    /// accepted. `\\` pairs are preserved so an escaped backslash followed by a slash is not
+    /// misread.
+    static func unescapingJSONForwardSlashes(_ data: Data) -> Data {
+        let backslash: UInt8 = 0x5C
+        let slash: UInt8 = 0x2F
+        guard data.contains(backslash) else { return data }
+        let bytes = [UInt8](data)
+        var result = [UInt8]()
+        result.reserveCapacity(bytes.count)
+        var index = 0
+        while index < bytes.count {
+            let byte = bytes[index]
+            if byte == backslash, index + 1 < bytes.count {
+                let next = bytes[index + 1]
+                if next == slash {
+                    result.append(slash)
+                } else {
+                    result.append(byte)
+                    result.append(next)
+                }
+                index += 2
+                continue
+            }
+            result.append(byte)
+            index += 1
+        }
+        return Data(result)
     }
 
     private func failPendingRequests(with error: Error) {

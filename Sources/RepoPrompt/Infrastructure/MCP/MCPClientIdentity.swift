@@ -51,6 +51,13 @@ enum MCPClientIdentity {
         }
         if matchesFamily(normalized, tokens: ["claude", "ai"]) { return "claude-ai" }
         if matchesFamily(normalized, tokens: ["repoprompt", "cli"]) { return "repoprompt-cli" }
+        // Grok's CLI names its MCP client per target server as "grok-shell-<serverName>"
+        // (e.g. "grok-shell-RepoPromptCE"). The server-name suffix is arbitrary (not a version
+        // token), so matchesFamily cannot canonicalize it. Map bare "grok" and any "grok-shell-*"
+        // to a single "grok" family so the expected-PID MCP routing affinity registered under
+        // grokMCPClientID ("grok") matches the connecting client and the injected RepoPrompt MCP
+        // server is admitted instead of timing out.
+        if normalized == "grok" || normalized.hasPrefix("grok-shell") { return "grok" }
         return nil
     }
 

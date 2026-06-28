@@ -13,6 +13,54 @@ final class ACPAgentSessionControllerModeConfigTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - ACP forward-slash escaping regression (Grok session/new)
+
+    func testUnescapingJSONForwardSlashesYieldsUnescapedMethodForStrictParsers() throws {
+        // Foundation escapes "/" as "\/"; Grok's zero-copy ACP `method` parser rejects the escape
+        // in borrowed string fields and silently drops every session/* request. The controller
+        // must emit unescaped slashes.
+        let payload: [String: Any] = [
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/new",
+            "params": ["cwd": "/Users/x/proj", "mcpServers": []]
+        ]
+        let serialized = try JSONSerialization.data(withJSONObject: payload, options: [])
+        let normalized = ACPAgentSessionController.unescapingJSONForwardSlashes(serialized)
+        let line = try XCTUnwrap(String(data: normalized, encoding: .utf8))
+        XCTAssertTrue(line.contains("\"session/new\""), "method slash must be unescaped: \(line)")
+        XCTAssertFalse(line.contains("\\/"), "no escaped slashes should remain: \(line)")
+        let reparsed = try JSONSerialization.jsonObject(with: normalized) as? [String: Any]
+        XCTAssertEqual(reparsed?["method"] as? String, "session/new")
+    }
+
+    func testUnescapingJSONForwardSlashesPreservesBackslashAndOtherEscapes() throws {
+        // "\\" pairs and non-slash escapes must be preserved; only "\/" collapses to "/".
+        let payload: [String: Any] = ["p": #"a\/b"#, "q": "l1\nl2", "path": "/x/y"]
+        let serialized = try JSONSerialization.data(withJSONObject: payload, options: [])
+        let normalized = ACPAgentSessionController.unescapingJSONForwardSlashes(serialized)
+        let reparsed = try JSONSerialization.jsonObject(with: normalized) as? [String: Any]
+        XCTAssertEqual(reparsed?["p"] as? String, #"a\/b"#)
+        XCTAssertEqual(reparsed?["q"] as? String, "l1\nl2")
+        XCTAssertEqual(reparsed?["path"] as? String, "/x/y")
+    }
+
+    // MARK: - Grok MCP client identity family regression
+
+    func testGrokShellMCPClientNameCanonicalizesToGrokFamily() {
+        // Grok proxies its MCP client identity as "grok-shell-<serverName>" (e.g. the injected
+        // RepoPromptCE server). It must canonicalize to the "grok" family so the expected-PID MCP
+        // routing policy registered under grokMCPClientID ("grok") admits the connection instead of
+        // falling through to a manual approval prompt.
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok-shell-RepoPromptCE"), "grok")
+        XCTAssertEqual(MCPClientIdentity.canonicalFamilyID("grok"), "grok")
+        XCTAssertTrue(MCPClientIdentity.matches("grok", "grok-shell-RepoPromptCE"))
+        XCTAssertTrue(MCPClientIdentity.sameFamily("grok", "grok-shell-anything"))
+        // Unrelated names must not collide with the grok family.
+        XCTAssertNil(MCPClientIdentity.canonicalFamilyID("grokfoo"))
+        XCTAssertNotEqual(MCPClientIdentity.canonicalFamilyID("cursor"), "grok")
+    }
+
     func testSessionOpenRoutesInjectMCPAndUseModernModeConfiguration() async throws {
         let cases = [
             SessionOpenRouteCase(

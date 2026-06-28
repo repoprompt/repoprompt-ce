@@ -3145,6 +3145,19 @@ actor ServerNetworkManager {
         return preferredExpectedPIDRunAffinity(for: clientName, clientPid: clientPid) != nil
     }
 
+    /// Whether a connection corresponds to an active Agent Mode run (pending agent-mode policy or
+    /// live / expected-PID run affinity). The connection approval handler uses this to auto-approve
+    /// the app's own agent-launched, executable-verified bundled `repoprompt-mcp` connections: an
+    /// ACP agent proxies its own MCP client name (e.g. Grok's "grok-shell-RepoPromptCE"), which is
+    /// not a "RepoPrompt CLI" name, so the bundled-CLI auto-approve path does not catch it and the
+    /// connection would otherwise hang on a manual approval prompt. External MCP clients have no
+    /// active agent-mode policy/affinity and are intentionally not matched here.
+    func isAgentModeAdmissionTarget(connectionID: UUID, clientName: String) async -> Bool {
+        let sessionKey = connections[connectionID]?.capabilityToken ?? capabilityTokenByConnection[connectionID]
+        let clientPid = await peerPID(for: connectionID)
+        return hasAgentPolicyAdmissionTarget(clientName: clientName, sessionKey: sessionKey, clientPid: clientPid)
+    }
+
     private func hasPendingAgentBootstrapIntent(
         clientName: String,
         sessionKey: String?,

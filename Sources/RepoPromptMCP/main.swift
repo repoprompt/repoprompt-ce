@@ -2122,11 +2122,13 @@ actor MCPService: Service {
                     ))
                 }
 
-                // PPID watchdog - detect orphaned CLI when parent dies
-                group.addTask {
-                    try await self.runPPIDWatchdog(initialPPID: initialPPID)
-                    return .ppidWatchdogCancelled
-                }
+                // Liveness is driven only by authoritative connection signals raced here: the
+                // host transport (stdin/stdout EOF when the launching agent dies) and the app's
+                // explicit kill-signal channel (run-lifecycle teardown). The OS parent PID is NOT a
+                // reliable liveness proxy — agents with non-trivial process models (re-exec, fork,
+                // leader/daemon handoff, e.g. Grok) legitimately reparent this CLI while the session
+                // is still alive, which a parent-PID watchdog would misread as an orphan and wrongly
+                // disconnect. `initialPPID` is retained for diagnostics in terminal records only.
 
                 // Main transport task
                 group.addTask {
@@ -2190,22 +2192,6 @@ actor MCPService: Service {
             record,
             to: MCPFilesystemConstants.eventsDirectoryURL()
         )
-    }
-
-    /// Monitors the parent process ID. If it changes (reparented to init/launchd),
-    /// the host process died and we should exit cleanly.
-    private func runPPIDWatchdog(initialPPID: pid_t) async throws {
-        // Check every 5 seconds - balance between responsiveness and CPU usage
-        while !Task.isCancelled {
-            try await Task.sleep(for: .seconds(5))
-
-            let currentPPID = getppid()
-            if currentPPID != initialPPID {
-                // Parent changed - we've been orphaned (typically reparented to PID 1)
-                log.notice("CLI: Parent process died (PPID changed from \(initialPPID) to \(currentPPID)), exiting")
-                throw CLIRuntimeError.hostDisconnected(.parentProcessChanged(initialPPID: initialPPID, currentPPID: currentPPID))
-            }
-        }
     }
 
     // MARK: - Reconnection Logic
