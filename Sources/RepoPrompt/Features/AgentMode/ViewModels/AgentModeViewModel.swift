@@ -567,6 +567,7 @@ final class AgentModeViewModel: ObservableObject {
     private let mcpServerEnabler: MCPServerEnabler
     private let mcpRunRoutingCleaner: MCPRunRoutingCleaner
     private let mcpRunToolCanceller: MCPRunToolCanceller
+    private var runBlockerRegistry: RunBlockerRegistry
     let codexCoordinator: CodexAgentModeCoordinator
     let claudeCoordinator: ClaudeAgentModeCoordinator
     let providerBindingService: AgentModeProviderBindingService
@@ -1539,18 +1540,29 @@ final class AgentModeViewModel: ObservableObject {
         }
         shouldManageCodexTooling = true
         usesProductionAgentDefaultsAndModelPolling = true
+        let initialRunBlockerRegistry = RunBlockerRegistry(
+            awaitNoActiveMCPTools: { [weak mcpServer] runID in
+                guard let mcpServer else { return }
+                try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
+            },
+            hasActiveMCPTools: { [weak mcpServer] runID in
+                mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
+            },
+            toolEndedCount: { [weak mcpServer] runID in
+                mcpServer?.toolEndedCount(runID: runID) ?? 0
+            },
+            hasActiveChildAgentRunWaits: { [weak mcpServer] runID in
+                mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            }
+        )
+        runBlockerRegistry = initialRunBlockerRegistry
         codexCoordinator = CodexAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
             codexControllerFactory: codexControllerFactory,
             connectionPolicyInstaller: connectionPolicyInstaller,
             shouldManageCodexTooling: true,
-            activeToolQuery: { [weak mcpServer] runID in
-                mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
-            },
-            activeAgentRunWaitQuery: { [weak mcpServer] runID in
-                mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
-            },
+            runBlockers: initialRunBlockerRegistry,
             stallWatchdogProbeThreshold: 90,
             stallWatchdogRecoveryThreshold: 300,
             initialLastUsedReasoningEffort: CodexAgentToolPreferences.lastUsedReasoningEffort(),
@@ -1559,33 +1571,37 @@ final class AgentModeViewModel: ObservableObject {
         claudeCoordinator = ClaudeAgentModeCoordinator(
             windowID: windowID,
             workspacePathProvider: sessionWorkspacePathProvider,
+            runBlockers: initialRunBlockerRegistry
+        )
+        self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
+        providerBindingService = AgentModeProviderBindingService()
+        runBlockerRegistry = RunBlockerRegistry(
             awaitNoActiveMCPTools: { [weak mcpServer] runID in
                 guard let mcpServer else { return }
                 try await mcpServer.awaitNoActiveToolExecutions(runID: runID)
             },
-            toolEndedCount: { [weak mcpServer] runID in
-                mcpServer?.toolEndedCount(runID: runID) ?? 0
-            },
             hasActiveMCPTools: { [weak mcpServer] runID in
                 mcpServer?.hasActiveToolExecutions(runID: runID) ?? false
             },
+            toolEndedCount: { [weak mcpServer] runID in
+                mcpServer?.toolEndedCount(runID: runID) ?? 0
+            },
             hasActiveChildAgentRunWaits: { [weak mcpServer] runID in
                 mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+            },
+            drainChildAgentRunWaits: { [weak self] runID, source in
+                guard let self, let mcpServer = self.mcpServer else { return true }
+                return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
+                    runID: runID,
+                    source: source,
+                    timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
+                    publicationForSessionID: { [weak self] childSessionID in
+                        self?.mcpWaitPublication(sessionID: childSessionID)
+                    }
+                )
             }
         )
-        self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
-        providerBindingService = AgentModeProviderBindingService()
-        codexCoordinator.setActiveAgentRunWaitDrain { [weak self] runID, source in
-            guard let self, let mcpServer = self.mcpServer else { return true }
-            return await mcpServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
-                runID: runID,
-                source: source,
-                timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
-                publicationForSessionID: { [weak self] childSessionID in
-                    self?.mcpWaitPublication(sessionID: childSessionID)
-                }
-            )
-        }
+        codexCoordinator.setRunBlockerRegistry(runBlockerRegistry)
         codexCoordinator.attach(viewModel: self)
         claudeCoordinator.attach(viewModel: self)
         runInteractionStateObserver = codexCoordinator
@@ -1716,21 +1732,23 @@ final class AgentModeViewModel: ObservableObject {
             } else {
                 max(testWatchdogProbeThreshold, legacyWatchdogThreshold ?? 0)
             }
-            codexCoordinator = CodexAgentModeCoordinator(
-                windowID: testWindowID,
-                workspacePathProvider: sessionWorkspacePathProvider,
-                codexControllerFactory: codexControllerFactory,
-                connectionPolicyInstaller: connectionPolicyInstaller,
-                shouldManageCodexTooling: shouldManageCodexTooling,
-                activeToolQuery: testCodexActiveToolQuery
+            let codexRunBlockerRegistry = RunBlockerRegistry(
+                awaitNoActiveMCPTools: { [weak testMCPServer] runID in
+                    guard let testMCPServer else { return }
+                    try await testMCPServer.awaitNoActiveToolExecutions(runID: runID)
+                },
+                hasActiveMCPTools: testCodexActiveToolQuery
                     ?? { [weak testMCPServer] runID in
                         testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
                     },
-                activeAgentRunWaitQuery: testCodexActiveAgentRunWaitQuery
+                toolEndedCount: { [weak testMCPServer] runID in
+                    testMCPServer?.toolEndedCount(runID: runID) ?? 0
+                },
+                hasActiveChildAgentRunWaits: testCodexActiveAgentRunWaitQuery
                     ?? { [weak testMCPServer] runID in
                         testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
                     },
-                activeAgentRunWaitDrain: testCodexActiveAgentRunWaitDrain
+                drainChildAgentRunWaits: testCodexActiveAgentRunWaitDrain
                     ?? { [weak testMCPServer] runID, source in
                         guard let testMCPServer else { return true }
                         return await testMCPServer.wakeAndDrainAgentRunWaitersOwnedByActiveRun(
@@ -1739,7 +1757,30 @@ final class AgentModeViewModel: ObservableObject {
                             timeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds,
                             publicationForSessionID: { _ in nil }
                         )
-                    },
+                    }
+            )
+            runBlockerRegistry = RunBlockerRegistry(
+                awaitNoActiveMCPTools: { [weak testMCPServer] runID in
+                    guard let testMCPServer else { return }
+                    try await testMCPServer.awaitNoActiveToolExecutions(runID: runID)
+                },
+                hasActiveMCPTools: { [weak testMCPServer] runID in
+                    testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
+                },
+                toolEndedCount: { [weak testMCPServer] runID in
+                    testMCPServer?.toolEndedCount(runID: runID) ?? 0
+                },
+                hasActiveChildAgentRunWaits: { [weak testMCPServer] runID in
+                    testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
+                }
+            )
+            codexCoordinator = CodexAgentModeCoordinator(
+                windowID: testWindowID,
+                workspacePathProvider: sessionWorkspacePathProvider,
+                codexControllerFactory: codexControllerFactory,
+                connectionPolicyInstaller: connectionPolicyInstaller,
+                shouldManageCodexTooling: shouldManageCodexTooling,
+                runBlockers: codexRunBlockerRegistry,
                 leaseRoutingTimeoutMs: testCodexLeaseRoutingTimeoutMs ?? 2000,
                 idleShutdownDelayNanos: testCodexIdleShutdownDelayNanos ?? 300_000_000_000,
                 stallWatchdogPollIntervalNanos: testCodexStallWatchdogPollIntervalNanos ?? 5_000_000_000,
@@ -1753,15 +1794,7 @@ final class AgentModeViewModel: ObservableObject {
                 windowID: testWindowID,
                 workspacePathProvider: sessionWorkspacePathProvider,
                 claudeControllerFactory: claudeControllerFactory,
-                toolEndedCount: { [weak testMCPServer] runID in
-                    testMCPServer?.toolEndedCount(runID: runID) ?? 0
-                },
-                hasActiveMCPTools: { [weak testMCPServer] runID in
-                    testMCPServer?.hasActiveToolExecutions(runID: runID) ?? false
-                },
-                hasActiveChildAgentRunWaits: { [weak testMCPServer] runID in
-                    testMCPServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
-                }
+                runBlockers: runBlockerRegistry
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
             providerBindingService = AgentModeProviderBindingService()
@@ -2053,13 +2086,7 @@ final class AgentModeViewModel: ObservableObject {
             cancelMCPToolsForRun: { [weak self] runID, reason in
                 self?.cancelActiveToolsForRun(runID: runID, reason: reason)
             },
-            awaitNoActiveMCPTools: { [weak self] runID in
-                guard let self, let mcp = mcpServer else { return }
-                try await mcp.awaitNoActiveToolExecutions(runID: runID)
-            },
-            activeAgentRunWaitQuery: { [weak self] runID in
-                self?.mcpServer?.hasActiveChildAgentRunWaits(runID: runID) ?? false
-            },
+            runBlockers: runBlockerRegistry,
             childAgentRunWaitDrainTimeoutSeconds: Self.childAgentRunWaitDrainTimeoutSeconds
         )
         let hooks = AgentModeRunService.Hooks(
@@ -5208,6 +5235,75 @@ final class AgentModeViewModel: ObservableObject {
         }
         // Fall back to persisted
         return try await AgentSessionDataService.shared.resolveAgentSessionID(reference: trimmed, for: workspace)
+    }
+
+    func mcpCancelTreeSessionIDs(rootSessionID: UUID) -> [UUID] {
+        struct LineageCandidate {
+            let sessionID: UUID
+            let parentSessionID: UUID?
+            let date: Date
+        }
+
+        var activeWorkspaceSessionIDByTabID: [UUID: UUID] = [:]
+        if let workspace = workspaceManager?.activeWorkspace {
+            for tab in workspace.composeTabs {
+                if let sessionID = tab.activeAgentSessionID {
+                    activeWorkspaceSessionIDByTabID[tab.id] = sessionID
+                }
+            }
+            for stashed in workspace.stashedTabs {
+                if let sessionID = stashed.tab.activeAgentSessionID {
+                    activeWorkspaceSessionIDByTabID[stashed.tab.id] = sessionID
+                }
+            }
+        }
+
+        let liveCandidates = sessions.values.compactMap { session -> LineageCandidate? in
+            guard let sessionID = session.activeAgentSessionID,
+                  mcpLiveSessionBelongsToActiveWorkspace(session)
+            else { return nil }
+            return LineageCandidate(
+                sessionID: sessionID,
+                parentSessionID: session.parentSessionID,
+                date: session.lastActivityAt
+            )
+        }
+        .sorted {
+            if $0.date != $1.date { return $0.date < $1.date }
+            return $0.sessionID.uuidString < $1.sessionID.uuidString
+        }
+
+        var seenSessionIDs = Set<UUID>()
+        var nodes: [AgentSessionLineageIndex.Node] = []
+        for candidate in liveCandidates where seenSessionIDs.insert(candidate.sessionID).inserted {
+            nodes.append(.init(sessionID: candidate.sessionID, parentSessionID: candidate.parentSessionID))
+        }
+
+        let indexedCandidates = ownerValidatedSessionIndex.values
+            .filter { !seenSessionIDs.contains($0.id) && activeWorkspaceSessionIDByTabID[$0.tabID] == $0.id }
+            .sorted {
+                if $0.savedAt != $1.savedAt { return $0.savedAt < $1.savedAt }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        for entry in indexedCandidates where seenSessionIDs.insert(entry.id).inserted {
+            nodes.append(.init(sessionID: entry.id, parentSessionID: entry.parentSessionID))
+        }
+
+        let lineage = AgentSessionLineageIndex(nodes: nodes)
+        let orderedSessionIDs = lineage.descendantSessionIDsChildFirst(of: rootSessionID, includeSelf: true)
+        return orderedSessionIDs.isEmpty ? [rootSessionID] : orderedSessionIDs
+    }
+
+    func mcpLiveSessionBelongsToActiveWorkspace(_ session: TabSession) -> Bool {
+        guard let workspace = workspaceManager?.activeWorkspace,
+              let sessionID = session.activeAgentSessionID
+        else { return false }
+        let tabID = session.tabID
+        return workspace.composeTabs.contains { tab in
+            tab.id == tabID && tab.activeAgentSessionID == sessionID
+        } || workspace.stashedTabs.contains { stashed in
+            stashed.tab.id == tabID && stashed.tab.activeAgentSessionID == sessionID
+        }
     }
 
     func mcpValidateAgentRunSpawnAllowed(

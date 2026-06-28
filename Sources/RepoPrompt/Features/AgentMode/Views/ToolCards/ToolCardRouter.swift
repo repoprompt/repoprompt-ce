@@ -571,6 +571,11 @@ private enum ToolCardSubtitleBuilder {
                         return "stop • \(sessionID)"
                     }
                     return "stop session"
+                case "cancel_tree":
+                    if let sessionID = args.sessionID, !sessionID.isEmpty {
+                        return "cancel tree • \(sessionID)"
+                    }
+                    return "cancel tree"
                 case "cleanup_sessions":
                     return "cleanup sessions"
                 default:

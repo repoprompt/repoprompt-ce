@@ -162,9 +162,23 @@ jobs:
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
           SOURCE_GH_TOKEN: ${{ github.token }}
           PUBLIC_UPDATE_GH_TOKEN: ${{ secrets.PUBLIC_UPDATE_REPOSITORY_TOKEN }}
+          PUBLIC_UPDATE_REPOSITORY: ${{ vars.PUBLIC_UPDATE_REPOSITORY }}
           RELEASE_COMMIT: ${{ needs.validate-ref.outputs.commit }}
           RELEASE_TAG: ${{ inputs.tag }}
           REVIEWED_CHECKSUMS_SHA256: ${{ inputs.reviewed_checksums_sha256 }}
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
         run: ./trusted-control-plane/Scripts/promote_release.sh promote
+
+      - name: Update Homebrew cask
+        env:
+          REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
+          REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          PUBLIC_UPDATE_REPOSITORY: ${{ vars.PUBLIC_UPDATE_REPOSITORY }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          HOMEBREW_TAP_GH_TOKEN: ${{ secrets.HOMEBREW_TAP_REPOSITORY_TOKEN }}
+          HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}
+          HOMEBREW_TAP_BRANCH: ${{ vars.HOMEBREW_TAP_BRANCH }}
+          HOMEBREW_CASK_PATH: ${{ vars.HOMEBREW_CASK_PATH }}
+          HOMEBREW_CASK_TOKEN: ${{ vars.HOMEBREW_CASK_TOKEN }}
+        run: ./trusted-control-plane/Scripts/update_homebrew_cask.sh update

@@ -353,6 +353,7 @@ struct AgentManageResultCard: View {
         case "create_session": "Create Session"
         case "resume_session": "Resume Session"
         case "stop_session": "Stop Session"
+        case "cancel_tree": "Cancel Tree"
         case "cleanup_sessions": "Cleanup Sessions"
         case "list_workflows": "List Workflows"
         default: "Agent Manage"
@@ -382,6 +383,10 @@ struct AgentManageResultCard: View {
             }
         case "create_session", "resume_session", "stop_session":
             return (resultObject["name"] as? String)?.nonEmpty
+        case "cancel_tree":
+            let cancelled = resultObject["cancelled_count"] as? Int ?? 0
+            let skipped = resultObject["skipped_count"] as? Int ?? 0
+            return "\(cancelled) cancelled, \(skipped) skipped"
         case "cleanup_sessions":
             let deleted = resultObject["deleted_count"] as? Int ?? 0
             let skipped = resultObject["skipped_count"] as? Int ?? 0

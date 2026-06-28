@@ -131,28 +131,16 @@ struct AgentModeSidebarAutoArchivePolicy {
     }
 
     private func threadGroups(for sessions: [AgentModeViewModel.SidebarSession]) -> [ThreadGroup] {
-        let rowBySessionID = Dictionary(
-            sessions.compactMap { row -> (UUID, AgentModeViewModel.SidebarSession)? in
+        let lineage = AgentSessionLineageIndex(
+            nodes: sessions.compactMap { row in
                 guard let sessionID = row.sessionID else { return nil }
-                return (sessionID, row)
-            },
-            uniquingKeysWith: { existing, _ in existing }
+                return .init(sessionID: sessionID, parentSessionID: row.parentSessionID)
+            }
         )
 
         func root(for row: AgentModeViewModel.SidebarSession) -> GroupRoot {
             guard let sessionID = row.sessionID else { return .tab(row.tabID) }
-            var cursor = sessionID
-            var visited: Set<UUID> = [sessionID]
-            while let parentID = rowBySessionID[cursor]?.parentSessionID,
-                  parentID != cursor,
-                  rowBySessionID[parentID] != nil
-            {
-                guard visited.insert(parentID).inserted else {
-                    return .session(sessionID)
-                }
-                cursor = parentID
-            }
-            return .session(cursor)
+            return .session(lineage.rootSessionID(for: sessionID) ?? sessionID)
         }
 
         var groupsByRoot: [GroupRoot: ThreadGroup] = [:]

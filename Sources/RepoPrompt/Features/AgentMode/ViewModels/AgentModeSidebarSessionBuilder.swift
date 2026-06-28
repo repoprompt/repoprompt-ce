@@ -470,11 +470,14 @@ struct AgentModeSidebarSessionBuilder {
     /// during persisted restore while still surfacing limited thread structure.
     private func sidebarSessionsPreservingFlatOrder(_ flat: [SidebarSession]) -> [SidebarSession] {
         var sessionIDToIndex: [UUID: Int] = [:]
+        var lineageNodes: [AgentSessionLineageIndex.Node] = []
         for (index, session) in flat.enumerated() {
-            if let sessionID = session.sessionID {
+            if let sessionID = session.sessionID, sessionIDToIndex[sessionID] == nil {
                 sessionIDToIndex[sessionID] = index
+                lineageNodes.append(.init(sessionID: sessionID, parentSessionID: session.parentSessionID))
             }
         }
+        let lineage = AgentSessionLineageIndex(nodes: lineageNodes)
 
         var cachedDepthByIndex: [Int: Int] = [:]
         var visiting = Set<Int>()
@@ -483,9 +486,8 @@ struct AgentModeSidebarSessionBuilder {
             if let cached = cachedDepthByIndex[index] {
                 return cached
             }
-            guard let parentSessionID = flat[index].parentSessionID,
-                  let sessionID = flat[index].sessionID,
-                  parentSessionID != sessionID,
+            guard let sessionID = flat[index].sessionID,
+                  let parentSessionID = lineage.parentSessionID(of: sessionID),
                   let parentIndex = sessionIDToIndex[parentSessionID],
                   parentIndex < index,
                   !visiting.contains(index)
@@ -513,42 +515,24 @@ struct AgentModeSidebarSessionBuilder {
         from flat: [SidebarSession],
         tabOrder: [UUID: Int]
     ) -> [SidebarSession] {
-        // Build lookup: sessionID -> index in flat list
-        var sessionIDToIndex: [UUID: Int] = [:]
-        for (i, session) in flat.enumerated() {
+        var lineageNodes: [AgentSessionLineageIndex.Node] = []
+        for session in flat {
             if let sid = session.sessionID {
-                sessionIDToIndex[sid] = i
+                lineageNodes.append(.init(sessionID: sid, parentSessionID: session.parentSessionID))
             }
         }
+        let lineage = AgentSessionLineageIndex(nodes: lineageNodes)
 
-        // Determine parent-child relationships
-        // A session is a child if: parentSessionID != nil, parent is in the visible set,
-        // parent != self, and attaching wouldn't create a cycle.
+        // Determine parent-child relationships from validated lineage edges.
         var childrenByParent: [UUID: [Int]] = [:] // parentSessionID -> [child flat indices]
         var isChild = Set<Int>()
 
         for (i, session) in flat.enumerated() {
-            guard let parentSID = session.parentSessionID,
-                  let selfSID = session.sessionID,
-                  parentSID != selfSID,
-                  sessionIDToIndex[parentSID] != nil
+            guard let selfSID = session.sessionID,
+                  let parentSID = lineage.parentSessionID(of: selfSID)
             else {
                 continue
             }
-            // Cycle detection: walk parent chain
-            var visited: Set<UUID> = [selfSID]
-            var cursor: UUID? = parentSID
-            var hasCycle = false
-            while let c = cursor {
-                if visited.contains(c) { hasCycle = true
-                    break
-                }
-                visited.insert(c)
-                let parentSession = sessionIDToIndex[c].flatMap { flat[$0] }
-                cursor = parentSession?.parentSessionID
-            }
-            guard !hasCycle else { continue }
-
             childrenByParent[parentSID, default: []].append(i)
             isChild.insert(i)
         }

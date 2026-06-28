@@ -1545,6 +1545,21 @@ enum AgentTranscriptToolNormalizer {
             return item.text.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         let toolName = normalizedToolName(item.toolName) ?? item.toolName ?? "tool"
+        if toolName == "agent_run" || toolName == "agent_explore",
+           let resultObject = jsonObject(from: item.toolResultJSON)
+        {
+            if let summaryText = stringValue(resultObject, keys: ["summary_text", "summaryText"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summaryText.isEmpty
+            {
+                return summaryText
+            }
+            if let deliverableObject = resultObject["deliverable"] as? [String: Any],
+               let summary = stringValue(deliverableObject, keys: ["summary"])?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !summary.isEmpty
+            {
+                return "\(toolName) • \(status.rawValue) • \(summary)"
+            }
+        }
         let pathSummary = keyPaths.prefix(3).joined(separator: ", ")
         if !pathSummary.isEmpty {
             return "\(toolName) • \(status.rawValue) • \(pathSummary)"

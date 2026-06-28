@@ -222,6 +222,7 @@ Add these environment secrets:
 | `NOTARYTOOL_ISSUER_ID` | App Store Connect API issuer ID. |
 | `SPARKLE_PRIVATE_KEY` | Modern Sparkle EdDSA private-key seed for the CE update channel. It must decode from base64 to exactly 32 bytes. |
 | `PUBLIC_UPDATE_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to `repoprompt/repoprompt-ce-updates` with repository contents read/write permission. |
+| `HOMEBREW_TAP_REPOSITORY_TOKEN` | Fine-grained GitHub token scoped only to the Homebrew tap repository with repository contents read/write permission. |
 
 The optional `SIGN_IDENTITY` environment variable defaults to:
 
@@ -242,6 +243,18 @@ source-repository `github.token`. Keep its repository scope narrow: the
 promotion workflow needs to create and publish GitHub Releases in the public
 artifact-only update repository, but it does not need broader organization
 permissions.
+
+`HOMEBREW_TAP_REPOSITORY_TOKEN` is also intentionally separate. Scope it only to
+the Homebrew tap repository that should receive cask commits. Configure these
+optional environment variables when the defaults do not match your tap:
+
+| Variable | Default |
+| --- | --- |
+| `HOMEBREW_TAP_REPOSITORY` | `z23cc/homebrew-tap` |
+| `HOMEBREW_TAP_BRANCH` | `main` |
+| `HOMEBREW_CASK_PATH` | `Casks/repoprompt-ce.rb` |
+| `HOMEBREW_CASK_TOKEN` | `repoprompt-ce` |
+| `PUBLIC_UPDATE_REPOSITORY` | `repoprompt/repoprompt-ce-updates` |
 
 App Store Connect organization API access must be enabled before generating the
 notarization `.p8` key. If **Users and Access → Integrations → App Store Connect
@@ -412,33 +425,37 @@ The promotion gate confirms:
 - The reviewed external artifact manifest regenerates exactly from both ZIP and
   DMG app contents and is mirrored unchanged to the public updater release.
 
-## Post-promote Homebrew tap checks
+## Homebrew tap publication
 
-RepoPrompt CE is also distributed through the
-[`repoprompt/homebrew-repoprompt-ce`](https://github.com/repoprompt/homebrew-repoprompt-ce)
-tap. After **Promote Release** succeeds, verify the tap before announcing
-Homebrew availability for that version.
+RepoPrompt CE is also distributed through a Homebrew tap. After **Promote
+Release** verifies and publishes the source and updater releases,
+`Scripts/update_homebrew_cask.sh` updates the configured tap cask.
 
-1. Confirm the updater release for the promoted tag contains the expected
-   `RepoPrompt-<version>-<build>.zip`, `appcast.xml`, and `SHA256SUMS` assets.
-2. Confirm `Casks/repoprompt-ce.rb` in the tap points at the tag-specific
-   updater ZIP, not a `latest/download` URL.
-3. Confirm the cask version encodes both `MARKETING_VERSION` and `BUILD_NUMBER`
-   as `<version>,<build>`.
-4. Confirm the cask `sha256` matches the promoted ZIP entry in the updater
-   release's `SHA256SUMS`.
-5. Run an install smoke:
+The workflow derives the cask values from the promoted release state:
 
-   ```bash
-   brew tap repoprompt/repoprompt-ce
-   brew install --cask repoprompt-ce
-   ```
+- `version` becomes `<MARKETING_VERSION>,<BUILD_NUMBER>`.
+- `url` points at the tag-specific updater ZIP:
+  `https://github.com/<PUBLIC_UPDATE_REPOSITORY>/releases/download/<tag>/RepoPrompt-<version>-<build>.zip`.
+- `sha256` is copied from the promoted updater release's `SHA256SUMS` entry for
+  that ZIP.
 
-6. Confirm Homebrew installed `/Applications/RepoPrompt CE.app`.
+The cask update refuses `latest/download` URLs and commits only the tap checkout.
+It does not need Developer ID, notarization, Sparkle, or source-repository
+write secrets. By default it publishes the cask commit to
+`z23cc/homebrew-tap`; set `HOMEBREW_TAP_REPOSITORY` only if that tap changes.
+Store `HOMEBREW_TAP_REPOSITORY_TOKEN` in the protected `release` environment.
 
-If the tap lags the promoted release, update only the tap repository. The
-source repository's protected `release` environment and release workflows do
-not need Homebrew signing, notarization, or Sparkle secrets.
+After promotion, verify Homebrew availability before announcement:
+
+```bash
+brew tap z23cc/tap
+brew install --cask repoprompt-ce
+```
+
+Confirm Homebrew installed `/Applications/RepoPrompt CE.app`. If the tap update
+fails after release promotion, rerun `Scripts/update_homebrew_cask.sh update`
+against the tap or update only the tap repository; do not rebuild, re-sign, or
+re-promote release assets just to repair the cask.
 
 ## Recovery
 

@@ -379,6 +379,11 @@ struct AgentRunMCPSnapshot: Equatable {
         }
         if let latestAssistantPreview, !latestAssistantPreview.isEmpty {
             obj["assistant_text"] = .string(latestAssistantPreview)
+            if status.isTerminal,
+               let deliverable = ChildAgentDeliverable.fromAssistantText(latestAssistantPreview)
+            {
+                obj["deliverable"] = .object(deliverable.asValueObject())
+            }
         }
         if let interaction {
             obj["interaction"] = .object(interaction.asObject())

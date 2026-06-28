@@ -53,6 +53,157 @@ final class AgentToolResultPersistencePolicyTests: XCTestCase {
         }
     }
 
+    func testAgentRunPersistsMarkdownDeliverableSummary() throws {
+        let raw = jsonString([
+            "status": "completed",
+            "session_id": "session-123",
+            "assistant_text": """
+            ## Summary
+            Implemented child deliverable projection.
+
+            ## Changed Files
+            - Sources/RepoPrompt/File.swift
+            - Tests/RepoPromptTests/FileTests.swift
+
+            ## Evidence
+            - Focused tests pass
+
+            ## Confidence
+            medium
+            """
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_run", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+        let deliverable = try XCTUnwrap(object["deliverable"] as? [String: Any])
+
+        XCTAssertTrue(summary.summaryOnly)
+        XCTAssertEqual(object["summary_text"] as? String, "agent_run • completed • Implemented child deliverable projection.")
+        XCTAssertEqual(deliverable["summary"] as? String, "Implemented child deliverable projection.")
+        XCTAssertEqual(deliverable["changed_files"] as? [String], ["Sources/RepoPrompt/File.swift", "Tests/RepoPromptTests/FileTests.swift"])
+        XCTAssertEqual(deliverable["evidence"] as? [String], ["Focused tests pass"])
+        XCTAssertEqual(deliverable["confidence"] as? String, "medium")
+        XCTAssertLessThanOrEqual((object["assistant_text"] as? String)?.count ?? 0, 240)
+        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+    }
+
+    func testRunningAgentRunAssistantTextDoesNotPersistDerivedDeliverable() throws {
+        let raw = jsonString([
+            "status": "running",
+            "assistant_text": """
+            ## Summary
+            This is only a live preview.
+
+            ## Findings
+            - Preliminary note
+            """
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_run", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+
+        XCTAssertEqual(object["status"] as? String, "running")
+        XCTAssertNil(object["deliverable"])
+        XCTAssertNil(object["summary_text"])
+        XCTAssertNotNil(object["assistant_text"])
+    }
+
+    func testNullOnlyStructuredDeliverableDoesNotCreatePersistedDeliverable() throws {
+        let raw = jsonString([
+            "status": "completed",
+            "deliverable": [
+                "summary": NSNull(),
+                "findings": [NSNull()],
+                "changed_files": [NSNull()],
+                "evidence": [NSNull()],
+                "blockers": [NSNull()],
+                "confidence": NSNull(),
+                "recommended_next_action": NSNull(),
+                "report_path": NSNull(),
+                "export_path": NSNull()
+            ]
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_run", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+
+        XCTAssertEqual(object["status"] as? String, "completed")
+        XCTAssertNil(object["deliverable"])
+        XCTAssertNil(object["summary_text"])
+        XCTAssertFalse(summary.resultJSON.contains("<null>"))
+    }
+
+    func testStructuredDeliverableIgnoresNullArrayEntriesAndArbitraryObjects() throws {
+        let raw = jsonString([
+            "status": "completed",
+            "deliverable": [
+                "summary": "Safe summary",
+                "findings": [NSNull(), "Finding A", ["nested": "ignored"], 42, true],
+                "changed_files": [NSNull(), "Sources/File.swift", ["path": "ignored"]],
+                "confidence": NSNull()
+            ]
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_run", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+        let deliverable = try XCTUnwrap(object["deliverable"] as? [String: Any])
+
+        XCTAssertEqual(deliverable["summary"] as? String, "Safe summary")
+        XCTAssertEqual(deliverable["findings"] as? [String], ["Finding A", "42", "true"])
+        XCTAssertEqual(deliverable["changed_files"] as? [String], ["Sources/File.swift"])
+        XCTAssertNil(deliverable["confidence"])
+        XCTAssertFalse(summary.resultJSON.contains("<null>"))
+        XCTAssertFalse(summary.resultJSON.contains("nested"))
+        XCTAssertFalse(summary.resultJSON.contains("ignored"))
+    }
+
+    func testAgentRunPersistsStructuredDeliverableAndOutputPath() throws {
+        let raw = jsonString([
+            "status": "completed",
+            "output_path": "/tmp/export.md",
+            "deliverable": [
+                "summary": "Wrote a report.",
+                "findings": ["Finding A"],
+                "report_path": "/tmp/report.md",
+                "recommended_next_action": "Review report"
+            ]
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_explore", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+        let deliverable = try XCTUnwrap(object["deliverable"] as? [String: Any])
+
+        XCTAssertEqual(object["summary_text"] as? String, "agent_explore • completed • Wrote a report.")
+        XCTAssertEqual(deliverable["source"] as? String, "structured")
+        XCTAssertEqual(deliverable["summary"] as? String, "Wrote a report.")
+        XCTAssertEqual(deliverable["findings"] as? [String], ["Finding A"])
+        XCTAssertEqual(deliverable["report_path"] as? String, "/tmp/report.md")
+        XCTAssertEqual(deliverable["export_path"] as? String, "/tmp/export.md")
+        XCTAssertEqual(deliverable["recommended_next_action"] as? String, "Review report")
+        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+    }
+
+    func testAgentRunOversizedDeliverableFallsBackWithinBudget() throws {
+        let raw = jsonString([
+            "status": "completed",
+            "assistant_text": """
+            ## Summary
+            \(String(repeating: "summary ", count: 200))
+
+            ## Findings
+            - \(String(repeating: "finding ", count: 200))
+            - \(String(repeating: "finding ", count: 200))
+            - \(String(repeating: "finding ", count: 200))
+            """
+        ])
+
+        let summary = try XCTUnwrap(persistedSummary(toolName: "agent_run", rawResultJSON: raw))
+        let object = try decodedObject(summary.resultJSON)
+
+        XCTAssertEqual(object["status"] as? String, "completed")
+        XCTAssertLessThanOrEqual(summary.resultJSON.utf8.count, AgentToolResultPersistencePolicy.maxPersistedToolSummaryBytes)
+    }
+
     func testContextBuilderPersistsOnlySelectedBoundedFollowUpRoutingMetadata() throws {
         let rows: [(responseType: String, persistedResponseType: String, selectedKey: String, chatID: String, mode: String)] = [
             ("plan", "plan", "plan", "plan-chat", "plan"),

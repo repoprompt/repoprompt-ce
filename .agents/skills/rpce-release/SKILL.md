@@ -45,7 +45,9 @@ and require the fresh secret-free exact-helper packaged roundtrip to pass, then
 use the environment-scoped **Promote Release** workflow for the same
 tag. Promotion verifies and mirrors the existing reviewed assets, publishes
 both releases without rebuilding, resumes matching partial states, enforces a
-monotonically increasing stable build, and runs anonymous post-publish checks.
+monotonically increasing stable build, runs anonymous post-publish checks, and
+updates the configured Homebrew tap cask with the promoted updater ZIP URL and
+checksum. The default tap is `z23cc/homebrew-tap`.
 Dispatch both workflows from protected `main` only after the `release`
 environment reviewer gate, `main` deployment restriction, and immutable `v*`
 tag ruleset are enabled, and GitHub Release immutability is enabled for both

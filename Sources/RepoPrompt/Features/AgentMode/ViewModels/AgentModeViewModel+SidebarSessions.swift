@@ -395,39 +395,29 @@ extension AgentModeViewModel {
                 },
                 uniquingKeysWith: { _, new in new }
             )
+            let lineage = lineageIndex(for: sortedSessions)
+
+            func includeSessionAndAncestors(_ session: SidebarSession, in matchedIDs: inout Set<UUID>) {
+                matchedIDs.insert(session.id)
+                guard let sessionID = session.sessionID else { return }
+                for ancestorSessionID in lineage.ancestorSessionIDs(of: sessionID) {
+                    if let ancestor = sessionByID[ancestorSessionID] {
+                        matchedIDs.insert(ancestor.id)
+                    }
+                }
+            }
 
             // Collect direct matches
             var matchedIDs = Set<UUID>()
-            for session in sortedSessions {
-                if session.title.localizedCaseInsensitiveContains(searchTrimmed) {
-                    matchedIDs.insert(session.id)
-                    // Include ancestor chain
-                    var cursor = session.parentSessionID
-                    var visitedSessionIDs: Set<UUID> = []
-                    while let pid = cursor,
-                          visitedSessionIDs.insert(pid).inserted,
-                          let parent = sessionByID[pid]
-                    {
-                        matchedIDs.insert(parent.id)
-                        cursor = parent.parentSessionID
-                    }
-                }
+            for session in sortedSessions where session.title.localizedCaseInsensitiveContains(searchTrimmed) {
+                includeSessionAndAncestors(session, in: &matchedIDs)
             }
 
             // Include active session's ancestor chain
             if let activeTabID = currentTabID,
                let activeSession = sortedSessions.first(where: { $0.tabID == activeTabID })
             {
-                matchedIDs.insert(activeSession.id)
-                var cursor = activeSession.parentSessionID
-                var visitedSessionIDs: Set<UUID> = []
-                while let pid = cursor,
-                      visitedSessionIDs.insert(pid).inserted,
-                      let parent = sessionByID[pid]
-                {
-                    matchedIDs.insert(parent.id)
-                    cursor = parent.parentSessionID
-                }
+                includeSessionAndAncestors(activeSession, in: &matchedIDs)
             }
 
             let filtered = sortedSessions.filter { matchedIDs.contains($0.id) }
@@ -453,6 +443,15 @@ extension AgentModeViewModel {
             )
         #endif
         return result
+    }
+
+    private func lineageIndex(for rows: [SidebarSession]) -> AgentSessionLineageIndex {
+        AgentSessionLineageIndex(
+            nodes: rows.compactMap { row in
+                guard let sessionID = row.sessionID else { return nil }
+                return .init(sessionID: sessionID, parentSessionID: row.parentSessionID)
+            }
+        )
     }
 
     private func sidebarRowsApplyingThreadCollapse(

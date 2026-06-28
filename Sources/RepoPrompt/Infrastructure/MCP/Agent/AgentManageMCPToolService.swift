@@ -73,10 +73,12 @@ struct AgentManageMCPToolService {
             return try await executeListWorkflows()
         case "stop_session":
             return try await executeStopSession(args: args)
+        case "cancel_tree":
+            return try await executeCancelTree(args: args)
         case "cleanup_sessions":
             return try await executeCleanupSessions(args: args)
         default:
-            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cleanup_sessions, or list_workflows.")
+            throw MCPError.invalidParams("Unsupported agent_manage op '\(op)'. Use list_agents, list_sessions, get_log, extract_handoff, create_session, resume_session, stop_session, cancel_tree, cleanup_sessions, or list_workflows.")
         }
     }
 
@@ -600,6 +602,181 @@ struct AgentManageMCPToolService {
         )
         summary["stop_requested"] = .bool(wasActive)
         return .object(summary)
+    }
+
+    private func executeCancelTree(args: [String: Value]) async throws -> Value {
+        let targetWindow = try requireTargetWindow()
+        guard let workspace = targetWindow.workspaceManager.activeWorkspace else {
+            throw MCPError.invalidParams("No active workspace available for agent_manage.cancel_tree.")
+        }
+        let sessionReference = try requireNonEmptyString(args["session_id"], name: "session_id")
+        let agentModeVM = targetWindow.agentModeViewModel
+        guard let rootSessionID = try await agentModeVM.mcpResolveSessionID(reference: sessionReference, workspace: workspace) else {
+            throw MCPError.invalidParams("Session '\(sessionReference)' was not found in the active workspace.")
+        }
+
+        let target: AgentModeViewModel.MCPSessionTarget
+        do {
+            target = try await agentModeVM.mcpResolveOrCreateSessionTarget(
+                tabID: nil,
+                sessionID: rootSessionID,
+                createIfNeeded: false,
+                sessionName: nil
+            )
+        } catch {
+            throw MCPError.invalidParams("Session '\(sessionReference)' is not currently live and cannot be cancelled as a tree.")
+        }
+
+        let orderedSessionIDs = agentModeVM.mcpCancelTreeSessionIDs(rootSessionID: rootSessionID)
+        var sessions: [[String: Value]] = []
+        var cancelledSessions: [[String: Value]] = []
+        var skippedSessions: [[String: Value]] = []
+
+        for sessionID in orderedSessionIDs {
+            let liveSession: AgentModeViewModel.TabSession?
+            do {
+                if sessionID == rootSessionID {
+                    let rootSession = await agentModeVM.ensureSessionReady(tabID: target.tabID)
+                    liveSession = rootSession.activeAgentSessionID == sessionID ? rootSession : nil
+                } else {
+                    liveSession = try agentModeVM.authoritativeLiveSession(for: sessionID)
+                }
+            } catch {
+                let entry = cancelTreeEntry(
+                    sessionID: sessionID,
+                    result: "skipped",
+                    reason: "ambiguous_agent_session"
+                )
+                sessions.append(entry)
+                skippedSessions.append(entry)
+                continue
+            }
+
+            guard let liveSession else {
+                let entry = cancelTreeEntry(sessionID: sessionID, result: "skipped", reason: "not_live")
+                sessions.append(entry)
+                skippedSessions.append(entry)
+                continue
+            }
+            guard liveSession.activeAgentSessionID == sessionID else {
+                let entry = cancelTreeEntry(
+                    sessionID: sessionID,
+                    tabID: liveSession.tabID,
+                    parentSessionID: liveSession.parentSessionID,
+                    name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name,
+                    result: "skipped",
+                    reason: "binding_mismatch"
+                )
+                sessions.append(entry)
+                skippedSessions.append(entry)
+                continue
+            }
+            guard agentModeVM.mcpLiveSessionBelongsToActiveWorkspace(liveSession) else {
+                let entry = cancelTreeEntry(
+                    sessionID: sessionID,
+                    tabID: liveSession.tabID,
+                    parentSessionID: liveSession.parentSessionID,
+                    name: targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name,
+                    result: "skipped",
+                    reason: "foreign_workspace"
+                )
+                sessions.append(entry)
+                skippedSessions.append(entry)
+                continue
+            }
+
+            let preState = agentModeVM.mcpSnapshot(for: liveSession)?.status.rawValue ?? liveSession.runState.rawValue
+            let tabName = targetWindow.workspaceManager.composeTab(with: liveSession.tabID)?.name ?? "Agent Session"
+            guard liveSession.runState.isActive else {
+                let reason = switch liveSession.runState {
+                case .completed, .failed, .cancelled: "terminal"
+                case .idle: "inactive"
+                case .running, .waitingForUser, .waitingForQuestion, .waitingForApproval: "inactive"
+                }
+                let entry = cancelTreeEntry(
+                    sessionID: sessionID,
+                    tabID: liveSession.tabID,
+                    parentSessionID: liveSession.parentSessionID,
+                    name: tabName,
+                    preState: preState,
+                    result: "skipped",
+                    reason: reason
+                )
+                sessions.append(entry)
+                skippedSessions.append(entry)
+                continue
+            }
+
+            await agentModeVM.cancelAgentRun(tabID: liveSession.tabID, completion: .terminalPublished)
+            await Task.yield()
+            let postState = agentModeVM.mcpSnapshot(for: liveSession)?.status.rawValue ?? liveSession.runState.rawValue
+            let entry = cancelTreeEntry(
+                sessionID: sessionID,
+                tabID: liveSession.tabID,
+                parentSessionID: liveSession.parentSessionID,
+                name: tabName,
+                preState: preState,
+                postState: postState,
+                result: "cancel_requested"
+            )
+            sessions.append(entry)
+            cancelledSessions.append(entry)
+        }
+
+        let status = if cancelledSessions.isEmpty {
+            "no_active_sessions"
+        } else if skippedSessions.isEmpty {
+            "completed"
+        } else {
+            "partial"
+        }
+
+        return .object([
+            "status": .string(status),
+            "target_session_id": .string(rootSessionID.uuidString),
+            "attempted_count": .int(orderedSessionIDs.count),
+            "cancelled_count": .int(cancelledSessions.count),
+            "skipped_count": .int(skippedSessions.count),
+            "ordered_session_ids": .array(orderedSessionIDs.map { .string($0.uuidString) }),
+            "cancelled_sessions": .array(cancelledSessions.map { .object($0) }),
+            "skipped_sessions": .array(skippedSessions.map { .object($0) }),
+            "sessions": .array(sessions.map { .object($0) })
+        ])
+    }
+
+    private func cancelTreeEntry(
+        sessionID: UUID,
+        tabID: UUID? = nil,
+        parentSessionID: UUID? = nil,
+        name: String? = nil,
+        preState: String? = nil,
+        postState: String? = nil,
+        result: String,
+        reason: String? = nil
+    ) -> [String: Value] {
+        var entry: [String: Value] = [
+            "session_id": .string(sessionID.uuidString),
+            "result": .string(result)
+        ]
+        if let tabID {
+            entry["tab_id"] = .string(tabID.uuidString)
+        }
+        if let parentSessionID {
+            entry["parent_session_id"] = .string(parentSessionID.uuidString)
+        }
+        if let name {
+            entry["name"] = .string(name)
+        }
+        if let preState {
+            entry["pre_state"] = .string(preState)
+        }
+        if let postState {
+            entry["post_state"] = .string(postState)
+        }
+        if let reason {
+            entry["reason"] = .string(reason)
+        }
+        return entry
     }
 
     private func executeCleanupSessions(args: [String: Value]) async throws -> Value {

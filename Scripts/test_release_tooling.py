@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import zipfile
@@ -1088,6 +1089,16 @@ SIGNING_TEAM_ID=648A27MST5
         promote_job = promote_workflow.split("\n  promote:", 1)[1]
         self.assertIn("- smoke-reviewed-helper", promote_job)
         self.assertIn("environment: release", promote_job)
+        promote_command = "        run: ./trusted-control-plane/Scripts/promote_release.sh promote"
+        homebrew_step = "      - name: Update Homebrew cask"
+        self.assertIn(homebrew_step, promote_job)
+        self.assertLess(promote_job.index(promote_command), promote_job.index(homebrew_step))
+        homebrew_update = promote_job.split(homebrew_step, 1)[1]
+        self.assertIn("PUBLIC_UPDATE_REPOSITORY: ${{ vars.PUBLIC_UPDATE_REPOSITORY }}", promote_job)
+        self.assertIn("HOMEBREW_TAP_REPOSITORY_TOKEN", homebrew_update)
+        self.assertIn("HOMEBREW_TAP_REPOSITORY: ${{ vars.HOMEBREW_TAP_REPOSITORY }}", homebrew_update)
+        self.assertNotIn("PUBLIC_UPDATE_GH_TOKEN: ${{ secrets.PUBLIC_UPDATE_REPOSITORY_TOKEN }}", homebrew_update)
+        self.assertIn("run: ./trusted-control-plane/Scripts/update_homebrew_cask.sh update", homebrew_update)
 
         p12_import = release_workflow.split("      - name: Import Developer ID certificate", 1)[1].split(
             "      - name: Prepare provisioning profile and notarization key", 1
@@ -1105,6 +1116,239 @@ SIGNING_TEAM_ID=648A27MST5
         self.assertIn('CERTIFICATE_PATH="$RUNNER_TEMP/repoprompt-release.p12"', final_cleanup)
         self.assertIn('rm -f "$CERTIFICATE_PATH"', final_cleanup)
         self.assertIn('rm -rf "$RUNNER_TEMP/repoprompt-release-secrets"', final_cleanup)
+
+    def test_update_homebrew_cask_updates_local_checkout_without_push(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+        sha256 = "a" * 64
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": sha256,
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("push disabled", result.stdout)
+        cask = (tap / "Casks" / "repoprompt-ce.rb").read_text(encoding="utf-8")
+        self.assertIn('  version "1.0.0,1"', cask)
+        self.assertIn(f'  sha256 "{sha256}"', cask)
+        self.assertIn(
+            '  url "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip",',
+            cask,
+        )
+        self.assertIn('      verified: "github.com/repoprompt/repoprompt-ce-updates/"', cask)
+        self.assertNotIn("latest/download", cask)
+        log = self.run_checked(["git", "log", "--oneline", "-1"], cwd=tap).stdout
+        self.assertIn("Update repoprompt-ce to 1.0.0 (1)", log)
+
+    def test_update_homebrew_cask_updates_verified_for_custom_updater_repository(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": "d" * 64,
+                "PUBLIC_UPDATE_REPOSITORY": "example/repoprompt-ce-updates",
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cask = (tap / "Casks" / "repoprompt-ce.rb").read_text(encoding="utf-8")
+        self.assertIn(
+            '  url "https://github.com/example/repoprompt-ce-updates/releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip",',
+            cask,
+        )
+        self.assertIn('      verified: "github.com/example/repoprompt-ce-updates/"', cask)
+
+    def test_update_homebrew_cask_updates_inline_verified_for_custom_updater_repository(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+        cask_path = tap / "Casks" / "repoprompt-ce.rb"
+        cask_path.write_text(
+            cask_path.read_text(encoding="utf-8").replace(
+                '  url "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v0.9.0/RepoPrompt-0.9.0-9.zip",\n      verified: "github.com/repoprompt/repoprompt-ce-updates/"',
+                '  url "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v0.9.0/RepoPrompt-0.9.0-9.zip", verified: "github.com/repoprompt/repoprompt-ce-updates/"',
+            ),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": "1" * 64,
+                "PUBLIC_UPDATE_REPOSITORY": "example/repoprompt-ce-updates",
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cask = cask_path.read_text(encoding="utf-8")
+        self.assertIn('verified: "github.com/example/repoprompt-ce-updates/"', cask)
+        self.assertNotIn('verified: "github.com/repoprompt/repoprompt-ce-updates/"', cask)
+
+    def test_update_homebrew_cask_verify_rejects_prefix_matches(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+        sha256 = "e" * 64
+        (tap / "Casks" / "repoprompt-ce.rb").write_text(
+            textwrap.dedent(
+                f"""\
+                cask "repoprompt-ce" do
+                  version "1.0.0,1-extra"
+                  sha256 "{sha256}extra"
+                  url "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip.evil",
+                      verified: "github.com/repoprompt/repoprompt-ce-updates/"
+                end
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "verify"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_CASK_SHA256": sha256,
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match expected release", result.stderr)
+
+    def test_update_homebrew_cask_verify_rejects_duplicate_stanzas(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+        sha256 = "f" * 64
+        (tap / "Casks" / "repoprompt-ce.rb").write_text(
+            textwrap.dedent(
+                f"""\
+                cask "repoprompt-ce" do
+                  version "1.0.0,1"
+                  version "0.9.0,9"
+                  sha256 "{sha256}"
+                  url "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v1.0.0/RepoPrompt-1.0.0-1.zip",
+                      verified: "github.com/repoprompt/repoprompt-ce-updates/"
+                end
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "verify"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_CASK_SHA256": sha256,
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("expected exactly one cask version stanza", result.stderr)
+
+    def test_update_homebrew_cask_rejects_invalid_manual_sha(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": "not-a-sha",
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid HOMEBREW_CASK_SHA256", result.stderr)
+
+    def test_update_homebrew_cask_rejects_cask_path_escape(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir)
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": "c" * 64,
+                "HOMEBREW_CASK_PATH": "../outside.rb",
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("HOMEBREW_CASK_PATH", result.stderr)
+
+    def test_update_homebrew_cask_rejects_latest_download_cask(self) -> None:
+        temp_dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, temp_dir, True)
+        root, tap = self.make_homebrew_cask_fixture(temp_dir, url="https://github.com/repoprompt/repoprompt-ce-updates/releases/latest/download/RepoPrompt.zip")
+
+        result = subprocess.run(
+            [str(root / "Scripts" / "update_homebrew_cask.sh"), "update"],
+            env={
+                "PATH": os.environ["PATH"],
+                "REPOPROMPT_RELEASE_SOURCE_ROOT": str(root),
+                "REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR": str(root / "Scripts"),
+                "HOMEBREW_TAP_CHECKOUT": str(tap),
+                "HOMEBREW_TAP_PUSH": "0",
+                "HOMEBREW_CASK_SHA256": "b" * 64,
+            },
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("latest/download", result.stderr)
 
     def test_staged_release_extractor_rejects_alternate_in_app_cli_target(self) -> None:
         for relative, alternate_target in (
@@ -1879,6 +2123,58 @@ extension Data {
             text=True,
             capture_output=True,
         )
+
+    def make_homebrew_cask_fixture(
+        self,
+        temp_dir: Path,
+        *,
+        url: str = "https://github.com/repoprompt/repoprompt-ce-updates/releases/download/v0.9.0/RepoPrompt-0.9.0-9.zip",
+    ) -> tuple[Path, Path]:
+        root = temp_dir / "release-source"
+        scripts = root / "Scripts"
+        tap = temp_dir / "homebrew-tap"
+        casks = tap / "Casks"
+        scripts.mkdir(parents=True)
+        casks.mkdir(parents=True)
+        for name in ("load_release_metadata.sh", "update_homebrew_cask.sh"):
+            shutil.copy2(SCRIPT_DIR / name, scripts / name)
+            scripts.joinpath(name).chmod(0o755)
+        (root / "version.env").write_text(
+            textwrap.dedent(
+                """\
+                APP_NAME=RepoPrompt
+                DISPLAY_NAME="RepoPrompt CE"
+                MARKETING_VERSION=1.0.0
+                BUILD_NUMBER=1
+                BUNDLE_ID=com.pvncher.repoprompt.ce
+                SIGNING_TEAM_ID=648A27MST5
+                """
+            ),
+            encoding="utf-8",
+        )
+        (casks / "repoprompt-ce.rb").write_text(
+            textwrap.dedent(
+                f"""\
+                cask "repoprompt-ce" do
+                  version "0.9.0,9"
+                  sha256 "{'0' * 64}"
+
+                  url "{url}",
+                      verified: "github.com/repoprompt/repoprompt-ce-updates/"
+                  name "RepoPrompt CE"
+                  desc "AI-native workspace for code context"
+                  homepage "https://repoprompt.com/"
+                end
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.run_checked(["git", "init", "-b", "main"], cwd=tap)
+        self.git(tap, "config", "user.email", "release-tests@example.com")
+        self.git(tap, "config", "user.name", "Release Tests")
+        self.git(tap, "add", "Casks/repoprompt-ce.rb")
+        self.git(tap, "commit", "-m", "Initial cask")
+        return root, tap
 
     def make_staged_release_fixture(self) -> tuple[Path, Path, Path]:
         temp_dir = Path(tempfile.mkdtemp())

@@ -11,13 +11,6 @@ final class ClaudeAgentModeCoordinator {
         _ launchSettings: ControllerLaunchSettings
     ) -> any NativeAgentRuntimeControlling
 
-    /// Closure that waits until the given runID has zero active MCP tool executions.
-    /// Throws `CancellationError` if the calling Task is cancelled.
-    typealias MCPToolIdleWaiter = (_ runID: UUID) async throws -> Void
-    typealias MCPToolEndedCountProvider = (_ runID: UUID) -> Int
-    typealias MCPActiveToolQuery = (_ runID: UUID) -> Bool
-    typealias ActiveAgentRunWaitQuery = (_ runID: UUID) -> Bool
-
     private enum SteeringInterruptSafePointResult {
         case ready
         case cancelled
@@ -52,10 +45,7 @@ final class ClaudeAgentModeCoordinator {
     private let windowID: Int
     private let workspacePathProvider: (AgentModeViewModel.TabSession) throws -> String?
     private let claudeControllerFactory: ClaudeControllerFactory
-    private let awaitNoActiveMCPTools: MCPToolIdleWaiter?
-    private let toolEndedCount: MCPToolEndedCountProvider
-    private let hasActiveMCPTools: MCPActiveToolQuery
-    private let hasActiveChildAgentRunWaits: ActiveAgentRunWaitQuery
+    private let runBlockers: RunBlockerRegistry
     private let steeringInterruptSafePointTimeoutSeconds: TimeInterval
 
     /// Per-tab tool tracking handler for Claude sessions.
@@ -78,19 +68,13 @@ final class ClaudeAgentModeCoordinator {
         windowID: Int,
         workspacePathProvider: @escaping (AgentModeViewModel.TabSession) throws -> String?,
         claudeControllerFactory: ClaudeControllerFactory? = nil,
-        awaitNoActiveMCPTools: MCPToolIdleWaiter? = nil,
-        toolEndedCount: @escaping MCPToolEndedCountProvider = { _ in 0 },
-        hasActiveMCPTools: @escaping MCPActiveToolQuery = { _ in false },
-        hasActiveChildAgentRunWaits: @escaping ActiveAgentRunWaitQuery = { _ in false },
+        runBlockers: RunBlockerRegistry? = nil,
         steeringInterruptSafePointTimeoutSeconds: TimeInterval = 2.0
     ) {
         self.windowID = windowID
         self.workspacePathProvider = workspacePathProvider
         self.claudeControllerFactory = claudeControllerFactory ?? Self.makeDefaultController
-        self.awaitNoActiveMCPTools = awaitNoActiveMCPTools
-        self.toolEndedCount = toolEndedCount
-        self.hasActiveMCPTools = hasActiveMCPTools
-        self.hasActiveChildAgentRunWaits = hasActiveChildAgentRunWaits
+        self.runBlockers = runBlockers ?? .inactive
         self.steeringInterruptSafePointTimeoutSeconds = steeringInterruptSafePointTimeoutSeconds
     }
 
@@ -668,25 +652,23 @@ final class ClaudeAgentModeCoordinator {
             }
 
             do {
-                if let awaitNoActiveMCPTools {
-                    let reachedLocalIdle = try await awaitOperationUntilDeadline(deadline: deadline) {
-                        try await awaitNoActiveMCPTools(runID)
-                    }
-                    guard reachedLocalIdle else {
-                        let snapshot = handler.explicitProviderToolResultAckSnapshot(for: runID)
-                        let localCount = toolEndedCount(runID)
-                        let stillActive = hasActiveMCPTools(runID) || hasActiveChildAgentRunWaits(runID)
-                        logSteeringInterruptSafePointTimeout(
-                            runID: runID,
-                            snapshot: snapshot,
-                            localCount: localCount,
-                            stillActive: stillActive
-                        )
-                        return .timedOut(snapshot: snapshot, localCount: localCount, stillActive: stillActive)
-                    }
+                let reachedLocalIdle = try await awaitOperationUntilDeadline(deadline: deadline) {
+                    try await self.runBlockers.awaitNoActiveMCPTools(runID: runID)
+                }
+                guard reachedLocalIdle else {
+                    let snapshot = handler.explicitProviderToolResultAckSnapshot(for: runID)
+                    let localCount = runBlockers.toolEndedCount(runID: runID)
+                    let stillActive = runBlockers.hasActiveMCPTools(runID: runID) || runBlockers.hasActiveChildAgentRunWaits(runID: runID)
+                    logSteeringInterruptSafePointTimeout(
+                        runID: runID,
+                        snapshot: snapshot,
+                        localCount: localCount,
+                        stillActive: stillActive
+                    )
+                    return .timedOut(snapshot: snapshot, localCount: localCount, stillActive: stillActive)
                 }
 
-                let requiredAckCount = toolEndedCount(runID)
+                let requiredAckCount = runBlockers.toolEndedCount(runID: runID)
                 let reachedAckParity = try await awaitOperationUntilDeadline(deadline: deadline) {
                     try await handler.awaitExplicitProviderToolResultAcks(
                         for: runID,
@@ -694,9 +676,9 @@ final class ClaudeAgentModeCoordinator {
                     )
                 }
                 let snapshot = handler.explicitProviderToolResultAckSnapshot(for: runID)
-                let currentLocalCount = toolEndedCount(runID)
-                let ordinaryMCPActive = hasActiveMCPTools(runID)
-                let childWaitActive = hasActiveChildAgentRunWaits(runID)
+                let currentLocalCount = runBlockers.toolEndedCount(runID: runID)
+                let ordinaryMCPActive = runBlockers.hasActiveMCPTools(runID: runID)
+                let childWaitActive = runBlockers.hasActiveChildAgentRunWaits(runID: runID)
                 let stillActive = ordinaryMCPActive || childWaitActive
 
                 guard reachedAckParity else {
@@ -731,8 +713,8 @@ final class ClaudeAgentModeCoordinator {
                 return .cancelled
             } catch {
                 let snapshot = handler.explicitProviderToolResultAckSnapshot(for: runID)
-                let localCount = toolEndedCount(runID)
-                let stillActive = hasActiveMCPTools(runID) || hasActiveChildAgentRunWaits(runID)
+                let localCount = runBlockers.toolEndedCount(runID: runID)
+                let stillActive = runBlockers.hasActiveMCPTools(runID: runID) || runBlockers.hasActiveChildAgentRunWaits(runID: runID)
                 logSteeringInterruptSafePointTimeout(
                     runID: runID,
                     snapshot: snapshot,

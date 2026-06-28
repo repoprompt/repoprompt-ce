@@ -19,11 +19,7 @@ final class AgentModeRunService {
         /// bootstrap lease can expose nested tools.
         let bindPendingOracleReviewContext: (_ tabID: UUID, _ runID: UUID) -> Void
         let cancelMCPToolsForRun: (_ runID: UUID, _ reason: String) -> Void
-        /// Waits until the given runID has zero active MCP tool executions.
-        /// Throws `CancellationError` if the calling Task is cancelled.
-        let awaitNoActiveMCPTools: (_ runID: UUID) async throws -> Void
-        /// Returns whether the parent run is currently blocked in child `agent_run.wait` scopes.
-        let activeAgentRunWaitQuery: (_ runID: UUID) -> Bool
+        let runBlockers: RunBlockerRegistry
         /// Bounded wait for child `agent_run.wait` scopes to drain before Claude native interrupt.
         let childAgentRunWaitDrainTimeoutSeconds: TimeInterval
     }
@@ -397,7 +393,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] ACP flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 do {
-                    try await dependencies.awaitNoActiveMCPTools(runID)
+                    try await dependencies.runBlockers.awaitNoActiveMCPTools(runID: runID)
                     steeringDebugLog("[AgentRunSteeringWake] ACP flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingACPSteeringInstructions.count)")
                 } catch {
                     releaseSupersedingProtectionIfUnused()
@@ -688,7 +684,7 @@ final class AgentModeRunService {
     ) async -> Bool {
         let timeoutSeconds = timeoutSeconds ?? dependencies.childAgentRunWaitDrainTimeoutSeconds
         let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(timeoutSeconds * 1000)))
-        while dependencies.activeAgentRunWaitQuery(runID) {
+        while dependencies.runBlockers.hasActiveChildAgentRunWaits(runID: runID) {
             guard isCurrentClaudeSteeringAttempt(session: session, runID: runID, runAttemptID: runAttemptID) else {
                 return false
             }
@@ -784,7 +780,7 @@ final class AgentModeRunService {
                 // Wait for all active MCP tool executions to finish before interrupting.
                 steeringDebugLog("[AgentRunSteeringWake] Claude flush waiting MCP idle tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 do {
-                    try await dependencies.awaitNoActiveMCPTools(runID)
+                    try await dependencies.runBlockers.awaitNoActiveMCPTools(runID: runID)
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle returned tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) queue=\(session.pendingClaudeSteeringInstructions.count)")
                 } catch {
                     steeringDebugLog("[AgentRunSteeringWake] Claude flush MCP idle cancelled tab=\(tabID) runID=\(runID) attempt=\(runAttemptID) error=\(error)")

@@ -5011,11 +5011,58 @@ extension ToolOutputFormatter {
         if let interactionPrompt, !interactionPrompt.isEmpty {
             lines.append("\n**Prompt**\n\n\(interactionPrompt)")
         }
+        if let deliverable = ChildAgentDeliverable.fromValueObject(object) {
+            lines.append(contentsOf: formattedChildDeliverableSection(deliverable))
+        }
         if let assistantText, !assistantText.isEmpty {
             let heading = isTerminal ? "Output" : "Preview"
             lines.append("\n**\(heading)**\n\n\(assistantText)")
         }
         return [.text(lines.joined(separator: "\n"))]
+    }
+
+    private static func formattedChildDeliverableSection(_ deliverable: ChildAgentDeliverable) -> [String] {
+        var lines = ["", "### Deliverable"]
+        if let summary = deliverable.summary {
+            lines.append("- Summary: \(summary)")
+        }
+        appendList(deliverable.findings, label: "Findings", to: &lines)
+        appendList(deliverable.changedFiles, label: "Changed files", to: &lines)
+        appendList(deliverable.evidence, label: "Evidence", to: &lines)
+        appendList(deliverable.blockers, label: "Blockers", to: &lines)
+        if let confidence = deliverable.confidence {
+            lines.append("- Confidence: \(confidence)")
+        }
+        if let recommendedNextAction = deliverable.recommendedNextAction {
+            lines.append("- Recommended next action: \(recommendedNextAction)")
+        }
+        if let reportPath = deliverable.reportPath {
+            lines.append("- Report path: `\(reportPath)`")
+        }
+        if let exportPath = deliverable.exportPath {
+            lines.append("- Export path: `\(exportPath)`")
+        }
+        return lines
+    }
+
+    private static func appendList(_ values: [String], label: String, to lines: inout [String]) {
+        guard !values.isEmpty else { return }
+        lines.append("- \(label):")
+        for value in values {
+            lines.append("  - \(value)")
+        }
+    }
+
+    private static func formattedChildDeliverableInline(from object: [String: Value]) -> String {
+        guard let deliverable = ChildAgentDeliverable.fromValueObject(object) else { return "" }
+        var parts: [String] = []
+        if let summary = deliverable.summary {
+            parts.append(summary)
+        }
+        if !deliverable.changedFiles.isEmpty {
+            parts.append("\(deliverable.changedFiles.count) changed files")
+        }
+        return parts.isEmpty ? "" : " — " + parts.joined(separator: " · ")
     }
 
     private static func agentRunWorktreeObjects(from object: [String: Value]) -> [[String: Value]] {
@@ -5100,6 +5147,7 @@ extension ToolOutputFormatter {
             if let name, !name.isEmpty {
                 line += " (\(name))"
             }
+            line += formattedChildDeliverableInline(from: snapObj)
             lines.append(line)
         }
         return [.text(lines.joined(separator: "\n"))]
@@ -5131,6 +5179,7 @@ extension ToolOutputFormatter {
             if let name, !name.isEmpty {
                 line += " (\(name))"
             }
+            line += formattedChildDeliverableInline(from: snapObj)
             lines.append(line)
         }
         return [.text(lines.joined(separator: "\n"))]
@@ -5141,6 +5190,55 @@ extension ToolOutputFormatter {
             return formatGeneric(value: value)
         }
         let rawOp = args["op"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if rawOp == "cancel_tree" {
+            var lines = ["**Agent manage · Cancel Tree**"]
+            if let targetSessionID = object["target_session_id"]?.stringValue, !targetSessionID.isEmpty {
+                lines.append("- Target: `\(targetSessionID)`")
+            }
+            if let cancelledCount = object["cancelled_count"]?.intValue {
+                lines.append("- Cancel requested: **\(cancelledCount)**")
+            }
+            if let skippedCount = object["skipped_count"]?.intValue {
+                lines.append("- Skipped: **\(skippedCount)**")
+            }
+            if let attemptedCount = object["attempted_count"]?.intValue {
+                lines.append("- Sessions considered: **\(attemptedCount)**")
+            }
+
+            let cancelledSessions = object["cancelled_sessions"]?.arrayValue?.compactMap(\.objectValue) ?? []
+            if !cancelledSessions.isEmpty {
+                lines.append("")
+                lines.append("Cancelled:")
+                for session in cancelledSessions {
+                    let sessionID = session["session_id"]?.stringValue ?? "unknown"
+                    let name = session["name"]?.stringValue
+                    let preState = session["pre_state"]?.stringValue
+                    let postState = session["post_state"]?.stringValue
+                    let stateText = if let preState, let postState {
+                        " — \(preState) → \(postState)"
+                    } else {
+                        ""
+                    }
+                    let nameText = name.map { " (\($0))" } ?? ""
+                    lines.append("  - `\(sessionID)`\(stateText)\(nameText)")
+                }
+            }
+
+            let skippedSessions = object["skipped_sessions"]?.arrayValue?.compactMap(\.objectValue) ?? []
+            if !skippedSessions.isEmpty {
+                lines.append("")
+                lines.append("Skipped:")
+                for session in skippedSessions {
+                    let sessionID = session["session_id"]?.stringValue ?? "unknown"
+                    let reason = session["reason"]?.stringValue ?? "skipped"
+                    let preState = session["pre_state"]?.stringValue
+                    let stateText = preState.map { " (\($0))" } ?? ""
+                    lines.append("  - `\(sessionID)` — \(reason)\(stateText)")
+                }
+            }
+            return [.text(lines.joined(separator: "\n"))]
+        }
+
         if rawOp == "extract_handoff" || rawOp == "handoff" {
             let outputPath = object["output_path"]?.stringValue
             let handoffXML = object["handoff_xml"]?.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines)

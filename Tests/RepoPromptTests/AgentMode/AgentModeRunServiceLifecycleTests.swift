@@ -1614,8 +1614,7 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             },
             bindPendingOracleReviewContext: { _, _ in },
             cancelMCPToolsForRun: cancelMCPTools,
-            awaitNoActiveMCPTools: idleWaiter,
-            activeAgentRunWaitQuery: { _ in false },
+            runBlockers: RunBlockerRegistry(awaitNoActiveMCPTools: idleWaiter),
             childAgentRunWaitDrainTimeoutSeconds: 0.01
         )
         return LifecycleHarness(

@@ -31,9 +31,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         _ allowsAgentExternalControlTools: Bool,
         _ requiresExpectedAgentPID: Bool
     ) async -> Void
-    typealias ActiveToolQuery = AgentModeViewModel.CodexActiveToolQuery
-    typealias ActiveAgentRunWaitQuery = AgentModeViewModel.CodexAgentRunWaitQuery
-    typealias ActiveAgentRunWaitDrain = AgentModeViewModel.CodexAgentRunWaitDrain
     typealias NativeToolLivenessState = AgentModeViewModel.CodexNativeToolLivenessState
 
     enum NativeSlashCommand: String, CaseIterable {
@@ -218,9 +215,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
     private let codexControllerFactory: CodexControllerFactory
     private let connectionPolicyInstaller: ConnectionPolicyInstaller
     private let shouldManageCodexTooling: Bool
-    private let activeToolQuery: ActiveToolQuery
-    private let activeAgentRunWaitQuery: ActiveAgentRunWaitQuery
-    private var activeAgentRunWaitDrain: ActiveAgentRunWaitDrain
+    private var runBlockers: RunBlockerRegistry
     private let authRecovery: any CodexManagedAuthRecovering
     private var codexModelsSubscriptionTask: Task<Void, Never>?
     private let commandRunningStatusCoalesceDelayNanos: UInt64 = 75_000_000
@@ -332,9 +327,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         connectionPolicyInstaller: @escaping ConnectionPolicyInstaller,
         shouldManageCodexTooling: Bool,
         authRecovery: any CodexManagedAuthRecovering = CodexManagedAuthRecoveryService.shared,
-        activeToolQuery: @escaping ActiveToolQuery = { _ in false },
-        activeAgentRunWaitQuery: @escaping ActiveAgentRunWaitQuery = { _ in false },
-        activeAgentRunWaitDrain: @escaping ActiveAgentRunWaitDrain = { _, _ in true },
+        runBlockers: RunBlockerRegistry? = nil,
         leaseRoutingTimeoutMs: Int = 2000,
         idleShutdownDelayNanos: UInt64 = 300_000_000_000,
         stallWatchdogPollIntervalNanos: UInt64 = 5_000_000_000,
@@ -352,9 +345,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         self.connectionPolicyInstaller = connectionPolicyInstaller
         self.shouldManageCodexTooling = shouldManageCodexTooling
         self.authRecovery = authRecovery
-        self.activeToolQuery = activeToolQuery
-        self.activeAgentRunWaitQuery = activeAgentRunWaitQuery
-        self.activeAgentRunWaitDrain = activeAgentRunWaitDrain
+        self.runBlockers = runBlockers ?? .inactive
         codexLeaseRoutingTimeoutMs = max(500, leaseRoutingTimeoutMs)
         codexIdleShutdownDelayNanos = max(1_000_000, idleShutdownDelayNanos)
         codexStallWatchdogPollIntervalNanos = max(10_000_000, stallWatchdogPollIntervalNanos)
@@ -386,8 +377,8 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         terminalCommitBarrier = barrier
     }
 
-    func setActiveAgentRunWaitDrain(_ drain: @escaping ActiveAgentRunWaitDrain) {
-        activeAgentRunWaitDrain = drain
+    func setRunBlockerRegistry(_ registry: RunBlockerRegistry) {
+        runBlockers = registry
     }
 
     private func logCodex(_ message: @autoclosure () -> String) {
@@ -456,14 +447,14 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         guard let runID = session.runID else {
             return false
         }
-        return activeToolQuery(runID)
+        return runBlockers.hasActiveMCPTools(runID: runID)
     }
 
     private func hasActiveAgentRunWaits(for session: AgentModeViewModel.TabSession) -> Bool {
         guard let runID = session.runID else {
             return false
         }
-        return activeAgentRunWaitQuery(runID)
+        return runBlockers.hasActiveChildAgentRunWaits(runID: runID)
     }
 
     private func hasPendingCodexInteraction(for session: AgentModeViewModel.TabSession) -> Bool {
@@ -4146,7 +4137,7 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
         let wasRunAlreadyActive = session.runState.isActive
         let activeSendRunID = wasRunAlreadyActive ? session.runID : nil
         if let activeSendRunID {
-            let drained = await activeAgentRunWaitDrain(activeSendRunID, "codex-native-active-send")
+            let drained = await runBlockers.drainChildAgentRunWaits(runID: activeSendRunID, source: "codex-native-active-send")
             if Task.isCancelled {
                 viewModel?.finalizeAttachmentsForTurn(
                     for: session,

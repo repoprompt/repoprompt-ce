@@ -169,7 +169,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             description: """
             List agents, manage sessions, and browse workflows.
 
-            **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | create_session | resume_session | stop_session | cleanup_sessions | list_workflows
+            **Operations**: list_agents | list_sessions | get_log | extract_handoff | handoff | create_session | resume_session | stop_session | cancel_tree | cleanup_sessions | list_workflows
 
             - `list_agents`: Returns top-level `task_labels` as the authoritative role-label→model mapping (explore, engineer, pair, design), plus `agents[].models[]` with explicit compound `model_id` targets for callers that want to pin a specific agent/model/effort. Use `task_labels` entries for role-based routing; use `agents[].models[].model_id` for exact selections. Pass `roles_only=true` to return only `task_labels` and omit the explicit per-agent target catalog.
             - `list_sessions`: Browse sessions. Returns `session_id` for each session. Filter by MCP-facing `state` (e.g. `running`, `waiting_for_input`, `completed`, `failed`). When called from agent mode, automatically scopes to sessions spawned by the current agent session.
@@ -177,6 +177,7 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
             - `extract_handoff` (`handoff` alias): Export the full `<forked_session ...>` handoff XML for a live or persisted session. Persisted sessions export transcript-only payloads; `include_file_contents` is accepted only for a live source tab that is currently active so file selection can be snapshotted reliably. Use `output_path` to write to a file; inline XML is returned by default only when no output path is provided.
             - `create_session` / `resume_session`: Create or resume a session with a specific `model_id`.
             - `stop_session`: Stop a live session.
+            - `cancel_tree`: Cancel the target live session and any active live descendants in its parent/child tree. Descendants are cancelled before the target. Does not delete sessions or cleanup persisted records.
             - `cleanup_sessions`: Delete specific MCP-originated sessions by ID. Only sessions started via MCP are eligible; user-created sessions are never deleted. Skips active sessions. Use `list_sessions` first to find session IDs, then pass them here.
             - `list_workflows`: Discover workflows usable with `agent_run` operations, including `orchestrate` for planning, decomposition, and sub-agent dispatch.
             """,
@@ -193,14 +194,15 @@ final class MCPAgentControlToolProvider: MCPWindowToolProviding {
                 **create_session**: model_id?, session_name?
                 **resume_session**: session_id (required), model_id?
                 **stop_session**: session_id (required)
+                **cancel_tree**: session_id (required)
                 **cleanup_sessions**: session_ids (required, array of session UUIDs)
 
                 Default extraction behavior: `extract_handoff` (or alias `handoff`) returns `handoff_xml` inline when `output_path` is omitted. When `output_path` is provided, XML is written to disk and omitted from the response unless `inline=true`. `output_path` must be absolute (or `~/...`); CLI shorthand resolves relative paths before calling MCP.
                 """,
                 properties: [
-                    "op": .string(description: "Operation.", enum: ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cleanup_sessions", "list_workflows"]),
+                    "op": .string(description: "Operation.", enum: ["list_agents", "list_sessions", "get_log", "extract_handoff", "handoff", "create_session", "resume_session", "stop_session", "cancel_tree", "cleanup_sessions", "list_workflows"]),
                     "model_id": .string(description: "[create_session, resume_session] Role label from list_agents task_labels (explore, engineer, pair, design — resolved via global role defaults), or an explicit compound model_id from list_agents agents[].models[].model_id."),
-                    "session_id": .string(description: "[get_log, extract_handoff, resume_session, stop_session] Session UUID."),
+                    "session_id": .string(description: "[get_log, extract_handoff, resume_session, stop_session, cancel_tree] Session UUID."),
                     "session_name": .string(description: "[create_session] Display name for a new session."),
                     "limit": .integer(description: "[list_sessions, get_log] Max results."),
                     "up_to_item_id": .string(description: "[extract_handoff] Optional transcript row UUID cutoff."),

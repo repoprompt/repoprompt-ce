@@ -359,6 +359,74 @@ final class ToolOutputFormatterWorktreeTests: XCTestCase {
         }
     }
 
+    func testAgentRunOutputShowsDeliverableSectionAndPreservesOutput() throws {
+        let value: Value = .object([
+            "status": .string("completed"),
+            "session_id": .string("session-deliverable"),
+            "assistant_text": .string("final assistant output"),
+            "deliverable": .object([
+                "schema_version": .int(1),
+                "source": .string("assistant_markdown"),
+                "summary": .string("Implemented child deliverables."),
+                "changed_files": .array([.string("Sources/File.swift")]),
+                "evidence": .array([.string("Focused tests pass")]),
+                "recommended_next_action": .string("Review the projection")
+            ])
+        ])
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": Self.value("wait")], value: value))
+
+        XCTAssertTrue(text.contains("### Deliverable"), text)
+        XCTAssertTrue(text.contains("- Summary: Implemented child deliverables."), text)
+        XCTAssertTrue(text.contains("- Changed files:"), text)
+        XCTAssertTrue(text.contains("  - Sources/File.swift"), text)
+        XCTAssertTrue(text.contains("- Evidence:"), text)
+        XCTAssertTrue(text.contains("**Output**\n\nfinal assistant output"), text)
+    }
+
+    func testRunningAgentRunPreviewDoesNotSynthesizeDeliverableSection() throws {
+        let value: Value = .object([
+            "status": .string("running"),
+            "session_id": .string("session-preview"),
+            "assistant_text": .string("""
+            ## Summary
+            This is a live preview, not a final deliverable.
+            """)
+        ])
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatAgentRun(args: ["op": Self.value("poll")], value: value))
+
+        XCTAssertFalse(text.contains("### Deliverable"), text)
+        XCTAssertTrue(text.contains("**Preview**"), text)
+        XCTAssertTrue(text.contains("This is a live preview, not a final deliverable."), text)
+    }
+
+    func testAgentExploreMultiPollOutputAppendsDeliverableSummary() throws {
+        let value: Value = .object([
+            "poll": .object([
+                "mode": .string("many"),
+                "polled_count": .int(1),
+                "terminal_session_ids": .array([.string("session-deliverable")])
+            ]),
+            "snapshots": .array([
+                .object([
+                    "status": .string("completed"),
+                    "session_id": .string("session-deliverable"),
+                    "deliverable": .object([
+                        "schema_version": .int(1),
+                        "source": .string("assistant_markdown"),
+                        "summary": .string("Found the wiring point."),
+                        "changed_files": .array([.string("Sources/File.swift"), .string("Tests/FileTests.swift")])
+                    ])
+                ])
+            ])
+        ])
+
+        let text = try Self.onlyText(ToolOutputFormatter.formatAgentExplore(args: ["op": Self.value("poll")], value: value))
+
+        XCTAssertTrue(text.contains("- `session-deliverable` — **Completed** — Found the wiring point. · 2 changed files"), text)
+    }
+
     private static func scope() -> ToolResultDTOs.WorktreeScopeDTO {
         ToolResultDTOs.WorktreeScopeDTO(
             kind: "session_bound_worktree",

@@ -300,7 +300,9 @@ enum AgentToolResultPersistencePolicy {
                 "apply_edits",
                 "ask_oracle",
                 "oracle_send",
-                "context_builder"
+                "context_builder",
+                "agent_run",
+                "agent_explore"
             ]
             guard let normalizedToolName,
                   let resultJSON = sanitized?.resultJSON,
@@ -1960,6 +1962,27 @@ enum AgentToolResultPersistencePolicy {
                let delivery = smallStringValue(meta, keys: ["delivery"])
             {
                 object["_meta"] = ["delivery": delivery]
+            }
+            let shouldDeriveDeliverableFromAssistantText = isTerminalAgentRunStatusWord(statusWord)
+            if let deliverable = ChildAgentDeliverable.fromJSONObject(
+                rawObject,
+                allowAssistantTextFallback: shouldDeriveDeliverableFromAssistantText
+            ), !deliverable.isEmpty {
+                object["deliverable"] = deliverable.asJSONObject()
+                if let summary = deliverable.summary,
+                   let summaryText = smallStorageSummaryText("\(normalizedToolName ?? "agent_run") • \(statusWord) • \(summary)")
+                {
+                    object["summary_text"] = summaryText
+                }
+                if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
+                    return json
+                }
+                object["deliverable"] = deliverable.asJSONObject(minimal: true)
+                if let json = jsonString(from: object), !exceedsPersistedToolSummaryBudget(json) {
+                    return json
+                }
+                object.removeValue(forKey: "deliverable")
+                object.removeValue(forKey: "summary_text")
             }
         }
         return jsonString(from: object)
