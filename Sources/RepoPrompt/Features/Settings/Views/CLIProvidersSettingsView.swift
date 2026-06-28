@@ -57,6 +57,8 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isLoadingGrok = false
+    @State private var isGrokExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -132,6 +134,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                grokCard
             }
             .padding(16)
         }
@@ -1871,6 +1874,80 @@ struct CLIProvidersSettingsView: View {
         return hasComposer2 ? "\(base) Composer 2 is available when selected." : "\(base) Auto is the built-in fallback."
     }
 
+    // MARK: - Grok Build Card
+
+    private var grokCard: some View {
+        providerCard(
+            title: "Grok Build CLI",
+            subtitle: "Uses the official Grok Build ACP runtime (`grok agent stdio`) for Agent Mode and headless tasks. RepoPrompt MCP tools are injected through ACP session configuration.",
+            infoURL: "https://x.ai/",
+            isConnected: viewModel.isGrokCLIConnected,
+            isExpanded: $isGrokExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isGrokCLIConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromGrok() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(grokModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    permissionSummaryLinkRow(for: .grok)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testGrokConnection() }) {
+                            if isLoadingGrok {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingGrok)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.grokCLIError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Sign in with `grok login` in your terminal, then connect. Models: Grok Build (512K) and Composer 2.5 Fast.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var grokModelSummary: String {
+        "Grok Build (512K context) and Composer 2.5 Fast are available; the model is selected per session and can be switched at runtime."
+    }
+
     // MARK: - Actions
 
     private func validateAndSaveZAIKey() {
@@ -2253,6 +2330,36 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testGrokConnection() {
+        isLoadingGrok = true
+        Task {
+            do {
+                let ok = try await viewModel.testGrokCLIConnection()
+                await MainActor.run {
+                    isLoadingGrok = false
+                    if ok {
+                        alertMessage = "Grok Build CLI connected. \(grokModelSummary)"
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingGrok = false
+                    alertMessage = viewModel.grokCLIError ?? error.asFriendlyString()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func signOutFromGrok() {
+        viewModel.disconnectGrokCLI()
+        alertMessage = "Signed out from Grok Build CLI"
         showAlert = true
         onAPIKeyUpdated?()
     }
