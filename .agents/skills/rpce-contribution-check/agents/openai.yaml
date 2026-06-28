@@ -1,4 +1,4 @@
 interface:
   display_name: "RepoPrompt CE Contribution Check"
-  short_description: "Validate RepoPrompt CE changes before commit or push"
-  default_prompt: "Use $rpce-contribution-check to validate this RepoPrompt CE contribution before committing or pushing."
+  short_description: "Clean up and validate focused RepoPrompt CE changes"
+  default_prompt: "Use $rpce-contribution-check to validate this RepoPrompt CE contribution and, before opening or updating its PR, briefly clean up the complete branch diff."
