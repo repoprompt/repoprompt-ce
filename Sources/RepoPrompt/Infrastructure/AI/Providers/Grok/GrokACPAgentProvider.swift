@@ -107,6 +107,17 @@ struct GrokACPAgentProvider: ACPAgentProvider {
         if error is GrokACPLaunchResolutionError || error is ExecutableFileIdentityError {
             return AIProviderError.invalidConfiguration(detail: error.localizedDescription)
         }
+        // Grok's cached token expires; the ACP server then rejects session/new with
+        // -32000 "Authentication required" and drops cached_token from authMethods.
+        // Surface a clear re-login instruction instead of a generic API error.
+        let description = error.localizedDescription
+        if description.localizedCaseInsensitiveContains("code -32000")
+            || description.localizedCaseInsensitiveContains("authentication required")
+        {
+            return AIProviderError.invalidConfiguration(
+                detail: "Grok Build CLI authentication is required or has expired. Run `grok login` in a terminal, then start the agent again."
+            )
+        }
         return AIProviderError.apiError(source: error)
     }
 

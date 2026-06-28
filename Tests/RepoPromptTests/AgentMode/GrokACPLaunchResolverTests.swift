@@ -184,6 +184,22 @@ final class GrokACPLaunchResolverTests: XCTestCase {
         }
     }
 
+    func testNormalizeErrorSurfacesGrokReloginOnAuthenticationRequired() {
+        let provider = GrokACPAgentProvider(
+            config: GrokAgentConfig(commandName: "grok", additionalPathHints: [])
+        )
+        let authError = NSError(
+            domain: "ACP",
+            code: -32000,
+            userInfo: [NSLocalizedDescriptionKey: "ACP request failed: Authentication required (code -32000)"]
+        )
+
+        guard case let .invalidConfiguration(detail) = provider.normalizeError(authError) as? AIProviderError else {
+            return XCTFail("Expected invalidConfiguration for the -32000 authentication error")
+        }
+        XCTAssertTrue(detail.localizedCaseInsensitiveContains("grok login"))
+    }
+
     private func makeRunRequest(workspacePath: String) -> ACPRunRequest {
         ACPRunRequest(
             agentKind: .grokBuild,
