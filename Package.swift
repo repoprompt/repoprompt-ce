@@ -112,6 +112,12 @@ let package = Package(
             resources: [
                 .copy("CodeMap/Fixtures"),
                 .copy("CodeMap/Goldens")
+            ],
+            linkerSettings: [
+                // SwiftPM copies the vendored Sparkle dynamic framework into the products dir but
+                // does not add it to the .xctest bundle's runtime search path. Add an rpath from the
+                // bundle (.../X.xctest/Contents/MacOS) up to the products dir so `swift test` can dlopen it.
+                .unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", "@loader_path/../../.."])
             ]
         )
     ],
