@@ -34,6 +34,36 @@ final class AgentModeProviderConversationCleanupTests: XCTestCase {
         XCTAssertEqual(calls.first?.action, .archive)
     }
 
+    func testDeleteSessionCleansLiveProviderConversationOnce() async {
+        let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
+        GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)
+        defer { GlobalSettingsStore.shared.setProviderConversationCleanupAction(previousAction, commit: false) }
+
+        let controller = CleanupRecordingCodexController(
+            outcome: .succeeded(message: "controller cleanup")
+        )
+        let viewModel = makeViewModel(codexController: controller)
+        let sessionID = UUID()
+        let tabID = UUID()
+        let session = viewModel.session(for: tabID)
+        _ = viewModel.test_installPersistentSessionBinding(sessionID: sessionID, on: session)
+        session.selectedAgent = .codexExec
+        session.codexController = controller
+        session.providerCleanupHandle = ProviderConversationCleanupHandle(
+            provider: AgentProviderKind.codexExec.rawValue,
+            conversationID: "delete-thread",
+            rolloutPath: "/tmp/delete-rollout.jsonl"
+        )
+
+        let outcome = await viewModel.deleteSession(tabID: tabID)
+
+        XCTAssertEqual(outcome, .succeeded(message: "controller cleanup"))
+        let calls = controller.cleanupCalls()
+        XCTAssertEqual(calls.count, 1)
+        XCTAssertEqual(calls.first?.handle.conversationID, "delete-thread")
+        XCTAssertEqual(calls.first?.action, .archive)
+    }
+
     func testPersistedCodexCleanupUsesStoredConversationMetadata() async {
         let previousAction = GlobalSettingsStore.shared.providerConversationCleanupAction()
         GlobalSettingsStore.shared.setProviderConversationCleanupAction(.archive, commit: false)
