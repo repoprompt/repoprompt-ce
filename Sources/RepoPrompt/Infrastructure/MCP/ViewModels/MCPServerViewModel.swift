@@ -2554,6 +2554,13 @@ final class MCPServerViewModel: ObservableObject {
     /// Disables tools for this window.
     func stopServer() async {
         windowToolsEnabled = false
+        await updateToolRegistration()
+    }
+
+    /// Disables this window's tools and fully stops the listener when no other window participates.
+    func shutdownForWindowClose() async {
+        windowToolsEnabled = false
+        await updateToolRegistration(shutdownListenerWhenUnused: true)
     }
 
     /// Convenience UI toggle.
@@ -2573,7 +2580,10 @@ final class MCPServerViewModel: ObservableObject {
 
     /// Updates tool registration based on windowToolsEnabled state
     @MainActor
-    private func updateToolRegistration(invalidateCatalogBeforeUpdate: Bool = true) async {
+    private func updateToolRegistration(
+        invalidateCatalogBeforeUpdate: Bool = true,
+        shutdownListenerWhenUnused: Bool = false
+    ) async {
         if invalidateCatalogBeforeUpdate {
             #if DEBUG || EDIT_FLOW_PERF
                 let invalidationToolRegistrationUpdateState = EditFlowPerf.begin(EditFlowPerf.Stage.MCPWindowToolCatalog.invalidationToolRegistrationUpdate)
@@ -2594,7 +2604,10 @@ final class MCPServerViewModel: ObservableObject {
             }
         } else {
             ServiceRegistry.unregister(windowToolCatalogService)
-            await service.leave(windowID: windowID)
+            await service.leave(
+                windowID: windowID,
+                shutdownListenerWhenUnused: shutdownListenerWhenUnused
+            )
             await service.refreshState()
         }
     }

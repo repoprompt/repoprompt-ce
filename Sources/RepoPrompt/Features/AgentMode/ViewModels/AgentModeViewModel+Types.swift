@@ -827,6 +827,7 @@ extension AgentModeViewModel {
         case initialSend
         case userExecutionLocationChange(confirmation: ExecutionLocationChangeConfirmation?)
         case externalManagement
+        case liveMCPWorktreeSwitch
     }
 
     /// Internal for cross-file AgentModeViewModel extension access after the mechanical file split.

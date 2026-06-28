@@ -58,7 +58,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
         XCTAssertEqual(previous["visual_color_hex"]?.stringValue, "#7C3AED")
     }
 
-    private static func worktreeDTO() -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
+    private static func worktreeDTO(isMain: Bool = false) -> ToolResultDTOs.ManageWorktreeReplyDTO.WorktreeDTO {
         .init(
             worktreeID: "wt_123",
             specifier: "@id:wt_123",
@@ -67,7 +67,7 @@ final class ManageWorktreeToolServiceTests: XCTestCase {
             name: "repo-wt",
             branch: "feature/demo",
             head: "abcdef0",
-            isMain: false,
+            isMain: isMain,
             isCurrent: true,
             isDetached: false,
             isLocked: false,

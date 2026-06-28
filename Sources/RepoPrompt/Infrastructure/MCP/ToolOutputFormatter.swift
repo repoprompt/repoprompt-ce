@@ -3710,6 +3710,19 @@ extension ToolOutputFormatter {
             if let worktree = dto.worktree ?? dto.worktrees?.first {
                 appendManageWorktreeNextSteps(&out, op: dto.op.lowercased(), worktree: worktree, binding: dto.binding)
             }
+        case "switch":
+            if let worktree = dto.worktree ?? dto.worktrees?.first {
+                out.append("")
+                out.append("### Worktree")
+                appendManageWorktreeDetails(&out, worktree: worktree)
+            }
+            appendManageWorktreeBinding(&out, title: "Binding", binding: dto.binding)
+            appendManageWorktreeBinding(&out, title: "Previous Binding", binding: dto.previousBinding)
+            out.append("")
+            out.append("### Live Routing")
+            out.append("- The current provider process remains at its original launch cwd.")
+            out.append("- RepoPrompt MCP tools now target the selected checkout.")
+            out.append("- A future provider start or resume will use the selected checkout.")
         case "unbind":
             let removed = dto.bindings ?? dto.binding.map { [$0] } ?? []
             out.append("")

@@ -184,6 +184,36 @@ extension AgentModeRunServiceLifecycleTests {
         ], in: recorder)
     }
 
+    func testLiveWorktreeSwitchRetainsClaudeControllerAcrossWorkspaceOnlyMismatch() async throws {
+        let recorder = LifecycleRecorder()
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        let harness = makeHarness(recorder: recorder)
+        let session = makeRunningClaudeSession(controller: controller)
+        let runtime = resolvedClaudeLaunchPolicy(profile: .mcpSafeDefaults, harness: harness)
+        session.permissionProfile = .mcpSafeDefaults
+        setClaudeControllerLaunchSettings(
+            for: session,
+            coordinator: harness.host.claudeCoordinator,
+            workspacePath: "/retained/provider/cwd",
+            permissionMode: runtime?.permissionMode,
+            allowNativeBashTool: runtime?.allowNativeBashTool,
+            mcpStrictMode: runtime?.mcpStrictMode
+        )
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        session.retainAttachedRuntimeForLiveWorktreeSwitch(
+            session.attachedProviderRuntimeIdentity,
+            for: ownership
+        )
+
+        await harness.host.claudeCoordinator.ensureClaudeNativeSession(session: session)
+
+        XCTAssertTrue(session.claudeController === controller)
+        XCTAssertEqual(
+            harness.host.claudeCoordinator.test_controllerLaunchSettings(for: session)?.workspacePath,
+            "/retained/provider/cwd"
+        )
+    }
+
     func testQueuedClaudeSteeringRecycleDoesNotClearReplacementControllerAfterAwait() async {
         let recorder = LifecycleRecorder()
         let currentSessionRefGate = LifecycleAsyncGate()

@@ -1326,8 +1326,8 @@ class WindowState: ObservableObject {
         await agentModeViewModel.prepareForWindowClose()
         WorkspaceApprovalManager.shared.cancelPending(forWindowID: windowID)
 
-        // Stop the local MCP server
-        await mcpServer.stopServer()
+        // Stop the local MCP server and fully release the listener when this is the last participating window.
+        await mcpServer.shutdownForWindowClose()
 
         // Release per-window codemap work before the closed window can contend with later windows.
         await workspaceFilesViewModel.cancelAllScans()

@@ -114,6 +114,150 @@ final class WorktreeAPISmokeHarnessTests: XCTestCase {
         XCTAssertTrue(formattedStart.contains("Agent Created WT"), formattedStart)
     }
 
+    func testManageWorktreeLiveSwitchPreservesSecondaryBindingAndSwitchesBackToMain() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let secondaryLogical = fixture.sandbox.appendingPathComponent("secondary-logical", isDirectory: true)
+        let secondaryPhysical = fixture.sandbox.appendingPathComponent("secondary-physical", isDirectory: true)
+        try FileManager.default.createDirectory(at: secondaryLogical, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: secondaryPhysical, withIntermediateDirectories: true)
+
+        let window = try await Self.makeWindow(root: fixture.repo)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        _ = try await window.workspaceFileContextStore.loadRoot(path: secondaryLogical.path)
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let initialValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/live-switch-initial-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let initialWorktree = try Self.worktreeObject(initialValue, key: "created_worktree")
+        let initialWorktreeID = try XCTUnwrap(initialWorktree["worktree_id"]?.stringValue)
+        let targetValue = try await manageWorktree([
+            "op": .string("create"),
+            "branch": .string("feature/live-switch-target-\(fixture.suffix)"),
+            "base_ref": .string("HEAD")
+        ])
+        let targetWorktree = try Self.worktreeObject(targetValue, key: "created_worktree")
+        let targetWorktreeID = try XCTUnwrap(targetWorktree["worktree_id"]?.stringValue)
+        let targetWorktreePath = try XCTUnwrap(targetWorktree["path"]?.stringValue)
+
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let sessionID = UUID()
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        session.hasLoadedPersistedState = true
+        let secondaryBinding = AgentSessionWorktreeBinding(
+            id: "secondary-binding",
+            repositoryID: "secondary-repository",
+            repoKey: "secondary",
+            logicalRootPath: secondaryLogical.path,
+            logicalRootName: "secondary-logical",
+            worktreeID: "secondary-worktree",
+            worktreeRootPath: secondaryPhysical.path,
+            worktreeName: "secondary-physical",
+            branch: "secondary/test",
+            source: "test.secondary"
+        )
+        session.worktreeBindings = [secondaryBinding]
+        _ = try await manageWorktree([
+            "op": .string("bind"),
+            "worktree_id": .string(initialWorktreeID),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let installedPrimaryBinding = try XCTUnwrap(session.worktreeBindings.last)
+        session.worktreeBindings.append(
+            AgentSessionWorktreeBinding(
+                id: "duplicate-primary-binding",
+                repositoryID: installedPrimaryBinding.repositoryID,
+                repoKey: installedPrimaryBinding.repoKey,
+                logicalRootPath: installedPrimaryBinding.logicalRootPath,
+                logicalRootName: installedPrimaryBinding.logicalRootName,
+                worktreeID: installedPrimaryBinding.worktreeID,
+                worktreeRootPath: installedPrimaryBinding.worktreeRootPath,
+                worktreeName: installedPrimaryBinding.worktreeName,
+                branch: installedPrimaryBinding.branch,
+                head: installedPrimaryBinding.head,
+                source: "test.legacy_duplicate"
+            )
+        )
+        let provider = UnsupportedHeadlessAgentProvider(reason: "live switch identity probe")
+        session.provider = provider
+        addTeardownBlock {
+            await window.workspaceFileContextStore.releaseSessionWorktreeOwnership(ownerID: sessionID)
+        }
+
+        let switchValue = try await manageWorktree([
+            "op": .string("switch"),
+            "worktree_id": .string(targetWorktreeID),
+            "session_id": .string(sessionID.uuidString),
+            "label": .string("Live Switch Target")
+        ])
+        XCTAssertEqual(switchValue.objectValue?["previous_binding"]?.objectValue?["worktree_id"]?.stringValue, initialWorktreeID)
+        XCTAssertEqual(switchValue.objectValue?["binding"]?.objectValue?["id"]?.stringValue, installedPrimaryBinding.id)
+        XCTAssertTrue(session.provider === provider)
+        XCTAssertEqual(session.worktreeBindings.count, 2)
+        XCTAssertEqual(session.worktreeBindings.first, secondaryBinding)
+        XCTAssertEqual(session.worktreeBindings.last?.id, installedPrimaryBinding.id)
+        XCTAssertEqual(try window.agentModeViewModel.effectiveWorkspacePath(for: session), targetWorktreePath)
+
+        let mainValue = try await manageWorktree([
+            "op": .string("switch"),
+            "worktree": .string("@main"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        XCTAssertNil(mainValue.objectValue?["binding"])
+        XCTAssertTrue(session.provider === provider)
+        XCTAssertEqual(session.worktreeBindings, [secondaryBinding])
+        XCTAssertEqual(try window.agentModeViewModel.effectiveWorkspacePath(for: session), fixture.repo.path)
+    }
+
+    func testManageWorktreeLiveSwitchAcceptsMainRepoSelectorFromLinkedPrimaryWorkspace() async throws {
+        let fixture = try Self.makeGitFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.sandbox) }
+
+        let linkedPrimary = fixture.sandbox.appendingPathComponent("linked-primary", isDirectory: true)
+        try Self.runGit([
+            "worktree", "add", "-b", "feature/linked-primary-\(fixture.suffix)", linkedPrimary.path
+        ], cwd: fixture.repo)
+
+        let window = try await Self.makeWindow(root: linkedPrimary)
+        defer { WindowStatesManager.shared.unregisterWindowState(window) }
+        let manageWorktree = try await Self.windowTool(named: MCPWindowToolName.manageWorktree, in: window)
+        let tabID = try XCTUnwrap(window.workspaceManager.activeWorkspace?.activeComposeTabID)
+        let sessionID = UUID()
+        let session = window.agentModeViewModel.session(for: tabID)
+        _ = window.agentModeViewModel.test_installPersistentSessionBinding(
+            sessionID: sessionID,
+            on: session,
+            updateWorkspaceMetadata: true
+        )
+        session.hasLoadedPersistedState = true
+        let provider = UnsupportedHeadlessAgentProvider(reason: "linked primary switch identity probe")
+        session.provider = provider
+        addTeardownBlock {
+            await window.workspaceFileContextStore.releaseSessionWorktreeOwnership(ownerID: sessionID)
+        }
+
+        let switchValue = try await manageWorktree([
+            "op": .string("switch"),
+            "repo_root": .string("@main"),
+            "worktree": .string("@main"),
+            "session_id": .string(sessionID.uuidString)
+        ])
+        let switchObject = try XCTUnwrap(switchValue.objectValue)
+        XCTAssertEqual(switchObject["worktree"]?.objectValue?["is_main"]?.boolValue, true)
+        XCTAssertEqual(switchObject["binding"]?.objectValue?["logical_root_path"]?.stringValue, linkedPrimary.path)
+        XCTAssertEqual(switchObject["binding"]?.objectValue?["worktree_root_path"]?.stringValue, fixture.repo.path)
+        XCTAssertTrue(session.provider === provider)
+        XCTAssertEqual(try window.agentModeViewModel.effectiveWorkspacePath(for: session), fixture.repo.path)
+    }
+
     func testWorktreeBoundManageSelectionPersistsAcrossOneShotContextConnections() async throws {
         let fixture = try Self.makeGitFixture()
         defer { try? FileManager.default.removeItem(at: fixture.sandbox) }

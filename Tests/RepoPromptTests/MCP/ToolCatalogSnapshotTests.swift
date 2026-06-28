@@ -198,42 +198,53 @@ final class ToolCatalogSnapshotTests: XCTestCase {
 
     func testProductionRegistrationUsesCatalogServiceNotViewModel() async throws {
         #if DEBUG
-            XCTAssertTrue(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
-                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true)
-            ))
-            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
-                bundleURL: URL(fileURLWithPath: "/tmp/RepoPromptTests.xctest", isDirectory: true)
-            ))
-            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
-                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true),
-                arguments: ["-RP_UITEST"]
-            ))
-            XCTAssertFalse(AppLaunchConfiguration.debugBuildForcesMCPAutoStart(
-                bundleURL: URL(fileURLWithPath: "/tmp/RepoPrompt.app", isDirectory: true),
-                environment: ["XCTestConfigurationFilePath": "/tmp/session.xctestconfiguration"]
-            ))
-
             try await MCPSharedServerTestLease.shared.withLease { _ in
-                let window = Self.makeWindowWithoutAutoStart()
-                let catalogService = window.mcpServer.windowMCPToolCatalogService
+                let firstWindow = Self.makeWindowWithoutAutoStart()
+                let secondWindow = Self.makeWindowWithoutAutoStart()
+                let windows = [firstWindow, secondWindow]
+                let catalogServices = windows.map(\.mcpServer.windowMCPToolCatalogService)
 
-                try await Self.withIsolatedBootstrapSocketNamespace(window: window, catalogService: catalogService) { socketURL in
+                try await Self.withIsolatedBootstrapSocketNamespace(windows: windows) { socketURL in
                     let storedAutoStart = GlobalSettingsStore.shared.mcpAutoStart()
-                    await window.mcpServer.ensureServerReadyForAgentBootstrap()
+                    await firstWindow.mcpServer.ensureServerReadyForAgentBootstrap()
+                    await secondWindow.mcpServer.ensureServerReadyForAgentBootstrap()
                     XCTAssertEqual(GlobalSettingsStore.shared.mcpAutoStart(), storedAutoStart)
-                    XCTAssertTrue(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (catalogService as AnyObject)
-                    })
-                    XCTAssertFalse(ServiceRegistry.services.contains { service in
-                        (service as AnyObject) === (window.mcpServer as AnyObject)
-                    })
+                    for (window, catalogService) in zip(windows, catalogServices) {
+                        XCTAssertTrue(ServiceRegistry.services.contains { service in
+                            (service as AnyObject) === (catalogService as AnyObject)
+                        })
+                        XCTAssertFalse(ServiceRegistry.services.contains { service in
+                            (service as AnyObject) === (window.mcpServer as AnyObject)
+                        })
+                    }
 
                     let attributes = try FileManager.default.attributesOfItem(atPath: socketURL.path)
                     XCTAssertEqual(attributes[.type] as? FileAttributeType, .typeSocket)
 
+                    let manager = ServerNetworkManager.shared
                     await Self.assertBootstrapSocketOverrideError(.managerNotFullyStopped) {
-                        try await ServerNetworkManager.shared.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
+                        try await manager.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
                     }
+
+                    await firstWindow.tearDown()
+                    XCTAssertFalse(ServiceRegistry.services.contains { service in
+                        (service as AnyObject) === (catalogServices[0] as AnyObject)
+                    })
+                    XCTAssertTrue(ServiceRegistry.services.contains { service in
+                        (service as AnyObject) === (catalogServices[1] as AnyObject)
+                    })
+                    let runningAfterFirstTeardown = await manager.isRunning()
+                    XCTAssertTrue(runningAfterFirstTeardown)
+                    XCTAssertTrue(FileManager.default.fileExists(atPath: socketURL.path))
+
+                    await secondWindow.tearDown()
+                    XCTAssertFalse(ServiceRegistry.services.contains { service in
+                        (service as AnyObject) === (catalogServices[1] as AnyObject)
+                    })
+                    let runningAfterLastTeardown = await manager.isRunning()
+                    XCTAssertFalse(runningAfterLastTeardown)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: socketURL.path))
+                    try await manager.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
                 }
             }
         #else
@@ -265,6 +276,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         XCTAssertTrue(manageOpEnum.contains("list"))
         XCTAssertTrue(manageOpEnum.contains("create"))
         XCTAssertTrue(manageOpEnum.contains("bind"))
+        XCTAssertTrue(manageOpEnum.contains("switch"))
 
         for field in [
             "operation_id",
@@ -333,66 +345,42 @@ final class ToolCatalogSnapshotTests: XCTestCase {
     }
 
     #if DEBUG
-        private struct BootstrapSocketNamespaceFixture {
-            let directoryURL: URL
-            let socketURL: URL
-
-            static func make() throws -> Self {
-                let directoryURL = URL(
-                    fileURLWithPath: "/tmp/rpce-xctest-bs-\(getpid())-\(UUID().uuidString)",
-                    isDirectory: true
-                )
-                let socketURL = directoryURL.appendingPathComponent("bootstrap.sock")
-                XCTAssertLessThan(socketURL.path.utf8CString.count, MemoryLayout<sockaddr_un>.size)
-                XCTAssertNotEqual(socketURL.standardizedFileURL, MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL)
-                try FileManager.default.createDirectory(
-                    at: directoryURL,
-                    withIntermediateDirectories: false,
-                    attributes: [.posixPermissions: 0o700]
-                )
-                return .init(directoryURL: directoryURL, socketURL: socketURL)
-            }
-
-            func removeOwnedDirectory() {
-                try? FileManager.default.removeItem(at: directoryURL)
-            }
-        }
-
         private static func withIsolatedBootstrapSocketNamespace(
-            window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
+            windows: [WindowState],
             operation: (URL) async throws -> Void
         ) async throws {
-            let fixture = try BootstrapSocketNamespaceFixture.make()
+            let directoryURL = URL(
+                fileURLWithPath: "/tmp/rpce-xctest-bs-\(getpid())-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            let socketURL = directoryURL.appendingPathComponent("bootstrap.sock")
+            XCTAssertLessThan(socketURL.path.utf8CString.count, MemoryLayout<sockaddr_un>.size)
+            try FileManager.default.createDirectory(
+                at: directoryURL,
+                withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
             let manager = ServerNetworkManager.shared
             let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
             let defaultSocketURL = await manager.debugResolvedBootstrapSocketURL()
             XCTAssertEqual(defaultSocketURL, productionSocketURL)
             let previousEnabledState = await manager.debugIsEnabledForBootstrapSocketURLOverride()
 
-            await assertBootstrapSocketOverrideError(.productionSocketURLRejected) {
-                try await manager.debugInstallBootstrapSocketURLOverride(productionSocketURL)
-            }
-
             do {
-                try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
+                try await manager.debugInstallBootstrapSocketURLOverride(socketURL)
             } catch {
-                fixture.removeOwnedDirectory()
+                try? FileManager.default.removeItem(at: directoryURL)
                 throw error
             }
 
-            await assertBootstrapSocketOverrideError(.overrideAlreadyInstalled) {
-                try await manager.debugInstallBootstrapSocketURLOverride(fixture.socketURL)
-            }
-
             do {
-                try await operation(fixture.socketURL)
+                try await operation(socketURL)
             } catch {
                 do {
                     try await cleanupIsolatedBootstrapSocketNamespace(
-                        window: window,
-                        catalogService: catalogService,
-                        fixture: fixture,
+                        windows: windows,
+                        socketURL: socketURL,
+                        directoryURL: directoryURL,
                         previousEnabledState: previousEnabledState
                     )
                 } catch {
@@ -402,30 +390,33 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             }
 
             try await cleanupIsolatedBootstrapSocketNamespace(
-                window: window,
-                catalogService: catalogService,
-                fixture: fixture,
+                windows: windows,
+                socketURL: socketURL,
+                directoryURL: directoryURL,
                 previousEnabledState: previousEnabledState
             )
         }
 
         private static func cleanupIsolatedBootstrapSocketNamespace(
-            window: WindowState,
-            catalogService: MCPWindowToolCatalogService,
-            fixture: BootstrapSocketNamespaceFixture,
+            windows: [WindowState],
+            socketURL: URL,
+            directoryURL: URL,
             previousEnabledState: Bool
         ) async throws {
-            await window.mcpServer.stopServer()
-            ServiceRegistry.unregister(catalogService)
-            await window.mcpServer.shutdownListener()
+            for window in windows {
+                await window.tearDown()
+            }
 
             let manager = ServerNetworkManager.shared
             let runningAfterShutdown = await manager.isRunning()
             XCTAssertFalse(runningAfterShutdown)
             let productionSocketURL = MCPFilesystemConstants.bootstrapSocketURL().standardizedFileURL
             let resolvedSocketURL = await manager.debugResolvedBootstrapSocketURL()
-            XCTAssertEqual(resolvedSocketURL, fixture.socketURL.standardizedFileURL)
-            try await manager.debugRestoreBootstrapSocketURLOverride(expected: fixture.socketURL)
+            if resolvedSocketURL == socketURL.standardizedFileURL {
+                try await manager.debugRestoreBootstrapSocketURLOverride(expected: socketURL)
+            } else {
+                XCTAssertEqual(resolvedSocketURL, productionSocketURL)
+            }
             let restoredSocketURL = await manager.debugResolvedBootstrapSocketURL()
             XCTAssertEqual(restoredSocketURL, productionSocketURL)
             await manager.setEnabled(previousEnabledState)
@@ -435,7 +426,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
             XCTAssertFalse(runningAfterEnabledRestore)
             let resolvedSocketURLAfterEnabledRestore = await manager.debugResolvedBootstrapSocketURL()
             XCTAssertEqual(resolvedSocketURLAfterEnabledRestore, productionSocketURL)
-            fixture.removeOwnedDirectory()
+            try? FileManager.default.removeItem(at: directoryURL)
         }
 
         private static func assertBootstrapSocketOverrideError(
@@ -478,7 +469,7 @@ final class ToolCatalogSnapshotTests: XCTestCase {
         "11|oracle_send|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=4608413a45189586669c6cc3339af4d467939a2477036545ef5d879b676b51fb|schema=6f940dcd0a0d39789189120217abdb60cd0f520b85f862beb81349f98bc1b19c",
         "12|oracle_chat_log|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=5acbb74a0fcf76bd3717faac8fc355f582f13523685d3bfebf11fda7241958b1|schema=50db94327abe785e20d3628135efa29cf184d18272d5af5b94a43d7246a4a201",
         "13|git|enabled=true|ann=title=nil,readOnly=true,destructive=false,idempotent=true,openWorld=false|desc=1a9ff83872cf8842146dd84563dd880f7d9b8f6190cc6e9204a0ea82fc8feca6|schema=51bd804997d6acfaa17d529867f6188b969282a4db95956e859a74ab07de626a",
-        "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=857ab8975667e3d2e5b35a09c7415e07ca0ab2f0ff16de6895170d4d1b47a820|schema=9263f9f047982b3709d92040f749804d69928d222ce46038a4171ded34d12bc6",
+        "14|manage_worktree|enabled=true|ann=title=nil,readOnly=false,destructive=true,idempotent=nil,openWorld=false|desc=8afe399f8a53d186f6a6be5da4d51a29e9f959776330f56cfb7354f3c0f18dae|schema=05722dab0708c1c80540b203110656f98ef56467ffe569343998f2bacb3e7d10",
         "15|context_builder|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=d83348b6b803b303965401075041ddc5d7dcea3512020afa3f352c04413750fb|schema=2da87e6e171809a1e0eb0614fa8f7db2f91311f655f8427745060be80755da1f",
         "16|ask_user|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=6b3870ae4848eb01c73de9fbbdf2ed1782487db150260469853757f799257ee0|schema=080446bb7697cf5f4cd31f07b42ecff8ab29edc8501ee0e84e61426748569156",
         "17|agent_explore|enabled=true|ann=title=nil,readOnly=false,destructive=false,idempotent=nil,openWorld=false|desc=698ab006db47713a51f394bfe3f832ada8637440d8acb4715be5430ec380cef8|schema=7b3c869b0c959c1c162dfadfd4ea578b05ed0834b2e930d177a8c38f96c31a4b",

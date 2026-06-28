@@ -450,6 +450,39 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         try await super.tearDown()
     }
 
+    func testPrimaryLogicalRootRequiresOneExactStandardizedVisibleMatch() throws {
+        let primary = try makeTemporaryDirectory(named: "primary-logical-root")
+        let secondary = try makeTemporaryDirectory(named: "secondary-logical-root")
+        let primaryRef = WorkspaceRootRef(id: UUID(), name: "Primary", fullPath: primary.path)
+        let secondaryRef = WorkspaceRootRef(id: UUID(), name: "Secondary", fullPath: secondary.path)
+
+        XCTAssertEqual(
+            AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+                in: [secondaryRef, primaryRef],
+                fallbackWorkspacePath: primary.appendingPathComponent("..").appendingPathComponent(primary.lastPathComponent).path
+            )?.id,
+            primaryRef.id
+        )
+        XCTAssertNil(
+            AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+                in: [primaryRef, WorkspaceRootRef(id: UUID(), name: "Duplicate", fullPath: primary.path)],
+                fallbackWorkspacePath: primary.path
+            )
+        )
+        XCTAssertNil(
+            AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+                in: [secondaryRef],
+                fallbackWorkspacePath: primary.path
+            )
+        )
+        XCTAssertNil(
+            AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+                in: [primaryRef],
+                fallbackWorkspacePath: nil
+            )
+        )
+    }
+
     func testEffectiveWorkspacePathCoversBoundUnboundAndMissingRecovery() throws {
         let root = try makeTemporaryDirectory(named: "root")
         let worktree = try makeTemporaryDirectory(named: "worktree")
@@ -1610,6 +1643,113 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
         XCTAssertEqual(session.items.filter { $0.kind == .user }.map(\.text), ["in-flight prompt"])
     }
 
+    func testLiveMCPWorktreeSwitchPreservesActiveRuntimeIdentityAndFutureWorkspacePath() async throws {
+        let root = try makeTemporaryDirectory(named: "live-switch-root")
+        let oldWorktree = try makeTemporaryDirectory(named: "live-switch-old-worktree")
+        let newWorktree = try makeTemporaryDirectory(named: "live-switch-new-worktree")
+        let window = try await makeWindow(root: root)
+        let viewModel = window.agentModeViewModel
+        let createdTabID = await viewModel.createAndActivateSessionTab()
+        let tabID = try XCTUnwrap(createdTabID)
+        let session = await viewModel.ensureSessionReady(tabID: tabID)
+        let sessionID = try XCTUnwrap(session.activeAgentSessionID)
+        let runID = UUID()
+        let controller = LiveSwitchWorktreeStartFakeCodexController()
+        let oldBinding = makeBinding(
+            logicalRoot: root.path,
+            worktreeRoot: oldWorktree.path,
+            worktreeID: "live-old"
+        )
+        let newBinding = makeBinding(
+            logicalRoot: root.path,
+            worktreeRoot: newWorktree.path,
+            worktreeID: "live-new"
+        )
+        session.hasLoadedPersistedState = true
+        session.hasSentFirstMessage = true
+        session.selectedAgent = .codexExec
+        session.runState = .running
+        session.runID = runID
+        let ownership = session.beginRunAttempt(source: "test.liveWorktreeSwitch")
+        session.providerSessionID = "provider-session-old-cwd"
+        session.codexConversationID = "codex-conversation-old-cwd"
+        session.codexRolloutPath = "/tmp/codex-rollout-old-cwd"
+        session.codexController = controller
+        session.codexControllerWorkspacePath = oldWorktree.path
+        session.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        session.pendingInstructions = ["queued instruction"]
+        session.worktreeBindings = [oldBinding]
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [newBinding],
+            forSessionID: sessionID,
+            intent: .liveMCPWorktreeSwitch
+        )
+
+        XCTAssertEqual(session.worktreeBindings, [newBinding])
+        XCTAssertEqual(session.runState, .running)
+        XCTAssertEqual(session.runID, runID)
+        XCTAssertEqual(session.providerSessionID, "provider-session-old-cwd")
+        XCTAssertEqual(session.codexConversationID, "codex-conversation-old-cwd")
+        XCTAssertEqual(session.codexRolloutPath, "/tmp/codex-rollout-old-cwd")
+        XCTAssertEqual(session.pendingInstructions, ["queued instruction"])
+        XCTAssertTrue(session.codexController === controller)
+        XCTAssertTrue(session.retainsCodexControllerForLiveWorktreeSwitch(controller))
+        XCTAssertEqual(session.liveWorktreeSwitchRuntimeRetention?.ownership, ownership)
+        XCTAssertEqual(session.codexControllerWorkspacePath, oldWorktree.path)
+        XCTAssertEqual(try viewModel.effectiveWorkspacePath(for: session), newWorktree.path)
+
+        await viewModel.codexCoordinator.ensureCodexNativeSession(
+            session: session,
+            deferReconnectForCurrentActiveTurn: true,
+            preserveExistingRunID: true,
+            semanticRunState: .running
+        )
+
+        XCTAssertTrue(session.codexController === controller)
+        XCTAssertEqual(controller.shutdownCount, 0)
+        XCTAssertEqual(session.codexControllerWorkspacePath, oldWorktree.path)
+
+        session.codexEventTask?.cancel()
+        session.codexEventTask = nil
+        session.codexController = nil
+        session.runState = .idle
+        session.runID = nil
+        await controller.shutdown()
+
+        let idleSession = viewModel.session(for: UUID())
+        let idleSessionID = UUID()
+        let idleController = LiveSwitchWorktreeStartFakeCodexController()
+        idleSession.testInstallPersistentSessionBinding(sessionID: idleSessionID)
+        idleSession.hasLoadedPersistedState = true
+        idleSession.hasSentFirstMessage = true
+        idleSession.selectedAgent = .codexExec
+        idleSession.runState = .idle
+        idleSession.codexController = idleController
+        idleSession.codexControllerWorkspacePath = oldWorktree.path
+        idleSession.codexControllerGoalSupportEnabled = CodexGoalSupport.isEnabled
+        idleSession.worktreeBindings = [oldBinding]
+
+        _ = try await viewModel.transitionWorktreeBindings(
+            [],
+            forSessionID: idleSessionID,
+            intent: .liveMCPWorktreeSwitch
+        )
+
+        XCTAssertNil(idleSession.liveWorktreeSwitchRuntimeRetention)
+        await viewModel.codexCoordinator.ensureCodexNativeSession(session: idleSession)
+        XCTAssertFalse(idleSession.codexController === idleController)
+        XCTAssertEqual(idleController.shutdownCount, 1)
+        XCTAssertEqual(idleSession.codexControllerWorkspacePath, root.path)
+
+        idleSession.codexEventTask?.cancel()
+        idleSession.codexEventTask = nil
+        if let controller = idleSession.codexController {
+            await controller.shutdown()
+        }
+        idleSession.codexController = nil
+    }
+
     func testExternalPrimaryRebindRejectsDuringActiveRunWithoutDroppingOldIdentity() async throws {
         let root = try makeTemporaryDirectory(named: "managed-active-root")
         let oldWorktree = try makeTemporaryDirectory(named: "managed-old-worktree")
@@ -2135,9 +2275,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
 
                 let manager = ServerNetworkManager.shared
                 if installStarted {
-                    await window.mcpServer.stopServer()
-                    ServiceRegistry.unregister(window.mcpServer.windowMCPToolCatalogService)
-                    await window.mcpServer.shutdownListener()
+                    await window.tearDown()
 
                     if await manager.isRunning() {
                         failures.append(String(describing: FixtureError.managerWasNotStopped))
@@ -2769,7 +2907,7 @@ final class AgentRunWorktreeStartTests: AgentRunWorktreeStartGitSeedTestCase {
     }
 }
 
-private final class WorktreeStartFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
+private class WorktreeStartFakeCodexController: CodexSessionControllerTurnDispatchTestDefaults {
     var hasActiveThread: Bool {
         false
     }
@@ -2843,4 +2981,21 @@ private final class WorktreeStartFakeCodexController: CodexSessionControllerTurn
     func cancelCurrentTurn() async {}
     func shutdown() async {}
     func respondToServerRequest(id: CodexAppServerRequestID, result: [String: Any]) async {}
+}
+
+private final class LiveSwitchWorktreeStartFakeCodexController: WorktreeStartFakeCodexController {
+    private var eventContinuations: [AsyncStream<CodexNativeSessionController.Event>.Continuation] = []
+    private(set) var shutdownCount = 0
+
+    override var events: AsyncStream<CodexNativeSessionController.Event> {
+        AsyncStream { continuation in
+            eventContinuations.append(continuation)
+        }
+    }
+
+    override func shutdown() async {
+        shutdownCount += 1
+        eventContinuations.forEach { $0.finish() }
+        eventContinuations.removeAll()
+    }
 }

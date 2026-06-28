@@ -722,6 +722,59 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(recorder.contains(prefix: "commit:"))
     }
 
+    func testLiveWorktreeSwitchRetentionExpiresOnlyForOwningTerminalCommit() async throws {
+        let recorder = LifecycleRecorder()
+        let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))
+        let controller = LifecycleFakeNativeController(recorder: recorder)
+        let session = makeRunningClaudeSession(controller: controller)
+        let ownership = try XCTUnwrap(session.activeRunOwnership)
+        session.retainAttachedRuntimeForLiveWorktreeSwitch(session.attachedProviderRuntimeIdentity, for: ownership)
+        XCTAssertTrue(session.retainsClaudeControllerForLiveWorktreeSwitch(controller))
+
+        let revision = await barrier.commit(.init(
+            session: session,
+            ownership: ownership,
+            expectedRunID: session.runID,
+            terminalState: .completed,
+            source: "test.liveWorktreeSwitch",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNotNil(revision)
+        XCTAssertNil(session.activeRunOwnership)
+        XCTAssertNil(session.liveWorktreeSwitchRuntimeRetention)
+        XCTAssertFalse(session.retainsClaudeControllerForLiveWorktreeSwitch(controller))
+
+        let rotated = AgentModeViewModel.TabSession(tabID: UUID())
+        rotated.runID = UUID()
+        rotated.runState = .running
+        rotated.claudeController = controller
+        let staleOwnership = rotated.beginRunAttempt(source: "test.staleLiveWorktreeSwitch")
+        rotated.retainAttachedRuntimeForLiveWorktreeSwitch(rotated.attachedProviderRuntimeIdentity, for: staleOwnership)
+        let currentOwnership = rotated.beginRunAttempt(source: "test.currentLiveWorktreeSwitch")
+        rotated.retainAttachedRuntimeForLiveWorktreeSwitch(rotated.attachedProviderRuntimeIdentity, for: currentOwnership)
+
+        let staleRevision = await barrier.commit(.init(
+            session: rotated,
+            ownership: staleOwnership,
+            expectedRunID: rotated.runID,
+            terminalState: .completed,
+            source: "test.staleLiveWorktreeSwitch",
+            attachmentDisposition: .deleteFiles,
+            finalizeNonCodexUsage: true,
+            supportsFollowUp: false,
+            notifyTurnComplete: false
+        ))
+
+        XCTAssertNil(staleRevision)
+        XCTAssertEqual(rotated.activeRunOwnership, currentOwnership)
+        XCTAssertEqual(rotated.liveWorktreeSwitchRuntimeRetention?.ownership, currentOwnership)
+        XCTAssertTrue(rotated.retainsClaudeControllerForLiveWorktreeSwitch(controller))
+    }
+
     func testNewAttemptResetsProviderDrainGenerationAcrossProviderFamilies() async {
         let recorder = LifecycleRecorder()
         let barrier = AgentRunTerminalCommitBarrier(hooks: makeHooks(recorder: recorder))

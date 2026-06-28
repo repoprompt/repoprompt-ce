@@ -132,12 +132,16 @@ actor MCPService: Sendable {
         updates.continuation.yield(state)
     }
 
-    func leave(windowID: Int) async {
+    func leave(windowID: Int, shutdownListenerWhenUnused: Bool = false) async {
         let removed = participatingWindows.remove(windowID) != nil
         mcpServiceLog("Window \(windowID) leaving MCP (removed: \(removed), remaining: \(participatingWindows.count))")
 
         if participatingWindows.isEmpty {
-            await stop() // stop() already yields
+            if shutdownListenerWhenUnused {
+                await fullShutdown()
+            } else {
+                await stop() // stop() already yields
+            }
         }
 
         // Broadcast even if nothing else changed so UI stays in sync

@@ -5532,9 +5532,45 @@ final class AgentModeViewModel: ObservableObject {
         let previousBindings = session.worktreeBindings
         let previousDestination = executionDestinationIdentity(in: previousBindings)
         let nextDestination = executionDestinationIdentity(in: desiredBindings)
+        let primaryDestinationChanged = previousDestination != nextDestination
         let changedDuringActiveRun = session.runState.isActive
+        let isLiveMCPWorktreeSwitch = if case .liveMCPWorktreeSwitch = intent {
+            true
+        } else {
+            false
+        }
+        let expectedRuntimeIdentity: AttachedProviderRuntimeIdentity? = if isLiveMCPWorktreeSwitch,
+                                                                           primaryDestinationChanged
+        {
+            session.attachedProviderRuntimeIdentity
+        } else {
+            nil
+        }
+        let retentionOwnership: AgentRunOwnership? = if isLiveMCPWorktreeSwitch,
+                                                        primaryDestinationChanged,
+                                                        changedDuringActiveRun
+        {
+            session.activeRunOwnership
+        } else {
+            nil
+        }
+        if isLiveMCPWorktreeSwitch,
+           primaryDestinationChanged,
+           expectedRuntimeIdentity?.hasAttachedRuntime != true
+        {
+            throw MCPError.invalidParams(
+                "A live worktree switch requires an attached Agent provider runtime. Use bind or select when the provider is not running."
+            )
+        }
+        if isLiveMCPWorktreeSwitch,
+           primaryDestinationChanged,
+           changedDuringActiveRun,
+           retentionOwnership == nil
+        {
+            throw ExecutionLocationTransitionError.stale
+        }
 
-        if changedDuringActiveRun, previousDestination != nextDestination {
+        if changedDuringActiveRun, primaryDestinationChanged {
             switch intent {
             case .userExecutionLocationChange(confirmation: .activeRunStop):
                 break
@@ -5546,6 +5582,8 @@ final class AgentModeViewModel: ObservableObject {
                 )
             case .initialSend:
                 throw MCPError.invalidParams("A running Agent thread cannot apply an initial execution location.")
+            case .liveMCPWorktreeSwitch:
+                break
             }
         }
 
@@ -5555,7 +5593,14 @@ final class AgentModeViewModel: ObservableObject {
         let preparation: WorkspaceRootBindingProjectionPreparation?
         if let materializer {
             do {
-                preparation = try await materializer.prepare(sessionID: sessionID, bindings: desiredBindings)
+                let prepared = try await materializer.prepare(sessionID: sessionID, bindings: desiredBindings)
+                if Task.isCancelled {
+                    await materializer.abort(prepared)
+                    try Task.checkCancellation()
+                }
+                preparation = prepared
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 throw ExecutionLocationTransitionError.unavailable(error.localizedDescription)
             }
@@ -5570,13 +5615,22 @@ final class AgentModeViewModel: ObservableObject {
             guard sessions[session.tabID] === session,
                   session.activeAgentSessionID == sessionID,
                   session.worktreeBindings == previousBindings,
-                  session.runState.isActive == changedDuringActiveRun
+                  session.runState.isActive == changedDuringActiveRun,
+                  !isLiveMCPWorktreeSwitch
+                  || !changedDuringActiveRun
+                  || session.activeRunOwnership == retentionOwnership
             else {
                 throw ExecutionLocationTransitionError.stale
             }
 
-            if previousDestination != nextDestination {
-                if changedDuringActiveRun {
+            if primaryDestinationChanged {
+                if isLiveMCPWorktreeSwitch {
+                    guard let expectedRuntimeIdentity,
+                          session.attachedProviderRuntimeIdentity == expectedRuntimeIdentity
+                    else {
+                        throw ExecutionLocationTransitionError.stale
+                    }
+                } else if changedDuringActiveRun {
                     switch intent {
                     case .userExecutionLocationChange(confirmation: .activeRunStop):
                         cancelPendingInstruction(for: session)
@@ -5588,38 +5642,82 @@ final class AgentModeViewModel: ObservableObject {
                             intent: .executionLocationChange,
                             completion: .terminalPublished
                         )
-                    case .userExecutionLocationChange, .externalManagement, .initialSend:
+                    case .userExecutionLocationChange, .externalManagement, .initialSend, .liveMCPWorktreeSwitch:
                         throw ExecutionLocationTransitionError.stale
                     }
                 }
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings,
-                      !session.runState.isActive
-                else {
-                    throw ExecutionLocationTransitionError.stale
-                }
-                if !changedDuringActiveRun {
-                    await stageResumeRecoveryHandoffIfNeeded(for: session)
-                }
-                await invalidateProviderContextForExecutionLocationChange(session)
-                guard sessions[session.tabID] === session,
-                      session.activeAgentSessionID == sessionID,
-                      session.worktreeBindings == previousBindings,
-                      !session.runState.isActive
-                else {
-                    throw ExecutionLocationTransitionError.stale
+                if !isLiveMCPWorktreeSwitch {
+                    guard sessions[session.tabID] === session,
+                          session.activeAgentSessionID == sessionID,
+                          session.worktreeBindings == previousBindings,
+                          !session.runState.isActive
+                    else {
+                        throw ExecutionLocationTransitionError.stale
+                    }
+                    if !changedDuringActiveRun {
+                        await stageResumeRecoveryHandoffIfNeeded(for: session)
+                    }
+                    await invalidateProviderContextForExecutionLocationChange(session)
+                    guard sessions[session.tabID] === session,
+                          session.activeAgentSessionID == sessionID,
+                          session.worktreeBindings == previousBindings,
+                          !session.runState.isActive
+                    else {
+                        throw ExecutionLocationTransitionError.stale
+                    }
                 }
             }
 
             let projection: WorkspaceRootBindingProjection?
             if let materializer, let preparation {
+                try Task.checkCancellation()
                 projection = try await materializer.commit(preparation)
                 ownershipCommitted = true
             } else {
                 projection = nil
             }
+            if isLiveMCPWorktreeSwitch,
+               primaryDestinationChanged,
+               let expectedRuntimeIdentity,
+               sessions[session.tabID] !== session
+               || session.activeAgentSessionID != sessionID
+               || session.worktreeBindings != previousBindings
+               || session.runState.isActive != changedDuringActiveRun
+               || changedDuringActiveRun && session.activeRunOwnership != retentionOwnership
+               || session.attachedProviderRuntimeIdentity != expectedRuntimeIdentity
+            {
+                if let materializer {
+                    do {
+                        try await restoreWorktreeOwnership(
+                            previousBindings,
+                            sessionID: sessionID,
+                            materializer: materializer
+                        )
+                    } catch {
+                        throw ExecutionLocationTransitionError.unavailable(
+                            "The live provider changed during the worktree switch and previous workspace ownership could not be restored: \(error.localizedDescription)"
+                        )
+                    }
+                }
+                throw ExecutionLocationTransitionError.stale
+            }
             _ = commitWorktreeBindings(desiredBindings, to: session)
+            if isLiveMCPWorktreeSwitch,
+               primaryDestinationChanged,
+               let expectedRuntimeIdentity
+            {
+                if let retentionOwnership {
+                    session.retainAttachedRuntimeForLiveWorktreeSwitch(
+                        expectedRuntimeIdentity,
+                        for: retentionOwnership
+                    )
+                }
+                mcpServer?.publishLiveWorktreeBindingSwitch(
+                    sessionID: sessionID,
+                    tabID: session.tabID,
+                    currentBindings: session.worktreeBindings
+                )
+            }
             if let materializer {
                 await materializer.initializeCodemaps(for: projection)
             }
@@ -5628,6 +5726,21 @@ final class AgentModeViewModel: ObservableObject {
             if !ownershipCommitted, let materializer, let preparation {
                 await materializer.abort(preparation)
             }
+            throw error
+        }
+    }
+
+    private func restoreWorktreeOwnership(
+        _ bindings: [AgentSessionWorktreeBinding],
+        sessionID: UUID,
+        materializer: WorkspaceRootBindingProjectionMaterializer
+    ) async throws {
+        let restoration = try await materializer.prepare(sessionID: sessionID, bindings: bindings)
+        do {
+            let projection = try await materializer.commit(restoration)
+            await materializer.initializeCodemaps(for: projection)
+        } catch {
+            await materializer.abort(restoration)
             throw error
         }
     }
@@ -5658,9 +5771,10 @@ final class AgentModeViewModel: ObservableObject {
         }
         let primaryPath = Self.standardizedWorkspacePath((primaryRoot as NSString).expandingTildeInPath) ?? primaryRoot
         let visibleRoots = await promptManager.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
-        guard let logicalRoot = visibleRoots.first(where: {
-            (Self.standardizedWorkspacePath($0.standardizedFullPath) ?? $0.standardizedFullPath) == primaryPath
-        }) else {
+        guard let logicalRoot = AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+            in: visibleRoots,
+            fallbackWorkspacePath: primaryPath
+        ) else {
             throw ExecutionLocationTransitionError.unavailable("Load the primary workspace root before selecting an execution location.")
         }
         guard let resolvedRepo = await VCSService.shared.resolveRepo(from: URL(fileURLWithPath: primaryPath)),

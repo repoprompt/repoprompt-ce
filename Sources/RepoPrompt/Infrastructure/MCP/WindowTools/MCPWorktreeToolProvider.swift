@@ -34,7 +34,7 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             description: """
             Manage Git worktrees, per-agent-session worktree bindings, and session-bound worktree merges.
 
-            **Management ops**: list | show | create | bind | select | unbind
+            **Management ops**: list | show | create | bind | select | switch | unbind
             **Merge ops**: preview | apply | status | continue | abort
 
             **Selectors**:
@@ -45,9 +45,11 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             - `target_worktree_id`: Durable merge target ID alternative to `target`.
 
             **Session binding and merge source**:
-            - `bind` and `select` persist a binding for one Agent session.
+            - `bind` and `select` persist a binding for one Agent session using restart-oriented transition semantics.
+            - `switch` changes the primary logical root's live binding while retaining the current provider process and its launch cwd; MCP tools reroute immediately and future provider starts use the selected checkout.
             - Merge ops use the Agent session's bound source worktree; `repo_root` disambiguates when multiple bindings exist.
             - `session_id` is optional only when MCP routing resolves an active Agent session; otherwise provide it explicitly.
+            - `switch` requires an authoritative live Agent session with an attached provider runtime and targets only the active workspace's exact primary logical root.
             - `create` can also bind with `bind=true`; `unbind` removes the selected root binding, or all bindings with `all=true`.
 
             **Merge safety**:
@@ -68,12 +70,12 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             annotations: .repoPromptLocalDestructive,
             inputSchema: .object(
                 properties: [
-                    "op": .string(description: "Operation", enum: ["list", "show", "create", "bind", "select", "unbind", "preview", "apply", "status", "continue", "abort"]),
+                    "op": .string(description: "Operation", enum: ["list", "show", "create", "bind", "select", "switch", "unbind", "preview", "apply", "status", "continue", "abort"]),
                     "repo_root": .string(description: "Optional loaded root path/name or repo/worktree specifier. Defaults to the first loaded Git repo."),
                     "repo_key": .string(description: "Optional repository key alternative to repo_root."),
                     "worktree": .string(description: "Worktree selector: @current, @main, @branch:<name>, branch/name/path, or @id:<worktree_id>."),
                     "worktree_id": .string(description: "Durable worktree ID alternative to worktree. Mutually exclusive with worktree."),
-                    "session_id": .string(description: "Target Agent session for bind/select/unbind, or create with bind=true."),
+                    "session_id": .string(description: "Target Agent session for bind/select/switch/unbind, or create with bind=true."),
                     "include_status": .boolean(description: "Include a compact dirty summary for each returned worktree. Default false."),
                     "persist_visuals": .boolean(description: "For list/show, persist fallback visual identities instead of returning deterministic fallbacks only."),
                     "branch": .string(description: "Create: branch name to create/check out."),
@@ -110,16 +112,16 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
     // MARK: - Execution
 
     enum Operation: String {
-        case list, show, create, bind, select, unbind
+        case list, show, create, bind, select, `switch`, unbind
         case preview, apply, status, `continue`, abort
     }
 
     private func executeManageWorktree(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         guard let opRaw = trimmedString(args["op"])?.lowercased() else {
-            throw MCPError.invalidParams("op is required. Valid ops: list, show, create, bind, select, unbind, preview, apply, status, continue, abort")
+            throw MCPError.invalidParams("op is required. Valid ops: list, show, create, bind, select, switch, unbind, preview, apply, status, continue, abort")
         }
         guard let op = Operation(rawValue: opRaw) else {
-            throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: list, show, create, bind, select, unbind, preview, apply, status, continue, abort")
+            throw MCPError.invalidParams("Invalid op: \(opRaw). Valid ops: list, show, create, bind, select, switch, unbind, preview, apply, status, continue, abort")
         }
 
         try validateArguments(args, for: op)
@@ -134,6 +136,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             return try await executeCreate(args: args)
         case .bind, .select:
             return try await executeBind(op: op, args: args)
+        case .switch:
+            return try await executeSwitch(args: args)
         case .unbind:
             return try await executeUnbind(args: args)
         case .preview, .apply, .status, .continue, .abort:
@@ -272,6 +276,98 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         )
     }
 
+    private func executeSwitch(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
+        let targetWindow = try dependencies.requireTargetWindow()
+        let sessionID = try await resolveBindingSessionID(args: args)
+        let agentModeVM = targetWindow.agentModeViewModel
+        guard let session = try agentModeVM.authoritativeLiveSession(for: sessionID),
+              session.hasLoadedPersistedState
+        else {
+            throw MCPError.invalidParams("The requested agent session is not currently available and hydrated.")
+        }
+        guard session.hasAttachedProviderRuntime else {
+            throw MCPError.invalidParams(
+                "op=switch requires an attached Agent provider runtime. Use bind or select when the provider is not running."
+            )
+        }
+        guard let activeWorkspace = targetWindow.workspaceManager.activeWorkspace,
+              activeWorkspace.composeTabs.contains(where: { $0.id == session.tabID })
+        else {
+            throw MCPError.invalidParams("The requested agent session does not belong to the active workspace.")
+        }
+
+        let context = try await resolvePrimarySwitchContext(args: args)
+        let worktree = try await resolveWorktree(
+            args: args,
+            repo: context.repo,
+            allRepos: [context.repo],
+            requireExplicit: true
+        )
+        try validateSwitchTargetAvailable(worktree)
+        try Task.checkCancellation()
+        let identity = try persistOrResolveVisualIdentity(for: worktree, args: args, persist: true)
+        let existing = session.worktreeBindings
+        let normalizedPrimaryRoot = standardizedPath(context.logicalRoot.standardizedFullPath)
+        let previousIndex = existing.firstIndex {
+            standardizedPath($0.logicalRootPath) == normalizedPrimaryRoot
+        }
+        let previous = previousIndex.map { existing[$0] }
+        let switchesToCanonicalCheckout = GitRepoRootAuthorization.canonicalPath(worktree.path)
+            == GitRepoRootAuthorization.canonicalPath(context.logicalRoot.standardizedFullPath)
+
+        var desiredBindings = existing.filter {
+            standardizedPath($0.logicalRootPath) != normalizedPrimaryRoot
+        }
+        let resultingBinding: AgentSessionWorktreeBinding?
+        if switchesToCanonicalCheckout {
+            resultingBinding = nil
+        } else {
+            let binding: AgentSessionWorktreeBinding = if let previous,
+                                                          previous.worktreeID == worktree.worktreeID,
+                                                          trimmedString(args["label"]) == nil,
+                                                          trimmedString(args["color"]) == nil
+            {
+                previous
+            } else {
+                makeBinding(
+                    previous: previous,
+                    logicalRoot: context.logicalRoot,
+                    worktree: worktree,
+                    visualIdentity: identity,
+                    source: "manage_worktree.switch"
+                )
+            }
+            desiredBindings.insert(binding, at: min(previousIndex ?? desiredBindings.count, desiredBindings.count))
+            resultingBinding = binding
+        }
+
+        if desiredBindings != existing {
+            try Task.checkCancellation()
+            _ = try await agentModeVM.transitionWorktreeBindings(
+                desiredBindings,
+                forSessionID: sessionID,
+                intent: .liveMCPWorktreeSwitch
+            )
+        }
+
+        let worktreeReply = try await worktreeDTO(
+            worktree,
+            visualIdentity: identity,
+            includeStatus: parseBool(args["include_status"]) ?? false
+        )
+        let destinationChanged = switchesToCanonicalCheckout
+            ? previous != nil
+            : previous?.worktreeID != worktree.worktreeID
+        return ToolResultDTOs.ManageWorktreeReplyDTO(
+            op: "switch",
+            repository: repositoryDTO(from: worktree.repository, fallback: context.repo),
+            worktree: worktreeReply,
+            worktrees: [worktreeReply],
+            binding: resultingBinding.map(bindingDTO),
+            previousBinding: destinationChanged ? previous.map(bindingDTO) : nil
+        )
+    }
+
     private func executeUnbind(args: [String: Value]) async throws -> ToolResultDTOs.ManageWorktreeReplyDTO {
         let sessionID = try await resolveBindingSessionID(args: args)
         let targetWindow = try dependencies.requireTargetWindow()
@@ -336,7 +432,32 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             return (bindingDTO(previous), nil)
         }
 
-        let binding = AgentSessionWorktreeBinding(
+        let binding = makeBinding(
+            previous: previous,
+            logicalRoot: logicalRoot,
+            worktree: worktree,
+            visualIdentity: visualIdentity,
+            source: source
+        )
+        var desiredBindings = existing.filter { standardizedPath($0.logicalRootPath) != normalizedRoot }
+        desiredBindings.append(binding)
+        _ = try await agentModeVM.transitionWorktreeBindings(
+            desiredBindings,
+            forSessionID: sessionID,
+            intent: .externalManagement
+        )
+        let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
+        return (bindingDTO(binding), previousDTO)
+    }
+
+    private func makeBinding(
+        previous: AgentSessionWorktreeBinding?,
+        logicalRoot: WorkspaceRootRef,
+        worktree: GitWorktreeDescriptor,
+        visualIdentity: WorktreeVisualIdentity,
+        source: String
+    ) -> AgentSessionWorktreeBinding {
+        AgentSessionWorktreeBinding(
             id: previous?.id ?? UUID().uuidString,
             repositoryID: worktree.repository.repositoryID,
             repoKey: worktree.repository.repoKey,
@@ -352,15 +473,6 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
             boundAt: previous?.worktreeID == worktree.worktreeID ? previous?.boundAt ?? Date() : Date(),
             source: source
         )
-        var desiredBindings = existing.filter { standardizedPath($0.logicalRootPath) != normalizedRoot }
-        desiredBindings.append(binding)
-        _ = try await agentModeVM.transitionWorktreeBindings(
-            desiredBindings,
-            forSessionID: sessionID,
-            intent: .externalManagement
-        )
-        let previousDTO = previous.flatMap { $0.worktreeID == binding.worktreeID ? nil : bindingDTO($0) }
-        return (bindingDTO(binding), previousDTO)
     }
 
     private func validateLiveSession(_ sessionID: UUID, in targetWindow: WindowState) throws {
@@ -396,6 +508,104 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         let visibleRoots: [WorkspaceRootRef]
         let lookupContext: WorkspaceLookupContext
         let explicitLogicalRoot: WorkspaceRootRef?
+    }
+
+    private struct PrimarySwitchContext {
+        let repo: GitRepoDescriptor
+        let logicalRoot: WorkspaceRootRef
+    }
+
+    private func resolvePrimarySwitchContext(args: [String: Value]) async throws -> PrimarySwitchContext {
+        guard let activeWorkspace = dependencies.workspaceManager?.activeWorkspace,
+              !activeWorkspace.isSystemWorkspace,
+              let primaryWorkspacePath = activeWorkspace.repoPaths.first
+        else {
+            throw MCPError.invalidParams(
+                "op=switch requires an active project workspace with a primary logical root."
+            )
+        }
+        if trimmedString(args["repo_root"]) != nil, trimmedString(args["repo_key"]) != nil {
+            throw MCPError.invalidParams("repo_root and repo_key are mutually exclusive for op=switch.")
+        }
+
+        let visibleRoots = await dependencies.promptVM.workspaceFileContextStore.rootRefs(scope: .visibleWorkspace)
+        guard let logicalRoot = AgentWorktreeRuntimeWorkspaceResolver.primaryLogicalRoot(
+            in: visibleRoots,
+            fallbackWorkspacePath: primaryWorkspacePath
+        ) else {
+            throw MCPError.invalidParams(
+                "The active workspace's primary logical root must resolve to exactly one visible root before switching worktrees."
+            )
+        }
+        guard let resolvedPrimaryRepo = await vcsService.resolveRepo(
+            from: URL(fileURLWithPath: logicalRoot.standardizedFullPath)
+        ), resolvedPrimaryRepo.backendKind == .git
+        else {
+            throw MCPError.invalidParams("The active workspace's primary logical root is not Git-backed.")
+        }
+        let primaryRepo = GitRepoDescriptor(rootURL: resolvedPrimaryRepo.rootURL)
+        var allRepos = try await discoverAllGitRepos(rootScope: .visibleWorkspace)
+        if !allRepos.contains(where: { sameRepository($0, primaryRepo) }) {
+            allRepos.append(primaryRepo)
+        }
+
+        let requestedRepo: GitRepoDescriptor?
+        if let repoKey = trimmedString(args["repo_key"]) {
+            guard let match = allRepos.first(where: { $0.repoKey == repoKey }) else {
+                throw MCPError.invalidParams(
+                    "repo_key not found: \(repoKey). Available: \(allRepos.map(\.repoKey).joined(separator: ", "))"
+                )
+            }
+            requestedRepo = match
+        } else if let repoRoot = trimmedString(args["repo_root"]) {
+            do {
+                requestedRepo = try await resolver.resolveRepoRootToken(
+                    repoRoot,
+                    allRepos: allRepos,
+                    visibleRoots: visibleRoots,
+                    defaultRepo: primaryRepo
+                )
+            } catch let error as GitRepoTargetResolverError {
+                throw MCPError.invalidParams(error.message)
+            }
+        } else {
+            requestedRepo = nil
+        }
+
+        if let requestedRepo, !sameRepository(requestedRepo, primaryRepo) {
+            throw MCPError.invalidParams(
+                "op=switch can target only the active workspace's primary logical-root repository (`\(primaryRepo.repoKey)`)."
+            )
+        }
+        return PrimarySwitchContext(repo: primaryRepo, logicalRoot: logicalRoot)
+    }
+
+    private func validateSwitchTargetAvailable(_ worktree: GitWorktreeDescriptor) throws {
+        if worktree.isPrunable {
+            throw MCPError.invalidParams(
+                "The selected worktree is prunable or unavailable: \(worktree.prunableReason ?? worktree.path)"
+            )
+        }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: worktree.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw MCPError.invalidParams("The selected worktree path is unavailable: \(worktree.path)")
+        }
+    }
+
+    private func sameRepository(_ lhs: GitRepoDescriptor, _ rhs: GitRepoDescriptor) -> Bool {
+        repositoryIdentity(for: lhs) == repositoryIdentity(for: rhs)
+    }
+
+    private func repositoryIdentity(for repo: GitRepoDescriptor) -> String {
+        guard let layout = GitRepositoryLayoutResolver.resolve(atWorkTreeRoot: repo.rootURL) else {
+            return GitRepoRootAuthorization.canonicalPath(repo.rootPath)
+        }
+        return GitWorktreeIdentity.repositoryIdentity(
+            commonGitDir: layout.commonDir,
+            mainWorktreeRoot: layout.knownMainWorktreeRoot
+        ).repositoryID
     }
 
     private func resolveRepositoryContext(args: [String: Value]) async throws -> RepositoryContext {
@@ -678,6 +888,8 @@ final class MCPWorktreeToolProvider: MCPWindowToolProviding {
         case .create:
             ["op", "repo_root", "repo_key", "session_id", "include_status", "branch", "base_ref", "path", "detach", "force", "allow_external_path", "bind", "label", "color", "icon_name", "marker_style"]
         case .bind, .select:
+            ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
+        case .switch:
             ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "include_status", "label", "color", "icon_name", "marker_style"]
         case .unbind:
             ["op", "repo_root", "repo_key", "worktree", "worktree_id", "session_id", "all"]
