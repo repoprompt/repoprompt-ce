@@ -113,6 +113,9 @@ jobs:
                       os.killpg(group, sent_signal)
                   except ProcessLookupError:
                       pass
+                  except PermissionError:
+                      # Process group may contain a process we do not own; skip it.
+                      pass
 
           def live_process_groups(groups):
               live = set()
@@ -121,8 +124,44 @@ jobs:
                       os.killpg(group, 0)
                   except ProcessLookupError:
                       continue
+                  except PermissionError:
+                      # We cannot signal this group; do not treat it as live for
+                      # cleanup purposes to avoid crashing the cleanup handler.
+                      continue
                   live.add(group)
               return live
+
+          def diagnose_hung_process(process):
+              pid = process.pid
+              sample_path = f"/tmp/swift-test-hang-{pid}.txt"
+              try:
+                  subprocess.run(
+                      ["sample", str(pid), "2", sample_path],
+                      check=False,
+                      timeout=5,
+                      capture_output=True,
+                  )
+                  if os.path.exists(sample_path):
+                      print(f"::group::Sample of hung swift test process (pid {pid})")
+                      with open(sample_path, "r") as handle:
+                          sys.stdout.write(handle.read())
+                      print("::endgroup::")
+                      os.remove(sample_path)
+              except Exception as e:
+                  print(f"::warning::Could not sample hung process: {e}", flush=True)
+              try:
+                  tree = subprocess.run(
+                      ["pstree", "-p", str(pid)],
+                      capture_output=True,
+                      text=True,
+                      timeout=5,
+                  )
+                  print(f"::group::Process tree of hung swift test process (pid {pid})")
+                  sys.stdout.write(tree.stdout)
+                  sys.stdout.write(tree.stderr)
+                  print("::endgroup::")
+              except Exception as e:
+                  print(f"::warning::Could not print process tree: {e}", flush=True)
 
           def stop_process_tree(process):
               groups = descendant_process_groups(process.pid)
@@ -136,6 +175,7 @@ jobs:
                       break
                   time.sleep(0.1)
 
+              diagnose_hung_process(process)
               signal_process_groups(groups, signal.SIGKILL)
               process.wait()
 

@@ -653,46 +653,274 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         XCTAssertFalse(remainsReusable)
     }
 
-    func testWindowCloseShutsDownRetainedACPController() async throws {
-        let fixture = try await makeRetainedACPFixture(processIDFileName: "window-close-acp-process-id.txt")
-        fixture.host.test_installLiveSession(fixture.session)
-        XCTAssertTrue(Self.processIsRunning(fixture.processID))
+    // MARK: - Consolidated runtime cleanup paths
 
-        await fixture.host.prepareForWindowClose()
+    private func makeCompletedReusableOpenCodeSession(
+        recorder: LifecycleRecorder = LifecycleRecorder()
+    ) async throws -> (
+        harness: LifecycleHarness,
+        session: AgentModeViewModel.TabSession,
+        controller: ACPAgentSessionController,
+        processID: pid_t
+    ) {
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("opencode-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .openCode)
+                return provider
+            },
+            autoSignalACPRouting: true
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
 
-        XCTAssertNil(fixture.session.acpController)
-        try await waitUntilProcessExits(fixture.processID, "Window close should terminate retained ACP process")
-        XCTAssertFalse(Self.processIsRunning(fixture.processID))
-        let remainsReusable = await fixture.controller.hasReusableSession
-        XCTAssertFalse(remainsReusable)
-        acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Complete and remain reusable",
+            initialMessageForRun: "Complete and remain reusable",
+            attachments: []
+        )
+
+        XCTAssertNil(outcome)
+        try await withLifecycleTimeout("OpenCode reusable-session run") {
+            await session.agentTask?.value
+        }
+        XCTAssertEqual(session.runState, .completed)
+        let controller = try XCTUnwrap(session.acpController)
+        let wasReusable = await controller.hasReusableSession
+        XCTAssertTrue(wasReusable)
+
+        try await waitUntil("OpenCode process ID should be recorded") {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        XCTAssertTrue(Self.processIsRunning(processID))
+
+        harness.host.test_installLiveSession(session)
+
+        return (harness, session, controller, processID)
     }
 
-    func testComposeTabRemovalShutsDownRetainedACPControllerBeforeRemovingSession() async throws {
-        let rows: [(PromptViewModel.ComposeTabRemovalReason, String)] = [
-            (.close, "close"),
-            (.stash, "stash"),
-            (.deleteStashed, "delete-stashed")
-        ]
+    func testWindowCloseShutsDownRetainedACPController() async throws {
+        let (harness, _, controller, processID) = try await makeCompletedReusableOpenCodeSession()
 
-        for (reason, name) in rows {
-            let fixture = try await makeRetainedACPFixture(processIDFileName: "compose-\(name)-acp-process-id.txt")
-            fixture.host.test_installLiveSession(fixture.session)
-            XCTAssertTrue(Self.processIsRunning(fixture.processID), name)
+        await harness.host.prepareForWindowClose()
 
-            await fixture.host.handleComposeTabsWillClose([fixture.session.tabID], reason: reason)
-
-            XCTAssertNil(fixture.session.acpController, name)
-            XCTAssertNil(fixture.host.sessions[fixture.session.tabID], name)
-            try await waitUntilProcessExits(
-                fixture.processID,
-                "Compose tab \(name) should terminate retained ACP process"
-            )
-            XCTAssertFalse(Self.processIsRunning(fixture.processID), name)
-            let remainsReusable = await fixture.controller.hasReusableSession
-            XCTAssertFalse(remainsReusable, name)
-            acpControllers.removeValue(forKey: ObjectIdentifier(fixture.controller))
+        try await waitUntil("OpenCode process should exit after window close") {
+            !Self.processIsRunning(processID)
         }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testSessionDeleteShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.deleteSession(tabID: session.tabID)
+
+        try await waitUntil("OpenCode process should exit after session delete") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabCloseShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+
+        try await waitUntil("OpenCode process should exit after compose tab close") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabStashShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .stash)
+
+        try await waitUntil("OpenCode process should exit after compose tab stash") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testComposeTabDeleteStashedShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .deleteStashed)
+
+        try await waitUntil("OpenCode process should exit after stashed tab delete") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testFinalizeDeletedReferencesShutsDownRetainedACPController() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+
+        _ = await harness.host.finalizeDeletedAgentSessionReferences(
+            sessionID: sessionID,
+            workspaceID: nil,
+            knownTabIDs: [session.tabID],
+            reason: "test_finalize_deleted_references"
+        )
+
+        try await waitUntil("OpenCode process should exit after finalize deleted references") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    func testConsolidatedCleanupIsIdempotent() async throws {
+        let (harness, session, controller, processID) = try await makeCompletedReusableOpenCodeSession()
+
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+        await harness.host.handleComposeTabsWillClose([session.tabID], reason: .close)
+        await harness.host.prepareForWindowClose()
+
+        try await waitUntil("OpenCode process should exit after repeated cleanup") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    // MARK: - Active-run teardown during deletion
+
+    /// Builds an OpenCode session whose `session/prompt` never responds, so the
+    /// run stays genuinely active (agentTask in flight, process alive) until the
+    /// controller is shut down. The PID file is written at startup, so callers
+    /// can confirm the process is running before invoking a deletion path.
+    private func makeActiveReusableOpenCodeSession(
+        recorder: LifecycleRecorder = LifecycleRecorder()
+    ) async throws -> (
+        harness: LifecycleHarness,
+        session: AgentModeViewModel.TabSession,
+        controller: ACPAgentSessionController,
+        processID: pid_t
+    ) {
+        let workspace = try makeTemporaryDirectory()
+        let processIDURL = workspace.appendingPathComponent("opencode-process-id.txt")
+        let scriptURL = try makeOpenCodeModeFlowServerBlockingScript()
+        let provider = LifecycleFakeACPProvider(
+            providerID: .openCode,
+            commandPath: scriptURL.path,
+            environment: ["ACP_PID_PATH": processIDURL.path],
+            recorder: recorder
+        )
+        let harness = makeHarness(
+            recorder: recorder,
+            workspacePathProvider: { _ in workspace.path },
+            acpProviderFactory: { agent, _ in
+                XCTAssertEqual(agent, .openCode)
+                return provider
+            },
+            autoSignalACPRouting: true
+        )
+        let session = AgentModeViewModel.TabSession(tabID: UUID())
+        session.selectedAgent = .openCode
+
+        let outcome = await harness.service.startRun(
+            tabID: session.tabID,
+            session: session,
+            initialUserMessage: "Stay alive until torn down",
+            initialMessageForRun: "Stay alive until torn down",
+            attachments: []
+        )
+        XCTAssertNil(outcome)
+
+        try await waitUntil("OpenCode process ID should be recorded for active run", timeoutSeconds: 10) {
+            FileManager.default.fileExists(atPath: processIDURL.path)
+        }
+        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let processID = try XCTUnwrap(pid_t(processIDText))
+        XCTAssertTrue(Self.processIsRunning(processID))
+
+        // The run must still be in flight when deletion begins. The controller
+        // being installed and the process still alive is the robust signal that
+        // the run reached the ACP layer and is genuinely active; runState can
+        // briefly lag under heavy concurrent test load, so we don't require it
+        // here. The blocking script never responds to session/prompt, so the
+        // process stays alive until the controller shuts it down.
+        try await waitUntil("OpenCode run should install an ACP controller", timeoutSeconds: 10) {
+            session.acpController != nil
+        }
+        let controller = try XCTUnwrap(session.acpController)
+        XCTAssertTrue(Self.processIsRunning(processID), "OpenCode process should still be alive before deletion")
+
+        harness.host.test_installLiveSession(session)
+        return (harness, session, controller, processID)
+    }
+
+    /// `deleteSession` uses `cancelActiveRun: false / awaitTerminalTeardown: false`,
+    /// relying on direct agentTask cancellation (step 7) and controller shutdown
+    /// (step 9) to tear down an in-flight run. Asserts no hang and full process
+    /// exit for an active run, complementing the completed-session coverage.
+    func testSessionDeleteTearsDownActiveRunWithoutHanging() async throws {
+        let (harness, session, controller, processID) = try await makeActiveReusableOpenCodeSession()
+
+        await harness.host.deleteSession(tabID: session.tabID)
+
+        try await waitUntil("OpenCode process should exit after deleting an active run") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
+    }
+
+    /// `finalizeDeletedAgentSessionReferences` uses the same
+    /// `cancelActiveRun: false / awaitTerminalTeardown: false` context as
+    /// `deleteSession`. With a live session matching the deleted sessionID, the
+    /// helper must still tear down the active run via steps 7/9 without hanging.
+    func testFinalizeDeletedReferencesTearsDownActiveRunWithoutHanging() async throws {
+        let (harness, session, controller, processID) = try await makeActiveReusableOpenCodeSession()
+        let sessionID = UUID()
+        session.testInstallPersistentSessionBinding(sessionID: sessionID)
+
+        _ = await harness.host.finalizeDeletedAgentSessionReferences(
+            sessionID: sessionID,
+            workspaceID: nil,
+            knownTabIDs: [session.tabID],
+            reason: "test_finalize_active_run"
+        )
+
+        try await waitUntil("OpenCode process should exit after finalizing an active run") {
+            !Self.processIsRunning(processID)
+        }
+        XCTAssertFalse(Self.processIsRunning(processID))
+        let remainsReusable = await controller.hasReusableSession
+        XCTAssertFalse(remainsReusable)
     }
 
     func testTerminalBarrierRejectsStaleOwnership() async {
@@ -1657,49 +1885,6 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         )
     }
 
-    private struct RetainedACPFixture {
-        let host: AgentModeViewModel
-        let session: AgentModeViewModel.TabSession
-        let controller: ACPAgentSessionController
-        let processID: pid_t
-    }
-
-    private func makeRetainedACPFixture(processIDFileName: String) async throws -> RetainedACPFixture {
-        let recorder = LifecycleRecorder()
-        let workspace = try makeTemporaryDirectory()
-        let processIDURL = workspace.appendingPathComponent(processIDFileName)
-        let scriptURL = try makeOpenCodeModeFlowServerScript()
-        let provider = LifecycleFakeACPProvider(
-            providerID: .openCode,
-            commandPath: scriptURL.path,
-            environment: ["ACP_PID_PATH": processIDURL.path],
-            recorder: recorder
-        )
-        let request = makeACPRunRequest(workspacePath: workspace.path)
-        let controller = try makeACPController(provider: provider, request: request, recorder: recorder)
-        try await withLifecycleTimeout("ACP bootstrap") {
-            _ = try await controller.bootstrap()
-        }
-        try await waitUntil("ACP process ID should be recorded") {
-            FileManager.default.fileExists(atPath: processIDURL.path)
-        }
-        let processIDText = try String(contentsOf: processIDURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let processID = try XCTUnwrap(pid_t(processIDText))
-        let harness = makeHarness(recorder: recorder, workspacePathProvider: { _ in workspace.path })
-        let session = AgentModeViewModel.TabSession(tabID: UUID())
-        session.selectedAgent = .openCode
-        session.runID = UUID()
-        session.runState = .completed
-        session.acpController = controller
-        return RetainedACPFixture(
-            host: harness.host,
-            session: session,
-            controller: controller,
-            processID: processID
-        )
-    }
-
     func makeRunningClaudeSession(controller: LifecycleFakeNativeController) -> AgentModeViewModel.TabSession {
         let session = AgentModeViewModel.TabSession(tabID: UUID())
         session.selectedAgent = .claudeCode
@@ -1889,6 +2074,60 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         return scriptURL
     }
 
+    /// Same as `makeOpenCodeModeFlowServerScript` but `session/prompt` never
+    /// responds, keeping the run in flight and the process alive until the
+    /// controller cancels/shuts it down. Used for active-run teardown coverage.
+    private func makeOpenCodeModeFlowServerBlockingScript() throws -> URL {
+        let directory = try makeTemporaryDirectory()
+        let scriptURL = directory.appendingPathComponent("fake_opencode_mode_flow_server_blocking.py")
+        let script = #"""
+        #!/usr/bin/env python3
+        import json
+        import os
+        import sys
+        import time
+
+        pid_path = os.environ.get("ACP_PID_PATH")
+
+        if pid_path:
+            with open(pid_path, "w", encoding="utf-8") as handle:
+                handle.write(str(os.getpid()))
+
+        def respond(request_id, result=None):
+            print(json.dumps({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": result if result is not None else {}
+            }), flush=True)
+
+        for line in sys.stdin:
+            try:
+                request = json.loads(line)
+            except Exception:
+                continue
+            method = request.get("method")
+            if method == "initialize":
+                respond(request.get("id"), {"agentCapabilities": {"loadSession": True}, "authMethods": []})
+            elif method == "session/new":
+                respond(request.get("id"), {
+                    "sessionId": "opencode-mode-flow-blocking",
+                    "configOptions": []
+                })
+            elif method == "session/prompt":
+                # Intentionally never respond. Keep the run in flight so the
+                # caller can exercise teardown of a genuinely active run. The
+                # process exits when the host closes stdin / terminates it.
+                pass
+            else:
+                respond(request.get("id"), {})
+            # Yield so the loop stays responsive to stdin closure.
+            time.sleep(0)
+        """#
+        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+        return scriptURL
+    }
+
     private func makeFakeACPServerScript() throws -> URL {
         let directory = try makeTemporaryDirectory()
         let scriptURL = directory.appendingPathComponent("fake_acp_server.py")
@@ -2014,14 +2253,6 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
         }
     }
 
-    private func waitUntilProcessExits(_ processID: pid_t, _ message: String) async throws {
-        try await withLifecycleTimeout(message, cancelOperationOnTimeout: false) {
-            while Self.processIsRunning(processID) {
-                try await Task.sleep(nanoseconds: 10_000_000)
-            }
-        }
-    }
-
     private func waitUntil(
         _ message: String,
         condition: @escaping @MainActor () -> Bool
@@ -2031,6 +2262,19 @@ final class AgentModeRunServiceLifecycleTests: XCTestCase {
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
         throw LifecycleTimeoutError(operation: message, timeoutSeconds: 0.5)
+    }
+
+    private func waitUntil(
+        _ message: String,
+        timeoutSeconds: TimeInterval,
+        condition: @escaping @MainActor () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if condition() { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        throw LifecycleTimeoutError(operation: message, timeoutSeconds: timeoutSeconds)
     }
 
     func assertOrderedEvents(

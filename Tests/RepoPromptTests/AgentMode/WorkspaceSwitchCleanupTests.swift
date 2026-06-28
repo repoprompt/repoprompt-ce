@@ -184,6 +184,157 @@ final class AgentModeWorkspaceSwitchCleanupTests: XCTestCase {
             testWorkspaceFileContextStore: workspaceFileContextStore
         )
     }
+
+    // MARK: - Consolidated cleanup: nil-session tabs and stale bookkeeping
+
+    private func makeWorkspace(
+        name: String,
+        tabs: [ComposeTabState],
+        activeTabID: UUID?
+    ) -> WorkspaceModel {
+        WorkspaceModel(
+            name: name,
+            repoPaths: [],
+            ephemeralFlag: true,
+            composeTabs: tabs,
+            activeComposeTabID: activeTabID
+        )
+    }
+
+    private func makeIndexEntry(
+        id: UUID,
+        tabID: UUID,
+        lastUserMessageAt: Date? = nil
+    ) -> AgentSessionIndexEntry {
+        AgentSessionIndexEntry(
+            id: id,
+            tabID: tabID,
+            name: "Agent",
+            lastUserMessageAt: lastUserMessageAt,
+            savedAt: Date(),
+            lastRunStateRaw: nil,
+            itemCount: lastUserMessageAt == nil ? 0 : 1,
+            agentKindRaw: nil,
+            agentModelRaw: nil,
+            agentReasoningEffortRaw: nil,
+            autoEditEnabled: false,
+            parentSessionID: nil,
+            hasUnknownConversationContent: false,
+            isMCPOriginated: false,
+            worktreeBindingSummaries: [],
+            activeWorktreeMergeSummaries: []
+        )
+    }
+
+    private func seedSidebarBoundNilSessionTab(
+        _ viewModel: AgentModeViewModel,
+        tabID: UUID,
+        sessionID: UUID
+    ) {
+        let workspace = makeWorkspace(
+            name: "Nil-session sidebar binding",
+            tabs: [ComposeTabState(id: tabID, name: "Nil-session")],
+            activeTabID: tabID
+        )
+        let owner = AgentModeViewModel.SessionIndexOwner(
+            workspaceID: workspace.id,
+            activationEpoch: 1
+        )
+        let entry = makeIndexEntry(
+            id: sessionID,
+            tabID: tabID,
+            lastUserMessageAt: Date(timeIntervalSince1970: 1)
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [entry.id: entry],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+    }
+
+    /// A tab with a sidebar-bound session but no live `TabSession` must still
+    /// release worktree ownership for the bound session ID when closed/stashed.
+    /// This covers the unconditional `releaseSessionWorktreeOwnership` path in
+    /// `handleComposeTabsWillClose` for never-instantiated tabs.
+    func testComposeTabRemovalReleasesWorktreeOwnershipForSidebarBoundNilSessionTab() async {
+        let reasons: [PromptViewModel.ComposeTabRemovalReason] = [.close, .stash, .deleteStashed]
+        for reason in reasons {
+            let viewModel = makeViewModel()
+            let tabID = UUID()
+            let sessionID = UUID()
+            seedSidebarBoundNilSessionTab(viewModel, tabID: tabID, sessionID: sessionID)
+
+            // No live session exists for this tab; the session is sidebar-bound only.
+            XCTAssertNil(viewModel.sessions[tabID])
+            XCTAssertEqual(viewModel.boundSessionID(for: tabID), sessionID)
+
+            let recordedBefore = viewModel.test_releaseSessionWorktreeOwnershipCalls
+            await viewModel.handleComposeTabsWillClose([tabID], reason: reason)
+
+            let recordedAfter = viewModel.test_releaseSessionWorktreeOwnershipCalls
+            XCTAssertEqual(recordedAfter.count, recordedBefore.count + 1)
+            XCTAssertEqual(recordedAfter.last, sessionID)
+            // The live session map must remain empty for this tab.
+            XCTAssertNil(viewModel.sessions[tabID])
+        }
+    }
+
+    /// `finalizeDeletedAgentSessionReferences` unconditionally clears stale
+    /// tab-scoped bookkeeping (`sessionListSortDates`, `tabsWithActiveAgentRun`,
+    /// `mcpControlledTabIDs`) for every candidate tabID, even when no live
+    /// session matches. Stale entries for candidate tabIDs must disappear while
+    /// unrelated active entries remain untouched.
+    func testFinalizeDeletedReferencesClearsStaleTabBookkeepingWhilePreservingUnrelatedEntries() async {
+        let viewModel = makeViewModel()
+        let staleTabID = UUID()
+        let unrelatedTabID = UUID()
+        let deletedSessionID = UUID()
+
+        // Empty session index so removeSessionIndex(deletedSessionID) is a no-op
+        // and does not rebuild sort dates, isolating the loop's clearing logic.
+        let workspace = makeWorkspace(name: "Stale bookkeeping", tabs: [], activeTabID: nil)
+        let owner = AgentModeViewModel.SessionIndexOwner(
+            workspaceID: workspace.id,
+            activationEpoch: 1
+        )
+        viewModel.test_installSessionIndexSnapshot(
+            [:],
+            owner: owner,
+            latestOwner: owner,
+            activeWorkspace: workspace
+        )
+        // Keep the active tab off the affected set so onTabChanged is not invoked.
+        viewModel.test_setCurrentTabIDOverride(unrelatedTabID)
+        defer { viewModel.test_setCurrentTabIDOverride(nil) }
+
+        let staleDate = Date(timeIntervalSince1970: 10)
+        let unrelatedDate = Date(timeIntervalSince1970: 20)
+        viewModel.test_setSessionListSortDates([
+            staleTabID: staleDate,
+            unrelatedTabID: unrelatedDate
+        ])
+        viewModel.test_setTabsWithActiveAgentRun([staleTabID, unrelatedTabID])
+        viewModel.test_setMCPControlledTabIDs([staleTabID, unrelatedTabID])
+
+        _ = await viewModel.finalizeDeletedAgentSessionReferences(
+            sessionID: deletedSessionID,
+            workspaceID: nil,
+            knownTabIDs: [staleTabID],
+            reason: "test_stale_bookkeeping"
+        )
+
+        // Stale candidate entries are cleared.
+        XCTAssertNil(viewModel.sessionListSortDates[staleTabID])
+        XCTAssertFalse(viewModel.tabsWithActiveAgentRun.contains(staleTabID))
+        XCTAssertFalse(viewModel.mcpControlledTabIDs.contains(staleTabID))
+        // Unrelated active entries remain.
+        XCTAssertEqual(viewModel.sessionListSortDates[unrelatedTabID], unrelatedDate)
+        XCTAssertTrue(viewModel.tabsWithActiveAgentRun.contains(unrelatedTabID))
+        XCTAssertTrue(viewModel.mcpControlledTabIDs.contains(unrelatedTabID))
+        // Ownership for the deleted session ID is released.
+        XCTAssertEqual(viewModel.test_releaseSessionWorktreeOwnershipCalls, [deletedSessionID])
+    }
 }
 
 private actor BlockingHeadlessProvider: HeadlessAgentProvider {
