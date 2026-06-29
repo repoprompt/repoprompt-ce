@@ -604,6 +604,11 @@ actor ACPAgentSessionController {
         }
         diagnose(.phaseCompleted("prompt"))
         let stopReason = response["stopReason"] as? String
+        // The stderr consumer task may not have processed pending stderr lines
+        // before the JSON-RPC response unblocks sendRequest. Yield to let the
+        // actor drain pending stderr so openCodeEmptyPromptDiagnosticMessage
+        // sees the error line.
+        await Task.yield()
         if let diagnosticMessage = openCodeEmptyPromptDiagnosticMessage(from: response, stopReason: stopReason) {
             #if DEBUG
                 if isRawACPCaptureEnabled {
