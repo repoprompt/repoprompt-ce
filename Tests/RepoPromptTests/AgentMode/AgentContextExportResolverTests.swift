@@ -237,7 +237,9 @@ final class AgentContextExportResolverTests: XCTestCase {
 
         let row = try XCTUnwrap(model.rows.first)
         XCTAssertEqual(model.rows.count, 1)
+        XCTAssertFalse(try XCTUnwrap(model.lookupContext.bindingProjection).isFullyMaterialized)
         XCTAssertEqual(row.displayPath, "Sources/App.swift")
+        XCTAssertEqual(row.directContentPath, fixture.worktreeRoot.appendingPathComponent("Sources/App.swift").standardizedFileURL.path)
 
         let previewText = await AgentContextExportResolver.loadRowContent(
             for: row,
