@@ -66,6 +66,10 @@ enum MCPAgentRoleDefaultsService {
         let effective: AgentModelCatalog.NormalizedAgentSelection
         let effectiveDisplayName: String
 
+        /// A persisted override exists for this role, even if it currently matches the recommendation.
+        let hasStoredOverride: Bool
+
+        /// The effective selection differs from the current recommendation.
         let hasCustomOverride: Bool
         let overrideUnavailable: Bool
 
@@ -211,6 +215,7 @@ enum MCPAgentRoleDefaultsService {
         let recommendedDisplayName = "\(recommended.agent.displayName) \(AgentModelCatalog.displayName(for: recommended.modelRaw, agentKind: recommended.agent, codexDynamicModels: codexDynamicModels))"
 
         // Check for stored override
+        let hasStoredOverride = overrides?[kind.rawValue] != nil
         let effective: AgentModelCatalog.NormalizedAgentSelection
         var hasCustomOverride = false
         var overrideUnavailable = false
@@ -247,6 +252,7 @@ enum MCPAgentRoleDefaultsService {
             recommendedDisplayName: recommendedDisplayName,
             effective: effective,
             effectiveDisplayName: effectiveDisplayName,
+            hasStoredOverride: hasStoredOverride,
             hasCustomOverride: hasCustomOverride,
             overrideUnavailable: overrideUnavailable
         )

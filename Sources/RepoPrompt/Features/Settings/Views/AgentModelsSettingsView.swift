@@ -586,7 +586,22 @@ struct AgentModelsSettingsView: View {
                 .fixedSize()
             }
 
-            if resolution.hasCustomOverride, !resolution.overrideUnavailable {
+            if resolution.overrideUnavailable {
+                HStack(spacing: 6) {
+                    Text("Saved override unavailable; using recommended default.")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                    if resolution.hasStoredOverride {
+                        Button("Clear Pin") {
+                            viewModel.applyRoleDefault(resolution)
+                        }
+                        .font(.caption2)
+                        .buttonStyle(.plain)
+                        .foregroundColor(.accentColor)
+                    }
+                }
+                .padding(.leading, 30)
+            } else if resolution.hasCustomOverride {
                 HStack(spacing: 6) {
                     Text("Recommended: \(resolution.recommendedDisplayName)")
                         .font(.caption2)
@@ -599,13 +614,19 @@ struct AgentModelsSettingsView: View {
                     .foregroundColor(.accentColor)
                 }
                 .padding(.leading, 30)
-            }
-
-            if resolution.overrideUnavailable {
-                Text("Saved override unavailable; using recommended default.")
+            } else if resolution.hasStoredOverride {
+                HStack(spacing: 6) {
+                    Text("Pinned to recommended")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Button("Clear Pin") {
+                        viewModel.applyRoleDefault(resolution)
+                    }
                     .font(.caption2)
-                    .foregroundColor(.orange)
-                    .padding(.leading, 30)
+                    .buttonStyle(.plain)
+                    .foregroundColor(.accentColor)
+                }
+                .padding(.leading, 30)
             }
         }
     }

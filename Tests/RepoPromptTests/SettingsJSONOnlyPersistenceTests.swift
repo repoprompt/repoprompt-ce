@@ -986,6 +986,72 @@ final class SettingsJSONOnlyPersistenceTests: XCTestCase {
         XCTAssertNotEqual(engineStore.globalAgentModelsProfile(), workspaceProfile)
     }
 
+    func testAgentModelsViewModelReportsStoredRecommendedRolePinAsOverrideAndClearsIt() throws {
+        let fileStore = CountingGlobalSettingsFileStore(document: GlobalSettingsDocument(
+            globalDefaults: GlobalDefaults(discoverAgentRaw: nil, discoverModelsByAgent: nil),
+            scalarPreferences: seededScalarPreferences()
+        ))
+        let store = try GlobalSettingsStore(defaults: makeIsolatedDefaults(), fileStore: fileStore)
+        let manager = WindowSettingsManager(windowID: -203, store: store)
+        let workspaceID = UUID()
+        let role = AgentModelCatalog.TaskLabelKind.explore
+        let availability = AgentModelCatalog.AvailabilityContext(
+            claudeCodeAvailable: false,
+            codexAvailable: true,
+            openCodeAvailable: false,
+            cursorAvailable: false,
+            zaiConfigured: false,
+            kimiConfigured: false,
+            customClaudeCompatibleConfigured: false
+        )
+        let baselineResolution = try XCTUnwrap(MCPAgentRoleDefaultsService.effectiveSelection(
+            for: role,
+            availability: availability,
+            recommendedAvailability: availability,
+            settingsStore: AgentModelsProfileRoleDefaultsStore(overrides: nil)
+        ))
+        let recommendedPin = AgentModelSelectionID(
+            agentRaw: baselineResolution.recommended.agent.rawValue,
+            modelRaw: baselineResolution.recommended.modelRaw
+        ).rawValue
+        let workspaceProfile = AgentModelsSettingsProfile(
+            planningModelRaw: AIModel.claude4Sonnet.rawValue,
+            preferredComposeModelRaw: AIModel.claude4Sonnet.rawValue,
+            syncChatModelWithOracle: true,
+            mcpAgentRoleOverrides: [role.rawValue: recommendedPin]
+        )
+        manager.setWorkspaceAgentModelsProfile(workspaceID: workspaceID, profile: workspaceProfile)
+        manager.setWorkspaceAgentModelsInheritanceMode(workspaceID: workspaceID, mode: .useWorkspaceOverrides)
+
+        let apiSettings = makeAPISettingsViewModel()
+        apiSettings.isClaudeCodeConnected = false
+        apiSettings.isCodexConnected = true
+        apiSettings.isOpenCodeConnected = false
+        apiSettings.isCursorConnected = false
+        let viewModel = AgentModelsSettingsViewModel(
+            apiSettingsVM: apiSettings,
+            workspaceID: workspaceID,
+            workspaceName: "Pinned role defaults",
+            settingsManager: manager,
+            settingsStore: store
+        )
+
+        let pinnedResolution = try XCTUnwrap(viewModel.roleDefaultsResolutions.first { $0.role == role })
+        XCTAssertEqual(pinnedResolution.effective, pinnedResolution.recommended)
+        XCTAssertTrue(pinnedResolution.hasStoredOverride)
+        XCTAssertFalse(pinnedResolution.hasCustomOverride)
+        XCTAssertTrue(viewModel.roleDefaultsHasOverrides)
+
+        viewModel.applyRoleDefault(pinnedResolution)
+
+        XCTAssertNil(viewModel.profileSnapshot.mcpAgentRoleOverrides)
+        XCTAssertNil(store.workspaceAgentModelsProfile(for: workspaceID)?.mcpAgentRoleOverrides)
+        let clearedResolution = try XCTUnwrap(viewModel.roleDefaultsResolutions.first { $0.role == role })
+        XCTAssertFalse(clearedResolution.hasStoredOverride)
+        XCTAssertFalse(clearedResolution.hasCustomOverride)
+        XCTAssertFalse(viewModel.roleDefaultsHasOverrides)
+    }
+
     private func makeAPISettingsViewModel() -> APISettingsViewModel {
         let keyManager = KeyManager(
             secureService: SecureKeysService(secureStorage: TestSecureStorageBackend())

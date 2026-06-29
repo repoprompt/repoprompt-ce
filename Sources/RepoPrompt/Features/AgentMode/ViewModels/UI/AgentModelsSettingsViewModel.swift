@@ -240,7 +240,7 @@ final class AgentModelsSettingsViewModel: ObservableObject {
     }
 
     var roleDefaultsHasOverrides: Bool {
-        roleDefaultsResolutions.contains(where: \.hasCustomOverride)
+        roleDefaultsResolutions.contains(where: \.hasStoredOverride)
     }
 
     var hasUnsatisfiedRecommendations: Bool {
