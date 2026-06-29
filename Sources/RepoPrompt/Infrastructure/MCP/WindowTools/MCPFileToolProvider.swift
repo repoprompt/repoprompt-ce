@@ -123,65 +123,74 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: []
             )
         ) { [self] _, args in
-            try Task.checkCancellation()
-            if await dependencies.promptVM.codeMapsGloballyDisabled {
-                throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+            try await WorkspaceToolSentryTelemetry.span(
+                operation: .codeMapStructure,
+                toolName: .getCodeStructure
+            ) {
+                try await executeGetCodeStructure(args: args)
             }
-            let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
-            let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
-            let metadata = await dependencies.captureRequestMetadata()
-            try Task.checkCancellation()
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            try Task.checkCancellation()
-            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-            try Task.checkCancellation()
+        }
+    }
 
-            switch scope {
-            case "selected":
-                guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
-                    throw CancellationError()
-                }
-                try Task.checkCancellation()
-                let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
-                try Task.checkCancellation()
-                var combined: [WorkspaceFileRecord] = []
-                var seenPaths = Set<String>()
-                for entry in collections.selected {
-                    try Task.checkCancellation()
-                    let abs = entry.file.standardizedFullPath
-                    if seenPaths.insert(abs).inserted { combined.append(entry.file) }
-                }
-                for entry in collections.codemap {
-                    try Task.checkCancellation()
-                    let abs = entry.file.standardizedFullPath
-                    if seenPaths.insert(abs).inserted { combined.append(entry.file) }
-                }
-                let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext)
-                try Task.checkCancellation()
-                return try Value(reply)
-            default:
-                guard let rawPaths = args["paths"]?.arrayValue else {
-                    throw MCPError.invalidParams("missing paths (required when scope='paths')")
-                }
-                let paths = rawPaths.compactMap(\.stringValue)
-                guard !paths.isEmpty else {
-                    throw MCPError.invalidParams("paths array cannot be empty")
-                }
-                let lookupRootScope = lookupContext.rootScope
-                let resolvedPaths = lookupContext.translateInputPaths(paths)
-                for path in resolvedPaths {
-                    try Task.checkCancellation()
-                    if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
-                        throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
-                    }
-                }
-                try Task.checkCancellation()
-                let resolvedFiles = try await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
-                try Task.checkCancellation()
-                let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext)
-                try Task.checkCancellation()
-                return try Value(reply)
+    private func executeGetCodeStructure(args: [String: Value]) async throws -> Value {
+        try Task.checkCancellation()
+        if await dependencies.promptVM.codeMapsGloballyDisabled {
+            throw MCPError.invalidParams(MCPServerViewModel.codeMapsGloballyDisabledMCPMessage)
+        }
+        let scope = (args["scope"]?.stringValue ?? "paths").lowercased()
+        let maxResults = max(0, args["max_results"]?.intValue ?? MCPWindowWorkspaceToolHelpers.defaultCodeStructureMaxResults)
+        let metadata = await dependencies.captureRequestMetadata()
+        try Task.checkCancellation()
+        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        try Task.checkCancellation()
+        _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+        try Task.checkCancellation()
+
+        switch scope {
+        case "selected":
+            guard await dependencies.drainReadFileAutoSelection(metadata, .canonicalSelection) == .completed else {
+                throw CancellationError()
             }
+            try Task.checkCancellation()
+            let collections = try await dependencies.selectionCollectionsForCurrentTabContext()
+            try Task.checkCancellation()
+            var combined: [WorkspaceFileRecord] = []
+            var seenPaths = Set<String>()
+            for entry in collections.selected {
+                try Task.checkCancellation()
+                let abs = entry.file.standardizedFullPath
+                if seenPaths.insert(abs).inserted { combined.append(entry.file) }
+            }
+            for entry in collections.codemap {
+                try Task.checkCancellation()
+                let abs = entry.file.standardizedFullPath
+                if seenPaths.insert(abs).inserted { combined.append(entry.file) }
+            }
+            let reply = try await dependencies.buildCodeStructureDTO(combined, maxResults, true, lookupContext)
+            try Task.checkCancellation()
+            return try Value(reply)
+        default:
+            guard let rawPaths = args["paths"]?.arrayValue else {
+                throw MCPError.invalidParams("missing paths (required when scope='paths')")
+            }
+            let paths = rawPaths.compactMap(\.stringValue)
+            guard !paths.isEmpty else {
+                throw MCPError.invalidParams("paths array cannot be empty")
+            }
+            let lookupRootScope = lookupContext.rootScope
+            let resolvedPaths = lookupContext.translateInputPaths(paths)
+            for path in resolvedPaths {
+                try Task.checkCancellation()
+                if let issue = await dependencies.promptVM.workspaceFileContextStore.exactPathResolutionIssue(for: path, kind: .either, rootScope: lookupRootScope) {
+                    throw MCPError.invalidParams(PathResolutionIssueRenderer.message(for: issue))
+                }
+            }
+            try Task.checkCancellation()
+            let resolvedFiles = try await dependencies.resolveFilesForCodeStructure(resolvedPaths, lookupRootScope)
+            try Task.checkCancellation()
+            let reply = try await dependencies.buildCodeStructureDTO(resolvedFiles, maxResults, false, lookupContext)
+            try Task.checkCancellation()
+            return try Value(reply)
         }
     }
 
@@ -321,6 +330,15 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
     }
 
     private func executeReadFile(args: [String: Value]) async throws -> Value {
+        try await WorkspaceToolSentryTelemetry.span(
+            operation: .fileRead,
+            toolName: .readFile
+        ) {
+            try await executeReadFileBody(args: args)
+        }
+    }
+
+    private func executeReadFileBody(args: [String: Value]) async throws -> Value {
         try Task.checkCancellation()
         EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.ReadFile.providerEntered)
         let providerTotalState = EditFlowPerf.begin(EditFlowPerf.Stage.ReadFile.providerTotal)
@@ -462,17 +480,32 @@ final class MCPFileToolProvider: MCPWindowToolProviding {
                 required: ["pattern"]
             )
         ) { [self] _, args in
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
-            let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
-            defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
-            let reply = try await executeFileSearch(args: args)
-            try Task.checkCancellation()
-            let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
-                try Value(reply)
-            }
-            EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerResultReady)
-            return value
+            try await executeFileSearchToolValue(args: args)
         }
+    }
+
+    private func executeFileSearchToolValue(args: [String: Value]) async throws -> Value {
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerEntered)
+        let providerTotal = EditFlowPerf.begin(EditFlowPerf.Stage.Search.providerTotal)
+        defer { EditFlowPerf.end(EditFlowPerf.Stage.Search.providerTotal, providerTotal) }
+        let reply = try await WorkspaceToolSentryTelemetry.span(
+            operation: .workspaceSearch,
+            toolName: .fileSearch,
+            completionAttributes: { reply in
+                [
+                    .resultCount(reply.totalMatches),
+                    .limitHit(reply.limitHit)
+                ]
+            }
+        ) {
+            try await executeFileSearch(args: args)
+        }
+        try Task.checkCancellation()
+        let value = try EditFlowPerf.measure(EditFlowPerf.Stage.Search.providerValueEncoding) {
+            try Value(reply)
+        }
+        EditFlowPerf.lifecycleEvent(EditFlowPerf.Lifecycle.Search.providerResultReady)
+        return value
     }
 
     private func executeFileSearch(args: [String: Value]) async throws -> ToolResultDTOs.SearchResultDTO {
