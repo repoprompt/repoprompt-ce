@@ -220,7 +220,9 @@ final class WorkspaceCodemapLocalGitClassificationTests: XCTestCase {
             }
         )
         let loaded = try await store.loadRoot(path: root.path)
-        defer { Task { await store.unloadRoot(id: loaded.id) } }
+        addTeardownBlock {
+            await store.unloadRoot(id: loaded.id)
+        }
         let file = try await firstFile(in: loaded, store: store)
 
         await assertNonGit(store.requestCodemapArtifact(forFileID: file.id))

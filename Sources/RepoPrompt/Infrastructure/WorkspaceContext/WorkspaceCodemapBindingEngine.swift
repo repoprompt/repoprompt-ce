@@ -6498,46 +6498,60 @@ actor WorkspaceCodemapBindingEngine {
         writerID: UUID
     ) async {
         while !Task.isCancelled {
-            guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
-            guard !writer.queuedWork.isEmpty else {
-                writer.writerID = nil
-                writer.task = nil
-                writer.inFlightWork = nil
-                writer.inFlightRevision = nil
-                if writer.waiters.isEmpty {
-                    manifestWriters.removeValue(forKey: namespace)
-                } else {
-                    manifestWriters[namespace] = writer
+            let item: ManifestMutationWorkItem
+            do {
+                guard var writer = manifestWriters[namespace], writer.writerID == writerID else { return }
+                guard !writer.queuedWork.isEmpty else {
+                    let orphaned = writer.waiters
+                    writer.waiters.removeAll()
+                    writer.writerID = nil
+                    writer.task = nil
+                    writer.inFlightWork = nil
+                    writer.inFlightRevision = nil
+                    storeManifestWriterState(writer, namespace: namespace)
+                    for waiter in orphaned {
+                        waiter.continuation.resume(returning: false)
+                    }
+                    return
                 }
-                return
+                item = writer.queuedWork.removeFirst()
+                writer.inFlightWork = item
+                writer.inFlightRevision = item.revision
+                manifestWriters[namespace] = writer
             }
-            let item = writer.queuedWork.removeFirst()
             let workKey = item.workKey
             let scope = workKey.scope
-            guard case let .eligible(session)? = roots[scope.rootEpoch],
-                  session.id == workKey.sessionID,
-                  let pipeline = session.pipelines[scope.pipelineIdentity],
-                  pipeline.id == workKey.pipelineSessionID,
-                  pipeline.namespace == namespace,
+            guard case let .eligible(initialSession)? = roots[scope.rootEpoch],
+                  initialSession.id == workKey.sessionID,
+                  let initialPipeline = initialSession.pipelines[scope.pipelineIdentity],
+                  initialPipeline.id == workKey.pipelineSessionID,
+                  initialPipeline.namespace == namespace,
                   manifestMutationProofIsCurrent(
                       item.proof,
                       rootEpoch: scope.rootEpoch,
-                      session: session,
-                      pipeline: pipeline
+                      session: initialSession,
+                      pipeline: initialPipeline
                   )
             else {
-                manifestWriters[namespace] = writer
                 discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
                 continue
             }
+            var session = initialSession
+            var pipeline = initialPipeline
             if item.revision <= pipeline.persistedManifestRevision {
-                let completed = writer.waiters.filter {
-                    $0.workKey == workKey && $0.revision <= item.revision
-                }
-                writer.waiters.removeAll {
-                    $0.workKey == workKey && $0.revision <= item.revision
-                }
-                manifestWriters[namespace] = writer
+                guard var currentWriter = currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) else { return }
+                currentWriter.inFlightWork = nil
+                currentWriter.inFlightRevision = nil
+                let completed = detachManifestWaiters(
+                    from: &currentWriter,
+                    workKey: workKey,
+                    revision: item.revision
+                )
+                storeManifestWriterState(currentWriter, namespace: namespace)
                 for waiter in completed {
                     waiter.continuation.resume(returning: true)
                 }
@@ -6548,6 +6562,11 @@ actor WorkspaceCodemapBindingEngine {
                     scope.rootEpoch,
                     generation.catalogToken
                 )
+                guard currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) != nil else { return }
                 guard tokenDisposition == .current,
                       case let .eligible(revalidated)? = roots[scope.rootEpoch],
                       revalidated.id == session.id,
@@ -6563,6 +6582,8 @@ actor WorkspaceCodemapBindingEngine {
                     discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
                     continue
                 }
+                session = revalidated
+                pipeline = revalidatedPipeline
             }
             let sessionID = session.id
             let pipelineSessionID = pipeline.id
@@ -6588,15 +6609,18 @@ actor WorkspaceCodemapBindingEngine {
             let removals = Set(changes.compactMap { path, change in
                 change.record == nil ? path : nil
             })
-            writer.inFlightWork = item
-            writer.inFlightRevision = revision
-            manifestWriters[namespace] = writer
             do {
-                guard let writerAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
+                let claimedWriterAuthority = await runtime.manifestStore.claimManifestWriterAuthority(
                     namespace: namespace,
                     authority: pipeline.authority,
                     writerSession: session.manifestWriterSession
-                ) else {
+                )
+                guard currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) != nil else { return }
+                guard let writerAuthority = claimedWriterAuthority else {
                     throw CodeMapRootManifestStoreError.staleWriterAuthority
                 }
                 guard case let .eligible(afterAuthority)? = roots[scope.rootEpoch],
@@ -6610,13 +6634,6 @@ actor WorkspaceCodemapBindingEngine {
                           pipeline: afterAuthorityPipeline
                       )
                 else {
-                    if var currentWriter = manifestWriters[namespace],
-                       currentWriter.writerID == writerID
-                    {
-                        currentWriter.inFlightWork = nil
-                        currentWriter.inFlightRevision = nil
-                        manifestWriters[namespace] = currentWriter
-                    }
                     discardManifestWorkItem(item, namespace: namespace, writerID: writerID)
                     continue
                 }
@@ -6628,18 +6645,24 @@ actor WorkspaceCodemapBindingEngine {
                     upserts: upserts,
                     removals: removals
                 )
+                guard currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) != nil else { return }
                 await hooks.afterManifestStoreWriteBeforeCompletion(scope.rootEpoch)
-                guard var currentWriter = manifestWriters[namespace],
-                      currentWriter.writerID == writerID
-                else { return }
+                guard var currentWriter = currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) else { return }
                 currentWriter.inFlightWork = nil
                 currentWriter.inFlightRevision = nil
-                let completed = currentWriter.waiters.filter {
-                    $0.workKey == workKey && $0.revision <= revision
-                }
-                currentWriter.waiters.removeAll {
-                    $0.workKey == workKey && $0.revision <= revision
-                }
+                let completed = detachManifestWaiters(
+                    from: &currentWriter,
+                    workKey: workKey,
+                    revision: revision
+                )
                 if case var .eligible(current)? = roots[scope.rootEpoch],
                    current.id == sessionID,
                    var currentPipeline = current.pipelines[scope.pipelineIdentity],
@@ -6666,24 +6689,25 @@ actor WorkspaceCodemapBindingEngine {
                     current.pipelines[scope.pipelineIdentity] = currentPipeline
                     roots[scope.rootEpoch] = .eligible(current)
                 }
-                manifestWriters[namespace] = currentWriter
+                storeManifestWriterState(currentWriter, namespace: namespace)
                 incrementCounter(\.manifestWrites)
                 for waiter in completed {
                     waiter.continuation.resume(returning: true)
                 }
             } catch {
-                guard var currentWriter = manifestWriters[namespace],
-                      currentWriter.writerID == writerID
-                else { return }
+                guard var currentWriter = currentManifestWriterState(
+                    namespace: namespace,
+                    writerID: writerID,
+                    itemID: item.id
+                ) else { return }
                 currentWriter.inFlightWork = nil
                 currentWriter.inFlightRevision = nil
-                let failed = currentWriter.waiters.filter {
-                    $0.workKey == workKey && $0.revision <= revision
-                }
-                currentWriter.waiters.removeAll {
-                    $0.workKey == workKey && $0.revision <= revision
-                }
-                manifestWriters[namespace] = currentWriter
+                let failed = detachManifestWaiters(
+                    from: &currentWriter,
+                    workKey: workKey,
+                    revision: revision
+                )
+                storeManifestWriterState(currentWriter, namespace: namespace)
                 if case var .eligible(current)? = roots[scope.rootEpoch],
                    current.id == sessionID,
                    var currentPipeline = current.pipelines[scope.pipelineIdentity],
@@ -6715,6 +6739,11 @@ actor WorkspaceCodemapBindingEngine {
         writer.waiters.removeAll {
             $0.workKey == workKey && $0.revision <= item.revision
         }
+        writer.queuedWork.removeAll { $0.id == item.id }
+        if writer.inFlightWork?.id == item.id {
+            writer.inFlightWork = nil
+            writer.inFlightRevision = nil
+        }
         if case var .eligible(session)? = roots[workKey.scope.rootEpoch],
            session.id == workKey.sessionID,
            var pipeline = session.pipelines[workKey.scope.pipelineIdentity],
@@ -6729,9 +6758,52 @@ actor WorkspaceCodemapBindingEngine {
             session.pipelines[workKey.scope.pipelineIdentity] = pipeline
             roots[workKey.scope.rootEpoch] = .eligible(session)
         }
-        manifestWriters[namespace] = writer
+        storeManifestWriterState(writer, namespace: namespace)
         for waiter in detached {
             waiter.continuation.resume(returning: false)
+        }
+    }
+
+    private func currentManifestWriterState(
+        namespace: CodeMapRootManifestNamespace,
+        writerID: UUID,
+        itemID: UUID
+    ) -> ManifestWriterState? {
+        guard let state = manifestWriters[namespace],
+              state.writerID == writerID,
+              state.inFlightWork?.id == itemID
+        else { return nil }
+        return state
+    }
+
+    private func detachManifestWaiters(
+        from writer: inout ManifestWriterState,
+        workKey: ManifestWriterWorkKey,
+        revision: UInt64
+    ) -> [ManifestWriteWaiter] {
+        let detached = writer.waiters.filter {
+            $0.workKey == workKey && $0.revision <= revision
+        }
+        writer.waiters.removeAll {
+            $0.workKey == workKey && $0.revision <= revision
+        }
+        return detached
+    }
+
+    private func storeManifestWriterState(
+        _ state: ManifestWriterState,
+        namespace: CodeMapRootManifestNamespace
+    ) {
+        if state.writerID == nil,
+           state.task == nil,
+           state.queuedWork.isEmpty,
+           state.inFlightWork == nil,
+           state.inFlightRevision == nil,
+           state.waiters.isEmpty
+        {
+            manifestWriters.removeValue(forKey: namespace)
+        } else {
+            manifestWriters[namespace] = state
         }
     }
 
@@ -7008,11 +7080,7 @@ actor WorkspaceCodemapBindingEngine {
             return
         }
         let waiter = state.waiters.remove(at: index)
-        if state.writerID == nil, state.queuedWork.isEmpty, state.waiters.isEmpty {
-            manifestWriters.removeValue(forKey: namespace)
-        } else {
-            manifestWriters[namespace] = state
-        }
+        storeManifestWriterState(state, namespace: namespace)
         waiter.continuation.resume(returning: false)
     }
 
@@ -7022,11 +7090,7 @@ actor WorkspaceCodemapBindingEngine {
             state.queuedWork.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
             let detached = state.waiters.filter { $0.workKey.scope.rootEpoch == rootEpoch }
             state.waiters.removeAll { $0.workKey.scope.rootEpoch == rootEpoch }
-            if state.writerID == nil, state.queuedWork.isEmpty, state.waiters.isEmpty {
-                manifestWriters.removeValue(forKey: namespace)
-            } else {
-                manifestWriters[namespace] = state
-            }
+            storeManifestWriterState(state, namespace: namespace)
             for waiter in detached {
                 waiter.continuation.resume(returning: false)
             }
