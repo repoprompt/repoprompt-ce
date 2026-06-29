@@ -858,7 +858,6 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     func stop() {
         stopCodexModelsSubscription()
-        stopAllCodexToolTracking()
         stopAllBashLivenessTasks()
         stopAllCodexIdleShutdownTasks()
         stopAllCodexStallWatchdogTasks()
@@ -2589,17 +2588,12 @@ final class CodexAgentModeCoordinator: AgentModeRunInteractionStateObserving {
 
     /// Stops and forgets every tab-scoped Codex tool tracker owned by the coordinator.
     ///
-    /// Per-session shutdown still performs run-aware observer unregistering when
-    /// it has a live session/run ID. This global stop path is the safety net for
-    /// window/view-model teardown where the coordinator must not retain stale
-    /// tracker controllers after its owning window is gone.
-    private func stopAllCodexToolTracking() {
-        let controllers = Array(toolTrackingByTabID.values)
-        toolTrackingByTabID.removeAll()
-        for controller in controllers {
-            Task {
-                await controller.stopTracking()
-            }
+    /// Call only from true lifetime teardown (`prepareForWindowClose`, `deinit`,
+    /// workspace switch). Do not invoke from `stop()`, which also runs when agent
+    /// mode UI is hidden while sessions and in-flight runs remain alive.
+    func stopAllCodexToolTrackingAndWait() async {
+        for tabID in Array(toolTrackingByTabID.keys) {
+            await stopCodexToolTrackingAndWait(for: AgentModeViewModel.TabSession(tabID: tabID))
         }
     }
 

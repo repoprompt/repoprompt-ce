@@ -1794,16 +1794,20 @@ final class AgentModeViewModel: ObservableObject {
         let tabCloseListenerToken = tabCloseListenerToken
         let workspaceDidSwitchListenerToken = workspaceDidSwitchListenerToken
         let beforeSaveListenerToken = beforeSaveListenerToken
+        let codex = codexCoordinator
+        let claude = claudeCoordinator
         Task { @MainActor in
-            if let tabCloseListenerToken {
-                promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
-            }
-            if let workspaceDidSwitchListenerToken {
-                workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
-            }
-            if let beforeSaveListenerToken {
-                workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
-            }
+            Self.removeRegisteredObserverListeners(
+                promptManager: promptManager,
+                workspaceManager: workspaceManager,
+                tabCloseListenerToken: tabCloseListenerToken,
+                workspaceDidSwitchListenerToken: workspaceDidSwitchListenerToken,
+                beforeSaveListenerToken: beforeSaveListenerToken
+            )
+            await codex.stopAllCodexToolTrackingAndWait()
+            await claude.stopAllClaudeToolTrackingAndWait()
+            codex.stop()
+            claude.stop()
         }
         cancellables.removeAll()
         uiRefreshTask?.cancel()
@@ -1822,12 +1826,6 @@ final class AgentModeViewModel: ObservableObject {
         sessionListCacheTask?.cancel()
         sidebarAutoArchiveTask?.cancel()
         sessionListCacheGeneration &+= 1
-        let codex = codexCoordinator
-        let claude = claudeCoordinator
-        Task { @MainActor in
-            codex.stop()
-            claude.stop()
-        }
     }
 
     lazy var claudeContextUsageEstimator = ClaudeContextUsageEstimator(
@@ -2764,25 +2762,44 @@ final class AgentModeViewModel: ObservableObject {
     /// prompt/workspace managers use explicit token-based listener arrays. Keeping
     /// this idempotent lets both `prepareForWindowClose()` and `deinit` call it.
     private func unregisterObserverRegistrations() {
+        Self.removeRegisteredObserverListeners(
+            promptManager: promptManager,
+            workspaceManager: workspaceManager,
+            tabCloseListenerToken: tabCloseListenerToken,
+            workspaceDidSwitchListenerToken: workspaceDidSwitchListenerToken,
+            beforeSaveListenerToken: beforeSaveListenerToken
+        )
+        tabCloseListenerToken = nil
+        workspaceDidSwitchListenerToken = nil
+        beforeSaveListenerToken = nil
+        cancellables.removeAll()
+    }
+
+    @MainActor
+    private static func removeRegisteredObserverListeners(
+        promptManager: PromptViewModel?,
+        workspaceManager: WorkspaceManagerViewModel?,
+        tabCloseListenerToken: UUID?,
+        workspaceDidSwitchListenerToken: UUID?,
+        beforeSaveListenerToken: UUID?
+    ) {
         if let tabCloseListenerToken {
             promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
-            self.tabCloseListenerToken = nil
         }
         if let workspaceDidSwitchListenerToken {
             workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
-            self.workspaceDidSwitchListenerToken = nil
         }
         if let beforeSaveListenerToken {
             workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
-            self.beforeSaveListenerToken = nil
         }
-        cancellables.removeAll()
     }
 
     func prepareForWindowClose() async {
         guard !hasPreparedForWindowClose else { return }
         hasPreparedForWindowClose = true
         unregisterObserverRegistrations()
+        await codexCoordinator.stopAllCodexToolTrackingAndWait()
+        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         stopOpenCodeModelsSubscription()
@@ -9951,6 +9968,8 @@ final class AgentModeViewModel: ObservableObject {
         if workspace != nil {
             publishLoadingTranscriptPresentation(tabID: initialActiveTabID)
         }
+        await codexCoordinator.stopAllCodexToolTrackingAndWait()
+        await claudeCoordinator.stopAllClaudeToolTrackingAndWait()
         codexCoordinator.stop()
         claudeCoordinator.stop()
         stopOpenCodeModelsSubscription()
@@ -10613,6 +10632,9 @@ final class AgentModeViewModel: ObservableObject {
                 if session.runState.isActive {
                     await cancelAgentRun(tabID: tabID)
                 }
+
+                session.agentTask?.cancel()
+                session.agentTask = nil
 
                 // All compose-tab removal reasons detach the live TabSession owner from `sessions`.
                 // Release retained ACP runtimes before that controller handle can become unreachable.
