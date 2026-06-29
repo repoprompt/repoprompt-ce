@@ -6950,11 +6950,28 @@ actor WorkspaceCodemapBindingEngine {
         else { return false }
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                guard !Task.isCancelled else {
+                guard !Task.isCancelled,
+                      case let .eligible(currentSession)? = roots[scope.rootEpoch],
+                      currentSession.id == workKey.sessionID,
+                      let currentPipeline = currentSession.pipelines[scope.pipelineIdentity],
+                      currentPipeline.id == workKey.pipelineSessionID,
+                      currentPipeline.namespace == namespace
+                else {
                     continuation.resume(returning: false)
                     return
                 }
+                if currentPipeline.persistedManifestRevision >= revision {
+                    continuation.resume(returning: true)
+                    return
+                }
                 var state = manifestWriters[namespace] ?? ManifestWriterState()
+                let hasRelevantWork = state.queuedWork.contains {
+                    $0.workKey == workKey && $0.revision >= revision
+                } || (state.inFlightWork?.workKey == workKey && (state.inFlightRevision ?? 0) >= revision)
+                guard hasRelevantWork else {
+                    continuation.resume(returning: false)
+                    return
+                }
                 state.waiters.append(ManifestWriteWaiter(
                     id: waiterID,
                     workKey: workKey,

@@ -82,6 +82,12 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
         defer { WindowStatesManager.shared.unregisterWindowState(window) }
 
         _ = try await window.workspaceFileContextStore.loadRoot(path: root.path)
+        let codemapLookup = await window.workspaceFileContextStore.lookupPath(codemapURL.path)
+        let codemapRecord = try XCTUnwrap(codemapLookup?.file)
+        let frozenPresentation = try makePresentation(
+            file: codemapRecord,
+            text: "File: Nested/Frozen.swift\nimport Foundation\nimport Combine\nfunc frozenReplyTokenSentinel() {}"
+        )
         let selection = StoredSelection(
             selectedPaths: [codemapURL.path],
             codemapAutoEnabled: false
@@ -94,7 +100,8 @@ final class MCPSelectionContentPackagingTests: XCTestCase {
             from: source,
             owner: window.mcpServer,
             rootScope: .visibleWorkspace,
-            contentPolicy: .cachedOnly
+            contentPolicy: .cachedOnly,
+            codemapPresentation: frozenPresentation
         )
         let codemapEntry = try XCTUnwrap(collections.codemap.first)
         let frozenEntry = try XCTUnwrap(
