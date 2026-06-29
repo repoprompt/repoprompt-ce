@@ -401,6 +401,7 @@ extension MCPServerViewModel {
             includeBlocks: includeBlocks,
             display: display,
             lookupContextOverride: lookupContext,
+            ingressPolicy: .alreadyAwaited,
             codemapPresentationOverride: codemapPresentation
         )
     }
