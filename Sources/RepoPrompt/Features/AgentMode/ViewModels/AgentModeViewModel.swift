@@ -640,9 +640,7 @@ final class AgentModeViewModel: ObservableObject {
     private var lastKnownWorkspaceSnapshot: WorkspaceModel?
     var tabDraftText: [UUID: String] = [:]
     private var cancellables = Set<AnyCancellable>()
-    private var tabCloseListenerToken: UUID?
-    private var workspaceDidSwitchListenerToken: UUID?
-    private var beforeSaveListenerToken: UUID?
+    private let listeners = ListenerRegistry()
     private var isAgentModeActive = false
     #if DEBUG
         private var test_currentTabIDOverride: UUID?
@@ -2290,24 +2288,36 @@ final class AgentModeViewModel: ObservableObject {
             .store(in: &cancellables)
 
         // Register for tab-close events
-        tabCloseListenerToken = promptManager.addComposeTabsWillCloseListener { [weak self] tabIDs, reason in
-            guard let self else { return }
-            await handleComposeTabsWillClose(tabIDs, reason: reason)
+        listeners.addToken(
+            promptManager.addComposeTabsWillCloseListener { [weak self] tabIDs, reason in
+                guard let self else { return }
+                await handleComposeTabsWillClose(tabIDs, reason: reason)
+            }
+        ) { [weak promptManager] token in
+            promptManager?.removeComposeTabsWillCloseListener(token)
         }
 
         // Observe workspace changes
-        workspaceDidSwitchListenerToken = workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
-            guard let self else { return }
-            let owner = receiveWorkspaceSwitchNotification(workspace)
-            Task { @MainActor in
-                await self.handleWorkspaceSwitch(workspace, owner: owner)
+        listeners.addToken(
+            workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
+                guard let self else { return }
+                let owner = receiveWorkspaceSwitchNotification(workspace)
+                Task { @MainActor in
+                    await self.handleWorkspaceSwitch(workspace, owner: owner)
+                }
             }
+        ) { [weak workspaceManager] token in
+            workspaceManager?.removeWorkspaceDidSwitchListener(token)
         }
 
         // Save before workspace saves
-        beforeSaveListenerToken = workspaceManager?.addBeforeSaveListener { [weak self] _ in
-            guard let self else { return }
-            persistCurrentSession()
+        listeners.addToken(
+            workspaceManager?.addBeforeSaveListener { [weak self] _ in
+                guard let self else { return }
+                persistCurrentSession()
+            }
+        ) { [weak workspaceManager] token in
+            workspaceManager?.removeBeforeSaveListener(token)
         }
 
         if let apiSettingsViewModel = promptManager.apiSettingsViewModel {
@@ -2754,18 +2764,7 @@ final class AgentModeViewModel: ObservableObject {
     /// called from `deinit`, which is nonisolated and cannot safely hop to
     /// @MainActor — see `deinit` and `WindowState.deinit` for the rationale.
     private func unregisterObserverRegistrations() {
-        if let tabCloseListenerToken {
-            promptManager?.removeComposeTabsWillCloseListener(tabCloseListenerToken)
-            self.tabCloseListenerToken = nil
-        }
-        if let workspaceDidSwitchListenerToken {
-            workspaceManager?.removeWorkspaceDidSwitchListener(workspaceDidSwitchListenerToken)
-            self.workspaceDidSwitchListenerToken = nil
-        }
-        if let beforeSaveListenerToken {
-            workspaceManager?.removeBeforeSaveListener(beforeSaveListenerToken)
-            self.beforeSaveListenerToken = nil
-        }
+        listeners.removeAll()
         cancellables.removeAll()
     }
 
