@@ -4203,6 +4203,58 @@ final class WorkspaceFileContextStoreTests: XCTestCase {
             XCTAssertEqual(try String(contentsOf: replacementTarget, encoding: .utf8), "replacement")
         }
 
+        func testValidatedSessionScopeToleratesDuplicateRootIDs() async throws {
+            let logicalRoot = try makeTemporaryRoot(name: "DuplicateValidatedLogical")
+            let worktree = try makeTemporaryRoot(name: "DuplicateValidatedWorktree")
+            let staleWorktree = try makeTemporaryRoot(name: "DuplicateValidatedStaleWorktree")
+            try write("logical", to: logicalRoot.appendingPathComponent("Logical.swift"))
+            try write("worktree", to: worktree.appendingPathComponent("Target.swift"))
+            try write("stale", to: staleWorktree.appendingPathComponent("Stale.swift"))
+
+            let store = WorkspaceFileContextStore()
+            let logicalRecord = try await store.loadRoot(path: logicalRoot.path)
+            let worktreeRecord = try await store.loadRoot(path: worktree.path, kind: .sessionWorktree)
+            let scope = WorkspaceLookupRootScope.validatedSessionBoundWorkspace(
+                canonicalRoots: [
+                    WorkspaceRootRef(
+                        id: logicalRecord.id,
+                        name: logicalRecord.name,
+                        fullPath: logicalRecord.standardizedFullPath
+                    )
+                ],
+                physicalRoots: [
+                    WorkspaceRootRef(
+                        id: worktreeRecord.id,
+                        name: worktreeRecord.name,
+                        fullPath: worktreeRecord.standardizedFullPath
+                    ),
+                    WorkspaceRootRef(
+                        id: worktreeRecord.id,
+                        name: worktreeRecord.name,
+                        fullPath: staleWorktree.standardizedFileURL.path
+                    )
+                ]
+            )
+
+            let availability = await store.rootScopeAvailability(scope)
+            let scopedRootIDs = await store.rootRefs(scope: scope).map(\.id)
+            let catalogAccess = await store.searchCatalogAccess(rootScope: scope)
+            let lookup = await store.lookupPath(
+                worktree.appendingPathComponent("Target.swift").path,
+                profile: .mcpRead,
+                rootScope: scope
+            )
+
+            XCTAssertEqual(availability, .available)
+            XCTAssertEqual(scopedRootIDs, [logicalRecord.id, worktreeRecord.id])
+            if case let .available(snapshot) = catalogAccess {
+                XCTAssertEqual(snapshot.roots.map(\.id), [logicalRecord.id, worktreeRecord.id])
+            } else {
+                XCTFail("Expected duplicate refs for the same loaded root to remain available")
+            }
+            XCTAssertEqual(lookup?.file?.rootID, worktreeRecord.id)
+        }
+
         func testSearchCatalogSnapshotCacheEvictsOnlyLeastRecentlyUsedEntryAtCapacity() async {
             let store = WorkspaceFileContextStore()
             let scopes = (0 ... 16).map { index in
