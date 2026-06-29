@@ -158,7 +158,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Run state for the active tab
-    @Published var runState: AgentSessionRunState = .idle {
+    var runState: AgentSessionRunState = .idle {
         didSet {
             guard runState != oldValue else { return }
             guard !isActiveUISyncSuppressed else { return }
@@ -167,7 +167,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    @Published var runningStatusText: String? = nil {
+    var runningStatusText: String? {
         didSet {
             guard runningStatusText != oldValue else { return }
             guard !isActiveUISyncSuppressed else { return }
@@ -175,7 +175,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    @Published var activeAgentRunStartedAt: Date? = nil {
+    var activeAgentRunStartedAt: Date? {
         didSet {
             guard activeAgentRunStartedAt != oldValue else { return }
             guard !isActiveUISyncSuppressed else { return }
@@ -194,7 +194,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Prompt shown while waiting
-    @Published var waitingPrompt: String? = nil {
+    var waitingPrompt: String? {
         didSet {
             guard waitingPrompt != oldValue else { return }
             guard !isActiveUISyncSuppressed else { return }
@@ -203,55 +203,55 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     /// Pending structured ask_user interaction from the agent
-    @Published var pendingAskUser: AgentAskUserPendingState? = nil {
+    var pendingAskUser: AgentAskUserPendingState? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var pendingApproval: AgentApprovalRequest? = nil {
+    var pendingApproval: AgentApprovalRequest? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var pendingPermissionsRequest: AgentPermissionsRequest? = nil {
+    var pendingPermissionsRequest: AgentPermissionsRequest? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var pendingMCPElicitationRequest: AgentMCPElicitationRequest? = nil {
+    var pendingMCPElicitationRequest: AgentMCPElicitationRequest? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var pendingApplyEditsReview: PendingApplyEditsReview? = nil {
+    var pendingApplyEditsReview: PendingApplyEditsReview? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var pendingWorktreeMergeReview: PendingWorktreeMergeReview? = nil {
+    var pendingWorktreeMergeReview: PendingWorktreeMergeReview? {
         didSet {
             guard !isActiveUISyncSuppressed else { return }
             syncRunInteractionUIState()
         }
     }
 
-    @Published var autoEditEnabled: Bool = ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()
-    @Published private(set) var activePermissionChromeState: ActivePermissionChromeState = .userConfigured
-    @Published var activeProviderControlsBinding: AgentProviderControlsBinding? = nil
-    @Published var autoEditPermissionGuidance: AutoEditPermissionGuidance? = nil
+    var autoEditEnabled: Bool = ApplyEditsApprovalStore.globalDefaultAutoEditEnabled()
+    private(set) var activePermissionChromeState: ActivePermissionChromeState = .userConfigured
+    var activeProviderControlsBinding: AgentProviderControlsBinding?
+    var autoEditPermissionGuidance: AutoEditPermissionGuidance?
 
     /// Context usage for the active tab
-    @Published var contextUsage: AgentContextUsage? = nil {
+    var contextUsage: AgentContextUsage? {
         didSet {
             guard contextUsage != oldValue else { return }
             guard !isActiveUISyncSuppressed else { return }
@@ -259,7 +259,7 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    @Published var contextUsageSnapshot: ContextUsageSnapshot? = nil
+    var contextUsageSnapshot: ContextUsageSnapshot?
     @Published var pendingImageAttachments: [AgentImageAttachment] = []
     @Published var pendingTaggedFileAttachments: [AgentTaggedFileAttachment] = []
     @Published var draftRestorationEvent: DraftRestorationEvent? = nil
@@ -268,11 +268,11 @@ final class AgentModeViewModel: ObservableObject {
     @Published private(set) var availableAgents: [AgentProviderKind] = AgentModelCatalog.selectableAgents(availability: .none)
 
     /// Selected workflow for the active tab
-    @Published var selectedWorkflow: AgentWorkflowDefinition? = nil
+    var selectedWorkflow: AgentWorkflowDefinition?
 
     /// When true, the first message in a new chat will ask the agent to interview
     /// the user with 2–3 clarifying questions before starting work.
-    @Published var interviewFirst: Bool = false {
+    var interviewFirst: Bool = false {
         didSet {
             guard interviewFirst != oldValue else { return }
             syncStatusPillsUIState()
