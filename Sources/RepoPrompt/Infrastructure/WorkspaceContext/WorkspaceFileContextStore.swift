@@ -2798,25 +2798,59 @@ actor WorkspaceFileContextStore {
             guard !canonicalRoots.isEmpty || !physicalRoots.isEmpty else {
                 return .sessionWorktreeUnavailable(missingPhysicalRootPaths: [])
             }
-            missing = (
-                canonicalRoots.map { ($0, WorkspaceRootKind.primaryWorkspace) }
-                    + physicalRoots.map { ($0, WorkspaceRootKind.sessionWorktree) }
+            missing = validatedSessionRootScopeMissingPaths(
+                canonicalPathsByRootID: validatedRootPathsByID(canonicalRoots),
+                physicalPathsByRootID: validatedRootPathsByID(physicalRoots)
             )
-            .compactMap { expectedRoot, expectedKind in
-                guard let currentRoot = rootStatesByID[expectedRoot.id]?.root,
-                      currentRoot.kind == expectedKind,
-                      currentRoot.standardizedFullPath == expectedRoot.standardizedFullPath
-                else { return expectedRoot.standardizedFullPath }
-                var isDirectory: ObjCBool = false
-                return FileManager.default.fileExists(
-                    atPath: currentRoot.standardizedFullPath,
-                    isDirectory: &isDirectory
-                ) && isDirectory.boolValue ? nil : currentRoot.standardizedFullPath
-            }.sorted()
         }
         return missing.isEmpty
             ? .available
             : .sessionWorktreeUnavailable(missingPhysicalRootPaths: missing)
+    }
+
+    private func validatedRootPathsByID(_ roots: Set<WorkspaceRootRef>) -> [UUID: Set<String>] {
+        roots.reduce(into: [UUID: Set<String>]()) { result, root in
+            result[root.id, default: []].insert(root.standardizedFullPath)
+        }
+    }
+
+    private func validatedSessionRootScopeMissingPaths(
+        canonicalPathsByRootID: [UUID: Set<String>],
+        physicalPathsByRootID: [UUID: Set<String>]
+    ) -> [String] {
+        (
+            canonicalPathsByRootID.map { ($0.key, $0.value, WorkspaceRootKind.primaryWorkspace) }
+                + physicalPathsByRootID.map { ($0.key, $0.value, WorkspaceRootKind.sessionWorktree) }
+        )
+        .flatMap { expectedRootID, expectedPaths, expectedKind -> [String] in
+            let sortedExpectedPaths = expectedPaths.sorted()
+            guard let currentRoot = rootStatesByID[expectedRootID]?.root,
+                  currentRoot.kind == expectedKind,
+                  expectedPaths.contains(currentRoot.standardizedFullPath)
+            else { return sortedExpectedPaths }
+
+            var isDirectory: ObjCBool = false
+            return FileManager.default.fileExists(
+                atPath: currentRoot.standardizedFullPath,
+                isDirectory: &isDirectory
+            ) && isDirectory.boolValue ? [] : [currentRoot.standardizedFullPath]
+        }
+        .sorted()
+    }
+
+    private func validatedRootScopeContains(
+        _ root: WorkspaceRootRecord,
+        canonicalPathsByRootID: [UUID: Set<String>],
+        physicalPathsByRootID: [UUID: Set<String>]
+    ) -> Bool {
+        switch root.kind {
+        case .primaryWorkspace:
+            canonicalPathsByRootID[root.id]?.contains(root.standardizedFullPath) == true
+        case .sessionWorktree:
+            physicalPathsByRootID[root.id]?.contains(root.standardizedFullPath) == true
+        case .workspaceGitData, .supplementalSystem:
+            false
+        }
     }
 
     #if DEBUG
@@ -9172,17 +9206,14 @@ actor WorkspaceFileContextStore {
                 }
             }
         case let .validatedSessionBoundWorkspace(canonicalRoots, physicalRoots):
-            let canonicalByID = Dictionary(uniqueKeysWithValues: canonicalRoots.map { ($0.id, $0) })
-            let physicalByID = Dictionary(uniqueKeysWithValues: physicalRoots.map { ($0.id, $0) })
+            let canonicalPathsByRootID = validatedRootPathsByID(canonicalRoots)
+            let physicalPathsByRootID = validatedRootPathsByID(physicalRoots)
             return allRoots.filter { root in
-                switch root.kind {
-                case .primaryWorkspace:
-                    canonicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
-                case .sessionWorktree:
-                    physicalByID[root.id]?.standardizedFullPath == root.standardizedFullPath
-                case .workspaceGitData, .supplementalSystem:
-                    false
-                }
+                validatedRootScopeContains(
+                    root,
+                    canonicalPathsByRootID: canonicalPathsByRootID,
+                    physicalPathsByRootID: physicalPathsByRootID
+                )
             }
         }
     }
