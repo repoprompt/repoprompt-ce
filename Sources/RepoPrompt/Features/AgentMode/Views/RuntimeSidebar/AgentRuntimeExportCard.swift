@@ -257,11 +257,11 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
                 onRemove: { row, model in remove(row, from: model) },
                 onClear: { model in clearSelection(for: model) }
             )
-            .frame(width: 380)
+            .frame(width: 420)
             .frame(
-                minHeight: 200,
-                idealHeight: min(500, Double(max(currentExportModel?.fileCount ?? selectionCount, 1)) * 40 + 120),
-                maxHeight: 500
+                minHeight: 124,
+                idealHeight: selectedFilesPopoverHeight(rowCount: currentExportModel?.fileCount ?? selectionCount),
+                maxHeight: 440
             )
         }
         .onChange(of: showSelectedFilesPopover) { _, isPresented in
@@ -275,6 +275,11 @@ struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
         .onReceive(selectionChangesPublisher) { change in
             handleSelectionChange(change)
         }
+    }
+
+    private func selectedFilesPopoverHeight(rowCount: Int) -> Double {
+        let visibleRows = min(max(rowCount, 3), 8)
+        return min(440, Double(visibleRows) * 40 + 64)
     }
 
     private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
@@ -666,9 +671,7 @@ private struct AgentSelectedFilesPopover: View {
     var body: some View {
         let split = RowSplit(rows: rows)
 
-        VStack(alignment: .leading, spacing: 6) {
-            header(split: split)
-            Divider().padding(.vertical, 2)
+        VStack(alignment: .leading, spacing: 5) {
             tabSwitcher(split: split)
 
             if isLoading, model == nil {
@@ -681,7 +684,7 @@ private struct AgentSelectedFilesPopover: View {
                     emptyState(title: activeTab == .files ? "No files in Agent context" : "No codemaps in Agent context")
                 } else {
                     ScrollView(.vertical, showsIndicators: true) {
-                        LazyVStack(alignment: .leading, spacing: 8) {
+                        LazyVStack(alignment: .leading, spacing: 4) {
                             ForEach(Array(activeRows.enumerated()), id: \.element.id) { index, row in
                                 AgentSelectedFileRow(
                                     row: row,
@@ -702,7 +705,9 @@ private struct AgentSelectedFilesPopover: View {
                 }
             }
         }
-        .padding(8)
+        .padding(.horizontal, 8)
+        .padding(.top, 2)
+        .padding(.bottom, 8)
         .onAppear {
             if autoRefreshOnAppear {
                 onRefresh()
@@ -723,48 +728,36 @@ private struct AgentSelectedFilesPopover: View {
         }
     }
 
-    private func header(split: RowSplit) -> some View {
-        HStack(alignment: .center) {
-            Text("Agent Files")
-                .font(fontPreset.standardFont.weight(.medium))
-                .foregroundColor(.primary)
-            Circle()
-                .fill(Color.secondary.opacity(0.3))
-                .frame(width: 4, height: 4)
-            Text("\(displayFileCount(split: split))")
-                .font(fontPreset.captionFont.weight(.medium))
-                .foregroundColor(.secondary)
-            Spacer()
-            Button {
-                guard let model else { return }
-                onClear(model)
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "xmark.circle")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 11))
-                    Text("Clear All")
-                        .font(fontPreset.captionFont)
+    private func tabSwitcher(split: RowSplit) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            HStack(spacing: 0) {
+                tabButton(icon: "doc.text", label: "Files", count: displayFileCount(split: split), tab: .files) {
+                    activeTab = .files
+                }
+                tabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, tab: .codemaps) {
+                    activeTab = .codemaps
                 }
             }
-            .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
-            .disabled(split.rows.isEmpty || !canMutate || model == nil)
-            .hoverTooltip(canMutate ? (split.rows.isEmpty ? "No Agent context files to clear" : "Clear the displayed Agent selection") : "Selection mutation is unavailable for this Agent context")
-            .accessibilityHint(canMutate ? (split.rows.isEmpty ? "No Agent context files to clear" : "Clear the displayed Agent selection") : "Selection mutation is unavailable for this Agent context")
+            .frame(maxWidth: .infinity)
+
+            clearButton(split: split)
         }
+        .padding(.horizontal, -4)
+        .padding(.bottom, 2)
     }
 
-    private func tabSwitcher(split: RowSplit) -> some View {
-        HStack(spacing: 0) {
-            tabButton(icon: "doc.text", label: "Files", count: displayFileCount(split: split), tab: .files) {
-                activeTab = .files
-            }
-            tabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, tab: .codemaps) {
-                activeTab = .codemaps
-            }
+    private func clearButton(split: RowSplit) -> some View {
+        Button {
+            guard let model else { return }
+            onClear(model)
+        } label: {
+            Text("Clear")
+                .font(fontPreset.captionFont.weight(.medium))
         }
-        .frame(maxWidth: .infinity)
-        .padding(.horizontal, -12)
-        .padding(.vertical, -6)
+        .buttonStyle(CustomButtonStyle(verticalPadding: 3, horizontalPadding: 8))
+        .disabled(split.rows.isEmpty || !canMutate || model == nil)
+        .hoverTooltip(canMutate ? "Clear selection" : "Unavailable")
+        .accessibilityHint(canMutate ? "Clear selection" : "Selection unavailable")
     }
 
     private func tabButton(
@@ -784,13 +777,13 @@ private struct AgentSelectedFilesPopover: View {
                 Text("\(count)")
                     .font(fontPreset.captionFont.weight(.medium))
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
-            .frame(maxWidth: .infinity, minHeight: 34)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 7)
+            .frame(maxWidth: .infinity, minHeight: 32)
             .foregroundColor(isActive ? Color.accentColor : Color.secondary)
             .overlay(alignment: .bottom) {
                 Rectangle()
-                    .fill(isActive ? Color.accentColor : Color.secondary.opacity(0.2))
+                    .fill(isActive ? Color.accentColor : Color.secondary.opacity(0.18))
                     .frame(height: isActive ? 2 : 1)
             }
             .contentShape(Rectangle())
@@ -810,10 +803,10 @@ private struct AgentSelectedFilesPopover: View {
         let rowCount = min(max(count, 1), 6)
         return VStack(alignment: .leading, spacing: 8) {
             ForEach(0 ..< rowCount, id: \.self) { _ in
-                HStack(spacing: 12) {
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.secondary.opacity(0.18))
-                        .frame(width: 4, height: 32)
+                HStack(spacing: 9) {
+                    Circle()
+                        .fill(Color.secondary.opacity(0.14))
+                        .frame(width: 14, height: 14)
                     VStack(alignment: .leading, spacing: 6) {
                         RoundedRectangle(cornerRadius: 4)
                             .fill(Color.secondary.opacity(0.16))
@@ -824,9 +817,9 @@ private struct AgentSelectedFilesPopover: View {
                     }
                     Spacer()
                 }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 10)
-                .background(Color(NSColor.controlBackgroundColor).opacity(0.28))
+                .padding(.vertical, 7)
+                .padding(.horizontal, 8)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.14))
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 .redacted(reason: .placeholder)
             }
@@ -953,6 +946,7 @@ private struct AgentSelectedFileRow: View {
 
     @State private var copyTask: Task<Void, Never>?
     @State private var isCopying = false
+    @State private var isHovered = false
     @ObservedObject private var fontScale = FontScaleManager.shared
 
     private var fontPreset: FontScalePreset {
@@ -967,105 +961,79 @@ private struct AgentSelectedFileRow: View {
         }
     }
 
+    private var leadingIconName: String {
+        switch row.kind {
+        case .codemap: "square.grid.2x2"
+        case .slices: "curlybraces"
+        case .full: "doc.text"
+        }
+    }
+
     private var disabledRemoveExplanation: String? {
         if !row.canRemove {
-            return "Expanded from a selected folder; remove the folder selection to remove this file"
+            return "Added via folder — remove the folder to drop this file"
         }
         if !canRemove {
-            return "Selection mutation is unavailable for this Agent context"
+            return "Unavailable"
         }
         return nil
     }
 
-    var body: some View {
-        HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 2)
-                .fill(accentColor.opacity(0.65))
-                .frame(width: 4, height: 32)
+    private var parentPathDisplay: String? {
+        let parent = (row.relativePath as NSString).deletingLastPathComponent
+        guard parent != ".", !parent.isEmpty else { return nil }
+        let components = parent.split(separator: "/").map(String.init)
+        guard components.count > 2 else { return parent }
+        return "…/" + components.suffix(2).joined(separator: "/")
+    }
 
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Image(systemName: row.kind.iconName)
-                        .foregroundColor(accentColor)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
-                    Text(row.displayName)
-                        .font(fontPreset.standardFont.weight(.semibold))
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    if let badge = row.kind.badgeText {
-                        Text(row.kind == .slices ? "\(badge) ×\(row.lineRanges?.count ?? 0)" : badge)
-                            .font(fontPreset.captionFont.bold())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(accentColor.opacity(0.15))
-                            .foregroundColor(accentColor)
-                            .cornerRadius(6)
-                    }
-                    Spacer(minLength: 0)
-                }
-                if let directory = row.directoryDisplay {
-                    Text(directory)
+    private var sliceCountText: String? {
+        guard row.kind == .slices, let count = row.lineRanges?.count, count > 0 else { return nil }
+        return "\(count)"
+    }
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            Image(systemName: leadingIconName)
+                .symbolRenderingMode(.monochrome)
+                .foregroundColor(accentColor)
+                .font(fontPreset.swiftUIFont(sizeAtNormal: 13, weight: .medium))
+                .imageScale(.medium)
+                .frame(width: 16, height: 16)
+
+            VStack(alignment: .leading, spacing: parentPathDisplay == nil ? 0 : 2) {
+                Text(row.displayName)
+                    .font(fontPreset.standardFont.weight(.medium))
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .layoutPriority(1)
+
+                if let parentPathDisplay {
+                    Text(parentPathDisplay)
                         .font(fontPreset.captionFont)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                 }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            .hoverTooltip(row.displayPath)
+            .accessibilityLabel(row.displayPath)
 
-            Spacer(minLength: 0)
-
-            HStack(spacing: 6) {
-                Button(action: openPreview) {
-                    Image(systemName: previewCoordinator.isLoadingPreview(for: row) ? "hourglass" : "magnifyingglass")
-                        .font(.system(size: 13, weight: .medium))
-                        .padding(6)
-                }
-                .buttonStyle(.plain)
-                .hoverTooltip("Preview file content")
-
-                Button(action: copyToClipboard) {
-                    Image(systemName: isCopying ? "hourglass" : "doc.on.clipboard")
-                        .font(.system(size: 13, weight: .medium))
-                        .padding(6)
-                }
-                .buttonStyle(.plain)
-                .disabled(isCopying)
-                .hoverTooltip(row.kind == .codemap ? "Copy Codemap" : "Copy File Content")
-
-                if let disabledRemoveExplanation {
-                    Image(systemName: "info.circle")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .padding(6)
-                        .hoverTooltip(disabledRemoveExplanation)
-                        .accessibilityLabel(disabledRemoveExplanation)
-                }
-
-                Button { onRemove(row) } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.secondary)
-                        .padding(6)
-                }
-                .buttonStyle(.plain)
-                .disabled(!canRemove)
-                .hoverTooltip(canRemove ? "Remove from Agent selection" : "Remove unavailable")
-            }
-            .padding(.horizontal, 4)
-            .padding(.vertical, 3)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.06)))
-            .frame(minWidth: 90, alignment: .trailing)
+            trailingControls
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 7)
+        .padding(.vertical, parentPathDisplay == nil ? 6 : 4)
         .background(
-            rowIndex % 2 == 0
-                ? Color(NSColor.controlBackgroundColor).opacity(0.24)
-                : Color(NSColor.controlBackgroundColor).opacity(0.14)
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(isHovered ? Color(NSColor.controlBackgroundColor).opacity(0.26) : Color(NSColor.controlBackgroundColor).opacity(0.10))
         )
-        .cornerRadius(8)
         .contentShape(Rectangle())
+        .onHover { hovering in
+            isHovered = hovering
+        }
         .popover(
             isPresented: Binding(
                 get: { previewCoordinator.isPreviewPresented(for: row) },
@@ -1081,6 +1049,68 @@ private struct AgentSelectedFileRow: View {
         .onDisappear {
             previewCoordinator.handleRowDisappear(row: row)
             copyTask?.cancel()
+        }
+    }
+
+    private var trailingControls: some View {
+        HStack(spacing: 3) {
+            sliceCountIndicator
+                .frame(width: 18, height: 26)
+
+            AgentFileRowActionButton(
+                systemName: "eye",
+                tooltip: "Preview",
+                rowIsHovered: isHovered,
+                isLoading: previewCoordinator.isLoadingPreview(for: row),
+                action: openPreview
+            )
+
+            AgentFileRowActionButton(
+                systemName: "doc.on.doc",
+                tooltip: "Copy contents",
+                rowIsHovered: isHovered,
+                isLoading: isCopying,
+                isDisabled: isCopying,
+                action: copyToClipboard
+            )
+
+            removeControl
+        }
+        .frame(width: 108, alignment: .trailing)
+    }
+
+    @ViewBuilder
+    private var sliceCountIndicator: some View {
+        if let sliceCountText {
+            Text(sliceCountText)
+                .font(fontPreset.captionFont.weight(.semibold).monospacedDigit())
+                .foregroundColor(accentColor)
+                .lineLimit(1)
+                .accessibilityLabel("\(sliceCountText) selected slice ranges")
+        } else {
+            Color.clear
+        }
+    }
+
+    @ViewBuilder
+    private var removeControl: some View {
+        if let disabledRemoveExplanation {
+            Image(systemName: "info.circle")
+                .font(.system(size: 13, weight: .regular))
+                .imageScale(.medium)
+                .foregroundColor(.secondary.opacity(isHovered ? 1 : 0.55))
+                .frame(width: 26, height: 26)
+                .hoverTooltip(disabledRemoveExplanation)
+                .accessibilityLabel(disabledRemoveExplanation)
+        } else {
+            AgentFileRowActionButton(
+                systemName: "minus.circle",
+                tooltip: "Remove",
+                rowIsHovered: isHovered,
+                hoverColor: .red,
+                isDisabled: !canRemove,
+                action: { onRemove(row) }
+            )
         }
     }
 
@@ -1100,6 +1130,49 @@ private struct AgentSelectedFileRow: View {
                 isCopying = false
                 copyTask = nil
             }
+        }
+    }
+}
+
+private struct AgentFileRowActionButton: View {
+    let systemName: String
+    let tooltip: String
+    let rowIsHovered: Bool
+    var hoverColor: Color = .primary
+    var isLoading = false
+    var isDisabled = false
+    let action: () -> Void
+
+    @State private var isButtonHovered = false
+
+    private var foregroundColor: Color {
+        guard !isDisabled else { return .secondary.opacity(0.35) }
+        if isButtonHovered { return hoverColor }
+        return .secondary.opacity(rowIsHovered ? 1 : 0.55)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                Image(systemName: systemName)
+                    .font(.system(size: 12, weight: .regular))
+                    .imageScale(.medium)
+                    .opacity(isLoading ? 0 : 1)
+                if isLoading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.60)
+                }
+            }
+            .foregroundColor(foregroundColor)
+            .frame(width: 26, height: 26)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+        .hoverTooltip(tooltip)
+        .onHover { hovering in
+            isButtonHovered = hovering
         }
     }
 }

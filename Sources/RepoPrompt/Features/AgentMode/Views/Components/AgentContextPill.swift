@@ -122,11 +122,13 @@ struct AgentContextPill: View {
     private var contextPopoverContent: some View {
         // Width grows with the font scale so the export card never feels
         // pinched at Large/Extra Large.
-        let popoverWidth = fontPreset.scaledClamped(360, max: 480)
+        let popoverWidth = fontPreset.scaledClamped(420, max: 520)
         let summary = selectionSummary
         let fileCount = summary.totalExplicitFileCount
+        let visibleManagerRows = min(max(fileCount, 3), 7)
+        let managerIdealHeight = min(360, Double(visibleManagerRows) * 40 + 54)
 
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 AgentContextIndicator(
                     contextWindowTokens: contextWindowTokens,
@@ -148,8 +150,8 @@ struct AgentContextPill: View {
                 summary: summary
             )
             .frame(
-                minHeight: 180,
-                idealHeight: min(360, Double(max(fileCount, 1)) * 40 + 120),
+                minHeight: 124,
+                idealHeight: managerIdealHeight,
                 maxHeight: 360
             )
 
