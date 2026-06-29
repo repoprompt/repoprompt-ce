@@ -108,15 +108,20 @@ final class MCPSelectionToolProvider: MCPWindowToolProviding {
     }
 
     private func executeManageSelection(args: [String: Value]) async throws -> ToolResultDTOs.SelectionReply {
-        do {
-            return try await executeManageSelectionAttempt(args: args)
-        } catch is ArtifactCommitConflict {
+        try await WorkspaceToolSentryTelemetry.span(
+            operation: .selectionUpdate,
+            toolName: .manageSelection
+        ) {
             do {
                 return try await executeManageSelectionAttempt(args: args)
-            } catch let retryConflict as ArtifactCommitConflict {
-                throw MCPError.internalError(
-                    "Canonical selection changed concurrently (\(retryConflict.reason)). Retry manage_selection."
-                )
+            } catch is ArtifactCommitConflict {
+                do {
+                    return try await executeManageSelectionAttempt(args: args)
+                } catch let retryConflict as ArtifactCommitConflict {
+                    throw MCPError.internalError(
+                        "Canonical selection changed concurrently (\(retryConflict.reason)). Retry manage_selection."
+                    )
+                }
             }
         }
     }

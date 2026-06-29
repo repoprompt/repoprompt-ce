@@ -73,38 +73,47 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
                 required: []
             )
         ) { [self] _, args in
-            let op = (args["op"]?.stringValue ?? "snapshot").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if op != "snapshot" {
-                var forwarded = args
-                forwarded["op"] = .string(op)
-                switch op {
-                case "export", "list_presets", "select_preset":
-                    return try await executePrompt(args: forwarded)
-                default:
-                    throw MCPError.invalidParams("Unsupported workspace_context op '\(op)'. Use snapshot, export, list_presets, or select_preset.")
-                }
+            try await WorkspaceToolSentryTelemetry.span(
+                operation: .promptRender,
+                toolName: .workspaceContext
+            ) {
+                try await executeWorkspaceContext(args: args)
             }
-            let includeArr = args["include"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? ["prompt", "selection", "code", "tokens"]
-            let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
-            let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
-            let metadata = await dependencies.captureRequestMetadata()
-            guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
-                throw CancellationError()
-            }
-            let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
-            if includeArr.contains("files") {
-                _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
-            }
-            let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
-            let dto = try await dependencies.buildTabWorkspaceContext(
-                resolvedTabContext.snapshot,
-                Set(includeArr),
-                display,
-                overridePreset,
-                resolvedTabContext.usesActiveTabCompatibility
-            )
-            return try Value(dto)
         }
+    }
+
+    private func executeWorkspaceContext(args: [String: Value]) async throws -> Value {
+        let op = (args["op"]?.stringValue ?? "snapshot").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if op != "snapshot" {
+            var forwarded = args
+            forwarded["op"] = .string(op)
+            switch op {
+            case "export", "list_presets", "select_preset":
+                return try await executePrompt(args: forwarded)
+            default:
+                throw MCPError.invalidParams("Unsupported workspace_context op '\(op)'. Use snapshot, export, list_presets, or select_preset.")
+            }
+        }
+        let includeArr = args["include"]?.arrayValue?.compactMap { $0.stringValue?.lowercased() } ?? ["prompt", "selection", "code", "tokens"]
+        let display: FilePathDisplay = ((args["path_display"]?.stringValue ?? "relative").lowercased() == "full") ? .full : .relative
+        let overridePreset = try await resolveCopyPresetOverride(args["copy_preset"])
+        let metadata = await dependencies.captureRequestMetadata()
+        guard await dependencies.drainReadFileAutoSelection(metadata, .mirroredSelectionAndMetrics) == .completed else {
+            throw CancellationError()
+        }
+        let lookupContext = await dependencies.resolveFileToolLookupContext(metadata)
+        if includeArr.contains("files") {
+            _ = await dependencies.promptVM.workspaceFileContextStore.awaitAppliedIngress(rootScope: lookupContext.rootScope)
+        }
+        let resolvedTabContext = try await dependencies.resolveTabContextSnapshot(metadata, MCPWindowToolName.workspaceContext, .allowLegacyImplicitRouting)
+        let dto = try await dependencies.buildTabWorkspaceContext(
+            resolvedTabContext.snapshot,
+            Set(includeArr),
+            display,
+            overridePreset,
+            resolvedTabContext.usesActiveTabCompatibility
+        )
+        return try Value(dto)
     }
 
     private func promptTool() -> Tool {
@@ -152,6 +161,15 @@ final class MCPPromptContextToolProvider: MCPWindowToolProviding {
     }
 
     private func executePrompt(args: [String: Value]) async throws -> Value {
+        try await WorkspaceToolSentryTelemetry.span(
+            operation: .promptRender,
+            toolName: .prompt
+        ) {
+            try await executePromptBody(args: args)
+        }
+    }
+
+    private func executePromptBody(args: [String: Value]) async throws -> Value {
         let op = (args["op"]?.stringValue ?? "get").lowercased()
         if op == "list_presets" {
             return try Value(ToolResultDTOs.PromptToolEnvelope.forPresetsList(dependencies.buildCopyPresetsListDTO()))
