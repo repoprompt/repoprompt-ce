@@ -7,34 +7,10 @@ struct AgentExportCard: View {
     let selectionCoordinator: WorkspaceSelectionCoordinator?
     let fileCount: Int?
     let selectionTokens: Int?
+    let showsFilesButton: Bool
     let currentTabID: UUID?
     let activeAgentSessionID: UUID?
     let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
-
-    @State private var showSelectedFilesPopover = false
-    @State private var exportModel: AgentContextExportModel?
-    @State private var exportModelRefreshID: UUID?
-    @State private var exportModelRefreshTask: Task<Void, Never>?
-    @State private var isLoadingExportModel = false
-
-    private var currentExportModel: AgentContextExportModel? {
-        guard let exportModel, modelMatchesCurrentContext(exportModel) else { return nil }
-        return exportModel
-    }
-
-    private var currentExportContextIdentity: AgentContextExportIdentity {
-        makeExportSource(flushPendingUI: false).exportContextIdentity
-    }
-
-    private var selectionSummary: AgentContextSelectionSummary {
-        AgentContextExportResolver.selectionSummary(
-            for: makeExportSource(flushPendingUI: false).selection
-        )
-    }
-
-    private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
-        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
-    }
 
     private var displayTokens: Int? {
         if let selectionTokens, selectionTokens > 0 {
@@ -66,7 +42,9 @@ struct AgentExportCard: View {
 
                 Spacer()
 
-                filesButton
+                if showsFilesButton {
+                    filesButton
+                }
 
                 Button {
                     let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
@@ -94,30 +72,27 @@ struct AgentExportCard: View {
 
             instructionsEditor
         }
-        .onReceive(selectionChangesPublisher) { change in
-            handleSelectionChange(change)
-        }
     }
 
     // MARK: - Files Button
 
     private var filesButton: some View {
-        let summary = selectionSummary
-        let selectionCount = summary.totalExplicitFileCount
-
-        return Button {
-            showSelectedFilesPopover.toggle()
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "doc.on.doc")
+        AgentSelectedFilesPopoverTrigger(
+            promptManager: promptManager,
+            selectionCoordinator: selectionCoordinator,
+            currentTabID: currentTabID,
+            activeAgentSessionID: activeAgentSessionID,
+            worktreeBindingsProvider: worktreeBindingsProvider,
+            summaryOverride: nil
+        ) { _ in
+            HStack(spacing: 5) {
+                Image(systemName: "list.bullet")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                Text(summary.compactText)
-                    .font(.system(size: 10, weight: .medium))
-                    .multilineTextAlignment(.trailing)
-                    .lineLimit(1)
+                Text("Files")
+                    .font(.system(size: 11, weight: .medium))
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 10)
             .padding(.vertical, 5)
             .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
             .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -126,34 +101,6 @@ struct AgentExportCard: View {
                     .stroke(Color.secondary.opacity(0.15), lineWidth: 0.5)
             )
         }
-        .buttonStyle(.plain)
-        .hoverTooltip("Selected: \(summary.headlineText)")
-        .accessibilityLabel("Selected files: \(summary.headlineText)")
-        .popover(isPresented: $showSelectedFilesPopover) {
-            AgentSelectedFilesPopover(
-                model: currentExportModel,
-                isLoading: isLoadingExportModel,
-                canMutate: selectionCoordinator != nil,
-                onRefresh: { refreshExportModel() },
-                onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
-                onRemove: { row, model in remove(row, from: model) },
-                onClear: { model in clearSelection(for: model) }
-            )
-            .frame(width: 380)
-            .frame(
-                minHeight: 200,
-                idealHeight: min(500, Double(max(currentExportModel?.fileCount ?? selectionCount, 1)) * 40 + 120),
-                maxHeight: 500
-            )
-        }
-        .onChange(of: showSelectedFilesPopover) { _, isPresented in
-            if !isPresented {
-                cancelExportModelRefresh()
-            }
-        }
-        .onChange(of: currentTabID) { _, _ in resetExportModelForContextChange() }
-        .onChange(of: activeAgentSessionID) { _, _ in resetExportModelForContextChange() }
-        .onChange(of: currentExportContextIdentity) { _, _ in resetOrRefreshExportModelForContextChange() }
     }
 
     private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
@@ -173,74 +120,6 @@ struct AgentExportCard: View {
                     worktreeBindingsProvider?(sessionID, tabID) ?? []
                 }
             )
-        )
-    }
-
-    private func refreshExportModel() {
-        exportModelRefreshTask?.cancel()
-        let source = makeExportSource()
-        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
-        let refreshID = UUID()
-        exportModelRefreshID = refreshID
-        isLoadingExportModel = true
-        exportModelRefreshTask = Task {
-            let model = await AgentContextExportResolver.resolveModel(
-                source: source,
-                store: promptManager.workspaceFileContextStore,
-                filePathDisplay: promptManager.filePathDisplayOption,
-                codeMapUsage: cfg.codeMapUsage
-            )
-            guard !Task.isCancelled else { return }
-            await MainActor.run {
-                guard exportModelRefreshID == refreshID else { return }
-                exportModel = model
-                isLoadingExportModel = false
-                exportModelRefreshID = nil
-                exportModelRefreshTask = nil
-            }
-        }
-    }
-
-    private func cancelExportModelRefresh() {
-        exportModelRefreshTask?.cancel()
-        exportModelRefreshTask = nil
-        exportModelRefreshID = nil
-        isLoadingExportModel = false
-    }
-
-    private func resetExportModelForContextChange() {
-        cancelExportModelRefresh()
-        exportModel = nil
-    }
-
-    private func resetOrRefreshExportModelForContextChange() {
-        resetExportModelForContextChange()
-        if showSelectedFilesPopover {
-            refreshExportModel()
-        }
-    }
-
-    private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change) {
-        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
-        guard change.tabID == tabID else { return }
-        resetExportModelForContextChange()
-        if showSelectedFilesPopover {
-            refreshExportModel()
-        }
-    }
-
-    private func modelMatchesCurrentContext(_ model: AgentContextExportModel) -> Bool {
-        model.source.exportContextIdentity == currentExportContextIdentity
-    }
-
-    private func loadRowContent(
-        _ row: AgentContextExportRow,
-        purpose: AgentContextExportRow.ContentPurpose
-    ) async -> String? {
-        await AgentContextExportResolver.loadRowContent(
-            for: row,
-            store: promptManager.workspaceFileContextStore,
-            purpose: purpose
         )
     }
 
@@ -279,6 +158,218 @@ struct AgentExportCard: View {
             )
         }
         return await AgentContextExportResolver.buildClipboardContent(request)
+    }
+
+    // MARK: - Instructions Editor
+
+    private static let placeholderText = """
+    Tell the receiving model what to do with this context — e.g. "Plan a fix for the login crash" or "Help me debug the auth flow".
+
+    Tip: Ask the agent to write this prompt for you.
+    """
+
+    private var instructionsEditor: some View {
+        ZStack(alignment: .topLeading) {
+            TextEditor(text: $promptManager.promptText)
+                .font(.system(size: 11))
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 150, maxHeight: 150)
+
+            if promptManager.promptText.isEmpty {
+                Text(Self.placeholderText)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 6)
+                    .padding(.leading, 5)
+                    .allowsHitTesting(false)
+            }
+        }
+        .padding(6)
+        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+        )
+    }
+}
+
+struct AgentSelectedFilesPopoverTrigger<Label: View>: View {
+    @ObservedObject var promptManager: PromptViewModel
+    let selectionCoordinator: WorkspaceSelectionCoordinator?
+    let currentTabID: UUID?
+    let activeAgentSessionID: UUID?
+    let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
+    let summaryOverride: AgentContextSelectionSummary?
+    @ViewBuilder let label: (AgentContextSelectionSummary) -> Label
+
+    @State private var showSelectedFilesPopover = false
+    @State private var exportModel: AgentContextExportModel?
+    @State private var exportModelRefreshID: UUID?
+    @State private var exportModelLoadingIdentity: AgentContextExportIdentity?
+    @State private var exportModelRefreshTask: Task<Void, Never>?
+    @State private var isLoadingExportModel = false
+
+    private var currentExportModel: AgentContextExportModel? {
+        guard let exportModel, modelMatchesCurrentContext(exportModel) else { return nil }
+        return exportModel
+    }
+
+    private var currentExportContextIdentity: AgentContextExportIdentity {
+        makeExportSource(flushPendingUI: false).exportContextIdentity
+    }
+
+    private var selectionSummary: AgentContextSelectionSummary {
+        if let summaryOverride {
+            return summaryOverride
+        }
+        return AgentContextExportResolver.selectionSummary(
+            for: makeExportSource(flushPendingUI: false).selection
+        )
+    }
+
+    private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
+        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    var body: some View {
+        let summary = selectionSummary
+        let selectionCount = summary.totalExplicitFileCount
+
+        Button {
+            showSelectedFilesPopover.toggle()
+        } label: {
+            label(summary)
+        }
+        .buttonStyle(.plain)
+        .hoverTooltip("View selected files: \(summary.headlineText)")
+        .accessibilityLabel("View selected files: \(summary.compactText)")
+        .accessibilityHint("Opens details for selected files and codemaps")
+        .popover(isPresented: $showSelectedFilesPopover) {
+            AgentSelectedFilesPopover(
+                model: currentExportModel,
+                isLoading: isLoadingExportModel,
+                placeholderFileCount: selectionCount,
+                autoRefreshOnAppear: true,
+                canMutate: selectionCoordinator != nil,
+                onRefresh: { refreshExportModel() },
+                onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
+                onRemove: { row, model in remove(row, from: model) },
+                onClear: { model in clearSelection(for: model) }
+            )
+            .frame(width: 380)
+            .frame(
+                minHeight: 200,
+                idealHeight: min(500, Double(max(currentExportModel?.fileCount ?? selectionCount, 1)) * 40 + 120),
+                maxHeight: 500
+            )
+        }
+        .onChange(of: showSelectedFilesPopover) { _, isPresented in
+            if !isPresented {
+                cancelExportModelRefresh()
+            }
+        }
+        .onChange(of: currentTabID) { _, _ in resetExportModelForContextChange() }
+        .onChange(of: activeAgentSessionID) { _, _ in resetExportModelForContextChange() }
+        .onChange(of: currentExportContextIdentity) { _, _ in resetOrRefreshExportModelForContextChange() }
+        .onReceive(selectionChangesPublisher) { change in
+            handleSelectionChange(change)
+        }
+    }
+
+    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
+        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
+        let selectionSnapshot = requestedTabID.flatMap {
+            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
+        }
+        return AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: promptManager.activeComposeTabID,
+                activePromptText: promptManager.promptText,
+                selectionSnapshot: selectionSnapshot,
+                composeTabs: promptManager.currentComposeTabs,
+                explicitActiveAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: { sessionID, tabID in
+                    worktreeBindingsProvider?(sessionID, tabID) ?? []
+                }
+            )
+        )
+    }
+
+    private func refreshExportModel() {
+        let source = makeExportSource()
+        let identity = source.exportContextIdentity
+        if isLoadingExportModel, exportModelLoadingIdentity == identity { return }
+        if exportModel?.source.exportContextIdentity == identity { return }
+
+        exportModelRefreshTask?.cancel()
+        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
+        let refreshID = UUID()
+        exportModelRefreshID = refreshID
+        exportModelLoadingIdentity = identity
+        isLoadingExportModel = true
+        exportModelRefreshTask = Task {
+            let model = await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: promptManager.workspaceFileContextStore,
+                filePathDisplay: promptManager.filePathDisplayOption,
+                codeMapUsage: cfg.codeMapUsage
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard exportModelRefreshID == refreshID, exportModelLoadingIdentity == identity else { return }
+                exportModel = model
+                isLoadingExportModel = false
+                exportModelRefreshID = nil
+                exportModelLoadingIdentity = nil
+                exportModelRefreshTask = nil
+            }
+        }
+    }
+
+    private func cancelExportModelRefresh() {
+        exportModelRefreshTask?.cancel()
+        exportModelRefreshTask = nil
+        exportModelRefreshID = nil
+        exportModelLoadingIdentity = nil
+        isLoadingExportModel = false
+    }
+
+    private func resetExportModelForContextChange() {
+        cancelExportModelRefresh()
+        exportModel = nil
+    }
+
+    private func resetOrRefreshExportModelForContextChange() {
+        resetExportModelForContextChange()
+        if showSelectedFilesPopover {
+            refreshExportModel()
+        }
+    }
+
+    private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change) {
+        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
+        guard change.tabID == tabID else { return }
+        resetExportModelForContextChange()
+        if showSelectedFilesPopover {
+            refreshExportModel()
+        }
+    }
+
+    private func modelMatchesCurrentContext(_ model: AgentContextExportModel) -> Bool {
+        model.source.exportContextIdentity == currentExportContextIdentity
+    }
+
+    private func loadRowContent(
+        _ row: AgentContextExportRow,
+        purpose: AgentContextExportRow.ContentPurpose
+    ) async -> String? {
+        await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: promptManager.workspaceFileContextStore,
+            purpose: purpose
+        )
     }
 
     private func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {
@@ -326,44 +417,199 @@ struct AgentExportCard: View {
             )
         }
     }
+}
 
-    // MARK: - Instructions Editor
+struct AgentSelectedFilesInlineManager: View {
+    @ObservedObject var promptManager: PromptViewModel
+    let selectionCoordinator: WorkspaceSelectionCoordinator?
+    let currentTabID: UUID?
+    let activeAgentSessionID: UUID?
+    let worktreeBindingsProvider: (@MainActor (UUID, UUID?) -> [AgentSessionWorktreeBinding])?
+    let summary: AgentContextSelectionSummary
 
-    private static let placeholderText = """
-    Tell the receiving model what to do with this context — e.g. "Plan a fix for the login crash" or "Help me debug the auth flow".
+    @State private var exportModel: AgentContextExportModel?
+    @State private var exportModelRefreshID: UUID?
+    @State private var exportModelLoadingIdentity: AgentContextExportIdentity?
+    @State private var exportModelRefreshTask: Task<Void, Never>?
+    @State private var isLoadingExportModel = false
 
-    Tip: Ask the agent to write this prompt for you.
-    """
+    private var currentExportModel: AgentContextExportModel? {
+        guard let exportModel, modelMatchesCurrentContext(exportModel) else { return nil }
+        return exportModel
+    }
 
-    private var instructionsEditor: some View {
-        ZStack(alignment: .topLeading) {
-            TextEditor(text: $promptManager.promptText)
-                .font(.system(size: 11))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 150, maxHeight: 150)
+    private var currentExportContextIdentity: AgentContextExportIdentity {
+        makeExportSource(flushPendingUI: false).exportContextIdentity
+    }
 
-            if promptManager.promptText.isEmpty {
-                Text(Self.placeholderText)
-                    .font(.system(size: 10))
-                    .foregroundStyle(.tertiary)
-                    .padding(.top, 6)
-                    .padding(.leading, 5)
-                    .allowsHitTesting(false)
+    private var selectionChangesPublisher: AnyPublisher<WorkspaceSelectionCoordinator.Change, Never> {
+        selectionCoordinator?.changes ?? Empty<WorkspaceSelectionCoordinator.Change, Never>(completeImmediately: false).eraseToAnyPublisher()
+    }
+
+    var body: some View {
+        AgentSelectedFilesPopover(
+            model: currentExportModel,
+            isLoading: isLoadingExportModel,
+            placeholderFileCount: summary.totalExplicitFileCount,
+            autoRefreshOnAppear: false,
+            canMutate: selectionCoordinator != nil,
+            onRefresh: { refreshExportModel() },
+            onLoadContent: { row, purpose in await loadRowContent(row, purpose: purpose) },
+            onRemove: { row, model in remove(row, from: model) },
+            onClear: { model in clearSelection(for: model) }
+        )
+        .onAppear {
+            refreshExportModel()
+        }
+        .onDisappear {
+            cancelExportModelRefresh()
+        }
+        .onChange(of: currentTabID) { _, _ in resetAndRefreshExportModelForContextChange() }
+        .onChange(of: activeAgentSessionID) { _, _ in resetAndRefreshExportModelForContextChange() }
+        .onChange(of: currentExportContextIdentity) { _, _ in resetAndRefreshExportModelForContextChange() }
+        .onReceive(selectionChangesPublisher) { change in
+            handleSelectionChange(change)
+        }
+    }
+
+    private func makeExportSource(flushPendingUI: Bool = true) -> AgentContextExportSource {
+        let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
+        let selectionSnapshot = requestedTabID.flatMap {
+            selectionCoordinator?.selectionSnapshot(for: $0, flushPendingUIIfActive: flushPendingUI)
+        }
+        return AgentContextExportSourceBuilder.makeSource(
+            AgentContextExportSourceBuildRequest(
+                requestedTabID: requestedTabID,
+                activeComposeTabID: promptManager.activeComposeTabID,
+                activePromptText: promptManager.promptText,
+                selectionSnapshot: selectionSnapshot,
+                composeTabs: promptManager.currentComposeTabs,
+                explicitActiveAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: { sessionID, tabID in
+                    worktreeBindingsProvider?(sessionID, tabID) ?? []
+                }
+            )
+        )
+    }
+
+    private func refreshExportModel() {
+        let source = makeExportSource()
+        let identity = source.exportContextIdentity
+        if isLoadingExportModel, exportModelLoadingIdentity == identity { return }
+        if exportModel?.source.exportContextIdentity == identity { return }
+
+        exportModelRefreshTask?.cancel()
+        let cfg = promptManager.resolvePromptContext(BuiltInCopyPresets.standard, custom: nil)
+        let refreshID = UUID()
+        exportModelRefreshID = refreshID
+        exportModelLoadingIdentity = identity
+        isLoadingExportModel = true
+        exportModelRefreshTask = Task {
+            let model = await AgentContextExportResolver.resolveModel(
+                source: source,
+                store: promptManager.workspaceFileContextStore,
+                filePathDisplay: promptManager.filePathDisplayOption,
+                codeMapUsage: cfg.codeMapUsage
+            )
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard exportModelRefreshID == refreshID, exportModelLoadingIdentity == identity else { return }
+                exportModel = model
+                isLoadingExportModel = false
+                exportModelRefreshID = nil
+                exportModelLoadingIdentity = nil
+                exportModelRefreshTask = nil
             }
         }
-        .padding(6)
-        .background(Color(NSColor.textBackgroundColor).opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .stroke(Color.secondary.opacity(0.2), lineWidth: 0.5)
+    }
+
+    private func cancelExportModelRefresh() {
+        exportModelRefreshTask?.cancel()
+        exportModelRefreshTask = nil
+        exportModelRefreshID = nil
+        exportModelLoadingIdentity = nil
+        isLoadingExportModel = false
+    }
+
+    private func resetAndRefreshExportModelForContextChange() {
+        cancelExportModelRefresh()
+        exportModel = nil
+        refreshExportModel()
+    }
+
+    private func handleSelectionChange(_ change: WorkspaceSelectionCoordinator.Change) {
+        let tabID = currentTabID ?? selectionCoordinator?.activeTabID() ?? promptManager.activeComposeTabID
+        guard change.tabID == tabID else { return }
+        resetAndRefreshExportModelForContextChange()
+    }
+
+    private func modelMatchesCurrentContext(_ model: AgentContextExportModel) -> Bool {
+        model.source.exportContextIdentity == currentExportContextIdentity
+    }
+
+    private func loadRowContent(
+        _ row: AgentContextExportRow,
+        purpose: AgentContextExportRow.ContentPurpose
+    ) async -> String? {
+        await AgentContextExportResolver.loadRowContent(
+            for: row,
+            store: promptManager.workspaceFileContextStore,
+            purpose: purpose
         )
+    }
+
+    private func remove(_ row: AgentContextExportRow, from model: AgentContextExportModel) {
+        guard row.canRemove else { return }
+        Task {
+            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
+            let updated = AgentContextExportResolver.removeRow(
+                row,
+                from: latestSelection,
+                lookupContext: model.lookupContext
+            )
+            await persistSelection(updated, source: model.source)
+            await MainActor.run { refreshExportModel() }
+        }
+    }
+
+    private func clearSelection(for model: AgentContextExportModel) {
+        Task {
+            let latestSelection = await MainActor.run { self.latestSelection(for: model.source) }
+            let updated = AgentContextExportResolver.removeSelectionSnapshot(model.source.selection, from: latestSelection)
+            await persistSelection(updated, source: model.source)
+            await MainActor.run { refreshExportModel() }
+        }
+    }
+
+    @MainActor
+    private func latestSelection(for source: AgentContextExportSource) -> StoredSelection {
+        guard let tabID = source.tabID else { return source.selection }
+        if let snapshot = selectionCoordinator?.selectionSnapshot(for: tabID, flushPendingUIIfActive: true) {
+            return snapshot.selection
+        }
+        return promptManager.currentComposeTabs.first { $0.id == tabID }?.selection ?? source.selection
+    }
+
+    @MainActor
+    private func persistSelection(_ selection: StoredSelection, source: AgentContextExportSource) async {
+        guard let selectionCoordinator else { return }
+        if let tabID = source.tabID,
+           let workspaceID = selectionCoordinator.activeSelectionIdentity()?.workspaceID
+        {
+            _ = await selectionCoordinator.persistSelection(
+                selection,
+                for: WorkspaceSelectionIdentity(workspaceID: workspaceID, tabID: tabID),
+                source: .runtimeMutation
+            )
+        }
     }
 }
 
 private struct AgentSelectedFilesPopover: View {
     let model: AgentContextExportModel?
     let isLoading: Bool
+    let placeholderFileCount: Int
+    let autoRefreshOnAppear: Bool
     let canMutate: Bool
     let onRefresh: () -> Void
     let onLoadContent: (AgentContextExportRow, AgentContextExportRow.ContentPurpose) async -> String?
@@ -426,8 +672,7 @@ private struct AgentSelectedFilesPopover: View {
             tabSwitcher(split: split)
 
             if isLoading, model == nil {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                loadingSkeletonRows(count: placeholderFileCount)
             } else if split.rows.isEmpty {
                 emptyState(title: "No files selected")
             } else {
@@ -459,7 +704,9 @@ private struct AgentSelectedFilesPopover: View {
         }
         .padding(8)
         .onAppear {
-            onRefresh()
+            if autoRefreshOnAppear {
+                onRefresh()
+            }
             adjustActiveTab(fileCount: split.fileRows.count, codemapCount: split.codemapRows.count)
         }
         .onChange(of: split.fileRows.count) { _, _ in
@@ -484,7 +731,7 @@ private struct AgentSelectedFilesPopover: View {
             Circle()
                 .fill(Color.secondary.opacity(0.3))
                 .frame(width: 4, height: 4)
-            Text("\(split.fileRows.count)")
+            Text("\(displayFileCount(split: split))")
                 .font(fontPreset.captionFont.weight(.medium))
                 .foregroundColor(.secondary)
             Spacer()
@@ -508,7 +755,7 @@ private struct AgentSelectedFilesPopover: View {
 
     private func tabSwitcher(split: RowSplit) -> some View {
         HStack(spacing: 0) {
-            tabButton(icon: "doc.text", label: "Files", count: split.fileRows.count, tab: .files) {
+            tabButton(icon: "doc.text", label: "Files", count: displayFileCount(split: split), tab: .files) {
                 activeTab = .files
             }
             tabButton(icon: "square.grid.2x2", label: "Codemaps", count: split.codemapRows.count, tab: .codemaps) {
@@ -550,6 +797,42 @@ private struct AgentSelectedFilesPopover: View {
         }
         .buttonStyle(.plain)
         .disabled(isActive)
+    }
+
+    private func displayFileCount(split: RowSplit) -> Int {
+        if model == nil, placeholderFileCount > 0 {
+            return placeholderFileCount
+        }
+        return split.fileRows.count
+    }
+
+    private func loadingSkeletonRows(count: Int) -> some View {
+        let rowCount = min(max(count, 1), 6)
+        return VStack(alignment: .leading, spacing: 8) {
+            ForEach(0 ..< rowCount, id: \.self) { _ in
+                HStack(spacing: 12) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.secondary.opacity(0.18))
+                        .frame(width: 4, height: 32)
+                    VStack(alignment: .leading, spacing: 6) {
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.secondary.opacity(0.16))
+                            .frame(width: 170, height: 10)
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(Color.secondary.opacity(0.10))
+                            .frame(width: 110, height: 8)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.28))
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .redacted(reason: .placeholder)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .accessibilityLabel("Loading selected files")
     }
 
     private func emptyState(title: String) -> some View {

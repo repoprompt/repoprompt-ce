@@ -124,7 +124,6 @@ struct AgentContextPill: View {
         // pinched at Large/Extra Large.
         let popoverWidth = fontPreset.scaledClamped(360, max: 480)
         let summary = selectionSummary
-        let detailedFileSummaryText = summary.headlineText
         let fileCount = summary.totalExplicitFileCount
 
         VStack(alignment: .leading, spacing: 10) {
@@ -138,14 +137,21 @@ struct AgentContextPill: View {
                     style: .labeled
                 )
                 Spacer()
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text("Selected")
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
-                        .foregroundStyle(.tertiary)
-                    Text(detailedFileSummaryText)
-                        .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
-                }
             }
+
+            AgentSelectedFilesInlineManager(
+                promptManager: promptManager,
+                selectionCoordinator: selectionCoordinator,
+                currentTabID: currentTabID,
+                activeAgentSessionID: activeAgentSessionID,
+                worktreeBindingsProvider: worktreeBindingsProvider,
+                summary: summary
+            )
+            .frame(
+                minHeight: 180,
+                idealHeight: min(360, Double(max(fileCount, 1)) * 40 + 120),
+                maxHeight: 360
+            )
 
             Divider()
 
@@ -155,6 +161,7 @@ struct AgentContextPill: View {
                 selectionCoordinator: selectionCoordinator,
                 fileCount: fileCount,
                 selectionTokens: selectionTokens,
+                showsFilesButton: false,
                 currentTabID: currentTabID,
                 activeAgentSessionID: activeAgentSessionID,
                 worktreeBindingsProvider: worktreeBindingsProvider
