@@ -56,7 +56,11 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
-    private var fileSummaryText: String {
+    private var compactFileSummaryText: String {
+        selectionSummary.compactText
+    }
+
+    private var detailedFileSummaryText: String {
         selectionSummary.headlineText
     }
 
@@ -75,7 +79,7 @@ struct AgentContextPill: View {
             lines.append("Context usage unavailable")
         }
 
-        lines.append("Selected: \(fileSummaryText)")
+        lines.append("Selected: \(detailedFileSummaryText)")
         if let selectionTokens {
             lines.append("Selection: \(AgentContextIndicator.formatTokens(selectionTokens)) tokens")
         }
@@ -92,7 +96,7 @@ struct AgentContextPill: View {
             showPopover.toggle()
         } label: {
             HStack(spacing: 6) {
-                Text(fileSummaryText)
+                Text(compactFileSummaryText)
                     .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .medium))
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -115,6 +119,8 @@ struct AgentContextPill: View {
         }
         .buttonStyle(.plain)
         .hoverTooltip(contextUsageTooltip, .top)
+        .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
+        .accessibilityHint("Opens context export controls and usage details")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
             contextPopoverContent
         }
@@ -140,7 +146,7 @@ struct AgentContextPill: View {
                     Text("Selected")
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 10))
                         .foregroundStyle(.tertiary)
-                    Text(fileSummaryText)
+                    Text(detailedFileSummaryText)
                         .font(fontPreset.swiftUIFont(sizeAtNormal: 12, weight: .semibold))
                 }
             }

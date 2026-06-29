@@ -112,10 +112,10 @@ struct AgentExportCard: View {
                 Image(systemName: "doc.on.doc")
                     .font(.system(size: 10, weight: .medium))
                     .foregroundStyle(.secondary)
-                Text(summary.headlineText)
+                Text(summary.compactText)
                     .font(.system(size: 10, weight: .medium))
                     .multilineTextAlignment(.trailing)
-                    .lineLimit(2)
+                    .lineLimit(1)
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 5)
@@ -127,6 +127,8 @@ struct AgentExportCard: View {
             )
         }
         .buttonStyle(.plain)
+        .hoverTooltip("Selected: \(summary.headlineText)")
+        .accessibilityLabel("Selected files: \(summary.headlineText)")
         .popover(isPresented: $showSelectedFilesPopover) {
             AgentSelectedFilesPopover(
                 model: currentExportModel,
