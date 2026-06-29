@@ -72,6 +72,10 @@ jobs:
           SOURCE_GITHUB_REPOSITORY: ${{ github.repository }}
           REPOPROMPT_CONTROL_PLANE_SCRIPTS_DIR: ${{ github.workspace }}/trusted-control-plane/Scripts
           REPOPROMPT_RELEASE_SOURCE_ROOT: ${{ github.workspace }}/release-source
+          # Link the Sentry SDK into the official release binary. Release-candidate and local
+          # builds never set this, so they neither download nor compile the SDK. Telemetry stays
+          # inert here regardless — the DSN is only injected later, in the signing step.
+          REPOPROMPT_ENABLE_SENTRY: "1"
         run: ./trusted-control-plane/Scripts/release.sh stage-publish
 
       - name: Upload staged release source
@@ -181,6 +185,15 @@ jobs:
           echo "REPOPROMPT_PROVISIONING_PROFILE=$SECRETS_DIR/repoprompt-ce.provisionprofile" >> "$GITHUB_ENV"
           echo "NOTARYTOOL_PRIVATE_KEY=$SECRETS_DIR/notarytool-private-key.p8" >> "$GITHUB_ENV"
 
+      - name: Install Sentry CLI when symbol upload is configured
+        env:
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${SENTRY_AUTH_TOKEN:-}" ]] && ! command -v sentry-cli >/dev/null 2>&1; then
+            brew install getsentry/tools/sentry-cli
+          fi
+
       - name: Sign, notarize, and create draft release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -195,6 +208,14 @@ jobs:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           NOTARYTOOL_KEY_ID: ${{ secrets.NOTARYTOOL_KEY_ID }}
           NOTARYTOOL_ISSUER_ID: ${{ secrets.NOTARYTOOL_ISSUER_ID }}
+          # Protected `release` environment secret, baked into the signed bundle's Info.plist by
+          # sign_staged_release.sh. Optional: if unset, telemetry simply stays off (fail-safe).
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          # Optional protected release secret for native symbolication. The upload helper reads the
+          # token from the environment but never prints it.
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          REPOPROMPT_SENTRY_ORG: ${{ vars.SENTRY_ORG }}
+          REPOPROMPT_SENTRY_PROJECT: ${{ vars.SENTRY_PROJECT }}
         run: ./trusted-control-plane/Scripts/release.sh publish-staged
 
       - name: Remove ephemeral keychain
