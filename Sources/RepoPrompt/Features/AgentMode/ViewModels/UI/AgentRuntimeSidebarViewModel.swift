@@ -27,6 +27,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         var contextWindowTokens: Int?
         var usageSource: UsageSource = .unavailable
         var selectionFileCount: Int?
+        var selectionSummary: AgentContextSelectionSummary?
         var selectionTokens: Int?
         var selectionDeltaTokens: Int?
         var observedReadFileCount: Int = 0
@@ -73,6 +74,23 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         let timestamp: Date
     }
 
+    private static func trustedSelectionTokens(
+        from metrics: SelectionToolMetrics?,
+        liveSelectionFileCount: Int?
+    ) -> Int? {
+        guard let metrics else { return nil }
+        guard let liveSelectionFileCount else {
+            return metrics.tokens
+        }
+        guard liveSelectionFileCount > 0 else {
+            return nil
+        }
+        guard metrics.fileCount == liveSelectionFileCount else {
+            return nil
+        }
+        return metrics.tokens
+    }
+
     private struct TimestampedToolResult<Value: Equatable>: Equatable {
         let value: Value
         let timestamp: Date
@@ -90,6 +108,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         snapshot transcriptSnapshot: AgentTranscriptAnalyticsSnapshot,
         codexUsage: AgentContextUsage?,
         liveSelectedFileCount: Int? = nil,
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil
     ) {
@@ -170,8 +189,12 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         }
 
         let selectionToolMetrics = latestToolSelectionMetrics()
-        let selectionFiles = liveSelectedFileCount ?? selectionToolMetrics?.fileCount
-        let selectionTokens = selectionToolMetrics?.tokens
+        let selectionFiles = liveSelectionSummary?.totalExplicitFileCount ?? liveSelectedFileCount ?? selectionToolMetrics?.fileCount
+        let selectionTokens = Self.trustedSelectionTokens(
+            from: selectionToolMetrics,
+            liveSelectionFileCount: selectionFiles
+        )
+        next.selectionSummary = liveSelectionSummary
         next.selectionTokens = selectionTokens
 
         if let selectionFiles {
@@ -197,6 +220,7 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         items: [AgentChatItem],
         codexUsage: AgentContextUsage?,
         liveSelectedFileCount: Int? = nil,
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind? = nil,
         selectedModelRaw: String? = nil
     ) {
@@ -234,8 +258,12 @@ final class AgentRuntimeSidebarViewModel: ObservableObject {
         }
 
         let selectionToolMetrics = latestToolSelectionMetrics()
-        let selectionFiles = liveSelectedFileCount ?? selectionToolMetrics?.fileCount
-        let selectionTokens = selectionToolMetrics?.tokens
+        let selectionFiles = liveSelectionSummary?.totalExplicitFileCount ?? liveSelectedFileCount ?? selectionToolMetrics?.fileCount
+        let selectionTokens = Self.trustedSelectionTokens(
+            from: selectionToolMetrics,
+            liveSelectionFileCount: selectionFiles
+        )
+        next.selectionSummary = liveSelectionSummary
         next.selectionTokens = selectionTokens
 
         if let selectionFiles {

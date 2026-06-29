@@ -5326,6 +5326,20 @@ actor WorkspaceFileContextStore {
         )
     }
 
+    func lookupSelectionPaths(_ requests: [WorkspacePathLookupRequest]) async -> [String: WorkspacePathLookupResult] {
+        var results: [String: WorkspacePathLookupResult] = [:]
+        results.reserveCapacity(requests.count)
+        for request in requests {
+            guard let result = await lookupSelectionPath(
+                request.userPath,
+                profile: request.profile,
+                rootScope: request.rootScope
+            ) else { continue }
+            results[request.userPath] = result
+        }
+        return results
+    }
+
     private func lookupSelectionPath(
         _ userPath: String,
         profile: PathLocateProfile,

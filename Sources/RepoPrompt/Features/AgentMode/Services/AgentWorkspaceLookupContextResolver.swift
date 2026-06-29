@@ -82,6 +82,36 @@ struct AgentWorkspaceLookupContextIdentity: Hashable {
 }
 
 enum AgentWorkspaceLookupContextResolver {
+    private struct CacheKey: Hashable {
+        let storeID: ObjectIdentifier
+        let identity: AgentWorkspaceLookupContextIdentity
+    }
+
+    private final class ProjectionCache {
+        private let lock = NSLock()
+        private var contexts: [CacheKey: WorkspaceLookupContext] = [:]
+
+        func context(for key: CacheKey) -> WorkspaceLookupContext? {
+            lock.lock()
+            defer { lock.unlock() }
+            return contexts[key]
+        }
+
+        func store(_ context: WorkspaceLookupContext, for key: CacheKey) {
+            lock.lock()
+            contexts[key] = context
+            lock.unlock()
+        }
+
+        func removeValue(for key: CacheKey) {
+            lock.lock()
+            contexts.removeValue(forKey: key)
+            lock.unlock()
+        }
+    }
+
+    private static let projectionCache = ProjectionCache()
+
     static let failClosedLookupContext = WorkspaceLookupContext(
         rootScope: .sessionBoundWorkspace(canonicalRootPaths: [], physicalRootPaths: []),
         bindingProjection: nil
@@ -116,6 +146,14 @@ enum AgentWorkspaceLookupContextResolver {
         } catch {
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }
+        let cacheKey = CacheKey(storeID: ObjectIdentifier(store), identity: source.identity)
+        if let cached = projectionCache.context(for: cacheKey) {
+            if await canReuseAuthoritativeLookupContext(cached, source: source, store: store) {
+                return cached
+            }
+            projectionCache.removeValue(for: cacheKey)
+        }
+
         guard let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
             sessionID: sessionID,
             bindings: bindings
@@ -128,8 +166,11 @@ enum AgentWorkspaceLookupContextResolver {
 
         switch await store.rootScopeAvailability(projection.lookupRootScope) {
         case .available:
-            return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+            let context = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+            projectionCache.store(context, for: cacheKey)
+            return context
         case .sessionWorktreeUnavailable:
+            projectionCache.removeValue(for: cacheKey)
             throw AgentWorkspaceLookupContextResolutionError.unavailableProjection
         }
     }
@@ -193,18 +234,52 @@ enum AgentWorkspaceLookupContextResolver {
         source: AgentWorkspaceLookupContextSource,
         store: WorkspaceFileContextStore
     ) async -> WorkspaceLookupContext {
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        var fields: [String: String] = [
+            "activeAgentSessionID": AgentSelectedFilesDiagnostics.shortID(source.activeAgentSessionID),
+            "bindingState": String(describing: source.worktreeBindingState),
+            "bindingCount": String(source.worktreeBindings.count),
+            "bindingFingerprint": String(source.identity.worktreeBindingFingerprint.prefix(16))
+        ]
+        AgentSelectedFilesDiagnostics.event("lookupResolver.lookupContext.start", fields: fields)
         guard let sessionID = source.activeAgentSessionID,
               case let .hydrated(bindings) = source.worktreeBindingState,
-              !bindings.isEmpty,
-              let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
-                  sessionID: sessionID,
-                  bindings: bindings
-              ),
-              !projection.isEmpty
+              !bindings.isEmpty
         else {
+            fields["result"] = "visibleWorkspace"
+            AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
             return WorkspaceLookupContext.visibleWorkspace
         }
-        return WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+
+        let cacheKey = CacheKey(storeID: ObjectIdentifier(store), identity: source.identity)
+        if let cached = projectionCache.context(for: cacheKey) {
+            if await canReuseAuthoritativeLookupContext(cached, source: source, store: store) {
+                fields["result"] = "cachedProjection"
+                fields["physicalRoots"] = String(cached.bindingProjection?.physicalRootRefs.count ?? 0)
+                fields["fullyMaterialized"] = String(cached.bindingProjection?.isFullyMaterialized ?? false)
+                AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+                return cached
+            }
+            projectionCache.removeValue(for: cacheKey)
+        }
+
+        guard let projection = await WorkspaceRootBindingProjectionMaterializer(store: store).materialize(
+            sessionID: sessionID,
+            bindings: bindings
+        ),
+            !projection.isEmpty
+        else {
+            fields["result"] = "visibleWorkspace"
+            AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+            return WorkspaceLookupContext.visibleWorkspace
+        }
+        fields["result"] = "projection"
+        fields["physicalRoots"] = String(projection.physicalRootRefs.count)
+        fields["fullyMaterialized"] = String(projection.isFullyMaterialized)
+        AgentSelectedFilesDiagnostics.durationEvent("lookupResolver.lookupContext", startMS: startMS, fields: fields)
+        let context = WorkspaceLookupContext(rootScope: projection.lookupRootScope, bindingProjection: projection)
+        projectionCache.store(context, for: cacheKey)
+        return context
     }
 }
 

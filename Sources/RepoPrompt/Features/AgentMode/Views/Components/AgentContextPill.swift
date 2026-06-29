@@ -27,7 +27,13 @@ struct AgentContextPill: View {
     }
 
     private var selectionSummary: AgentContextSelectionSummary {
-        AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
+        if let summary = runtimeVM.snapshot.selectionSummary {
+            return summary
+        }
+        if let count = runtimeVM.snapshot.selectionFileCount {
+            return .filesOnly(count)
+        }
+        return AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
     }
 
     private var currentExportSourceSelection: StoredSelection {

@@ -9,6 +9,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
         transcriptSnapshot: AgentTranscriptAnalyticsSnapshot,
         codexUsage: AgentContextUsage?,
         liveSelectedFileCount: Int?,
+        liveSelectionSummary: AgentContextSelectionSummary? = nil,
         selectedAgent: AgentProviderKind,
         selectedModelRaw: String
     ) {
@@ -17,6 +18,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
             snapshot: transcriptSnapshot,
             codexUsage: codexUsage,
             liveSelectedFileCount: liveSelectedFileCount,
+            liveSelectionSummary: liveSelectionSummary,
             selectedAgent: selectedAgent,
             selectedModelRaw: selectedModelRaw
         )
@@ -33,6 +35,7 @@ final class AgentRuntimeMetricsUIStore: ObservableObject {
                     "usedTokens": runtimeVM.snapshot.usedTokens.map(String.init) ?? "nil",
                     "estimatedTranscriptTokens": runtimeVM.snapshot.estimatedTranscriptTokens.map(String.init) ?? "nil",
                     "selectionFileCount": runtimeVM.snapshot.selectionFileCount.map(String.init) ?? "nil",
+                    "selectionSliceRanges": runtimeVM.snapshot.selectionSummary.map { String($0.sliceRangeCount) } ?? "nil",
                     "updatedAtChanged": String(runtimeVM.snapshot.updatedAt != previousSnapshot.updatedAt)
                 ]
             )

@@ -98,6 +98,22 @@ final class AgentRuntimeSidebarViewModelTests: XCTestCase {
         )
 
         XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 0)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
+    }
+
+    func testLiveSelectionCountMismatchSuppressesStaleToolSelectionTokens() throws {
+        let store = AgentRuntimeMetricsUIStore()
+        let manageSelectionItem = try makeManageSelectionItem(fileCount: 3)
+        store.update(
+            transcriptSnapshot: AgentTranscriptAnalyticsSnapshot(latestManageSelectionItem: manageSelectionItem),
+            codexUsage: nil,
+            liveSelectedFileCount: 2,
+            selectedAgent: .codexExec,
+            selectedModelRaw: "gpt-5.1-codex"
+        )
+
+        XCTAssertEqual(store.runtimeVM.snapshot.selectionFileCount, 2)
+        XCTAssertNil(store.runtimeVM.snapshot.selectionTokens)
     }
 
     func testClaudeFableSelectionFallsBackToOneMillionTokenContextWindow() {

@@ -669,7 +669,7 @@ class WorkspaceFilesViewModel: ObservableObject {
         }
     }
 
-    private(set) var selectionStateRevision: UInt64 = 0
+    @Published private(set) var selectionStateRevision: UInt64 = 0
 
     @Published private(set) var selectedFiles: [FileViewModel] = [] {
         didSet {

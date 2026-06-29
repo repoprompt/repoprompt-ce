@@ -355,12 +355,31 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics.event(
+            "projection.prepare.start",
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                "bindingCount": String(bindings.count),
+                "bindingFingerprint": String(AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings).prefix(16))
+            ]
+        )
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
-        return try await prepare(
+        let preparation = try await prepare(
             sessionID: sessionID,
             bindings: bindings,
             visibleRoots: visibleRoots
         )
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.prepare",
+            startMS: startMS,
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                "bindingCount": String(bindings.count),
+                "visibleRootCount": String(visibleRoots.count)
+            ]
+        )
+        return preparation
     }
 
     private func prepare(
@@ -368,10 +387,20 @@ struct WorkspaceRootBindingProjectionMaterializer {
         bindings: [AgentSessionWorktreeBinding],
         visibleRoots: [WorkspaceRootRef]
     ) async throws -> WorkspaceRootBindingProjectionPreparation {
+        let ownershipStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let ownership = try await store.prepareSessionWorktreeOwnership(
             ownerID: sessionID,
             bindingFingerprint: AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings),
             physicalRootPaths: bindings.map(\.worktreeRootPath)
+        )
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.prepareOwnership",
+            startMS: ownershipStartMS,
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                "bindingCount": String(bindings.count),
+                "physicalRootCount": String(bindings.map(\.worktreeRootPath).count)
+            ]
         )
         return WorkspaceRootBindingProjectionPreparation(
             sessionID: sessionID,
@@ -384,7 +413,18 @@ struct WorkspaceRootBindingProjectionMaterializer {
     func commit(
         _ preparation: WorkspaceRootBindingProjectionPreparation
     ) async throws -> WorkspaceRootBindingProjection? {
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let commitOwnershipStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let records = try await store.commitSessionWorktreeOwnership(preparation.ownership)
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.commitOwnership",
+            startMS: commitOwnershipStartMS,
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(preparation.sessionID),
+                "recordCount": String(records.count),
+                "bindingCount": String(preparation.bindings.count)
+            ]
+        )
         guard !preparation.bindings.isEmpty else { return nil }
 
         let recordsByPath = Dictionary(uniqueKeysWithValues: records.map {
@@ -415,17 +455,37 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 )
             ))
         }
-        return WorkspaceRootBindingProjection(
+        let projection = WorkspaceRootBindingProjection(
             sessionID: preparation.sessionID,
             boundRoots: boundRoots,
             visibleLogicalRoots: preparation.visibleRoots
         )
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.commit",
+            startMS: startMS,
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(preparation.sessionID),
+                "boundRootCount": String(boundRoots.count),
+                "visibleRootCount": String(preparation.visibleRoots.count),
+                "fullyMaterialized": String(projection.isFullyMaterialized)
+            ]
+        )
+        return projection
     }
 
     func initializeCodemaps(for projection: WorkspaceRootBindingProjection?) async {
         guard let projection else { return }
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         _ = await store.initializeCodemapsForSessionWorktreeRoots(
             rootIDs: projection.physicalRootRefs.map(\.id)
+        )
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.initializeCodemaps",
+            startMS: startMS,
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(projection.sessionID),
+                "physicalRootCount": String(projection.physicalRootRefs.count)
+            ]
         )
     }
 
@@ -441,7 +501,22 @@ struct WorkspaceRootBindingProjectionMaterializer {
         sessionID: UUID,
         bindings: [AgentSessionWorktreeBinding]
     ) async -> WorkspaceRootBindingProjection? {
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics.event(
+            "projection.materialize.start",
+            fields: [
+                "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                "bindingCount": String(bindings.count),
+                "bindingFingerprint": String(AgentWorkspaceLookupContextSource.worktreeBindingFingerprint(bindings).prefix(16))
+            ]
+        )
+        let visibleRootsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let visibleRoots = await store.rootRefs(scope: .visibleWorkspace)
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "projection.materialize.visibleRoots",
+            startMS: visibleRootsStartMS,
+            fields: ["visibleRootCount": String(visibleRoots.count)]
+        )
         do {
             let preparation = try await prepare(
                 sessionID: sessionID,
@@ -451,9 +526,28 @@ struct WorkspaceRootBindingProjectionMaterializer {
             do {
                 let projection = try await commit(preparation)
                 await initializeCodemaps(for: projection)
+                AgentSelectedFilesDiagnostics.durationEvent(
+                    "projection.materialize.complete",
+                    startMS: startMS,
+                    fields: [
+                        "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                        "bindingCount": String(bindings.count),
+                        "result": projection == nil ? "nil" : "projection",
+                        "physicalRootCount": String(projection?.physicalRootRefs.count ?? 0)
+                    ]
+                )
                 return projection
             } catch {
                 await abort(preparation)
+                AgentSelectedFilesDiagnostics.durationEvent(
+                    "projection.materialize.commitFailed",
+                    startMS: startMS,
+                    fields: [
+                        "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                        "bindingCount": String(bindings.count),
+                        "error": String(describing: error)
+                    ]
+                )
                 return failClosedProjection(
                     sessionID: sessionID,
                     bindings: bindings,
@@ -461,6 +555,15 @@ struct WorkspaceRootBindingProjectionMaterializer {
                 )
             }
         } catch {
+            AgentSelectedFilesDiagnostics.durationEvent(
+                "projection.materialize.prepareFailed",
+                startMS: startMS,
+                fields: [
+                    "sessionID": AgentSelectedFilesDiagnostics.shortID(sessionID),
+                    "bindingCount": String(bindings.count),
+                    "error": String(describing: error)
+                ]
+            )
             return failClosedProjection(
                 sessionID: sessionID,
                 bindings: bindings,

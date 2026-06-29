@@ -27,7 +27,7 @@ struct AgentContextExportSource: Equatable {
     }
 }
 
-struct AgentContextExportIdentity: Equatable {
+struct AgentContextExportIdentity: Equatable, Hashable {
     let tabID: UUID?
     let selection: StoredSelection
     let activeAgentSessionID: UUID?
@@ -39,6 +39,15 @@ struct AgentContextSelectionSummary: Equatable {
     let fullFileCount: Int
     let slicedFileCount: Int
     let sliceRangeCount: Int
+
+    static func filesOnly(_ count: Int) -> AgentContextSelectionSummary {
+        AgentContextSelectionSummary(
+            totalExplicitFileCount: count,
+            fullFileCount: count,
+            slicedFileCount: 0,
+            sliceRangeCount: 0
+        )
+    }
 
     var compactText: String {
         fileCountText
@@ -223,17 +232,37 @@ enum AgentContextExportResolver {
         selectionSummary(for: sourceSelection).totalExplicitFileCount
     }
 
+    private static func selectionNeedsResolution(_ selection: StoredSelection, codeMapUsage: CodeMapUsage) -> Bool {
+        if !selection.selectedPaths.isEmpty { return true }
+        if selection.slices.contains(where: { !$0.value.isEmpty }) { return true }
+        switch codeMapUsage {
+        case .auto:
+            return !selection.autoCodemapPaths.isEmpty
+        case .complete:
+            return true
+        case .none, .selected:
+            return false
+        }
+    }
+
     static func lookupContext(
         source: AgentContextExportSource,
         store: WorkspaceFileContextStore
     ) async -> WorkspaceLookupContext {
-        await AgentWorkspaceLookupContextResolver.lookupContext(
+        let startMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics.event("resolver.lookupContext.start", fields: AgentSelectedFilesDiagnostics.sourceFields(source))
+        let context = await AgentWorkspaceLookupContextResolver.lookupContext(
             source: AgentWorkspaceLookupContextSource(
                 activeAgentSessionID: source.activeAgentSessionID,
                 worktreeBindings: source.worktreeBindings
             ),
             store: store
         )
+        var fields = AgentSelectedFilesDiagnostics.sourceFields(source)
+        fields["rootScope"] = String(describing: context.rootScope)
+        fields["hasProjection"] = String(context.bindingProjection != nil)
+        AgentSelectedFilesDiagnostics.durationEvent("resolver.lookupContext", startMS: startMS, fields: fields)
+        return context
     }
 
     static func resolveModel(
@@ -242,9 +271,49 @@ enum AgentContextExportResolver {
         filePathDisplay: FilePathDisplay,
         codeMapUsage: CodeMapUsage
     ) async -> AgentContextExportModel {
+        let totalStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        var startFields = AgentSelectedFilesDiagnostics.sourceFields(source)
+        startFields["filePathDisplay"] = String(describing: filePathDisplay)
+        startFields["codeMapUsage"] = String(describing: codeMapUsage)
+        AgentSelectedFilesDiagnostics.event("resolver.resolveModel.start", fields: startFields)
+        guard selectionNeedsResolution(source.selection, codeMapUsage: codeMapUsage) else {
+            AgentSelectedFilesDiagnostics.durationEvent(
+                "resolver.resolveModel.fastEmpty",
+                startMS: totalStartMS,
+                fields: startFields
+            )
+            return AgentContextExportModel(
+                source: source,
+                lookupContext: .visibleWorkspace,
+                rows: [],
+                missingPaths: [],
+                invalidPaths: []
+            )
+        }
+
         let lookupContext = await lookupContext(source: source, store: store)
+        let physicalizeStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let physicalSelection = lookupContext.physicalizeSelection(source.selection)
-        let codemapSnapshots = await store.codemapSnapshotDictionary()
+        var physicalizeFields = AgentSelectedFilesDiagnostics.selectionFields(physicalSelection)
+        physicalizeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
+        AgentSelectedFilesDiagnostics.durationEvent("resolver.physicalizeSelection", startMS: physicalizeStartMS, fields: physicalizeFields)
+
+        let codemapSnapshotStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let codemapSnapshots: [UUID: WorkspaceCodemapSnapshot] = if codeMapUsage == .complete {
+            await store.codemapSnapshotDictionary()
+        } else {
+            [:]
+        }
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.codemapSnapshotDictionary",
+            startMS: codemapSnapshotStartMS,
+            fields: [
+                "codeMapUsage": String(describing: codeMapUsage),
+                "snapshotCount": String(codemapSnapshots.count)
+            ]
+        )
+
+        let resolveRowsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let resolution = await resolveRows(
             selection: physicalSelection,
             store: store,
@@ -253,6 +322,17 @@ enum AgentContextExportResolver {
             codeMapUsage: codeMapUsage,
             codemapSnapshots: codemapSnapshots
         )
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.resolveRows",
+            startMS: resolveRowsStartMS,
+            fields: [
+                "rowEntries": String(resolution.rows.count),
+                "missingPaths": String(resolution.missingPaths.count),
+                "invalidPaths": String(resolution.invalidPaths.count)
+            ]
+        )
+
+        let rowMapStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let roots = await store.rootRefs(scope: lookupContext.rootScope)
         let rows = resolution.rows.map { rowEntry in
             row(
@@ -264,6 +344,20 @@ enum AgentContextExportResolver {
             )
         }
         .sorted(by: rowSort)
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.mapRows",
+            startMS: rowMapStartMS,
+            fields: [
+                "rootCount": String(roots.count),
+                "rowCount": String(rows.count)
+            ]
+        )
+        var completeFields = startFields
+        completeFields["rowCount"] = String(rows.count)
+        completeFields["missingPaths"] = String(resolution.missingPaths.count)
+        completeFields["invalidPaths"] = String(resolution.invalidPaths.count)
+        completeFields["hasProjection"] = String(lookupContext.bindingProjection != nil)
+        AgentSelectedFilesDiagnostics.durationEvent("resolver.resolveModel.complete", startMS: totalStartMS, fields: completeFields)
         return AgentContextExportModel(
             source: source,
             lookupContext: lookupContext,
@@ -398,6 +492,17 @@ enum AgentContextExportResolver {
         codeMapUsage: CodeMapUsage,
         codemapSnapshots: [UUID: WorkspaceCodemapSnapshot]
     ) async -> (rows: [RowResolutionEntry], missingPaths: [String], invalidPaths: [String]) {
+        let totalStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        AgentSelectedFilesDiagnostics.event(
+            "resolver.resolveRows.start",
+            fields: [
+                "selectedPaths": String(selection.selectedPaths.count),
+                "sliceFiles": String(selection.slices.count(where: { !$0.value.isEmpty })),
+                "autoCodemapPaths": String(selection.autoCodemapPaths.count),
+                "codeMapUsage": String(describing: codeMapUsage),
+                "rootScope": String(describing: rootScope)
+            ]
+        )
         var rows: [RowResolutionEntry] = []
         var missingPaths: [String] = []
         var invalidPaths: [String] = []
@@ -407,7 +512,16 @@ enum AgentContextExportResolver {
         let selectedRequests = selection.selectedPaths.map {
             WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
         }
-        let selectedLookupResults = await store.lookupPaths(selectedRequests)
+        let selectedLookupStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+        let selectedLookupResults = await store.lookupSelectionPaths(selectedRequests)
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.lookupSelectedPaths",
+            startMS: selectedLookupStartMS,
+            fields: [
+                "requestCount": String(selectedRequests.count),
+                "resultCount": String(selectedLookupResults.count)
+            ]
+        )
 
         for path in selection.selectedPaths {
             let result = await selectedLookupResult(
@@ -435,7 +549,12 @@ enum AgentContextExportResolver {
             if let file = result.file {
                 selectedFileIDs.insert(file.id)
                 let ranges = sliceRanges(for: path, file: file, location: result.location, in: selection.slices)
-                let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshots[file.id]?.fileAPI != nil
+                let hasSelectedCodemapAPI = if codeMapUsage == .selected {
+                    await hasCodemapAPI(fileID: file.id, store: store, snapshots: codemapSnapshots)
+                } else {
+                    false
+                }
+                let useSelectedCodemap = codeMapUsage == .selected && hasSelectedCodemapAPI
                 let entry = ResolvedPromptFileEntry(
                     file: file,
                     isCodemap: useSelectedCodemap,
@@ -450,7 +569,12 @@ enum AgentContextExportResolver {
                 let prefix = folder.standardizedRelativePath
                 for file in files where prefix.isEmpty || file.standardizedRelativePath == prefix || file.standardizedRelativePath.hasPrefix(prefix + "/") {
                     selectedFileIDs.insert(file.id)
-                    let useSelectedCodemap = codeMapUsage == .selected && codemapSnapshots[file.id]?.fileAPI != nil
+                    let hasSelectedCodemapAPI = if codeMapUsage == .selected {
+                        await hasCodemapAPI(fileID: file.id, store: store, snapshots: codemapSnapshots)
+                    } else {
+                        false
+                    }
+                    let useSelectedCodemap = codeMapUsage == .selected && hasSelectedCodemapAPI
                     let entry = ResolvedPromptFileEntry(
                         file: file,
                         isCodemap: useSelectedCodemap,
@@ -471,11 +595,20 @@ enum AgentContextExportResolver {
         let sliceLookupRequests = slicePaths.map {
             WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
         }
+        let sliceLookupStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let sliceLookupResults: [String: WorkspacePathLookupResult] = if sliceLookupRequests.isEmpty {
             [:]
         } else {
-            await store.lookupPaths(sliceLookupRequests)
+            await store.lookupSelectionPaths(sliceLookupRequests)
         }
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.lookupSlicePaths",
+            startMS: sliceLookupStartMS,
+            fields: [
+                "requestCount": String(sliceLookupRequests.count),
+                "resultCount": String(sliceLookupResults.count)
+            ]
+        )
         for (path, ranges) in selection.slices where !ranges.isEmpty {
             guard let result = selectedLookupResults[path] ?? sliceLookupResults[path] else {
                 missingPaths.append(path)
@@ -497,15 +630,25 @@ enum AgentContextExportResolver {
             append(entry, canRemove: true, to: &rows, seenIDs: &seenIDs)
         }
 
-        let scopedRoots = await store.rootRefs(scope: rootScope)
-        let scopedRootIDs = Set(scopedRoots.map(\.id))
-        let codemapPaths: [String] = switch codeMapUsage {
+        let codemapPaths: [String]
+        switch codeMapUsage {
         case .none, .selected:
-            []
+            codemapPaths = []
         case .auto:
-            Array(selection.autoCodemapPaths)
+            codemapPaths = Array(selection.autoCodemapPaths)
         case .complete:
-            codemapSnapshots.compactMap { fileID, snapshot in
+            let scopedRootsStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
+            let scopedRoots = await store.rootRefs(scope: rootScope)
+            let scopedRootIDs = Set(scopedRoots.map(\.id))
+            AgentSelectedFilesDiagnostics.durationEvent(
+                "resolver.scopedRootRefs",
+                startMS: scopedRootsStartMS,
+                fields: [
+                    "rootCount": String(scopedRoots.count),
+                    "reason": "completeCodemapFilter"
+                ]
+            )
+            codemapPaths = codemapSnapshots.compactMap { fileID, snapshot in
                 guard !selectedFileIDs.contains(fileID),
                       scopedRootIDs.contains(snapshot.rootID),
                       snapshot.fileAPI != nil
@@ -517,11 +660,21 @@ enum AgentContextExportResolver {
         let codemapLookupRequests = codemapPaths.map {
             WorkspacePathLookupRequest(userPath: $0, profile: profile, rootScope: rootScope)
         }
+        let codemapLookupStartMS = AgentSelectedFilesDiagnostics.timestampMSIfEnabled()
         let codemapLookupResults: [String: WorkspacePathLookupResult] = if codemapLookupRequests.isEmpty {
             [:]
         } else {
-            await store.lookupPaths(codemapLookupRequests)
+            await store.lookupSelectionPaths(codemapLookupRequests)
         }
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.lookupCodemapPaths",
+            startMS: codemapLookupStartMS,
+            fields: [
+                "pathCount": String(codemapPaths.count),
+                "requestCount": String(codemapLookupRequests.count),
+                "resultCount": String(codemapLookupResults.count)
+            ]
+        )
         for path in codemapPaths {
             guard let result = codemapLookupResults[path] else {
                 missingPaths.append(path)
@@ -531,7 +684,8 @@ enum AgentContextExportResolver {
                 invalidPaths.append(path)
                 continue
             }
-            guard !selectedFileIDs.contains(file.id), codemapSnapshots[file.id]?.fileAPI != nil else { continue }
+            let hasCodemapAPI = await hasCodemapAPI(fileID: file.id, store: store, snapshots: codemapSnapshots)
+            guard !selectedFileIDs.contains(file.id), hasCodemapAPI else { continue }
             let entry = ResolvedPromptFileEntry(
                 file: file,
                 isCodemap: true,
@@ -542,7 +696,28 @@ enum AgentContextExportResolver {
             append(entry, canRemove: codeMapUsage == .auto, to: &rows, seenIDs: &seenIDs)
         }
 
+        AgentSelectedFilesDiagnostics.durationEvent(
+            "resolver.resolveRows.complete",
+            startMS: totalStartMS,
+            fields: [
+                "rowEntries": String(rows.count),
+                "selectedFileIDs": String(selectedFileIDs.count),
+                "missingPaths": String(Set(missingPaths).count),
+                "invalidPaths": String(Set(invalidPaths).count)
+            ]
+        )
         return (rows, Array(Set(missingPaths)).sorted(), Array(Set(invalidPaths)).sorted())
+    }
+
+    private static func hasCodemapAPI(
+        fileID: UUID,
+        store: WorkspaceFileContextStore,
+        snapshots: [UUID: WorkspaceCodemapSnapshot]
+    ) async -> Bool {
+        if let snapshot = snapshots[fileID] {
+            return snapshot.fileAPI != nil
+        }
+        return await store.codemapSnapshot(fileID: fileID)?.fileAPI != nil
     }
 
     private static func row(

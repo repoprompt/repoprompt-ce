@@ -215,7 +215,7 @@ final class AgentContextExportResolverTests: XCTestCase {
                 ),
                 explicitFileCount
             )
-            XCTAssertEqual(snapshotBuildCount, 1)
+            XCTAssertEqual(snapshotBuildCount, 0)
             XCTAssertEqual(capture.droppedSampleCount, 0)
         #endif
     }
@@ -269,6 +269,28 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertTrue(clipboard.contains("Sources/App.swift"), clipboard)
         XCTAssertTrue(clipboard.contains("let origin = \"worktree\""), clipboard)
         XCTAssertFalse(clipboard.contains("let origin = \"base\""), clipboard)
+    }
+
+    func testEmptyBoundExportSkipsWorktreeProjection() async throws {
+        let fixture = try await makeBoundFixture()
+        let source = makeSource(
+            logicalRoot: fixture.logicalRoot,
+            worktreeRoot: fixture.worktreeRoot,
+            selection: StoredSelection(codemapAutoEnabled: false)
+        )
+
+        let model = await AgentContextExportResolver.resolveModel(
+            source: source,
+            store: fixture.store,
+            filePathDisplay: .relative,
+            codeMapUsage: .none
+        )
+
+        XCTAssertTrue(model.rows.isEmpty)
+        XCTAssertTrue(model.missingPaths.isEmpty)
+        XCTAssertTrue(model.invalidPaths.isEmpty)
+        XCTAssertNil(model.lookupContext.bindingProjection)
+        XCTAssertEqual(model.lookupContext.rootScope, .visibleWorkspace)
     }
 
     func testBoundExportFailsClosedWhenPhysicalWorktreeCannotBeLoaded() async throws {
