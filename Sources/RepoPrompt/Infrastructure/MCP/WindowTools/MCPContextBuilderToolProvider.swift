@@ -317,7 +317,9 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 await progressTimeline.reportActivity(phase: phase, message: message)
             }
 
-            func runContextBuilderAndPlan() async throws -> ContextBuilderToolResult {
+            func runContextBuilderAndPlan(
+                parentSpan: SentryTelemetryBootstrap.TraceSpan
+            ) async throws -> ContextBuilderToolResult {
                 await dependencies.sendStageProgress(
                     connectionID,
                     MCPWindowToolName.contextBuilder,
@@ -331,28 +333,38 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                     "discovering",
                     "Running Context Builder agent..."
                 )
-                let snapshot = try await withTimelinePhaseCompletion(progressTimeline) {
-                    try await withHeartbeat(
-                        connectionID: connectionID,
-                        tool: MCPWindowToolName.contextBuilder,
-                        stage: "discovering",
-                        message: "Still building context...",
-                        timeline: progressTimeline
-                    ) {
-                        try await contextBuilderVM.runContextBuilderForMCP(
-                            tabID: finalTabID,
-                            instructionsOverride: instructions.isEmpty ? nil : instructions,
-                            tokenBudgetOverride: tokenBudgetOverride,
-                            persistTokenBudget: false,
-                            enhancementModeOverride: .fullRewrite,
-                            agentOverride: preferredAgent,
-                            modelOverrideRaw: preferredModelRaw,
-                            responseType: responseType?.rawValue,
-                            planModelName: planModelName,
-                            workspaceContext: workspaceContext,
-                            mcpControlToken: mcpControlToken,
-                            progressReporter: progressReporter
-                        )
+                let snapshot = try await SentryTelemetryBootstrap.childSpanAsync(
+                    parent: parentSpan,
+                    operation: .contextBuilderDiscovery,
+                    attributes: ContextBuilderSentryTelemetry.attributes(
+                        phase: .discovery,
+                        outcome: .started,
+                        tokenBudget: contextBuilderTokenBudget
+                    )
+                ) {
+                    try await withTimelinePhaseCompletion(progressTimeline) {
+                        try await withHeartbeat(
+                            connectionID: connectionID,
+                            tool: MCPWindowToolName.contextBuilder,
+                            stage: "discovering",
+                            message: "Still building context...",
+                            timeline: progressTimeline
+                        ) {
+                            try await contextBuilderVM.runContextBuilderForMCP(
+                                tabID: finalTabID,
+                                instructionsOverride: instructions.isEmpty ? nil : instructions,
+                                tokenBudgetOverride: tokenBudgetOverride,
+                                persistTokenBudget: false,
+                                enhancementModeOverride: .fullRewrite,
+                                agentOverride: preferredAgent,
+                                modelOverrideRaw: preferredModelRaw,
+                                responseType: responseType?.rawValue,
+                                planModelName: planModelName,
+                                workspaceContext: workspaceContext,
+                                mcpControlToken: mcpControlToken,
+                                progressReporter: progressReporter
+                            )
+                        }
                     }
                 }
 
@@ -424,14 +436,25 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                 let sel = resultTab.selection
                 let fileCount = sel.selectedPaths.count + sel.autoCodemapPaths.count
 
-                let selectionReply = try await dependencies.buildTabSelectionReply(
-                    sel,
-                    false,
-                    .relative,
-                    .auto,
-                    lookupContext,
-                    tabResolution.reviewGitContext
-                )
+                let selectionReply = try await SentryTelemetryBootstrap.childSpanAsync(
+                    parent: parentSpan,
+                    operation: .contextBuilderSelectionCommit,
+                    attributes: ContextBuilderSentryTelemetry.attributes(
+                        phase: .selectionCommit,
+                        outcome: .started,
+                        fileCount: fileCount,
+                        tokenBudget: contextBuilderTokenBudget
+                    )
+                ) {
+                    try await dependencies.buildTabSelectionReply(
+                        sel,
+                        false,
+                        .relative,
+                        .auto,
+                        lookupContext,
+                        tabResolution.reviewGitContext
+                    )
+                }
                 let formattedSelection = ToolOutputFormatter.formatSelectionReplyToString(selectionReply)
 
                 var planReply: ChatSendReply? = nil
@@ -528,28 +551,39 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                         "Generating \(modeLabel)..."
                     )
 
-                    let reply = try await withTimelinePhaseCompletion(progressTimeline) {
-                        try await withHeartbeat(
-                            connectionID: connectionID,
-                            tool: MCPWindowToolName.contextBuilder,
-                            stage: "generating",
-                            message: "Still generating \(modeLabel)...",
-                            timeline: progressTimeline
-                        ) {
-                            try await dependencies.runMCPPlanOrQuestion(
-                                contextBuilderVM,
-                                resultTab.id,
-                                tabResolution.agentModeSessionID,
-                                tabResolution.agentModeRunID,
-                                mode,
-                                effectivePrompt,
-                                sel,
-                                lookupContext,
-                                tabResolution.reviewGitContext,
-                                finalReviewAuthorization,
-                                progressReporter,
-                                activityReporter
-                            )
+                    let reply = try await SentryTelemetryBootstrap.childSpanAsync(
+                        parent: parentSpan,
+                        operation: .contextBuilderOracleResponse,
+                        attributes: ContextBuilderSentryTelemetry.attributes(
+                            phase: .oracleResponse,
+                            outcome: .started,
+                            fileCount: fileCount,
+                            tokenBudget: contextBuilderTokenBudget
+                        )
+                    ) {
+                        try await withTimelinePhaseCompletion(progressTimeline) {
+                            try await withHeartbeat(
+                                connectionID: connectionID,
+                                tool: MCPWindowToolName.contextBuilder,
+                                stage: "generating",
+                                message: "Still generating \(modeLabel)...",
+                                timeline: progressTimeline
+                            ) {
+                                try await dependencies.runMCPPlanOrQuestion(
+                                    contextBuilderVM,
+                                    resultTab.id,
+                                    tabResolution.agentModeSessionID,
+                                    tabResolution.agentModeRunID,
+                                    mode,
+                                    effectivePrompt,
+                                    sel,
+                                    lookupContext,
+                                    tabResolution.reviewGitContext,
+                                    finalReviewAuthorization,
+                                    progressReporter,
+                                    activityReporter
+                                )
+                            }
                         }
                     }
 
@@ -617,33 +651,63 @@ final class MCPContextBuilderToolProvider: MCPWindowToolProviding {
                             }
                         }
                         .joined(separator: "\n")
-                    let exportMode = responseType?.rawValue ?? planReply?.mode ?? reviewReply?.mode ?? "response"
-                    let chatID = planReply?.shortId ?? reviewReply?.shortId
-                    guard let capturedOracleExportDestination else {
-                        throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
+                    oracleExportFile = try await SentryTelemetryBootstrap.childSpanAsync(
+                        parent: parentSpan,
+                        operation: .contextBuilderExport,
+                        attributes: ContextBuilderSentryTelemetry.attributes(
+                            phase: .export,
+                            outcome: .started,
+                            fileCount: fileCount,
+                            tokenBudget: contextBuilderTokenBudget
+                        )
+                    ) {
+                        let exportMode = responseType?.rawValue ?? planReply?.mode ?? reviewReply?.mode ?? "response"
+                        let chatID = planReply?.shortId ?? reviewReply?.shortId
+                        guard let capturedOracleExportDestination else {
+                            throw MCPError.internalError("Missing captured Oracle export destination for context_builder export.")
+                        }
+                        let exportPath = try await dependencies.resolveDefaultOracleExportPath(
+                            exportMode,
+                            chatID,
+                            capturedOracleExportDestination
+                        )
+                        let resolvedPath = try await dependencies.writeGeneratedOracleExportFile(
+                            exportPath,
+                            markdown,
+                            capturedOracleExportDestination
+                        )
+                        return OracleExportFile(
+                            path: resolvedPath,
+                            instruction: AgentOracleExport.instruction(path: resolvedPath)
+                        )
                     }
-                    let exportPath = try await dependencies.resolveDefaultOracleExportPath(
-                        exportMode,
-                        chatID,
-                        capturedOracleExportDestination
-                    )
-                    let resolvedPath = try await dependencies.writeGeneratedOracleExportFile(
-                        exportPath,
-                        markdown,
-                        capturedOracleExportDestination
-                    )
-                    oracleExportFile = OracleExportFile(
-                        path: resolvedPath,
-                        instruction: AgentOracleExport.instruction(path: resolvedPath)
-                    )
                 }
 
+                ContextBuilderSentryTelemetry.recordCompleted(fileCount: fileCount, tokenBudget: contextBuilderTokenBudget)
                 return makeResult(
                     oracleExportPath: oracleExportFile?.path,
                     oracleExportInstruction: oracleExportFile?.instruction
                 )
             }
-            return try await runContextBuilderAndPlan()
+            return try await SentryTelemetryBootstrap.traceAsync(
+                .contextBuilderRun,
+                attributes: ContextBuilderSentryTelemetry.attributes(
+                    phase: .discovery,
+                    outcome: .started,
+                    tokenBudget: contextBuilderTokenBudget
+                )
+            ) { parentSpan in
+                ContextBuilderSentryTelemetry.recordStarted(tokenBudget: contextBuilderTokenBudget)
+                do {
+                    return try await runContextBuilderAndPlan(parentSpan: parentSpan)
+                } catch {
+                    ContextBuilderSentryTelemetry.recordFailed(
+                        tokenBudget: contextBuilderTokenBudget,
+                        errorKind: error is CancellationError ? .cancelled : .error
+                    )
+                    throw error
+                }
+            }
         }
     }
 
