@@ -1030,8 +1030,25 @@ class OperationRegistry:
         "RPCE_RUN_CODEMAP_E2E",
         "RPCE_RUN_SCALE_TESTS",
     ]
+    TELEMETRY_ENV_KEYS = [
+        "REPOPROMPT_ENABLE_SENTRY",
+        "REPOPROMPT_SENTRY_DSN",
+        "REPOPROMPT_UPLOAD_SENTRY_SYMBOLS",
+        "REPOPROMPT_SENTRY_AUTH_TOKEN_FILE",
+        "REPOPROMPT_SENTRY_ORG",
+        "REPOPROMPT_SENTRY_PROJECT",
+        "REPOPROMPT_SENTRY_UPLOAD_WAIT",
+        "SENTRY_URL",
+    ]
     PASSTHROUGH_ENV_KEYS = sorted(
-        set(SIGNING_ENV_KEYS + DEBUG_ENV_KEYS + BUILD_ENV_KEYS + STYLE_ENV_KEYS + TEST_ENV_KEYS)
+        set(
+            SIGNING_ENV_KEYS
+            + DEBUG_ENV_KEYS
+            + BUILD_ENV_KEYS
+            + STYLE_ENV_KEYS
+            + TEST_ENV_KEYS
+            + TELEMETRY_ENV_KEYS
+        )
     )
 
     def __init__(self, repo_root: Path) -> None:
