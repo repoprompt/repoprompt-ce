@@ -135,6 +135,12 @@ final class AgentProviderPreferenceSnapshotStore {
                 autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
                 acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
             )
+        case .droid:
+            let level = effectiveDroidPermissionLevel(profile: profile)
+            return AgentProviderRuntimePermissionBinding(
+                autoApproveAllACPToolPermissions: level.autoApprovesACPToolPermissions,
+                acceptsPendingACPApprovalWhenActivated: level.autoApprovesACPToolPermissions
+            )
         }
     }
 
@@ -149,6 +155,8 @@ final class AgentProviderPreferenceSnapshotStore {
             OpenCodeAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         case let .cursor(level):
             CursorAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
+        case let .droid(level):
+            DroidAgentToolPreferences.setPermissionLevel(level, defaults: defaults, secureStore: securePermissions)
         }
         bumpRevision(for: id.providerID)
         return id.providerID
@@ -307,6 +315,26 @@ final class AgentProviderPreferenceSnapshotStore {
                 options: CursorAgentToolPreferences.PermissionLevel.allCases.map { level in
                     AgentPermissionOptionBinding(
                         id: .cursor(level),
+                        title: level.displayName,
+                        iconName: level.iconName,
+                        detailText: level.detailText,
+                        isWarning: level.isWarning,
+                        isSelected: level == effective,
+                        isEnabled: externallyManagedReason == nil
+                    )
+                }
+            )
+        case .droid:
+            let effective = effectiveDroidPermissionLevel(profile: profile)
+            return AgentPermissionChromeBinding(
+                providerID: providerID,
+                displayName: effective.displayName,
+                iconName: effective.iconName,
+                isWarning: effective.isWarning,
+                externallyManagedReason: externallyManagedReason,
+                options: DroidAgentToolPreferences.PermissionLevel.allCases.map { level in
+                    AgentPermissionOptionBinding(
+                        id: .droid(level),
                         title: level.displayName,
                         iconName: level.iconName,
                         detailText: level.detailText,
@@ -482,6 +510,22 @@ final class AgentProviderPreferenceSnapshotStore {
         case .claude: .claudeCode
         case .openCode: .openCode
         case .cursor: .cursor
+        case .droid: .droid
+        }
+    }
+
+    private func effectiveDroidPermissionLevel(
+        profile: AgentProviderPermissionProfile
+    ) -> DroidAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            DroidAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.droid(level)):
+            level
+        case .providerOverride:
+            .managedDefault
         }
     }
 

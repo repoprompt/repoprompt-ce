@@ -9,6 +9,7 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
     case claude
     case openCode
     case cursor
+    case droid
 
     var secureStorageAccount: SecureStorageAccount {
         switch self {
@@ -22,6 +23,8 @@ enum AgentPermissionSecureDomain: String, CaseIterable, Hashable {
             .agentPermissionOpenCodeDocument
         case .cursor:
             .agentPermissionCursorDocument
+        case .droid:
+            .agentPermissionDroidDocument
         }
     }
 
@@ -280,6 +283,36 @@ struct SecureCursorPermissionDocument: Codable, Equatable {
     }
 }
 
+struct SecureDroidPermissionDocument: Codable, Equatable {
+    static let currentSchemaVersion = 1
+
+    var schemaVersion: Int
+    var updatedAt: Date
+    var permissionLevelRaw: String?
+
+    init(
+        schemaVersion: Int = currentSchemaVersion,
+        updatedAt: Date = Date(),
+        permissionLevelRaw: String? = DroidAgentToolPreferences.PermissionLevel.managedDefault.rawValue
+    ) {
+        self.schemaVersion = schemaVersion
+        self.updatedAt = updatedAt
+        self.permissionLevelRaw = permissionLevelRaw
+    }
+
+    static func failClosedDocument(now: Date = Date()) -> SecureDroidPermissionDocument {
+        SecureDroidPermissionDocument(updatedAt: now)
+    }
+
+    func permissionLevel() -> DroidAgentToolPreferences.PermissionLevel {
+        DroidAgentToolPreferences.PermissionLevel(rawValue: permissionLevelRaw ?? "") ?? .managedDefault
+    }
+
+    func sessionModeID() -> String {
+        permissionLevel().sessionModeID
+    }
+}
+
 final class AgentPermissionSecureStore {
     static let shared = AgentPermissionSecureStore(secureStrings: SecureKeysService())
 
@@ -295,6 +328,7 @@ final class AgentPermissionSecureStore {
     private var claudeCache: SecureClaudePermissionDocument?
     private var openCodeCache: SecureOpenCodePermissionDocument?
     private var cursorCache: SecureCursorPermissionDocument?
+    private var droidCache: SecureDroidPermissionDocument?
     private var diagnosticsByDomain: [AgentPermissionSecureDomain: AgentPermissionStorageDiagnostic] = [:]
     private let permissionDecisionAccessMode: KeychainAccessMode = .nonInteractive(reason: .permissionDecision)
 
@@ -342,6 +376,7 @@ final class AgentPermissionSecureStore {
             claudeCache = nil
             openCodeCache = nil
             cursorCache = nil
+            droidCache = nil
         }
     }
 
@@ -379,6 +414,10 @@ final class AgentPermissionSecureStore {
             var cursor = SecureCursorPermissionDocument.failClosedDocument(now: resetDate)
             _ = normalizeCursor(&cursor)
             record(.cursor, resetLocked(cursor, domain: .cursor, cache: &cursorCache, deferred: &effects))
+
+            var droid = SecureDroidPermissionDocument.failClosedDocument(now: resetDate)
+            _ = normalizeDroid(&droid)
+            record(.droid, resetLocked(droid, domain: .droid, cache: &droidCache, deferred: &effects))
 
             return AgentPermissionStorageResetResult(
                 succeededDomains: succeededDomains,
@@ -424,6 +463,12 @@ final class AgentPermissionSecureStore {
     func cursorPermissions() -> SecureCursorPermissionDocument {
         withLockAndDeferredSideEffects { effects in
             loadCursorPermissionsLocked(deferred: &effects)
+        }
+    }
+
+    func droidPermissions() -> SecureDroidPermissionDocument {
+        withLockAndDeferredSideEffects { effects in
+            loadDroidPermissionsLocked(deferred: &effects)
         }
     }
 
@@ -485,6 +530,17 @@ final class AgentPermissionSecureStore {
     }
 
     @discardableResult
+    func updateDroidPermissions(_ mutation: (inout SecureDroidPermissionDocument) -> Void) -> Bool {
+        withLockAndDeferredSideEffects { effects in
+            var document = loadDroidPermissionsLocked(deferred: &effects)
+            mutation(&document)
+            normalizeDroid(&document)
+            document.updatedAt = now()
+            return saveLocked(document, domain: .droid, cache: &droidCache, deferred: &effects)
+        }
+    }
+
+    @discardableResult
     func setCodexPermissionLevel(_ level: CodexAgentToolPreferences.PermissionLevel) -> Bool {
         updateCodexPermissions { document in
             document.approvalPolicyRaw = level.approvalPolicy.persistedValue
@@ -510,6 +566,13 @@ final class AgentPermissionSecureStore {
     @discardableResult
     func setCursorPermissionLevel(_ level: CursorAgentToolPreferences.PermissionLevel) -> Bool {
         updateCursorPermissions { document in
+            document.permissionLevelRaw = level.rawValue
+        }
+    }
+
+    @discardableResult
+    func setDroidPermissionLevel(_ level: DroidAgentToolPreferences.PermissionLevel) -> Bool {
+        updateDroidPermissions { document in
             document.permissionLevelRaw = level.rawValue
         }
     }
@@ -563,6 +626,16 @@ final class AgentPermissionSecureStore {
             cache: &cursorCache,
             failClosedDocument: SecureCursorPermissionDocument.failClosedDocument(now: now()),
             normalize: normalizeCursor,
+            deferred: &effects
+        )
+    }
+
+    private func loadDroidPermissionsLocked(deferred effects: inout DeferredSideEffects) -> SecureDroidPermissionDocument {
+        loadLocked(
+            domain: .droid,
+            cache: &droidCache,
+            failClosedDocument: SecureDroidPermissionDocument.failClosedDocument(now: now()),
+            normalize: normalizeDroid,
             deferred: &effects
         )
     }
@@ -887,6 +960,21 @@ final class AgentPermissionSecureStore {
         return changed
     }
 
+    @discardableResult
+    private func normalizeDroid(_ document: inout SecureDroidPermissionDocument) -> Bool {
+        var changed = false
+        if document.schemaVersion != SecureDroidPermissionDocument.currentSchemaVersion {
+            document.schemaVersion = SecureDroidPermissionDocument.currentSchemaVersion
+            changed = true
+        }
+        let level = DroidAgentToolPreferences.PermissionLevel(rawValue: document.permissionLevelRaw ?? "") ?? .managedDefault
+        if document.permissionLevelRaw != level.rawValue {
+            document.permissionLevelRaw = level.rawValue
+            changed = true
+        }
+        return changed
+    }
+
     // MARK: - Helpers
 
     private func supportedSchemaVersion(of document: some Any) -> Int {
@@ -901,6 +989,8 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.currentSchemaVersion
         case _ as SecureCursorPermissionDocument:
             SecureCursorPermissionDocument.currentSchemaVersion
+        case _ as SecureDroidPermissionDocument:
+            SecureDroidPermissionDocument.currentSchemaVersion
         default:
             1
         }
@@ -917,6 +1007,8 @@ final class AgentPermissionSecureStore {
         case let value as SecureOpenCodePermissionDocument:
             value.schemaVersion
         case let value as SecureCursorPermissionDocument:
+            value.schemaVersion
+        case let value as SecureDroidPermissionDocument:
             value.schemaVersion
         default:
             1
@@ -935,6 +1027,8 @@ final class AgentPermissionSecureStore {
             SecureOpenCodePermissionDocument.failClosedDocument(now: now())
         case .cursor:
             SecureCursorPermissionDocument.failClosedDocument(now: now())
+        case .droid:
+            SecureDroidPermissionDocument.failClosedDocument(now: now())
         }
     }
 

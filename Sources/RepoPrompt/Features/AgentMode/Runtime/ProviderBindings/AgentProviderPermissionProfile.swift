@@ -150,8 +150,21 @@ extension AgentProviderPermissionProfile {
             openCodeSessionModeID
         case .cursor:
             nil
+        case .droid:
+            nil
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil
+        }
+    }
+
+    func droidPermissionLevel(
+        userConfigured: DroidAgentToolPreferences.PermissionLevel = DroidAgentToolPreferences.permissionLevel()
+    ) -> DroidAgentToolPreferences.PermissionLevel {
+        switch self {
+        case .userConfigured: userConfigured
+        case .mcpSafeDefaults: .managedDefault
+        case let .providerOverride(.droid(level)): level
+        case .providerOverride: .managedDefault
         }
     }
 }

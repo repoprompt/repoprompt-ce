@@ -40,6 +40,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     case codexExec
     case openCode
     case cursor
+    case droid
     case claudeCodeGLM
     case kimiCode
     case customClaudeCompatible
@@ -48,6 +49,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
     static let codexMCPClientID = "codex-mcp-client"
     static let openCodeMCPClientID = "opencode"
     static let cursorMCPClientID = "cursor"
+    static let droidMCPClientID = "droid"
 
     var commandName: String {
         switch self {
@@ -59,6 +61,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode"
         case .cursor:
             "cursor-agent"
+        case .droid:
+            "droid"
         }
     }
 
@@ -72,6 +76,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "OpenCode"
         case .cursor:
             "Cursor CLI"
+        case .droid:
+            "Droid CLI"
         case .claudeCodeGLM:
             ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI).normalizedDisplayName
         case .kimiCode:
@@ -91,6 +97,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             Self.openCodeMCPClientID
         case .cursor:
             Self.cursorMCPClientID
+        case .droid:
+            Self.droidMCPClientID
         }
     }
 
@@ -100,6 +108,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .openCode
         case .cursor:
             .cursor
+        case .droid:
+            .droid
         case .claudeCode, .codexExec, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             nil
         }
@@ -109,7 +119,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .droid:
             false
         }
     }
@@ -120,7 +130,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
 
     var requiresExpectedPIDOwnedAgentModeMCPRouting: Bool {
         switch self {
-        case .claudeCode, .codexExec, .openCode, .cursor, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .cursor, .droid, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
@@ -129,7 +139,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
         switch self {
         case .cursor:
             false
-        case .claudeCode, .codexExec, .openCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
+        case .claudeCode, .codexExec, .openCode, .droid, .claudeCodeGLM, .kimiCode, .customClaudeCompatible:
             true
         }
     }
@@ -145,6 +155,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             return "OpenCode ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .cursor:
             return "Cursor CLI ACP agent. Uses Cursor's ACP runtime and injects RepoPrompt MCP tools through ACP session configuration."
+        case .droid:
+            return "Droid ACP agent. Interactive Agent Mode uses RepoPrompt MCP tools; headless discovery/delegate runs use RepoPrompt's managed no-native-tools mode."
         case .claudeCodeGLM:
             let config = ClaudeCodeCompatibleBackendStore.shared.config(for: .glmZAI)
             if case let .claudeSlotMapping(mapping) = config.modelBehavior {
@@ -177,6 +189,8 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             "opencode_acp"
         case .cursor:
             "cursor_acp"
+        case .droid:
+            "droid_acp"
         }
     }
 
@@ -190,7 +204,7 @@ enum AgentProviderKind: String, CaseIterable, Hashable {
             .kimi
         case .customClaudeCompatible:
             .customCompatible
-        case .codexExec, .openCode, .cursor:
+        case .codexExec, .openCode, .cursor, .droid:
             nil
         }
     }
@@ -290,6 +304,16 @@ final class AgentRuntimeProviderService {
                 Self.logger.debug("Created CursorACPHeadlessAgentProvider")
             }
             return CursorACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
+        case .droid:
+            let config = DroidAgentConfig(
+                modelString: modelString,
+                enableDebugLogging: Self.enableDebugLogging,
+                toolProfile: .headless
+            )
+            if Self.enableDebugLogging {
+                Self.logger.debug("Created DroidACPHeadlessAgentProvider")
+            }
+            return DroidACPHeadlessAgentProvider(config: config, workspacePath: workspacePath)
         }
     }
 }

@@ -291,6 +291,10 @@ enum ACPAIModelCatalog {
         cursorModelOptionsFromStore().map { .cursorCustom(name: $0.rawValue) }
     }
 
+    static func droidModelsFromStore() -> [AIModel] {
+        droidModelOptionsFromStore().map { .droidCustom(name: $0.rawValue) }
+    }
+
     static func openCodeModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
@@ -301,12 +305,23 @@ enum ACPAIModelCatalog {
     static func cursorModelOption(for rawValue: String) -> AgentModelOption? {
         let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !normalized.isEmpty else { return nil }
-        if let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .cursor)?.options.first(where: {
+        return cursorModelOptionsFromStore()
+            .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
+    }
+
+    static func droidModelOptionsFromStore() -> [AgentModelOption] {
+        AgentACPModelRegistry.shared.resolvedSnapshot(for: .droid)?.options ?? []
+    }
+
+    static func droidModelOption(for rawValue: String) -> AgentModelOption? {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        if let discovered = AgentACPModelRegistry.shared.resolvedSnapshot(for: .droid)?.options.first(where: {
             $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame
         }) {
             return discovered
         }
-        return cursorModelOptionsFromStore()
+        return droidModelOptionsFromStore()
             .first { $0.rawValue.caseInsensitiveCompare(normalized) == .orderedSame }
     }
 

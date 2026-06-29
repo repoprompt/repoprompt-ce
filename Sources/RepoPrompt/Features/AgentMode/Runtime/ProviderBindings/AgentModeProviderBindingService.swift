@@ -223,6 +223,18 @@ final class AgentModeProviderBindingService {
                         updateActiveBindings(session)
                     }
                 }
+            case .droid:
+                let runtime = runtimePermission(for: session.selectedAgent, profile: session.permissionProfile)
+                guard session.runState.isActive, let controller = session.acpController else { continue }
+                Task { @MainActor in
+                    await controller.setAutoApproveAllToolPermissions(runtime.autoApproveAllACPToolPermissions)
+                    if runtime.autoApproveAllACPToolPermissions, let pendingApproval = session.pendingApproval {
+                        await controller.respondToPermissionRequest(id: pendingApproval.requestID.displayValue, decision: .acceptForSession)
+                    }
+                    if session.tabID == currentTabID {
+                        updateActiveBindings(session)
+                    }
+                }
             }
         }
 

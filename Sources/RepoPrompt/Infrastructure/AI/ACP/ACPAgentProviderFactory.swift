@@ -21,6 +21,14 @@ enum ACPAgentProviderFactory {
                     modelString: modelString
                 )
             )
+        case .droid:
+            DroidACPAgentProvider(
+                config: DroidAgentConfig(
+                    modelString: modelString,
+                    enableDebugLogging: AgentRuntimeProviderService.enableDebugLogging,
+                    toolProfile: .agentMode
+                )
+            )
         case .claudeCode, .claudeCodeGLM, .kimiCode, .customClaudeCompatible, .codexExec:
             nil
         }

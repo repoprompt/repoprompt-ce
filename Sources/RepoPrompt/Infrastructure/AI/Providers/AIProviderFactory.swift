@@ -18,7 +18,7 @@ class AIProviderFactory {
         }
 
         // CLI providers don't need API keys - they leverage existing authentication
-        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor {
+        if providerType == .claudeCode || providerType == .codex || providerType == .openCode || providerType == .cursor || providerType == .droid {
             return try await createProvider(
                 for: providerType,
                 key: "",
@@ -87,6 +87,9 @@ class AIProviderFactory {
             return OpenCodeCLIProvider()
         case .cursor:
             return CursorCLIProvider()
+        case .droid:
+            // DroidCLIProvider for non-agent chat is not yet implemented.
+            return BlankProvider()
         case .customProvider:
             let config = try CustomProviderConfiguration.load()
 
@@ -178,6 +181,7 @@ enum AIProviderType: Codable, Equatable {
     case codex // <-- New Codex CLI provider case
     case openCode // OpenCode CLI provider case
     case cursor // Cursor CLI provider case
+    case droid // Droid CLI provider case
 }
 
 extension AIProviderType {
@@ -199,6 +203,7 @@ extension AIProviderType {
         case .codex: "Codex CLI"
         case .openCode: "OpenCode"
         case .cursor: "Cursor CLI"
+        case .droid: "Droid CLI"
         }
     }
 

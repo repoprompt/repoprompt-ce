@@ -40,11 +40,13 @@ struct CLIProvidersSettingsView: View {
     @State private var isLoggingIntoCodex = false
     @State private var isLoadingOpenCode = false
     @State private var isLoadingCursor = false
+    @State private var isLoadingDroid = false
     @State private var isLoadingZAI = false
     @State private var showClaudeCodeTraceDump = false
     @State private var showCodexTraceDump = false
     @State private var showOpenCodeTraceDump = false
     @State private var showCursorTraceDump = false
+    @State private var showDroidTraceDump = false
     @State private var isClaudePromptSettingsExpanded = false
     @State private var claudeNativePromptMode = ClaudeAgentToolPreferences.agentModePromptDelivery()
 
@@ -57,6 +59,7 @@ struct CLIProvidersSettingsView: View {
     @State private var isCodexExpanded: Bool = false
     @State private var isOpenCodeExpanded: Bool = false
     @State private var isCursorExpanded: Bool = false
+    @State private var isDroidExpanded: Bool = false
 
     // Per-backend secret text entry buffers (GLM uses viewModel.zaiApiKey directly).
     // SEARCH-HELPER: Claude-Compatible Backends settings, Kimi API key entry, Custom backend key entry
@@ -75,6 +78,7 @@ struct CLIProvidersSettingsView: View {
             || viewModel.isCodexConnected
             || viewModel.isOpenCodeConnected
             || viewModel.isCursorConnected
+            || viewModel.isDroidConnected
     }
 
     private var codexStatusText: String? {
@@ -132,6 +136,7 @@ struct CLIProvidersSettingsView: View {
                 claudeCompatibleBackendsSection
                 openCodeCard
                 cursorCard
+                droidCard
             }
             .padding(16)
         }
@@ -171,6 +176,13 @@ struct CLIProvidersSettingsView: View {
                     primaryButton: .default(Text("Save Trace to Downloads"), action: dumpCursorTrace),
                     secondaryButton: .cancel(Text("OK"), action: { showCursorTraceDump = false })
                 )
+            } else if showDroidTraceDump, viewModel.hasDroidTrace() {
+                Alert(
+                    title: Text("CLI Provider Management"),
+                    message: Text(alertMessage),
+                    primaryButton: .default(Text("Save Trace to Downloads"), action: dumpDroidTrace),
+                    secondaryButton: .cancel(Text("OK"), action: { showDroidTraceDump = false })
+                )
             } else {
                 Alert(
                     title: Text("CLI Provider Management"),
@@ -185,6 +197,7 @@ struct CLIProvidersSettingsView: View {
                 showCodexTraceDump = false
                 showOpenCodeTraceDump = false
                 showCursorTraceDump = false
+                showDroidTraceDump = false
             }
         }
     }
@@ -368,6 +381,9 @@ struct CLIProvidersSettingsView: View {
             return level.autoApprovesACPToolPermissions
                 ? "ACP auto-approve: on"
                 : "ACP auto-approve: off"
+        case .droid:
+            let level = DroidAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: secureStore)
+            return "ACP session mode: \(level.displayName)"
         }
     }
 
@@ -434,7 +450,7 @@ struct CLIProvidersSettingsView: View {
             } else {
                 permissionControlsUnavailableRow()
             }
-        case .openCode, .cursor:
+        case .openCode, .cursor, .droid:
             EmptyView()
         }
     }
@@ -1847,6 +1863,85 @@ struct CLIProvidersSettingsView: View {
         }
     }
 
+    // MARK: - Droid Card
+
+    private var droidCard: some View {
+        providerCard(
+            title: "Droid CLI",
+            subtitle: "Uses Droid's ACP runtime for Agent Mode, headless tasks, and chat. RepoPrompt MCP tools are added only for agent/headless runs.",
+            infoURL: "https://docs.factory.ai/cli/getting-started/overview",
+            isConnected: viewModel.isDroidConnected,
+            isExpanded: $isDroidExpanded
+        ) {
+            VStack(alignment: .leading, spacing: 12) {
+                if viewModel.isDroidConnected {
+                    HStack(spacing: 8) {
+                        Button(action: { testDroidConnection() }) {
+                            if isLoadingDroid {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Test Connection", systemImage: "antenna.radiowaves.left.and.right")
+                            }
+                        }
+                        .disabled(isLoadingDroid)
+                        .buttonStyle(CustomButtonStyle())
+
+                        Spacer()
+
+                        Button(action: { signOutFromDroid() }) {
+                            Text("Sign Out")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(CustomButtonStyle())
+                    }
+
+                    Text(droidModelSummary)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    permissionSummaryLinkRow(for: .droid)
+                } else {
+                    HStack(spacing: 10) {
+                        Button(action: { testDroidConnection() }) {
+                            if isLoadingDroid {
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                                    .frame(height: 16)
+                            } else {
+                                Label("Connect", systemImage: "link")
+                            }
+                        }
+                        .disabled(isLoadingDroid)
+                        .buttonStyle(CustomButtonStyle())
+
+                        if let error = viewModel.droidError, !error.isEmpty {
+                            Text(error)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
+                            Text("Run `droid auth login` in your terminal to authenticate.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private var droidModelSummary: String {
+        let options = viewModel.availableDroidModelOptions
+        let count = options.count
+        if count == 0 {
+            return "Model discovery will refresh in the background."
+        }
+        return count == 1 ? "1 model discovered." : "\(count) models discovered."
+    }
+
     private var cursorModelSummary: String {
         let options = viewModel.availableCursorModelOptions
         let count = options.count
@@ -2248,6 +2343,58 @@ struct CLIProvidersSettingsView: View {
         viewModel.disconnectCursor()
         alertMessage = "Signed out from Cursor CLI"
         showCursorTraceDump = false
+        showAlert = true
+        onAPIKeyUpdated?()
+    }
+
+    private func testDroidConnection() {
+        isLoadingDroid = true
+        Task {
+            do {
+                let ok = try await viewModel.testDroidConnection()
+                await MainActor.run {
+                    isLoadingDroid = false
+                    if ok {
+                        let modelSummary = droidModelSummary.lowercased()
+                        alertMessage = "Droid CLI connected. \(modelSummary)"
+                        showDroidTraceDump = false
+                    }
+                    showAlert = true
+                    onAPIKeyUpdated?()
+                }
+            } catch {
+                await MainActor.run {
+                    isLoadingDroid = false
+                    alertMessage = viewModel.droidError ?? error.asFriendlyString()
+                    showDroidTraceDump = viewModel.hasDroidTrace()
+                    showAlert = true
+                }
+            }
+        }
+    }
+
+    private func dumpDroidTrace() {
+        do {
+            let url = try viewModel.dumpDroidTrace()
+            alertMessage = "Trace saved to Downloads/\(url.lastPathComponent)."
+        } catch let error as CLIProcessLogCollectorError {
+            switch error {
+            case .noEntries:
+                alertMessage = "No trace data is available to export yet."
+            case .downloadsDirectoryUnavailable:
+                alertMessage = "Unable to locate the Downloads folder."
+            }
+        } catch {
+            alertMessage = "Failed to export trace: \(error.localizedDescription)"
+        }
+        showDroidTraceDump = false
+        showAlert = true
+    }
+
+    private func signOutFromDroid() {
+        viewModel.disconnectDroid()
+        alertMessage = "Signed out from Droid CLI"
+        showDroidTraceDump = false
         showAlert = true
         onAPIKeyUpdated?()
     }

@@ -172,6 +172,22 @@ struct AgentPermissionCapabilitySummaryBuilder {
                 approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
                 warnings: warnings
             )
+        case .droid:
+            let level = droidPermissionLevel(profile: profile)
+            let warnings = level == .fullAccess
+                ? ["Droid auto-approves all ACP tool permissions."]
+                : []
+            return AgentPermissionCapabilitySummary(
+                providerID: providerID,
+                providerName: providerID.displayName,
+                isAvailable: isAvailable,
+                fileMutation: "Auto-approve ACP tools: \(level.autoApprovesACPToolPermissions ? "on" : "off")",
+                shell: "Handled by Droid CLI",
+                externalMCP: "Third-party MCP: not supported",
+                search: "Managed by Droid CLI",
+                approvalModeDescription: level.autoApprovesACPToolPermissions ? "Auto-approve: on" : "Auto-approve: off",
+                warnings: warnings
+            )
         }
     }
 
@@ -193,6 +209,7 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .claude: availability.claudeCodeAvailable
         case .openCode: availability.openCodeAvailable
         case .cursor: availability.cursorAvailable
+        case .droid: availability.droidAvailable
         }
     }
 
@@ -249,6 +266,19 @@ struct AgentPermissionCapabilitySummaryBuilder {
         case .mcpSafeDefaults:
             .managedDefault
         case let .providerOverride(.cursor(level)):
+            level
+        case .providerOverride:
+            .managedDefault
+        }
+    }
+
+    private func droidPermissionLevel(profile: AgentProviderPermissionProfile) -> DroidAgentToolPreferences.PermissionLevel {
+        switch profile {
+        case .userConfigured:
+            DroidAgentToolPreferences.permissionLevel(defaults: defaults, secureStore: securePermissions)
+        case .mcpSafeDefaults:
+            .managedDefault
+        case let .providerOverride(.droid(level)):
             level
         case .providerOverride:
             .managedDefault

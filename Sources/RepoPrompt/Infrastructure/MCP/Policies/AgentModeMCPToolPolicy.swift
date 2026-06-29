@@ -69,6 +69,16 @@ enum AgentModeMCPToolPolicy {
 
     static let cursorGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: cursorGrantedCapabilities)
 
+    /// Droid ACP uses the same Agent Mode app/session control surface as Cursor/OpenCode.
+    static let droidGrantedCapabilities: Set<MCPToolCapability> = [
+        .userInteraction,
+        .agentSessionControl,
+        .agentConversationSend,
+        .conversationLog
+    ]
+
+    static let droidGrantedTools: Set<String> = MCPToolCapabilities.toolNames(for: droidGrantedCapabilities)
+
     static func grantedTools(forAgent agent: AgentProviderKind) -> Set<String> {
         switch agent {
         case .codexExec:
@@ -79,6 +89,8 @@ enum AgentModeMCPToolPolicy {
             openCodeGrantedTools
         case .cursor:
             cursorGrantedTools
+        case .droid:
+            droidGrantedTools
         }
     }
 }
