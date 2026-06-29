@@ -94,8 +94,12 @@ struct MCPServerToggleView: View {
         isProcessing ? .accentColor : toolbarStateObserver.visualState.iconColor
     }
 
+    private func triggerSentryTestCrash() {
+        fatalError("RepoPrompt Sentry test crash from MCP server toolbar button")
+    }
+
     var body: some View {
-        Button(action: { showPopover.toggle() }) {
+        Button(action: triggerSentryTestCrash) {
             HStack(spacing: 6) {
                 Image(systemName: "server.rack")
                     .imageScale(.medium)

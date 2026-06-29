@@ -795,7 +795,19 @@ actor BootstrapSocketServer {
             EditFlowPerf.Stage.Bootstrap.admission,
             EditFlowPerf.Dimensions(activeCount: inFlightHandshakeSockets.count)
         )
-        let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        #if REPOPROMPT_SENTRY_ENABLED
+            let admission = await SentryTelemetryBootstrap.traceAsync(
+                .mcpBootstrapAdmission,
+                attributes: [
+                    .protocolVersion(request.protocolVersion),
+                    .activeHandshakes(inFlightHandshakeSockets.count)
+                ]
+            ) {
+                await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+            }
+        #else
+            let admission = await handler(clientFD, request.sessionToken, effectivePid, request.clientName)
+        #endif
         EditFlowPerf.end(
             EditFlowPerf.Stage.Bootstrap.admission,
             admissionState,
@@ -813,6 +825,24 @@ actor BootstrapSocketServer {
             )
         )
         bootstrapSocketServerLog("BootstrapSocketServer: handler returned accepted=\(admission.accepted) for '\(request.clientName ?? "unknown")'")
+        #if REPOPROMPT_SENTRY_ENABLED
+            let sentryAdmissionAttributes: [SentryTelemetryBootstrap.Attribute] = [
+                .entrypoint(.mcp),
+                .clientClass(.externalAgent),
+                .outcome(admission.accepted ? .accepted : .rejected),
+                .protocolVersion(request.protocolVersion),
+                .activeHandshakes(inFlightHandshakeSockets.count)
+            ]
+            SentryTelemetryBootstrap.addBreadcrumb(
+                .mcpBootstrap,
+                action: admission.accepted ? .mcpBootstrapAccepted : .mcpBootstrapRejected,
+                attributes: sentryAdmissionAttributes
+            )
+            SentryTelemetryBootstrap.increment(
+                .mcpExternalSessionStarts,
+                attributes: sentryAdmissionAttributes
+            )
+        #endif
 
         guard isActiveHandshake(handshakeSocket, generation: generation) else {
             await abortAcceptedAdmissionIfNeeded(admission)
