@@ -245,21 +245,33 @@ final actor ClaudeNativeProcessSessionController {
     /// method releases file-handle callbacks, closes stdin, sends SIGTERM to any
     /// still-owned child process, and schedules expected-PID cleanup on the MCP actor.
     private func performSynchronousDeinitCleanup() {
-        stdoutChunkChannel?.finish()
-        stderrChunkChannel?.finish()
-        stdoutConsumerTask?.cancel()
-        stderrConsumerTask?.cancel()
+        closeOutputChannelsAndInput()
 
         if let process {
-            process.stdout.readabilityHandler = nil
-            process.stderr.readabilityHandler = nil
-            process.stdin?.closeFile()
             _ = Darwin.kill(process.pid, SIGTERM)
             var status: Int32 = 0
             _ = Darwin.waitpid(process.pid, &status, WNOHANG)
         }
 
         scheduleExpectedAgentPIDDeinitClearIfNeeded()
+    }
+
+    private func closeOutputChannelsAndInput() {
+        stdoutChunkChannel?.finish()
+        stderrChunkChannel?.finish()
+        stdoutConsumerTask?.cancel()
+        stderrConsumerTask?.cancel()
+
+        stdoutChunkChannel = nil
+        stderrChunkChannel = nil
+        stdoutConsumerTask = nil
+        stderrConsumerTask = nil
+
+        if let process {
+            process.stdout.readabilityHandler = nil
+            process.stderr.readabilityHandler = nil
+            process.stdin?.closeFile()
+        }
     }
 
     /// Clears MCP expected-agent PID registration when async `shutdown()` did not run.
@@ -494,20 +506,9 @@ final actor ClaudeNativeProcessSessionController {
         clearTurnIDQueue()
         cancelAuthoritativeLifecycleState()
 
-        // Tear down chunk channels and consumer tasks before process cleanup.
-        stdoutChunkChannel?.finish()
-        stderrChunkChannel?.finish()
-        stdoutConsumerTask?.cancel()
-        stderrConsumerTask?.cancel()
-        stdoutChunkChannel = nil
-        stderrChunkChannel = nil
-        stdoutConsumerTask = nil
-        stderrConsumerTask = nil
+        closeOutputChannelsAndInput()
 
         if let process {
-            process.stdout.readabilityHandler = nil
-            process.stderr.readabilityHandler = nil
-            process.stdin?.closeFile()
             let pid = process.pid
             _ = await ProcessTermination.terminateAndReap(
                 pid: pid,

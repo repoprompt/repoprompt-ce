@@ -604,7 +604,7 @@ final class AgentModeViewModel: ObservableObject {
     private var skillCatalogDeltaObservationTask: Task<Void, Never>?
     private var skillCatalogRefreshDebounceTask: Task<Void, Never>?
     let sessionIndexStore = AgentWorkspaceSessionIndexStore()
-    let workspaceSwitchProvider: WorkspaceSwitchSessionProvider
+    let workspaceSwitchProvider: AgentModeWorkspaceSwitchCleanupProvider
     private var sessionListCacheTask: Task<Void, Never>?
     private var sessionListCacheGeneration: UInt64 = 0
     private var activeSessionIndexRefreshToken: SessionIndexRefreshToken?
@@ -812,7 +812,7 @@ final class AgentModeViewModel: ObservableObject {
         }
 
         func test_receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
-            receiveWorkspaceSwitchNotification(workspace)
+            sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
         }
 
         func test_handleWorkspaceSwitch(
@@ -876,7 +876,7 @@ final class AgentModeViewModel: ObservableObject {
             lastKnownWorkspaceSnapshot = activeWorkspace
             test_activeWorkspaceIDForSessionIndexOverride = activeWorkspace.id
             sessionIndexStore.setSessionIndex(entries)
-            rebuildSessionSortDatesFromIndex()
+            sessionIndexStore.rebuildSessionSortDatesFromIndex()
             sessionIndexStore.setSessionListCacheReadyDirectly(true)
         }
 
@@ -1520,7 +1520,7 @@ final class AgentModeViewModel: ObservableObject {
             }
         )
         self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
-        workspaceSwitchProvider = WorkspaceSwitchSessionProvider(
+        workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
             codexCoordinator: codexCoordinator,
             claudeCoordinator: claudeCoordinator
         )
@@ -1716,7 +1716,7 @@ final class AgentModeViewModel: ObservableObject {
                 }
             )
             self.clearConsumedAttachmentsAfterProviderConsumption = clearConsumedAttachmentsAfterProviderConsumption
-            workspaceSwitchProvider = WorkspaceSwitchSessionProvider(
+            workspaceSwitchProvider = AgentModeWorkspaceSwitchCleanupProvider(
                 codexCoordinator: codexCoordinator,
                 claudeCoordinator: claudeCoordinator
             )
@@ -2252,7 +2252,7 @@ final class AgentModeViewModel: ObservableObject {
         listeners.addToken(
             workspaceManager?.addWorkspaceDidSwitchListener(label: "agentMode") { [weak self] workspace in
                 guard let self else { return }
-                let owner = receiveWorkspaceSwitchNotification(workspace)
+                let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
                 Task { @MainActor in
                     await self.handleWorkspaceSwitch(workspace, owner: owner)
                 }
@@ -2646,11 +2646,11 @@ final class AgentModeViewModel: ObservableObject {
             return
         }
         guard let owner = sessionIndexOwner,
-              isSessionIndexOwnerCurrent(owner)
+              sessionIndexStore.isOwnerCurrent(owner)
         else {
             return
         }
-        setSessionListCacheReady(false, for: owner)
+        sessionIndexStore.setSessionListCacheReady(false, for: owner)
         refreshSessionListCache(for: workspace, owner: owner)
     }
 
@@ -2689,10 +2689,10 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionLoadInProgressTabID = targetTabID
         if let workspace = workspaceManager?.activeWorkspace,
            let owner = sessionIndexOwner,
-           isSessionIndexOwnerCurrent(owner),
+           sessionIndexStore.isOwnerCurrent(owner),
            owner.workspaceID == workspace.id
         {
-            setSessionListCacheReady(false, for: owner)
+            sessionIndexStore.setSessionListCacheReady(false, for: owner)
             refreshSessionListCache(for: workspace, owner: owner)
         }
         #if DEBUG
@@ -2763,11 +2763,7 @@ final class AgentModeViewModel: ObservableObject {
             await cancelAgentRun(tabID: session.tabID)
         }
         await cleanupACPStateForDeletedSession(session)
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
+        await session.disposeProviderIfPresent()
         await codexCoordinator.shutdownCodexSession(session)
         await claudeCoordinator.shutdownClaudeSession(session)
         let sessionID = boundSessionID(for: session.tabID)
@@ -3282,7 +3278,7 @@ final class AgentModeViewModel: ObservableObject {
         sessionID: UUID?
     ) {
         guard let token = activeSessionIndexRefreshToken,
-              isSessionIndexOwnerCurrent(token.owner),
+              sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(tabID)
         else {
             return
@@ -3293,12 +3289,12 @@ final class AgentModeViewModel: ObservableObject {
         let workspace = currentWorkspaceSnapshot(for: token.owner)
             ?? activeSessionIndexRefreshWorkspace
         cancelSessionIndexRefresh(releaseFrozenOrder: false, owner: token.owner)
-        setSessionListCacheReady(false, for: token.owner)
+        sessionIndexStore.setSessionListCacheReady(false, for: token.owner)
         guard let workspace,
               workspace.id == token.owner.workspaceID,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
-            releaseSidebarRestoreFrozenOrder(for: token.owner)
+            sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
             return
         }
         refreshSessionListCache(for: workspace, owner: token.owner)
@@ -5728,11 +5724,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     private func invalidateProviderContextForExecutionLocationChange(_ session: TabSession) async {
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
+        await session.disposeProviderIfPresent()
         if let controller = session.acpController {
             session.acpController = nil
             AgentModeProcessRunIdentity.clearProcessRunID(for: session)
@@ -9447,21 +9439,6 @@ final class AgentModeViewModel: ObservableObject {
         }
     }
 
-    private func receiveWorkspaceSwitchNotification(_ workspace: WorkspaceModel?) -> SessionIndexOwner {
-        sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
-    }
-
-    private func isWorkspaceActivationCurrent(
-        _ owner: SessionIndexOwner,
-        workspace: WorkspaceModel?
-    ) -> Bool {
-        sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace)
-    }
-
-    private func isSessionIndexOwnerCurrent(_ owner: SessionIndexOwner) -> Bool {
-        sessionIndexStore.isOwnerCurrent(owner)
-    }
-
     var ownerValidatedSessionIndex: [UUID: AgentSessionIndexEntry] {
         sessionIndexStore.ownerValidatedSessionIndex
     }
@@ -9482,21 +9459,13 @@ final class AgentModeViewModel: ObservableObject {
         sessionIndexStore.ownerValidatedSidebarRestoreFrozenOrderByTabID
     }
 
-    private func releaseSidebarRestoreFrozenOrder(for owner: SessionIndexOwner) {
-        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: owner)
-    }
-
-    private func setSessionListCacheReady(_ ready: Bool, for owner: SessionIndexOwner) {
-        sessionIndexStore.setSessionListCacheReady(ready, for: owner)
-    }
-
     private func cancelSessionIndexRefresh(
         releaseFrozenOrder: Bool,
         owner: SessionIndexOwner? = nil
     ) {
         let refreshOwner = owner ?? activeSessionIndexRefreshToken?.owner
         if let token = activeSessionIndexRefreshToken,
-           isSessionIndexOwnerCurrent(token.owner)
+           sessionIndexStore.isOwnerCurrent(token.owner)
         {
             publishSessionIndexReplacement(activeSessionIndexRefreshBaselineEntries, token: token)
         }
@@ -9511,7 +9480,7 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
         if releaseFrozenOrder, let refreshOwner {
-            releaseSidebarRestoreFrozenOrder(for: refreshOwner)
+            sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: refreshOwner)
         }
     }
 
@@ -9519,16 +9488,10 @@ final class AgentModeViewModel: ObservableObject {
         _ owner: SessionIndexOwner,
         workspace: WorkspaceModel?
     ) {
-        guard isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
         cancelSessionIndexRefresh(releaseFrozenOrder: false)
         sessionIndexStore.installOwner(owner, workspace: workspace)
         lastSidebarContentFingerprint = nil
-    }
-
-    private func sessionIndexEntriesApplyingLocalOverlay(
-        to base: [UUID: AgentSessionIndexEntry]
-    ) -> [UUID: AgentSessionIndexEntry] {
-        sessionIndexStore.sessionIndexEntriesApplyingLocalOverlay(to: base)
     }
 
     private func publishSessionIndexReplacement(
@@ -9536,11 +9499,11 @@ final class AgentModeViewModel: ObservableObject {
         token: SessionIndexRefreshToken
     ) {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return
         }
-        let replacement = sessionIndexEntriesApplyingLocalOverlay(to: base)
+        let replacement = sessionIndexStore.sessionIndexEntriesApplyingLocalOverlay(to: base)
         sessionIndexStore.setSessionIndexAndRebuildSortDates(replacement)
     }
 
@@ -9550,10 +9513,6 @@ final class AgentModeViewModel: ObservableObject {
 
     private func applyLocalSessionIndexRemoval(sessionID: UUID) {
         sessionIndexStore.applyLocalRemoval(sessionID: sessionID)
-    }
-
-    private func rebuildSessionSortDatesFromIndex() {
-        sessionIndexStore.rebuildSessionSortDatesFromIndex()
     }
 
     private func currentWorkspaceSnapshot(for owner: SessionIndexOwner) -> WorkspaceModel? {
@@ -9597,7 +9556,7 @@ final class AgentModeViewModel: ObservableObject {
     }
 
     func handleWorkspaceSwitch(_ workspace: WorkspaceModel?) async {
-        let owner = receiveWorkspaceSwitchNotification(workspace)
+        let owner = sessionIndexStore.receiveWorkspaceSwitchNotification(workspace)
         await handleWorkspaceSwitch(workspace, owner: owner)
     }
 
@@ -9605,10 +9564,10 @@ final class AgentModeViewModel: ObservableObject {
         _ workspace: WorkspaceModel?,
         owner: SessionIndexOwner
     ) async {
-        guard isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
+        guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace) else { return }
         lastKnownWorkspaceSnapshot = workspace
         installSessionIndexOwner(owner, workspace: workspace)
-        guard isSessionIndexOwnerCurrent(owner) else { return }
+        guard sessionIndexStore.isOwnerCurrent(owner) else { return }
         #if DEBUG
             let workspaceSwitchStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
             let workspaceSwitchInitialSessions = sessions.count
@@ -9692,8 +9651,8 @@ final class AgentModeViewModel: ObservableObject {
             targets: cleanupTargets,
             reason: "workspace_switch"
         )
-        guard isWorkspaceActivationCurrent(owner, workspace: workspace),
-              isSessionIndexOwnerCurrent(owner)
+        guard sessionIndexStore.isWorkspaceActivationCurrent(owner, workspace: workspace),
+              sessionIndexStore.isOwnerCurrent(owner)
         else {
             return
         }
@@ -9807,7 +9766,7 @@ final class AgentModeViewModel: ObservableObject {
     ) {
         guard let owner = explicitOwner ?? sessionIndexOwner,
               owner.workspaceID == workspace.id,
-              isSessionIndexOwnerCurrent(owner)
+              sessionIndexStore.isOwnerCurrent(owner)
         else {
             return
         }
@@ -9875,7 +9834,7 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        setSessionListCacheReady(false, for: owner)
+        sessionIndexStore.setSessionListCacheReady(false, for: owner)
 
         if Self.shouldSkipSessionListCacheRefresh(
             for: workspace,
@@ -10009,7 +9968,7 @@ final class AgentModeViewModel: ObservableObject {
         reason: String
     ) {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner),
+              sessionIndexStore.isOwnerCurrent(token.owner),
               workspace.id == token.owner.workspaceID
         else {
             return
@@ -10024,8 +9983,8 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshValidTabIDs.removeAll()
         activeSessionIndexRefreshBoundSessionIDByTabID.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        setSessionListCacheReady(true, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
+        sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
+        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
         #if DEBUG
             WorkspaceRestorePerfLog.log(
                 "agentSessionIndex.refreshSkipped windowID=\(windowID) workspaceID=\(WorkspaceRestorePerfLog.shortID(workspace.id)) activationEpoch=\(token.owner.activationEpoch) generation=\(token.generation) reason=\(reason) managerInitialized=\(workspaceManager?.isInitialized == true) managerSwitching=\(workspaceManager?.isSwitchingWorkspace == true)"
@@ -10055,7 +10014,7 @@ final class AgentModeViewModel: ObservableObject {
         token: SessionIndexRefreshToken
     ) -> Bool {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner),
+              sessionIndexStore.isOwnerCurrent(token.owner),
               activeSessionIndexRefreshValidTabIDs.contains(entry.tabID)
         else {
             return false
@@ -10083,7 +10042,7 @@ final class AgentModeViewModel: ObservableObject {
             let applyStartMS = WorkspaceRestorePerfLog.timestampMSIfEnabled()
         #endif
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return
         }
@@ -10154,7 +10113,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private func prepareSidebarIndexStreamRetry(token: SessionIndexRefreshToken) -> Bool {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return false
         }
@@ -10169,7 +10128,7 @@ final class AgentModeViewModel: ObservableObject {
 
     private func applySidebarIndexCompletion(token: SessionIndexRefreshToken) {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return
         }
@@ -10183,14 +10142,14 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        setSessionListCacheReady(true, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
+        sessionIndexStore.setSessionListCacheReady(true, for: token.owner)
+        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
         scheduleSidebarAutoArchive(reason: .sessionListReady)
     }
 
     private func applySidebarIndexFailure(token: SessionIndexRefreshToken) {
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             return
         }
@@ -10204,8 +10163,8 @@ final class AgentModeViewModel: ObservableObject {
         activeSessionIndexRefreshPrioritizedEntries.removeAll()
         activeSessionIndexRefreshFullEntries.removeAll()
         activeSessionIndexRefreshHasPublishedFullBatch = false
-        setSessionListCacheReady(false, for: token.owner)
-        releaseSidebarRestoreFrozenOrder(for: token.owner)
+        sessionIndexStore.setSessionListCacheReady(false, for: token.owner)
+        sessionIndexStore.releaseSidebarRestoreFrozenOrder(for: token.owner)
     }
 
     private func notePrioritizedActiveSessionRestoreStatus(
@@ -10230,14 +10189,14 @@ final class AgentModeViewModel: ObservableObject {
         #endif
         guard let prioritizedTabID else {
             let shouldContinue = activeSessionIndexRefreshToken == token
-                && isSessionIndexOwnerCurrent(token.owner)
+                && sessionIndexStore.isOwnerCurrent(token.owner)
             #if DEBUG
                 logActiveRestoreWait(outcome: "noPrioritizedTab", waited: false)
             #endif
             return shouldContinue
         }
         guard activeSessionIndexRefreshToken == token,
-              isSessionIndexOwnerCurrent(token.owner)
+              sessionIndexStore.isOwnerCurrent(token.owner)
         else {
             #if DEBUG
                 logActiveRestoreWait(outcome: "generationChangedBeforeStatus", waited: false)
@@ -10252,7 +10211,7 @@ final class AgentModeViewModel: ObservableObject {
         }
         guard sessions[prioritizedTabID]?.persistedLoadTask != nil else {
             let shouldContinue = activeSessionIndexRefreshToken == token
-                && isSessionIndexOwnerCurrent(token.owner)
+                && sessionIndexStore.isOwnerCurrent(token.owner)
             #if DEBUG
                 logActiveRestoreWait(outcome: "notWaitingNoPersistedLoadTask", waited: false)
             #endif
@@ -15287,9 +15246,7 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
-            if let provider = session.provider {
-                await provider.dispose()
-            }
+            await session.disposeProviderIfPresent()
             await codexCoordinator.shutdownCodexSession(session)
             await claudeCoordinator.shutdownClaudeSession(session)
             await cleanupMCPRunRoutingIfPresent(
@@ -15358,9 +15315,7 @@ final class AgentModeViewModel: ObservableObject {
             cancelPendingInstruction(for: session)
             await cleanupACPStateForDeletedSession(session)
             await teardownMCPControl(for: session, cleanupSessionStore: true)
-            if let provider = session.provider {
-                await provider.dispose()
-            }
+            await session.disposeProviderIfPresent()
             await codexCoordinator.shutdownCodexSession(session)
             await claudeCoordinator.shutdownClaudeSession(session)
         }

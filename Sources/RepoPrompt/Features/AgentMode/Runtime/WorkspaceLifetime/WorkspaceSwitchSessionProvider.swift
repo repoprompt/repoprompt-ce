@@ -3,7 +3,7 @@ import Foundation
 /// Snapshot of a session needed for background cleanup after workspace switch.
 struct WorkspaceSwitchSessionCleanupTarget {
     let tabID: UUID
-    let session: TabSession
+    let session: AgentModeViewModel.TabSession
     let boundSessionID: UUID?
     let runID: UUID?
 }
@@ -26,7 +26,7 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// clears mcpControlContext, etc.). The session is already detached
     /// from the active workspace.
     func teardownMCPControlForDiscardedSession(
-        _ session: TabSession,
+        _ session: AgentModeViewModel.TabSession,
         cleanupSessionStore: Bool,
         publishChanges: Bool,
         deactivateLiveControlContext: Bool
@@ -35,14 +35,14 @@ protocol WorkspaceSwitchSessionProviderDelegate: AnyObject {
     /// Cleanup MCP run routing for a discarded session.
     func cleanupMCPRunRoutingForDiscardedSession(
         boundSessionID: UUID?,
-        liveSession: TabSession,
+        liveSession: AgentModeViewModel.TabSession,
         explicitRunID: UUID?,
         reason: String
     ) async
 }
 
 @MainActor
-final class WorkspaceSwitchSessionProvider {
+final class AgentModeWorkspaceSwitchCleanupProvider {
     weak var delegate: WorkspaceSwitchSessionProviderDelegate?
 
     private let codexCoordinator: CodexAgentModeCoordinator
@@ -121,11 +121,7 @@ final class WorkspaceSwitchSessionProvider {
         claudeCoordinator: ClaudeAgentModeCoordinator
     ) async {
         let session = target.session
-        let provider = session.provider
-        session.provider = nil
-        if let provider {
-            await provider.dispose()
-        }
+        await session.disposeProviderIfPresent()
         await session.teardownACPControllerIfPresent()
         await codexCoordinator.shutdownCodexSession(
             session,
@@ -152,10 +148,12 @@ final class WorkspaceSwitchSessionProvider {
 
         func test_drainBackgroundCleanup(timeoutNanoseconds: UInt64) async throws {
             let cleanupIDs = Array(test_backgroundCleanupDrainTasks.keys)
-            for let cleanupID in cleanupIDs {
+            for cleanupID in cleanupIDs {
                 guard test_backgroundCleanupDrainTasks[cleanupID] != nil else { continue }
                 let task = test_backgroundCleanupDrainTasks[cleanupID]
-                try await withTaskCancellationHandler {
+                try await withTaskCancellationHandler(handler: {
+                    task?.cancel()
+                }, operation: {
                     try await withCheckedThrowingContinuation { continuation in
                         test_backgroundCleanupDrainWaiters[cleanupID] = continuation
                         let timeoutTask = Task { @MainActor in
@@ -166,9 +164,7 @@ final class WorkspaceSwitchSessionProvider {
                         }
                         test_backgroundCleanupDrainTimeoutTasks[cleanupID] = timeoutTask
                     }
-                } onCancellation: {
-                    task?.cancel()
-                }
+                })
             }
         }
     #endif
@@ -196,6 +192,14 @@ final class WorkspaceSwitchSessionProvider {
 }
 
 extension AgentModeViewModel.TabSession {
+    func disposeProviderIfPresent() async {
+        let provider = provider
+        self.provider = nil
+        if let provider {
+            await provider.dispose()
+        }
+    }
+
     func teardownACPControllerIfPresent() async {
         acpSteeringFlushTask?.cancel()
         acpSteeringFlushTask = nil
