@@ -1263,11 +1263,20 @@ struct WorkspaceSelectionMutationService {
                 await ownership.record(ticket)
             }
         }
-        for rootEpoch in sourceTicketsByRoot.keys.sorted(by: workspaceCodemapRootEpochPrecedes) {
-            guard await store.waitForCodemapGraphPublication(
-                rootEpoch: rootEpoch,
-                deadline: deadline
-            ) else { break }
+        let sourceGraphDrainRootEpochs = Set(sourceTicketsByRoot.keys)
+        guard try await drainAutomaticSelectionGraphPublications(
+            rootEpochs: sourceGraphDrainRootEpochs,
+            clock: clock,
+            deadline: deadline
+        ) else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .pending(
+                    sourceGraphDrainRootEpochs
+                        .sorted(by: workspaceCodemapRootEpochPrecedes)
+                        .map { .graphRebuild(rootEpoch: $0) }
+                )
+            )
         }
 
         var candidatePlanDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition =
@@ -1533,11 +1542,20 @@ struct WorkspaceSelectionMutationService {
                 rootLifetimeID: $0.identity.rootLifetimeID
             )
         })
-        for rootEpoch in candidateRootEpochs.sorted(by: workspaceCodemapRootEpochPrecedes) {
-            guard await store.waitForCodemapGraphPublication(
-                rootEpoch: rootEpoch,
-                deadline: deadline
-            ) else { break }
+        let finalGraphDrainRootEpochs = Set(readySources.map(\.rootEpoch)).union(candidateRootEpochs)
+        guard try await drainAutomaticSelectionGraphPublications(
+            rootEpochs: finalGraphDrainRootEpochs,
+            clock: clock,
+            deadline: deadline
+        ) else {
+            return WorkspaceCodemapAutomaticSelectionResult(
+                roots: [],
+                aggregateCoverage: .pending(
+                    finalGraphDrainRootEpochs
+                        .sorted(by: workspaceCodemapRootEpochPrecedes)
+                        .map { .graphRebuild(rootEpoch: $0) }
+                )
+            )
         }
 
         var result = try await store.resolveAutomaticCodemapSelection(
@@ -1616,19 +1634,16 @@ struct WorkspaceSelectionMutationService {
         guard !rootEpochs.isEmpty else { return true }
         for rootEpoch in rootEpochs.sorted(by: workspaceCodemapRootEpochPrecedes) {
             try Task.checkCancellation()
-            guard automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline) else {
-                return false
-            }
+            guard clock.now < deadline else { return false }
             let publicationCurrent = await store.waitForCodemapGraphPublication(
                 rootEpoch: rootEpoch,
                 deadline: deadline
             )
-            guard publicationCurrent,
-                  automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
-            else { return false }
+            try Task.checkCancellation()
+            guard publicationCurrent, clock.now < deadline else { return false }
         }
         try Task.checkCancellation()
-        return automaticSelectionDeadlineIsCurrent(clock: clock, deadline: deadline)
+        return clock.now < deadline
     }
 
     private func settleProvisionalAutomaticCandidates(

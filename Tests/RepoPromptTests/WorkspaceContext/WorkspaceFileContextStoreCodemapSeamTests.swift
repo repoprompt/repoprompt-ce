@@ -394,8 +394,19 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
                 maximumPathByteCount: 4096
             ))
         }
-        let enteredCatalogBuildEpoch = await catalogBuildGate.waitUntilEntered()
-        XCTAssertEqual(enteredCatalogBuildEpoch, rootEpoch)
+        addTeardownBlock {
+            pageTask.cancel()
+            await responsivenessGate.release()
+            await catalogBuildGate.release()
+            await registrationGate.release()
+        }
+        let enteredCatalogBuildEpoch = await catalogBuildGate.waitUntilEntered(timeout: .seconds(10))
+        guard enteredCatalogBuildEpoch == rootEpoch else {
+            pageTask.cancel()
+            await catalogBuildGate.release()
+            XCTFail("Expected catalog shard build gate to enter \(rootEpoch), got \(String(describing: enteredCatalogBuildEpoch))")
+            return
+        }
 
         let responsivenessTask = Task {
             let roots = await store.roots()
@@ -8204,14 +8215,20 @@ final class WorkspaceFileContextStoreCodemapSeamTests: XCTestCase {
             repositoryFixture.cleanup()
         }
 
-        let warmStore = fixture.makeStore()
+        let warmStore = fixture.makeStore(
+            codemapProjectionPreloadLaunchPolicy: .disabled
+        )
         let warmRoot = try await warmStore.loadRoot(path: root.path)
         let warmFiles = await warmStore.files(inRoot: warmRoot.id)
         for file in warmFiles {
             let ticket = try await pendingTicket(
                 warmStore.requestCodemapArtifact(forFileID: file.id)
             )
-            _ = try await readyResult(settledResult(store: warmStore, ticket: ticket))
+            let warmResult = try await settledResult(store: warmStore, ticket: ticket)
+            guard case .ready = warmResult else {
+                XCTFail("Expected warm codemap demand for \(file.standardizedRelativePath) to be ready, got \(warmResult)")
+                throw CodemapStoreTestError.expectedReady
+            }
         }
         let warmBuildCount = fixture.buildCount.value
         await warmStore.unloadRoot(id: warmRoot.id)

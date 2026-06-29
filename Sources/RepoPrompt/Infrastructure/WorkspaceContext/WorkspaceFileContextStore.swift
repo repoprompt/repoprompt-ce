@@ -12069,11 +12069,13 @@ actor WorkspaceFileContextStore {
         var waitedFlightIDs = Set<UUID>()
         var waitedObserverIDs = Set<UUID>()
         var waitedWorkerIDs = Set<UUID>()
+        var observedQuiescentPass = false
         while codemapDeadlineIsCurrent(deadline) {
             if let flight = codemapSessionsByRootEpoch[rootEpoch]?.graphPublicationFlight,
                waitedFlightIDs.insert(flight.id).inserted,
                let task = flight.task
             {
+                observedQuiescentPass = false
                 guard await waitForCodemapSharedTask(task, deadline: deadline),
                       codemapDeadlineIsCurrent(deadline)
                 else { return false }
@@ -12083,6 +12085,7 @@ actor WorkspaceFileContextStore {
                waitedObserverIDs.insert(observer.id).inserted,
                let task = observer.task
             {
+                observedQuiescentPass = false
                 guard await waitForCodemapSharedTask(task, deadline: deadline),
                       codemapDeadlineIsCurrent(deadline)
                 else { return false }
@@ -12093,9 +12096,15 @@ actor WorkspaceFileContextStore {
                waitedWorkerIDs.insert(workerID).inserted,
                let task = state.workerTask
             {
+                observedQuiescentPass = false
                 guard await waitForCodemapSharedTask(task, deadline: deadline),
                       codemapDeadlineIsCurrent(deadline)
                 else { return false }
+                continue
+            }
+            guard observedQuiescentPass else {
+                observedQuiescentPass = true
+                await Task.yield()
                 continue
             }
             return codemapDeadlineIsCurrent(deadline)

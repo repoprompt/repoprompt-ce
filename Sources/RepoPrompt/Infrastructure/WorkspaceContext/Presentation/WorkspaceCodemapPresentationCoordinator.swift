@@ -565,6 +565,21 @@ struct WorkspaceCodemapPresentationCoordinator {
                 await ownership.record(ticket)
             }
         }
+        let sourceGraphDrainRootEpochs = Set(sourceTicketsByRoot.keys)
+        guard try await drainAutomaticSelectionGraphPublications(
+            rootEpochs: sourceGraphDrainRootEpochs,
+            clock: clock,
+            deadline: deadline
+        ) else {
+            let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage
+                .pending(
+                    sourceGraphDrainRootEpochs
+                        .sorted(by: workspaceCodemapRootEpochPrecedes)
+                        .map { .graphRebuild(rootEpoch: $0) }
+                )
+            issues.append(.automatic(automaticCoverage))
+            return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
+        }
 
         var planDisposition: WorkspaceCodemapAutomaticSelectionCandidatePlanDisposition = .pending([])
         var provisionallyDemandedFileIDs = Set<UUID>()
@@ -755,6 +770,22 @@ struct WorkspaceCodemapPresentationCoordinator {
         }
         guard candidatePending.isEmpty else {
             let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage.pending(candidatePending)
+            issues.append(.automatic(automaticCoverage))
+            return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
+        }
+
+        let finalGraphDrainRootEpochs = Set(readySources.map(\.rootEpoch)).union(plan.candidates.map(\.rootEpoch))
+        guard try await drainAutomaticSelectionGraphPublications(
+            rootEpochs: finalGraphDrainRootEpochs,
+            clock: clock,
+            deadline: deadline
+        ) else {
+            let automaticCoverage = WorkspaceCodemapAutomaticSelectionAggregateCoverage
+                .pending(
+                    finalGraphDrainRootEpochs
+                        .sorted(by: workspaceCodemapRootEpochPrecedes)
+                        .map { .graphRebuild(rootEpoch: $0) }
+                )
             issues.append(.automatic(automaticCoverage))
             return AutomaticPreparation(candidates: [], issues: issues, coverage: .pending(issues), receipt: nil)
         }
@@ -1416,6 +1447,7 @@ struct WorkspaceCodemapPresentationCoordinator {
                 rootEpoch: rootEpoch,
                 deadline: deadline
             )
+            try Task.checkCancellation()
             guard publicationCurrent, clock.now < deadline else { return false }
         }
         try Task.checkCancellation()
