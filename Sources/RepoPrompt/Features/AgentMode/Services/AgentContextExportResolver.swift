@@ -39,17 +39,14 @@ struct AgentContextSelectionSummary: Equatable {
     let fullFileCount: Int
     let slicedFileCount: Int
     let sliceRangeCount: Int
-    let mapCount: Int
 
     var compactText: String {
         fileCountText
     }
 
     var headlineText: String {
-        let detailTexts = [sliceCountText, mapCountText].compactMap(\.self)
-        guard !detailTexts.isEmpty else { return fileCountText }
-        let leadingTexts = totalExplicitFileCount > 0 ? [fileCountText] : []
-        return (leadingTexts + detailTexts).joined(separator: " · ")
+        guard let sliceCountText else { return fileCountText }
+        return "\(fileCountText) · \(sliceCountText)"
     }
 
     private var fileCountText: String {
@@ -57,13 +54,8 @@ struct AgentContextSelectionSummary: Equatable {
     }
 
     private var sliceCountText: String? {
-        guard slicedFileCount > 0 else { return nil }
-        return "\(slicedFileCount) slice\(slicedFileCount == 1 ? "" : "s")"
-    }
-
-    private var mapCountText: String? {
-        guard mapCount > 0 else { return nil }
-        return "\(mapCount) map\(mapCount == 1 ? "" : "s")"
+        guard sliceRangeCount > 0 else { return nil }
+        return "\(sliceRangeCount) slice\(sliceRangeCount == 1 ? "" : "s")"
     }
 }
 
@@ -204,7 +196,6 @@ enum AgentContextExportResolver {
         var explicitFileKeys = Set(selection.selectedPaths.map(normalizedSelectionKey))
         var slicedFileKeys = Set<String>()
         var sliceRangeCount = 0
-        let mapKeys = Set(selection.autoCodemapPaths.map(normalizedSelectionKey))
 
         for (path, ranges) in selection.slices where !ranges.isEmpty {
             let key = normalizedSelectionKey(path)
@@ -217,8 +208,7 @@ enum AgentContextExportResolver {
             totalExplicitFileCount: explicitFileKeys.count,
             fullFileCount: explicitFileKeys.count - slicedFileKeys.count,
             slicedFileCount: slicedFileKeys.count,
-            sliceRangeCount: sliceRangeCount,
-            mapCount: mapKeys.count
+            sliceRangeCount: sliceRangeCount
         )
     }
 

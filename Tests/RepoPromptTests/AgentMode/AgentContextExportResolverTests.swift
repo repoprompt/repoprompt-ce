@@ -49,8 +49,7 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 2)
         XCTAssertEqual(summary.compactText, "2 files")
-        XCTAssertEqual(summary.mapCount, 0)
-        XCTAssertEqual(summary.headlineText, "2 files · 1 slice")
+        XCTAssertEqual(summary.headlineText, "2 files · 2 slices")
     }
 
     func testSelectionSummaryIncludesLegacySliceOnlyKey() {
@@ -66,7 +65,6 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 1)
         XCTAssertEqual(summary.compactText, "1 file")
-        XCTAssertEqual(summary.mapCount, 0)
         XCTAssertEqual(summary.headlineText, "1 file · 1 slice")
     }
 
@@ -83,10 +81,9 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 1)
-        XCTAssertEqual(summary.mapCount, 0)
     }
 
-    func testSelectionSummaryExcludesEmptySlicesAndIncludesMaps() {
+    func testSelectionSummaryExcludesEmptySlicesAndAutoCodemaps() {
         let selection = StoredSelection(
             autoCodemapPaths: ["Sources/Dependency.swift"],
             slices: ["Sources/Empty.swift": []],
@@ -99,9 +96,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 0)
         XCTAssertEqual(summary.sliceRangeCount, 0)
-        XCTAssertEqual(summary.mapCount, 1)
         XCTAssertEqual(summary.compactText, "0 files")
-        XCTAssertEqual(summary.headlineText, "1 map")
+        XCTAssertEqual(summary.headlineText, "0 files")
     }
 
     func testSelectionSummaryRetainsFullOnlyFormatting() {
@@ -136,28 +132,8 @@ final class AgentContextExportResolverTests: XCTestCase {
         XCTAssertEqual(summary.fullFileCount, 0)
         XCTAssertEqual(summary.slicedFileCount, 1)
         XCTAssertEqual(summary.sliceRangeCount, 3)
-        XCTAssertEqual(summary.mapCount, 0)
         XCTAssertEqual(summary.compactText, "1 file")
-        XCTAssertEqual(summary.headlineText, "1 file · 1 slice")
-    }
-
-    func testSelectionSummaryIncludesFilesSlicesAndMaps() {
-        let selection = StoredSelection(
-            selectedPaths: ["Sources/Full.swift"],
-            autoCodemapPaths: ["Sources/Dependency.swift", " Sources/Dependency.swift "],
-            slices: ["Sources/Sliced.swift": [LineRange(start: 3, end: 7)]],
-            codemapAutoEnabled: true
-        )
-
-        let summary = AgentContextExportResolver.selectionSummary(for: selection)
-
-        XCTAssertEqual(summary.totalExplicitFileCount, 2)
-        XCTAssertEqual(summary.fullFileCount, 1)
-        XCTAssertEqual(summary.slicedFileCount, 1)
-        XCTAssertEqual(summary.sliceRangeCount, 1)
-        XCTAssertEqual(summary.mapCount, 1)
-        XCTAssertEqual(summary.compactText, "2 files")
-        XCTAssertEqual(summary.headlineText, "2 files · 1 slice · 1 map")
+        XCTAssertEqual(summary.headlineText, "1 file · 3 slices")
     }
 
     func testAutoCodemapExportResolutionBatchesPopoverPathLookups() async throws {

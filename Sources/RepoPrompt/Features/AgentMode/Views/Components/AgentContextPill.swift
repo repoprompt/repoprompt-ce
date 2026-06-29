@@ -30,10 +30,6 @@ struct AgentContextPill: View {
         AgentContextExportResolver.selectionSummary(for: currentExportSourceSelection)
     }
 
-    private var fileCount: Int {
-        selectionSummary.totalExplicitFileCount
-    }
-
     private var currentExportSourceSelection: StoredSelection {
         let requestedTabID = currentTabID ?? promptManager.activeComposeTabID
         let selectionSnapshot = requestedTabID.flatMap {
@@ -56,15 +52,7 @@ struct AgentContextPill: View {
         runtimeVM.snapshot.selectionTokens
     }
 
-    private var compactFileSummaryText: String {
-        selectionSummary.compactText
-    }
-
-    private var detailedFileSummaryText: String {
-        selectionSummary.headlineText
-    }
-
-    private var contextUsageTooltip: String {
+    private func contextUsageTooltip(detailedFileSummaryText: String) -> String {
         var lines: [String] = []
 
         if let usedTokens = estimatedUsedTokens,
@@ -92,6 +80,10 @@ struct AgentContextPill: View {
             let _ = AgentModePerfDiagnostics.increment("ui.body.statusPills.context")
         #endif
         let cornerRadius = AgentPillMetrics.cornerRadius()
+        let summary = selectionSummary
+        let compactFileSummaryText = summary.compactText
+        let detailedFileSummaryText = summary.headlineText
+
         Button {
             showPopover.toggle()
         } label: {
@@ -118,7 +110,7 @@ struct AgentContextPill: View {
             )
         }
         .buttonStyle(.plain)
-        .hoverTooltip(contextUsageTooltip, .top)
+        .hoverTooltip(contextUsageTooltip(detailedFileSummaryText: detailedFileSummaryText), .top)
         .accessibilityLabel("Agent context: \(detailedFileSummaryText)")
         .accessibilityHint("Opens context export controls and usage details")
         .popover(isPresented: $showPopover, arrowEdge: .bottom) {
@@ -131,6 +123,10 @@ struct AgentContextPill: View {
         // Width grows with the font scale so the export card never feels
         // pinched at Large/Extra Large.
         let popoverWidth = fontPreset.scaledClamped(360, max: 480)
+        let summary = selectionSummary
+        let detailedFileSummaryText = summary.headlineText
+        let fileCount = summary.totalExplicitFileCount
+
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
                 AgentContextIndicator(
